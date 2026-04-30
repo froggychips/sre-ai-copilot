@@ -1,34 +1,39 @@
 from typing import List, Dict, Any, Optional
 from app.core.reasoning.hypothesis import Hypothesis
-from app.core.reasoning.evidence import EvidenceGraph
-from app.core.reasoning.engine.confidence_engine import ConfidenceEngine
+from app.core.reasoning.engine.unified_state import SystemState, StateEvaluator
 
 class InterpretationEngine:
-    def __init__(self, graph: EvidenceGraph, beliefs: Dict[str, float]):
-        self.graph = graph
-        self.beliefs = beliefs
-        self.confidence_engine = ConfidenceEngine()
+    def __init__(self, state: SystemState):
+        self.state = state
 
-    def rank_hypotheses(self, hypotheses: List[Hypothesis], top_k: int = 3) -> List[Hypothesis]:
-        """Ранжирует гипотезы, используя ConfidenceEngine."""
-        for h in hypotheses:
-            h.confidence_score = self.confidence_engine.calculate(h, self.beliefs, self.graph)
+    def rank_hypotheses(self, top_k: int = 3) -> List[Hypothesis]:
+        """Ранжирует гипотезы на основе энергетического вклада в E(S)."""
+        # Считаем вклад гипотезы в общую энергию как прокси confidence
+        for h in self.state.hypotheses:
+            h.confidence_score = self._compute_emergence(h)
 
-        return sorted(hypotheses, key=lambda h: h.confidence_score, reverse=True)[:top_k]
+        return sorted(self.state.hypotheses, key=lambda h: h.confidence_score, reverse=True)[:top_k]
+
+    def _compute_emergence(self, h: Hypothesis) -> float:
+        """Confidence как производная от энергетического ландшафта."""
+        # Чем ниже E(h), тем выше стабильность (уверенность)
+        # Инициализируем локальное состояние гипотезы для оценки
+        local_state = SystemState(graph=self.state.graph, hypotheses=[h], beliefs=self.state.beliefs)
+        energy = StateEvaluator.evaluate(local_state)
+        return float(1 / (1 + energy))
 
     def build_explanation(self, root_cause: Hypothesis) -> Dict[str, Any]:
+        """Формирует RCA строго из текущего SystemState."""
         return {
             "root_cause": root_cause.claim,
             "confidence": round(root_cause.confidence_score, 2),
+            "supporting_evidence": root_cause.supporting_evidence_ids,
+            "contradictions": root_cause.contradiction_evidence_ids,
             "summary": root_cause.description
         }
 
-    def select_root_cause(self, ranked_hypotheses: List[Hypothesis]) -> Optional[Hypothesis]:
-        """Выбирает лучшую гипотезу с подтвержденным каузальным путем."""
-        for h in ranked_hypotheses:
-            if not h.contradiction_evidence_ids: # Нет критических противоречий
-                return h
-        return ranked_hypotheses[0] if ranked_hypotheses else None
+    def select_root_cause(self, ranked: List[Hypothesis]) -> Optional[Hypothesis]:
+        return ranked[0] if ranked else None
 
     def extract_causal_chain(self, evidence_id: str) -> List[str]:
         """Использует traverse_causal_chain графа для RCA объяснения."""
