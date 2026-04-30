@@ -7,12 +7,6 @@ services:
     ports:
       - "8000:8000"
     env_file: .env
-    restart: always
-    deploy:
-      resources:
-        limits:
-          cpus: '0.5'
-          memory: 512M
     depends_on:
       - redis
     volumes:
@@ -22,14 +16,8 @@ services:
   worker:
     build: .
     container_name: sre-ai-worker
-    command: python -m app.workers.tasks
+    command: python -m app.queue.worker
     env_file: .env
-    restart: always
-    deploy:
-      resources:
-        limits:
-          cpus: '1.0'
-          memory: 1G
     depends_on:
       - redis
     volumes:
@@ -41,8 +29,3 @@ services:
     container_name: sre-ai-redis
     ports:
       - "6379:6379"
-    restart: always
-    deploy:
-      resources:
-        limits:
-          memory: 256M
