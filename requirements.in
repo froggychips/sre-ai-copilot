@@ -1,0 +1,16 @@
+fastapi
+uvicorn[standard]
+google-generativeai
+pydantic-settings
+structlog
+sqlalchemy
+alembic
+celery[redis]
+python-jose[cryptography]
+opentelemetry-api
+opentelemetry-sdk
+opentelemetry-instrumentation-fastapi
+opentelemetry-exporter-otlp
+prometheus-client
+psycopg2-binary
+tenacity
