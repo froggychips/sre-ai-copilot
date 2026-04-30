@@ -1,4 +1,4 @@
-from fastapi import FastAPI, Request, Depends, HTTPException, Body
+from fastapi import FastAPI, Request, Depends, HTTPException, Body, Response
 from sqlalchemy import text
 from app.database import engine
 from app.api import webhooks
@@ -15,7 +15,8 @@ from typing import Optional
 from uuid import UUID
 from app import repository
 from app.models import MessageRole
-from app.workers.tasks import process_incident_task # Reusing task for copilot processing
+from app.celery_worker import celery_app, generate_reply
+from celery.result import AsyncResult
 
 # Observability configuration
 structlog.configure(processors=[structlog.processors.JSONRenderer()])
@@ -44,6 +45,7 @@ app.include_router(webhooks.router, prefix="/webhooks")
 
 @app.post("/copilot", status_code=202)
 async def post_copilot(
+    response: Response,
     conversation_id: Optional[UUID] = Body(None),
     prompt: str = Body(...)
 ):
@@ -59,12 +61,35 @@ async def post_copilot(
     )
     
     # 3. Enqueue the processing task to Celery
-    process_incident_task.delay({"incident_id": str(conversation_id), "prompt": prompt})
+    task = generate_reply.delay(str(conversation_id), prompt)
+    
+    # 4. Set Location header
+    response.headers["Location"] = f"/jobs/{task.id}"
     
     return {
-        "conversation_id": conversation_id,
-        "status": "queued"
+        "task_id": task.id,
+        "conversation_id": conversation_id
     }
+
+@app.get("/jobs/{task_id}")
+async def get_job_status(task_id: str):
+    """
+    Checks the status of a Celery task and returns its current state and result.
+    """
+    result = AsyncResult(task_id, app=celery_app)
+    
+    response_data = {
+        "task_id": task_id,
+        "status": result.status,
+    }
+
+    if result.ready():
+        if result.successful():
+            response_data["result"] = result.result
+        else:
+            response_data["error"] = str(result.result)
+
+    return response_data
 
 @app.get("/healthz")
 async def healthz():

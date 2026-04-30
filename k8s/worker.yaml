@@ -1,0 +1,54 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: copilot-worker
+  labels:
+    app: copilot-worker
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: copilot-worker
+  template:
+    metadata:
+      labels:
+        app: copilot-worker
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        fsGroup: 10001
+      containers:
+      - name: worker
+        image: froggychips/sre-ai-copilot:latest
+        command:
+        - celery
+        - -A
+        - app.celery_worker.celery_app
+        - worker
+        - --loglevel=info
+        securityContext:
+          readOnlyRootFilesystem: true
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop: ["ALL"]
+        envFrom:
+        - secretRef:
+            name: sre-ai-secrets
+        resources:
+          limits:
+            cpu: 200m
+            memory: 256Mi
+          requests:
+            cpu: 200m
+            memory: 256Mi
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: copilot-worker-pdb
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app: copilot-worker
