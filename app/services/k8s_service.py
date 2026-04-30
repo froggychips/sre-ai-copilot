@@ -4,13 +4,20 @@ import logging
 from app.config import settings
 from app.services.audit_logger import audit_service
 from app.services.k8s_guard import k8s_guard, K8sOperation
+from app.core.execution_dsl import ExecutionIntent, DSLTranslator
 
 class K8sService:
     def __init__(self):
         self.safe_mode = settings.SAFE_MODE
 
+    def execute_intent(self, intent: ExecutionIntent, dry_run: bool = True) -> Dict[str, Any]:
+        """Транслирует интент в команду и исполняет её."""
+        command = DSLTranslator.to_kubectl(intent)
+        return self.run_command(command, risk_level=intent.risk, dry_run=dry_run)
+
     def run_command(self, command: str, risk_level: str = "MEDIUM", dry_run: bool = True, body: dict = None) -> Dict[str, Any]:
-        """
+...
+
         Executes a kubectl command with mandatory safety checks and auditing.
         """
         if not command.startswith("kubectl"):
