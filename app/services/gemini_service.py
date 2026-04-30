@@ -1,18 +1,14 @@
 import google.generativeai as genai
 from app.config import settings
-from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
+from app.services.resilience import llm_retry_strategy
 import logging
 
 class GeminiService:
     def __init__(self):
         genai.configure(api_key=settings.GEMINI_API_KEY)
-        self.model = genai.GenerativeModel('gemini-pro')
+        self.model = genai.GenerativeModel(settings.MODEL_NAME)
 
-    @retry(
-        stop=stop_after_attempt(3),
-        wait=wait_exponential(multiplier=1, min=4, max=10),
-        reraise=True
-    )
+    @llm_retry_strategy
     async def generate_content(self, prompt: str) -> str:
         try:
             response = self.model.generate_content(prompt)
@@ -20,7 +16,8 @@ class GeminiService:
                 raise ValueError("Empty response from Gemini")
             return response.text
         except Exception as e:
-            logging.error(f"Gemini API error: {e}")
+            # Логируем ошибку, декоратор сам решит, делать ли ретрай
+            logging.error(f"Gemini call attempt failed: {e}")
             raise
 
 gemini_client = GeminiService()
