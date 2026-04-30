@@ -1,9 +1,11 @@
 from fastapi import FastAPI, Request, Depends, HTTPException, Body, Response
+from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import text
 from app.database import engine
 from app.api import webhooks
 from app.config import settings
 from app.middleware import RequestIDMiddleware
+from app.auth import get_current_user, User
 from opentelemetry import trace
 from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
 from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import OTLPSpanExporter
@@ -18,6 +20,32 @@ from app.models import MessageRole
 from app.celery_worker import celery_app, generate_reply
 from celery.result import AsyncResult
 
+# Environment-aware FastAPI instantiation
+app_configs = {
+    "title": "SRE AI Copilot",
+    "version": "2.3.0",
+}
+
+if settings.ENV == "production":
+    app_configs.update({
+        "docs_url": None,
+        "redoc_url": None,
+        "openapi_url": None,
+    })
+
+app = FastAPI(**app_configs)
+
+# Middleware
+app.add_middleware(RequestIDMiddleware)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=settings.ALLOWED_ORIGINS,
+    allow_credentials=True,
+    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+    allow_headers=["Authorization", "Content-Type", "X-Request-ID"],
+    expose_headers=["X-Request-ID"],
+)
+
 # Observability configuration
 structlog.configure(processors=[structlog.processors.JSONRenderer()])
 logger = structlog.get_logger()
@@ -25,11 +53,6 @@ logger = structlog.get_logger()
 trace.set_tracer_provider(TracerProvider())
 otlp_exporter = OTLPSpanExporter(endpoint=settings.OTLP_EXPORTER_ENDPOINT, insecure=True)
 trace.get_tracer_provider().add_span_processor(BatchSpanProcessor(otlp_exporter))
-
-app = FastAPI(title="SRE AI Copilot", version="2.0.0")
-
-# Middleware
-app.add_middleware(RequestIDMiddleware)
 
 # Metrics
 metrics_app = make_asgi_app()
@@ -47,7 +70,8 @@ app.include_router(webhooks.router, prefix="/webhooks")
 async def post_copilot(
     response: Response,
     conversation_id: Optional[UUID] = Body(None),
-    prompt: str = Body(...)
+    prompt: str = Body(...),
+    user: User = Depends(get_current_user)
 ):
     # 1. Create conversation if ID is not provided
     if not conversation_id:
@@ -68,7 +92,8 @@ async def post_copilot(
     
     return {
         "task_id": task.id,
-        "conversation_id": conversation_id
+        "conversation_id": conversation_id,
+        "user_sub": user.sub
     }
 
 @app.get("/jobs/{task_id}")

@@ -1,6 +1,6 @@
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
-from typing import Optional
+from typing import Optional, List
 
 
 class Settings(BaseSettings):
@@ -8,8 +8,9 @@ class Settings(BaseSettings):
     Application configuration settings using Pydantic-settings v2.
     Loads variables from environment or a .env file.
     """
-
+    ENV: str = Field("development", description="Environment (production/development)")
     GEMINI_API_KEY: str = Field(..., description="API key for Gemini authentication")
+    OPENAI_API_KEY: str = Field(..., description="OpenAI API key placeholder")
     
     DATABASE_URL: str = Field(
         "postgresql://user:password@localhost:5432/dbname", 
@@ -39,9 +40,13 @@ class Settings(BaseSettings):
     DISCORD_WEBHOOK_URL: str = Field(..., description="Discord webhook URL")
     
     # Auth
+    JWT_PUBLIC_KEY: str = Field("", description="RSA Public Key for JWT validation")
     OIDC_WELL_KNOWN_URL: Optional[str] = None
     JWT_ALGORITHM: str = "RS256"
     JWT_AUDIENCE: Optional[str] = None
+    
+    # CORS
+    ALLOWED_ORIGINS: List[str] = Field(default_factory=lambda: ["*"])
     
     # Security
     NEW_RELIC_WEBHOOK_SECRET: Optional[str] = None
