@@ -9,5 +9,8 @@ class AnalyzerAgent(BaseAgent):
         )
 
     async def analyze(self, incident: NewRelicIncident) -> str:
-        prompt = f"Analyze this raw incident data from New Relic:\n{incident.model_dump_json(indent=2)}\nSummarize what is happening technically."
-        return await self.ask(prompt)
+        # Передаем данные инцидента как контекст, а инструкцию отдельно
+        return await self.ask(
+            user_context=incident.model_dump_json(indent=2),
+            instruction="Analyze this raw incident data from New Relic. Summarize what is happening technically."
+        )
