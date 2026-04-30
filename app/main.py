@@ -1,4 +1,4 @@
-from fastapi import FastAPI, Request, Depends, HTTPException
+from fastapi import FastAPI, Request, Depends, HTTPException, Body
 from sqlalchemy import text
 from app.database import engine
 from app.api import webhooks
@@ -11,6 +11,11 @@ from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import BatchSpanProcessor
 from prometheus_client import make_asgi_app, Counter
 import structlog
+from typing import Optional
+from uuid import UUID
+from app import repository
+from app.models import MessageRole
+from app.workers.tasks import process_incident_task # Reusing task for copilot processing
 
 # Observability configuration
 structlog.configure(processors=[structlog.processors.JSONRenderer()])
@@ -36,6 +41,30 @@ async def metrics_middleware(request: Request, call_next):
     return await call_next(request)
 
 app.include_router(webhooks.router, prefix="/webhooks")
+
+@app.post("/copilot", status_code=202)
+async def post_copilot(
+    conversation_id: Optional[UUID] = Body(None),
+    prompt: str = Body(...)
+):
+    # 1. Create conversation if ID is not provided
+    if not conversation_id:
+        conversation_id = await repository.create_conversation()
+    
+    # 2. Store the user's prompt in the database
+    await repository.add_message(
+        conv_id=conversation_id,
+        role=MessageRole.user,
+        content=prompt
+    )
+    
+    # 3. Enqueue the processing task to Celery
+    process_incident_task.delay({"incident_id": str(conversation_id), "prompt": prompt})
+    
+    return {
+        "conversation_id": conversation_id,
+        "status": "queued"
+    }
 
 @app.get("/healthz")
 async def healthz():

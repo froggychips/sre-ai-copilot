@@ -34,9 +34,13 @@ spec:
             path: /healthz
             port: 8000
         readinessProbe:
-          httpGet:
-            path: /readyz
-            port: 8000
+          exec:
+            command:
+            - pg_isready
+            - -d
+            - "$(DATABASE_URL)"
+          initialDelaySeconds: 5
+          periodSeconds: 10
         resources:
           limits:
             cpu: 500m
