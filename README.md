@@ -52,3 +52,20 @@ Production-ready Kubernetes incident response AI system.
 - Gemini Pro API
 - Discord.py
 - Kubernetes Python Client
+
+## Testing
+We use `pytest` for automated testing. Since LLM responses are non-deterministic, we mock the API calls and verify the logic of prompt formation and security filtering.
+
+### Run Tests:
+```bash
+# Install test dependencies
+pip install -r requirements.txt
+
+# Run all tests
+pytest tests/
+```
+
+### What is tested:
+- **Prompt Formation:** Ensures data is correctly wrapped in XML isolation tags.
+- **Security Guardrails:** Verifies that `PromptGuard` blocks injection attempts in real agent workflows.
+- **Resilience Logic:** Checks agent behavior on empty or failed API responses.
