@@ -10,3 +10,6 @@ kubernetes==28.1.0
 python-dotenv==1.0.0
 httpx==0.25.1
 python-multipart==0.0.6
+slowapi==0.1.9
+structlog==23.2.0
+tenacity==8.2.3
