@@ -3,8 +3,14 @@ from typing import Optional
 
 class Settings(BaseSettings):
     GEMINI_API_KEY: str
-    REDIS_URL: str = "redis://localhost:6379/0"
+    DATABASE_URL: str = "postgresql://sre:sre@postgres:5432/sre_db"
+    REDIS_URL: str = "redis://redis:6379/0"
     DISCORD_WEBHOOK_URL: str
+    
+    # Auth
+    OIDC_WELL_KNOWN_URL: Optional[str] = None
+    JWT_ALGORITHM: str = "RS256"
+    JWT_AUDIENCE: Optional[str] = None
     
     # Security
     NEW_RELIC_WEBHOOK_SECRET: Optional[str] = None
@@ -13,7 +19,7 @@ class Settings(BaseSettings):
     
     # Observability
     LOG_LEVEL: str = "INFO"
-    AUDIT_LOG_PATH: str = "audit.log"
+    OTLP_EXPORTER_ENDPOINT: str = "http://tempo:4317"
     
     K8S_CONTEXT: str = ""
     

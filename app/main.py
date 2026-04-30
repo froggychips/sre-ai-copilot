@@ -1,25 +1,47 @@
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, Depends, HTTPException
 from app.api import webhooks
-from slowapi import Limiter, _rate_limit_exceeded_handler
-from slowapi.util import get_remote_address
-from slowapi.errors import RateLimitExceeded
-import logging
+from app.config import settings
+from opentelemetry import trace
+from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
+from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import OTLPSpanExporter
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export import BatchSpanProcessor
+from prometheus_client import make_asgi_app, Counter
+import structlog
+import uuid
 
-logging.basicConfig(level=logging.INFO)
+# Observability
+structlog.configure(processors=[structlog.processors.JSONRenderer()])
+logger = structlog.get_logger()
 
-limiter = Limiter(key_func=get_remote_address)
-app = FastAPI(title="SRE AI Copilot", version="1.0.0")
-app.state.limiter = limiter
-app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+trace.set_tracer_provider(TracerProvider())
+otlp_exporter = OTLPSpanExporter(endpoint=settings.OTLP_EXPORTER_ENDPOINT, insecure=True)
+trace.get_tracer_provider().add_span_processor(BatchSpanProcessor(otlp_exporter))
 
-app.include_router(webhooks.router, prefix="/webhooks", tags=["webhooks"])
+app = FastAPI(title="SRE AI Copilot", version="2.0.0")
+
+# Metrics
+metrics_app = make_asgi_app()
+app.mount("/metrics", metrics_app)
+REQUEST_COUNT = Counter("http_requests_total", "Total HTTP Requests", ["method", "endpoint"])
 
 @app.middleware("http")
-async def audit_middleware(request: Request, call_next):
-    # Basic access logging for audit
-    logging.info(f"Access: {request.method} {request.url.path} from {request.client.host}")
-    return await call_next(request)
+async def observability_middleware(request: Request, call_next):
+    request_id = str(uuid.uuid4())
+    structlog.contextvars.clear_contextvars()
+    structlog.contextvars.bind_contextvars(request_id=request_id)
+    
+    REQUEST_COUNT.labels(method=request.method, endpoint=request.url.path).inc()
+    response = await call_next(request)
+    response.headers["X-Request-ID"] = request_id
+    return response
 
-@app.get("/")
-async def root():
-    return {"message": "SRE AI Copilot is running"}
+app.include_router(webhooks.router, prefix="/webhooks")
+
+@app.get("/healthz")
+async def healthz(): return {"status": "ok"}
+
+@app.get("/readyz")
+async def readyz(): return {"status": "ready"}
+
+FastAPIInstrumentor.instrument_app(app)

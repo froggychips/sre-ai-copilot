@@ -1,35 +1,36 @@
-from fastapi import APIRouter, Request, BackgroundTasks, HTTPException
-from app.workers.tasks import q, start_worker_task
+from fastapi import APIRouter, Request, Depends, HTTPException
+from app.workers.tasks import process_incident_task
+from app.database import get_db, IncidentRecord
+from sqlalchemy.orm import Session
 from app.config import settings
-from slowapi import Limiter
-from slowapi.util import get_remote_address
-import logging
 
 router = APIRouter()
-limiter = Limiter(key_func=get_remote_address)
 
-async def verify_signature(request: Request):
-    if not settings.NEW_RELIC_WEBHOOK_SECRET:
-        return True # Dev mode
-    
-    header_secret = request.headers.get("X-NewRelic-Secret")
-    return header_secret == settings.NEW_RELIC_WEBHOOK_SECRET
-
-@router.post("/newrelic")
-@limiter.limit("5/minute")
-async def newrelic_webhook(request: Request):
-    if not await verify_signature(request):
-        raise HTTPException(status_code=403, detail="Invalid signature")
-        
+@router.post("/newrelic", status_code=202)
+async def newrelic_webhook(request: Request, db: Session = Depends(get_db)):
     data = await request.json()
     incident_id = data.get("incident_id")
-    logging.info(f"Accepted incident: {incident_id}")
     
-    # Queue for async processing
-    q.enqueue(start_worker_task, data)
-    
-    return {"status": "accepted", "incident_id": incident_id}
+    # Persist initial record
+    new_incident = IncidentRecord(
+        incident_id=incident_id,
+        status="PENDING",
+        data=data
+    )
+    db.add(new_incident)
+    db.commit()
 
-@router.get("/health")
-async def health_check():
-    return {"status": "healthy"}
+    # Async task
+    task = process_incident_task.delay(data)
+    
+    return {
+        "status": "accepted",
+        "task_id": task.id,
+        "location": f"/webhooks/status/{task.id}"
+    }
+
+@router.get("/status/{task_id}")
+async def get_task_status(task_id: str):
+    from app.workers.tasks import celery_app
+    res = celery_app.AsyncResult(task_id)
+    return {"task_id": task_id, "status": res.status}
