@@ -1,25 +1,16 @@
 from pydantic import BaseModel, Field
-from typing import List, Literal, Optional, Dict
-from .evidence import Contradiction
+from typing import List, Optional, Dict
 
 class Hypothesis(BaseModel):
     hypothesis_id: str
-    parent_hypothesis_id: Optional[str] = None
-    derived_from: List[str] = []
-    
     claim: str
     description: str
     
+    # Store ONLY IDs, no computed state
     supporting_evidence_ids: List[str] = []
     missing_evidence_ids: List[str] = []
     contradiction_evidence_ids: List[str] = []
     
-    contradictions: List[Contradiction] = []
-    
-    confidence_score: float = 0.5
-    confidence_breakdown: Dict[str, float] = Field(default_factory=dict)
-    
-    verification_queries: List[dict] = []
-    
-    status: Literal["pending", "verifying", "confirmed", "rejected"] = "pending"
+    # Status and iteration tracking only
+    status: str = "pending"
     iteration_count: int = 0
