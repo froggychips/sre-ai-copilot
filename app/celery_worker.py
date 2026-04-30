@@ -32,12 +32,20 @@ celery_app.conf.update(
     task_track_started=True,
     task_time_limit=300,
 )
+from app.context.context_builder import ContextBuilder
+# ... (импорты)
 
 async def _generate_reply_logic(conversation_id: str, prompt: str) -> str:
     db = SessionLocal()
     conv = db.query(Conversation).filter_by(id=conversation_id).first()
-    
+
+    # 1. Обогащение контекста
+    builder = ContextBuilder()
+    enriched_ctx = builder.build_context(conv.data) # Используем JSON данные из DB
+
     def transition(to_state: IncidentState):
+...
+
         if not StateMachine.validate_transition(IncidentState(conv.current_state), to_state):
             raise Exception(f"Invalid transition from {conv.current_state} to {to_state}")
         conv.current_state = to_state.value
