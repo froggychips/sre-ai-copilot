@@ -6,13 +6,11 @@ from app.api import webhooks
 from app.config import settings
 from app.middleware import RequestIDMiddleware
 from app.auth import get_current_user, User
-from opentelemetry import trace
-from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
-from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import OTLPSpanExporter
-from opentelemetry.sdk.trace import TracerProvider
-from opentelemetry.sdk.trace.export import BatchSpanProcessor
-from prometheus_client import make_asgi_app, Counter
+from app.telemetry import setup_telemetry
+from app.metrics import observe_request_latency
+from prometheus_client import start_http_server
 import structlog
+import time
 from typing import Optional
 from uuid import UUID
 from app import repository
@@ -20,49 +18,29 @@ from app.models import MessageRole
 from app.celery_worker import celery_app, generate_reply
 from celery.result import AsyncResult
 
-# Environment-aware FastAPI instantiation
-app_configs = {
-    "title": "SRE AI Copilot",
-    "version": "2.3.0",
-}
-
+app_configs = {"title": "SRE AI Copilot", "version": "2.4.0"}
 if settings.ENV == "production":
-    app_configs.update({
-        "docs_url": None,
-        "redoc_url": None,
-        "openapi_url": None,
-    })
+    app_configs.update({"docs_url": None, "redoc_url": None, "openapi_url": None})
 
 app = FastAPI(**app_configs)
 
-# Middleware
+# Setup Tracing & Instrumentation
+setup_telemetry(app)
+
 app.add_middleware(RequestIDMiddleware)
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=settings.ALLOWED_ORIGINS,
-    allow_credentials=True,
-    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
-    allow_headers=["Authorization", "Content-Type", "X-Request-ID"],
-    expose_headers=["X-Request-ID"],
-)
-
-# Observability configuration
-structlog.configure(processors=[structlog.processors.JSONRenderer()])
-logger = structlog.get_logger()
-
-trace.set_tracer_provider(TracerProvider())
-otlp_exporter = OTLPSpanExporter(endpoint=settings.OTLP_EXPORTER_ENDPOINT, insecure=True)
-trace.get_tracer_provider().add_span_processor(BatchSpanProcessor(otlp_exporter))
-
-# Metrics
-metrics_app = make_asgi_app()
-app.mount("/metrics", metrics_app)
-REQUEST_COUNT = Counter("http_requests_total", "Total HTTP Requests", ["method", "endpoint"])
+app.add_middleware(CORSMiddleware, allow_origins=settings.ALLOWED_ORIGINS, allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
 @app.middleware("http")
 async def metrics_middleware(request: Request, call_next):
-    REQUEST_COUNT.labels(method=request.method, endpoint=request.url.path).inc()
-    return await call_next(request)
+    start_time = time.time()
+    response = await call_next(request)
+    observe_request_latency(time.time() - start_time)
+    return response
+
+@app.on_event("startup")
+async def startup_event():
+    # Start separate metrics server on port 8001
+    start_http_server(port=8001)
 
 app.include_router(webhooks.router, prefix="/webhooks")
 
@@ -73,28 +51,21 @@ async def post_copilot(
     prompt: str = Body(...),
     user: User = Depends(get_current_user)
 ):
-    # 1. Create conversation if ID is not provided
     if not conversation_id:
         conversation_id = await repository.create_conversation()
-    
-    # 2. Store the user's prompt in the database
-    await repository.add_message(
-        conv_id=conversation_id,
-        role=MessageRole.user,
-        content=prompt
-    )
-    
-    # 3. Enqueue the processing task to Celery
+    await repository.add_message(conv_id=conversation_id, role=MessageRole.user, content=prompt)
     task = generate_reply.delay(str(conversation_id), prompt)
-    
-    # 4. Set Location header
     response.headers["Location"] = f"/jobs/{task.id}"
-    
-    return {
-        "task_id": task.id,
-        "conversation_id": conversation_id,
-        "user_sub": user.sub
-    }
+    return {"task_id": task.id, "conversation_id": conversation_id}
+
+@app.get("/healthz")
+async def healthz(): return {"status": "ok"}
+@app.get("/readyz")
+async def readyz():
+    try:
+        with engine.connect() as conn: conn.execute(text("SELECT 1"))
+        return {"status": "ready"}
+    except: raise HTTPException(status_code=503)
 
 @app.get("/jobs/{task_id}")
 async def get_job_status(task_id: str):

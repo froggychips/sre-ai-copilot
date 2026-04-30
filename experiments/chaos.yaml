@@ -1,0 +1,32 @@
+apiVersion: chaos-mesh.org/v1alpha1
+kind: PodChaos
+metadata:
+  name: pod-kill
+  namespace: chaos-mesh
+spec:
+  action: pod-failure
+  mode: one
+  duration: '1m'
+  selector:
+    namespaces: [copilot-prod]
+    labelSelectors: {'app.kubernetes.io/name': 'copilot'}
+---
+apiVersion: chaos-mesh.org/v1alpha1
+kind: NetworkChaos
+metadata:
+  name: redis-delay
+  namespace: chaos-mesh
+spec:
+  action: delay
+  mode: all
+  selector:
+    namespaces: [copilot-prod]
+    labelSelectors: {'app.kubernetes.io/name': 'redis'}
+  delay:
+    latency: '200ms'
+  duration: '5m'
+  direction: to
+  target:
+    selector:
+      namespaces: [copilot-prod]
+      labelSelectors: {'app.kubernetes.io/name': 'copilot'}
