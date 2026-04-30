@@ -1,28 +1,25 @@
 # SRE AI Copilot
 
-Production-ready Kubernetes incident response platform powered by multi-agent AI.
+Production-ready Kubernetes incident response platform.
 
 ## Architecture
-- **Async Pipeline:** FastAPI -> Redis (RQ/Celery) -> Workers.
-- **AI Engine:** Multi-agent pipeline (Analyzer, Hypothesis, Critic, Fix, Risk) with model routing (cheap/medium/strong).
-- **Safety Layer:** K8s DSL Execution, Prompt Guard, and Human-in-the-Loop (HITL) gate.
-- **Observability:** OpenTelemetry tracing, Prometheus metrics, structured JSON logs.
+Система является **Deterministic Reasoning Engine**, а не LLM-чатом.
+1. **EvidenceGraph**: Причинно-следственный граф фактов.
+2. **Belief Propagation**: Итеративный движок распространения сигналов вероятности.
+3. **Interpretation Layer**: Детерминированная генерация RCA.
+
+## Documentation
+- `docs/ARCHITECTURE.md`: Общая архитектура и потоки данных.
+- `docs/MODULE_DOCS.md`: Описание API модулей.
+- `docs/DR.md`: Disaster Recovery и Backups.
 
 ## Quick Start
-1. Configure `.env` using `.env.example`.
-2. Run infrastructure: `docker-compose up -d`.
-3. Deploy to K8s: `helm install copilot ./charts/copilot`.
-
-## Safety Model
-- **K8s Guardrails:** Strict allow-list for verbs and resources. No destructive commands allowed without approval.
-- **Prompt Injection:** XML-based isolation (`<user_context>`) and heuristics blocking code-injection patterns.
-- **HITL:** High-risk K8s operations require manual approval via Discord notifications.
-
-## Testing
 ```bash
-pytest tests/
+docker-compose up -d
+helm install copilot ./charts/copilot
 ```
-Tests mock LLM interactions to verify prompt structure, security guardrails, and error handling logic.
 
-## Disaster Recovery
-See `docs/DR.md` for Velero backup procedures and PostgreSQL point-in-time recovery steps.
+## Safety & Governance
+- **Guardrails:** Блокировка деструктивных действий.
+- **Evidence-Driven:** ИИ не галлюцинирует, он оперирует графом фактов.
+- **Explainable RCA:** Каждое решение подтверждено каузальной цепочкой из графа.
