@@ -1,4 +1,5 @@
 import asyncio
+import json
 import structlog
 from celery import Celery
 from openai import AsyncOpenAI
@@ -7,6 +8,8 @@ from app import repository
 from app.models import MessageRole, Conversation
 from app.database import SessionLocal
 from app.core.state_machine import StateMachine, IncidentState
+from app.context.context_builder import ContextBuilder
+from app.agents.analyzer import AnalyzerAgent
 from app.services.resilience import LLMResilienceManager
 from app.services.session_manager import SessionManager
 from redis.asyncio import from_url
@@ -32,20 +35,12 @@ celery_app.conf.update(
     task_track_started=True,
     task_time_limit=300,
 )
-from app.context.context_builder import ContextBuilder
-# ... (импорты)
 
 async def _generate_reply_logic(conversation_id: str, prompt: str) -> str:
     db = SessionLocal()
     conv = db.query(Conversation).filter_by(id=conversation_id).first()
-
-    # 1. Обогащение контекста
-    builder = ContextBuilder()
-    enriched_ctx = builder.build_context(conv.data) # Используем JSON данные из DB
-
+    
     def transition(to_state: IncidentState):
-...
-
         if not StateMachine.validate_transition(IncidentState(conv.current_state), to_state):
             raise Exception(f"Invalid transition from {conv.current_state} to {to_state}")
         conv.current_state = to_state.value
@@ -53,21 +48,33 @@ async def _generate_reply_logic(conversation_id: str, prompt: str) -> str:
 
     try:
         transition(IncidentState.INVESTIGATING)
+        builder = ContextBuilder()
+        enriched_ctx = builder.build_context(conv.data)
         
-        client = AsyncOpenAI(api_key=settings.GEMINI_API_KEY)
-        response = await client.chat.completions.create(
-            model=settings.MODEL_NAME,
-            messages=[{"role": "user", "content": prompt}],
-            max_tokens=settings.MAX_TOKENS,
-        )
-        assistant_message = response.choices[0].message.content
-        
-        transition(IncidentState.HYPOTHESIS_GENERATED)
-        
-        await repository.add_message(conversation_id, MessageRole.assistant, assistant_message)
+        # Reasoning Loop: максимум 3 итерации проверки гипотезы
+        for iteration in range(3):
+            analyzer = AnalyzerAgent()
+            analysis_data = await analyzer.analyze(enriched_ctx)
+            
+            # Попытка распарсить JSON, если агент вернул структурированный ответ
+            try:
+                analysis = json.loads(analysis_data)
+                confidence = analysis.get("confidence_score", 0)
+            except:
+                confidence = 0
+            
+            # Confidence Gate
+            if confidence >= 0.7:
+                transition(IncidentState.HYPOTHESIS_GENERATED)
+                break
+            else:
+                logger.warning("low_confidence_loop", iteration=iteration, score=confidence)
+                enriched_ctx["socratic_feedback"] = "Confidence too low. Focus on specific pod logs."
+        else:
+            raise Exception("Failed to reach confidence threshold after 3 iterations")
         
         transition(IncidentState.FIX_PROPOSED)
-        return assistant_message
+        return analysis_data
 
     except Exception as e:
         if conv:

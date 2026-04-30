@@ -1,71 +1,28 @@
 # SRE AI Copilot
 
-Production-ready Kubernetes incident response AI system.
+Production-ready Kubernetes incident response platform powered by multi-agent AI.
 
-## Features
-- **Webhook Ingestion:** Receives New Relic alerts via FastAPI.
-- **Async Processing:** Uses Redis Queue (RQ) for multi-agent analysis.
-- **Multi-Agent Pipeline:** 
-    - `Analyzer`: Interprets metrics/logs.
-    - `Hypothesis`: Brainstorms root causes.
-    - `Critic`: Filters/Audits hypotheses.
-    - `Fixer`: Suggests `kubectl` commands.
-    - `RiskManager`: Evaluates stability impact.
-- **Safety Layer:** Dry-run execution and approval gates for Kubernetes.
-- **Discord Integration:** Detailed reports with risk assessments.
+## Architecture
+- **Async Pipeline:** FastAPI -> Redis (RQ/Celery) -> Workers.
+- **AI Engine:** Multi-agent pipeline (Analyzer, Hypothesis, Critic, Fix, Risk) with model routing (cheap/medium/strong).
+- **Safety Layer:** K8s DSL Execution, Prompt Guard, and Human-in-the-Loop (HITL) gate.
+- **Observability:** OpenTelemetry tracing, Prometheus metrics, structured JSON logs.
 
-## Setup
-
-1. **Clone the repo:**
-   ```bash
-   git clone <repo-url>
-   cd sre-ai-copilot
-   ```
-
-2. **Configure Environment:**
-   Copy `.env.example` to `.env` and fill in:
-   - `GEMINI_API_KEY` (Google AI Studio)
-   - `DISCORD_WEBHOOK_URL`
-   - `REDIS_URL`
-
-3. **Run with Docker Compose:**
-   ```bash
-   docker-compose up --build
-   ```
-
-4. **Expose to New Relic:**
-   Use `ngrok` or similar to expose port 8000:
-   ```bash
-   ngrok http 8000
-   ```
-   Set New Relic webhook URL to: `https://<your-url>/webhooks/newrelic`
+## Quick Start
+1. Configure `.env` using `.env.example`.
+2. Run infrastructure: `docker-compose up -d`.
+3. Deploy to K8s: `helm install copilot ./charts/copilot`.
 
 ## Safety Model
-- `SAFE_MODE=true` ensures no `kubectl` command is run without manual approval.
-- Every suggested fix is audited by the `RiskAgent`.
-- `K8sService` performs `--dry-run=server` by default.
-
-## Tech Stack
-- Python 3.11
-- FastAPI
-- Redis / RQ
-- Gemini Pro API
-- Discord.py
-- Kubernetes Python Client
+- **K8s Guardrails:** Strict allow-list for verbs and resources. No destructive commands allowed without approval.
+- **Prompt Injection:** XML-based isolation (`<user_context>`) and heuristics blocking code-injection patterns.
+- **HITL:** High-risk K8s operations require manual approval via Discord notifications.
 
 ## Testing
-We use `pytest` for automated testing. Since LLM responses are non-deterministic, we mock the API calls and verify the logic of prompt formation and security filtering.
-
-### Run Tests:
 ```bash
-# Install test dependencies
-pip install -r requirements.txt
-
-# Run all tests
 pytest tests/
 ```
+Tests mock LLM interactions to verify prompt structure, security guardrails, and error handling logic.
 
-### What is tested:
-- **Prompt Formation:** Ensures data is correctly wrapped in XML isolation tags.
-- **Security Guardrails:** Verifies that `PromptGuard` blocks injection attempts in real agent workflows.
-- **Resilience Logic:** Checks agent behavior on empty or failed API responses.
+## Disaster Recovery
+See `docs/DR.md` for Velero backup procedures and PostgreSQL point-in-time recovery steps.
