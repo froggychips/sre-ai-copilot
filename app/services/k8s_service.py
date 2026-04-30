@@ -3,21 +3,42 @@ from typing import List, Dict, Any
 import logging
 from app.config import settings
 from app.services.audit_logger import audit_service
+from app.services.k8s_guard import k8s_guard, K8sOperation
 
 class K8sService:
     def __init__(self):
         self.safe_mode = settings.SAFE_MODE
 
-    def run_command(self, command: str, risk_level: str = "MEDIUM", dry_run: bool = True) -> Dict[str, Any]:
+    def run_command(self, command: str, risk_level: str = "MEDIUM", dry_run: bool = True, body: dict = None) -> Dict[str, Any]:
         """
         Executes a kubectl command with mandatory safety checks and auditing.
         """
         if not command.startswith("kubectl"):
             return {"success": False, "error": "Invalid command. Must be kubectl."}
 
-        # Forced Dry-run for destructive operations unless explicitly cleared
+        # 1. Парсинг параметров для Guardrails
+        cmd_parts = command.split()
+        verb = cmd_parts[1] if len(cmd_parts) > 1 else "get"
+        resource = cmd_parts[2] if len(cmd_parts) > 2 else "pods"
+        namespace = "default"
+        if "-n" in cmd_parts: namespace = cmd_parts[cmd_parts.index("-n") + 1]
+        elif "--namespace" in cmd_parts: namespace = cmd_parts[cmd_parts.index("--namespace") + 1]
+
+        # 2. ПРОВЕРКА БЕЗОПАСНОСТИ (Guardrails)
+        try:
+            k8s_guard.validate(K8sOperation(
+                verb=verb, 
+                resource=resource, 
+                namespace=namespace, 
+                body=body
+            ))
+        except PermissionError as e:
+            return {"success": False, "error": f"GUARDRAIL_BLOCK: {str(e)}"}
+
+        # Forced Dry-run logic
         destructive_keywords = ["delete", "patch", "apply", "scale", "restart"]
-        is_destructive = any(kw in command for kw in destructive_keywords)
+...
+
         
         full_cmd = command.split()
         
