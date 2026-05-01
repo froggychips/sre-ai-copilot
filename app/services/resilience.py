@@ -1,15 +1,37 @@
+import asyncio
 import time
+from functools import wraps
+
 import structlog
 from redis.asyncio import Redis
-from fastapi import HTTPException
-from app.config import settings
 
 logger = structlog.get_logger()
+
+
+def llm_retry_strategy(func):
+    """Simple async retry decorator for transient LLM failures."""
+
+    @wraps(func)
+    async def wrapper(*args, **kwargs):
+        retries = 3
+        delay = 0.5
+        last_exc = None
+        for attempt in range(1, retries + 1):
+            try:
+                return await func(*args, **kwargs)
+            except Exception as exc:
+                last_exc = exc
+                logger.warning("llm_call_retry", attempt=attempt, error=str(exc))
+                if attempt < retries:
+                    await asyncio.sleep(delay * attempt)
+        raise last_exc
+
+    return wrapper
+
 
 class LLMResilienceManager:
     def __init__(self, redis_client: Redis):
         self.redis = redis_client
-        # Атомарный Token Bucket на Lua
         self.rate_limit_lua = """
         local key = KEYS[1]
         local capacity = tonumber(ARGV[1])
@@ -36,7 +58,6 @@ class LLMResilienceManager:
     async def check_rate_limit(self, user_id: str) -> bool:
         key = f"rl:user:{user_id}"
         now = time.time()
-        # Лимиты из конфига: например, 5 запросов в минуту
         allowed = await self.redis.eval(self.rate_limit_lua, 1, key, 10, 0.1, now, 1)
         return bool(allowed)
 
@@ -46,9 +67,10 @@ class LLMResilienceManager:
     async def report_failure(self, provider: str):
         key = f"cb:fail:{provider}"
         count = await self.redis.incr(key)
-        if count == 1: await self.redis.expire(key, 60)
-        
-        if count >= 5: # Порог срабатывания
+        if count == 1:
+            await self.redis.expire(key, 60)
+
+        if count >= 5:
             logger.error("circuit_breaker_opened", provider=provider)
             await self.redis.set(f"cb:open:{provider}", "1", ex=60)
 
