@@ -52,6 +52,7 @@ class Settings(BaseSettings):
     NEW_RELIC_WEBHOOK_SECRET: Optional[str] = None
     SAFE_MODE: bool = True
     APPROVAL_REQUIRED: bool = True
+    REPLAY_MODE: bool = False
     
     # Observability
     OTLP_EXPORTER_ENDPOINT: str = "http://tempo:4317"

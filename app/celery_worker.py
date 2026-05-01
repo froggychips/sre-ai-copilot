@@ -35,13 +35,15 @@ celery_app.conf.update(
     task_time_limit=300,
 )
 
-async def _generate_reply_logic(conversation_id: str, prompt: str) -> str:
+async def _generate_reply_logic(conversation_id: str, prompt: str, replay_mode: bool = False) -> str:
     db = SessionLocal()
     conv = db.query(Conversation).filter_by(id=conversation_id).first()
     
     def transition(to_state: IncidentState):
         if not StateMachine.validate_transition(IncidentState(conv.current_state), to_state):
-            raise Exception(f"Invalid transition from {conv.current_state} to {to_state}")
+            # В режиме replay игнорируем ошибки переходов для гибкости
+            if not replay_mode:
+                raise Exception(f"Invalid transition from {conv.current_state} to {to_state}")
         conv.current_state = to_state.value
         db.commit()
 
@@ -50,19 +52,17 @@ async def _generate_reply_logic(conversation_id: str, prompt: str) -> str:
         builder = ContextBuilder()
         enriched_ctx = builder.build_context(conv.data)
         
-        # Reasoning Loop: максимум 3 итерации проверки гипотезы
+        # Reasoning Loop
         for iteration in range(3):
             analyzer = AnalyzerAgent()
             analysis_data = await analyzer.analyze(enriched_ctx)
             
-            # Попытка распарсить JSON, если агент вернул структурированный ответ
             try:
                 analysis = json.loads(analysis_data)
                 confidence = analysis.get("confidence_score", 0)
             except:
                 confidence = 0
             
-            # Confidence Gate
             if confidence >= 0.7:
                 transition(IncidentState.HYPOTHESIS_GENERATED)
                 break
@@ -73,6 +73,12 @@ async def _generate_reply_logic(conversation_id: str, prompt: str) -> str:
             raise Exception("Failed to reach confidence threshold after 3 iterations")
         
         transition(IncidentState.FIX_PROPOSED)
+        
+        # В режиме REPLAY пропускаем отправку в Discord
+        if not replay_mode:
+            from app.services.discord_service import discord_service
+            await discord_service.send_report(f"Analysis for incident {conversation_id} completed.")
+            
         return analysis_data
 
     except Exception as e:
@@ -85,8 +91,8 @@ async def _generate_reply_logic(conversation_id: str, prompt: str) -> str:
         db.close()
 
 @celery_app.task(name='generate_reply', bind=True, max_retries=3)
-def generate_reply(self, conversation_id: str, prompt: str):
+def generate_reply(self, conversation_id: str, prompt: str, replay_mode: bool = False):
     try:
-        return asyncio.run(_generate_reply_logic(conversation_id, prompt))
+        return asyncio.run(_generate_reply_logic(conversation_id, prompt, replay_mode))
     except Exception as exc:
         raise self.retry(exc=exc, countdown=2 ** self.request.retries)

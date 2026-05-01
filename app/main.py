@@ -47,7 +47,12 @@ async def startup_event():
     start_http_server(port=8001)
 
 
+from app.api import webhooks, approvals, replay
+...
 app.include_router(webhooks.router, prefix="/webhooks")
+app.include_router(approvals.router, prefix="/approvals", tags=["approvals"])
+app.include_router(replay.router, prefix="/replay", tags=["replay"])
+...
 
 
 @app.post("/copilot", status_code=202)
