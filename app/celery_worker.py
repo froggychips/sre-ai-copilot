@@ -2,7 +2,6 @@ import asyncio
 import json
 import structlog
 from celery import Celery
-from openai import AsyncOpenAI
 from app.config import settings
 from app import repository
 from app.models import MessageRole, Conversation

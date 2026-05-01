@@ -55,6 +55,7 @@ class Settings(BaseSettings):
     
     # Observability
     OTLP_EXPORTER_ENDPOINT: str = "http://tempo:4317"
+    AUDIT_LOG_PATH: str = "./audit.log"
 
     # Configuration for pydantic-settings v2
     model_config = SettingsConfigDict(

@@ -31,7 +31,9 @@ Task: {instruction}
 """
             # Использование роутера вместо gemini_client
             response = await ModelRouter.route_and_call(self.task_type, full_prompt)
-            
+            if not response:
+                raise ValueError("Empty response from model")
+
             record_llm_metrics(span, model=settings.MODEL_NAME, usage={
                 "total_tokens": len(full_prompt) // 4 + len(response) // 4
             })
