@@ -61,3 +61,27 @@ uvicorn app.main:app --reload --port 8000
 - [Module Docs](docs/MODULE_DOCS.md)
 - [Semantic Contract](docs/SEMANTIC_CONTRACT.md)
 - [DR Plan](docs/DR.md)
+
+## Control-Plane Contracts Validation
+
+The repository includes versioned JSON contracts under `contracts/`:
+
+- `snapshot.v1.json`
+- `budget.v1.json`
+- `ledger.v1.json`
+- `routing-policy.v1.json`
+- `breaker.v1.json`
+
+Run contract checks locally:
+
+```bash
+make contracts-check
+python scripts/validate_contracts.py
+pytest -q tests/contracts/test_contracts.py
+```
+
+These checks validate:
+
+- JSON Schema structural correctness (Draft 2020-12)
+- Representative sample instances per contract
+- Rejection of unknown payload fields where `additionalProperties: false`

@@ -1,0 +1,32 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.local/contracts/routing-policy.v1.json",
+  "title": "Routing Policy Contract v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "mode", "risk_weights", "safe_bias"],
+  "properties": {
+    "schema_version": { "const": "routing-policy.v1" },
+    "mode": { "type": "string", "enum": ["NORMAL", "DEGRADED", "PROTECTED"] },
+    "risk_weights": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["severity", "blast_radius", "change_velocity", "pattern_confidence"],
+      "properties": {
+        "severity": { "type": "number", "minimum": 0 },
+        "blast_radius": { "type": "number", "minimum": 0 },
+        "change_velocity": { "type": "number", "minimum": 0 },
+        "pattern_confidence": { "type": "number", "minimum": 0 }
+      }
+    },
+    "safe_bias": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["default_route", "allow_full_on_uncertainty"],
+      "properties": {
+        "default_route": { "type": "string", "enum": ["SHORT", "HYBRID", "FULL"] },
+        "allow_full_on_uncertainty": { "const": false }
+      }
+    }
+  }
+}

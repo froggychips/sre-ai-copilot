@@ -1,0 +1,30 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.local/contracts/ledger.v1.json",
+  "title": "Cost Ledger Contract v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "entry_id",
+    "incident_id",
+    "usage_event_id",
+    "pricing_version",
+    "cost",
+    "recorded_at"
+  ],
+  "properties": {
+    "schema_version": { "const": "ledger.v1" },
+    "entry_id": { "type": "string", "minLength": 1 },
+    "incident_id": { "type": "string", "minLength": 1 },
+    "usage_event_id": { "type": "string", "minLength": 1 },
+    "stage": { "type": "string" },
+    "pricing_version": { "type": "string", "pattern": "^v[0-9]+$" },
+    "token_count": { "type": "integer", "minimum": 0 },
+    "call_count": { "type": "integer", "minimum": 0 },
+    "cost": { "type": "number", "minimum": 0 },
+    "retry_attempt": { "type": "integer", "minimum": 0 },
+    "fingerprint": { "type": "string" },
+    "recorded_at": { "type": "string", "format": "date-time" }
+  }
+}
