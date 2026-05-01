@@ -376,3 +376,62 @@ Use this checklist in release meetings; all items must be explicitly marked.
 - [ ] SRE Owner
 - [ ] Product Owner
 - [ ] Analytics Owner
+
+---
+
+## KPI & Threshold Baseline v1 (Initial Operating Targets)
+
+> Note: values below are starting targets for v1 and should be tuned after canary data.
+
+### Cost & Budget Guardrails
+| Metric | Target | Alert | Hard Action |
+|---|---:|---:|---|
+| Cost per incident (p95) | <= +20% vs approved baseline | > +25% | Enable PROTECTED mode + force short/hybrid |
+| Cost per replay run | <= 15% of incident budget | > 20% | Stop replay run, mark `REPLAY_BUDGET_EXHAUSTED` |
+| Budget cap breaches blocked | 100% | < 100% | Immediate release freeze |
+| Retry-attributed spend share | <= 10% of incident cost | > 15% | Reduce retry limits for hot stages |
+
+### Ledger Correctness & Drift
+| Metric | Target | Alert | Hard Action |
+|---|---:|---:|---|
+| `ledger_runtime_drift` (daily) | <= 1.0% | > 1.5% | Switch to protected routing until reconciled |
+| Unpriced usage events | 0 | > 0 | Block closeout + open Sev2 internal incident |
+| Pricing-table version mismatch | 0 | > 0 | Reject write path with explicit error |
+
+### Replay Determinism & Isolation
+| Metric | Target | Alert | Hard Action |
+|---|---:|---:|---|
+| Deterministic replay match rate | >= 99.5% | < 99.0% | Disable full replay globally |
+| Replay live-call violations | 0 | > 0 | Trigger policy violation and block replay |
+| Replay impact on live p95 latency | <= +5% | > +8% | Move replay to strict low-priority queue only |
+
+### Runtime Stability
+| Metric | Target | Alert | Hard Action |
+|---|---:|---:|---|
+| Duplicate stage executions | 0 | > 0 | Enforce single-flight lockdown mode |
+| Breaker state flapping | <= 2 transitions/hour | > 3/hour | Increase hysteresis/cooldown and hold rollout |
+| Checkpoint resume success rate | >= 99% | < 98% | Disable auto-resume; require operator approval |
+
+### Routing Quality & Safety
+| Metric | Target | Alert | Hard Action |
+|---|---:|---:|---|
+| Unknown/ambiguous routed to full | 0% by default | > 0% | Force safe-bias override |
+| Short/hybrid ratio under stress | >= 70% | < 60% | Auto-increase short-path ratio |
+| Degraded-policy violations | 0 | > 0 | Enter PROTECTED + audit incident |
+
+### SLO Auto-Governance Trigger Matrix
+| Trigger Condition | Auto-Action 1 | Auto-Action 2 | Escalation |
+|---|---|---|---|
+| Cost burn > threshold for 10 min | Increase short-path ratio by +15% | Lower full-threshold by -10% | Page SRE on-call |
+| Queue backlog > threshold for 15 min | Enter DEGRADED | Suspend full pipeline for low severity | Incident commander notified |
+| Error rate > threshold for 5 min | Enter PROTECTED | Disable learning writes | Page Backend + Platform |
+| Drift > threshold for 2 cycles | Freeze pricing update pointer | Force reconciliation priority job | Escalate to TL |
+
+### KPI Ownership & Review Cadence
+| Area | Primary Owner | Review Cadence | Reporting Forum |
+|---|---|---|---|
+| Cost/Budget | Backend + Product Analytics | Daily | Ops standup |
+| Ledger/Drift | Platform | Daily | Reliability review |
+| Replay Safety | SRE + Backend | Per release + weekly | SRE governance |
+| Breaker Stability | SRE | Per canary wave | Release council |
+| ROI Outcomes | Product Analytics + TL | Weekly | Executive review |
