@@ -75,6 +75,7 @@ The repository includes versioned JSON contracts under `contracts/`:
 Run contract checks locally:
 
 ```bash
+make contracts-check
 python scripts/validate_contracts.py
 pytest -q tests/contracts/test_contracts.py
 ```
