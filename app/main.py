@@ -48,11 +48,12 @@ async def startup_event():
 
 
 from app.api import webhooks, approvals, replay
-...
+from app.evaluation import feedback
+
 app.include_router(webhooks.router, prefix="/webhooks")
 app.include_router(approvals.router, prefix="/approvals", tags=["approvals"])
 app.include_router(replay.router, prefix="/replay", tags=["replay"])
-...
+app.include_router(feedback.router, prefix="/evaluation", tags=["evaluation"])
 
 
 @app.post("/copilot", status_code=202)
