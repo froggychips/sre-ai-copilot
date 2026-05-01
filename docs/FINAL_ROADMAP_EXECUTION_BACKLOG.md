@@ -435,3 +435,58 @@ Use this checklist in release meetings; all items must be explicitly marked.
 | Replay Safety | SRE + Backend | Per release + weekly | SRE governance |
 | Breaker Stability | SRE | Per canary wave | Release council |
 | ROI Outcomes | Product Analytics + TL | Weekly | Executive review |
+
+---
+
+## RACI Matrix (Cross-Team Ownership)
+
+Legend: **R** = Responsible, **A** = Accountable, **C** = Consulted, **I** = Informed.
+
+| Workstream / Decision Area | Tech Lead | Backend | Platform | SRE | Product | Analytics |
+|---|---|---|---|---|---|---|
+| Contract schema changes (`snapshot/budget/ledger/routing/breaker`) | A | R | C | C | C | I |
+| Contract versioning/deprecation policy | A | R | C | C | C | I |
+| Snapshot integrity gate behavior | C | A/R | C | C | I | I |
+| Replay data firewall policy | C | R | C | A | I | I |
+| Budget state machine transitions/caps | C | A/R | C | C | I | C |
+| Pricing table version updates | A | R | C | I | C | C |
+| Reconciliation loop + drift policy | C | R | A | C | I | C |
+| Risk routing scoring function | C | A/R | C | C | C | I |
+| Degraded/protected policy semantics | A | C | C | R | C | I |
+| Single-flight locking and contention controls | I | R | A | C | I | I |
+| Retry policy matrix updates | C | R | A | C | I | I |
+| Global breaker thresholds/hysteresis | C | C | R | A | C | I |
+| Manual override activation | I | I | C | A/R | C | I |
+| Rollback pointer/hotfix execution | C | R | A | C | I | I |
+| SLO auto-actions policy | C | C | R | A | C | C |
+| ROI baseline definition | C | I | I | C | A | R |
+| Executive demo acceptance | A | C | C | C | R | C |
+
+### Escalation & Approval Boundaries
+
+#### Emergency policy rollback
+- **Authority:** SRE (A) can trigger rollback immediately in incident context.
+- **Execution:** Platform (R) applies rollback pointer/hotfix.
+- **Post-action review:** TL + Backend + Product within next business day.
+
+#### Breaker manual override
+- **Authority:** SRE (A/R) during active incident.
+- **Guardrails:** Mandatory audit trail + incident ticket link.
+- **Cooldown:** Return-to-normal requires SRE + Platform concurrence.
+
+#### Pricing update freeze
+- **Authority:** Tech Lead (A) can freeze pointer on drift anomalies.
+- **Execution:** Backend (R) applies freeze; Platform (C) validates reconciliation jobs.
+
+#### Go/No-Go decision rights
+- **GO requires unanimous sign-off:** TL, Backend Owner, Platform Owner, SRE Owner.
+- **Product veto:** Product can veto GO for unmet business readiness/ROI methodology.
+
+### Handoff SLAs (Inter-team)
+| Handoff | SLA | Evidence |
+|---|---|---|
+| Contract change proposal -> review decision | <= 2 business days | ADR/comment resolution log |
+| Drift alert -> reconciliation action started | <= 30 minutes | Alert timeline + job run ID |
+| Breaker PROTECTED -> operator acknowledgment | <= 10 minutes | Pager ack + incident timeline |
+| Rollback request -> rollback applied | <= 15 minutes | Change event + audit entry |
+| SLO breach -> auto-governance action verified | <= 20 minutes | Metric event + policy action log |
