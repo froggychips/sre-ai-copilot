@@ -3,6 +3,7 @@ from app.workers.tasks import process_incident_task
 from app.database import get_db, IncidentRecord
 from sqlalchemy.orm import Session
 from app.config import settings
+from app.ingestion.raw_collector import raw_collector
 
 router = APIRouter()
 
@@ -10,6 +11,7 @@ router = APIRouter()
 async def newrelic_webhook(request: Request, db: Session = Depends(get_db)):
     data = await request.json()
     incident_id = data.get("incident_id")
+    raw_collector.ingest(data)
     
     # Persist initial record
     new_incident = IncidentRecord(
