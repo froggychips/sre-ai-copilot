@@ -1,0 +1,45 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.local/contracts/budget.v1.json",
+  "title": "Budget Contract v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "incident_id",
+    "state",
+    "caps",
+    "consumption",
+    "version"
+  ],
+  "properties": {
+    "schema_version": { "const": "budget.v1" },
+    "incident_id": { "type": "string", "minLength": 1 },
+    "state": { "type": "string", "enum": ["OK", "WARN", "EXHAUSTED", "TERMINATED"] },
+    "version": { "type": "integer", "minimum": 0 },
+    "caps": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["calls", "tokens", "cost", "replay_cost", "replay_time_ms"],
+      "properties": {
+        "calls": { "type": "integer", "minimum": 0 },
+        "tokens": { "type": "integer", "minimum": 0 },
+        "cost": { "type": "number", "minimum": 0 },
+        "replay_cost": { "type": "number", "minimum": 0 },
+        "replay_time_ms": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "consumption": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["calls", "tokens", "cost", "replay_cost", "replay_time_ms"],
+      "properties": {
+        "calls": { "type": "integer", "minimum": 0 },
+        "tokens": { "type": "integer", "minimum": 0 },
+        "cost": { "type": "number", "minimum": 0 },
+        "replay_cost": { "type": "number", "minimum": 0 },
+        "replay_time_ms": { "type": "integer", "minimum": 0 }
+      }
+    }
+  }
+}

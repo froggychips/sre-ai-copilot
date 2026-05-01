@@ -1,0 +1,34 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.local/contracts/snapshot.v1.json",
+  "title": "Snapshot Contract v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "incident_id",
+    "captured_at",
+    "environment_fingerprint",
+    "observability_fingerprint",
+    "context",
+    "artifacts"
+  ],
+  "properties": {
+    "schema_version": { "const": "snapshot.v1" },
+    "incident_id": { "type": "string", "minLength": 1 },
+    "captured_at": { "type": "string", "format": "date-time" },
+    "environment_fingerprint": { "type": "string", "minLength": 8 },
+    "observability_fingerprint": { "type": "string", "minLength": 8 },
+    "integrity_status": { "type": "string", "enum": ["PASS", "DEGRADED", "FAIL"] },
+    "context": { "type": "object", "additionalProperties": true },
+    "artifacts": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "logs": { "type": "array", "items": { "type": "string" } },
+        "metrics": { "type": "array", "items": { "type": "string" } },
+        "events": { "type": "array", "items": { "type": "string" } }
+      }
+    }
+  }
+}
