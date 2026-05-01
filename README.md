@@ -1,56 +1,63 @@
 # SRE AI Copilot
 
-**SRE AI Copilot** — это детерминированный движок каузального анализа инцидентов (Reasoning Engine), предназначенный для автоматизации процессов SRE в Kubernetes.
+**SRE AI Copilot** — backend-сервис для автоматизации incident response в Kubernetes: прием вебхуков, асинхронный анализ инцидентов, генерация гипотез/фиксов и контур human approval.
 
-## 🧠 Архитектура
-Система не является чат-ботом. Это **Reasoning Engine**, работающий на основе **Evidence-Driven Belief Propagation**.
-1. **Ingestion**: Прием инцидентов (New Relic) и их преобразование в типизированные факты (Evidence).
-2. **Reasoning Core**: Построение причинно-следственного графа и распространение вероятностей (beliefs) по связям.
-3. **Interpretation**: Детерминированное построение RCA-отчета на основе графовых связей.
+## Что умеет сервис
+- Принимает события инцидентов через вебхук (`/webhooks/newrelic`) и ставит обработку в Celery.
+- Выполняет агентный пайплайн (analyzer → hypothesis → critic → fix → risk).
+- Хранит записи инцидентов и результаты анализа в PostgreSQL.
+- Поддерживает replay-режим для исторических инцидентов (`/replay/{incident_id}`).
+- Экспортирует health/readiness, Prometheus-метрики и OpenTelemetry-трейсинг.
 
-## 🚀 Quick Start
+## Технологический стек
+- **API**: FastAPI
+- **Очереди**: Celery + Redis
+- **БД**: PostgreSQL + SQLAlchemy
+- **Observability**: Prometheus, OpenTelemetry, structlog
+- **Интеграции**: Discord webhook, Kubernetes guardrails, Gemini/OpenAI ключи в конфиге
 
-### Требования
-- Docker, Docker Compose
+## Быстрый старт
+
+### 1) Требования
+- Docker + Docker Compose
 - Python 3.11+
-- Helm / kubectl
 
-### Настройка
-1. Скопируйте `.env.example` в `.env` и укажите необходимые ключи:
-   - `GEMINI_API_KEY`: Ключ API для ИИ.
-   - `DATABASE_URL`: Строка подключения к PostgreSQL.
-   - `REDIS_URL`: URL для Redis.
-   - `DISCORD_WEBHOOK_URL`: Для уведомлений об инцидентах.
-   - `JWT_PUBLIC_KEY`: RSA ключ для валидации запросов.
+### 2) Настройка окружения
+Создайте `.env` и задайте минимум:
+- `GEMINI_API_KEY`
+- `OPENAI_API_KEY`
+- `DATABASE_URL`
+- `REDIS_URL`
+- `DISCORD_WEBHOOK_URL`
+- `JWT_PUBLIC_KEY` (если включена авторизация JWT)
 
-### Запуск
+### 3) Запуск
 ```bash
-# Инфраструктура
 docker-compose up -d
-
-# Деплой в Kubernetes
-helm install copilot ./charts/copilot
 ```
 
-## 🧪 Тестирование и Качество
-Система поддерживает два уровня проверки качества:
-- **Replay Mode**: Повторный запуск анализа на исторических данных через `POST /replay/{incident_id}`.
-- **Feedback Loop**: Сбор оценок инженеров через `POST /evaluation/{incident_id}/submit`.
+Для локального API (без контейнера):
+```bash
+uvicorn app.main:app --reload --port 8000
+```
 
-Статистика точности доступна по адресу `GET /evaluation/stats`.
+## Основные API-эндпоинты
+- `POST /webhooks/newrelic` — прием инцидента, постановка async-задачи.
+- `GET /webhooks/status/{task_id}` — статус Celery-задачи вебхука.
+- `POST /copilot` — запуск генерации ответа/анализа в фоне.
+- `GET /jobs/{task_id}` — статус задачи `generate_reply`.
+- `POST /approvals/{approval_id}/approve|reject` — подтверждение/отклонение действий.
+- `POST /replay/{incident_id}` — повтор анализа исторического инцидента.
+- `POST /evaluation/{incident_id}/submit` и `GET /evaluation/stats` — feedback-контур.
+- `GET /healthz`, `GET /readyz` — liveness/readiness.
 
-## 🛡 Безопасность (Guardrails)
-- **K8s DSL**: Агент не исполняет команды напрямую, он генерирует `ExecutionIntent` (DSL).
-- **Prompt Isolation**: Изоляция ввода через `<user_context>` XML-теги.
-- **Human-in-the-Loop (HITL)**: Критические операции требуют подтверждения в Discord.
+## Безопасность и guardrails
+- AI не исполняет kubectl напрямую: используется `ExecutionIntent` DSL и детерминированный транслятор.
+- Есть whitelist для K8s-операций (verb/resource) и blacklist системных namespace.
+- Потенциально опасные действия проходят через approval flow.
 
-## 📚 Документация
-- [Architecture](docs/ARCHITECTURE.md) — Потоки данных и Reasoning Loop.
-- [Module Docs](docs/MODULE_DOCS.md) — Справочник модулей.
-- [DR Plan](docs/DR.md) — Disaster Recovery и бэкапы.
-
-## 📊 Observability
-Система поддерживает:
-- **Metrics**: Эндпоинт `/metrics` (Prometheus).
-- **Tracing**: OpenTelemetry (OTLP) экспорт в Jaeger/Tempo.
-- **Logs**: Структурированные JSON-логи (structlog).
+## Документация
+- [Architecture](docs/ARCHITECTURE.md)
+- [Module Docs](docs/MODULE_DOCS.md)
+- [Semantic Contract](docs/SEMANTIC_CONTRACT.md)
+- [DR Plan](docs/DR.md)
