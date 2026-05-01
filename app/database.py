@@ -15,6 +15,8 @@ class IncidentRecord(Base):
     status = Column(String)
     data = Column(JSON)
     analysis = Column(JSON, nullable=True)
+    user_feedback = Column(JSON, nullable=True) # {score: 1-5, comment: str}
+    is_accepted = Column(String, nullable=True) # "ACCEPTED", "REJECTED"
     created_at = Column(DateTime, default=datetime.utcnow)
 
 def get_db():

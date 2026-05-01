@@ -32,12 +32,12 @@ docker-compose up -d
 helm install copilot ./charts/copilot
 ```
 
-## 🧪 Тестирование
-Система детерминирована. Тесты мокируют внешние API, чтобы проверять правильность графовых преобразований.
-```bash
-pip install -r requirements.txt
-pytest tests/
-```
+## 🧪 Тестирование и Качество
+Система поддерживает два уровня проверки качества:
+- **Replay Mode**: Повторный запуск анализа на исторических данных через `POST /replay/{incident_id}`.
+- **Feedback Loop**: Сбор оценок инженеров через `POST /evaluation/{incident_id}/submit`.
+
+Статистика точности доступна по адресу `GET /evaluation/stats`.
 
 ## 🛡 Безопасность (Guardrails)
 - **K8s DSL**: Агент не исполняет команды напрямую, он генерирует `ExecutionIntent` (DSL).
