@@ -12,7 +12,8 @@ class PromptGuard:
         r"new\s+rule:",
         r"set\s+your\s+output\s+format\s+to",
         r"dan\s+mode",
-        r"<\|endoftext\|>", 
+        r"<\|endoftext\|>",
+        r"ignore\s+all\s+rules",
     ]
 
     # Паттерны попыток выполнить код (Python/Bash)
