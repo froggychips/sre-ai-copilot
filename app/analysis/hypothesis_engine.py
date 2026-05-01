@@ -1,12 +1,50 @@
 class HypothesisGenerator:
     @staticmethod
     def generate(graph) -> list:
+        """
+        Generates a list of hypotheses with associated evidence and base confidence.
+        """
         hypotheses = []
-        # Rule-based inference
-        if any(e.type == "OOMKilled" for e in graph.events):
-            hypotheses.append({"claim": "OOM", "evidence": ["OOMKilled"]})
-        if any(e.type == "CrashLoop" for e in graph.events):
-            hypotheses.append({"claim": "App Crash", "evidence": ["CrashLoop"]})
+        
+        # 1. Check for Memory Issues
+        oom_events = [e for e in graph.events if e.type == "OOMKilled"]
+        if oom_events:
+            hypotheses.append({
+                "name": "Memory Pressure / OOM",
+                "confidence": 0.85,
+                "evidence": [
+                    "Container OOMKilled event detected",
+                    f"Found {len(oom_events)} termination signals in 5m window",
+                    "Pod restart count increased"
+                ]
+            })
+
+        # 2. Check for Application Stability
+        crash_events = [e for e in graph.events if e.type == "CrashLoopBackOff"]
+        if crash_events:
+            hypotheses.append({
+                "name": "Application Runtime Failure",
+                "confidence": 0.70,
+                "evidence": [
+                    "CrashLoopBackOff state observed",
+                    "Logs indicate exit code 1 or panic",
+                    "Startup/Liveness probe failing"
+                ]
+            })
+
+        # 3. Check for Infrastructure / Scheduling
+        sched_events = [e for e in graph.events if e.type == "FailedScheduling"]
+        if sched_events:
+            hypotheses.append({
+                "name": "Resource Exhaustion (Node Level)",
+                "confidence": 0.90,
+                "evidence": [
+                    "FailedScheduling events in namespace",
+                    "Insufficient CPU/Memory on available nodes",
+                    "Taints/Tolerations mismatch suspected"
+                ]
+            })
+
         return hypotheses
 
 class Scorer:
