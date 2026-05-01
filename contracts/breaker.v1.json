@@ -1,0 +1,33 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.local/contracts/breaker.v1.json",
+  "title": "Global Breaker Contract v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "state", "signals", "hysteresis"],
+  "properties": {
+    "schema_version": { "const": "breaker.v1" },
+    "state": { "type": "string", "enum": ["NORMAL", "DEGRADED", "PROTECTED"] },
+    "signals": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["cost_burn", "token_burn", "queue_backlog", "error_rate", "latency"],
+      "properties": {
+        "cost_burn": { "type": "number", "minimum": 0 },
+        "token_burn": { "type": "number", "minimum": 0 },
+        "queue_backlog": { "type": "integer", "minimum": 0 },
+        "error_rate": { "type": "number", "minimum": 0 },
+        "latency": { "type": "number", "minimum": 0 }
+      }
+    },
+    "hysteresis": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["cooldown_seconds", "min_state_hold_seconds"],
+      "properties": {
+        "cooldown_seconds": { "type": "integer", "minimum": 0 },
+        "min_state_hold_seconds": { "type": "integer", "minimum": 0 }
+      }
+    }
+  }
+}
