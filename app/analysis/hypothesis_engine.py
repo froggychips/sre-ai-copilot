@@ -11,8 +11,24 @@ class HypothesisGenerator:
 
 class Scorer:
     @staticmethod
-    def score(hypothesis: dict, evidence: list) -> float:
-        # Simple heuristic, deterministic
-        score = 0.5
-        if len(evidence) > 2: score += 0.3
-        return min(score, 1.0)
+    def score(hypothesis: dict, evidence: list) -> dict:
+        """
+        Deterministic scoring with breakdown for transparency.
+        """
+        base_score = 0.5
+        evidence_boost = 0.0
+        
+        # Logic: boost score if we have more than 2 pieces of evidence
+        if len(evidence) > 2:
+            evidence_boost = 0.3
+            
+        total = min(base_score + evidence_boost, 1.0)
+        
+        return {
+            "total": total,
+            "breakdown": {
+                "base_score": base_score,
+                "evidence_count_boost": evidence_boost,
+                "evidence_count": len(evidence)
+            }
+        }
