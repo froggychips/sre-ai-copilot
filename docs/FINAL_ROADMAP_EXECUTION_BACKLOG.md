@@ -490,3 +490,68 @@ Legend: **R** = Responsible, **A** = Accountable, **C** = Consulted, **I** = Inf
 | Breaker PROTECTED -> operator acknowledgment | <= 10 minutes | Pager ack + incident timeline |
 | Rollback request -> rollback applied | <= 15 minutes | Change event + audit entry |
 | SLO breach -> auto-governance action verified | <= 20 minutes | Metric event + policy action log |
+
+---
+
+## Resilience Test Plan (Load / Chaos / Isolation)
+
+### Test Scope
+Validate that cost control, replay isolation, routing safety, and breaker stability hold under stress and partial failures.
+
+### Environment Strategy
+- **Stage A (Pre-prod deterministic tests):** contract + replay determinism + ledger correctness.
+- **Stage B (Canary load tests):** mixed live/replay synthetic incidents with production-like traffic profile.
+- **Stage C (Failure-injection tests):** targeted control-plane, queue, and dependency disruptions.
+
+### Scenario Matrix
+| ID | Scenario | Injection / Load | Expected Outcome | Blocking Severity |
+|---|---|---|---|---|
+| LT-01 | Incident burst storm | 3–5x normal incident arrival for 30 min | No runaway cost, breaker converges, no flapping | Blocker |
+| LT-02 | Replay flood | Replay queue saturation with bounded budget | Live latency/SLA preserved, replay throttled | Blocker |
+| LT-03 | Retry amplification | Force transient failures on hot stage | Retry caps applied, retry spend bounded | High |
+| LT-04 | Single-flight contention | Concurrent same `(incident_id,stage)` submissions | Exactly one execution path, duplicates suppressed | Blocker |
+| LT-05 | Ledger drift simulation | Inject delayed/duplicate usage events | Reconciliation catches drift and triggers actions | High |
+| LT-06 | Control-plane partial outage | Disable dynamic policy service for 10 min | Static fallback mode engages safely | Blocker |
+| LT-07 | Breaker trigger/recover | Oscillating latency+error signal | Hysteresis prevents oscillation | High |
+| LT-08 | Replay firewall violation attempt | Simulate live external call from replay path | Call blocked, policy violation logged | Blocker |
+| LT-09 | Checkpoint/resume | Kill execution mid-stage | Resume from checkpoint without duplicate spend | High |
+| LT-10 | Pricing pointer mismatch | Swap pricing version mid-run | Write rejection + auditable error path | High |
+
+### Required Metrics Per Test
+- Cost: total, per-incident p95, replay cost share.
+- Safety: budget terminations, blocked over-budget calls, firewall violations.
+- Stability: queue depth, breaker transitions/hour, error rate, p95 latency.
+- Correctness: deterministic replay match rate, duplicate-stage count, ledger drift %.
+- Recovery: rollback time, fallback activation time, checkpoint resume success rate.
+
+### Pass/Fail Criteria
+- **PASS** only if all blocker scenarios pass and no hard-action policy is violated.
+- **CONDITIONAL PASS** if only High severity scenarios fail with approved mitigation + deadline.
+- **FAIL** if any blocker fails, breaker flaps above threshold, or drift exceeds threshold.
+
+### Evidence Artifacts
+- Test run manifest (scenario IDs, timestamps, versions).
+- Metric export snapshots and dashboard captures.
+- Policy decision logs (routing, breaker, fallback, rollback).
+- Ledger reconciliation report and drift deltas.
+- Incident timeline for each failed scenario with RCA owner.
+
+### Execution Cadence
+- Pre-merge (critical policy changes): LT-04, LT-08, LT-10 smoke set.
+- Pre-release candidate: full LT-01..LT-10 suite.
+- Post-release canary: LT-01, LT-02, LT-07, LT-06 daily for 3 days.
+- Monthly resilience drill: full suite + updated thresholds review.
+
+### Ownership
+| Test Area | Primary Owner | Backup Owner |
+|---|---|---|
+| Load generation & orchestration | Platform | SRE |
+| Policy validation (routing/breaker) | SRE | Backend |
+| Budget/ledger correctness | Backend | Platform |
+| ROI/cost interpretation | Analytics | Product |
+
+### Exit Rule for Production Promotion
+Production promotion is allowed only when:
+- Last full resilience suite status is PASS.
+- No unresolved blocker defects remain open.
+- Go/No-Go committee confirms evidence completeness.
