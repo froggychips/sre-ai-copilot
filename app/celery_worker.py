@@ -12,6 +12,7 @@ from app.agents.analyzer import AnalyzerAgent
 from app.services.resilience import LLMResilienceManager
 from app.services.session_manager import SessionManager
 from redis.asyncio import from_url
+from app.replay.contract import assert_replay_isolated_runtime
 
 # Initialize services
 logger = structlog.get_logger()
@@ -35,7 +36,7 @@ celery_app.conf.update(
     task_time_limit=300,
 )
 
-async def _generate_reply_logic(conversation_id: str, prompt: str, replay_mode: bool = False) -> str:
+async def _generate_reply_logic(conversation_id: str, prompt: str, replay_mode: bool = False, snapshot: dict | None = None, environment_fingerprint: str | None = None) -> str:
     db = SessionLocal()
     conv = db.query(Conversation).filter_by(id=conversation_id).first()
     
@@ -49,8 +50,14 @@ async def _generate_reply_logic(conversation_id: str, prompt: str, replay_mode: 
 
     try:
         transition(IncidentState.INVESTIGATING)
-        builder = ContextBuilder()
-        enriched_ctx = builder.build_context(conv.data)
+        if replay_mode:
+            assert_replay_isolated_runtime(allow_network_egress=False, allow_k8s_api=False, allow_external_tools=False)
+            if not snapshot:
+                raise Exception("Replay mode requires immutable snapshot input")
+            enriched_ctx = snapshot.get("payload", {})
+        else:
+            builder = ContextBuilder()
+            enriched_ctx = builder.build_context(conv.data)
         
         # Reasoning Loop
         for iteration in range(3):
@@ -79,6 +86,8 @@ async def _generate_reply_logic(conversation_id: str, prompt: str, replay_mode: 
             from app.services.discord_service import discord_service
             await discord_service.send_report(f"Analysis for incident {conversation_id} completed.")
             
+        if replay_mode and environment_fingerprint:
+            return json.dumps({"analysis": analysis_data, "environment_fingerprint": environment_fingerprint})
         return analysis_data
 
     except Exception as e:
@@ -91,8 +100,8 @@ async def _generate_reply_logic(conversation_id: str, prompt: str, replay_mode: 
         db.close()
 
 @celery_app.task(name='generate_reply', bind=True, max_retries=3)
-def generate_reply(self, conversation_id: str, prompt: str, replay_mode: bool = False):
+def generate_reply(self, conversation_id: str, prompt: str, replay_mode: bool = False, snapshot: dict | None = None, environment_fingerprint: str | None = None):
     try:
-        return asyncio.run(_generate_reply_logic(conversation_id, prompt, replay_mode))
+        return asyncio.run(_generate_reply_logic(conversation_id, prompt, replay_mode, snapshot, environment_fingerprint))
     except Exception as exc:
         raise self.retry(exc=exc, countdown=2 ** self.request.retries)

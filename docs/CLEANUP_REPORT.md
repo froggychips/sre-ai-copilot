@@ -1,7 +1,24 @@
-# Cleanup Report
+# Documentation Cleanup Report (2026-05-01)
 
-## Architectural Observations
-- **Redundancy Removed:** Удалены экспериментальные модули `energy/` и градиентный спуск из Reasoning Engine.
-- **Overengineering Zones:** В системе было 3 способа расчета confidence — все заменены на унифицированный `BayesianConfidenceEngine`.
-- **Performance Risks:** Работа с графом в памяти при огромном количестве событий может замедлить цикл. Рекомендуется в будущем внедрить `graph-snapshots` в Redis.
-- **Simplification:** Пайплайн обработки теперь имеет фиксированный контракт: Context -> Reasoning Engine -> RCA Report.
+## Что было обновлено
+- Полностью синхронизированы `README.md` и разделы `docs/` с текущей структурой кода.
+- Удалены ссылки на несуществующие модули (`app/core/reasoning/*` и устаревшие confidence engines).
+- Актуализированы endpoint'ы, фоновые пайплайны и контуры безопасности.
+
+## Найденные несоответствия до обновления
+1. Документация описывала архитектуру “belief propagation engine”, отсутствующую в текущей реализации.
+2. `MODULE_DOCS.md` ссылался на пути, которых нет в репозитории.
+3. `README.md` содержал устаревшие инструкции деплоя через Helm chart, которого нет в дереве проекта.
+
+## Актуальная модель системы
+- Система работает как API + Celery orchestration с агентным pipeline, а не как отдельный графовый reasoner.
+- Основные гарантии качества/безопасности обеспечиваются через:
+  - state machine и replay mode,
+  - approval manager,
+  - execution DSL + K8s security guard,
+  - feedback loop и observability.
+
+## Рекомендации на будущее
+- Поддерживать docs-update в каждом PR, который меняет API контракт или workflow workers.
+- Добавить автоматическую проверку в CI на “битые ссылки” в markdown.
+- Раз в релиз сверять `README` с фактическими env переменными из `app/config.py`.
