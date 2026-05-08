@@ -29,7 +29,6 @@ Task: {instruction}
 {safe_context}
 </user_context>
 """
-            # Использование роутера вместо gemini_client
             response = await ModelRouter.route_and_call(self.task_type, full_prompt)
             if not response:
                 raise ValueError("Empty response from model")
