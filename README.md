@@ -52,7 +52,8 @@ uvicorn app.main:app --reload --port 8000
 
 ## Безопасность и guardrails
 - AI не исполняет kubectl напрямую: используется `ExecutionIntent` DSL и детерминированный транслятор.
-- Есть whitelist для K8s-операций (verb/resource) и blacklist системных namespace.
+- Tiered namespace policy в `app/services/k8s_guard.py`: production (`prod`/`preprod`/`preupdate`) — read-only, dev (`squad-*`) — write через approval, system/auth (`kube-*`, `mcp`) — forbidden.
+- Whitelist по verb/resource; deep-inspection body на `privileged`/`hostNetwork`.
 - Потенциально опасные действия проходят через approval flow.
 
 ## Документация
