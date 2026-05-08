@@ -1,5 +1,6 @@
 import pytest
 from unittest.mock import AsyncMock
+import app.services.llm_service  # noqa: F401  ensure module loaded for mocker.patch
 from app.agents.analyzer import AnalyzerAgent
 from app.models.incident import NewRelicIncident
 
@@ -29,7 +30,7 @@ def mock_incident():
 async def test_analyzer_prompt_structure(mocker, mock_incident):
     """Тест: Проверка структуры промпта и наличия XML-тегов."""
     agent = AnalyzerAgent()
-    mock_api = mocker.patch("app.services.gemini_service.gemini_client.generate_content", new_callable=AsyncMock)
+    mock_api = mocker.patch("app.services.llm_service.llm_client.generate_content", new_callable=AsyncMock)
     mock_api.return_value = "Summary"
 
     await agent.analyze(mock_incident)
@@ -56,8 +57,7 @@ async def test_analyzer_injection_block(mocker, mock_incident):
 async def test_agent_error_on_empty_api_response(mocker, mock_incident):
     """Тест: Обработка пустого ответа от API."""
     agent = AnalyzerAgent()
-    mocker.patch("app.services.gemini_service.gemini_client.generate_content", new_callable=AsyncMock, return_value="")
+    mocker.patch("app.services.llm_service.llm_client.generate_content", new_callable=AsyncMock, return_value="")
     
-    # В Phase 3 мы добавили ValueError на пустой ответ в gemini_service
     with pytest.raises(ValueError):
         await agent.analyze(mock_incident)

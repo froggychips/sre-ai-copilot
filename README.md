@@ -14,7 +14,7 @@
 - **Очереди**: Celery + Redis
 - **БД**: PostgreSQL + SQLAlchemy
 - **Observability**: Prometheus, OpenTelemetry, structlog
-- **Интеграции**: Discord webhook, Kubernetes guardrails, Gemini/OpenAI ключи в конфиге
+- **Интеграции**: Discord webhook, Kubernetes guardrails, Anthropic Claude API
 
 ## Быстрый старт
 
@@ -24,8 +24,7 @@
 
 ### 2) Настройка окружения
 Создайте `.env` и задайте минимум:
-- `GEMINI_API_KEY`
-- `OPENAI_API_KEY`
+- `ANTHROPIC_API_KEY`
 - `DATABASE_URL`
 - `REDIS_URL`
 - `DISCORD_WEBHOOK_URL`

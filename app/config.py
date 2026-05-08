@@ -9,8 +9,7 @@ class Settings(BaseSettings):
     Loads variables from environment or a .env file.
     """
     ENV: str = Field("development", description="Environment (production/development)")
-    GEMINI_API_KEY: str = Field(..., description="API key for Gemini authentication")
-    OPENAI_API_KEY: str = Field(..., description="OpenAI API key placeholder")
+    ANTHROPIC_API_KEY: str = Field(..., description="API key for Anthropic Claude")
     
     DATABASE_URL: str = Field(
         "postgresql://user:password@localhost:5432/dbname", 
@@ -23,7 +22,7 @@ class Settings(BaseSettings):
     )
     
     MODEL_NAME: str = Field(
-        "gemini-pro", 
+        "claude-sonnet-4-6",
         description="The model to use"
     )
     
