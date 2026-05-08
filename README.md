@@ -1,6 +1,11 @@
 # SRE AI Copilot
 
-**SRE AI Copilot** — backend-сервис для автоматизации incident response в Kubernetes: прием вебхуков, асинхронный анализ инцидентов, генерация гипотез/фиксов и контур human approval.
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![Python](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/)
+[![FastAPI](https://img.shields.io/badge/FastAPI-0.104-009688)](https://fastapi.tiangolo.com/)
+[![Celery](https://img.shields.io/badge/Celery-5.3-37814A)](https://docs.celeryq.dev/)
+
+**SRE AI Copilot** — backend-сервис для автоматизации incident response в Kubernetes: прием Prometheus AlertManager-вебхуков, асинхронный анализ инцидентов через агентный LLM-пайплайн (analyzer → hypothesis → critic → fix → risk), guardrails по k8s-namespace и human-approval flow перед любым write-действием.
 
 ## Что умеет сервис
 - Принимает события инцидентов через вебхук Prometheus AlertManager (`/webhooks/alertmanager`) и ставит обработку в Celery.
