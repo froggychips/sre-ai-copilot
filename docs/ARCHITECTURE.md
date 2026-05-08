@@ -18,10 +18,10 @@
 
 ## 3. Data Flow (Webhook Incident)
 ```text
-NewRelic webhook
-  -> POST /webhooks/newrelic
-  -> IncidentRecord(status=PENDING)
-  -> Celery task: process_incident
+AlertManager webhook
+  -> POST /webhooks/alertmanager
+  -> for each alert: IncidentRecord(status=PENDING)
+  -> Celery task: process_incident (one per alert)
   -> Analyzer -> Hypothesis -> Critic -> Fix -> Risk
   -> IncidentRecord(status=COMPLETED, analysis=...)
   -> Discord report

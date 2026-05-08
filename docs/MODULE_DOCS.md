@@ -2,7 +2,7 @@
 
 ## API Layer
 - `app/main.py`: инициализация FastAPI, middleware, роутеры, health/readiness, async job endpoints.
-- `app/api/webhooks.py`: endpoint для NewRelic webhook и статус фоновой задачи.
+- `app/api/webhooks.py`: endpoint для AlertManager webhook и статус фоновой задачи.
 - `app/api/replay.py`: повторный запуск анализа по историческому `incident_id`.
 - `app/api/approvals.py`: approve/reject/get для approval workflow.
 - `app/evaluation/feedback.py`: прием пользовательского feedback и агрегированная статистика.

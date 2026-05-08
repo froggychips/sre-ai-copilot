@@ -8,7 +8,7 @@ from app.agents.risk import RiskAgent
 from app.services.discord_service import discord_service
 from app.services.audit_logger import audit_service
 from app.database import SessionLocal, IncidentRecord
-from app.models.incident import NewRelicIncident
+from app.models.incident import Incident
 import asyncio
 import logging
 
@@ -29,7 +29,7 @@ async def async_process_incident(incident_data: dict):
     audit_service.log_event("CELERY_START", {"incident_id": incident_id})
 
     try:
-        incident = NewRelicIncident(**incident_data)
+        incident = Incident(**incident_data)
         
         # Agents chain
         analyzer = AnalyzerAgent()

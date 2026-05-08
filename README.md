@@ -1,9 +1,14 @@
 # SRE AI Copilot
 
-**SRE AI Copilot** — backend-сервис для автоматизации incident response в Kubernetes: прием вебхуков, асинхронный анализ инцидентов, генерация гипотез/фиксов и контур human approval.
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![Python](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/)
+[![FastAPI](https://img.shields.io/badge/FastAPI-0.104-009688)](https://fastapi.tiangolo.com/)
+[![Celery](https://img.shields.io/badge/Celery-5.3-37814A)](https://docs.celeryq.dev/)
+
+**SRE AI Copilot** — backend-сервис для автоматизации incident response в Kubernetes: прием Prometheus AlertManager-вебхуков, асинхронный анализ инцидентов через агентный LLM-пайплайн (analyzer → hypothesis → critic → fix → risk), guardrails по k8s-namespace и human-approval flow перед любым write-действием.
 
 ## Что умеет сервис
-- Принимает события инцидентов через вебхук (`/webhooks/newrelic`) и ставит обработку в Celery.
+- Принимает события инцидентов через вебхук Prometheus AlertManager (`/webhooks/alertmanager`) и ставит обработку в Celery.
 - Выполняет агентный пайплайн (analyzer → hypothesis → critic → fix → risk).
 - Хранит записи инцидентов и результаты анализа в PostgreSQL.
 - Поддерживает replay-режим для исторических инцидентов (`/replay/{incident_id}`).
@@ -41,7 +46,7 @@ uvicorn app.main:app --reload --port 8000
 ```
 
 ## Основные API-эндпоинты
-- `POST /webhooks/newrelic` — прием инцидента, постановка async-задачи.
+- `POST /webhooks/alertmanager` — прием AlertManager-батча, постановка async-задачи на каждый alert.
 - `GET /webhooks/status/{task_id}` — статус Celery-задачи вебхука.
 - `POST /copilot` — запуск генерации ответа/анализа в фоне.
 - `GET /jobs/{task_id}` — статус задачи `generate_reply`.
@@ -52,7 +57,8 @@ uvicorn app.main:app --reload --port 8000
 
 ## Безопасность и guardrails
 - AI не исполняет kubectl напрямую: используется `ExecutionIntent` DSL и детерминированный транслятор.
-- Есть whitelist для K8s-операций (verb/resource) и blacklist системных namespace.
+- Tiered namespace policy в `app/services/k8s_guard.py`: production (`prod`/`preprod`/`preupdate`) — read-only, dev (`squad-*`) — write через approval, system/auth (`kube-*`, `mcp`) — forbidden.
+- Whitelist по verb/resource; deep-inspection body на `privileged`/`hostNetwork`.
 - Потенциально опасные действия проходят через approval flow.
 
 ## Документация
@@ -61,26 +67,3 @@ uvicorn app.main:app --reload --port 8000
 - [Semantic Contract](docs/SEMANTIC_CONTRACT.md)
 - [DR Plan](docs/DR.md)
 
-## Control-Plane Contracts Validation
-
-The repository includes versioned JSON contracts under `contracts/`:
-
-- `snapshot.v1.json`
-- `budget.v1.json`
-- `ledger.v1.json`
-- `routing-policy.v1.json`
-- `breaker.v1.json`
-
-Run contract checks locally:
-
-```bash
-make contracts-check
-python scripts/validate_contracts.py
-pytest -q tests/contracts/test_contracts.py
-```
-
-These checks validate:
-
-- JSON Schema structural correctness (Draft 2020-12)
-- Representative sample instances per contract
-- Rejection of unknown payload fields where `additionalProperties: false`
