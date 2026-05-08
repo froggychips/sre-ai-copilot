@@ -3,7 +3,7 @@
 **SRE AI Copilot** — backend-сервис для автоматизации incident response в Kubernetes: прием вебхуков, асинхронный анализ инцидентов, генерация гипотез/фиксов и контур human approval.
 
 ## Что умеет сервис
-- Принимает события инцидентов через вебхук (`/webhooks/newrelic`) и ставит обработку в Celery.
+- Принимает события инцидентов через вебхук Prometheus AlertManager (`/webhooks/alertmanager`) и ставит обработку в Celery.
 - Выполняет агентный пайплайн (analyzer → hypothesis → critic → fix → risk).
 - Хранит записи инцидентов и результаты анализа в PostgreSQL.
 - Поддерживает replay-режим для исторических инцидентов (`/replay/{incident_id}`).
@@ -41,7 +41,7 @@ uvicorn app.main:app --reload --port 8000
 ```
 
 ## Основные API-эндпоинты
-- `POST /webhooks/newrelic` — прием инцидента, постановка async-задачи.
+- `POST /webhooks/alertmanager` — прием AlertManager-батча, постановка async-задачи на каждый alert.
 - `GET /webhooks/status/{task_id}` — статус Celery-задачи вебхука.
 - `POST /copilot` — запуск генерации ответа/анализа в фоне.
 - `GET /jobs/{task_id}` — статус задачи `generate_reply`.

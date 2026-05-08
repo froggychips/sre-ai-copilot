@@ -11,7 +11,7 @@ Base = declarative_base()
 class IncidentRecord(Base):
     __tablename__ = "incidents"
     id = Column(Integer, primary_key=True, index=True)
-    incident_id = Column(Integer, unique=True, index=True)
+    incident_id = Column(String, unique=True, index=True)
     status = Column(String)
     data = Column(JSON)
     analysis = Column(JSON, nullable=True)
