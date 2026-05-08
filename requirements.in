@@ -14,4 +14,3 @@ opentelemetry-exporter-otlp
 prometheus-client
 psycopg2-binary
 tenacity
-jsonschema
