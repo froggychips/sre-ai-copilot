@@ -1,6 +1,6 @@
 fastapi
 uvicorn[standard]
-google-generativeai
+anthropic
 pydantic-settings
 structlog
 sqlalchemy

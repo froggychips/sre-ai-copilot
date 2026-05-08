@@ -14,9 +14,7 @@ REQUIRED_FILES = [
     ROOT / "contracts" / "routing-policy.v1.json",
     ROOT / "contracts" / "breaker.v1.json",
     ROOT / "docs" / "adr" / "0001-control-plane-contracts.md",
-    ROOT / "docs" / "policies" / "control-plane-versioning-policy.md",
-    ROOT / "docs" / "policies" / "control-plane-rollback-policy.md",
-    ROOT / "docs" / "policies" / "control-plane-no-bypass-policy.md",
+    ROOT / "docs" / "policies" / "control-plane-policies.md",
 ]
 
 
