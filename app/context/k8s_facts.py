@@ -47,6 +47,9 @@ class K8sFacts:
 
             # Факт 2: сравнение с peer namespace
             peer = K8sFacts._peer_namespace(namespace)
+            if peer is None and namespace.startswith("squad-"):
+                logger.warning("k8s_facts_peer_namespace_unrecognized", namespace=namespace,
+                               hint="namespace starts with 'squad-' but doesn't match squad-<N>-<suffix> pattern")
             if peer:
                 try:
                     peer_pods = v1.list_namespaced_pod(peer)
