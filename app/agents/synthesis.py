@@ -54,6 +54,7 @@ class SynthesisAgent(BaseAgent):
                 "**What happened** — one sentence, blast radius\n"
                 "**Root cause** — one sentence with supporting evidence\n"
                 "**Fix** — concrete steps, priority-ordered\n"
+                "**Fix addresses root cause?** — YES or NO. If NO: explain the misalignment and propose an alternative fix that directly addresses the identified root cause.\n"
                 "**Risk** — LOW / MEDIUM / HIGH and the key concern\n"
                 "**Confidence** — 0–100% and what would increase it\n\n"
                 "Be direct. No padding. Engineers will act on this."
