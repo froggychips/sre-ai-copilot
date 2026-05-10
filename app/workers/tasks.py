@@ -39,7 +39,7 @@ async def async_process_incident(incident_data: dict):
         hypotheses = await hypo.generate(analysis)
         
         critic = CriticAgent()
-        final_cause = await critic.audit(analysis, hypotheses)
+        final_cause = await critic.audit(analysis, hypotheses, namespace=incident.namespace)
         
         fixer = FixAgent()
         fix_suggestion = await fixer.suggest(final_cause)
