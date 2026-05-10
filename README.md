@@ -9,7 +9,7 @@
 
 ## Что умеет сервис
 - Принимает события инцидентов через вебхук Prometheus AlertManager (`/webhooks/alertmanager`) и ставит обработку в Celery.
-- Выполняет агентный пайплайн (analyzer → hypothesis → critic → fix → risk).
+- Выполняет агентный пайплайн (analyzer → hypothesis → critic → fix → risk → synthesis).
 - Хранит записи инцидентов и результаты анализа в PostgreSQL.
 - Поддерживает replay-режим для исторических инцидентов (`/replay/{incident_id}`).
 - Экспортирует health/readiness, Prometheus-метрики и OpenTelemetry-трейсинг.
@@ -63,7 +63,7 @@ uvicorn app.main:app --reload --port 8000
 
 ## sre-ai-copilot vs froggy-sre
 
-Оба запускают один и тот же 5-этапный пайплайн. Выбор зависит от контекста:
+froggy-sre запускает 5-этапный пайплайн. sre-ai-copilot добавляет шестой этап: Synthesis-агент видит все 5 выходов одновременно и формирует итоговый отчёт (двухуровневый reasoning). Выбор зависит от контекста:
 
 | | sre-ai-copilot | [froggy-sre](https://github.com/froggychips/froggy-sre) |
 |---|---|---|
