@@ -1,4 +1,4 @@
-FROM python:3.11-slim
+FROM python:3.14-slim
 
 RUN groupadd -g 10001 sre && \
     useradd -u 10001 -g sre -m -s /bin/bash sre
