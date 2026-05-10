@@ -5,6 +5,7 @@ from app.agents.hypothesis import HypothesisAgent
 from app.agents.critic import CriticAgent
 from app.agents.fix import FixAgent
 from app.agents.risk import RiskAgent
+from app.agents.synthesis import SynthesisAgent
 from app.services.discord_service import discord_service
 from app.services.audit_logger import audit_service
 from app.database import SessionLocal, IncidentRecord
@@ -47,20 +48,35 @@ async def async_process_incident(incident_data: dict):
         risker = RiskAgent()
         risk_report = await risker.assess(fix_suggestion)
 
+        # Stage 6: Synthesis — sees all 5 outputs simultaneously (two-level reasoning)
+        synthesizer = SynthesisAgent()
+        synthesis = await synthesizer.synthesize(
+            incident_id=incident_id,
+            analysis=analysis,
+            hypotheses=hypotheses,
+            final_cause=final_cause,
+            fix_suggestion=fix_suggestion,
+            risk_report=risk_report,
+        )
+
         # Persistence
         record = db.query(IncidentRecord).filter(IncidentRecord.incident_id == incident_id).first()
         if record:
             record.analysis = {
                 "summary": analysis,
+                "hypotheses": hypotheses,
                 "cause": final_cause,
                 "fix": fix_suggestion,
-                "risk": risk_report
+                "risk": risk_report,
+                "synthesis": synthesis,
             }
             record.status = "COMPLETED"
             db.commit()
 
-        # Notification
-        await discord_service.send_report(f"**Incident {incident_id} Analysis Complete.**\nRisk: {risk_report}")
+        # Notification — send synthesized report, not raw stage output
+        await discord_service.send_report(
+            f"**Incident {incident_id} Analysis Complete.**\n\n{synthesis}"
+        )
         
     except Exception as e:
         db.rollback()
