@@ -61,6 +61,20 @@ uvicorn app.main:app --reload --port 8000
 - Whitelist по verb/resource; deep-inspection body на `privileged`/`hostNetwork`.
 - Потенциально опасные действия проходят через approval flow.
 
+## sre-ai-copilot vs froggy-sre
+
+Оба запускают один и тот же 5-этапный пайплайн. Выбор зависит от контекста:
+
+| | sre-ai-copilot | [froggy-sre](https://github.com/froggychips/froggy-sre) |
+|---|---|---|
+| **Триггер** | AlertManager webhook (headless) | MCP tool call из Claude Code |
+| **Runtime** | Любой сервер / k8s pod | macOS dev-машина |
+| **LLM** | Anthropic API | Froggy local → Anthropic fallback |
+| **k8s контекст** | In-cluster kubernetes SDK | `kubectl` через kubeconfig |
+| **Хранилище** | SQLite + Celery queue | `~/.froggy-sre/incidents/` (local JSON) |
+| **Уведомления** | Discord webhook | Ответ в Claude Code |
+| **Когда использовать** | Нужен постоянный headless алертинг в production | Анализ инцидентов интерактивно через Claude Code |
+
 ## Документация
 - [Architecture](docs/ARCHITECTURE.md)
 - [Module Docs](docs/MODULE_DOCS.md)

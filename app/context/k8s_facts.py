@@ -29,18 +29,20 @@ class K8sFacts:
 
             # Факт 1: все non-Running поды в namespace + restart counts
             pods = v1.list_namespaced_pod(namespace)
-            unhealthy = []
+            unhealthy_pods = []
             for p in pods.items:
                 if p.status.phase not in ("Running", "Succeeded"):
                     restarts = sum(
                         cs.restart_count
                         for cs in (p.status.container_statuses or [])
                     )
-                    unhealthy.append(
-                        f"{p.metadata.name}: {p.status.phase} restarts={restarts}"
-                    )
+                    unhealthy_pods.append((p.metadata.name, p.status.phase, restarts))
+            unhealthy_strs = [
+                f"{name}: {phase} restarts={restarts}"
+                for name, phase, restarts in unhealthy_pods
+            ]
             results.append(
-                f"Unhealthy pods in {namespace}: {unhealthy if unhealthy else 'none'}"
+                f"Unhealthy pods in {namespace}: {unhealthy_strs if unhealthy_strs else 'none'}"
             )
 
             # Факт 2: сравнение с peer namespace
@@ -59,6 +61,24 @@ class K8sFacts:
                     )
                 except Exception as e:
                     logger.warning("k8s_facts_peer_unavailable", peer=peer, error=str(e))
+
+            # Факт 3: логи для первых 3 unhealthy подов (tail 50)
+            for pod_name, _, _ in unhealthy_pods[:3]:
+                try:
+                    logs = v1.read_namespaced_pod_log(
+                        pod_name, namespace, tail_lines=50
+                    )
+                    if logs:
+                        results.append(f"Logs {pod_name} (tail 50):\n{logs.strip()}")
+                except Exception:
+                    try:
+                        logs = v1.read_namespaced_pod_log(
+                            pod_name, namespace, tail_lines=50, previous=True
+                        )
+                        if logs:
+                            results.append(f"Logs {pod_name} (previous, tail 50):\n{logs.strip()}")
+                    except Exception as e:
+                        logger.warning("k8s_facts_logs_unavailable", pod=pod_name, error=str(e))
 
         except Exception as e:
             logger.error("k8s_facts_collection_failed", namespace=namespace, error=str(e))
