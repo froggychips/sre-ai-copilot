@@ -11,8 +11,11 @@ jobs:
     name: Lint and Test
     # Self-hosted runner (jabbook-air-m3-sre-copilot) because the froggychips
     # account is currently blocked from GitHub-hosted runners on a billing
-    # issue. macOS arm64; Python 3.12 chosen because psycopg2-binary 2.9.9
-    # has prebuilt wheels for macosx_11_0_arm64 starting from cp312, not cp311.
+    # issue. macOS arm64; we use the homebrew-installed Python 3.12 directly
+    # instead of actions/setup-python — that action assumes GitHub-hosted
+    # paths (/Users/runner) that don't exist on a self-hosted setup.
+    # Python 3.12 chosen because psycopg2-binary 2.9.9 has prebuilt wheels
+    # for macosx_11_0_arm64 starting from cp312.
     runs-on: [self-hosted, macOS, ARM64]
     steps:
       - name: Checkout Code
@@ -20,17 +23,15 @@ jobs:
         with:
           clean: false
 
-      - name: Set up Python 3.12
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-          cache: "pip"
+      - name: Show Python version
+        run: /opt/homebrew/bin/python3.12 --version
 
-      - name: Install Dependencies
+      - name: Create venv and install dependencies
         run: |
-          python -m pip install --upgrade pip
-          pip install ruff mypy pytest pytest-cov pytest-asyncio pytest-mock
-          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+          /opt/homebrew/bin/python3.12 -m venv .venv
+          .venv/bin/pip install --upgrade pip
+          .venv/bin/pip install ruff mypy pytest pytest-cov pytest-asyncio pytest-mock
+          if [ -f requirements.txt ]; then .venv/bin/pip install -r requirements.txt; fi
 
       # Ruff and Mypy are non-blocking right now — the repo carries
       # 27 ruff and 69 mypy errors of pre-existing lint debt. The
@@ -38,14 +39,14 @@ jobs:
       # tracked separately.
       - name: Run Ruff (Linting)
         continue-on-error: true
-        run: ruff check .
+        run: .venv/bin/ruff check .
 
       - name: Run Mypy (Type Checking)
         continue-on-error: true
-        run: mypy .
+        run: .venv/bin/mypy .
 
       - name: Run Pytest with Coverage
-        run: pytest --cov=app --cov-report=xml
+        run: .venv/bin/pytest --cov=app --cov-report=xml
 
   build-and-push:
     name: Build and Push Docker Image
