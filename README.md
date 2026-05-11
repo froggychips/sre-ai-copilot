@@ -35,6 +35,16 @@
 - `DISCORD_WEBHOOK_URL`
 - `JWT_PUBLIC_KEY` (если включена авторизация JWT)
 
+> **Альтернатива `ANTHROPIC_API_KEY` для local dev / PoC.**
+> Subprocess-обёртка вокруг `claude --print <prompt>` в headless-режиме
+> позволяет гонять полный pipeline без Anthropic API key, опираясь на
+> авторизацию CLI пользователя. Используется в локальной разработке /
+> PoC; не предназначено для production (один CLI-spawn ≈ 1–3 секунды
+> overhead вверх к LLM-латенси).
+> Тот же паттерн применяется в `agent_runner.py` discord-бота из
+> внутренней моно-репы — Claude Code CLI запускается с подключёнными
+> MCP-серверами и принимает prompt через stdin/stdout.
+
 ### 3) Запуск
 ```bash
 docker-compose up -d
