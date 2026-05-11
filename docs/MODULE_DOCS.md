@@ -30,6 +30,8 @@
 - `app/repository.py`: CRUD-операции разговоров/сообщений.
 
 ## Services & Safety
+- `app/services/mcp_client.py`: клиент для выполнения инструментов на внешних MCP-серверах.
+- `app/services/teamcity_service.py`: интеграция с TeamCity для анализа деплоев через MCP-интерфейс.
 - `app/services/approval_manager.py`: Redis-based lifecycle approvals.
 - `app/services/k8s_guard.py`: policy-check операций (verb/resource/namespace/body).
 - `app/core/execution_dsl.py`: строго типизированный `ExecutionIntent` и kubectl-транслятор.
