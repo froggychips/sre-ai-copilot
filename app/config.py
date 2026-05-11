@@ -25,7 +25,29 @@ class Settings(BaseSettings):
         "claude-sonnet-4-6",
         description="The model to use"
     )
-    
+
+    # Backend для LLM-вызовов:
+    #   anthropic — AsyncAnthropic SDK + ANTHROPIC_API_KEY (default, production)
+    #   claude_cli — subprocess `claude --print` (local PoC без API key)
+    LLM_BACKEND: str = Field("anthropic", description="anthropic|claude_cli")
+    CLAUDE_CLI_TIMEOUT_SECONDS: float = 180.0
+
+    # Eager Celery — для in-process e2e без Redis/worker'а
+    CELERY_TASK_ALWAYS_EAGER: bool = False
+
+    # Прямой вызов async_process_incident прямо из вебхука (минуя Celery).
+    # Полезно в локальном e2e без Redis: блокирует curl, но возвращает реальный
+    # результат, виден в логах + persists в DB. Eager-mode Celery несовместим
+    # с async endpoint-ом (loop.run_until_complete внутри уже запущенного loop).
+    PIPELINE_DIRECT_INVOKE: bool = False
+
+    # Не отправлять реальный Discord webhook, только логировать (для local e2e).
+    DISCORD_DRY_RUN: bool = False
+
+    # Anti-DoS cap для prompt_guard.detect_injection. Поднимать только
+    # осознанно — каждый LLM-вызов биллится по входным токенам.
+    PROMPT_INPUT_MAX_CHARS: int = 20000
+
     MAX_TOKENS: int = Field(
         1024, 
         description="Maximum number of tokens to generate in LLM responses"
