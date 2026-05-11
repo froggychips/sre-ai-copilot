@@ -9,7 +9,7 @@
 
 ## Что умеет сервис
 - Принимает события инцидентов через вебхук Prometheus AlertManager (`/webhooks/alertmanager`) и ставит обработку в Celery.
-- Выполняет агентный пайплайн (analyzer → hypothesis → critic → fix → risk).
+- Выполняет агентный пайплайн (analyzer → hypothesis → critic → fix → risk → synthesis).
 - Хранит записи инцидентов и результаты анализа в PostgreSQL.
 - Поддерживает replay-режим для исторических инцидентов (`/replay/{incident_id}`).
 - Экспортирует health/readiness, Prometheus-метрики и OpenTelemetry-трейсинг.
@@ -60,6 +60,20 @@ uvicorn app.main:app --reload --port 8000
 - Tiered namespace policy в `app/services/k8s_guard.py`: production (`prod`/`preprod`/`preupdate`) — read-only, dev (`squad-*`) — write через approval, system/auth (`kube-*`, `mcp`) — forbidden.
 - Whitelist по verb/resource; deep-inspection body на `privileged`/`hostNetwork`.
 - Потенциально опасные действия проходят через approval flow.
+
+## sre-ai-copilot vs froggy-sre
+
+froggy-sre запускает 5-этапный пайплайн. sre-ai-copilot добавляет шестой этап: Synthesis-агент видит все 5 выходов одновременно и формирует итоговый отчёт (двухуровневый reasoning). Выбор зависит от контекста:
+
+| | sre-ai-copilot | [froggy-sre](https://github.com/froggychips/froggy-sre) |
+|---|---|---|
+| **Триггер** | AlertManager webhook (headless) | MCP tool call из Claude Code |
+| **Runtime** | Любой сервер / k8s pod | macOS dev-машина |
+| **LLM** | Anthropic API | Froggy local → Anthropic fallback |
+| **k8s контекст** | In-cluster kubernetes SDK | `kubectl` через kubeconfig |
+| **Хранилище** | SQLite + Celery queue | `~/.froggy-sre/incidents/` (local JSON) |
+| **Уведомления** | Discord webhook | Ответ в Claude Code |
+| **Когда использовать** | Нужен постоянный headless алертинг в production | Анализ инцидентов интерактивно через Claude Code |
 
 ## Документация
 - [Architecture](docs/ARCHITECTURE.md)
