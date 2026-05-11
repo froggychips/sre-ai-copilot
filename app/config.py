@@ -57,9 +57,13 @@ class Settings(BaseSettings):
     OTLP_EXPORTER_ENDPOINT: str = "http://tempo:4317"
     AUDIT_LOG_PATH: str = "./audit.log"
 
-    # TeamCity REST integration — обогащение incident-а recent-deploys
-    TC_URL: str = Field("", description="TeamCity base URL, e.g. https://wo-teamcity.lastoasisgame.com")
-    TC_TOKEN: str = Field("", description="TeamCity personal access token (reused from mcp-teamcity)")
+    # TeamCity integration — обогащение incident-а recent-deploys.
+    # Ходим через mcp-teamcity-server (external/mcp/teamcity-server, MR !1):
+    #   prod: https://mcp-teamcity.lastoasisgame.com/mcp (после деплоя)
+    #   local PoC: http://127.0.0.1:8001/mcp (server поднят локально)
+    TEAMCITY_MCP_URL: str = Field("", description="mcp-teamcity-server MCP endpoint URL")
+    TEAMCITY_MCP_TOKEN: str = Field("", description="Bearer для mcp_auth (пусто = no-auth local PoC)")
+    TEAMCITY_WEB_URL: str = Field("https://wo-teamcity.lastoasisgame.com", description="TC web UI base — для viewLog ссылок в Discord")
     TC_TIMEOUT_SECONDS: float = 5.0
     TC_LOOKBACK_MINUTES: int = 60
     TC_BACKEND_PROJECT_ID: str = "Wo_Backend_K8sNewCluster"
