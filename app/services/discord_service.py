@@ -7,6 +7,9 @@ from app.config import settings
 
 class DiscordService:
     async def send_report(self, report_text: str):
+        if settings.DISCORD_DRY_RUN:
+            logging.info("[DISCORD_DRY_RUN] send_report:\n%s", report_text)
+            return
         payload = {"content": report_text}
         async with httpx.AsyncClient() as client:
             await client.post(settings.DISCORD_WEBHOOK_URL, json=payload)

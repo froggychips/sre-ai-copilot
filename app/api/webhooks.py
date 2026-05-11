@@ -1,7 +1,8 @@
 from fastapi import APIRouter, Depends
 from sqlalchemy.orm import Session
 import structlog
-from app.workers.tasks import process_incident_task, celery_app
+from app.config import settings
+from app.workers.tasks import process_incident_task, celery_app, async_process_incident
 from app.database import get_db, IncidentRecord
 from app.models.incident import AlertManagerWebhook, Incident
 from app.ingestion.raw_collector import raw_collector
@@ -14,7 +15,12 @@ log = structlog.get_logger()
 @router.post("/alertmanager", status_code=202)
 async def alertmanager_webhook(payload: AlertManagerWebhook, db: Session = Depends(get_db)):
     """Receive a Prometheus AlertManager webhook batch and dispatch one Celery task per alert."""
-    raw_collector.ingest(payload.model_dump())
+    # raw_collector requires `id` or `incident_id` at top level. AlertManager
+    # batch не имеет глобального id, поэтому используем `groupKey` как идентификатор
+    # этого batch-а (один webhook = один batch с одним groupKey).
+    raw_payload = payload.model_dump()
+    raw_payload.setdefault("id", payload.groupKey)
+    raw_collector.ingest(raw_payload)
 
     accepted = []
     for alert in payload.alerts:
@@ -45,10 +51,21 @@ async def alertmanager_webhook(payload: AlertManagerWebhook, db: Session = Depen
                     data=incident.model_dump(),
                 )
             )
-        task = process_incident_task.delay(incident.model_dump())
-        accepted.append({"incident_id": incident.incident_id, "task_id": task.id})
+        # Коммитим PENDING-запись СЕЙЧАС: pipeline (Celery или direct-invoke)
+        # открывает свою SessionLocal и UPDATE-ит status=COMPLETED по
+        # incident_id. Без commit-а запись не видна pipeline-сессии,
+        # UPDATE становится no-op (trace/analysis теряются).
+        db.commit()
 
-    db.commit()
+        if settings.PIPELINE_DIRECT_INVOKE:
+            # Локальный e2e без Redis/Celery: блокируем endpoint и гоняем
+            # pipeline inline. Возвращаем «task_id»=direct для совместимости.
+            await async_process_incident(incident.model_dump())
+            accepted.append({"incident_id": incident.incident_id, "task_id": "direct"})
+        else:
+            task = process_incident_task.delay(incident.model_dump())
+            accepted.append({"incident_id": incident.incident_id, "task_id": task.id})
+
     return {"status": "accepted", "alerts": accepted}
 
 

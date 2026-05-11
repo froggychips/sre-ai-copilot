@@ -46,7 +46,13 @@ class PromptGuard:
             if re.search(pattern, cleaned):
                 return True, "CODE_INJECTION_ATTEMPT"
 
-        if len(user_input) > 5000: # Лимит для предотвращения DoS
+        # Лимит для предотвращения DoS — настраиваемый через PROMPT_INPUT_MAX_CHARS.
+        # Дефолт 5000 был тесноват для incident-ов с teamcity_context (recent
+        # deploys + changes). Поднимать в production-сетинге — после оценки
+        # стоимости LLM-вызова.
+        from app.config import settings as _settings
+        max_chars = getattr(_settings, "PROMPT_INPUT_MAX_CHARS", 5000)
+        if len(user_input) > max_chars:
             return True, "INPUT_TOO_LONG"
 
         return False, ""

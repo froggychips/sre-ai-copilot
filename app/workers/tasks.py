@@ -58,6 +58,13 @@ celery_app = Celery(
     backend=settings.REDIS_URL
 )
 
+if settings.CELERY_TASK_ALWAYS_EAGER:
+    # Inline-режим для локального e2e: process_incident_task.delay(...)
+    # выполняется синхронно в текущем процессе, без Redis/worker-а.
+    celery_app.conf.task_always_eager = True
+    celery_app.conf.task_eager_propagates = True
+
+
 @celery_app.task(name="process_incident", bind=True, max_retries=3)
 def process_incident_task(self, incident_data: dict):
     loop = asyncio.get_event_loop()
