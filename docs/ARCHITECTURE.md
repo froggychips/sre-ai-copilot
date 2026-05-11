@@ -1,19 +1,14 @@
 # SRE AI Copilot Architecture
 
 ## 1. System Overview
-Приложение состоит из HTTP API (FastAPI), фоновых задач (Celery), слоя данных (PostgreSQL) и интеграций (Redis, Discord, Kubernetes).
-
-Основные сценарии:
-1. Ingestion инцидента через webhook.
-2. Асинхронный анализ инцидента в worker.
-3. Фиксация результата и отправка уведомлений.
-4. Replay исторического инцидента без побочных эффектов (Discord/K8s).
+Приложение состоит из HTTP API (FastAPI), фоновых задач (Celery), слоя данных (PostgreSQL), внешних MCP-серверов (интеграция) и поддержки (Redis, Discord, Kubernetes).
 
 ## 2. Runtime Components
 - **API app (`app.main`)**: маршрутизация, auth dependency, метрики, health/readiness.
 - **Webhook pipeline (`app.api.webhooks` + `app.workers.tasks`)**: прием payload и агентный chain.
 - **Copilot pipeline (`app.main:/copilot` + `app.celery_worker`)**: фоновая генерация аналитического ответа с state machine.
 - **Data layer (`app.database`, `app.repository`)**: SQLAlchemy-модели и операции.
+- **Integration layer (`app.services.mcp_client`)**: клиент для взаимодействия с внешними MCP-серверами.
 - **Safety services**: approval manager, K8s guard, execution DSL.
 
 ## 3. Data Flow (Webhook Incident)
@@ -22,6 +17,7 @@ AlertManager webhook
   -> POST /webhooks/alertmanager
   -> for each alert: IncidentRecord(status=PENDING)
   -> Celery task: process_incident (one per alert)
+  -> Context Builder (incl. MCP TeamCity Enrichment)
   -> Analyzer -> Hypothesis -> Critic -> Fix -> Risk
   -> IncidentRecord(status=COMPLETED, analysis=...)
   -> Discord report

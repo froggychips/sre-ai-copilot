@@ -1,12 +1,14 @@
 from fastapi import APIRouter, Depends
 from sqlalchemy.orm import Session
+import structlog
 from app.workers.tasks import process_incident_task, celery_app
 from app.database import get_db, IncidentRecord
 from app.models.incident import AlertManagerWebhook, Incident
 from app.ingestion.raw_collector import raw_collector
-from app.core.state_machine import IncidentState
+from app.services.teamcity_service import incident_teamcity_context
 
 router = APIRouter()
+log = structlog.get_logger()
 
 
 @router.post("/alertmanager", status_code=202)
@@ -17,6 +19,15 @@ async def alertmanager_webhook(payload: AlertManagerWebhook, db: Session = Depen
     accepted = []
     for alert in payload.alerts:
         incident = Incident.from_alertmanager(alert)
+        # Обогащение TC-контекстом (recent deploys + changes) — best-effort.
+        # При недоступности TC просто остаётся None, инцидент обрабатывается без контекста.
+        try:
+            incident.teamcity_context = await incident_teamcity_context(
+                namespace=incident.namespace,
+                incident_starts_at=incident.starts_at,
+            )
+        except Exception as e:
+            log.warning("teamcity_context.unhandled", error=str(e), incident_id=incident.incident_id)
         existing = (
             db.query(IncidentRecord)
             .filter(IncidentRecord.incident_id == incident.incident_id)
