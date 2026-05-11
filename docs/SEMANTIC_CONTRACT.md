@@ -41,7 +41,10 @@
    - blacklist namespace
    - deep inspection тела запроса (например, `privileged: true` запрещен)
 
-## 5. Replay Mode Contract
+## 5. External Data Contract (Sanitization)
+Данные, получаемые из внешних систем (например, комментарии коммитов из TeamCity), должны проходить очистку (sanitize) перед включением в промпты агентов для предотвращения атак типа Prompt Injection.
+
+## 6. Replay Mode Contract
 Replay-сценарий запускает повторный анализ исторического инцидента и должен:
 - не вызывать внешние side effects (например, Discord alerting),
 - позволять гибкость переходов state machine при ретроспективном прогоне.
