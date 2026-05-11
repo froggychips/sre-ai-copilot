@@ -43,6 +43,9 @@ class Incident(BaseModel):
     ends_at: Optional[str] = None
     generator_url: Optional[str] = None
     raw: Dict[str, Any] = Field(default_factory=dict)
+    # Заполняется на ingestion из app.services.teamcity_service.incident_teamcity_context.
+    # None = TC не сконфигурирован, namespace не маппится, или TC недоступен.
+    teamcity_context: Optional[Dict[str, Any]] = None
 
     @classmethod
     def from_alertmanager(cls, alert: AlertManagerAlert) -> "Incident":

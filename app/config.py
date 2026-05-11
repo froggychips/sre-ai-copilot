@@ -57,6 +57,13 @@ class Settings(BaseSettings):
     OTLP_EXPORTER_ENDPOINT: str = "http://tempo:4317"
     AUDIT_LOG_PATH: str = "./audit.log"
 
+    # TeamCity REST integration — обогащение incident-а recent-deploys
+    TC_URL: str = Field("", description="TeamCity base URL, e.g. https://wo-teamcity.lastoasisgame.com")
+    TC_TOKEN: str = Field("", description="TeamCity personal access token (reused from mcp-teamcity)")
+    TC_TIMEOUT_SECONDS: float = 5.0
+    TC_LOOKBACK_MINUTES: int = 60
+    TC_BACKEND_PROJECT_ID: str = "Wo_Backend_K8sNewCluster"
+
     # Configuration for pydantic-settings v2
     model_config = SettingsConfigDict(
         env_file=".env",

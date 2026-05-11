@@ -29,7 +29,10 @@ class HypothesisAgent(BaseAgent):
         """
         instruction = (
             "List 3 most likely root causes based on this analysis. "
-            "Rank them by probability."
+            "Rank them by probability. "
+            "If the analysis mentions a recent TeamCity deploy that finished "
+            "shortly before the alert, rank 'recent code change in that deploy' "
+            "as a top hypothesis and cite the build ID/author."
         )
         user_context = analysis
 
