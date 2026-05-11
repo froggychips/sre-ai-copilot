@@ -50,11 +50,14 @@ def mocked_dependencies(mocker):
     mocker.patch("app.workers.tasks.audit_service.log_event")
 
     # DB session: in-process MagicMock. The pipeline does query().filter().first(),
-    # then mutates the returned record and calls commit().
+    # then mutates the returned record and calls commit(). Pre-seed status with
+    # the enum's OPEN value so the StateMachine accepts the first transition
+    # to INVESTIGATING (PENDING is also accepted via legacy alias).
+    from app.core.state_machine import IncidentState
     record = MagicMock()
     record.trace = None
     record.analysis = None
-    record.status = None
+    record.status = IncidentState.OPEN.value
     mock_session = MagicMock()
     mock_session.query.return_value.filter.return_value.first.return_value = record
     mocker.patch("app.workers.tasks.SessionLocal", return_value=mock_session)
@@ -132,9 +135,13 @@ async def test_pipeline_stores_similar_past_count_in_analysis(mocked_dependencie
 
 
 @pytest.mark.asyncio
-async def test_pipeline_marks_completed_and_commits(mocked_dependencies, incident_data):
+async def test_pipeline_marks_resolved_and_commits(mocked_dependencies, incident_data):
     from app.workers.tasks import async_process_incident
+    from app.core.state_machine import IncidentState
     await async_process_incident(incident_data)
 
-    assert mocked_dependencies["record"].status == "COMPLETED"
+    # Was "COMPLETED" before StateMachine wiring; now the pipeline drives
+    # the row through OPEN → INVESTIGATING → HYPOTHESIS_GENERATED →
+    # FIX_PROPOSED → RESOLVED and the final status is RESOLVED.
+    assert mocked_dependencies["record"].status == IncidentState.RESOLVED.value
     mocked_dependencies["session"].commit.assert_called()
