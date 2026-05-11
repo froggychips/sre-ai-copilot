@@ -19,7 +19,7 @@
 - **Очереди**: Celery + Redis
 - **БД**: PostgreSQL + SQLAlchemy
 - **Observability**: Prometheus, OpenTelemetry, structlog
-- **Интеграции**: Discord webhook, Kubernetes guardrails, Anthropic Claude API
+- **Интеграции**: Discord webhook, Kubernetes guardrails, Anthropic Claude API, MCP (Model Context Protocol)
 
 ## Быстрый старт
 
