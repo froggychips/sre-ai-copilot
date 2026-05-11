@@ -34,10 +34,14 @@ async def alertmanager_webhook(payload: AlertManagerWebhook, db: Session = Depen
             .first()
         )
         if existing is None:
+            # Start in the IncidentState enum (OPEN), not the legacy
+            # "PENDING" string — the worker pipeline runs the StateMachine
+            # against record.status, so the initial value must be a real
+            # enum member to avoid hitting the legacy alias fallback.
             db.add(
                 IncidentRecord(
                     incident_id=incident.incident_id,
-                    status="PENDING",
+                    status=IncidentState.OPEN.value,
                     data=incident.model_dump(),
                 )
             )

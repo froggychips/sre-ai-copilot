@@ -40,13 +40,20 @@ class StageTrace:
     stage: str
     duration_ms: int
     llm_calls: list[LLMCallInfo] = field(default_factory=list)
+    # State of the incident after this stage finished, if the orchestrator
+    # transitioned the StateMachine during the stage. None = no transition
+    # at this stage (analyzer stays in INVESTIGATING, etc).
+    state_after: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        d: dict[str, Any] = {
             "stage": self.stage,
             "duration_ms": self.duration_ms,
             "llm_calls": [asdict(c) for c in self.llm_calls],
         }
+        if self.state_after is not None:
+            d["state_after"] = self.state_after
+        return d
 
 
 # Per-task storage. `None` outside of any `StageTimer` scope — callers
