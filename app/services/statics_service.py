@@ -27,7 +27,7 @@ _PROVIDER_RE = re.compile(
     r"IStatics\s+(\w+?)(?:ListProvider|Provider|Service|Factory)?(?:\b|$)",
     re.IGNORECASE,
 )
-_ENTITY_FROM_PROVIDER = re.compile(r"([A-Z][a-z]+(?:[A-Z][a-z]+)*)")  # CamelCase split
+_CAMEL_SPLIT = re.compile(r"[A-Z][a-z]+")  # CamelCase split: CityEffect → ['City', 'Effect']
 
 
 def _extract_keywords(error_text: str) -> List[str]:
@@ -38,7 +38,7 @@ def _extract_keywords(error_text: str) -> List[str]:
         full = m.group(1)  # e.g. CityEffect
         keywords.append(full.lower())
         # camel-split: CityEffect → ['city', 'effect']
-        for part in _ENTITY_FROM_PROVIDER.findall(full):
+        for part in _CAMEL_SPLIT.findall(full):
             if len(part) > 2:
                 keywords.append(part.lower())
     if not keywords:
@@ -109,7 +109,7 @@ def _run_statics_check(error_text: str, recent_n: int) -> Optional[str]:
         verdicts = []
         for tbl in matching_tables[:5]:
             try:
-                cur.execute(f"SELECT count(*) AS cnt FROM {tbl}")
+                cur.execute(f'SELECT count(*) AS cnt FROM "{tbl}"')
                 row = cur.fetchone()
                 cnt = row["cnt"] if row else 0
                 status = "OK" if cnt > 0 else "EMPTY"

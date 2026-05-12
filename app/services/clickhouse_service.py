@@ -61,12 +61,18 @@ class ClickHouseClient:
 
     async def query(self, sql: str) -> List[Dict[str, Any]]:
         """Выполнить SELECT, вернуть список dicts (column→value)."""
-        params = {"query": sql + " FORMAT JSONCompact", "default_format": "JSONCompact"}
+        params = {
+            "database": "WOAnalytics",
+            "default_format": "JSONCompact",
+        }
+        body = sql.strip() + "\nFORMAT JSONCompact"
         async with httpx.AsyncClient(timeout=self._timeout) as client:
-            r = await client.get(
-                self._base,
+            r = await client.post(
+                self._base + "/",
+                content=body.encode(),
                 params=params,
                 auth=self._auth,
+                headers={"Content-Type": "text/plain; charset=utf-8"},
             )
             r.raise_for_status()
             data = r.json()
@@ -139,12 +145,12 @@ ORDER BY Minute
     def avg_users(rs: List[Dict]) -> float:
         if not rs:
             return 0.0
-        return sum(r["active_users"] for r in rs) / len(rs)
+        return sum(int(r["active_users"]) for r in rs) / len(rs)
 
     baseline_avg = avg_users(baseline_rows)
     incident_avg = avg_users(incident_rows)
-    incident_min = min(r["active_users"] for r in incident_rows)
-    incident_max = max(r["active_users"] for r in incident_rows)
+    incident_min = min(int(r["active_users"]) for r in incident_rows)
+    incident_max = max(int(r["active_users"]) for r in incident_rows)
 
     drop_pct = 0
     if baseline_avg > 0:
