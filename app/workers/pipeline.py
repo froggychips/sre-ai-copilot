@@ -46,6 +46,7 @@ from app.models.incident import Incident
 from app.observability.ai_metrics import track_disagreement, track_no_survivor
 from app.services.audit_logger import audit_service
 from app.services.discord_service import discord_service
+from app.services.gitlab_service import enrich_with_gitlab, gitlab_context_to_prompt
 from app.services.teamcity_service import incident_teamcity_context
 
 logger = structlog.get_logger()
@@ -122,6 +123,7 @@ class IncidentPipeline:
         self.risk_report: Optional[str] = None
         self.synthesis: Optional[str] = None
         self.cluster_health_context: Optional[str] = None
+        self.gitlab_context: Optional[Dict[str, Any]] = None
 
     # ------------------------------------------------------------------
     # State machine helpers
@@ -167,6 +169,7 @@ class IncidentPipeline:
     async def stage_diagnose(self) -> None:
         async with StageTimer("diagnostics") as t:
             await self._enrich_teamcity()
+            await self._enrich_gitlab()
             diag_ctx = build_diagnostics_ctx(
                 incident=self.incident,
                 analyzer_summary=self.analysis,
@@ -178,6 +181,18 @@ class IncidentPipeline:
         snap = t.snapshot().to_dict()
         self._safe_transition(IncidentState.FACTS_COLLECTED, snap)
         self.traces.append(snap)
+
+    async def _enrich_gitlab(self) -> None:
+        try:
+            gl_ctx = await enrich_with_gitlab(self.incident.teamcity_context)
+            if gl_ctx:
+                self.gitlab_context = gl_ctx
+                audit_service.log_event(
+                    "GITLAB_ENRICHED",
+                    {"mr_count": len(gl_ctx.get("mrs", []))},
+                )
+        except Exception as e:
+            audit_service.log_event("GITLAB_ENRICH_FAILED", {"error": str(e)})
 
     async def _enrich_teamcity(self) -> None:
         if self.incident.teamcity_context is not None:
@@ -288,6 +303,10 @@ class IncidentPipeline:
         # pod issue" from "cluster-wide pressure" (e.g. 8 crashloops + disk 92%).
         if self.cluster_health_context:
             summary = f"{summary}\n\n{self.cluster_health_context}"
+
+        gl_prompt = gitlab_context_to_prompt(self.gitlab_context)
+        if gl_prompt:
+            summary = f"{summary}\n\n{gl_prompt}"
 
         if self.similar_past:
             bullets = []
@@ -451,6 +470,7 @@ class IncidentPipeline:
                 "disagreement_signal": self.critiqued.disagreement_signal(),
                 "consensus_kinds": self.critiqued.consensus_kinds(),
                 "cluster_health_context": self.cluster_health_context,
+                "gitlab_context": self.gitlab_context,
             }
             self._safe_transition(IncidentState.RESOLVED, synth_snap)
             record.trace = self.traces + [synth_snap]

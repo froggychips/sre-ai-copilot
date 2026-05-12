@@ -91,11 +91,16 @@ class Settings(BaseSettings):
     VICTORIA_METRICS_WINDOW_MINUTES: int = 15
 
     # TeamCity integration — обогащение incident-а recent-deploys.
-    # Ходим через mcp-teamcity-server (external/mcp/teamcity-server, MR !1):
-    #   prod: https://mcp-teamcity.lastoasisgame.com/mcp (после деплоя)
-    #   local PoC: http://127.0.0.1:8001/mcp (server поднят локально)
+    # Режимы (в порядке приоритета):
+    #   1. Прямой TC REST API: TC_URL + TC_TOKEN (те же что у локального teamcity-mcp).
+    #      Пакет teamcity_mcp.client.TeamCityClient из ~/projects/teamcity-mcp.
+    #   2. MCP HTTP server: TEAMCITY_MCP_URL + TEAMCITY_MCP_TOKEN
+    #      (задеплоенный mcp-teamcity-server — пока не поднят).
+    #   Пусто / оба отсутствуют = graceful degrade (recent_deploy остаётся unknown).
+    TC_URL: str = Field("", description="TeamCity base URL (напр. https://wo-teamcity.lastoasisgame.com)")
+    TC_TOKEN: str = Field("", description="TeamCity Bearer token (тот же что в MCP-конфиге Claude)")
     TEAMCITY_MCP_URL: str = Field(
-        "", description="mcp-teamcity-server MCP endpoint URL"
+        "", description="mcp-teamcity-server MCP endpoint URL (fallback)"
     )
     TEAMCITY_MCP_TOKEN: str = Field(
         "", description="Bearer для mcp_auth (пусто = no-auth local PoC)"
@@ -107,6 +112,14 @@ class Settings(BaseSettings):
     TC_TIMEOUT_SECONDS: float = 5.0
     TC_LOOKBACK_MINUTES: int = 60
     TC_BACKEND_PROJECT_ID: str = "Wo_Backend_K8sNewCluster"
+
+    # GitLab — обогащение MR-метаданными по SHA из TC-деплоев.
+    # Токен из k8s secret mcp-shared-secret (ключ GITLAB_TOKEN).
+    GITLAB_URL: str = Field("", description="GitLab base URL (напр. https://wo-gitlab.lastoasisgame.com)")
+    GITLAB_TOKEN: str = Field("", description="GitLab Personal Access Token (read_api)")
+    # Проекты для поиска MR по sha: project_id (числовой) или namespace/name.
+    # backend-services живёт в new-wo/backend-services (id найдём динамически).
+    GITLAB_BACKEND_PROJECT: str = Field("new-wo/backend-services", description="GitLab project path для backend MR-поиска")
 
     # Atlassian Jira — поиск известных инцидентов/задач по сервису.
     # Basic Auth: email + API token (https://id.atlassian.com/manage-profile/security/api-tokens)
