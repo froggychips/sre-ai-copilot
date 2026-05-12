@@ -251,11 +251,19 @@ async def async_process_incident(incident_data: dict):
         similar_past = SimilarIncidentEngine.find(
             current_incident=incident_data, limit=3
         )
+        # Рецидив: хотя бы один похожий инцидент с тем же сервисом, resolved
+        # в последние RECURRENCE_WINDOW_DAYS дней. Меняет тактику FixAgent.
+        is_recurrence = any(p.get("recurrence") for p in similar_past)
+
         if similar_past:
-            past_bullets = "\n".join(
-                f"- score={p.get('score', '?')} cause={(p.get('root_cause') or '?')[:200]}"
-                for p in similar_past
-            )
+            past_bullets_parts = []
+            for p in similar_past:
+                line = f"- score={p.get('score', '?')} cause={(p.get('root_cause') or '?')[:200]}"
+                if p.get("recurrence"):
+                    days = p.get("days_ago")
+                    line += f" [RECURRENCE: {days}d ago]" if days is not None else " [RECURRENCE]"
+                past_bullets_parts.append(line)
+            past_bullets = "\n".join(past_bullets_parts)
             multi_summary = (
                 f"{analysis}\n\nSimilar past resolutions (consider as patterns, "
                 f"verify against current facts):\n{past_bullets}"
@@ -307,10 +315,11 @@ async def async_process_incident(incident_data: dict):
         if record is not None:
             transition_to(record, IncidentState.HYPOTHESIS_GENERATED, db)
 
-        # Stage 5: Fix — поверх final_cause. Контракт FixAgent не менялся.
+        # Stage 5: Fix — поверх final_cause. При рецидиве FixAgent переключается
+        # с mitigation-режима на investigative-режим.
         async with StageTimer("fix") as t:
             fixer = FixAgent()
-            fix_suggestion = await fixer.suggest(final_cause)
+            fix_suggestion = await fixer.suggest(final_cause, is_recurrence=is_recurrence)
         snap = t.snapshot().to_dict()
         safe_transition(IncidentState.FIX_PROPOSED, snap)
         traces.append(snap)
@@ -359,6 +368,7 @@ async def async_process_incident(incident_data: dict):
                 "risk": risk_report,
                 "synthesis": synthesis,
                 "similar_past_count": len(similar_past),
+                "is_recurrence": is_recurrence,
                 # Fact-anchored details для post-mortem и regression-тестов:
                 "facts": fact_store.to_dict()["facts"],
                 "fact_conflicts": [
