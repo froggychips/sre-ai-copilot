@@ -30,6 +30,44 @@ class OOMKilledRule(Rule):
     name = "OOMKilledRule"
 
     def evaluate(self, ctx: Dict[str, Any]) -> List[Fact]:
+        # Structured check первый — точнее regex и не зависит от текста.
+        pod = ctx.get("pod") or ctx.get("service")
+        pod_state = ctx.get("k8s_pod_state") or {}
+        if pod and pod in pod_state:
+            info = pod_state[pod]
+            if info.get("reason") == "OOMKilled":
+                return [
+                    Fact(
+                        kind=FactKind.OOM_KILLED,
+                        observed=True,
+                        confidence=0.98,
+                        subject=pod,
+                        evidence={
+                            "source": "k8s_terminated_state",
+                            "exit_code": info.get("exit_code"),
+                            "container": info.get("container"),
+                        },
+                        source_rule=self.name,
+                    )
+                ]
+            if info.get("exit_code") == 137:
+                # exit 137 без OOMKilled в reason — может быть kill -9 или OOM.
+                return [
+                    Fact(
+                        kind=FactKind.OOM_KILLED,
+                        observed=True,
+                        confidence=0.55,
+                        subject=pod,
+                        evidence={
+                            "source": "k8s_terminated_state",
+                            "exit_code": 137,
+                            "note": "exit 137 without explicit OOMKilled reason",
+                            "container": info.get("container"),
+                        },
+                        source_rule=self.name,
+                    )
+                ]
+
         text = self.text_haystack(ctx)
 
         hard = self.count_matches(text, _HARD_PATTERN)

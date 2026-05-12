@@ -11,7 +11,7 @@ class Settings(BaseSettings):
     """
 
     ENV: str = Field("development", description="Environment (production/development)")
-    ANTHROPIC_API_KEY: str = Field(..., description="API key for Anthropic Claude")
+    ANTHROPIC_API_KEY: Optional[str] = Field(None, description="API key for Anthropic Claude (not needed when LLM_BACKEND=claude_cli)")
 
     DATABASE_URL: str = Field(
         "postgresql://user:password@localhost:5432/dbname",
@@ -54,7 +54,7 @@ class Settings(BaseSettings):
 
     LOG_LEVEL: str = Field("INFO", description="Standard logging level")
 
-    DISCORD_WEBHOOK_URL: str = Field(..., description="Discord webhook URL")
+    DISCORD_WEBHOOK_URL: Optional[str] = Field(None, description="Discord webhook URL (пусто = discord отключён)")
 
     # Auth
     JWT_PUBLIC_KEY: str = Field("", description="RSA Public Key for JWT validation")
@@ -99,6 +99,11 @@ class Settings(BaseSettings):
 
     @model_validator(mode="after")
     def _enforce_prod_invariants(self) -> "Settings":
+        if self.LLM_BACKEND == "anthropic" and not self.ANTHROPIC_API_KEY:
+            raise ValueError(
+                "ANTHROPIC_API_KEY is required when LLM_BACKEND=anthropic. "
+                "For local dev without an API key, set LLM_BACKEND=claude_cli."
+            )
         if self.ENV == "production":
             if not self.SAFE_MODE:
                 raise ValueError(

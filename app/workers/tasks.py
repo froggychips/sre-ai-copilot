@@ -15,6 +15,7 @@ from app.core.state_machine import IncidentState, StateMachine
 from app.core.tracing import StageTimer
 from app.database import IncidentRecord, SessionLocal
 from app.diagnostics import default_engine as diag_engine
+from app.context.k8s_facts import K8sFacts
 from app.diagnostics.facts import FactStore
 from app.diagnostics.incident_ctx import build_diagnostics_ctx
 from app.knowledge_graph.auto_populator import populate_from_incident
@@ -167,6 +168,23 @@ async def async_process_incident(incident_data: dict):
             diag_ctx = build_diagnostics_ctx(
                 incident=incident, analyzer_summary=analysis, kg_session=db
             )
+            # Enrich с живыми k8s данными: pod logs, terminated reasons, events.
+            # Best-effort — если кластер недоступен, diag_ctx остаётся без enrichment,
+            # rules выдадут ✗ как обычно.
+            if incident.namespace:
+                try:
+                    k8s_snap = await K8sFacts.collect_snapshot(
+                        namespace=incident.namespace,
+                        pod=incident.labels.get("pod"),
+                    )
+                    diag_ctx["logs_summary"] = k8s_snap.text
+                    diag_ctx["k8s_pod_state"] = k8s_snap.container_terminated
+                    diag_ctx["k8s_events"] = k8s_snap.pod_events
+                except Exception as _k8s_err:
+                    audit_service.log_event(
+                        "K8S_ENRICHMENT_FAILED",
+                        {"incident_id": incident_id, "error": type(_k8s_err).__name__},
+                    )
             fact_store = diag_engine.run(diag_ctx)
         snap = t.snapshot().to_dict()
         safe_transition(IncidentState.FACTS_COLLECTED, snap)
