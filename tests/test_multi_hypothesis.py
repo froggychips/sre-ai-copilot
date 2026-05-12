@@ -137,7 +137,7 @@ def facts_oom_only():
 
 @pytest.mark.asyncio
 async def test_orchestrator_fans_out_and_grounds(facts_oom_only):
-    """Все 3 perspective дают по 1 гипотезе на oom_killed — остаются все."""
+    """Все 4 perspective дают по 1 гипотезе на oom_killed — остаются все."""
     captured = {"calls": []}
 
     async def fake_ask(self, user_context, instruction=""):
@@ -154,11 +154,11 @@ async def test_orchestrator_fans_out_and_grounds(facts_oom_only):
             incident_summary="pod stub-1 OOMKilled", facts=facts_oom_only
         )
 
-    # Все 3 perspective отработали.
+    # Все 4 perspective отработали.
     assert set(captured["calls"]) == {
-        "Hypothesis-app", "Hypothesis-infra", "Hypothesis-deps"
+        "Hypothesis-app", "Hypothesis-infra", "Hypothesis-deps", "Hypothesis-runtime"
     }
-    assert len(result.items) == 3
+    assert len(result.items) == 4
     # Все hypotheses сохранили oom_killed anchor (он observed).
     for h in result.items:
         assert h.anchored_facts == ["oom_killed"]
@@ -180,7 +180,7 @@ async def test_orchestrator_filters_unobserved_anchors(facts_oom_only):
             incident_summary="anything", facts=facts_oom_only
         )
 
-    assert result.items == []  # все 3 perspective выкинуло
+    assert result.items == []  # все perspective выкинуло
 
 
 @pytest.mark.asyncio
@@ -202,7 +202,7 @@ async def test_orchestrator_survives_perspective_exception(facts_oom_only):
 
     perspectives = {h.perspective for h in result.items}
     assert "deps" not in perspectives
-    assert perspectives == {"app", "infra"}
+    assert perspectives == {"app", "infra", "runtime"}
 
 
 @pytest.mark.asyncio
@@ -213,4 +213,4 @@ async def test_perspective_agent_validates_perspective_name():
 
 def test_perspectives_registry_unchanged():
     """Гайдрейл: если добавляешь новый perspective — синхронизируй тест."""
-    assert set(PERSPECTIVES.keys()) == {"app", "infra", "deps"}
+    assert set(PERSPECTIVES.keys()) == {"app", "infra", "deps", "runtime"}

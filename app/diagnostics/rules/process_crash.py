@@ -64,6 +64,8 @@ class ProcessCrashRule(Rule):
         pod_state = ctx.get("k8s_pod_state") or {}
         structured_fact = self._check_pod_state(pod_state, pod)
         if structured_fact is not None:
+            if structured_fact.observed and ctx.get("core_dump_node"):
+                structured_fact.evidence["core_dump_node"] = ctx["core_dump_node"]
             return [structured_fact]
 
         # ── 2. Regex fallback на текст логов ──────────────────────────────
@@ -104,6 +106,10 @@ class ProcessCrashRule(Rule):
                 source_rule=self.name,
             )
         ]
+
+    def _core_dump_evidence(self, ctx: Dict[str, Any]) -> Dict[str, Any]:
+        node = ctx.get("core_dump_node")
+        return {"core_dump_node": node} if node else {}
 
     def _check_pod_state(
         self, pod_state: Dict[str, Any], pod: Optional[str]

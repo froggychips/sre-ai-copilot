@@ -16,8 +16,10 @@ from app.core.tracing import StageTimer
 from app.database import IncidentRecord, SessionLocal
 from app.diagnostics import default_engine as diag_engine
 from app.context.k8s_facts import K8sFacts
+from app.context.vm_client import VMClient
 from app.diagnostics.facts import FactStore
 from app.diagnostics.incident_ctx import build_diagnostics_ctx
+from app.services.teamcity_service import incident_teamcity_context
 from app.knowledge_graph.auto_populator import populate_from_incident
 from app.models.incident import Incident
 from app.observability.ai_metrics import (track_disagreement,
@@ -165,12 +167,29 @@ async def async_process_incident(incident_data: dict):
         # Это сердцевина fact-anchored архитектуры: LLM-стадии дальше
         # работают ПОВЕРХ фактов, а не сырого текста alert-а.
         async with StageTimer("diagnostics") as t:
+            # TC context — enriches recent_deployments перед build_diagnostics_ctx.
+            # Best-effort: squad-N namespaces не маппятся (branch_for_namespace=None),
+            # prod/preprod/squad-gd получают список билдов за TC_LOOKBACK_MINUTES.
+            if incident.teamcity_context is None:
+                try:
+                    tc_ctx = await incident_teamcity_context(
+                        namespace=incident.namespace,
+                        incident_starts_at=incident.starts_at,
+                    )
+                    if tc_ctx:
+                        incident.teamcity_context = tc_ctx
+                except Exception as _tc_err:
+                    audit_service.log_event(
+                        "TC_ENRICHMENT_FAILED",
+                        {"incident_id": incident_id, "error": type(_tc_err).__name__},
+                    )
+
             diag_ctx = build_diagnostics_ctx(
                 incident=incident, analyzer_summary=analysis, kg_session=db
             )
-            # Enrich с живыми k8s данными: pod logs, terminated reasons, events.
-            # Best-effort — если кластер недоступен, diag_ctx остаётся без enrichment,
-            # rules выдадут ✗ как обычно.
+
+            # K8s enrichment: pod logs (previous first, tail 200), terminated
+            # reasons, events, core dump detection. Best-effort.
             if incident.namespace:
                 try:
                     k8s_snap = await K8sFacts.collect_snapshot(
@@ -180,11 +199,45 @@ async def async_process_incident(incident_data: dict):
                     diag_ctx["logs_summary"] = k8s_snap.text
                     diag_ctx["k8s_pod_state"] = k8s_snap.container_terminated
                     diag_ctx["k8s_events"] = k8s_snap.pod_events
+                    if k8s_snap.core_dump_node:
+                        diag_ctx["core_dump_node"] = k8s_snap.core_dump_node
                 except Exception as _k8s_err:
                     audit_service.log_event(
                         "K8S_ENRICHMENT_FAILED",
                         {"incident_id": incident_id, "error": type(_k8s_err).__name__},
                     )
+
+            # VictoriaMetrics: memory/CPU trend за 15 мин до инцидента.
+            # Best-effort: если URL не задан или VM недоступна — молчим.
+            if settings.VICTORIA_METRICS_URL and incident.namespace:
+                try:
+                    from datetime import datetime, timezone
+                    pod = incident.labels.get("pod", "")
+                    incident_ts = None
+                    if incident.starts_at:
+                        try:
+                            incident_ts = datetime.fromisoformat(
+                                incident.starts_at.replace("Z", "+00:00")
+                            )
+                        except ValueError:
+                            pass
+                    vm = VMClient(
+                        settings.VICTORIA_METRICS_URL,
+                        timeout=10.0,
+                    )
+                    metrics = await vm.get_pod_metrics(
+                        namespace=incident.namespace,
+                        pod=pod,
+                        window_minutes=settings.VICTORIA_METRICS_WINDOW_MINUTES,
+                        incident_time=incident_ts,
+                    )
+                    diag_ctx["metrics_summary"] = metrics
+                except Exception as _vm_err:
+                    audit_service.log_event(
+                        "VM_ENRICHMENT_FAILED",
+                        {"incident_id": incident_id, "error": type(_vm_err).__name__},
+                    )
+
             fact_store = diag_engine.run(diag_ctx)
         snap = t.snapshot().to_dict()
         safe_transition(IncidentState.FACTS_COLLECTED, snap)
