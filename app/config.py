@@ -121,6 +121,22 @@ class Settings(BaseSettings):
     # backend-services живёт в new-wo/backend-services (id найдём динамически).
     GITLAB_BACKEND_PROJECT: str = Field("new-wo/backend-services", description="GitLab project path для backend MR-поиска")
 
+    # ClickHouse prod — blast radius (активные игроки вокруг времени инцидента).
+    # Внешний хост, не требует port-forward.
+    CH_PROD_HOST: str = Field("", description="ClickHouse prod host")
+    CH_PROD_PORT: int = Field(8725, description="ClickHouse HTTP port")
+    CH_PROD_USER: str = Field("", description="ClickHouse user")
+    CH_PROD_PASSWORD: str = Field("", description="ClickHouse password")
+    CH_BLAST_RADIUS_WINDOW_MINUTES: int = Field(15, description="Minutes before/after incident to check active players")
+
+    # Statics Postgres — версии конфигов, проверка entity по ошибке DI.
+    # Внешний хост, не требует port-forward.
+    STATICS_HOST: str = Field("", description="Statics Postgres host")
+    STATICS_PORT: int = Field(31700, description="Statics Postgres port")
+    STATICS_USER: str = Field("claude", description="Statics Postgres user")
+    STATICS_PASSWORD: str = Field("", description="Statics Postgres password")
+    STATICS_RECENT_VERSIONS: int = Field(5, description="How many recent statics versions to compare")
+
     # Atlassian Jira — поиск известных инцидентов/задач по сервису.
     # Basic Auth: email + API token (https://id.atlassian.com/manage-profile/security/api-tokens)
     # Пусто = Jira отключена (graceful degrade).

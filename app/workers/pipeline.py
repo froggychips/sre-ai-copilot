@@ -45,8 +45,10 @@ from app.knowledge_graph.auto_populator import populate_from_incident
 from app.models.incident import Incident
 from app.observability.ai_metrics import track_disagreement, track_no_survivor
 from app.services.audit_logger import audit_service
+from app.services.clickhouse_service import get_blast_radius
 from app.services.discord_service import discord_service
 from app.services.gitlab_service import enrich_with_gitlab, gitlab_context_to_prompt
+from app.services.statics_service import check_statics_for_error
 from app.services.teamcity_service import incident_teamcity_context
 
 logger = structlog.get_logger()
@@ -124,6 +126,8 @@ class IncidentPipeline:
         self.synthesis: Optional[str] = None
         self.cluster_health_context: Optional[str] = None
         self.gitlab_context: Optional[Dict[str, Any]] = None
+        self.blast_radius_context: Optional[str] = None
+        self.statics_check_context: Optional[str] = None
 
     # ------------------------------------------------------------------
     # State machine helpers
@@ -175,12 +179,49 @@ class IncidentPipeline:
                 analyzer_summary=self.analysis,
                 kg_session=self.db,
             )
-            await self._enrich_k8s(diag_ctx)
-            await self._enrich_vm(diag_ctx)
+            await asyncio.gather(
+                self._enrich_k8s(diag_ctx),
+                self._enrich_vm(diag_ctx),
+                self._enrich_clickhouse(diag_ctx),
+                self._enrich_statics(diag_ctx),
+                return_exceptions=True,
+            )
             self.fact_store = diag_engine.run(diag_ctx)
         snap = t.snapshot().to_dict()
         self._safe_transition(IncidentState.FACTS_COLLECTED, snap)
         self.traces.append(snap)
+
+    async def _enrich_clickhouse(self, diag_ctx: dict) -> None:
+        if not self.incident.namespace or not self.incident.starts_at:
+            return
+        try:
+            blast = await get_blast_radius(
+                namespace=self.incident.namespace,
+                starts_at=self.incident.starts_at,
+            )
+            if blast:
+                diag_ctx["blast_radius"] = blast
+                self.blast_radius_context = blast
+                audit_service.log_event("CH_BLAST_RADIUS_ENRICHED", {"incident_id": self.incident_id})
+        except Exception as e:
+            audit_service.log_event("CH_ENRICH_FAILED", {"incident_id": self.incident_id, "error": str(e)})
+
+    async def _enrich_statics(self, diag_ctx: dict) -> None:
+        error_text = (
+            (self.incident.annotations or {}).get("description")
+            or self.incident.description
+            or ""
+        )
+        if not error_text:
+            return
+        try:
+            statics_check = await check_statics_for_error(error_text)
+            if statics_check:
+                diag_ctx["statics_check"] = statics_check
+                self.statics_check_context = statics_check
+                audit_service.log_event("STATICS_ENRICHED", {"incident_id": self.incident_id})
+        except Exception as e:
+            audit_service.log_event("STATICS_ENRICH_FAILED", {"incident_id": self.incident_id, "error": str(e)})
 
     async def _enrich_gitlab(self) -> None:
         try:
@@ -307,6 +348,12 @@ class IncidentPipeline:
         gl_prompt = gitlab_context_to_prompt(self.gitlab_context)
         if gl_prompt:
             summary = f"{summary}\n\n{gl_prompt}"
+
+        if self.blast_radius_context:
+            summary = f"{summary}\n\n{self.blast_radius_context}"
+
+        if self.statics_check_context:
+            summary = f"{summary}\n\n{self.statics_check_context}"
 
         if self.similar_past:
             bullets = []
@@ -471,6 +518,8 @@ class IncidentPipeline:
                 "consensus_kinds": self.critiqued.consensus_kinds(),
                 "cluster_health_context": self.cluster_health_context,
                 "gitlab_context": self.gitlab_context,
+                "blast_radius_context": self.blast_radius_context,
+                "statics_check_context": self.statics_check_context,
             }
             self._safe_transition(IncidentState.RESOLVED, synth_snap)
             record.trace = self.traces + [synth_snap]
