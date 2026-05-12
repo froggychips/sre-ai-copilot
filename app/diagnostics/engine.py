@@ -13,7 +13,7 @@ from typing import Any, Dict, List, Optional
 
 import structlog
 
-from app.diagnostics.facts import Fact, FactStore
+from app.diagnostics.facts import Fact, FactStore, MUTUALLY_EXCLUSIVE_PAIRS
 from app.diagnostics.rules import DEFAULT_RULES, Rule
 from app.observability.ai_metrics import track_fact_observed
 
@@ -49,7 +49,33 @@ class DiagnosticEngine:
                     continue
                 store.add(f)
                 track_fact_observed(kind=f.kind, observed=f.observed)
+
+        self._apply_conflict_signals(store)
         return store
+
+    @staticmethod
+    def _apply_conflict_signals(store: FactStore) -> None:
+        """Понижает confidence конфликтующих фактов и проставляет cross-reference.
+
+        Если два взаимоисключающих факта оба observed=True — данные противоречивы.
+        Caps обоих до 0.60, чтобы Critic не строил сильных гипотез на
+        противоречивом основании.
+        """
+        _CONFLICT_CONF_CAP = 0.60
+        for a, b in store.conflicts():
+            if a.confidence > _CONFLICT_CONF_CAP:
+                a.confidence = _CONFLICT_CONF_CAP
+            if b.confidence > _CONFLICT_CONF_CAP:
+                b.confidence = _CONFLICT_CONF_CAP
+            a.evidence.setdefault("conflict_with", b.kind)
+            b.evidence.setdefault("conflict_with", a.kind)
+            logger.warning(
+                "fact_conflict_detected",
+                kind_a=a.kind,
+                kind_b=b.kind,
+                source_a=a.source_rule,
+                source_b=b.source_rule,
+            )
 
 
 # Singleton для случаев, когда нет смысла переопределять правила.

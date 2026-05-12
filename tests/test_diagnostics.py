@@ -12,7 +12,7 @@ from datetime import datetime, timedelta, timezone
 import pytest
 
 from app.diagnostics import DiagnosticEngine, default_engine
-from app.diagnostics.facts import Fact, FactKind, FactStore
+from app.diagnostics.facts import Fact, FactKind, FactStore, MUTUALLY_EXCLUSIVE_PAIRS
 from app.diagnostics.rules import (
     CrashLoopBackOffRule,
     FailedSchedulingRule,
@@ -248,6 +248,80 @@ def test_upstream_empty_list_means_checked_and_clean():
     })
     assert facts[0].observed is False
     assert facts[0].confidence >= 0.85
+
+
+# ---------- Fact conflict detection --------------------------------------
+
+def test_factstore_no_conflicts_when_only_one_observed():
+    store = FactStore([
+        Fact(kind=FactKind.OOM_KILLED, observed=True, confidence=0.95),
+        Fact(kind=FactKind.PROCESS_CRASH, observed=False, confidence=0.70),
+    ])
+    assert store.conflicts() == []
+
+
+def test_factstore_detects_oom_process_crash_conflict():
+    store = FactStore([
+        Fact(kind=FactKind.OOM_KILLED, observed=True, confidence=0.95),
+        Fact(kind=FactKind.PROCESS_CRASH, observed=True, confidence=0.97),
+    ])
+    conflicts = store.conflicts()
+    assert len(conflicts) == 1
+    kinds = {conflicts[0][0].kind, conflicts[0][1].kind}
+    assert kinds == {FactKind.OOM_KILLED, FactKind.PROCESS_CRASH}
+
+
+def test_engine_caps_confidence_on_conflict():
+    """DiagnosticEngine понижает confidence конфликтующих фактов до 0.60."""
+    from app.diagnostics.rules.process_crash import ProcessCrashRule
+    engine = DiagnosticEngine(rules=[OOMKilledRule(), ProcessCrashRule()])
+    store = engine.run({
+        "pod": "notificator-abc",
+        "description": "container OOMKilled",  # triggers OOMKilledRule text match
+        "k8s_pod_state": {
+            "notificator-abc": {"reason": "Error", "exit_code": 139, "container": "app"},
+        },
+    })
+    # ProcessCrashRule → process_crash=✓; OOMKilledRule → non-OOM exit suppresses text
+    # (нет конфликта после фикса OOMKilledRule). Проверяем что при явном конфликте cap работает.
+    # Форсируем конфликт через прямой FactStore:
+    conflict_store = FactStore([
+        Fact(kind=FactKind.OOM_KILLED, observed=True, confidence=0.95),
+        Fact(kind=FactKind.PROCESS_CRASH, observed=True, confidence=0.97),
+    ])
+    from app.diagnostics.engine import DiagnosticEngine as DE
+    DE._apply_conflict_signals(conflict_store)
+    oom_fact = conflict_store.by_kind(FactKind.OOM_KILLED)[0]
+    crash_fact = conflict_store.by_kind(FactKind.PROCESS_CRASH)[0]
+    assert oom_fact.confidence == 0.60
+    assert crash_fact.confidence == 0.60
+    assert oom_fact.evidence["conflict_with"] == FactKind.PROCESS_CRASH
+    assert crash_fact.evidence["conflict_with"] == FactKind.OOM_KILLED
+
+
+def test_conflict_visible_in_prompt_context():
+    """<conflicts> блок появляется в to_prompt_context() при конфликте."""
+    store = FactStore([
+        Fact(kind=FactKind.OOM_KILLED, observed=True, confidence=0.95),
+        Fact(kind=FactKind.PROCESS_CRASH, observed=True, confidence=0.97),
+    ])
+    ctx = store.to_prompt_context()
+    assert "<conflicts>" in ctx
+    assert "mutually exclusive" in ctx
+
+
+def test_no_conflict_block_when_clean():
+    store = FactStore([
+        Fact(kind=FactKind.OOM_KILLED, observed=True, confidence=0.95),
+    ])
+    ctx = store.to_prompt_context()
+    assert "<conflicts>" not in ctx
+
+
+def test_mutually_exclusive_pairs_covers_oom_and_crash():
+    """Гайдрейл: oom_killed ↔ process_crash должны быть в MUTUALLY_EXCLUSIVE_PAIRS."""
+    pair_kinds = [set(p) for p in MUTUALLY_EXCLUSIVE_PAIRS]
+    assert {FactKind.OOM_KILLED, FactKind.PROCESS_CRASH} in pair_kinds
 
 
 # ---------- DiagnosticEngine ---------------------------------------------
