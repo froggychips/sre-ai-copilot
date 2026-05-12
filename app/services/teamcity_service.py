@@ -14,6 +14,7 @@ Graceful degrade (None) если ни один транспорт не дост�
 from __future__ import annotations
 
 import asyncio
+import os
 import re
 import sys
 from datetime import datetime, timedelta, timezone
@@ -25,10 +26,11 @@ import structlog
 from app.config import settings
 from app.services.mcp_client import McpHttpClient
 
-# Локальный пакет teamcity_mcp — лежит рядом с проектом.
-_TC_MCP_SRC = "/Users/yaroslav/projects/teamcity-mcp/src"
-if _TC_MCP_SRC not in sys.path:
-    sys.path.insert(0, _TC_MCP_SRC)
+# Пакет teamcity_mcp — устанавливается отдельно (pip install teamcity-mcp).
+# В dev можно передать путь через TC_MCP_SRC env var.
+_tc_mcp_src = os.environ.get("TC_MCP_SRC", "")
+if _tc_mcp_src and _tc_mcp_src not in sys.path:
+    sys.path.insert(0, _tc_mcp_src)
 try:
     from teamcity_mcp.client import TeamCityClient as _TCClient
     _TC_CLIENT_AVAILABLE = True
@@ -44,10 +46,7 @@ _BRANCH_RULES = [
     (re.compile(r"^prod(-|$)"), "prod"),
     (re.compile(r"^preprod(-|$)"), "preprod"),
     (re.compile(r"^preupdate(-|$)"), "preupdate"),
-    (
-        re.compile(r"^squad-gd(-|$)"),
-        "preprod",
-    ),  # WO-11324: squad-gd деплоится из preprod-ветки
+    (re.compile(r"^squad-gd(-|$)"), "preprod"),
 ]
 
 

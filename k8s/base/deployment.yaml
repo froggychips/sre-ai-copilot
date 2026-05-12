@@ -1,3 +1,15 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: sre-ai-api
+spec:
+  selector:
+    app: sre-ai-api
+  ports:
+  - name: http
+    port: 8000
+    targetPort: 8000
+---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -23,7 +35,7 @@ spec:
       containers:
       - name: api
         # Pin по digest в CI: image: ghcr.io/froggychips/sre-ai-copilot@sha256:<digest>
-        image: froggychips/sre-ai-copilot:latest
+        image: ghcr.io/froggychips/sre-ai-copilot:latest
         ports:
         - containerPort: 8000
         securityContext:
