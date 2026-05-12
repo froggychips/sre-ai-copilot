@@ -1,0 +1,90 @@
+# RBAC для sre-ai (api + worker).
+#
+# Принципы:
+#   * ОТКАЗ default-SA: pod-ы используют sre-ai SA с явным наборов прав.
+#   * Чтение — широкое (pod/pod log/event/deployment в большинстве ns).
+#   * Запись — только то, что реально дёргает agent fix/synthesis:
+#       - deployments rollout (patch/scale) — в whitelisted namespace-ах.
+#       - pod eviction (delete) — там же.
+#   * forbidden ns (kube-system, kube-public, kube-node-lease, chaos-mesh, mcp)
+#     не покрываются НИЧЕМ — guard в коде дополнительно блокирует, но и API
+#     уровень тоже отрезан.
+#
+# Применять отдельно для каждого target-namespace (squad-*):
+#   kubectl -n squad-foo apply -f rbac.yaml
+# либо через kustomize patch — добавлять RoleBinding для нужных namespace-ов.
+
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: sre-ai
+  labels:
+    app.kubernetes.io/part-of: sre-ai-copilot
+automountServiceAccountToken: true
+
+---
+# Read-only Role на текущий namespace — применяется в любом ns, куда
+# деплоится sre-ai либо где он должен расследовать инциденты.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: sre-ai-read
+rules:
+- apiGroups: [""]
+  resources: ["pods", "pods/log", "events", "services", "endpoints", "configmaps"]
+  verbs: ["get", "list", "watch"]
+- apiGroups: ["apps"]
+  resources: ["deployments", "statefulsets", "replicasets", "daemonsets"]
+  verbs: ["get", "list", "watch"]
+- apiGroups: ["metrics.k8s.io"]
+  resources: ["pods", "nodes"]
+  verbs: ["get", "list"]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: sre-ai-read
+subjects:
+- kind: ServiceAccount
+  name: sre-ai
+  namespace: default  # перенесать в свой namespace при kustomize-overlay
+roleRef:
+  kind: Role
+  name: sre-ai-read
+  apiGroup: rbac.authorization.k8s.io
+
+---
+# Write-Role применяется ТОЛЬКО в squad-* (через отдельный RoleBinding).
+# Не делать ClusterRoleBinding — иначе обходим principle of least privilege.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: sre-ai-remediate
+rules:
+- apiGroups: ["apps"]
+  resources: ["deployments", "deployments/scale"]
+  verbs: ["get", "list", "patch", "update"]
+- apiGroups: [""]
+  resources: ["pods"]
+  verbs: ["delete"]  # для restart/eviction
+- apiGroups: [""]
+  resources: ["pods/exec"]
+  verbs: ["create"]  # под жёстким allowlist в k8s_guard
+
+---
+# Пример write-binding в squad-* namespace. Размножать через kustomize.
+# Не применять автоматически — каждый bind должен быть осознанным merge'ем.
+# apiVersion: rbac.authorization.k8s.io/v1
+# kind: RoleBinding
+# metadata:
+#   name: sre-ai-remediate
+#   namespace: squad-foo
+# subjects:
+# - kind: ServiceAccount
+#   name: sre-ai
+#   namespace: default
+# roleRef:
+#   kind: Role
+#   name: sre-ai-remediate
+#   apiGroup: rbac.authorization.k8s.io

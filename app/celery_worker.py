@@ -69,7 +69,7 @@ async def _generate_reply_logic(
             enriched_ctx = snapshot.get("payload", {})
         else:
             builder = ContextBuilder()
-            enriched_ctx = builder.build_context(conv.data)
+            enriched_ctx = await builder.build_context(conv.data)
 
         # Reasoning Loop
         for iteration in range(3):

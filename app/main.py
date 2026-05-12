@@ -29,13 +29,17 @@ app = FastAPI(**app_configs)
 setup_telemetry(app)
 
 app.add_middleware(RequestIDMiddleware)
-if settings.ENV == "production":
-    allowed_origins = [
-        "https://grafana.example.com",
-        "https://app.example.com",
-    ]  # Replace with actual domains
-else:
-    allowed_origins = ["http://localhost:3000", "http://localhost:5173"]
+
+# CORS origins берутся из settings.ALLOWED_ORIGINS. В .env передавать как
+# JSON-массив (pydantic умеет парсить):
+#   ALLOWED_ORIGINS=["https://grafana.example.com","https://app.example.com"]
+# Default settings.ALLOWED_ORIGINS = ["*"] — допустимо только для dev.
+allowed_origins = settings.ALLOWED_ORIGINS
+if settings.ENV == "production" and allowed_origins == ["*"]:
+    raise RuntimeError(
+        "ALLOWED_ORIGINS=['*'] is forbidden in production. "
+        "Set a concrete origin list in env/secrets."
+    )
 
 app.add_middleware(
     CORSMiddleware,
@@ -66,10 +70,6 @@ async def rate_limit_middleware(request: Request, call_next):
 
 @app.middleware("http")
 async def metrics_middleware(request: Request, call_next):
-    start_time = time.time()
-    response = await call_next(request)
-    observe_request_latency(time.time() - start_time)
-    return response
     start_time = time.time()
     response = await call_next(request)
     observe_request_latency(time.time() - start_time)

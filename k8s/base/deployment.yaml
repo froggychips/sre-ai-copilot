@@ -12,12 +12,17 @@ spec:
       labels:
         app: sre-ai-api
     spec:
+      serviceAccountName: sre-ai
+      automountServiceAccountToken: true
       securityContext:
         runAsNonRoot: true
         runAsUser: 10001
         fsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
       containers:
       - name: api
+        # Pin по digest в CI: image: ghcr.io/froggychips/sre-ai-copilot@sha256:<digest>
         image: froggychips/sre-ai-copilot:latest
         ports:
         - containerPort: 8000
@@ -33,14 +38,28 @@ spec:
           httpGet:
             path: /healthz
             port: 8000
-        readinessProbe:
-          exec:
-            command:
-            - pg_isready
-            - -d
-            - "$(DATABASE_URL)"
-          initialDelaySeconds: 5
+          initialDelaySeconds: 30
           periodSeconds: 10
+          timeoutSeconds: 5
+          failureThreshold: 3
+        readinessProbe:
+          # /readyz уже делает SELECT 1 к Postgres (см. app/main.py:readyz).
+          # pg_isready через exec.command не раскрывает $(DATABASE_URL) без
+          # shell — отсюда и шёл silent-fail. HTTP-проба надёжнее.
+          httpGet:
+            path: /readyz
+            port: 8000
+          initialDelaySeconds: 10
+          periodSeconds: 10
+          timeoutSeconds: 5
+          failureThreshold: 3
+        startupProbe:
+          httpGet:
+            path: /healthz
+            port: 8000
+          # До 60 секунд на старт — достаточно для миграции БД и init-overhead.
+          periodSeconds: 5
+          failureThreshold: 12
         resources:
           limits:
             cpu: 500m
@@ -48,6 +67,16 @@ spec:
           requests:
             cpu: 200m
             memory: 256Mi
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: sre-ai-api-pdb
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app: sre-ai-api
 ---
 apiVersion: networking.k8s.io/v1
 kind: Ingress

@@ -156,16 +156,25 @@ class TestConfiguration:
     """Test application configuration"""
 
     def test_safe_mode_validation(self):
-        """Test SAFE_MODE validation in production"""
-        # Production with SAFE_MODE=False should warn
-        with patch("app.config.structlog.get_logger") as mock_logger:
-            settings = Settings(
+        """SAFE_MODE=false в prod должен фейлить инициализацию (strict-блокировка)."""
+        with pytest.raises(ValidationError, match="SAFE_MODE"):
+            Settings(
                 ENV="production",
                 SAFE_MODE=False,
                 ANTHROPIC_API_KEY="test-key",
                 DISCORD_WEBHOOK_URL="http://test",
+                ALERTMANAGER_WEBHOOK_SECRET="any-secret",
             )
-            # Should initialize without error
+
+    def test_prod_requires_webhook_secret(self):
+        """prod без ALERTMANAGER_WEBHOOK_SECRET должен фейлить (HMAC обязателен)."""
+        with pytest.raises(ValidationError, match="ALERTMANAGER_WEBHOOK_SECRET"):
+            Settings(
+                ENV="production",
+                SAFE_MODE=True,
+                ANTHROPIC_API_KEY="test-key",
+                DISCORD_WEBHOOK_URL="http://test",
+            )
 
 
 class TestIncidentPipeline:
