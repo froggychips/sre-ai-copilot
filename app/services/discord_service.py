@@ -56,7 +56,8 @@ class DiscordService:
         status_icon = "✅" if resolution_quality == "resolved" else "⚠️"
         recurrence_tag = " · 🔁 RECURRENCE" if is_recurrence else ""
         flap_tag = f" · 🔄 ×{flap_count}" if flap_count > 0 else ""
-        title = f"{status_icon} {alertname} · {namespace}{recurrence_tag}{flap_tag}"
+        ns_part = f" · {namespace}" if namespace else ""
+        title = f"{status_icon} {alertname}{ns_part}{recurrence_tag}{flap_tag}"
 
         fields = []
         if service:
