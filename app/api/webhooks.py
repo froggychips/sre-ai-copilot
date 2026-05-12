@@ -60,21 +60,15 @@ def validate_alert_labels(alert):
     if not alertname:
         raise HTTPException(status_code=400, detail="Missing alertname in labels")
 
-    # Allowlist for alertname - adjust as needed
-    allowed_alertnames = {
-        "PodCrashLooping",
-        "HighCpuUsage",
-        "MemoryPressure",
-        "DeploymentUnavailable",
-    }
-    if alertname not in allowed_alertnames:
-        log.warning("unknown_alertname", alertname=alertname)
-        # For now, allow but log; in production, reject
-
     if namespace:
-        # Basic validation - no special chars that could be used for injection
+        # Basic validation — no special chars that could be used for injection
         if not re.match(r"^[a-z0-9-]+$", namespace):
             raise HTTPException(status_code=400, detail="Invalid namespace format")
+
+    # instance label (Node* alerts) — same injection guard
+    instance = labels.get("instance", "")
+    if instance and not re.match(r"^[a-zA-Z0-9._:/-]+$", instance):
+        raise HTTPException(status_code=400, detail="Invalid instance format")
 
 
 @router.post(
@@ -93,15 +87,16 @@ async def alertmanager_webhook(
     raw_payload.setdefault("id", payload.groupKey)
     raw_collector.ingest(raw_payload)
 
-    # States where the pipeline has already run or is in flight — no retry.
+    # States where the pipeline is already in-flight — skip re-dispatch.
     # FAILED is the only terminal state we allow to re-run (transient infra error).
+    # NOTE: RESOLVED is intentionally absent — a re-fire after RESOLVED is flapping
+    # and must be re-processed (see flapping detection below).
     _SKIP_STATES = {
-        IncidentState.OPEN.value,              # queued, pipeline hasn't started yet
+        IncidentState.OPEN.value,
         IncidentState.INVESTIGATING.value,
         IncidentState.FACTS_COLLECTED.value,
         IncidentState.HYPOTHESIS_GENERATED.value,
         IncidentState.FIX_PROPOSED.value,
-        IncidentState.RESOLVED.value,
     }
 
     accepted = []
@@ -109,14 +104,38 @@ async def alertmanager_webhook(
         validate_alert_labels(alert)
         incident = Incident.from_alertmanager(alert)
 
-        # Dedup check BEFORE TC enrichment — no point spending the TC roundtrip
-        # if we're going to skip this fingerprint anyway.
         existing = (
             db.query(IncidentRecord)
             .filter(IncidentRecord.incident_id == incident.incident_id)
             .first()
         )
-        if existing is not None and existing.status in _SKIP_STATES:
+
+        # ── RESOLVED webhook: update DB, no pipeline dispatch ──────────────
+        if alert.status == "resolved":
+            if existing is not None and existing.status not in {
+                IncidentState.RESOLVED.value,
+                IncidentState.FAILED.value,
+            }:
+                existing.status = IncidentState.RESOLVED.value
+                db.commit()
+                log.info("webhook.alert_resolved", incident_id=incident.incident_id,
+                         prev_status=existing.status)
+            accepted.append({"incident_id": incident.incident_id, "task_id": "resolved"})
+            continue
+
+        # ── FIRING: detect flapping (re-fire after RESOLVED) ───────────────
+        if existing is not None and existing.status == IncidentState.RESOLVED.value:
+            prev_flap_count = (existing.data or {}).get("flap_count", 0)
+            incident = incident.model_copy(update={"flap_count": prev_flap_count + 1})
+            log.info(
+                "webhook.flapping_detected",
+                incident_id=incident.incident_id,
+                flap_count=incident.flap_count,
+            )
+            # Fall through to TC enrichment + pipeline re-run.
+
+        # ── Normal dedup: pipeline already in-flight ───────────────────────
+        elif existing is not None and existing.status in _SKIP_STATES:
             log.info(
                 "webhook.deduplicated",
                 incident_id=incident.incident_id,
@@ -151,8 +170,10 @@ async def alertmanager_webhook(
                 )
             )
         else:
-            # FAILED retry: reset to OPEN so the state machine can advance again.
+            # Reset to OPEN for both FAILED retry and flapping re-fire.
+            # Overwrite data so flap_count is persisted in the row.
             existing.status = IncidentState.OPEN.value
+            existing.data = incident.model_dump()
         # Commit before pipeline: the worker opens its own SessionLocal and needs
         # the row to be visible before it starts writing state transitions.
         db.commit()

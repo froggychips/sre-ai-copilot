@@ -10,7 +10,7 @@ from prometheus_client import start_http_server
 from sqlalchemy import text
 
 from app import repository
-from app.api import approvals, replay, webhooks
+from app.api import approvals, discord_interactions, replay, webhooks
 from app.evaluation import feedback
 from app.auth import User, get_current_user
 from app.celery_worker import celery_app, generate_reply
@@ -99,6 +99,7 @@ app.include_router(webhooks.router, prefix="/webhooks")
 app.include_router(approvals.router, prefix="/approvals", tags=["approvals"])
 app.include_router(replay.router, prefix="/replay", tags=["replay"])
 app.include_router(feedback.router, prefix="/evaluation", tags=["evaluation"])
+app.include_router(discord_interactions.router, prefix="/discord", tags=["discord"])
 
 
 @app.post("/copilot", status_code=202)

@@ -47,6 +47,8 @@ class Incident(BaseModel):
     # Заполняется на ingestion из app.services.teamcity_service.incident_teamcity_context.
     # None = TC не сконфигурирован, namespace не маппится, или TC недоступен.
     teamcity_context: Optional[Dict[str, Any]] = None
+    # >0 если алерт снова сработал после RESOLVED — счётчик циклов флаппинга.
+    flap_count: int = 0
 
     @classmethod
     def from_alertmanager(cls, alert: AlertManagerAlert) -> "Incident":
