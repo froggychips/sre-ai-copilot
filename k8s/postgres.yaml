@@ -1,3 +1,13 @@
+# ⚠️ ЭТО DEV-ONLY single-replica Postgres.
+#
+# Для prod-grade HA использовать ОДИН из вариантов:
+#   * CloudNativePG (рекомендуется) — см. postgres.cnpg.yaml.example.
+#   * Managed (RDS / Cloud SQL / Aiven) — secrets.external.yaml забирает URL.
+#   * Bitnami `postgresql-ha` Helm chart — если HA на самом кластере.
+#
+# Single-replica устраивает только local kind/minikube и preview-env-ы,
+# где допустимо терять данные при рестарте ноды.
+
 apiVersion: v1
 kind: Service
 metadata:
@@ -29,6 +39,10 @@ spec:
       labels:
         app: postgres
     spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 999
+        fsGroup: 999
       containers:
         - name: postgres
           image: postgres:15-alpine
@@ -51,6 +65,30 @@ spec:
                 secretKeyRef:
                   name: postgres-secret
                   key: POSTGRES_DB
+            # PGDATA должна быть подпапкой, иначе init падает на lost+found.
+            - name: PGDATA
+              value: /var/lib/postgresql/data/pgdata
+          resources:
+            limits:
+              cpu: 1000m
+              memory: 1Gi
+            requests:
+              cpu: 200m
+              memory: 512Mi
+          livenessProbe:
+            exec:
+              command: ["/bin/sh", "-c", "pg_isready -U \"$POSTGRES_USER\" -d \"$POSTGRES_DB\""]
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 6
+          readinessProbe:
+            exec:
+              command: ["/bin/sh", "-c", "pg_isready -U \"$POSTGRES_USER\" -d \"$POSTGRES_DB\""]
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 3
           volumeMounts:
             - name: postgres-data
               mountPath: /var/lib/postgresql/data
@@ -59,7 +97,7 @@ spec:
         name: postgres-data
       spec:
         accessModes: ["ReadWriteOnce"]
-        storageClassName: "{{ .Values.storageClass }}"
+        # storageClassName: gp3   # на AWS EBS gp3; в kind/minikube — оставить пустым (default)
         resources:
           requests:
-            storage: 1Gi
+            storage: 50Gi

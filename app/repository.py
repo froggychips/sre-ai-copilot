@@ -6,7 +6,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import joinedload
 from starlette.concurrency import run_in_threadpool
 
-from app.db.session import SessionLocal
+from app.database import SessionLocal
 from app.models import Conversation, Message, MessageRole
 
 

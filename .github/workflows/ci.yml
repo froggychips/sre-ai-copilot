@@ -30,7 +30,7 @@ jobs:
         run: |
           /opt/homebrew/bin/python3.12 -m venv .venv
           .venv/bin/pip install --upgrade pip
-          .venv/bin/pip install ruff mypy pytest pytest-cov pytest-asyncio pytest-mock
+          .venv/bin/pip install ruff mypy pytest pytest-cov pytest-asyncio pytest-mock bandit pip-audit
           if [ -f requirements.txt ]; then .venv/bin/pip install -r requirements.txt; fi
 
       # Ruff and Mypy are non-blocking right now — the repo carries
@@ -45,8 +45,23 @@ jobs:
         continue-on-error: true
         run: .venv/bin/mypy .
 
+      # Coverage gate. Текущий baseline после Э4.* — 58%. Gate с буфером в 3%
+      # на флуктуации. Поднимать вручную при росте покрытия.
       - name: Run Pytest with Coverage
-        run: .venv/bin/pytest --cov=app --cov-report=xml
+        run: .venv/bin/pytest --cov=app --cov-report=xml --cov-fail-under=55
+
+      # bandit — статический security-скан кода. Игнорируем low/info,
+      # фейлим только на medium+. Известные исключения добавлять в
+      # .bandit/.bandit.yml, а не понижать порог.
+      - name: Bandit (security static analysis)
+        run: .venv/bin/bandit -r app -q --severity-level medium
+
+      # pip-audit — известные CVE в зависимостях. Не блокируем job,
+      # пока в долге pre-existing уязвимости; репортим в логах.
+      # Перевести в blocking, когда долг будет нулевой.
+      - name: pip-audit (dependency CVEs)
+        continue-on-error: true
+        run: .venv/bin/pip-audit --requirement requirements.txt --strict
 
   build-and-push:
     name: Build and Push Docker Image
@@ -56,6 +71,10 @@ jobs:
     permissions:
       contents: read
       packages: write
+      id-token: write  # OIDC для cosign keyless
+
+    outputs:
+      image-digest: ${{ steps.build.outputs.digest }}
 
     steps:
       - name: Checkout Code
@@ -69,10 +88,44 @@ jobs:
           password: ${{ secrets.GHCR_TOKEN }}
 
       - name: Build and Push Docker Image
+        id: build
         uses: docker/build-push-action@v7
         with:
           context: .
           push: true
           tags: |
-            ghcr.io/${{ github.repository }}:latest
             ghcr.io/${{ github.repository }}:${{ github.sha }}
+          # Не публикуем :latest — в k8s pin по digest. Перетягиваем тег
+          # ${{ github.sha }} вручную через retag при релизе, чтобы избежать
+          # race "deployment пришёл, а :latest уже новый".
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3
+
+      - name: Cosign sign image (keyless, OIDC)
+        env:
+          COSIGN_EXPERIMENTAL: "1"
+        run: |
+          cosign sign --yes \
+            ghcr.io/${{ github.repository }}@${{ steps.build.outputs.digest }}
+
+      - name: Install syft
+        uses: anchore/sbom-action/download-syft@v0
+
+      - name: Generate SBOM (SPDX)
+        run: |
+          syft "ghcr.io/${{ github.repository }}@${{ steps.build.outputs.digest }}" \
+            -o spdx-json > sbom.spdx.json
+
+      - name: Cosign attach SBOM
+        env:
+          COSIGN_EXPERIMENTAL: "1"
+        run: |
+          cosign attest --yes --predicate sbom.spdx.json --type spdx \
+            ghcr.io/${{ github.repository }}@${{ steps.build.outputs.digest }}
+
+      - name: Upload SBOM artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: sbom-${{ github.sha }}
+          path: sbom.spdx.json

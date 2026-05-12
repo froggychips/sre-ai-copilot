@@ -1,0 +1,155 @@
+# PrometheusRule для sre-ai-copilot.
+#
+# Требует prometheus-operator (kube-prometheus-stack) в кластере, который
+# подхватывает PrometheusRule по селектору.
+#
+# Метрики, на которые опираемся (app/metrics.py, app/observability/ai_metrics.py):
+#   * request_latency_seconds (Histogram)
+#   * celery_queue_length (Gauge)
+#   * llm_request_duration_seconds{model}
+#   * llm_api_errors_total{model,error_type}
+#   * llm_tokens_total{model,type}
+#
+# Алерты на DB / pod up{} — приходят из kube-state-metrics + postgres-exporter
+# (если не установлен — добавить в кластер отдельным шагом).
+
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: sre-ai-copilot
+  labels:
+    app.kubernetes.io/part-of: sre-ai-copilot
+    prometheus: kube-prometheus
+    role: alert-rules
+spec:
+  groups:
+  - name: sre-ai-copilot.llm
+    interval: 30s
+    rules:
+    - alert: SREAICopilotHighLLMErrorRate
+      expr: |
+        sum by (model, error_type) (rate(llm_api_errors_total[5m])) > 0.1
+      for: 10m
+      labels:
+        severity: warning
+        team: sre
+      annotations:
+        summary: "LLM API errors > 0.1/s on {{ $labels.model }} ({{ $labels.error_type }})"
+        description: |
+          Pipeline ловит LLM ошибки чаще 1 раз в 10 секунд за окно 5 мин.
+          Проверить ANTHROPIC_API_KEY rotation, rate-limit, или вышел ли
+          провайдер. Дешбоард: ai_metrics.
+        runbook_url: "https://github.com/froggychips/sre-ai-copilot/blob/master/docs/DR.md#llm-down"
+
+    - alert: SREAICopilotSlowLLM
+      expr: |
+        histogram_quantile(0.99,
+          sum by (le, model) (rate(llm_request_duration_seconds_bucket[10m]))
+        ) > 30
+      for: 15m
+      labels:
+        severity: warning
+        team: sre
+      annotations:
+        summary: "p99 LLM latency > 30s on {{ $labels.model }}"
+        description: |
+          99-й процентиль времени ответа LLM выше 30 секунд за окно 10 мин.
+          Это лочит Celery-worker (синхронный await) и копит очередь.
+
+    - alert: SREAICopilotLLMSilence
+      # absent() сигналит, если сервис вообще не отдаёт метрику — значит pod
+      # упал/не доехал до Prometheus, либо crashloop.
+      expr: absent(llm_request_duration_seconds_count) == 1
+      for: 5m
+      labels:
+        severity: critical
+        team: sre
+      annotations:
+        summary: "sre-ai-copilot не отдаёт llm_* метрики"
+        description: |
+          Prometheus не видит llm_request_duration_seconds_count.
+          Либо все pod-ы упали, либо scrape сломан.
+
+  - name: sre-ai-copilot.pipeline
+    interval: 30s
+    rules:
+    - alert: SREAICopilotCeleryBacklog
+      expr: celery_queue_length > 100
+      for: 10m
+      labels:
+        severity: warning
+        team: sre
+      annotations:
+        summary: "Celery queue > 100 task-ов 10+ мин"
+        description: |
+          Очередь Celery растёт. Возможно, worker заблокирован
+          синхронным IO (см. context_builder, Э3.4) или LLM медленный.
+
+    - alert: SREAICopilotApiP99Latency
+      expr: |
+        histogram_quantile(0.99,
+          sum by (le) (rate(request_latency_seconds_bucket[5m]))
+        ) > 5
+      for: 10m
+      labels:
+        severity: warning
+        team: sre
+      annotations:
+        summary: "p99 HTTP latency > 5s"
+        description: |
+          Webhook / approvals API отвечают медленно.
+
+  - name: sre-ai-copilot.infra
+    interval: 30s
+    rules:
+    - alert: SREAICopilotPostgresDown
+      # Требует postgres-exporter с label app=postgres (правится под локальный
+      # discovery selector).
+      expr: up{job=~".*postgres.*"} == 0
+      for: 2m
+      labels:
+        severity: critical
+        team: sre
+      annotations:
+        summary: "Postgres не отвечает scrape-у Prometheus"
+        description: |
+          DB недоступна или exporter лёг. sre-ai-copilot откажет в /readyz.
+
+    - alert: SREAICopilotApiDown
+      expr: |
+        kube_deployment_status_replicas_available{deployment="sre-ai-api"} == 0
+      for: 2m
+      labels:
+        severity: critical
+        team: sre
+      annotations:
+        summary: "Нет ready реплик sre-ai-api"
+        description: |
+          Deployment живой, но 0 ready pod-ов. Probes/секреты/RBAC?
+
+    - alert: SREAICopilotWorkerDown
+      expr: |
+        kube_deployment_status_replicas_available{deployment="copilot-worker"} == 0
+      for: 2m
+      labels:
+        severity: critical
+        team: sre
+      annotations:
+        summary: "Нет ready реплик copilot-worker"
+        description: |
+          Worker не обрабатывает incident-ы. Очередь будет расти.
+
+    - alert: SREAICopilotPodCrashLooping
+      expr: |
+        rate(kube_pod_container_status_restarts_total{
+          namespace=~".*",
+          pod=~"sre-ai-.*|copilot-worker-.*"
+        }[15m]) > 0
+      for: 15m
+      labels:
+        severity: warning
+        team: sre
+      annotations:
+        summary: "Pod {{ $labels.pod }} рестартится"
+        description: |
+          Контейнер падает с ненулевой регулярностью.

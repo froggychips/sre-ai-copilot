@@ -1,6 +1,6 @@
 from typing import List, Optional
 
-from pydantic import Field, field_validator
+from pydantic import Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -73,7 +73,11 @@ class Settings(BaseSettings):
 
     # Observability
     OTLP_EXPORTER_ENDPOINT: str = "http://tempo:4317"
-    AUDIT_LOG_PATH: str = "./audit.log"
+    # AUDIT_LOG_PATH:
+    #   "" / "-" / "stdout" → stdout (default, prod-acceptable: Fluent Bit / Loki ловят).
+    #   "/path/to/file"     → файл (dev / local-e2e). Под readOnlyRootFilesystem
+    #                          в k8s — упадёт, что и требуется (явная ошибка > silent drop).
+    AUDIT_LOG_PATH: str = ""
 
     # TeamCity integration — обогащение incident-а recent-deploys.
     # Ходим через mcp-teamcity-server (external/mcp/teamcity-server, MR !1):
@@ -93,20 +97,20 @@ class Settings(BaseSettings):
     TC_LOOKBACK_MINUTES: int = 60
     TC_BACKEND_PROJECT_ID: str = "Wo_Backend_K8sNewCluster"
 
-    @validator("SAFE_MODE")
-    def validate_safe_mode(cls, v, values):
-        env = values.get("ENV", "development")
-        if env == "production" and not v:
-            # In production, SAFE_MODE=false requires compensating controls
-            # For now, allow but log warning; in strict mode, raise error
-            import structlog
-
-            logger = structlog.get_logger()
-            logger.warning(
-                "production_safe_mode_disabled",
-                message="SAFE_MODE=false in production without compensating controls",
-            )
-        return v
+    @model_validator(mode="after")
+    def _enforce_prod_invariants(self) -> "Settings":
+        if self.ENV == "production":
+            if not self.SAFE_MODE:
+                raise ValueError(
+                    "SAFE_MODE=false is forbidden in production. "
+                    "Either set SAFE_MODE=true or change ENV."
+                )
+            if not self.ALERTMANAGER_WEBHOOK_SECRET:
+                raise ValueError(
+                    "ALERTMANAGER_WEBHOOK_SECRET must be set in production "
+                    "to authenticate AlertManager webhook calls."
+                )
+        return self
 
     # Configuration for pydantic-settings v2
     model_config = SettingsConfigDict(

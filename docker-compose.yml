@@ -1,3 +1,11 @@
+# ⚠️ DEV-ONLY compose-файл. Для prod-деплоя — k8s/ манифесты (in-cluster
+# ServiceAccount + SealedSecrets), а НЕ этот compose.
+#
+# kubeconfig в контейнер НЕ маунтится: при компрометации контейнера токены
+# уехали бы в кластер. Локально работаем через переменную KUBECONFIG,
+# которую compose пробрасывает из .env (если разработчику нужен kubectl
+# внутри контейнера, он явно монтирует нужный конкретный конфиг через
+# `docker compose run -v $PWD/local-kubeconfig:/home/sre/.kube/config:ro ...`).
 version: '3.8'
 
 services:
@@ -11,7 +19,6 @@ services:
       - redis
     volumes:
       - .:/app
-      - ~/.kube:/root/.kube:ro
 
   worker:
     build: .
@@ -22,7 +29,6 @@ services:
       - redis
     volumes:
       - .:/app
-      - ~/.kube:/root/.kube:ro
 
   redis:
     image: redis:7-alpine

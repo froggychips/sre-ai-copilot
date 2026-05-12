@@ -27,6 +27,8 @@ import time
 from dataclasses import asdict, dataclass, field
 from typing import Any
 
+from app.observability.ai_metrics import API_ERRORS, LLM_LATENCY
+
 
 @dataclass
 class LLMCallInfo:
@@ -65,13 +67,24 @@ _current_recorder: contextvars.ContextVar[list[LLMCallInfo] | None] = (
 
 
 def record_llm_call(backend: str, duration_ms: int, error: str | None = None) -> None:
-    """Push one LLM call's metadata into the active StageTimer.
+    """Единая точка фиксации одного LLM-вызова.
 
-    No-op if called outside of any `StageTimer` block (unit tests of
-    bare agents, ad-hoc scripts). Backend should be a stable identifier
-    like the model name (`"claude-haiku-4-5"`) or a routing label
-    (`"local-ollama"` / `"anthropic-cloud"`).
+    Делает два:
+      1. Инкрементит Prometheus-метрики (llm_request_duration_seconds,
+         llm_api_errors_total). На эти метрики опираются PrometheusRule в
+         k8s/prometheus-rules.yaml — без этого вызова алерты SREAICopilotLLMSilence
+         сработают всегда (absent()).
+      2. Пишет в активный StageTimer (per-incident trace в IncidentRecord.trace).
+         No-op, если вызов вне StageTimer (unit-tests, ad-hoc) — Prometheus всё
+         равно фиксирует, чтобы метрики не выпадали.
+
+    Backend должен быть стабильным идентификатором: имя модели
+    ("claude-sonnet-4-6") или routing-label ("local-ollama" / "anthropic-cloud").
     """
+    LLM_LATENCY.labels(model=backend).observe(duration_ms / 1000.0)
+    if error:
+        API_ERRORS.labels(model=backend, error_type=error).inc()
+
     bucket = _current_recorder.get()
     if bucket is None:
         return

@@ -7,6 +7,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from sqlalchemy.orm import Session
 
 from app.config import settings
+from app.core.state_machine import IncidentState
 from app.database import IncidentRecord, get_db
 from app.ingestion.raw_collector import raw_collector
 from app.models.incident import AlertManagerWebhook, Incident
@@ -19,13 +20,27 @@ log = structlog.get_logger()
 
 
 async def verify_alertmanager_signature(request: Request):
-    """Verify HMAC signature from AlertManager webhook if secret is configured."""
+    """Verify HMAC-SHA256 signature on AlertManager webhook.
+
+    В prod settings гарантирует наличие ALERTMANAGER_WEBHOOK_SECRET (см.
+    Settings._enforce_prod_invariants). В dev без секрета вызов пропускается
+    с предупреждением — чтобы локальный e2e не требовал ключа, но шумел в логах.
+    """
     if not settings.ALERTMANAGER_WEBHOOK_SECRET:
-        return  # Skip verification if no secret configured
+        log.warning(
+            "alertmanager.webhook_unauthenticated",
+            env=settings.ENV,
+            reason="ALERTMANAGER_WEBHOOK_SECRET not set",
+        )
+        return
 
     signature = request.headers.get("X-Alertmanager-Signature")
     if not signature:
         raise HTTPException(status_code=401, detail="Missing AlertManager signature")
+
+    # AlertManager-совместимый формат: либо голый hex, либо `sha256=<hex>`.
+    if signature.startswith("sha256="):
+        signature = signature[len("sha256="):]
 
     body = await request.body()
     expected_signature = hmac.new(
@@ -70,8 +85,6 @@ def validate_alert_labels(alert):
 async def alertmanager_webhook(
     payload: AlertManagerWebhook, db: Session = Depends(get_db)
 ):
-    """Receive a Prometheus AlertManager webhook batch and dispatch one Celery task per alert."""
-    """Receive a Prometheus AlertManager webhook batch and dispatch one Celery task per alert."""
     """Receive a Prometheus AlertManager webhook batch and dispatch one Celery task per alert."""
     # raw_collector requires `id` or `incident_id` at top level. AlertManager
     # batch не имеет глобального id, поэтому используем `groupKey` как идентификатор

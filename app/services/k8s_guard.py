@@ -1,9 +1,14 @@
 import json
-import re
 from typing import Optional, Set
 
 import structlog
 from pydantic import BaseModel
+
+from app.security.namespaces import (
+    FORBIDDEN_NAMESPACES,
+    READ_ONLY_NAMESPACES,
+    is_write_namespace,
+)
 
 logger = structlog.get_logger()
 
@@ -17,20 +22,6 @@ ALLOWED_RESOURCES: Set[str] = {
     "ingresses",
 }
 
-# WO cluster (lastoasisgame-local) namespace policy.
-# Production-tier namespaces are read-only for AI; squad-* dev environments
-# allow writes (still gated by approval flow upstream); system/auth namespaces
-# are forbidden outright.
-FORBIDDEN_NAMESPACES: Set[str] = {
-    "kube-system",
-    "kube-public",
-    "kube-node-lease",
-    "chaos-mesh",
-    "mcp",  # MCP auth/tooling — never touch
-}
-READ_ONLY_NAMESPACES: Set[str] = {"prod", "preprod", "preupdate"}
-WRITE_NAMESPACE_PATTERNS = [re.compile(r"^squad-\d+$"), re.compile(r"^squad-gd$")]
-
 
 class K8sOperation(BaseModel):
     verb: str
@@ -43,7 +34,7 @@ class K8sOperation(BaseModel):
 class K8sSecurityGuard:
     @classmethod
     def _is_write_namespace(cls, ns: str) -> bool:
-        return any(p.match(ns) for p in WRITE_NAMESPACE_PATTERNS)
+        return is_write_namespace(ns)
 
     @classmethod
     def validate(cls, op: K8sOperation) -> bool:

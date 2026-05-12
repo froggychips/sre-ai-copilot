@@ -1,13 +1,31 @@
+"""Единый источник engine / SessionLocal / Base для всего приложения.
+
+Все модули обязаны импортировать отсюда. Параллельные обёртки в app/db/*
+удалены — наличие двух SessionLocal вело к утечкам соединений и race
+между Celery worker-ом и FastAPI handler-ом.
+"""
 from datetime import datetime
 
 from sqlalchemy import JSON, Column, DateTime, Integer, String, create_engine
-from sqlalchemy.ext.declarative import declarative_base
-from sqlalchemy.orm import sessionmaker
+from sqlalchemy.orm import declarative_base, sessionmaker
 
 from app.config import settings
 
-engine = create_engine(settings.DATABASE_URL)
-SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+engine = create_engine(
+    settings.DATABASE_URL,
+    echo=False,
+    # pool_pre_ping вытаскивает stale connections при возврате из пула —
+    # обязателен в k8s, где DB pod может рестартиться без уведомления.
+    pool_pre_ping=True,
+)
+SessionLocal = sessionmaker(
+    bind=engine,
+    autocommit=False,
+    autoflush=False,
+    # expire_on_commit=False — иначе после commit() ORM-объекты надо
+    # перевычитывать. В Celery-task-ах это лишний roundtrip.
+    expire_on_commit=False,
+)
 Base = declarative_base()
 
 

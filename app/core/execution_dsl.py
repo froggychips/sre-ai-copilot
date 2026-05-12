@@ -3,6 +3,8 @@ from typing import Any, Dict
 
 from pydantic import BaseModel, Field, field_validator
 
+from app.security.namespaces import FORBIDDEN_NAMESPACES
+
 
 class ActionType(str, Enum):
     RESTART_DEPLOYMENT = "restart_deployment"
@@ -23,8 +25,10 @@ class ExecutionIntent(BaseModel):
     @field_validator("namespace")
     @classmethod
     def block_system_ns(cls, v: str):
-        if v in ["kube-system", "kube-public", "chaos-mesh"]:
-            raise ValueError("Access to system namespaces via DSL is blocked.")
+        if v in FORBIDDEN_NAMESPACES:
+            raise ValueError(
+                f"Access to namespace '{v}' is forbidden by security policy."
+            )
         return v
 
 

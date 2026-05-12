@@ -1,0 +1,76 @@
+# Production-grade Postgres HA через CloudNativePG operator.
+#
+# Установить оператор (один раз на кластер):
+#   kubectl apply --server-side -f \
+#     https://raw.githubusercontent.com/cloudnative-pg/cloudnative-pg/release-1.23/releases/cnpg-1.23.0.yaml
+#
+# После apply — оператор создаст StatefulSet с 3 нодами, streaming replication,
+# автоматический failover, point-in-time recovery, scheduled backup в S3.
+
+apiVersion: postgresql.cnpg.io/v1
+kind: Cluster
+metadata:
+  name: sre-ai-postgres
+spec:
+  instances: 3
+  imageName: ghcr.io/cloudnative-pg/postgresql:15.6
+
+  primaryUpdateStrategy: unsupervised
+  enableSuperuserAccess: false
+
+  bootstrap:
+    initdb:
+      database: sre_db
+      owner: sre
+      secret:
+        name: postgres-secret  # SealedSecret/ExternalSecret c POSTGRES_USER/POSTGRES_PASSWORD
+
+  storage:
+    size: 100Gi
+    # storageClass: gp3  # для AWS EBS; на GKE — pd-ssd; в kind — пусто.
+
+  resources:
+    requests:
+      cpu: 500m
+      memory: 1Gi
+    limits:
+      cpu: 2
+      memory: 4Gi
+
+  # Streaming replication + sync-mode (минимум 1 синхронная реплика).
+  # Гарантирует, что коммит вернётся только после fsync на secondary.
+  minSyncReplicas: 1
+  maxSyncReplicas: 2
+
+  # PITR + base backup в S3-совместимый bucket.
+  # Альтернатива — VolumeSnapshot CronJob (см. Э2.4).
+  backup:
+    barmanObjectStore:
+      destinationPath: "s3://sre-ai-postgres-backups"
+      s3Credentials:
+        accessKeyId:
+          name: postgres-backup-s3
+          key: ACCESS_KEY_ID
+        secretAccessKey:
+          name: postgres-backup-s3
+          key: SECRET_ACCESS_KEY
+      wal:
+        compression: gzip
+      data:
+        compression: gzip
+    retentionPolicy: "30d"
+
+  monitoring:
+    enablePodMonitor: true
+
+---
+# ScheduledBackup — ежедневный base backup (PITR из WAL уже работает непрерывно).
+apiVersion: postgresql.cnpg.io/v1
+kind: ScheduledBackup
+metadata:
+  name: sre-ai-postgres-daily
+spec:
+  schedule: "0 2 * * *"   # 02:00 UTC
+  backupOwnerReference: self
+  cluster:
+    name: sre-ai-postgres

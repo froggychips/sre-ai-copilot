@@ -6,10 +6,35 @@ metadata:
     app: redis
 data:
   redis.conf: |
-    maxmemory 100mb
+    maxmemory 256mb
     maxmemory-policy allkeys-lru
+    # AOF — append-only file. Каждая запись фьюшится на диск через
+    # everysec. На рестарте Redis восстанавливает state из AOF.
     appendonly yes
+    appendfsync everysec
+    auto-aof-rewrite-percentage 100
+    auto-aof-rewrite-min-size 64mb
+    # RDB snapshot как страховка (1 раз в час при изменениях).
+    save 3600 1
 ---
+# Headless Service для StatefulSet (стабильные DNS имена redis-0.redis-headless).
+apiVersion: v1
+kind: Service
+metadata:
+  name: redis-headless
+  labels:
+    app: redis
+spec:
+  clusterIP: None
+  ports:
+    - port: 6379
+      targetPort: 6379
+      protocol: TCP
+      name: redis
+  selector:
+    app: redis
+---
+# Обычный Service — точка для клиентов (api/worker).
 apiVersion: v1
 kind: Service
 metadata:
@@ -27,12 +52,13 @@ spec:
     app: redis
 ---
 apiVersion: apps/v1
-kind: Deployment
+kind: StatefulSet
 metadata:
   name: redis
   labels:
     app: redis
 spec:
+  serviceName: redis-headless
   replicas: 1
   selector:
     matchLabels:
@@ -42,6 +68,12 @@ spec:
       labels:
         app: redis
     spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 999
+        fsGroup: 999
+        seccompProfile:
+          type: RuntimeDefault
       containers:
       - name: redis
         image: redis:7-alpine
@@ -51,18 +83,25 @@ spec:
         ports:
         - containerPort: 6379
           name: redis
+        securityContext:
+          readOnlyRootFilesystem: true
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop: ["ALL"]
         resources:
           limits:
-            cpu: 100m
-            memory: 128Mi
+            cpu: 500m
+            memory: 384Mi
           requests:
             cpu: 100m
-            memory: 128Mi
+            memory: 256Mi
         livenessProbe:
           tcpSocket:
             port: 6379
-          initialDelaySeconds: 5
+          initialDelaySeconds: 10
           periodSeconds: 20
+          timeoutSeconds: 5
+          failureThreshold: 3
         readinessProbe:
           exec:
             command:
@@ -70,15 +109,37 @@ spec:
             - ping
           initialDelaySeconds: 5
           periodSeconds: 10
+          timeoutSeconds: 3
+          failureThreshold: 3
         volumeMounts:
         - name: config
           mountPath: /usr/local/etc/redis/redis.conf
           subPath: redis.conf
         - name: redis-data
           mountPath: /data
+        - name: tmp
+          mountPath: /tmp
       volumes:
       - name: config
         configMap:
           name: redis-config
-      - name: redis-data
+      - name: tmp
         emptyDir: {}
+  volumeClaimTemplates:
+  - metadata:
+      name: redis-data
+    spec:
+      accessModes: ["ReadWriteOnce"]
+      resources:
+        requests:
+          storage: 10Gi
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: redis-pdb
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app: redis
