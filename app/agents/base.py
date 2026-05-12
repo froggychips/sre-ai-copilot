@@ -1,13 +1,15 @@
 import time
 
-from app.llm.router import ModelRouter
-from app.services.prompt_guard import prompt_guard
-from app.services.telemetry_utils import tracer, record_llm_metrics
-from app.config import settings
-from app.core.tracing import record_llm_call
 import structlog
 
+from app.config import settings
+from app.core.tracing import record_llm_call
+from app.llm.router import ModelRouter
+from app.services.prompt_guard import prompt_guard
+from app.services.telemetry_utils import record_llm_metrics, tracer
+
 logger = structlog.get_logger()
+
 
 class BaseAgent:
     def __init__(self, name: str, role: str, task_type: str = "analysis"):
@@ -40,7 +42,11 @@ Task: {instruction}
                 response = await ModelRouter.route_and_call(self.task_type, full_prompt)
                 duration_ms = int((time.monotonic() - start) * 1000)
                 if not response:
-                    record_llm_call(backend=settings.MODEL_NAME, duration_ms=duration_ms, error="empty_response")
+                    record_llm_call(
+                        backend=settings.MODEL_NAME,
+                        duration_ms=duration_ms,
+                        error="empty_response",
+                    )
                     raise ValueError("Empty response from model")
                 record_llm_call(backend=settings.MODEL_NAME, duration_ms=duration_ms)
             except Exception as exc:
@@ -52,8 +58,10 @@ Task: {instruction}
                 )
                 raise
 
-            record_llm_metrics(span, model=settings.MODEL_NAME, usage={
-                "total_tokens": len(full_prompt) // 4 + len(response) // 4
-            })
+            record_llm_metrics(
+                span,
+                model=settings.MODEL_NAME,
+                usage={"total_tokens": len(full_prompt) // 4 + len(response) // 4},
+            )
 
             return response

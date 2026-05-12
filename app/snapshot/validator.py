@@ -7,7 +7,6 @@ from typing import Any, Dict, List
 
 from app.snapshot.schema import IncidentSnapshotV1
 
-
 REQUIRED_FIELDS = [
     "snapshot_id",
     "incident_id",
@@ -51,8 +50,12 @@ def validate_snapshot(snapshot: Dict[str, Any]) -> Dict[str, Any]:
             warnings.append("non-monotonic timestamps detected")
 
     payload = snapshot.get("payload") or {}
-    expected_metric_hash = sha256(json.dumps(payload.get("metrics", {}), sort_keys=True).encode("utf-8")).hexdigest()
-    expected_log_hash = sha256(json.dumps(payload.get("logs", []), sort_keys=True).encode("utf-8")).hexdigest()
+    expected_metric_hash = sha256(
+        json.dumps(payload.get("metrics", {}), sort_keys=True).encode("utf-8")
+    ).hexdigest()
+    expected_log_hash = sha256(
+        json.dumps(payload.get("logs", []), sort_keys=True).encode("utf-8")
+    ).hexdigest()
 
     if snapshot.get("metric_snapshot_hash") != expected_metric_hash:
         errors.append("metric_snapshot_hash mismatch")
@@ -67,7 +70,9 @@ def validate_snapshot(snapshot: Dict[str, Any]) -> Dict[str, Any]:
         if event_id not in source_set:
             errors.append(f"correlation_index[{i}] invalid event_id")
         if not set(related_to).issubset(source_set):
-            errors.append(f"correlation_index[{i}] related_to must be subset of source_event_ids")
+            errors.append(
+                f"correlation_index[{i}] related_to must be subset of source_event_ids"
+            )
 
     if not snapshot.get("ingest_time_source"):
         errors.append("ingest_time_source is required")

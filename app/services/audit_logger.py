@@ -1,12 +1,14 @@
-import structlog
 import json
 from datetime import datetime
+
+import structlog
+
 from app.config import settings
 
 structlog.configure(
     processors=[
         structlog.processors.TimeStamper(fmt="iso"),
-        structlog.processors.JSONRenderer()
+        structlog.processors.JSONRenderer(),
     ],
     logger_factory=structlog.WriteLoggerFactory(
         file=open(settings.AUDIT_LOG_PATH, "a")
@@ -14,6 +16,7 @@ structlog.configure(
 )
 
 audit_logger = structlog.get_logger("sre_audit")
+
 
 class AuditService:
     def log_event(self, event_type: str, details: dict):
@@ -25,5 +28,6 @@ class AuditService:
             timestamp=datetime.utcnow().isoformat(),
             **details,
         )
+
 
 audit_service = AuditService()

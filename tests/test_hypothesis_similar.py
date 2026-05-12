@@ -6,8 +6,9 @@ parameter keeps the legacy single-arg signature, and that an empty
 list is treated identically to None (don't render the section at all).
 """
 
-import pytest
 from unittest.mock import AsyncMock
+
+import pytest
 
 from app.agents.hypothesis import HypothesisAgent
 

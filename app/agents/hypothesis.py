@@ -11,11 +11,13 @@ class HypothesisAgent(BaseAgent):
     def __init__(self):
         super().__init__(
             name="Hypothesis",
-            role="SRE Problem Solver. Generate possible root causes for the given incident analysis."
+            role="SRE Problem Solver. Generate possible root causes for the given incident analysis.",
         )
 
     @trace_agent("Hypothesis")
-    async def generate(self, analysis: str, similar_past: list[dict] | None = None) -> str:
+    async def generate(
+        self, analysis: str, similar_past: list[dict] | None = None
+    ) -> str:
         """Generate ranked root cause hypotheses.
 
         Optionally augmented with `similar_past` — a short list of previously

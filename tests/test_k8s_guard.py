@@ -1,8 +1,11 @@
 import pytest
+
 from app.services.k8s_guard import K8sOperation, k8s_guard
 
 
-def op(verb: str, ns: str, resource: str = "pods", body: dict | None = None) -> K8sOperation:
+def op(
+    verb: str, ns: str, resource: str = "pods", body: dict | None = None
+) -> K8sOperation:
     return K8sOperation(verb=verb, resource=resource, namespace=ns, body=body)
 
 
@@ -52,4 +55,6 @@ def test_privileged_container_blocked():
 
 def test_host_network_blocked():
     with pytest.raises(PermissionError, match="hostNetwork"):
-        k8s_guard.validate(op("create", "squad-1", body={"spec": {"hostNetwork": True}}))
+        k8s_guard.validate(
+            op("create", "squad-1", body={"spec": {"hostNetwork": True}})
+        )

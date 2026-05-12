@@ -1,5 +1,6 @@
+from typing import Any, Dict, List, Optional
+
 from pydantic import BaseModel, Field
-from typing import Dict, Any, List, Optional
 
 
 class AlertManagerAlert(BaseModel):
@@ -55,7 +56,9 @@ class Incident(BaseModel):
             incident_id=alert.fingerprint,
             severity=labels.get("severity", "unknown"),
             status=alert.status,
-            summary=annotations.get("summary", labels.get("alertname", "unknown alert")),
+            summary=annotations.get(
+                "summary", labels.get("alertname", "unknown alert")
+            ),
             description=annotations.get("description", ""),
             namespace=labels.get("namespace"),
             labels=labels,

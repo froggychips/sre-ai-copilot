@@ -1,6 +1,7 @@
 from enum import Enum
 from typing import Dict, Set
 
+
 class IncidentState(str, Enum):
     OPEN = "OPEN"
     INVESTIGATING = "INVESTIGATING"
@@ -10,6 +11,7 @@ class IncidentState(str, Enum):
     EXECUTING = "EXECUTING"
     RESOLVED = "RESOLVED"
     FAILED = "FAILED"
+
 
 class StateMachine:
     # Two paths through the state machine, both valid:
@@ -28,9 +30,19 @@ class StateMachine:
     # FAILED is reachable from every non-terminal state.
     TRANSITIONS: Dict[IncidentState, Set[IncidentState]] = {
         IncidentState.OPEN: {IncidentState.INVESTIGATING, IncidentState.FAILED},
-        IncidentState.INVESTIGATING: {IncidentState.HYPOTHESIS_GENERATED, IncidentState.FAILED},
-        IncidentState.HYPOTHESIS_GENERATED: {IncidentState.FIX_PROPOSED, IncidentState.FAILED},
-        IncidentState.FIX_PROPOSED: {IncidentState.APPROVAL_PENDING, IncidentState.RESOLVED, IncidentState.FAILED},
+        IncidentState.INVESTIGATING: {
+            IncidentState.HYPOTHESIS_GENERATED,
+            IncidentState.FAILED,
+        },
+        IncidentState.HYPOTHESIS_GENERATED: {
+            IncidentState.FIX_PROPOSED,
+            IncidentState.FAILED,
+        },
+        IncidentState.FIX_PROPOSED: {
+            IncidentState.APPROVAL_PENDING,
+            IncidentState.RESOLVED,
+            IncidentState.FAILED,
+        },
         IncidentState.APPROVAL_PENDING: {IncidentState.EXECUTING, IncidentState.FAILED},
         IncidentState.EXECUTING: {IncidentState.RESOLVED, IncidentState.FAILED},
         IncidentState.RESOLVED: set(),
@@ -38,5 +50,7 @@ class StateMachine:
     }
 
     @classmethod
-    def validate_transition(cls, current: IncidentState, next_state: IncidentState) -> bool:
+    def validate_transition(
+        cls, current: IncidentState, next_state: IncidentState
+    ) -> bool:
         return next_state in cls.TRANSITIONS.get(current, set())

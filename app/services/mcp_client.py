@@ -41,7 +41,12 @@ class McpHttpClient:
         await self._client.aclose()
 
     async def _rpc(self, method: str, params: Optional[dict] = None) -> dict[str, Any]:
-        body = {"jsonrpc": "2.0", "id": next(self._id), "method": method, "params": params or {}}
+        body = {
+            "jsonrpc": "2.0",
+            "id": next(self._id),
+            "method": method,
+            "params": params or {},
+        }
         r = await self._client.post(self._url, json=body)
         r.raise_for_status()
         text = r.text
@@ -58,7 +63,9 @@ class McpHttpClient:
         формат FastMCP) или текстовый content при отсутствии structuredContent.
         Бросает RuntimeError на JSON-RPC error.
         """
-        resp = await self._rpc("tools/call", {"name": name, "arguments": arguments or {}})
+        resp = await self._rpc(
+            "tools/call", {"name": name, "arguments": arguments or {}}
+        )
         if "error" in resp:
             raise RuntimeError(f"MCP tool error [{name}]: {resp['error']}")
         result = resp.get("result", {})

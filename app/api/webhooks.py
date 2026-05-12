@@ -1,19 +1,77 @@
-from fastapi import APIRouter, Depends
-from sqlalchemy.orm import Session
+import hashlib
+import hmac
+import re
+
 import structlog
+from fastapi import APIRouter, Depends, HTTPException, Request
+from sqlalchemy.orm import Session
+
 from app.config import settings
-from app.workers.tasks import process_incident_task, celery_app, async_process_incident
-from app.database import get_db, IncidentRecord
-from app.models.incident import AlertManagerWebhook, Incident
+from app.database import IncidentRecord, get_db
 from app.ingestion.raw_collector import raw_collector
+from app.models.incident import AlertManagerWebhook, Incident
 from app.services.teamcity_service import incident_teamcity_context
+from app.workers.tasks import (async_process_incident, celery_app,
+                               process_incident_task)
 
 router = APIRouter()
 log = structlog.get_logger()
 
 
-@router.post("/alertmanager", status_code=202)
-async def alertmanager_webhook(payload: AlertManagerWebhook, db: Session = Depends(get_db)):
+async def verify_alertmanager_signature(request: Request):
+    """Verify HMAC signature from AlertManager webhook if secret is configured."""
+    if not settings.ALERTMANAGER_WEBHOOK_SECRET:
+        return  # Skip verification if no secret configured
+
+    signature = request.headers.get("X-Alertmanager-Signature")
+    if not signature:
+        raise HTTPException(status_code=401, detail="Missing AlertManager signature")
+
+    body = await request.body()
+    expected_signature = hmac.new(
+        settings.ALERTMANAGER_WEBHOOK_SECRET.encode(), body, hashlib.sha256
+    ).hexdigest()
+
+    if not hmac.compare_digest(signature, expected_signature):
+        raise HTTPException(status_code=401, detail="Invalid AlertManager signature")
+
+
+def validate_alert_labels(alert):
+    """Validate alert labels for security."""
+    labels = alert.labels
+    alertname = labels.get("alertname")
+    namespace = labels.get("namespace")
+
+    if not alertname:
+        raise HTTPException(status_code=400, detail="Missing alertname in labels")
+
+    # Allowlist for alertname - adjust as needed
+    allowed_alertnames = {
+        "PodCrashLooping",
+        "HighCpuUsage",
+        "MemoryPressure",
+        "DeploymentUnavailable",
+    }
+    if alertname not in allowed_alertnames:
+        log.warning("unknown_alertname", alertname=alertname)
+        # For now, allow but log; in production, reject
+
+    if namespace:
+        # Basic validation - no special chars that could be used for injection
+        if not re.match(r"^[a-z0-9-]+$", namespace):
+            raise HTTPException(status_code=400, detail="Invalid namespace format")
+
+
+@router.post(
+    "/alertmanager",
+    status_code=202,
+    dependencies=[Depends(verify_alertmanager_signature)],
+)
+async def alertmanager_webhook(
+    payload: AlertManagerWebhook, db: Session = Depends(get_db)
+):
+    """Receive a Prometheus AlertManager webhook batch and dispatch one Celery task per alert."""
+    """Receive a Prometheus AlertManager webhook batch and dispatch one Celery task per alert."""
     """Receive a Prometheus AlertManager webhook batch and dispatch one Celery task per alert."""
     # raw_collector requires `id` or `incident_id` at top level. AlertManager
     # batch не имеет глобального id, поэтому используем `groupKey` как идентификатор
@@ -24,6 +82,7 @@ async def alertmanager_webhook(payload: AlertManagerWebhook, db: Session = Depen
 
     accepted = []
     for alert in payload.alerts:
+        validate_alert_labels(alert)
         incident = Incident.from_alertmanager(alert)
         # Обогащение TC-контекстом (recent deploys + changes) — best-effort.
         # При недоступности TC просто остаётся None, инцидент обрабатывается без контекста.
@@ -33,7 +92,11 @@ async def alertmanager_webhook(payload: AlertManagerWebhook, db: Session = Depen
                 incident_starts_at=incident.starts_at,
             )
         except Exception as e:
-            log.warning("teamcity_context.unhandled", error=str(e), incident_id=incident.incident_id)
+            log.warning(
+                "teamcity_context.unhandled",
+                error=str(e),
+                incident_id=incident.incident_id,
+            )
         existing = (
             db.query(IncidentRecord)
             .filter(IncidentRecord.incident_id == incident.incident_id)

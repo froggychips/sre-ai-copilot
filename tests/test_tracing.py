@@ -7,6 +7,7 @@ and nesting / parallel timers don't trample each other.
 """
 
 import asyncio
+
 import pytest
 
 from app.core.tracing import StageTimer, record_llm_call
@@ -56,7 +57,9 @@ async def test_to_dict_shape_matches_db_contract() -> None:
     assert d.keys() == {"stage", "duration_ms", "llm_calls"}
     assert d["stage"] == "risk"
     assert isinstance(d["duration_ms"], int)
-    assert d["llm_calls"] == [{"backend": "claude-haiku", "duration_ms": 42, "error": None}]
+    assert d["llm_calls"] == [
+        {"backend": "claude-haiku", "duration_ms": 42, "error": None}
+    ]
 
 
 @pytest.mark.asyncio

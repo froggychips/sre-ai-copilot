@@ -75,7 +75,9 @@ class ClaudeCliService:
         elapsed = time.monotonic() - start
         if proc.returncode != 0:
             err = stderr.decode(errors="replace").strip()[:800]
-            raise RuntimeError(f"claude CLI exit {proc.returncode} ({elapsed:.1f}s): {err}")
+            raise RuntimeError(
+                f"claude CLI exit {proc.returncode} ({elapsed:.1f}s): {err}"
+            )
         text = stdout.decode(errors="replace").strip()
         if not text:
             raise ValueError(f"claude CLI returned empty output ({elapsed:.1f}s)")
