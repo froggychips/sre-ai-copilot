@@ -1,0 +1,89 @@
+{{- if .Values.serviceAccount.create }}
+# RBAC для sre-ai (api + worker).
+#
+# Принципы:
+#   * ОТКАЗ default-SA: pod-ы используют sre-ai SA с явным набором прав.
+#   * Чтение — широкое (pod/pod log/event/deployment в текущем namespace).
+#   * Запись — только то, что реально дёргает agent fix/synthesis:
+#       - deployments rollout (patch/scale)
+#       - pod eviction (delete)
+#   * forbidden ns (kube-system, kube-public, kube-node-lease, chaos-mesh, mcp)
+#     не покрываются НИЧЕМ — guard в коде дополнительно блокирует, но и API
+#     уровень тоже отрезан.
+
+---
+# Read-only Role — применяется в namespace релиза.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ include "sre-ai-copilot.fullname" . }}-read
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "sre-ai-copilot.labels" . | nindent 4 }}
+rules:
+- apiGroups: [""]
+  resources: ["pods", "pods/log", "events", "services", "endpoints", "configmaps"]
+  verbs: ["get", "list", "watch"]
+- apiGroups: ["apps"]
+  resources: ["deployments", "statefulsets", "replicasets", "daemonsets"]
+  verbs: ["get", "list", "watch"]
+- apiGroups: ["metrics.k8s.io"]
+  resources: ["pods", "nodes"]
+  verbs: ["get", "list"]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ include "sre-ai-copilot.fullname" . }}-read
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "sre-ai-copilot.labels" . | nindent 4 }}
+subjects:
+- kind: ServiceAccount
+  name: {{ include "sre-ai-copilot.serviceAccountName" . }}
+  namespace: {{ .Release.Namespace }}
+roleRef:
+  kind: Role
+  name: {{ include "sre-ai-copilot.fullname" . }}-read
+  apiGroup: rbac.authorization.k8s.io
+
+---
+# Write-Role — применяется ТОЛЬКО в squad-* namespace-ах (через отдельный RoleBinding).
+# Не делать ClusterRoleBinding — иначе обходим principle of least privilege.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ include "sre-ai-copilot.fullname" . }}-remediate
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "sre-ai-copilot.labels" . | nindent 4 }}
+rules:
+- apiGroups: ["apps"]
+  resources: ["deployments", "deployments/scale"]
+  verbs: ["get", "list", "patch", "update"]
+- apiGroups: [""]
+  resources: ["pods"]
+  verbs: ["delete"]  # для restart/eviction
+- apiGroups: [""]
+  resources: ["pods/exec"]
+  verbs: ["create"]  # под жёстким allowlist в k8s_guard
+
+# NOTE: To grant remediation rights in a target namespace (e.g. squad-foo),
+# create a RoleBinding there manually or via a kustomize overlay:
+#
+# apiVersion: rbac.authorization.k8s.io/v1
+# kind: RoleBinding
+# metadata:
+#   name: {{ include "sre-ai-copilot.fullname" . }}-remediate
+#   namespace: squad-foo
+# subjects:
+# - kind: ServiceAccount
+#   name: {{ include "sre-ai-copilot.serviceAccountName" . }}
+#   namespace: {{ .Release.Namespace }}
+# roleRef:
+#   kind: Role
+#   name: {{ include "sre-ai-copilot.fullname" . }}-remediate
+#   apiGroup: rbac.authorization.k8s.io
+
+{{- end }}

@@ -1,0 +1,76 @@
+replicaCount:
+  api: 2
+  worker: 2
+
+image:
+  repository: froggychips/sre-ai-copilot
+  tag: "latest"
+  pullPolicy: IfNotPresent
+
+imagePullSecrets: []
+
+serviceAccount:
+  # Create the ServiceAccount
+  create: true
+  # Annotations to add to the service account (e.g. IRSA)
+  annotations: {}
+
+service:
+  type: ClusterIP
+  port: 8000
+
+ingress:
+  enabled: true
+  host: sre-ai.example.com
+  # oauth2-proxy domain (e.g. auth.example.com)
+  authDomain: auth.example.com
+  tls:
+    secretName: sre-ai-tls
+
+redis:
+  image: redis:7-alpine
+  storage: 10Gi
+  maxmemory: "256mb"
+  maxmemoryPolicy: allkeys-lru
+
+resources:
+  api:
+    limits:
+      cpu: 500m
+      memory: 512Mi
+    requests:
+      cpu: 200m
+      memory: 256Mi
+  worker:
+    limits:
+      cpu: 200m
+      memory: 256Mi
+    requests:
+      cpu: 200m
+      memory: 256Mi
+  redis:
+    limits:
+      cpu: 500m
+      memory: 384Mi
+    requests:
+      cpu: 100m
+      memory: 256Mi
+
+env:
+  llmBackend: anthropic
+  logLevel: info
+  # Set to "true" to enable safe-mode (disables write k8s actions)
+  safeMode: "false"
+
+# All secret keys — fill in before deploying.
+# In production prefer SealedSecrets or ExternalSecrets (see k8s/base/secrets.*.yaml.example).
+secrets:
+  anthropicApiKey: ""
+  databaseUrl: ""
+  redisUrl: ""
+  discordWebhookUrl: ""
+  alertmanagerWebhookSecret: ""
+  jwtPublicKey: ""
+  jiraBaseUrl: ""
+  jiraEmail: ""
+  jiraApiToken: ""

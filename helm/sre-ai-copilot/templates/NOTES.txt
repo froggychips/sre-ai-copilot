@@ -1,0 +1,18 @@
+sre-ai-copilot deployed successfully.
+
+Service URL:
+{{- if .Values.ingress.enabled }}
+  https://{{ .Values.ingress.host }}
+{{- else }}
+  kubectl port-forward svc/{{ include "sre-ai-copilot.fullname" . }}-api 8000:8000
+  http://localhost:8000
+{{- end }}
+
+IMPORTANT: configure secrets before the pods will start:
+
+  kubectl -n {{ .Release.Namespace }} edit secret {{ include "sre-ai-copilot.secretName" . }}
+
+Required keys: ANTHROPIC_API_KEY, DATABASE_URL, REDIS_URL, DISCORD_WEBHOOK_URL,
+ALERTMANAGER_WEBHOOK_SECRET, JWT_PUBLIC_KEY, JIRA_BASE_URL, JIRA_EMAIL, JIRA_API_TOKEN.
+
+For production use SealedSecrets or ExternalSecrets instead of plain Secret.

@@ -5,12 +5,15 @@
 [![FastAPI](https://img.shields.io/badge/FastAPI-0.104-009688)](https://fastapi.tiangolo.com/)
 [![Celery](https://img.shields.io/badge/Celery-5.3-37814A)](https://docs.celeryq.dev/)
 
-**SRE AI Copilot** — backend-сервис для автоматизации incident response в Kubernetes: прием Prometheus AlertManager-вебхуков, асинхронный анализ инцидентов через агентный LLM-пайплайн (analyzer → hypothesis → critic → fix → risk), guardrails по k8s-namespace и human-approval flow перед любым write-действием.
+**SRE AI Copilot** — backend-сервис для автоматизации incident response в Kubernetes: прием Prometheus AlertManager-вебхуков, детерминированная диагностика через `FactStore`, многогипотезный LLM-пайплайн с adversarial grounding, генерация `ExecutionIntent`, guardrails и human-approval flow перед любым write-действием.
 
 ## Что умеет сервис
-- Принимает события инцидентов через вебхук Prometheus AlertManager (`/webhooks/alertmanager`) и ставит обработку в Celery.
-- Выполняет агентный пайплайн (analyzer → hypothesis → critic → fix → risk → synthesis).
-- Хранит записи инцидентов и результаты анализа в PostgreSQL.
+- Принимает события инцидентов через вебхук Prometheus AlertManager (`/webhooks/alertmanager`).
+- Запускает `DiagnosticsEngine` — детерминированные правила выдают `FactStore` с typed-фактами и конфликт-сигналами до любого LLM-вызова.
+- Выполняет многогипотезный LLM-пайплайн: 4 перспективы (app/infra/deps/runtime) → FactCritic adversarial grounding → Fix → Risk → Synthesis.
+- Детектирует рецидивы: если тот же сервис закрыл аналогичный инцидент < 7 дней назад, FixAgent переключается в investigative mode.
+- Обогащает контекст через Atlassian Jira: открытые/закрытые тикеты по сервису идут в FixAgent как KNOWN ISSUES.
+- Хранит записи инцидентов и результаты анализа в PostgreSQL; KG-quality gate фильтрует мусорные причины.
 - Поддерживает replay-режим для исторических инцидентов (`/replay/{incident_id}`).
 - Экспортирует health/readiness, Prometheus-метрики и OpenTelemetry-трейсинг.
 
@@ -86,8 +89,24 @@ froggy-sre запускает 5-этапный пайплайн. sre-ai-copilot 
 | **Когда использовать** | Нужен постоянный headless алертинг в production | Анализ инцидентов интерактивно через Claude Code |
 
 ## Документация
-- [Architecture](docs/ARCHITECTURE.md)
-- [Module Docs](docs/MODULE_DOCS.md)
-- [Semantic Contract](docs/SEMANTIC_CONTRACT.md)
-- [DR Plan](docs/DR.md)
+
+| Документ | EN | RU |
+|---|---|---|
+| Архитектура | [ARCHITECTURE.md](docs/ARCHITECTURE.md) | [ARCHITECTURE.ru.md](docs/ARCHITECTURE.ru.md) |
+| Боевые прогоны / Runbook | [RUNBOOK.md](docs/RUNBOOK.md) | [RUNBOOK.ru.md](docs/RUNBOOK.ru.md) |
+| Модули | [MODULE_DOCS.md](docs/MODULE_DOCS.md) | [MODULE_DOCS.ru.md](docs/MODULE_DOCS.ru.md) |
+| Semantic Contract | [SEMANTIC_CONTRACT.md](docs/SEMANTIC_CONTRACT.md) | — |
+| FAQ | [FAQ.md](docs/FAQ.md) | [FAQ.ru.md](docs/FAQ.ru.md) |
+| DR Plan | [DR.md](docs/DR.md) | — |
+| Changelog | [CHANGELOG.md](CHANGELOG.md) | — |
+
+## Helm
+
+```bash
+helm install sre-ai-copilot helm/sre-ai-copilot/ \
+  --set ingress.host=sre-ai.example.com \
+  --set image.tag=0.5.0
+```
+
+Перед установкой заполните секреты (см. `helm/sre-ai-copilot/templates/secret.yaml`).
 
