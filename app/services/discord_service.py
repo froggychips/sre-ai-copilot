@@ -1,8 +1,22 @@
 import logging
+from datetime import datetime, timezone
+from typing import Any, Dict, Optional
 
 import httpx
 
 from app.config import settings
+
+# Discord embed colour codes
+_COLOR_CRITICAL = 0xE53935   # red
+_COLOR_WARNING  = 0xFDD835   # yellow
+_COLOR_RESOLVED = 0x43A047   # green
+_COLOR_UNKNOWN  = 0x9E9E9E   # grey
+
+_SEVERITY_COLORS = {
+    "critical": _COLOR_CRITICAL,
+    "warning":  _COLOR_WARNING,
+    "info":     _COLOR_UNKNOWN,
+}
 
 
 class DiscordService:
@@ -13,6 +27,67 @@ class DiscordService:
         payload = {"content": report_text}
         async with httpx.AsyncClient() as client:
             await client.post(settings.DISCORD_WEBHOOK_URL, json=payload)
+
+    async def send_incident_report(
+        self,
+        incident_id: str,
+        alertname: str,
+        namespace: str,
+        pod: Optional[str],
+        service: Optional[str],
+        severity: str,
+        cause: Optional[str],
+        resolution_quality: str,
+        synthesis: str,
+        is_recurrence: bool = False,
+    ) -> None:
+        """Единый embed-отчёт, заменяющий сырой алерт от Spidey Bot.
+
+        Формат: заголовок алерта (что видел Spidey Bot) + root cause +
+        краткий вывод пайплайна — всё в одном Discord-сообщении.
+        """
+        color = (
+            _COLOR_RESOLVED if resolution_quality == "resolved"
+            else _SEVERITY_COLORS.get(severity.lower(), _COLOR_UNKNOWN)
+        )
+
+        status_icon = "✅" if resolution_quality == "resolved" else "⚠️"
+        recurrence_tag = " · 🔁 RECURRENCE" if is_recurrence else ""
+        title = f"{status_icon} {alertname} · {namespace}{recurrence_tag}"
+
+        fields = []
+        if service:
+            fields.append({"name": "Service", "value": f"`{service}`", "inline": True})
+        if pod:
+            fields.append({"name": "Pod", "value": f"`{pod}`", "inline": True})
+        fields.append({
+            "name": "Root Cause",
+            "value": (cause or "Manual triage required — no hypothesis survived")[:1024],
+            "inline": False,
+        })
+
+        # Synthesis truncated to fit Discord embed description limit (4096).
+        description = synthesis[:3800] + ("…" if len(synthesis) > 3800 else "")
+
+        payload = {
+            "embeds": [{
+                "title": title,
+                "color": color,
+                "fields": fields,
+                "description": description,
+                "footer": {"text": f"incident/{incident_id}"},
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+            }]
+        }
+
+        if settings.DISCORD_DRY_RUN:
+            logging.info("[DISCORD_DRY_RUN] send_incident_report: %s | cause=%s | rq=%s",
+                         title, cause, resolution_quality)
+            return
+        async with httpx.AsyncClient() as client:
+            r = await client.post(settings.DISCORD_WEBHOOK_URL, json=payload)
+            if r.status_code >= 400:
+                logging.error("discord_incident_report_failed", extra={"status": r.status_code})
 
     async def send_approval_request(self, approval_id: str, details: dict):
         """Отправляет Rich Embed с информацией об опасной операции и ссылками для подтверждения."""

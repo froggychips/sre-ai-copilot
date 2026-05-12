@@ -415,8 +415,18 @@ class IncidentPipeline:
         else:
             self.traces.append(synth_snap)
 
-        await discord_service.send_report(
-            f"**Incident {self.incident_id} Analysis Complete.**\n\n{self.synthesis}"
+        labels = self.incident.labels or {}
+        await discord_service.send_incident_report(
+            incident_id=self.incident_id,
+            alertname=labels.get("alertname", "UnknownAlert"),
+            namespace=self.incident.namespace or "",
+            pod=labels.get("pod"),
+            service=labels.get("service") or labels.get("app"),
+            severity=self.incident.severity or "warning",
+            cause=self.best.cause if self.best else None,
+            resolution_quality="resolved" if self.best else "unresolved",
+            synthesis=self.synthesis or "",
+            is_recurrence=self.is_recurrence,
         )
 
     # ------------------------------------------------------------------
