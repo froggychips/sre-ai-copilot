@@ -28,6 +28,21 @@ class DiscordService:
         async with httpx.AsyncClient() as client:
             await client.post(settings.DISCORD_WEBHOOK_URL, json=payload)
 
+    async def send_stats_report(self, content: str) -> None:
+        """Отправить текст в канал #stats (cluster health, daily report)."""
+        url = settings.DISCORD_WEBHOOK_STATS_URL
+        if not url:
+            logging.warning("DISCORD_WEBHOOK_STATS_URL not set, skipping stats report")
+            return
+        if settings.DISCORD_DRY_RUN:
+            logging.info("[DISCORD_DRY_RUN] send_stats_report:\n%s", content)
+            return
+        payload = {"content": content}
+        async with httpx.AsyncClient() as client:
+            r = await client.post(url, json=payload)
+            if r.status_code >= 400:
+                logging.error("discord_stats_report_failed", extra={"status": r.status_code})
+
     async def send_incident_report(
         self,
         incident_id: str,

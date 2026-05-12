@@ -54,7 +54,8 @@ class Settings(BaseSettings):
 
     LOG_LEVEL: str = Field("INFO", description="Standard logging level")
 
-    DISCORD_WEBHOOK_URL: Optional[str] = Field(None, description="Discord webhook URL (пусто = discord отключён)")
+    DISCORD_WEBHOOK_URL: Optional[str] = Field(None, description="Discord webhook — канал #error (инциденты)")
+    DISCORD_WEBHOOK_STATS_URL: Optional[str] = Field(None, description="Discord webhook — канал #stats (cluster health, daily report)")
     # Discord Interactions — для обработки нажатий кнопок 👍/👎.
     # Взять из Discord Developer Portal → Application → General Information.
     DISCORD_PUBLIC_KEY: Optional[str] = Field(None, description="Ed25519 публичный ключ приложения Discord")
