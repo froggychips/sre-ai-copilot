@@ -348,7 +348,13 @@ async def async_process_incident(incident_data: dict):
             record.analysis = {
                 "summary": analysis,
                 "hypotheses": hypotheses_text,
-                "cause": final_cause,
+                # cause=None при no_survivor — KG quality gate.
+                # SimilarIncidentEngine пропускает такие записи, чтобы
+                # "Manual triage required" не попадал в past_bullets будущих инцидентов.
+                # Полный pipeline-статус сохраняем в triage_note.
+                "cause": best.cause if best else None,
+                "triage_note": final_cause if best is None else None,
+                "resolution_quality": "resolved" if best else "unresolved",
                 "fix": fix_suggestion,
                 "risk": risk_report,
                 "synthesis": synthesis,
