@@ -54,6 +54,57 @@ def test_oom_rule_clean_context():
     assert facts[0].confidence >= 0.8
 
 
+def test_oom_rule_structured_oomkilled_reason():
+    """k8s_pod_state: reason=OOMKilled → structured fact, conf=0.98."""
+    facts = OOMKilledRule().evaluate({
+        "pod": "payment-svc-7",
+        "k8s_pod_state": {
+            "payment-svc-7": {"reason": "OOMKilled", "exit_code": 137, "container": "app"},
+        },
+    })
+    assert facts[0].observed is True
+    assert facts[0].confidence == 0.98
+    assert facts[0].evidence["source"] == "k8s_terminated_state"
+
+
+def test_oom_rule_structured_exit137_no_reason():
+    """k8s_pod_state: exit 137 без reason → conf=0.55 (kill -9 или OOM)."""
+    facts = OOMKilledRule().evaluate({
+        "pod": "payment-svc-7",
+        "k8s_pod_state": {
+            "payment-svc-7": {"reason": "Error", "exit_code": 137, "container": "app"},
+        },
+    })
+    assert facts[0].observed is True
+    assert facts[0].confidence == 0.55
+
+
+def test_oom_rule_non_oom_exit_suppresses_text_match():
+    """Exit 139 в k8s_pod_state → observed=False, текстовый 'OOMKilled' подавляется."""
+    facts = OOMKilledRule().evaluate({
+        "pod": "notificator-abc",
+        "description": "Container was OOMKilled in the namespace yesterday",
+        "k8s_pod_state": {
+            "notificator-abc": {"reason": "Error", "exit_code": 139, "container": "app"},
+        },
+    })
+    assert facts[0].observed is False
+    assert facts[0].evidence.get("exit_code") == 139
+
+
+def test_oom_rule_scans_all_pods_finds_oom_in_namespace():
+    """Target-под пересоздан, но в pod_state другой под с OOMKilled → observed=True."""
+    facts = OOMKilledRule().evaluate({
+        "pod": "notificator-abc-new",
+        "k8s_pod_state": {
+            "notificator-abc-old": {"reason": "OOMKilled", "exit_code": 137, "container": "app"},
+        },
+    })
+    assert facts[0].observed is True
+    assert facts[0].confidence == 0.98
+    assert facts[0].subject == "notificator-abc-old"
+
+
 # ---------- CrashLoopBackOffRule -----------------------------------------
 
 def test_crashloop_rule_detects_phrase():
