@@ -97,8 +97,8 @@ class Settings(BaseSettings):
     #   2. MCP HTTP server: TEAMCITY_MCP_URL + TEAMCITY_MCP_TOKEN
     #      (задеплоенный mcp-teamcity-server — пока не поднят).
     #   Пусто / оба отсутствуют = graceful degrade (recent_deploy остаётся unknown).
-    TC_URL: str = Field("", description="TeamCity base URL (напр. https://wo-teamcity.lastoasisgame.com)")
-    TC_TOKEN: str = Field("", description="TeamCity Bearer token (тот же что в MCP-конфиге Claude)")
+    TC_URL: str = Field("", description="TeamCity base URL")
+    TC_TOKEN: str = Field("", description="TeamCity Bearer token")
     TEAMCITY_MCP_URL: str = Field(
         "", description="mcp-teamcity-server MCP endpoint URL (fallback)"
     )
@@ -106,16 +106,15 @@ class Settings(BaseSettings):
         "", description="Bearer для mcp_auth (пусто = no-auth local PoC)"
     )
     TEAMCITY_WEB_URL: str = Field(
-        "https://wo-teamcity.lastoasisgame.com",
+        "",
         description="TC web UI base — для viewLog ссылок в Discord",
     )
     TC_TIMEOUT_SECONDS: float = 5.0
     TC_LOOKBACK_MINUTES: int = 60
-    TC_BACKEND_PROJECT_ID: str = "Wo_Backend_K8sNewCluster"
+    TC_BACKEND_PROJECT_ID: str = Field("", description="TeamCity project ID для поиска билдов")
 
     # GitLab — обогащение MR-метаданными по SHA из TC-деплоев.
-    # Токен из k8s secret mcp-shared-secret (ключ GITLAB_TOKEN).
-    GITLAB_URL: str = Field("", description="GitLab base URL (напр. https://wo-gitlab.lastoasisgame.com)")
+    GITLAB_URL: str = Field("", description="GitLab base URL")
     GITLAB_TOKEN: str = Field("", description="GitLab Personal Access Token (read_api)")
     # Проекты для поиска MR по sha: project_id (числовой) или namespace/name.
     # backend-services живёт в new-wo/backend-services (id найдём динамически).

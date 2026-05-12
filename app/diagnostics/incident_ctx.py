@@ -22,7 +22,7 @@ def _extract_deploys_from_tc(tc_ctx: Optional[Dict[str, Any]]) -> List[Dict[str,
           "branch": "master",
           "recent_builds": [
             {"number": "1234", "status": "SUCCESS",
-             "buildtype_id": "Wo_Backend_K8sNewCluster_ServiceX",
+             "buildtype_id": "MyProject_BuildServiceX",
              "branch": "master", "finished_at": "2026-05-12T09:30:00Z"},
             ...
           ]
