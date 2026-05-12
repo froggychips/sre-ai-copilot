@@ -21,11 +21,14 @@ class K8sSnapshot:
         из container_status.state.terminated или last_state.terminated.
     pod_events — список k8s Events для target-пода, отсортированных
         по last_timestamp DESC. Каждый элемент: {type, reason, message, count}.
+    core_dump_node — имя ноды, на которой найден core dump в /tmp/dump,
+        или None если не найден / проверка не проводилась.
     """
 
     text: str
     container_terminated: Dict[str, Dict[str, Any]] = field(default_factory=dict)
     pod_events: List[Dict[str, Any]] = field(default_factory=list)
+    core_dump_node: Optional[str] = None
 
 
 class K8sFacts:
@@ -128,27 +131,27 @@ class K8sFacts:
                         "k8s_facts_peer_unavailable", peer=peer, error=str(e)
                     )
 
-            # ── Pod logs (tail 50 for first 3 unhealthy) ─────────────────
+            # ── Pod logs (tail 200 for first 3 unhealthy) ────────────────
+            # previous=True первым: содержит вывод упавшего контейнера
+            # (stacktrace, exit reason), а не свежего restarted-а.
             for pod_name, _, _ in unhealthy_pods[:3]:
-                try:
-                    logs = v1.read_namespaced_pod_log(
-                        pod_name, namespace, tail_lines=50
-                    )
-                    if logs:
-                        results.append(f"Logs {pod_name} (tail 50):\n{logs.strip()}")
-                except Exception:
+                fetched = False
+                for prev in (True, False):
                     try:
                         logs = v1.read_namespaced_pod_log(
-                            pod_name, namespace, tail_lines=50, previous=True
+                            pod_name, namespace, tail_lines=200, previous=prev
                         )
-                        if logs:
+                        if logs and logs.strip():
+                            label = "previous" if prev else "current"
                             results.append(
-                                f"Logs {pod_name} (previous, tail 50):\n{logs.strip()}"
+                                f"Logs {pod_name} ({label}, tail 200):\n{logs.strip()}"
                             )
-                    except Exception as e:
-                        logger.warning(
-                            "k8s_facts_logs_unavailable", pod=pod_name, error=str(e)
-                        )
+                            fetched = True
+                            break
+                    except Exception:
+                        continue
+                if not fetched:
+                    logger.warning("k8s_facts_logs_unavailable", pod=pod_name)
 
             # ── Pod events ────────────────────────────────────────────────
             # Если указан конкретный pod — берём события только по нему,
@@ -195,10 +198,36 @@ class K8sFacts:
             )
             return K8sSnapshot(text=f"[k8s_facts unavailable: {e}]")
 
+        # ── Core dump check ───────────────────────────────────────────────
+        # Если у пода смонтирован host-dump (/tmp/dump), проверяем наличие
+        # файлов через kubectl exec. Работает только если под Running.
+        core_dump_node: Optional[str] = None
+        if pod:
+            try:
+                all_pods = v1.list_namespaced_pod(namespace)
+                for p in all_pods.items:
+                    if pod in p.metadata.name and p.status.phase == "Running":
+                        has_dump_mount = any(
+                            (vm.mount_path or "").startswith("/tmp/dump")
+                            for vm in (p.spec.containers[0].volume_mounts or [])
+                            if p.spec.containers
+                        )
+                        if has_dump_mount:
+                            node = p.spec.node_name
+                            core_dump_node = node
+                            results.append(
+                                f"Core dump mount detected on node {node} at /tmp/dump "
+                                f"(pod {p.metadata.name}) — crash dump may be available"
+                            )
+                        break
+            except Exception as e:
+                logger.warning("k8s_facts_coredump_check_failed", error=str(e))
+
         return K8sSnapshot(
             text="\n".join(results),
             container_terminated=container_terminated,
             pod_events=pod_events,
+            core_dump_node=core_dump_node,
         )
 
     @staticmethod

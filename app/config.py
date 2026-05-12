@@ -79,6 +79,13 @@ class Settings(BaseSettings):
     #                          в k8s — упадёт, что и требуется (явная ошибка > silent drop).
     AUDIT_LOG_PATH: str = ""
 
+    # VictoriaMetrics — memory/CPU метрики пода за N минут до инцидента.
+    # In-cluster: http://vmsingle-vm-victoria-metrics-k8s-stack.monitoring:8428
+    # Local dev:  http://localhost:8428 (kubectl port-forward)
+    # Пусто = метрики отключены.
+    VICTORIA_METRICS_URL: str = Field("", description="VMSingle base URL")
+    VICTORIA_METRICS_WINDOW_MINUTES: int = 15
+
     # TeamCity integration — обогащение incident-а recent-deploys.
     # Ходим через mcp-teamcity-server (external/mcp/teamcity-server, MR !1):
     #   prod: https://mcp-teamcity.lastoasisgame.com/mcp (после деплоя)

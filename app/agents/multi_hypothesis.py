@@ -46,6 +46,15 @@ PERSPECTIVES: Dict[str, str] = {
         "network partitions, DNS, TLS, latency cascades, load balancer "
         "failover, queue backpressure."
     ),
+    "runtime": (
+        "SRE focused on APPLICATION RUNTIME crashes: process_crash facts "
+        "(SIGSEGV/SIGABRT/SIGILL exit codes 139/134/132), .NET CLR / JVM / Go "
+        "runtime failures, native P/Invoke interop bugs, heap/stack corruption, "
+        "unhandled exceptions in async code, GC-induced pauses, thread pool "
+        "exhaustion, finalizer panics. When process_crash is observed — this is "
+        "your primary perspective. Look for runtime-specific signals: exit codes, "
+        "core dumps, signal names in logs."
+    ),
 }
 
 
