@@ -1,6 +1,8 @@
 import asyncio
+import logging
 
 from celery import Celery
+from celery.schedules import crontab
 
 from app.config import settings
 from app.core.state_machine import IncidentState
@@ -9,6 +11,8 @@ from app.services.audit_logger import audit_service
 from app.services.telemetry_utils import incident_span
 from app.workers.pipeline import IncidentPipeline, transition_to
 
+logger = logging.getLogger(__name__)
+
 celery_app = Celery("sre_tasks", broker=settings.REDIS_URL, backend=settings.REDIS_URL)
 
 if settings.CELERY_TASK_ALWAYS_EAGER:
@@ -16,6 +20,13 @@ if settings.CELERY_TASK_ALWAYS_EAGER:
     # выполняется синхронно в текущем процессе, без Redis/worker-а.
     celery_app.conf.task_always_eager = True
     celery_app.conf.task_eager_propagates = True
+
+celery_app.conf.beat_schedule = {
+    "kg-topology-sync": {
+        "task": "kg_topology_sync",
+        "schedule": crontab(minute=0),  # каждый час
+    },
+}
 
 
 @celery_app.task(name="process_incident", bind=True, max_retries=3)
@@ -51,3 +62,19 @@ async def async_process_incident(incident_data: dict):
             raise e
         finally:
             db.close()
+
+
+@celery_app.task(name="kg_topology_sync")
+def kg_topology_sync_task():
+    from app.knowledge_graph.kg_sync import sync_topology
+
+    db = SessionLocal()
+    try:
+        result = sync_topology(db)
+        logger.info("kg_topology_sync.done result=%s", result)
+        return result
+    except Exception as e:
+        logger.error("kg_topology_sync.failed: %s", e)
+        raise
+    finally:
+        db.close()
