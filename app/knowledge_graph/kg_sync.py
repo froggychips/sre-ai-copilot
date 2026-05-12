@@ -40,7 +40,7 @@ _SKIP_VALUE_FRAGMENTS = ("azure", "google", "openai", "gpt", "amazonaws", "redis
 # Namespace'ы для сканирования по умолчанию (env-prefix → список)
 DEFAULT_SCAN_NAMESPACES = [
     "preprod-kingdom1", "preprod-kingdom2", "preprod-kingdom3", "preprod-shared",
-    "preupdate-kingdom1", "preupdate-kingdom2", "preupdate-kingdom3", "preupdate-shared",
+    "preupdate-kingdom1", "preupdate-kingdom2", "preupdate-kingdom3", "preupdate-kingdom5", "preupdate-shared",
     "prod-kingdom1", "prod-kingdom2", "prod-kingdom3", "prod-kingdom4", "prod-kingdom5",
     "prod-lo-legal", "prod-shared",
 ]
