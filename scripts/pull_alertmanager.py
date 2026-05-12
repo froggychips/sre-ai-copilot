@@ -40,10 +40,17 @@ DEFAULT_STATE_FILE = pathlib.Path.home() / ".cache" / "sre-ai-copilot" / "pulled
 
 
 def _env_bool(name: str, default: bool = False) -> bool:
-    return os.environ.get(name, str(default)).strip().lower() in ("1", "true", "yes", "y")
+    return os.environ.get(name, str(default)).strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "y",
+    )
 
 
-def fetch_alerts(am_url: str, filters: list[str], include_inhibited: bool, include_silenced: bool) -> list[dict[str, Any]]:
+def fetch_alerts(
+    am_url: str, filters: list[str], include_inhibited: bool, include_silenced: bool
+) -> list[dict[str, Any]]:
     qs = {
         "active": "true",
         "silenced": "true" if include_silenced else "false",
@@ -57,7 +64,9 @@ def fetch_alerts(am_url: str, filters: list[str], include_inhibited: bool, inclu
         return json.loads(r.read().decode())
 
 
-def to_webhook_payload(alerts: list[dict[str, Any]], external_url: str) -> dict[str, Any]:
+def to_webhook_payload(
+    alerts: list[dict[str, Any]], external_url: str
+) -> dict[str, Any]:
     """Сборка batch-payload в формате AlertManagerWebhook (v4)."""
     return {
         "version": "4",
@@ -128,7 +137,12 @@ def post_webhook(copilot_url: str, payload: dict[str, Any]) -> tuple[int, str]:
 def tick(args, state_file: pathlib.Path, seen: set[str]) -> int:
     """Один цикл pull. Возвращает кол-во новых алертов, переданных в copilot."""
     try:
-        raw = fetch_alerts(args.alertmanager_url, args.filter, args.include_inhibited, args.include_silenced)
+        raw = fetch_alerts(
+            args.alertmanager_url,
+            args.filter,
+            args.include_inhibited,
+            args.include_silenced,
+        )
     except urllib.error.URLError as e:
         log.error("AM fetch failed: %s", e)
         return 0
@@ -141,7 +155,9 @@ def tick(args, state_file: pathlib.Path, seen: set[str]) -> int:
         a["status"] = {"state": normalise_status(a)}
     payload = to_webhook_payload(new, args.alertmanager_url)
     if args.dry_run:
-        log.info("DRY: %d new alerts:\n%s", len(new), json.dumps(payload, indent=2)[:2000])
+        log.info(
+            "DRY: %d new alerts:\n%s", len(new), json.dumps(payload, indent=2)[:2000]
+        )
     else:
         try:
             code, body = post_webhook(args.copilot_url, payload)
@@ -158,14 +174,42 @@ def tick(args, state_file: pathlib.Path, seen: set[str]) -> int:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="AlertManager → local sre-ai-copilot pull adapter")
-    parser.add_argument("--alertmanager-url", default=os.environ.get("ALERTMANAGER_URL", "http://localhost:9093"))
-    parser.add_argument("--copilot-url", default=os.environ.get("SRE_COPILOT_URL", "http://localhost:8000"))
-    parser.add_argument("--interval", type=int, default=int(os.environ.get("POLL_INTERVAL_SECONDS", "30")))
-    parser.add_argument("--state-file", type=pathlib.Path, default=pathlib.Path(os.environ.get("STATE_FILE", DEFAULT_STATE_FILE)))
-    parser.add_argument("--include-inhibited", action="store_true", default=_env_bool("INCLUDE_INHIBITED"))
-    parser.add_argument("--include-silenced", action="store_true", default=_env_bool("INCLUDE_SILENCED"))
-    parser.add_argument("--filter", action="append", default=os.environ.get("FILTER", "").split(",") if os.environ.get("FILTER") else [])
+    parser = argparse.ArgumentParser(
+        description="AlertManager → local sre-ai-copilot pull adapter"
+    )
+    parser.add_argument(
+        "--alertmanager-url",
+        default=os.environ.get("ALERTMANAGER_URL", "http://localhost:9093"),
+    )
+    parser.add_argument(
+        "--copilot-url",
+        default=os.environ.get("SRE_COPILOT_URL", "http://localhost:8000"),
+    )
+    parser.add_argument(
+        "--interval",
+        type=int,
+        default=int(os.environ.get("POLL_INTERVAL_SECONDS", "30")),
+    )
+    parser.add_argument(
+        "--state-file",
+        type=pathlib.Path,
+        default=pathlib.Path(os.environ.get("STATE_FILE", DEFAULT_STATE_FILE)),
+    )
+    parser.add_argument(
+        "--include-inhibited",
+        action="store_true",
+        default=_env_bool("INCLUDE_INHIBITED"),
+    )
+    parser.add_argument(
+        "--include-silenced", action="store_true", default=_env_bool("INCLUDE_SILENCED")
+    )
+    parser.add_argument(
+        "--filter",
+        action="append",
+        default=(
+            os.environ.get("FILTER", "").split(",") if os.environ.get("FILTER") else []
+        ),
+    )
     parser.add_argument("--dry-run", action="store_true", default=_env_bool("DRY_RUN"))
     parser.add_argument("--once", action="store_true", help="Один pull и выход")
     parser.add_argument("-v", "--verbose", action="store_true")
@@ -178,18 +222,27 @@ def main() -> int:
     args.filter = [f for f in args.filter if f]
 
     seen = load_state(args.state_file)
-    log.info("start: am=%s copilot=%s interval=%ss dry=%s state=%s seen=%d",
-             args.alertmanager_url, args.copilot_url, args.interval, args.dry_run, args.state_file, len(seen))
+    log.info(
+        "start: am=%s copilot=%s interval=%ss dry=%s state=%s seen=%d",
+        args.alertmanager_url,
+        args.copilot_url,
+        args.interval,
+        args.dry_run,
+        args.state_file,
+        len(seen),
+    )
 
     if args.once:
         tick(args, args.state_file, seen)
         return 0
 
     stop = False
+
     def _shutdown(_sig, _frame):
         nonlocal stop
         stop = True
         log.info("shutdown requested")
+
     signal.signal(signal.SIGINT, _shutdown)
     signal.signal(signal.SIGTERM, _shutdown)
 

@@ -1,4 +1,5 @@
 import pytest
+
 from app.context.k8s_facts import K8sFacts
 
 
@@ -33,4 +34,7 @@ def test_peer_squad_no_suffix_returns_none():
 
 
 def test_peer_suffix_preserved_exactly():
-    assert K8sFacts._peer_namespace("squad-1-very-long-suffix") == "squad-2-very-long-suffix"
+    assert (
+        K8sFacts._peer_namespace("squad-1-very-long-suffix")
+        == "squad-2-very-long-suffix"
+    )

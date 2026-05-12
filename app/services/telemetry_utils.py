@@ -1,4 +1,5 @@
 import functools
+
 import structlog
 from opentelemetry import trace
 from opentelemetry.trace import Status, StatusCode
@@ -7,10 +8,12 @@ from opentelemetry.trace import Status, StatusCode
 tracer = trace.get_tracer("sre_ai_agents")
 logger = structlog.get_logger()
 
+
 def trace_agent(agent_name: str):
     """
     Декоратор для автоматического создания спана вокруг методов анализа агента.
     """
+
     def decorator(func):
         @functools.wraps(func)
         async def wrapper(*args, **kwargs):
@@ -23,10 +26,15 @@ def trace_agent(agent_name: str):
                 except Exception as e:
                     span.record_exception(e)
                     span.set_status(Status(StatusCode.ERROR, str(e)))
-                    logger.error("agent_execution_failed", agent=agent_name, error=str(e))
+                    logger.error(
+                        "agent_execution_failed", agent=agent_name, error=str(e)
+                    )
                     raise e
+
         return wrapper
+
     return decorator
+
 
 def record_llm_metrics(span, model: str, usage: dict = None):
     """

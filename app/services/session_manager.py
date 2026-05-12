@@ -1,10 +1,12 @@
 import json
 import uuid
+from typing import Any, Dict, List, Optional
+
 import structlog
-from typing import List, Dict, Any, Optional
 from redis.asyncio import Redis
 
 logger = structlog.get_logger()
+
 
 class SessionManager:
     def __init__(self, redis_client: Redis, ttl: int = 86400):
@@ -31,31 +33,37 @@ class SessionManager:
         """Добавляет сообщение в историю (Redis List) с продлением TTL."""
         key = self._get_key(self.PRE_HISTORY, session_id)
         message = json.dumps({"role": role, "content": content})
-        
+
         async with self.redis.pipeline(transaction=True) as pipe:
             await pipe.rpush(key, message)
             await pipe.expire(key, self.ttl)
             await pipe.execute()
-        
+
         logger.debug("message_added_to_history", session_id=session_id, role=role)
 
-    async def get_context(self, session_id: str, last_n: int = 15) -> List[Dict[str, str]]:
+    async def get_context(
+        self, session_id: str, last_n: int = 15
+    ) -> List[Dict[str, str]]:
         """Возвращает последние N сообщений для промпта."""
         key = self._get_key(self.PRE_HISTORY, session_id)
         raw_messages = await self.redis.lrange(key, -last_n, -1)
         return [json.loads(m) for m in raw_messages]
 
-    async def save_agent_state(self, session_id: str, agent_id: str, state: Dict[str, Any]):
+    async def save_agent_state(
+        self, session_id: str, agent_id: str, state: Dict[str, Any]
+    ):
         """Сохраняет промежуточное состояние конкретного агента."""
         key = self._get_key(self.PRE_STATE, session_id)
         async with self.redis.pipeline(transaction=True) as pipe:
             await pipe.hset(key, agent_id, json.dumps(state))
             await pipe.expire(key, self.ttl)
             await pipe.execute()
-        
+
         logger.info("agent_state_persisted", session_id=session_id, agent=agent_id)
 
-    async def get_agent_state(self, session_id: str, agent_id: str) -> Optional[Dict[str, Any]]:
+    async def get_agent_state(
+        self, session_id: str, agent_id: str
+    ) -> Optional[Dict[str, Any]]:
         """Получает состояние агента из Redis."""
         key = self._get_key(self.PRE_STATE, session_id)
         raw_state = await self.redis.hget(key, agent_id)

@@ -1,14 +1,21 @@
 import json
 import re
-import structlog
 from typing import Optional, Set
+
+import structlog
 from pydantic import BaseModel
 
 logger = structlog.get_logger()
 
 READ_ONLY_VERBS: Set[str] = {"get", "list", "watch"}
 WRITE_VERBS: Set[str] = {"patch", "create"}
-ALLOWED_RESOURCES: Set[str] = {"pods", "deployments", "services", "configmaps", "ingresses"}
+ALLOWED_RESOURCES: Set[str] = {
+    "pods",
+    "deployments",
+    "services",
+    "configmaps",
+    "ingresses",
+}
 
 # WO cluster (lastoasisgame-local) namespace policy.
 # Production-tier namespaces are read-only for AI; squad-* dev environments
@@ -45,16 +52,24 @@ class K8sSecurityGuard:
 
         if ns in FORBIDDEN_NAMESPACES:
             logger.error("security_violation_namespace_forbidden", ns=ns)
-            raise PermissionError(f"Access to namespace '{ns}' is blocked by security policy.")
+            raise PermissionError(
+                f"Access to namespace '{ns}' is blocked by security policy."
+            )
 
         if op.resource.lower() not in ALLOWED_RESOURCES:
             logger.error("security_violation_resource", resource=op.resource)
-            raise PermissionError(f"Resource '{op.resource}' is not in the approved list.")
+            raise PermissionError(
+                f"Resource '{op.resource}' is not in the approved list."
+            )
 
         if verb in WRITE_VERBS:
             if ns in READ_ONLY_NAMESPACES:
-                logger.error("security_violation_write_to_readonly_ns", ns=ns, verb=verb)
-                raise PermissionError(f"Write actions are not permitted in '{ns}' (read-only tier).")
+                logger.error(
+                    "security_violation_write_to_readonly_ns", ns=ns, verb=verb
+                )
+                raise PermissionError(
+                    f"Write actions are not permitted in '{ns}' (read-only tier)."
+                )
             if not cls._is_write_namespace(ns):
                 logger.error("security_violation_write_outside_squad", ns=ns, verb=verb)
                 raise PermissionError(
@@ -62,7 +77,9 @@ class K8sSecurityGuard:
                 )
         elif verb not in READ_ONLY_VERBS:
             logger.error("security_violation_verb", verb=verb)
-            raise PermissionError(f"Action '{verb}' is not permitted for AI-driven operations.")
+            raise PermissionError(
+                f"Action '{verb}' is not permitted for AI-driven operations."
+            )
 
         if op.body:
             body_str = json.dumps(op.body).lower()
@@ -71,7 +88,9 @@ class K8sSecurityGuard:
                 raise PermissionError("Privileged containers are strictly forbidden.")
             if '"hostnetwork": true' in body_str:
                 logger.error("security_violation_host_network")
-                raise PermissionError("hostNetwork usage is blocked for security reasons.")
+                raise PermissionError(
+                    "hostNetwork usage is blocked for security reasons."
+                )
 
         logger.info("k8s_guard_passed", verb=verb, resource=op.resource, ns=ns)
         return True

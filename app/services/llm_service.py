@@ -1,8 +1,12 @@
-from anthropic import AsyncAnthropic
-from app.config import settings
-from app.services.resilience import llm_retry_strategy
-from app.services.claude_cli_service import ClaudeCliService
+import asyncio
 import logging
+
+from anthropic import AsyncAnthropic
+from httpx import AsyncClient, TimeoutException
+
+from app.config import settings
+from app.services.claude_cli_service import ClaudeCliService
+from app.services.resilience import llm_retry_strategy
 
 
 class LLMService:
@@ -19,7 +23,9 @@ class LLMService:
         if self.backend == "claude_cli":
             self.cli = ClaudeCliService(
                 model=settings.MODEL_NAME or None,
-                timeout_seconds=float(getattr(settings, "CLAUDE_CLI_TIMEOUT_SECONDS", 180.0)),
+                timeout_seconds=float(
+                    getattr(settings, "CLAUDE_CLI_TIMEOUT_SECONDS", 180.0)
+                ),
             )
             self.client = None
         else:
@@ -31,10 +37,15 @@ class LLMService:
         try:
             if self.backend == "claude_cli":
                 return await self.cli.generate_content(prompt)
-            response = await self.client.messages.create(
-                model=self.model,
-                max_tokens=settings.MAX_TOKENS,
-                messages=[{"role": "user", "content": prompt}],
+            # Add timeout for LLM calls
+            llm_timeout = getattr(settings, "LLM_TIMEOUT_SECONDS", 30.0)
+            response = await asyncio.wait_for(
+                self.client.messages.create(
+                    model=self.model,
+                    max_tokens=settings.MAX_TOKENS,
+                    messages=[{"role": "user", "content": prompt}],
+                ),
+                timeout=llm_timeout,
             )
             text = "".join(
                 block.text
@@ -44,6 +55,9 @@ class LLMService:
             if not text:
                 raise ValueError("Empty response from LLM")
             return text
+        except asyncio.TimeoutError:
+            logging.error("LLM call timed out")
+            raise ValueError("LLM timeout")
         except Exception as e:
             logging.error(f"LLM call attempt failed: {e}")
             raise

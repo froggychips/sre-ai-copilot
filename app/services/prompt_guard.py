@@ -1,8 +1,10 @@
 import re
-import structlog
 from typing import Tuple
 
+import structlog
+
 logger = structlog.get_logger()
+
 
 class PromptGuard:
     # Паттерны атак: "ignore previous instructions", "jailbreak", "override"
@@ -17,9 +19,7 @@ class PromptGuard:
     ]
 
     # Паттерны попыток выполнить код (Python/Bash)
-    CODE_PATTERNS = [
-        r"import\s+os", r"subprocess\.", r"rm\s+-rf", r"eval\(", r"exec\("
-    ]
+    CODE_PATTERNS = [r"import\s+os", r"subprocess\.", r"rm\s+-rf", r"eval\(", r"exec\("]
 
     @classmethod
     def sanitize(cls, user_input: str) -> str:
@@ -37,7 +37,7 @@ class PromptGuard:
         Проверяет ввод на наличие признаков Prompt Injection.
         """
         cleaned = user_input.lower()
-        
+
         for pattern in cls.INJECTION_PATTERNS:
             if re.search(pattern, cleaned):
                 return True, "INSTRUCTION_OVERRIDE_ATTEMPT"
@@ -51,10 +51,12 @@ class PromptGuard:
         # deploys + changes). Поднимать в production-сетинге — после оценки
         # стоимости LLM-вызова.
         from app.config import settings as _settings
+
         max_chars = getattr(_settings, "PROMPT_INPUT_MAX_CHARS", 5000)
         if len(user_input) > max_chars:
             return True, "INPUT_TOO_LONG"
 
         return False, ""
+
 
 prompt_guard = PromptGuard()

@@ -1,22 +1,23 @@
-from typing import List, Dict
+from typing import Dict, List
+
 
 class NextStepsGenerator:
     MAPPING = {
         "OOM": [
             "Inspect pod memory limits and requests",
             "Check application heap usage / GC logs",
-            "Verify if a recent deploy increased memory footprint"
+            "Verify if a recent deploy increased memory footprint",
         ],
         "App Crash": [
             "Inspect container logs for panic or uncaught exceptions",
             "Verify environment variables and secrets",
-            "Check liveness/readiness probe configurations"
+            "Check liveness/readiness probe configurations",
         ],
         "ImagePullBackOff": [
             "Verify container registry credentials",
             "Check if the image tag exists in the registry",
-            "Inspect node connectivity to the registry"
-        ]
+            "Inspect node connectivity to the registry",
+        ],
     }
 
     @classmethod
@@ -24,4 +25,6 @@ class NextStepsGenerator:
         """
         Возвращает список действий на основе детерминированного маппинга причин.
         """
-        return cls.MAPPING.get(root_cause, ["Consult SRE playbooks", "Investigate service logs"])
+        return cls.MAPPING.get(
+            root_cause, ["Consult SRE playbooks", "Investigate service logs"]
+        )

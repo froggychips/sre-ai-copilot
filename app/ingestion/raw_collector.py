@@ -31,7 +31,11 @@ class RawCollector:
                     "raw": event,
                 }
             )
-        return {"status": "accepted", "event_id": event_id, "ingest_time_source": "collector-node-clock"}
+        return {
+            "status": "accepted",
+            "event_id": event_id,
+            "ingest_time_source": "collector-node-clock",
+        }
 
 
 raw_collector = RawCollector()

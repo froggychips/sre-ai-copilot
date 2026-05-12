@@ -6,8 +6,9 @@ shouldn't make any network round-trip. The DB session is mocked at
 `SessionLocal` so the test runs without Postgres.
 """
 
-import pytest
 from unittest.mock import AsyncMock, MagicMock
+
+import pytest
 
 
 @pytest.fixture
@@ -32,12 +33,36 @@ def incident_data() -> dict:
 def mocked_dependencies(mocker):
     """Mock all the things `async_process_incident` reaches into."""
     # All 6 agent class methods → simple AsyncMock that returns a string.
-    mocker.patch("app.workers.tasks.AnalyzerAgent.analyze", new_callable=AsyncMock, return_value="analysis text")
-    mocker.patch("app.workers.tasks.HypothesisAgent.generate", new_callable=AsyncMock, return_value="hyp text")
-    mocker.patch("app.workers.tasks.CriticAgent.audit", new_callable=AsyncMock, return_value="cause text")
-    mocker.patch("app.workers.tasks.FixAgent.suggest", new_callable=AsyncMock, return_value="fix text")
-    mocker.patch("app.workers.tasks.RiskAgent.assess", new_callable=AsyncMock, return_value="risk text")
-    mocker.patch("app.workers.tasks.SynthesisAgent.synthesize", new_callable=AsyncMock, return_value="synth text")
+    mocker.patch(
+        "app.workers.tasks.AnalyzerAgent.analyze",
+        new_callable=AsyncMock,
+        return_value="analysis text",
+    )
+    mocker.patch(
+        "app.workers.tasks.HypothesisAgent.generate",
+        new_callable=AsyncMock,
+        return_value="hyp text",
+    )
+    mocker.patch(
+        "app.workers.tasks.CriticAgent.audit",
+        new_callable=AsyncMock,
+        return_value="cause text",
+    )
+    mocker.patch(
+        "app.workers.tasks.FixAgent.suggest",
+        new_callable=AsyncMock,
+        return_value="fix text",
+    )
+    mocker.patch(
+        "app.workers.tasks.RiskAgent.assess",
+        new_callable=AsyncMock,
+        return_value="risk text",
+    )
+    mocker.patch(
+        "app.workers.tasks.SynthesisAgent.synthesize",
+        new_callable=AsyncMock,
+        return_value="synth text",
+    )
 
     # Similar incidents — empty by default; individual tests override.
     similar_mock = mocker.patch(
@@ -46,7 +71,9 @@ def mocked_dependencies(mocker):
     )
 
     # Discord and audit — no-op.
-    mocker.patch("app.workers.tasks.discord_service.send_report", new_callable=AsyncMock)
+    mocker.patch(
+        "app.workers.tasks.discord_service.send_report", new_callable=AsyncMock
+    )
     mocker.patch("app.workers.tasks.audit_service.log_event")
 
     # DB session: in-process MagicMock. The pipeline does query().filter().first(),
@@ -72,6 +99,7 @@ def mocked_dependencies(mocker):
 @pytest.mark.asyncio
 async def test_pipeline_writes_six_stage_trace(mocked_dependencies, incident_data):
     from app.workers.tasks import async_process_incident
+
     await async_process_incident(incident_data)
 
     record = mocked_dependencies["record"]
@@ -92,9 +120,16 @@ async def test_pipeline_writes_six_stage_trace(mocked_dependencies, incident_dat
 
 
 @pytest.mark.asyncio
-async def test_pipeline_passes_similar_past_to_hypothesis(mocker, mocked_dependencies, incident_data):
+async def test_pipeline_passes_similar_past_to_hypothesis(
+    mocker, mocked_dependencies, incident_data
+):
     mocked_dependencies["similar_find"].return_value = [
-        {"incident_id": "OLD-1", "score": 0.7, "root_cause": "memory limit", "summary": "OOM"},
+        {
+            "incident_id": "OLD-1",
+            "score": 0.7,
+            "root_cause": "memory limit",
+            "summary": "OOM",
+        },
     ]
     # Re-patch HypothesisAgent.generate so we can inspect its call args.
     hypo_mock = mocker.patch(
@@ -104,6 +139,7 @@ async def test_pipeline_passes_similar_past_to_hypothesis(mocker, mocked_depende
     )
 
     from app.workers.tasks import async_process_incident
+
     await async_process_incident(incident_data)
 
     # SimilarIncidentEngine.find was called with the incident_data dict
@@ -120,13 +156,16 @@ async def test_pipeline_passes_similar_past_to_hypothesis(mocker, mocked_depende
 
 
 @pytest.mark.asyncio
-async def test_pipeline_stores_similar_past_count_in_analysis(mocked_dependencies, incident_data):
+async def test_pipeline_stores_similar_past_count_in_analysis(
+    mocked_dependencies, incident_data
+):
     mocked_dependencies["similar_find"].return_value = [
         {"incident_id": "OLD-1", "score": 0.7, "root_cause": "x", "summary": "y"},
         {"incident_id": "OLD-2", "score": 0.5, "root_cause": "a", "summary": "b"},
     ]
 
     from app.workers.tasks import async_process_incident
+
     await async_process_incident(incident_data)
 
     analysis = mocked_dependencies["record"].analysis
@@ -138,6 +177,7 @@ async def test_pipeline_stores_similar_past_count_in_analysis(mocked_dependencie
 async def test_pipeline_marks_resolved_and_commits(mocked_dependencies, incident_data):
     from app.workers.tasks import async_process_incident
     from app.core.state_machine import IncidentState
+
     await async_process_incident(incident_data)
 
     # Was "COMPLETED" before StateMachine wiring; now the pipeline drives

@@ -24,7 +24,7 @@ from __future__ import annotations
 
 import contextvars
 import time
-from dataclasses import dataclass, field, asdict
+from dataclasses import asdict, dataclass, field
 from typing import Any
 
 
@@ -59,8 +59,8 @@ class StageTrace:
 # Per-task storage. `None` outside of any `StageTimer` scope — callers
 # that record LLM calls in that state are silently dropped (matches the
 # Swift `LLMRouter.recorder?.record(...)` semantics).
-_current_recorder: contextvars.ContextVar[list[LLMCallInfo] | None] = contextvars.ContextVar(
-    "llm_call_recorder", default=None
+_current_recorder: contextvars.ContextVar[list[LLMCallInfo] | None] = (
+    contextvars.ContextVar("llm_call_recorder", default=None)
 )
 
 

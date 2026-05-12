@@ -12,7 +12,9 @@ class K8sService:
     def __init__(self):
         self.safe_mode = settings.SAFE_MODE
 
-    def execute_intent(self, intent: ExecutionIntent, dry_run: bool = True) -> Dict[str, Any]:
+    def execute_intent(
+        self, intent: ExecutionIntent, dry_run: bool = True
+    ) -> Dict[str, Any]:
         """Translate execution intent to kubectl command and execute it safely."""
         command = DSLTranslator.to_kubectl(intent)
         return self.run_command(command, risk_level=intent.risk, dry_run=dry_run)
@@ -34,11 +36,18 @@ class K8sService:
         namespace = "default"
         if "-n" in cmd_parts and len(cmd_parts) > cmd_parts.index("-n") + 1:
             namespace = cmd_parts[cmd_parts.index("-n") + 1]
-        elif "--namespace" in cmd_parts and len(cmd_parts) > cmd_parts.index("--namespace") + 1:
+        elif (
+            "--namespace" in cmd_parts
+            and len(cmd_parts) > cmd_parts.index("--namespace") + 1
+        ):
             namespace = cmd_parts[cmd_parts.index("--namespace") + 1]
 
         try:
-            k8s_guard.validate(K8sOperation(verb=verb, resource=resource, namespace=namespace, body=body))
+            k8s_guard.validate(
+                K8sOperation(
+                    verb=verb, resource=resource, namespace=namespace, body=body
+                )
+            )
         except PermissionError as e:
             return {"success": False, "error": f"GUARDRAIL_BLOCK: {str(e)}"}
 
@@ -65,7 +74,9 @@ class K8sService:
             return {"success": False, "error": "SAFE_MODE: Manual approval required."}
 
         try:
-            result = subprocess.run(full_cmd, capture_output=True, text=True, check=False)
+            result = subprocess.run(
+                full_cmd, capture_output=True, text=True, check=False
+            )
             status = result.returncode == 0
             audit_service.log_event(
                 "K8S_COMMAND_RESULT",

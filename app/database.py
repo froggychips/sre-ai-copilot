@@ -1,12 +1,15 @@
-from sqlalchemy import create_engine, Column, Integer, String, JSON, DateTime
+from datetime import datetime
+
+from sqlalchemy import JSON, Column, DateTime, Integer, String, create_engine
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker
-from datetime import datetime
+
 from app.config import settings
 
 engine = create_engine(settings.DATABASE_URL)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
+
 
 class IncidentRecord(Base):
     __tablename__ = "incidents"
@@ -21,9 +24,10 @@ class IncidentRecord(Base):
     # Self-contained inside the incident row so post-mortem doesn't need
     # a separate trip into OTel/Prometheus.
     trace = Column(JSON, nullable=True)
-    user_feedback = Column(JSON, nullable=True) # {score: 1-5, comment: str}
-    is_accepted = Column(String, nullable=True) # "ACCEPTED", "REJECTED"
+    user_feedback = Column(JSON, nullable=True)  # {score: 1-5, comment: str}
+    is_accepted = Column(String, nullable=True)  # "ACCEPTED", "REJECTED"
     created_at = Column(DateTime, default=datetime.utcnow)
+
 
 def get_db():
     db = SessionLocal()

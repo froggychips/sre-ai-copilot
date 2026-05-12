@@ -33,7 +33,10 @@ _BRANCH_RULES = [
     (re.compile(r"^prod(-|$)"), "prod"),
     (re.compile(r"^preprod(-|$)"), "preprod"),
     (re.compile(r"^preupdate(-|$)"), "preupdate"),
-    (re.compile(r"^squad-gd(-|$)"), "preprod"),  # WO-11324: squad-gd деплоится из preprod-ветки
+    (
+        re.compile(r"^squad-gd(-|$)"),
+        "preprod",
+    ),  # WO-11324: squad-gd деплоится из preprod-ветки
 ]
 
 
@@ -78,7 +81,11 @@ async def incident_teamcity_context(
         return None
 
     try:
-        end = datetime.fromisoformat((incident_starts_at or "").replace("Z", "+00:00")) if incident_starts_at else datetime.now(timezone.utc)
+        end = (
+            datetime.fromisoformat((incident_starts_at or "").replace("Z", "+00:00"))
+            if incident_starts_at
+            else datetime.now(timezone.utc)
+        )
     except Exception:
         end = datetime.now(timezone.utc)
     since = end - timedelta(minutes=settings.TC_LOOKBACK_MINUTES)
@@ -98,22 +105,30 @@ async def incident_teamcity_context(
         timeout=settings.TC_TIMEOUT_SECONDS,
     )
     try:
+
         async def _list(extra: dict[str, Any]) -> list[dict[str, Any]]:
             try:
-                rv = await mcp.call_tool("teamcity_list_builds", {
-                    "project_id": settings.TC_BACKEND_PROJECT_ID,
-                    "state": "finished",
-                    "count": 50,
-                    **extra,
-                })
+                rv = await mcp.call_tool(
+                    "teamcity_list_builds",
+                    {
+                        "project_id": settings.TC_BACKEND_PROJECT_ID,
+                        "state": "finished",
+                        "count": 50,
+                        **extra,
+                    },
+                )
                 return rv if isinstance(rv, list) else []
             except (httpx.HTTPError, RuntimeError) as e:
-                logger.warning("teamcity.list_builds (mcp) failed", error=str(e), extra=extra)
+                logger.warning(
+                    "teamcity.list_builds (mcp) failed", error=str(e), extra=extra
+                )
                 return []
 
         default_branch, logical_branch = await asyncio.gather(
-            _list({}),                      # default branches (refs/heads/<x> для buildTypes без branchSpec)
-            _list({"branch": branch}),      # logical name (для buildTypes с branchSpec)
+            _list(
+                {}
+            ),  # default branches (refs/heads/<x> для buildTypes без branchSpec)
+            _list({"branch": branch}),  # logical name (для buildTypes с branchSpec)
         )
 
         seen_ids: set[int] = set()
@@ -138,41 +153,52 @@ async def incident_teamcity_context(
             if not btype:
                 return []
             try:
-                rv = await mcp.call_tool("teamcity_list_changes", {"buildtype_id": btype, "count": 5})
+                rv = await mcp.call_tool(
+                    "teamcity_list_changes", {"buildtype_id": btype, "count": 5}
+                )
                 return rv if isinstance(rv, list) else []
             except (httpx.HTTPError, RuntimeError) as e:
-                logger.warning("teamcity.list_changes (mcp) failed", buildtype_id=btype, error=str(e))
+                logger.warning(
+                    "teamcity.list_changes (mcp) failed",
+                    buildtype_id=btype,
+                    error=str(e),
+                )
                 return []
 
-        all_changes = await asyncio.gather(*[_changes(b) for b in builds]) if builds else []
+        all_changes = (
+            await asyncio.gather(*[_changes(b) for b in builds]) if builds else []
+        )
 
         recent_builds = []
         for b, changes in zip(builds, all_changes):
-            recent_builds.append({
-                "id": b.get("id"),
-                "number": b.get("number"),
-                "status": b.get("status"),
-                "state": b.get("state"),
-                "buildtype_id": b.get("buildtype_id"),
-                "branch": b.get("branch"),
-                "started_at": b.get("started"),
-                "finished_at": b.get("finished"),
-                "agent": b.get("agent"),
-                "status_text": b.get("status_text"),
-                "url": (
-                    f"{settings.TEAMCITY_WEB_URL.rstrip('/')}/viewLog.html?buildId={b.get('id')}"
-                    if settings.TEAMCITY_WEB_URL else None
-                ),
-                "changes": [
-                    {
-                        "version": (c.get("version") or "")[:12],
-                        "author": c.get("username") or c.get("author"),
-                        "date": c.get("date"),
-                        "comment": _trim_comment(c.get("comment", "")),
-                    }
-                    for c in changes
-                ],
-            })
+            recent_builds.append(
+                {
+                    "id": b.get("id"),
+                    "number": b.get("number"),
+                    "status": b.get("status"),
+                    "state": b.get("state"),
+                    "buildtype_id": b.get("buildtype_id"),
+                    "branch": b.get("branch"),
+                    "started_at": b.get("started"),
+                    "finished_at": b.get("finished"),
+                    "agent": b.get("agent"),
+                    "status_text": b.get("status_text"),
+                    "url": (
+                        f"{settings.TEAMCITY_WEB_URL.rstrip('/')}/viewLog.html?buildId={b.get('id')}"
+                        if settings.TEAMCITY_WEB_URL
+                        else None
+                    ),
+                    "changes": [
+                        {
+                            "version": (c.get("version") or "")[:12],
+                            "author": c.get("username") or c.get("author"),
+                            "date": c.get("date"),
+                            "comment": _trim_comment(c.get("comment", "")),
+                        }
+                        for c in changes
+                    ],
+                }
+            )
 
         return {
             "branch": branch,

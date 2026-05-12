@@ -1,18 +1,19 @@
 from app.agents.base import BaseAgent
 from app.services.telemetry_utils import trace_agent
 
+
 class FixAgent(BaseAgent):
     def __init__(self):
         super().__init__(
             name="Fixer",
-            role="Kubernetes Expert. Generate structured execution intents to fix the incident."
+            role="Kubernetes Expert. Generate structured execution intents to fix the incident.",
         )
 
     @trace_agent("Fixer")
     async def suggest(self, finalized_cause: str) -> str:
         instruction = """
         Suggest a Kubernetes fix using a Structured Execution Intent.
-        
+
         Output ONLY a valid JSON object matching this schema:
         {
             "action": "restart_deployment | scale_deployment | get_logs | describe_resource",
@@ -24,7 +25,4 @@ class FixAgent(BaseAgent):
         }
         Do not include markdown or extra text.
         """
-        return await self.ask(
-            user_context=finalized_cause,
-            instruction=instruction
-        )
+        return await self.ask(user_context=finalized_cause, instruction=instruction)

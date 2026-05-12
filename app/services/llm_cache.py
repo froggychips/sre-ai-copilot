@@ -1,10 +1,12 @@
 import hashlib
-import structlog
-from typing import Optional, Callable
 from functools import wraps
+from typing import Callable, Optional
+
+import structlog
 from redis.asyncio import Redis
 
 logger = structlog.get_logger()
+
 
 class LLMCache:
     def __init__(self, redis_client: Redis, ttl: int = 3600):
@@ -33,27 +35,34 @@ class LLMCache:
         await self.redis.set(key, response, ex=self.ttl)
         logger.info("llm_cache_miss_saved", key=key[:12])
 
+
 def cache_llm_response(ttl: int = 3600):
     """
     Декоратор для методов класса BaseAgent, который кэширует ответы в Redis.
     """
+
     def decorator(func: Callable):
         @wraps(func)
         async def wrapper(self, user_context: str, instruction: str = "", **kwargs):
             # Используем Redis клиент, который должен быть инициализирован в системе
             from app.celery_worker import redis_client
+
             cache_manager = LLMCache(redis_client, ttl=ttl)
-            
+
             # 1. Пробуем получить из кэша
-            cached_result = await cache_manager.get(self.role, instruction, user_context)
+            cached_result = await cache_manager.get(
+                self.role, instruction, user_context
+            )
             if cached_result:
                 return cached_result
-            
+
             # 2. Если нет — вызываем реальный метод (с LLM, Guardrails и т.д.)
             response = await func(self, user_context, instruction, **kwargs)
-            
+
             # 3. Сохраняем в кэш
             await cache_manager.set(self.role, instruction, user_context, response)
             return response
+
         return wrapper
+
     return decorator

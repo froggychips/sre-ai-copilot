@@ -1,8 +1,10 @@
-import pytest
 from unittest.mock import AsyncMock
+
+import pytest
+
 import app.services.llm_service  # noqa: F401  ensure module loaded for mocker.patch
 from app.agents.analyzer import AnalyzerAgent
-from app.models.incident import Incident, AlertManagerAlert
+from app.models.incident import AlertManagerAlert, Incident
 
 
 @pytest.fixture

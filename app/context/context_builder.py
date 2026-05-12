@@ -1,7 +1,9 @@
-from app.context.metrics import MetricsCollector
+from kubernetes import config
+
 from app.context.deployments import DeploymentCollector
 from app.context.logs import LogCollector
-from kubernetes import config
+from app.context.metrics import MetricsCollector
+
 
 class ContextBuilder:
     def __init__(self):
@@ -13,10 +15,10 @@ class ContextBuilder:
     def build_context(self, incident: dict) -> dict:
         ns = incident.get("targets", [{}])[0].get("namespace", "default")
         pod = incident.get("targets", [{}])[0].get("pod", "")
-        
+
         return {
             "incident": incident,
             "metrics": self.metrics.get_namespace_health(ns),
             "deployments": self.deps.get_recent_deployments(ns),
-            "logs_summary": self.logs.get_summary(ns, pod) if pod else "No pod target"
+            "logs_summary": self.logs.get_summary(ns, pod) if pod else "No pod target",
         }

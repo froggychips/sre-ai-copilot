@@ -1,5 +1,7 @@
-from typing import List, Dict
+from typing import Dict, List
+
 from app.ingestion.kubernetes_events import IncidentEvent
+
 
 class IncidentSignalGraph:
     def __init__(self):
@@ -10,5 +12,9 @@ class IncidentSignalGraph:
         self.nodes.append(event)
         # Автоматическая корреляция по времени
         for node in self.nodes:
-            if abs((node.timestamp - event.timestamp).total_seconds()) < 300: # 5 min window
-                self.edges.append({"source": node, "target": event, "type": "time_proximity"})
+            if (
+                abs((node.timestamp - event.timestamp).total_seconds()) < 300
+            ):  # 5 min window
+                self.edges.append(
+                    {"source": node, "target": event, "type": "time_proximity"}
+                )
