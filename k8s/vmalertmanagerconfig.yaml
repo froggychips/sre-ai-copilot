@@ -1,0 +1,40 @@
+apiVersion: operator.victoriametrics.com/v1beta1
+kind: VMAlertmanagerConfig
+metadata:
+  name: sre-ai-copilot
+  namespace: sre-ai
+spec:
+  receivers:
+  - name: sre-ai-prod
+    webhook_configs:
+    - url: http://sre-ai-api.sre-ai.svc.cluster.local:8000/webhook/alert
+      send_resolved: true
+      max_alerts: 10
+  - name: sre-ai-preprod
+    webhook_configs:
+    - url: http://sre-ai-api.sre-ai.svc.cluster.local:8000/webhook/alert
+      send_resolved: true
+      max_alerts: 10
+  - name: sre-ai-preupdate
+    webhook_configs:
+    - url: http://sre-ai-api.sre-ai.svc.cluster.local:8000/webhook/alert
+      send_resolved: true
+      max_alerts: 10
+  route:
+    receiver: sre-ai-prod  # fallback (не должен срабатывать — все алерты ловятся ниже)
+    routes:
+    - matchers:
+      - severity =~ "critical|warning"
+      - namespace =~ "prod-.+"
+      receiver: sre-ai-prod
+      continue: true   # продолжаем — discord-error тоже должен получить
+    - matchers:
+      - severity =~ "critical|warning"
+      - namespace =~ "preprod-.+"
+      receiver: sre-ai-preprod
+      continue: true
+    - matchers:
+      - severity =~ "critical|warning"
+      - namespace =~ "preupdate-.+"
+      receiver: sre-ai-preupdate
+      continue: true
