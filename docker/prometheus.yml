@@ -3,6 +3,12 @@ global:
   evaluation_interval: 15s
 
 scrape_configs:
-  - job_name: sre-copilot
+  # app внутри docker-compose (docker compose up api)
+  - job_name: sre-copilot-docker
     static_configs:
       - targets: ['api:8001']
+
+  # app запущена локально (uvicorn вне docker)
+  - job_name: sre-copilot-local
+    static_configs:
+      - targets: ['host.docker.internal:8001']

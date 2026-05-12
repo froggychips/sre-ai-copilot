@@ -9,7 +9,10 @@ from app.core.state_machine import IncidentState
 from app.database import IncidentRecord, SessionLocal
 from app.services.audit_logger import audit_service
 from app.services.telemetry_utils import incident_span
+from app.telemetry import setup_telemetry
 from app.workers.pipeline import IncidentPipeline, transition_to
+
+setup_telemetry(service_name="copilot-worker")
 
 logger = logging.getLogger(__name__)
 
