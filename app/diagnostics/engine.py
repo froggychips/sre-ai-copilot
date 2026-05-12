@@ -15,6 +15,7 @@ import structlog
 
 from app.diagnostics.facts import Fact, FactStore
 from app.diagnostics.rules import DEFAULT_RULES, Rule
+from app.observability.ai_metrics import track_fact_observed
 
 logger = structlog.get_logger()
 
@@ -47,6 +48,7 @@ class DiagnosticEngine:
                     )
                     continue
                 store.add(f)
+                track_fact_observed(kind=f.kind, observed=f.observed)
         return store
 
 
