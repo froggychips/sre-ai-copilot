@@ -49,7 +49,7 @@ from app.services.clickhouse_service import get_blast_radius
 from app.services.discord_service import discord_service
 from app.services.gitlab_service import enrich_with_gitlab, gitlab_context_to_prompt
 from app.services.statics_service import check_statics_for_error
-from app.services.teamcity_service import incident_teamcity_context
+from app.services.teamcity_service import incident_teamcity_context, teamcity_context_to_prompt
 
 logger = structlog.get_logger()
 
@@ -344,6 +344,10 @@ class IncidentPipeline:
         # pod issue" from "cluster-wide pressure" (e.g. 8 crashloops + disk 92%).
         if self.cluster_health_context:
             summary = f"{summary}\n\n{self.cluster_health_context}"
+
+        tc_prompt = teamcity_context_to_prompt(self.incident.teamcity_context)
+        if tc_prompt:
+            summary = f"{summary}\n\n{tc_prompt}"
 
         gl_prompt = gitlab_context_to_prompt(self.gitlab_context)
         if gl_prompt:
