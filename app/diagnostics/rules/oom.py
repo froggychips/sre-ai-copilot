@@ -1,8 +1,14 @@
 """OOMKilled detector.
 
-Ищет в текстовом enriched context признаки OOM-событий: alertname,
-k8s events summary, описание alert-а. Конкретные паттерны взяты из
-реальных текстов k8s events:
+Ищет в контексте признаки OOM-событий. Приоритеты (по убыванию точности):
+  1. k8s_pod_state — terminated.reason/exit_code из k8s API (наиболее точно)
+  2. Текстовый regex — только если k8s_pod_state не опровергает OOM
+
+ВАЖНО: если k8s_pod_state содержит данные о target-поде с non-OOM exit code
+(≠ 0, ≠ 137), текстовый fallback подавляется. Иначе "OOMKilled" из событий
+соседних подов namespace даёт ложный positive.
+
+Конкретные паттерны взяты из реальных текстов k8s events:
     "OOMKilled"
     "out of memory"
     "Container ... was OOM killed"
@@ -12,7 +18,7 @@ k8s events summary, описание alert-а. Конкретные паттер
 from __future__ import annotations
 
 import re
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional, Tuple
 
 from app.diagnostics.facts import Fact, FactKind
 from app.diagnostics.rules.base import Rule
@@ -30,46 +36,36 @@ class OOMKilledRule(Rule):
     name = "OOMKilledRule"
 
     def evaluate(self, ctx: Dict[str, Any]) -> List[Fact]:
-        # Structured check первый — точнее regex и не зависит от текста.
         pod = ctx.get("pod") or ctx.get("service")
         pod_state = ctx.get("k8s_pod_state") or {}
-        if pod and pod in pod_state:
-            info = pod_state[pod]
-            if info.get("reason") == "OOMKilled":
-                return [
-                    Fact(
-                        kind=FactKind.OOM_KILLED,
-                        observed=True,
-                        confidence=0.98,
-                        subject=pod,
-                        evidence={
-                            "source": "k8s_terminated_state",
-                            "exit_code": info.get("exit_code"),
-                            "container": info.get("container"),
-                        },
-                        source_rule=self.name,
-                    )
-                ]
-            if info.get("exit_code") == 137:
-                # exit 137 без OOMKilled в reason — может быть kill -9 или OOM.
-                return [
-                    Fact(
-                        kind=FactKind.OOM_KILLED,
-                        observed=True,
-                        confidence=0.55,
-                        subject=pod,
-                        evidence={
-                            "source": "k8s_terminated_state",
-                            "exit_code": 137,
-                            "note": "exit 137 without explicit OOMKilled reason",
-                            "container": info.get("container"),
-                        },
-                        source_rule=self.name,
-                    )
-                ]
 
+        # ── 1. Structured: k8s terminated state ──────────────────────────
+        # Сканируем target-под первым, потом остальные (вдруг пересоздан).
+        structured, target_exit = self._check_pod_state(pod_state, pod)
+        if structured is not None:
+            return [structured]
+
+        # ── 2. Блокировка text-fallback при наличии non-OOM данных ───────
+        # Если k8s API вернул данные о target-поде с exit code ≠ 137,
+        # любые текстовые совпадения "OOMKilled" — шум из соседних подов.
+        if target_exit is not None and target_exit not in (0, 137):
+            return [
+                Fact(
+                    kind=FactKind.OOM_KILLED,
+                    observed=False,
+                    confidence=0.90,
+                    subject=pod,
+                    evidence={
+                        "source": "k8s_terminated_state",
+                        "exit_code": target_exit,
+                        "note": "non-OOM exit code; text matches suppressed",
+                    },
+                    source_rule=self.name,
+                )
+            ]
+
+        # ── 3. Text regex fallback ────────────────────────────────────────
         text = self.text_haystack(ctx)
-
         hard = self.count_matches(text, _HARD_PATTERN)
         soft = self.count_matches(text, _SOFT_PATTERN)
 
@@ -79,35 +75,94 @@ class OOMKilledRule(Rule):
                     kind=FactKind.OOM_KILLED,
                     observed=True,
                     confidence=0.95,
-                    subject=ctx.get("pod") or ctx.get("service"),
-                    evidence={
-                        "hard_matches": hard,
-                        "soft_matches": soft,
-                    },
+                    subject=pod,
+                    evidence={"hard_matches": hard, "soft_matches": soft},
                     source_rule=self.name,
                 )
             ]
         if soft >= 1:
-            # exit 137 без явного OOMKilled — слабый сигнал. Фиксируем как
-            # observed=True но с низкой confidence; критик потом может
-            # отбраковать гипотезу, которая на него опирается.
+            # exit 137 без явного OOMKilled — слабый сигнал.
             return [
                 Fact(
                     kind=FactKind.OOM_KILLED,
                     observed=True,
                     confidence=0.4,
-                    subject=ctx.get("pod") or ctx.get("service"),
+                    subject=pod,
                     evidence={"soft_matches": soft, "note": "exit 137 only"},
                     source_rule=self.name,
                 )
             ]
+
+        # ── 4. ✗ — OOM не обнаружен ──────────────────────────────────────
         return [
             Fact(
                 kind=FactKind.OOM_KILLED,
                 observed=False,
                 confidence=0.9,
-                subject=ctx.get("pod") or ctx.get("service"),
+                subject=pod,
                 evidence={},
                 source_rule=self.name,
             )
         ]
+
+    def _check_pod_state(
+        self, pod_state: Dict[str, Any], pod: Optional[str]
+    ) -> Tuple[Optional[Fact], Optional[int]]:
+        """Возвращает (Fact | None, target_exit_code | None).
+
+        Fact — если нашли OOM в structured данных.
+        target_exit_code — exit code target-пода (для блокировки text-fallback),
+            None если target-под отсутствует в pod_state или exit_code не задан.
+        """
+        candidates = []
+        if pod and pod in pod_state:
+            candidates.append((pod, pod_state[pod]))
+        for pod_name, info in pod_state.items():
+            if pod_name != pod:
+                candidates.append((pod_name, info))
+
+        target_exit: Optional[int] = None
+        if pod and pod in pod_state:
+            target_exit = pod_state[pod].get("exit_code")
+
+        for pod_name, info in candidates:
+            reason = (info.get("reason") or "").strip()
+            exit_code = info.get("exit_code")
+
+            if reason == "OOMKilled":
+                return (
+                    Fact(
+                        kind=FactKind.OOM_KILLED,
+                        observed=True,
+                        confidence=0.98,
+                        subject=pod_name,
+                        evidence={
+                            "source": "k8s_terminated_state",
+                            "exit_code": exit_code,
+                            "container": info.get("container", ""),
+                        },
+                        source_rule=self.name,
+                    ),
+                    target_exit,
+                )
+
+            if exit_code == 137:
+                # exit 137 без OOMKilled — может быть kill -9 или OOM.
+                return (
+                    Fact(
+                        kind=FactKind.OOM_KILLED,
+                        observed=True,
+                        confidence=0.55,
+                        subject=pod_name,
+                        evidence={
+                            "source": "k8s_terminated_state",
+                            "exit_code": 137,
+                            "note": "exit 137 without explicit OOMKilled reason",
+                            "container": info.get("container", ""),
+                        },
+                        source_rule=self.name,
+                    ),
+                    target_exit,
+                )
+
+        return None, target_exit
