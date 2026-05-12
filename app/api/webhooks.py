@@ -93,12 +93,43 @@ async def alertmanager_webhook(
     raw_payload.setdefault("id", payload.groupKey)
     raw_collector.ingest(raw_payload)
 
+    # States where the pipeline has already run or is in flight — no retry.
+    # FAILED is the only terminal state we allow to re-run (transient infra error).
+    _SKIP_STATES = {
+        IncidentState.OPEN.value,              # queued, pipeline hasn't started yet
+        IncidentState.INVESTIGATING.value,
+        IncidentState.FACTS_COLLECTED.value,
+        IncidentState.HYPOTHESIS_GENERATED.value,
+        IncidentState.FIX_PROPOSED.value,
+        IncidentState.RESOLVED.value,
+    }
+
     accepted = []
     for alert in payload.alerts:
         validate_alert_labels(alert)
         incident = Incident.from_alertmanager(alert)
-        # Обогащение TC-контекстом (recent deploys + changes) — best-effort.
-        # При недоступности TC просто остаётся None, инцидент обрабатывается без контекста.
+
+        # Dedup check BEFORE TC enrichment — no point spending the TC roundtrip
+        # if we're going to skip this fingerprint anyway.
+        existing = (
+            db.query(IncidentRecord)
+            .filter(IncidentRecord.incident_id == incident.incident_id)
+            .first()
+        )
+        if existing is not None and existing.status in _SKIP_STATES:
+            log.info(
+                "webhook.deduplicated",
+                incident_id=incident.incident_id,
+                status=existing.status,
+            )
+            accepted.append({
+                "incident_id": incident.incident_id,
+                "task_id": "deduplicated",
+                "status": existing.status,
+            })
+            continue
+
+        # TC enrichment — best-effort, only for new / retriable incidents.
         try:
             incident.teamcity_context = await incident_teamcity_context(
                 namespace=incident.namespace,
@@ -110,16 +141,8 @@ async def alertmanager_webhook(
                 error=str(e),
                 incident_id=incident.incident_id,
             )
-        existing = (
-            db.query(IncidentRecord)
-            .filter(IncidentRecord.incident_id == incident.incident_id)
-            .first()
-        )
+
         if existing is None:
-            # Start in the IncidentState enum (OPEN), not the legacy
-            # "PENDING" string — the worker pipeline runs the StateMachine
-            # against record.status, so the initial value must be a real
-            # enum member to avoid hitting the legacy alias fallback.
             db.add(
                 IncidentRecord(
                     incident_id=incident.incident_id,
@@ -127,15 +150,14 @@ async def alertmanager_webhook(
                     data=incident.model_dump(),
                 )
             )
-        # Коммитим PENDING-запись СЕЙЧАС: pipeline (Celery или direct-invoke)
-        # открывает свою SessionLocal и UPDATE-ит status=COMPLETED по
-        # incident_id. Без commit-а запись не видна pipeline-сессии,
-        # UPDATE становится no-op (trace/analysis теряются).
+        else:
+            # FAILED retry: reset to OPEN so the state machine can advance again.
+            existing.status = IncidentState.OPEN.value
+        # Commit before pipeline: the worker opens its own SessionLocal and needs
+        # the row to be visible before it starts writing state transitions.
         db.commit()
 
         if settings.PIPELINE_DIRECT_INVOKE:
-            # Локальный e2e без Redis/Celery: блокируем endpoint и гоняем
-            # pipeline inline. Возвращаем «task_id»=direct для совместимости.
             await async_process_incident(incident.model_dump())
             accepted.append({"incident_id": incident.incident_id, "task_id": "direct"})
         else:
