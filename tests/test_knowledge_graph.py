@@ -176,3 +176,36 @@ def test_nearby_alerts_no_upstream(db):
         db, "squad-1", "isolated", around=datetime.now(timezone.utc)
     )
     assert out == []
+
+
+# ---------- SimilarIncidentEngine quality gate ----------------------------
+
+def test_is_quality_cause_accepts_real_cause():
+    from app.core.intelligence.similar_incidents import _is_quality_cause
+    assert _is_quality_cause("SIGSEGV crash in notificator", None) is True
+    assert _is_quality_cause("OOM: memory limit exceeded", "resolved") is True
+
+
+def test_is_quality_cause_rejects_none():
+    from app.core.intelligence.similar_incidents import _is_quality_cause
+    assert _is_quality_cause(None, None) is False
+    assert _is_quality_cause(None, "resolved") is False
+
+
+def test_is_quality_cause_rejects_unresolved_quality():
+    from app.core.intelligence.similar_incidents import _is_quality_cause
+    assert _is_quality_cause("Something happened", "unresolved") is False
+
+
+def test_is_quality_cause_rejects_no_survivor_text():
+    """Backward compat: старые записи с полным текстом pipeline-статуса."""
+    from app.core.intelligence.similar_incidents import _is_quality_cause
+    assert _is_quality_cause(
+        "No hypothesis survived adversarial critique. Observed facts: ['crashloop'].",
+        None
+    ) is False
+
+
+def test_is_quality_cause_rejects_empty_string():
+    from app.core.intelligence.similar_incidents import _is_quality_cause
+    assert _is_quality_cause("", None) is False
