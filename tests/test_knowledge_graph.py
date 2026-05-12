@@ -209,3 +209,108 @@ def test_is_quality_cause_rejects_no_survivor_text():
 def test_is_quality_cause_rejects_empty_string():
     from app.core.intelligence.similar_incidents import _is_quality_cause
     assert _is_quality_cause("", None) is False
+
+
+# ---------- SimilarIncidentEngine recurrence detection -------------------
+
+def test_extract_service_ns_new_format():
+    from app.core.intelligence.similar_incidents import _extract_service_ns
+    data = {"namespace": "prod-k1", "labels": {"service": "notificator"}}
+    svc, ns = _extract_service_ns(data)
+    assert svc == "notificator"
+    assert ns == "prod-k1"
+
+
+def test_extract_service_ns_old_format():
+    from app.core.intelligence.similar_incidents import _extract_service_ns
+    data = {"targets": [{"service": "town-service", "namespace": "preprod-shared"}]}
+    svc, ns = _extract_service_ns(data)
+    assert svc == "town-service"
+    assert ns == "preprod-shared"
+
+
+def test_extract_service_ns_empty():
+    from app.core.intelligence.similar_incidents import _extract_service_ns
+    svc, ns = _extract_service_ns({})
+    assert svc is None
+    assert ns is None
+
+
+def test_recurrence_flag_set_for_recent_resolved_same_service(db):
+    """Инцидент того же сервиса, resolved < 7 дней — recurrence=True."""
+    from datetime import datetime, timedelta
+    from app.core.intelligence.similar_incidents import SimilarIncidentEngine
+    from app.database import IncidentRecord
+
+    recent_incident = IncidentRecord(
+        incident_id="old-notificator-1",
+        status="RESOLVED",
+        is_accepted="ACCEPTED",
+        data={"labels": {"service": "notificator"}, "namespace": "squad-10-shared"},
+        analysis={
+            "cause": "SIGSEGV crash in native interop",
+            "resolution_quality": "resolved",
+        },
+        created_at=datetime.utcnow() - timedelta(days=2),
+    )
+    db.add(recent_incident)
+    db.commit()
+
+    # Патчим SessionLocal чтобы использовать тестовую DB.
+    import app.core.intelligence.similar_incidents as sie_module
+    original_session = sie_module.SessionLocal
+    sie_module.SessionLocal = lambda: db
+    try:
+        results = SimilarIncidentEngine.find(
+            current_incident={
+                "labels": {"service": "notificator"},
+                "namespace": "squad-10-shared",
+            },
+            limit=3,
+        )
+    finally:
+        sie_module.SessionLocal = original_session
+
+    assert len(results) >= 1
+    match = next(r for r in results if r["incident_id"] == "old-notificator-1")
+    assert match["recurrence"] is True
+    assert match["days_ago"] == 2
+
+
+def test_recurrence_false_for_old_resolved_same_service(db):
+    """Инцидент того же сервиса, resolved > 7 дней — recurrence=False."""
+    from datetime import datetime, timedelta
+    from app.core.intelligence.similar_incidents import SimilarIncidentEngine
+    from app.database import IncidentRecord
+
+    old_incident = IncidentRecord(
+        incident_id="old-notificator-stale",
+        status="RESOLVED",
+        is_accepted="ACCEPTED",
+        data={"labels": {"service": "notificator"}, "namespace": "squad-10-shared"},
+        analysis={
+            "cause": "SIGSEGV crash in native interop",
+            "resolution_quality": "resolved",
+        },
+        created_at=datetime.utcnow() - timedelta(days=14),
+    )
+    db.add(old_incident)
+    db.commit()
+
+    import app.core.intelligence.similar_incidents as sie_module
+    original_session = sie_module.SessionLocal
+    sie_module.SessionLocal = lambda: db
+    try:
+        results = SimilarIncidentEngine.find(
+            current_incident={
+                "labels": {"service": "notificator"},
+                "namespace": "squad-10-shared",
+            },
+            limit=3,
+        )
+    finally:
+        sie_module.SessionLocal = original_session
+
+    match = next((r for r in results if r["incident_id"] == "old-notificator-stale"), None)
+    if match:
+        assert match["recurrence"] is False
