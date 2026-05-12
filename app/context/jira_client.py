@@ -84,16 +84,18 @@ class JiraClient:
         ]
         jql = " AND ".join(jql_parts) + " ORDER BY created DESC"
 
-        params = {
+        # Atlassian deprecated GET /rest/api/3/search (returns 410 Gone).
+        # Current endpoint: POST /rest/api/3/search/jql
+        payload = {
             "jql": jql,
             "maxResults": 5,
-            "fields": "summary,status,priority,created,labels",
+            "fields": ["summary", "status", "priority", "created", "labels"],
         }
         try:
             async with httpx.AsyncClient(timeout=self._timeout) as client:
-                r = await client.get(
-                    f"{self._base}/rest/api/3/search",
-                    params=params,
+                r = await client.post(
+                    f"{self._base}/rest/api/3/search/jql",
+                    json=payload,
                     headers=self._headers,
                 )
                 r.raise_for_status()

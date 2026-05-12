@@ -95,7 +95,7 @@ async def test_jira_client_returns_parsed_issues():
         mock_client = AsyncMock()
         mock_client.__aenter__ = AsyncMock(return_value=mock_client)
         mock_client.__aexit__ = AsyncMock(return_value=False)
-        mock_client.get = AsyncMock(return_value=mock_resp)
+        mock_client.post = AsyncMock(return_value=mock_resp)
         mock_client_cls.return_value = mock_client
 
         client = JiraClient(
@@ -118,7 +118,7 @@ async def test_jira_client_returns_empty_on_http_error():
         mock_client = AsyncMock()
         mock_client.__aenter__ = AsyncMock(return_value=mock_client)
         mock_client.__aexit__ = AsyncMock(return_value=False)
-        mock_client.get = AsyncMock(side_effect=Exception("connection refused"))
+        mock_client.post = AsyncMock(side_effect=Exception("connection refused"))
         mock_client_cls.return_value = mock_client
 
         client = JiraClient(

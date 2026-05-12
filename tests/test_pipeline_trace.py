@@ -61,41 +61,41 @@ def mocked_dependencies(mocker):
     """Замокировать всё, в что лезет `async_process_incident`."""
     # AnalyzerAgent / FixAgent / RiskAgent / SynthesisAgent — старые контракты.
     mocker.patch(
-        "app.workers.tasks.AnalyzerAgent.analyze",
+        "app.workers.pipeline.AnalyzerAgent.analyze",
         new_callable=AsyncMock,
         return_value="analysis text",
     )
     mocker.patch(
-        "app.workers.tasks.FixAgent.suggest",
+        "app.workers.pipeline.FixAgent.suggest",
         new_callable=AsyncMock,
         return_value="fix text",
     )
     mocker.patch(
-        "app.workers.tasks.RiskAgent.assess",
+        "app.workers.pipeline.RiskAgent.assess",
         new_callable=AsyncMock,
         return_value="risk text",
     )
     mocker.patch(
-        "app.workers.tasks.SynthesisAgent.synthesize",
+        "app.workers.pipeline.SynthesisAgent.synthesize",
         new_callable=AsyncMock,
         return_value="synth text",
     )
 
     # MultiHypothesisAgent + FactCriticAgent — новые контракты.
     mocker.patch(
-        "app.workers.tasks.MultiHypothesisAgent.generate",
+        "app.workers.pipeline.MultiHypothesisAgent.generate",
         new_callable=AsyncMock,
         return_value=_make_hypothesis_set(),
     )
     mocker.patch(
-        "app.workers.tasks.FactCriticAgent.critique_all",
+        "app.workers.pipeline.FactCriticAgent.critique_all",
         new_callable=AsyncMock,
         return_value=_make_critiqued_set(),
     )
 
     # SimilarIncidentEngine остаётся как enrichment hypothesis-стадии.
     similar_mock = mocker.patch(
-        "app.workers.tasks.SimilarIncidentEngine.find",
+        "app.workers.pipeline.SimilarIncidentEngine.find",
         return_value=[],
     )
 
@@ -103,15 +103,15 @@ def mocked_dependencies(mocker):
     # отдаёт серию observed=False фактов. Но для предсказуемости подсунем
     # FactStore с одним observed-фактом, чтобы grounded-фильтр прошёл.
     diag_store_mock = mocker.patch(
-        "app.workers.tasks.diag_engine.run",
+        "app.workers.pipeline.diag_engine.run",
         return_value=__make_fact_store(),
     )
 
     mocker.patch(
-        "app.workers.tasks.discord_service.send_report",
+        "app.workers.pipeline.discord_service.send_report",
         new_callable=AsyncMock,
     )
-    mocker.patch("app.workers.tasks.audit_service.log_event")
+    mocker.patch("app.workers.pipeline.audit_service.log_event")
 
     record = MagicMock()
     record.trace = None
@@ -177,7 +177,7 @@ async def test_pipeline_passes_similar_past_to_hypothesis(
     ]
     # Re-patch MultiHypothesisAgent.generate, чтобы прочитать его call args.
     multi_mock = mocker.patch(
-        "app.workers.tasks.MultiHypothesisAgent.generate",
+        "app.workers.pipeline.MultiHypothesisAgent.generate",
         new_callable=AsyncMock,
         return_value=_make_hypothesis_set(),
     )
