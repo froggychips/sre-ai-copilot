@@ -57,6 +57,14 @@ PERSPECTIVES: Dict[str, str] = {
     ),
 }
 
+# Pre-conditions для perspective-агентов: минимальный набор observed FactKind-ов,
+# без которых perspective не активируется. Пустое множество = всегда активен.
+# Смысл: "runtime" без process_crash будет галлюцинировать CLR/JVM детали на
+# инцидентах, где нет никакого сигнала о крэше процесса.
+PERSPECTIVE_PRECONDITIONS: Dict[str, set] = {
+    "runtime": {FactKind.PROCESS_CRASH},
+}
+
 
 def _facts_block(facts: FactStore) -> str:
     """Маркап фактов для prompt-а. Точный формат — обязанность FactStore."""
@@ -192,16 +200,35 @@ class MultiHypothesisAgent:
     async def generate(
         self, incident_summary: str, facts: FactStore
     ) -> HypothesisSet:
+        # Фильтруем perspective-агентов по pre-conditions: "runtime" запускается
+        # только если process_crash observed. Без этого агент галлюцинирует
+        # CLR/JVM детали на инцидентах без сигнала краша.
+        observed = facts.observed_kinds()
+        active_agents = [
+            a for a in self._agents
+            if all(
+                kind in observed
+                for kind in PERSPECTIVE_PRECONDITIONS.get(a.perspective, set())
+            )
+        ]
+        skipped = [a.perspective for a in self._agents if a not in active_agents]
+        if skipped:
+            logger.info(
+                "multi_hypothesis.perspectives_skipped",
+                skipped=skipped,
+                reason="preconditions_not_met",
+            )
+
         # Параллельный fan-out. Если один perspective упадёт — остальные
         # вернутся, и мы продолжим. Это критично для устойчивости
         # pipeline-а к flaky LLM-провайдеру.
         tasks = [
-            agent.generate(incident_summary, facts) for agent in self._agents
+            agent.generate(incident_summary, facts) for agent in active_agents
         ]
         results: List[Any] = await asyncio.gather(*tasks, return_exceptions=True)
 
         merged: List[Hypothesis] = []
-        for agent, res in zip(self._agents, results):
+        for agent, res in zip(active_agents, results):
             if isinstance(res, Exception):
                 logger.warning(
                     "perspective_failed",

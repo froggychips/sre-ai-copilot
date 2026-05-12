@@ -4,8 +4,9 @@ from unittest.mock import patch
 import pytest
 
 from app.agents.models.hypothesis import Hypothesis, HypothesisSet
-from app.agents.multi_hypothesis import (PERSPECTIVES, MultiHypothesisAgent,
-                                         PerspectiveAgent, _parse_hypotheses)
+from app.agents.multi_hypothesis import (PERSPECTIVE_PRECONDITIONS, PERSPECTIVES,
+                                         MultiHypothesisAgent, PerspectiveAgent,
+                                         _parse_hypotheses)
 from app.diagnostics.facts import Fact, FactKind, FactStore
 
 
@@ -137,7 +138,7 @@ def facts_oom_only():
 
 @pytest.mark.asyncio
 async def test_orchestrator_fans_out_and_grounds(facts_oom_only):
-    """Все 4 perspective дают по 1 гипотезе на oom_killed — остаются все."""
+    """OOM-инцидент: 3 perspective активны (runtime пропускается — нет process_crash)."""
     captured = {"calls": []}
 
     async def fake_ask(self, user_context, instruction=""):
@@ -154,12 +155,11 @@ async def test_orchestrator_fans_out_and_grounds(facts_oom_only):
             incident_summary="pod stub-1 OOMKilled", facts=facts_oom_only
         )
 
-    # Все 4 perspective отработали.
+    # runtime пропущен — нет process_crash в observed.
     assert set(captured["calls"]) == {
-        "Hypothesis-app", "Hypothesis-infra", "Hypothesis-deps", "Hypothesis-runtime"
+        "Hypothesis-app", "Hypothesis-infra", "Hypothesis-deps"
     }
-    assert len(result.items) == 4
-    # Все hypotheses сохранили oom_killed anchor (он observed).
+    assert len(result.items) == 3
     for h in result.items:
         assert h.anchored_facts == ["oom_killed"]
 
@@ -202,7 +202,8 @@ async def test_orchestrator_survives_perspective_exception(facts_oom_only):
 
     perspectives = {h.perspective for h in result.items}
     assert "deps" not in perspectives
-    assert perspectives == {"app", "infra", "runtime"}
+    # runtime тоже пропущен — facts_oom_only не содержит process_crash.
+    assert perspectives == {"app", "infra"}
 
 
 @pytest.mark.asyncio
@@ -214,3 +215,50 @@ async def test_perspective_agent_validates_perspective_name():
 def test_perspectives_registry_unchanged():
     """Гайдрейл: если добавляешь новый perspective — синхронизируй тест."""
     assert set(PERSPECTIVES.keys()) == {"app", "infra", "deps", "runtime"}
+
+
+def test_runtime_precondition_requires_process_crash():
+    """runtime perspective требует process_crash в preconditions."""
+    from app.diagnostics.facts import FactKind
+    assert FactKind.PROCESS_CRASH in PERSPECTIVE_PRECONDITIONS["runtime"]
+
+
+@pytest.mark.asyncio
+async def test_runtime_skipped_without_process_crash():
+    """Без process_crash в observed — runtime perspective не запускается."""
+    captured = {"calls": []}
+
+    async def fake_ask(self, user_context, instruction=""):
+        captured["calls"].append(self.name)
+        return '{"hypotheses":[{"cause":"x","anchored_facts":["oom_killed"],"confidence":0.8}]}'
+
+    facts_no_crash = FactStore([
+        Fact(kind=FactKind.OOM_KILLED, observed=True, confidence=0.95),
+    ])
+
+    with patch("app.agents.base.BaseAgent.ask", new=fake_ask):
+        agent = MultiHypothesisAgent()
+        await agent.generate(incident_summary="OOM incident", facts=facts_no_crash)
+
+    assert "Hypothesis-runtime" not in captured["calls"]
+    assert "Hypothesis-app" in captured["calls"]
+
+
+@pytest.mark.asyncio
+async def test_runtime_active_with_process_crash():
+    """С process_crash в observed — runtime perspective запускается."""
+    captured = {"calls": []}
+
+    async def fake_ask(self, user_context, instruction=""):
+        captured["calls"].append(self.name)
+        return '{"hypotheses":[{"cause":"x","anchored_facts":["process_crash"],"confidence":0.8}]}'
+
+    facts_with_crash = FactStore([
+        Fact(kind=FactKind.PROCESS_CRASH, observed=True, confidence=0.97),
+    ])
+
+    with patch("app.agents.base.BaseAgent.ask", new=fake_ask):
+        agent = MultiHypothesisAgent()
+        await agent.generate(incident_summary="SIGSEGV crash", facts=facts_with_crash)
+
+    assert "Hypothesis-runtime" in captured["calls"]

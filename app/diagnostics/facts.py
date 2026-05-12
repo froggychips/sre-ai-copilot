@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, FrozenSet, List, Optional, Tuple
 
 
 @dataclass
@@ -46,6 +46,14 @@ class FactKind:
     })
 
 
+# Пары взаимоисключающих фактов.
+# exit 137 (SIGKILL/OOM) и exit 139+ (SIGSEGV и др.) физически не могут быть
+# одновременно причиной одного краша — если оба observed=True, данные противоречивы.
+MUTUALLY_EXCLUSIVE_PAIRS: List[FrozenSet[str]] = [
+    frozenset({FactKind.OOM_KILLED, FactKind.PROCESS_CRASH}),
+]
+
+
 class FactStore:
     """Контейнер фактов одного прогона диагностики.
 
@@ -75,6 +83,18 @@ class FactStore:
     def has_observed(self, kind: str) -> bool:
         return any(f.observed for f in self.by_kind(kind))
 
+    def conflicts(self) -> List[Tuple[Fact, Fact]]:
+        """Пары фактов, оба observed=True и взаимоисключающих друг друга."""
+        result: List[Tuple[Fact, Fact]] = []
+        for pair in MUTUALLY_EXCLUSIVE_PAIRS:
+            kinds = list(pair)
+            a_facts = [f for f in self._facts if f.kind == kinds[0] and f.observed]
+            b_facts = [f for f in self._facts if f.kind == kinds[1] and f.observed]
+            for a in a_facts:
+                for b in b_facts:
+                    result.append((a, b))
+        return result
+
     def to_dict(self) -> Dict[str, Any]:
         return {"facts": [f.to_dict() for f in self._facts]}
 
@@ -82,7 +102,7 @@ class FactStore:
         """JSON-подобный блок для подмеса в LLM-промпт.
 
         Формат стабильный, потому что hypothesis/critic-агенты будут на
-        него ссылаться по полям. См. C/D в плане.
+        него ссылаться по полям.
         """
         if not self._facts:
             return "<facts>no deterministic facts collected</facts>"
@@ -95,5 +115,17 @@ class FactStore:
                 f"  {marker} {f.kind} (conf={f.confidence:.2f}){subj}"
                 + (f" — {ev_preview}" if ev_preview else "")
             )
+
+        conflict_pairs = self.conflicts()
+        if conflict_pairs:
+            lines.append("<conflicts>")
+            for a, b in conflict_pairs:
+                lines.append(
+                    f"  WARNING: {a.kind} and {b.kind} are both observed=True "
+                    f"but mutually exclusive — data is contradictory, treat both "
+                    f"with reduced confidence."
+                )
+            lines.append("</conflicts>")
+
         lines.append("</facts>")
         return "\n".join(lines)

@@ -355,6 +355,11 @@ async def async_process_incident(incident_data: dict):
                 "similar_past_count": len(similar_past),
                 # Fact-anchored details для post-mortem и regression-тестов:
                 "facts": fact_store.to_dict()["facts"],
+                "fact_conflicts": [
+                    {"a": a.kind, "b": b.kind,
+                     "a_conf": a.confidence, "b_conf": b.confidence}
+                    for a, b in fact_store.conflicts()
+                ],
                 "hypothesis_set": [h.model_dump() for h in critiqued.items],
                 "best_candidate": best.model_dump() if best else None,
                 "disagreement_signal": critiqued.disagreement_signal(),
