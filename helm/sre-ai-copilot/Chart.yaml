@@ -1,0 +1,13 @@
+apiVersion: v2
+name: sre-ai-copilot
+description: Python FastAPI + Celery SRE incident-response copilot
+type: application
+version: "0.1.0"
+appVersion: "0.5.0"
+keywords:
+  - sre
+  - ai
+  - copilot
+  - incident-response
+maintainers:
+  - name: froggychips

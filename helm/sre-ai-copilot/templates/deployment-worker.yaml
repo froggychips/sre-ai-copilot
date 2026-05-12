@@ -1,0 +1,55 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "sre-ai-copilot.fullname" . }}-worker
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "sre-ai-copilot.labels" . | nindent 4 }}
+    app.kubernetes.io/component: worker
+spec:
+  replicas: {{ .Values.replicaCount.worker }}
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: {{ include "sre-ai-copilot.name" . }}
+      app.kubernetes.io/instance: {{ .Release.Name }}
+      app.kubernetes.io/component: worker
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: {{ include "sre-ai-copilot.name" . }}
+        app.kubernetes.io/instance: {{ .Release.Name }}
+        app.kubernetes.io/component: worker
+    spec:
+      serviceAccountName: {{ include "sre-ai-copilot.serviceAccountName" . }}
+      automountServiceAccountToken: true
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        {{- include "sre-ai-copilot.podSecurityContext" . | nindent 8 }}
+      containers:
+      - name: worker
+        # Pin по digest в CI: image: ghcr.io/froggychips/sre-ai-copilot@sha256:<digest>
+        image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+        imagePullPolicy: {{ .Values.image.pullPolicy }}
+        command:
+        - celery
+        - -A
+        - app.celery_worker.celery_app
+        - worker
+        - --loglevel=info
+        securityContext:
+          {{- include "sre-ai-copilot.containerSecurityContext" . | nindent 10 }}
+        envFrom:
+        - secretRef:
+            name: {{ include "sre-ai-copilot.secretName" . }}
+        env:
+        - name: LLM_BACKEND
+          value: {{ .Values.env.llmBackend | quote }}
+        - name: LOG_LEVEL
+          value: {{ .Values.env.logLevel | quote }}
+        - name: SAFE_MODE
+          value: {{ .Values.env.safeMode | quote }}
+        resources:
+          {{- toYaml .Values.resources.worker | nindent 10 }}
