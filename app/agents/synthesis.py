@@ -50,13 +50,14 @@ class SynthesisAgent(BaseAgent):
         return await self.ask(
             user_context=context,
             instruction=(
-                "Synthesize the 5-stage pipeline output into a single structured report.\n\n"
-                "**What happened** — one sentence, blast radius\n"
-                "**Root cause** — one sentence with supporting evidence\n"
-                "**Fix** — concrete steps, priority-ordered\n"
-                "**Fix addresses root cause?** — YES or NO. If NO: explain the misalignment and propose an alternative fix that directly addresses the identified root cause.\n"
-                "**Risk** — LOW / MEDIUM / HIGH and the key concern\n"
-                "**Confidence** — 0–100% and what would increase it\n\n"
-                "Be direct. No padding. Engineers will act on this."
+                "Синтезируй результаты 5 стадий в краткий структурированный отчёт на **русском языке**.\n\n"
+                "**Что случилось** — одно предложение, blast radius\n"
+                "**Причина** — одно предложение с ключевыми доказательствами\n"
+                "**Исправление** — 2–4 конкретных шага, по приоритету\n"
+                "**Фикс устраняет причину?** — ДА / НЕТ. Если НЕТ: одно предложение с альтернативой.\n"
+                "**Риск** — НИЗКИЙ / СРЕДНИЙ / ВЫСОКИЙ и ключевая угроза\n"
+                "**Уверенность** — 0–100% и что бы её повысило\n\n"
+                "Технические термины, названия сервисов, команды — оставлять на английском.\n"
+                "Цель — максимум информации минимумом слов. Весь отчёт должен умещаться в ~800 символов."
             ),
         )

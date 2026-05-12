@@ -88,8 +88,8 @@ class DiscordService:
             "inline": False,
         })
 
-        # Synthesis truncated to fit Discord embed description limit (4096).
-        description = synthesis[:3800] + ("…" if len(synthesis) > 3800 else "")
+        # Synthesis truncated — Discord limit 4096, но читаемость важнее.
+        description = synthesis[:1200] + ("…" if len(synthesis) > 1200 else "")
 
         payload = {
             "embeds": [{
