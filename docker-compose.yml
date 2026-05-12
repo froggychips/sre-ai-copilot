@@ -14,9 +14,13 @@ services:
     container_name: sre-ai-api
     ports:
       - "8000:8000"
+      - "8001:8001"   # Prometheus metrics
     env_file: .env
+    environment:
+      - OTLP_EXPORTER_ENDPOINT=http://otelcollector:4317
     depends_on:
       - redis
+      - otelcollector
     volumes:
       - .:/app
 
@@ -25,8 +29,11 @@ services:
     container_name: sre-ai-worker
     command: python -m app.queue.worker
     env_file: .env
+    environment:
+      - OTLP_EXPORTER_ENDPOINT=http://otelcollector:4317
     depends_on:
       - redis
+      - otelcollector
     volumes:
       - .:/app
 
@@ -36,13 +43,51 @@ services:
     ports:
       - "6379:6379"
 
+  otelcollector:
+    image: otel/opentelemetry-collector-contrib:0.102.0
+    container_name: sre-ai-otelcollector
+    ports:
+      - "4317:4317"   # OTLP gRPC (от app и от локальных скриптов)
+      - "4318:4318"   # OTLP HTTP
+    volumes:
+      - ./docker/otelcollector.yml:/etc/otelcol-contrib/config.yaml:ro
+    depends_on:
+      - jaeger
+
   jaeger:
     image: jaegertracing/all-in-one:1.57
     container_name: sre-ai-jaeger
     ports:
       - "16686:16686"   # UI — http://localhost:16686
-      - "4317:4317"     # OTLP gRPC
-      - "4318:4318"     # OTLP HTTP
     environment:
       - COLLECTOR_OTLP_ENABLED=true
       - SPAN_STORAGE_TYPE=memory
+
+  prometheus:
+    image: prom/prometheus:v2.52.0
+    container_name: sre-ai-prometheus
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./docker/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --web.enable-lifecycle
+    depends_on:
+      - api
+
+  grafana:
+    image: grafana/grafana:10.4.3
+    container_name: sre-ai-grafana
+    ports:
+      - "3000:3000"
+    environment:
+      - GF_AUTH_ANONYMOUS_ENABLED=true
+      - GF_AUTH_ANONYMOUS_ORG_ROLE=Admin
+      - GF_AUTH_DISABLE_LOGIN_FORM=true
+    volumes:
+      - ./docker/grafana/provisioning:/etc/grafana/provisioning:ro
+    depends_on:
+      - prometheus
+      - jaeger
