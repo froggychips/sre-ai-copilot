@@ -1,20 +1,25 @@
 """State machine integration tests.
 
-Verify that `async_process_incident` drives the IncidentRecord through
-the full StateMachine sequence (OPEN → INVESTIGATING → HYPOTHESIS_GENERATED
-→ FIX_PROPOSED → RESOLVED), records `state_after` in the trace at the
-stage where each transition fires, falls back to FAILED on any agent
-exception, and accepts the legacy "PENDING" status as a starting point.
+Проверяем, что `async_process_incident` проводит IncidentRecord через
+fact-anchored поток состояний:
+    OPEN → INVESTIGATING → FACTS_COLLECTED → HYPOTHESIS_GENERATED
+        → FIX_PROPOSED → RESOLVED
+
+Фиксирует `state_after` в trace на стадии, где происходит transition,
+сваливается в FAILED при exception от любого агента, принимает legacy
+"PENDING" как стартовый статус.
 """
 
 import pytest
 from unittest.mock import AsyncMock, MagicMock
 
+from app.agents.models.hypothesis import Hypothesis, HypothesisSet
 from app.core.state_machine import IncidentState, StateMachine
-from app.workers.tasks import transition_to, _current_state
+from app.diagnostics.facts import Fact, FactKind, FactStore
+from app.workers.tasks import _current_state, transition_to
 
 
-# MARK: - Helpers (mirror fixtures from test_pipeline_trace.py)
+# MARK: - Helpers
 
 @pytest.fixture
 def incident_data() -> dict:
@@ -34,16 +39,37 @@ def incident_data() -> dict:
     }
 
 
+def _hyp_set():
+    return HypothesisSet(items=[
+        Hypothesis(cause="x", anchored_facts=[FactKind.OOM_KILLED],
+                   confidence=0.9, perspective="infra"),
+    ])
+
+
+def _fact_store():
+    return FactStore([
+        Fact(kind=FactKind.OOM_KILLED, observed=True, confidence=0.95)
+    ])
+
+
 @pytest.fixture
 def happy_path_dependencies(mocker):
-    mocker.patch("app.workers.tasks.AnalyzerAgent.analyze", new_callable=AsyncMock, return_value="a")
-    mocker.patch("app.workers.tasks.HypothesisAgent.generate", new_callable=AsyncMock, return_value="h")
-    mocker.patch("app.workers.tasks.CriticAgent.audit", new_callable=AsyncMock, return_value="c")
-    mocker.patch("app.workers.tasks.FixAgent.suggest", new_callable=AsyncMock, return_value="f")
-    mocker.patch("app.workers.tasks.RiskAgent.assess", new_callable=AsyncMock, return_value="r")
-    mocker.patch("app.workers.tasks.SynthesisAgent.synthesize", new_callable=AsyncMock, return_value="s")
+    mocker.patch("app.workers.tasks.AnalyzerAgent.analyze",
+                 new_callable=AsyncMock, return_value="a")
+    mocker.patch("app.workers.tasks.MultiHypothesisAgent.generate",
+                 new_callable=AsyncMock, return_value=_hyp_set())
+    mocker.patch("app.workers.tasks.FactCriticAgent.critique_all",
+                 new_callable=AsyncMock, return_value=_hyp_set())
+    mocker.patch("app.workers.tasks.FixAgent.suggest",
+                 new_callable=AsyncMock, return_value="f")
+    mocker.patch("app.workers.tasks.RiskAgent.assess",
+                 new_callable=AsyncMock, return_value="r")
+    mocker.patch("app.workers.tasks.SynthesisAgent.synthesize",
+                 new_callable=AsyncMock, return_value="s")
     mocker.patch("app.workers.tasks.SimilarIncidentEngine.find", return_value=[])
-    mocker.patch("app.workers.tasks.discord_service.send_report", new_callable=AsyncMock)
+    mocker.patch("app.workers.tasks.diag_engine.run", return_value=_fact_store())
+    mocker.patch("app.workers.tasks.discord_service.send_report",
+                 new_callable=AsyncMock)
     mocker.patch("app.workers.tasks.audit_service.log_event")
 
     record = MagicMock()
@@ -101,10 +127,9 @@ def test_transition_to_rejects_invalid_jump():
     rec = MagicMock()
     rec.status = IncidentState.OPEN.value
     db = MagicMock()
-    # OPEN → RESOLVED is not in the StateMachine transitions table.
+    # OPEN → RESOLVED не в TRANSITIONS.
     with pytest.raises(ValueError, match="Invalid state transition"):
         transition_to(rec, IncidentState.RESOLVED, db)
-    # Status must NOT have changed on failed validation.
     assert rec.status == IncidentState.OPEN.value
     db.commit.assert_not_called()
 
@@ -114,7 +139,6 @@ def test_transition_to_accepts_legacy_pending_as_open():
     rec = MagicMock()
     rec.status = "PENDING"
     db = MagicMock()
-    # PENDING aliased to OPEN, so OPEN → INVESTIGATING is allowed.
     transition_to(rec, IncidentState.INVESTIGATING, db)
     assert rec.status == IncidentState.INVESTIGATING.value
 
@@ -122,7 +146,6 @@ def test_transition_to_accepts_legacy_pending_as_open():
 # MARK: - StateMachine.TRANSITIONS sanity
 
 def test_failed_is_reachable_from_every_non_terminal_state():
-    """The orchestrator's except-block depends on this invariant."""
     for state in IncidentState:
         if state in (IncidentState.RESOLVED, IncidentState.FAILED):
             continue
@@ -136,6 +159,40 @@ def test_terminal_states_have_no_outgoing_transitions():
     assert StateMachine.TRANSITIONS[IncidentState.FAILED] == set()
 
 
+def test_fact_anchored_path_is_valid():
+    """OPEN → INVESTIGATING → FACTS_COLLECTED → HYPOTHESIS_GENERATED → FIX_PROPOSED → RESOLVED."""
+    path = [
+        IncidentState.OPEN,
+        IncidentState.INVESTIGATING,
+        IncidentState.FACTS_COLLECTED,
+        IncidentState.HYPOTHESIS_GENERATED,
+        IncidentState.FIX_PROPOSED,
+        IncidentState.RESOLVED,
+    ]
+    for cur, nxt in zip(path, path[1:]):
+        assert StateMachine.validate_transition(cur, nxt), (
+            f"fact-anchored path broken at {cur.value} → {nxt.value}"
+        )
+
+
+def test_legacy_path_still_valid():
+    assert StateMachine.validate_transition(
+        IncidentState.INVESTIGATING, IncidentState.HYPOTHESIS_GENERATED
+    )
+
+
+def test_cannot_skip_investigating_to_facts_collected():
+    assert not StateMachine.validate_transition(
+        IncidentState.OPEN, IncidentState.FACTS_COLLECTED
+    )
+
+
+def test_cannot_go_backwards_from_facts_collected():
+    assert not StateMachine.validate_transition(
+        IncidentState.FACTS_COLLECTED, IncidentState.INVESTIGATING
+    )
+
+
 # MARK: - Pipeline integration: full happy path
 
 @pytest.mark.asyncio
@@ -144,23 +201,22 @@ async def test_pipeline_drives_full_state_sequence(happy_path_dependencies, inci
     await async_process_incident(incident_data)
 
     record = happy_path_dependencies["record"]
-    # Final state: RESOLVED.
     assert record.status == IncidentState.RESOLVED.value
 
-    # Trace should mark transitions on the stages that triggered them.
     trace_by_stage = {entry["stage"]: entry for entry in record.trace}
     assert trace_by_stage["analyzer"].get("state_after") == IncidentState.INVESTIGATING.value
-    assert trace_by_stage["hypothesis"].get("state_after") == IncidentState.HYPOTHESIS_GENERATED.value
-    # Critic stays in HYPOTHESIS_GENERATED — no transition expected.
-    assert "state_after" not in trace_by_stage["critic"]
+    assert trace_by_stage["diagnostics"].get("state_after") == IncidentState.FACTS_COLLECTED.value
+    # hypothesis сама state_after не двигает, transition в HYPOTHESIS_GENERATED
+    # ставится после critic — отражено в critic stage.
+    assert trace_by_stage["critic"].get("state_after") == IncidentState.HYPOTHESIS_GENERATED.value
     assert trace_by_stage["fix"].get("state_after") == IncidentState.FIX_PROPOSED.value
-    # Risk stays in FIX_PROPOSED.
+    # Risk остаётся в FIX_PROPOSED.
     assert "state_after" not in trace_by_stage["risk"]
     assert trace_by_stage["synthesis"].get("state_after") == IncidentState.RESOLVED.value
 
 
 @pytest.mark.asyncio
-async def test_pipeline_accepts_legacy_pending_status(mocker, happy_path_dependencies, incident_data):
+async def test_pipeline_accepts_legacy_pending_status(happy_path_dependencies, incident_data):
     """Rows pre-created by old webhook code start with 'PENDING'."""
     happy_path_dependencies["record"].status = "PENDING"
 
@@ -174,7 +230,6 @@ async def test_pipeline_accepts_legacy_pending_status(mocker, happy_path_depende
 
 @pytest.mark.asyncio
 async def test_pipeline_marks_failed_on_agent_exception(mocker, happy_path_dependencies, incident_data):
-    """Any agent raising should land the record in FAILED, not stuck mid-way."""
     mocker.patch(
         "app.workers.tasks.FixAgent.suggest",
         new_callable=AsyncMock,
@@ -185,31 +240,34 @@ async def test_pipeline_marks_failed_on_agent_exception(mocker, happy_path_depen
     with pytest.raises(RuntimeError):
         await async_process_incident(incident_data)
 
-    # The record was in FIX_PROPOSED's predecessor (HYPOTHESIS_GENERATED)
-    # when the exception fired. The except-block transitions it to FAILED.
     record = happy_path_dependencies["record"]
     assert record.status == IncidentState.FAILED.value
 
 
 @pytest.mark.asyncio
 async def test_pipeline_handles_no_record_gracefully(mocker, incident_data):
-    """When webhook didn't pre-create the row (e.g. ad-hoc CLI run),
-    the worker shouldn't crash — it just skips state writes."""
-    mocker.patch("app.workers.tasks.AnalyzerAgent.analyze", new_callable=AsyncMock, return_value="a")
-    mocker.patch("app.workers.tasks.HypothesisAgent.generate", new_callable=AsyncMock, return_value="h")
-    mocker.patch("app.workers.tasks.CriticAgent.audit", new_callable=AsyncMock, return_value="c")
-    mocker.patch("app.workers.tasks.FixAgent.suggest", new_callable=AsyncMock, return_value="f")
-    mocker.patch("app.workers.tasks.RiskAgent.assess", new_callable=AsyncMock, return_value="r")
-    mocker.patch("app.workers.tasks.SynthesisAgent.synthesize", new_callable=AsyncMock, return_value="s")
+    """Webhook не пред-создал row (ad-hoc CLI run) — worker не должен крашиться."""
+    mocker.patch("app.workers.tasks.AnalyzerAgent.analyze",
+                 new_callable=AsyncMock, return_value="a")
+    mocker.patch("app.workers.tasks.MultiHypothesisAgent.generate",
+                 new_callable=AsyncMock, return_value=_hyp_set())
+    mocker.patch("app.workers.tasks.FactCriticAgent.critique_all",
+                 new_callable=AsyncMock, return_value=_hyp_set())
+    mocker.patch("app.workers.tasks.FixAgent.suggest",
+                 new_callable=AsyncMock, return_value="f")
+    mocker.patch("app.workers.tasks.RiskAgent.assess",
+                 new_callable=AsyncMock, return_value="r")
+    mocker.patch("app.workers.tasks.SynthesisAgent.synthesize",
+                 new_callable=AsyncMock, return_value="s")
     mocker.patch("app.workers.tasks.SimilarIncidentEngine.find", return_value=[])
-    mocker.patch("app.workers.tasks.discord_service.send_report", new_callable=AsyncMock)
+    mocker.patch("app.workers.tasks.diag_engine.run", return_value=_fact_store())
+    mocker.patch("app.workers.tasks.discord_service.send_report",
+                 new_callable=AsyncMock)
     mocker.patch("app.workers.tasks.audit_service.log_event")
 
     mock_session = MagicMock()
-    # Simulate no pre-existing row.
     mock_session.query.return_value.filter.return_value.first.return_value = None
     mocker.patch("app.workers.tasks.SessionLocal", return_value=mock_session)
 
     from app.workers.tasks import async_process_incident
-    # Must not raise.
     await async_process_incident(incident_data)

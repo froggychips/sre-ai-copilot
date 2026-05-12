@@ -1,14 +1,25 @@
-"""Pipeline-level integration: 6 stages produce a 6-entry trace, and the
-SimilarIncidentEngine output flows into HypothesisAgent.
+"""Pipeline-level integration: новый fact-anchored поток через 7 стадий.
 
-All LLM-calling agents are mocked at the class-method level — the test
-shouldn't make any network round-trip. The DB session is mocked at
-`SessionLocal` so the test runs without Postgres.
+Стадии после интеграции multi_hypothesis + fact_critic:
+    analyzer → diagnostics → hypothesis → critic → fix → risk → synthesis
+
+В отличие от старого pipeline-а тут:
+    * MultiHypothesisAgent заменяет HypothesisAgent (контракт другой)
+    * FactCriticAgent заменяет CriticAgent (контракт другой)
+    * Между analyzer и hypothesis вставлена stage `diagnostics`, которая
+      ничего LLM-вого не делает (DiagnosticEngine.run — синхронно)
+    * SimilarIncidentEngine.find остался и подмешивается в incident_summary
+
+LLM-агенты замокирваны на уровне класса. DB session — MagicMock.
 """
 
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+
+from app.agents.models.hypothesis import Hypothesis, HypothesisSet
+from app.core.state_machine import IncidentState
+from app.diagnostics.facts import Fact, FactKind
 
 
 @pytest.fixture
@@ -29,24 +40,30 @@ def incident_data() -> dict:
     }
 
 
+def _make_hypothesis_set() -> HypothesisSet:
+    return HypothesisSet(items=[
+        Hypothesis(
+            cause="OOM on api-7d8f",
+            anchored_facts=[FactKind.OOM_KILLED],
+            confidence=0.9,
+            perspective="infra",
+        ),
+    ])
+
+
+def _make_critiqued_set() -> HypothesisSet:
+    # Та же гипотеза, без refutations — survivor.
+    return _make_hypothesis_set()
+
+
 @pytest.fixture
 def mocked_dependencies(mocker):
-    """Mock all the things `async_process_incident` reaches into."""
-    # All 6 agent class methods → simple AsyncMock that returns a string.
+    """Замокировать всё, в что лезет `async_process_incident`."""
+    # AnalyzerAgent / FixAgent / RiskAgent / SynthesisAgent — старые контракты.
     mocker.patch(
         "app.workers.tasks.AnalyzerAgent.analyze",
         new_callable=AsyncMock,
         return_value="analysis text",
-    )
-    mocker.patch(
-        "app.workers.tasks.HypothesisAgent.generate",
-        new_callable=AsyncMock,
-        return_value="hyp text",
-    )
-    mocker.patch(
-        "app.workers.tasks.CriticAgent.audit",
-        new_callable=AsyncMock,
-        return_value="cause text",
     )
     mocker.patch(
         "app.workers.tasks.FixAgent.suggest",
@@ -64,23 +81,38 @@ def mocked_dependencies(mocker):
         return_value="synth text",
     )
 
-    # Similar incidents — empty by default; individual tests override.
+    # MultiHypothesisAgent + FactCriticAgent — новые контракты.
+    mocker.patch(
+        "app.workers.tasks.MultiHypothesisAgent.generate",
+        new_callable=AsyncMock,
+        return_value=_make_hypothesis_set(),
+    )
+    mocker.patch(
+        "app.workers.tasks.FactCriticAgent.critique_all",
+        new_callable=AsyncMock,
+        return_value=_make_critiqued_set(),
+    )
+
+    # SimilarIncidentEngine остаётся как enrichment hypothesis-стадии.
     similar_mock = mocker.patch(
         "app.workers.tasks.SimilarIncidentEngine.find",
         return_value=[],
     )
 
-    # Discord and audit — no-op.
+    # DiagnosticEngine — синхронный, мокать не обязательно: на пустом ctx
+    # отдаёт серию observed=False фактов. Но для предсказуемости подсунем
+    # FactStore с одним observed-фактом, чтобы grounded-фильтр прошёл.
+    diag_store_mock = mocker.patch(
+        "app.workers.tasks.diag_engine.run",
+        return_value=__make_fact_store(),
+    )
+
     mocker.patch(
-        "app.workers.tasks.discord_service.send_report", new_callable=AsyncMock
+        "app.workers.tasks.discord_service.send_report",
+        new_callable=AsyncMock,
     )
     mocker.patch("app.workers.tasks.audit_service.log_event")
 
-    # DB session: in-process MagicMock. The pipeline does query().filter().first(),
-    # then mutates the returned record and calls commit(). Pre-seed status with
-    # the enum's OPEN value so the StateMachine accepts the first transition
-    # to INVESTIGATING (PENDING is also accepted via legacy alias).
-    from app.core.state_machine import IncidentState
     record = MagicMock()
     record.trace = None
     record.analysis = None
@@ -93,11 +125,20 @@ def mocked_dependencies(mocker):
         "record": record,
         "session": mock_session,
         "similar_find": similar_mock,
+        "diag_run": diag_store_mock,
     }
 
 
+def __make_fact_store():
+    """FactStore с одним observed: oom_killed — ровно как мок hypothesis сделал anchor."""
+    from app.diagnostics.facts import FactStore
+    return FactStore([
+        Fact(kind=FactKind.OOM_KILLED, observed=True, confidence=0.95)
+    ])
+
+
 @pytest.mark.asyncio
-async def test_pipeline_writes_six_stage_trace(mocked_dependencies, incident_data):
+async def test_pipeline_writes_seven_stage_trace(mocked_dependencies, incident_data):
     from app.workers.tasks import async_process_incident
 
     await async_process_incident(incident_data)
@@ -105,17 +146,19 @@ async def test_pipeline_writes_six_stage_trace(mocked_dependencies, incident_dat
     record = mocked_dependencies["record"]
     assert record.trace is not None
     assert isinstance(record.trace, list)
-    assert len(record.trace) == 6
+    assert len(record.trace) == 7
     stages = [s["stage"] for s in record.trace]
-    assert stages == ["analyzer", "hypothesis", "critic", "fix", "risk", "synthesis"]
+    assert stages == [
+        "analyzer", "diagnostics", "hypothesis", "critic",
+        "fix", "risk", "synthesis"
+    ]
 
     for entry in record.trace:
         assert "duration_ms" in entry
         assert "llm_calls" in entry
         assert isinstance(entry["duration_ms"], int)
         assert entry["duration_ms"] >= 0
-        # Mocked agents bypass BaseAgent.ask, so they don't push llm_calls.
-        # Empty list is the expected (and tested) shape.
+        # Mocked agents bypass BaseAgent.ask, so они не пушат llm_calls.
         assert entry["llm_calls"] == []
 
 
@@ -123,36 +166,35 @@ async def test_pipeline_writes_six_stage_trace(mocked_dependencies, incident_dat
 async def test_pipeline_passes_similar_past_to_hypothesis(
     mocker, mocked_dependencies, incident_data
 ):
+    """SimilarIncidentEngine.find подмешивается в incident_summary для MultiHypothesisAgent."""
     mocked_dependencies["similar_find"].return_value = [
         {
             "incident_id": "OLD-1",
             "score": 0.7,
-            "root_cause": "memory limit",
+            "root_cause": "memory limit was too low",
             "summary": "OOM",
         },
     ]
-    # Re-patch HypothesisAgent.generate so we can inspect its call args.
-    hypo_mock = mocker.patch(
-        "app.workers.tasks.HypothesisAgent.generate",
+    # Re-patch MultiHypothesisAgent.generate, чтобы прочитать его call args.
+    multi_mock = mocker.patch(
+        "app.workers.tasks.MultiHypothesisAgent.generate",
         new_callable=AsyncMock,
-        return_value="hyp",
+        return_value=_make_hypothesis_set(),
     )
 
     from app.workers.tasks import async_process_incident
-
     await async_process_incident(incident_data)
 
-    # SimilarIncidentEngine.find was called with the incident_data dict
     mocked_dependencies["similar_find"].assert_called_once()
     called_with = mocked_dependencies["similar_find"].call_args
     assert called_with.kwargs.get("current_incident") == incident_data
     assert called_with.kwargs.get("limit") == 3
 
-    # HypothesisAgent.generate was called with similar_past forwarded.
-    assert hypo_mock.await_count == 1
-    forwarded_similar = hypo_mock.call_args.kwargs["similar_past"]
-    assert len(forwarded_similar) == 1
-    assert forwarded_similar[0]["incident_id"] == "OLD-1"
+    # incident_summary, переданный в MultiHypothesisAgent, должен содержать
+    # past-cause фразу.
+    assert multi_mock.await_count == 1
+    passed_summary = multi_mock.call_args.kwargs["incident_summary"]
+    assert "memory limit was too low" in passed_summary
 
 
 @pytest.mark.asyncio
@@ -165,7 +207,6 @@ async def test_pipeline_stores_similar_past_count_in_analysis(
     ]
 
     from app.workers.tasks import async_process_incident
-
     await async_process_incident(incident_data)
 
     analysis = mocked_dependencies["record"].analysis
@@ -176,12 +217,26 @@ async def test_pipeline_stores_similar_past_count_in_analysis(
 @pytest.mark.asyncio
 async def test_pipeline_marks_resolved_and_commits(mocked_dependencies, incident_data):
     from app.workers.tasks import async_process_incident
-    from app.core.state_machine import IncidentState
 
     await async_process_incident(incident_data)
 
-    # Was "COMPLETED" before StateMachine wiring; now the pipeline drives
-    # the row through OPEN → INVESTIGATING → HYPOTHESIS_GENERATED →
-    # FIX_PROPOSED → RESOLVED and the final status is RESOLVED.
+    # Pipeline должен довести инцидент до RESOLVED через
+    # OPEN → INVESTIGATING → FACTS_COLLECTED → HYPOTHESIS_GENERATED →
+    # FIX_PROPOSED → RESOLVED.
     assert mocked_dependencies["record"].status == IncidentState.RESOLVED.value
     mocked_dependencies["session"].commit.assert_called()
+
+
+@pytest.mark.asyncio
+async def test_pipeline_persists_fact_anchored_details(mocked_dependencies, incident_data):
+    """В record.analysis должны лежать facts + hypothesis_set + best_candidate."""
+    from app.workers.tasks import async_process_incident
+
+    await async_process_incident(incident_data)
+    analysis = mocked_dependencies["record"].analysis
+    assert "facts" in analysis
+    assert isinstance(analysis["facts"], list)
+    assert "hypothesis_set" in analysis
+    assert len(analysis["hypothesis_set"]) >= 1
+    assert "best_candidate" in analysis
+    assert analysis["best_candidate"]["cause"] == "OOM on api-7d8f"

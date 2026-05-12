@@ -5,6 +5,11 @@ from typing import Dict, Set
 class IncidentState(str, Enum):
     OPEN = "OPEN"
     INVESTIGATING = "INVESTIGATING"
+    # FACTS_COLLECTED — промежуточная стадия после DiagnosticEngine.run.
+    # Введена с fact-anchored reasoning архитектурой (см. multi_hypothesis
+    # + fact_critic). Legacy-pipeline без deterministic-слоя по-прежнему
+    # может идти INVESTIGATING → HYPOTHESIS_GENERATED напрямую.
+    FACTS_COLLECTED = "FACTS_COLLECTED"
     HYPOTHESIS_GENERATED = "HYPOTHESIS_GENERATED"
     FIX_PROPOSED = "FIX_PROPOSED"
     APPROVAL_PENDING = "APPROVAL_PENDING"
@@ -14,23 +19,32 @@ class IncidentState(str, Enum):
 
 
 class StateMachine:
-    # Two paths through the state machine, both valid:
+    # Три валидных pipeline-пути:
     #
-    # 1. **Analysis-only** (Celery worker, Synthesis-as-stage-6):
+    # 1. **Fact-anchored** (новый, deterministic-first):
+    #    OPEN → INVESTIGATING → FACTS_COLLECTED → HYPOTHESIS_GENERATED
+    #         → FIX_PROPOSED → RESOLVED
+    #
+    # 2. **Legacy chain** (старый, без deterministic-слоя; сохранён как
+    #    fallback и для backward-compat existing incident-ов):
     #    OPEN → INVESTIGATING → HYPOTHESIS_GENERATED → FIX_PROPOSED → RESOLVED
-    #    The pipeline writes a synthesised report and that's the end of the
-    #    incident's lifecycle. No human approval, no kubectl apply.
     #
-    # 2. **With human approval** (approvals API):
-    #    OPEN → ... → FIX_PROPOSED → APPROVAL_PENDING → EXECUTING → RESOLVED
-    #    A human approves the proposed fix and the executor applies it.
+    # 3. **With human approval** (любой из двух предыдущих + apply):
+    #    ... → FIX_PROPOSED → APPROVAL_PENDING → EXECUTING → RESOLVED
     #
-    # FIX_PROPOSED therefore has two outgoing non-failure edges: straight
-    # to RESOLVED (path 1) or into the approval pipeline (path 2).
-    # FAILED is reachable from every non-terminal state.
+    # FIX_PROPOSED имеет два non-failure исхода: прямо в RESOLVED (только
+    # synthesis-отчёт) или в APPROVAL_PENDING (apply через approval flow).
+    # FAILED достижим из любого non-terminal state.
     TRANSITIONS: Dict[IncidentState, Set[IncidentState]] = {
         IncidentState.OPEN: {IncidentState.INVESTIGATING, IncidentState.FAILED},
         IncidentState.INVESTIGATING: {
+            IncidentState.FACTS_COLLECTED,
+            # Legacy direct path сохраняется — без него старые pipeline-ы
+            # сломаются. После полной миграции можно будет удалить.
+            IncidentState.HYPOTHESIS_GENERATED,
+            IncidentState.FAILED,
+        },
+        IncidentState.FACTS_COLLECTED: {
             IncidentState.HYPOTHESIS_GENERATED,
             IncidentState.FAILED,
         },

@@ -3,9 +3,10 @@ import asyncio
 from celery import Celery
 
 from app.agents.analyzer import AnalyzerAgent
-from app.agents.critic import CriticAgent
+from app.agents.fact_critic import (FactCriticAgent, best_candidate, refuted,
+                                    survivors)
 from app.agents.fix import FixAgent
-from app.agents.hypothesis import HypothesisAgent
+from app.agents.multi_hypothesis import MultiHypothesisAgent
 from app.agents.risk import RiskAgent
 from app.agents.synthesis import SynthesisAgent
 from app.config import settings
@@ -13,6 +14,10 @@ from app.core.intelligence.similar_incidents import SimilarIncidentEngine
 from app.core.state_machine import IncidentState, StateMachine
 from app.core.tracing import StageTimer
 from app.database import IncidentRecord, SessionLocal
+from app.diagnostics import default_engine as diag_engine
+from app.diagnostics.facts import FactStore
+from app.diagnostics.incident_ctx import build_diagnostics_ctx
+from app.knowledge_graph.auto_populator import populate_from_incident
 from app.models.incident import Incident
 from app.services.audit_logger import audit_service
 from app.services.discord_service import discord_service
@@ -54,6 +59,7 @@ def transition_to(record, new_state: IncidentState, db) -> None:
     record.status = new_state.value
     db.commit()
 
+
 celery_app = Celery("sre_tasks", broker=settings.REDIS_URL, backend=settings.REDIS_URL)
 
 if settings.CELERY_TASK_ALWAYS_EAGER:
@@ -67,6 +73,40 @@ if settings.CELERY_TASK_ALWAYS_EAGER:
 def process_incident_task(self, incident_data: dict):
     loop = asyncio.get_event_loop()
     return loop.run_until_complete(async_process_incident(incident_data))
+
+
+def _serialize_hypotheses_for_synthesis(critiqued, facts: FactStore) -> str:
+    """Превратить HypothesisSet в текст для SynthesisAgent.
+
+    SynthesisAgent читает строку, не структуру (его контракт остался прежним).
+    Чтобы synthesis-отчёт всё-таки опирался на anchor-структуру, мы
+    рендерим в plain-text:
+      * выживших с их anchors,
+      * отказанных с их refutations,
+      * сводный набор фактов.
+    """
+    lines = ["=== HYPOTHESES (fact-anchored multi-perspective) ==="]
+    surv = survivors(critiqued).items
+    ref = refuted(critiqued).items
+    if not surv and not ref:
+        lines.append("(no hypotheses produced — facts may be insufficient)")
+    for h in surv:
+        lines.append(
+            f"[SURVIVED] perspective={h.perspective} conf={h.confidence:.2f}"
+        )
+        lines.append(f"  cause: {h.cause}")
+        if h.detail:
+            lines.append(f"  detail: {h.detail}")
+        lines.append(f"  anchored_facts: {h.anchored_facts}")
+    for h in ref:
+        lines.append(
+            f"[REFUTED]  perspective={h.perspective} conf={h.confidence:.2f}"
+        )
+        lines.append(f"  cause: {h.cause}")
+        lines.append(f"  refuted_by: {h.refutations}")
+    lines.append("")
+    lines.append(facts.to_prompt_context())
+    return "\n".join(lines)
 
 
 async def async_process_incident(incident_data: dict):
@@ -96,7 +136,21 @@ async def async_process_incident(incident_data: dict):
     try:
         incident = Incident(**incident_data)
 
-        # OPEN → INVESTIGATING (pipeline really started doing work).
+        # Auto-populate knowledge graph (best-effort, не валит pipeline).
+        # Каждый инцидент добавляет Service + AlertEvent + Deployments
+        # из TC-context. Со временем граф наполняется без отдельной cron.
+        try:
+            populate_from_incident(db, incident)
+            db.commit()
+        except Exception as e:
+            audit_service.log_event(
+                "KG_POPULATE_FAILED",
+                {"incident_id": incident_id, "error": type(e).__name__},
+            )
+            db.rollback()
+
+        # Stage 1: Analyzer — читает alert + контекст, формирует summary
+        # для дальнейших стадий. Транзит OPEN → INVESTIGATING.
         async with StageTimer("analyzer") as t:
             analyzer = AnalyzerAgent()
             analysis = await analyzer.analyze(incident)
@@ -104,28 +158,79 @@ async def async_process_incident(incident_data: dict):
         safe_transition(IncidentState.INVESTIGATING, snap)
         traces.append(snap)
 
-        # Stage 2: Hypothesis — augmented with up to 3 past ACCEPTED resolutions
-        # matching by service/cause/namespace (deterministic scoring inside
-        # SimilarIncidentEngine — no LLM call here).
+        # Stage 2: Diagnostics (deterministic) — выдаёт structured FactStore.
+        # Это сердцевина fact-anchored архитектуры: LLM-стадии дальше
+        # работают ПОВЕРХ фактов, а не сырого текста alert-а.
+        async with StageTimer("diagnostics") as t:
+            diag_ctx = build_diagnostics_ctx(
+                incident=incident, analyzer_summary=analysis, kg_session=db
+            )
+            fact_store = diag_engine.run(diag_ctx)
+        snap = t.snapshot().to_dict()
+        safe_transition(IncidentState.FACTS_COLLECTED, snap)
+        traces.append(snap)
+
+        # Stage 3: Fan-out hypothesis (3 perspective-агента параллельно)
+        # + anchor-валидация. SimilarIncidentEngine подмешивается в
+        # incident_summary как мини-context из похожих ACCEPTED-инцидентов.
+        # Не делает state transition — это часть рассуждения, формальное
+        # HYPOTHESIS_GENERATED ставится после критика.
         similar_past = SimilarIncidentEngine.find(
             current_incident=incident_data, limit=3
         )
-        async with StageTimer("hypothesis") as t:
-            hypo = HypothesisAgent()
-            hypotheses = await hypo.generate(analysis, similar_past=similar_past)
-        snap = t.snapshot().to_dict()
-        safe_transition(IncidentState.HYPOTHESIS_GENERATED, snap)
-        traces.append(snap)
+        if similar_past:
+            past_bullets = "\n".join(
+                f"- score={p.get('score', '?')} cause={(p.get('root_cause') or '?')[:200]}"
+                for p in similar_past
+            )
+            multi_summary = (
+                f"{analysis}\n\nSimilar past resolutions (consider as patterns, "
+                f"verify against current facts):\n{past_bullets}"
+            )
+        else:
+            multi_summary = analysis
 
-        # Stage 3: Critic — no state transition; still in HYPOTHESIS_GENERATED.
-        async with StageTimer("critic") as t:
-            critic = CriticAgent()
-            final_cause = await critic.audit(
-                analysis, hypotheses, namespace=incident.namespace
+        async with StageTimer("hypothesis") as t:
+            mha = MultiHypothesisAgent()
+            hypothesis_set = await mha.generate(
+                incident_summary=multi_summary, facts=fact_store
             )
         traces.append(t.snapshot().to_dict())
 
-        # Stage 4: Fix → FIX_PROPOSED.
+        # Stage 4: Fact-based adversarial critic — отбраковывает гипотезы,
+        # анchor-факты которых не observed (или anchor с низкой
+        # уверенностью).
+        async with StageTimer("critic") as t:
+            critic = FactCriticAgent()
+            critiqued = await critic.critique_all(hypothesis_set, fact_store)
+        traces.append(t.snapshot().to_dict())
+
+        # Стадии 3+4 в сумме = выбранная гипотеза. Это и есть момент
+        # HYPOTHESIS_GENERATED. Текст для последующих агентов формируется
+        # из best_candidate; если выживших нет — pipeline всё равно идёт
+        # до конца с явной пометкой «manual triage».
+        best = best_candidate(critiqued)
+        if best is None:
+            final_cause = (
+                "No hypothesis survived adversarial critique. "
+                f"Observed facts: {sorted(fact_store.observed_kinds())}. "
+                "Manual triage required."
+            )
+            hypotheses_text = _serialize_hypotheses_for_synthesis(
+                critiqued, fact_store
+            )
+        else:
+            final_cause = best.cause + (f" — {best.detail}" if best.detail else "")
+            hypotheses_text = _serialize_hypotheses_for_synthesis(
+                critiqued, fact_store
+            )
+        # safe_transition сюда, потому что critic уже отработал.
+        if traces:
+            traces[-1]["state_after"] = IncidentState.HYPOTHESIS_GENERATED.value
+        if record is not None:
+            transition_to(record, IncidentState.HYPOTHESIS_GENERATED, db)
+
+        # Stage 5: Fix — поверх final_cause. Контракт FixAgent не менялся.
         async with StageTimer("fix") as t:
             fixer = FixAgent()
             fix_suggestion = await fixer.suggest(final_cause)
@@ -133,31 +238,30 @@ async def async_process_incident(incident_data: dict):
         safe_transition(IncidentState.FIX_PROPOSED, snap)
         traces.append(snap)
 
-        # Stage 5: Risk — no state transition; still in FIX_PROPOSED.
+        # Stage 6: Risk — оценка предложенного фикса.
         async with StageTimer("risk") as t:
             risker = RiskAgent()
             risk_report = await risker.assess(fix_suggestion)
         traces.append(t.snapshot().to_dict())
 
-        # Stage 6: Synthesis — sees all 5 outputs simultaneously (two-level
-        # reasoning). Final transition to RESOLVED happens after the synth
-        # is stored so the row carries the synthesis text at the same time
-        # the state flips.
+        # Stage 7: Synthesis — финальный отчёт. SynthesisAgent ничего не
+        # знает про FactStore; ему передаётся подготовленный текст с
+        # SURVIVED/REFUTED + facts-блок.
         async with StageTimer("synthesis") as t:
             synthesizer = SynthesisAgent()
             synthesis = await synthesizer.synthesize(
                 incident_id=incident_id,
                 analysis=analysis,
-                hypotheses=hypotheses,
+                hypotheses=hypotheses_text,
                 final_cause=final_cause,
                 fix_suggestion=fix_suggestion,
                 risk_report=risk_report,
             )
         synth_snap = t.snapshot().to_dict()
 
-        # Persistence — analysis bundle plus the per-stage trace and the
-        # similar-past matches that fed into Hypothesis. Both fields are
-        # JSON columns; existing rows without them stay backward-compatible.
+        # Persistence — analysis bundle + структурированный fact-anchored
+        # блок + полный per-stage trace. Все JSON-колонки опциональны,
+        # старые строки остаются backward-совместимыми.
         record = (
             db.query(IncidentRecord)
             .filter(IncidentRecord.incident_id == incident_id)
@@ -166,18 +270,19 @@ async def async_process_incident(incident_data: dict):
         if record:
             record.analysis = {
                 "summary": analysis,
-                "hypotheses": hypotheses,
+                "hypotheses": hypotheses_text,
                 "cause": final_cause,
                 "fix": fix_suggestion,
                 "risk": risk_report,
                 "synthesis": synthesis,
                 "similar_past_count": len(similar_past),
+                # Fact-anchored details для post-mortem и regression-тестов:
+                "facts": fact_store.to_dict()["facts"],
+                "hypothesis_set": [h.model_dump() for h in critiqued.items],
+                "best_candidate": best.model_dump() if best else None,
+                "disagreement_signal": critiqued.disagreement_signal(),
+                "consensus_kinds": critiqued.consensus_kinds(),
             }
-            # Transition FIX_PROPOSED → APPROVAL_PENDING → ... is the
-            # "with human-approval" path; the always-on Synthesis-as-stage-6
-            # path treats Synthesis output as the final report and goes
-            # straight to RESOLVED. APPROVAL_PENDING / EXECUTING / are
-            # entered later by the approvals API endpoint.
             safe_transition(IncidentState.RESOLVED, synth_snap)
             record.trace = traces + [synth_snap]
             db.commit()
@@ -185,19 +290,18 @@ async def async_process_incident(incident_data: dict):
             # Tests that bypass the DB still get the in-memory trace.
             traces.append(synth_snap)
 
-        # Notification — send synthesized report, not raw stage output
         await discord_service.send_report(
             f"**Incident {incident_id} Analysis Complete.**\n\n{synthesis}"
         )
 
     except Exception as e:
-        # Any agent / synthesis failure marks the incident FAILED.
-        # validate_transition allows X → FAILED from every non-terminal state.
+        # Любая ошибка агента/синтеза — FAILED.
+        # validate_transition разрешает X → FAILED из любого non-terminal.
         if record is not None:
             try:
                 transition_to(record, IncidentState.FAILED, db)
             except ValueError:
-                # Already in a terminal state (RESOLVED/FAILED) — leave as is.
+                # Already in terminal state — leave as is.
                 db.rollback()
         else:
             db.rollback()
