@@ -34,10 +34,15 @@ class FactKind:
     RECENT_DEPLOY = "recent_deploy"
     RESOURCE_PRESSURE = "resource_pressure"
     UPSTREAM_DEGRADED = "upstream_degraded"
+    # Процесс упал от сигнала (SIGSEGV/SIGABRT/SIGBUS/SIGFPE/SIGILL).
+    # Отличается от oom_killed (SIGKILL=137) тем, что причина — баг в коде,
+    # а не нехватка памяти.
+    PROCESS_CRASH = "process_crash"
 
     ALL = frozenset({
         OOM_KILLED, CRASHLOOP, FAILED_SCHEDULING,
         RECENT_DEPLOY, RESOURCE_PRESSURE, UPSTREAM_DEGRADED,
+        PROCESS_CRASH,
     })
 
 

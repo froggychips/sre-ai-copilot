@@ -8,6 +8,7 @@ from app.diagnostics.rules.crashloop import CrashLoopBackOffRule
 from app.diagnostics.rules.failed_scheduling import FailedSchedulingRule
 from app.diagnostics.rules.oom import OOMKilledRule
 from app.diagnostics.rules.pod_events import PodEventsRule
+from app.diagnostics.rules.process_crash import ProcessCrashRule
 from app.diagnostics.rules.recent_deploy import RecentDeployRule
 from app.diagnostics.rules.resource_pressure import ResourcePressureRule
 from app.diagnostics.rules.upstream_degraded import UpstreamDegradedRule
@@ -20,6 +21,7 @@ DEFAULT_RULES: list[Rule] = [
     ResourcePressureRule(),
     UpstreamDegradedRule(),
     PodEventsRule(),
+    ProcessCrashRule(),
 ]
 
 __all__ = [
@@ -32,4 +34,5 @@ __all__ = [
     "ResourcePressureRule",
     "UpstreamDegradedRule",
     "PodEventsRule",
+    "ProcessCrashRule",
 ]
