@@ -15,6 +15,7 @@ from app.core.state_machine import IncidentState, StateMachine
 from app.core.tracing import StageTimer
 from app.database import IncidentRecord, SessionLocal
 from app.diagnostics import default_engine as diag_engine
+from app.context.jira_client import JiraClient, build_jira_context
 from app.context.k8s_facts import K8sFacts
 from app.context.vm_client import VMClient
 from app.diagnostics.facts import FactStore
@@ -315,11 +316,43 @@ async def async_process_incident(incident_data: dict):
         if record is not None:
             transition_to(record, IncidentState.HYPOTHESIS_GENERATED, db)
 
+        # Jira enrichment — best-effort перед FixAgent.
+        # Ищет открытые/недавние тикеты по имени сервиса.
+        # OPEN issue меняет рекомендацию с "restart" на "escalation + link".
+        jira_context = None
+        if settings.JIRA_BASE_URL and settings.JIRA_API_TOKEN:
+            try:
+                jira = JiraClient(
+                    base_url=settings.JIRA_BASE_URL,
+                    email=settings.JIRA_EMAIL,
+                    api_token=settings.JIRA_API_TOKEN,
+                    project_key=settings.JIRA_PROJECT_KEY,
+                    backend_label=settings.JIRA_BACKEND_LABEL,
+                )
+                service_name = incident.labels.get("service") or incident.labels.get("app", "")
+                if service_name:
+                    issues = await jira.search_by_service(
+                        service=service_name,
+                        namespace=incident.namespace,
+                        days=settings.JIRA_SEARCH_DAYS,
+                    )
+                    jira_context = build_jira_context(issues)
+            except Exception as _jira_err:
+                audit_service.log_event(
+                    "JIRA_ENRICHMENT_FAILED",
+                    {"incident_id": incident_id, "error": type(_jira_err).__name__},
+                )
+
         # Stage 5: Fix — поверх final_cause. При рецидиве FixAgent переключается
         # с mitigation-режима на investigative-режим.
+        # При найденных Jira-тикетах — добавляет их в контекст.
         async with StageTimer("fix") as t:
             fixer = FixAgent()
-            fix_suggestion = await fixer.suggest(final_cause, is_recurrence=is_recurrence)
+            fix_suggestion = await fixer.suggest(
+                final_cause,
+                is_recurrence=is_recurrence,
+                jira_context=jira_context,
+            )
         snap = t.snapshot().to_dict()
         safe_transition(IncidentState.FIX_PROPOSED, snap)
         traces.append(snap)
@@ -369,6 +402,7 @@ async def async_process_incident(incident_data: dict):
                 "synthesis": synthesis,
                 "similar_past_count": len(similar_past),
                 "is_recurrence": is_recurrence,
+                "jira_context": jira_context,
                 # Fact-anchored details для post-mortem и regression-тестов:
                 "facts": fact_store.to_dict()["facts"],
                 "fact_conflicts": [
