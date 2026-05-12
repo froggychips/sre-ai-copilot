@@ -1,3 +1,5 @@
+from typing import Any, Dict, Optional
+
 from app.agents.base import BaseAgent
 from app.services.telemetry_utils import trace_agent
 
@@ -31,6 +33,26 @@ or infrastructure regression.
 """
 
 
+def _build_jira_prefix(jira_context: Dict[str, Any]) -> str:
+    """Форматирует Jira-контекст как преамбулу для FixAgent."""
+    lines = ["=== KNOWN JIRA ISSUES ==="]
+    for issue in jira_context.get("open", []):
+        lines.append(
+            f"[OPEN]     {issue['key']} [{issue['priority']}] {issue['summary']} — {issue['url']}"
+        )
+    for issue in jira_context.get("resolved", []):
+        lines.append(
+            f"[RESOLVED] {issue['key']} {issue['summary']} — {issue['url']}"
+        )
+    if jira_context.get("has_open"):
+        lines.append(
+            "\nIMPORTANT: There are OPEN Jira issues for this service. "
+            "The fix should reference the existing issue and focus on mitigation "
+            "or escalation, NOT just a restart."
+        )
+    return "\n".join(lines)
+
+
 class FixAgent(BaseAgent):
     def __init__(self):
         super().__init__(
@@ -39,8 +61,16 @@ class FixAgent(BaseAgent):
         )
 
     @trace_agent("Fixer")
-    async def suggest(self, finalized_cause: str, is_recurrence: bool = False) -> str:
+    async def suggest(
+        self,
+        finalized_cause: str,
+        is_recurrence: bool = False,
+        jira_context: Optional[Dict[str, Any]] = None,
+    ) -> str:
         instruction = (
             _RECURRENCE_PREFIX + _BASE_INSTRUCTION if is_recurrence else _BASE_INSTRUCTION
         )
-        return await self.ask(user_context=finalized_cause, instruction=instruction)
+        context = finalized_cause
+        if jira_context:
+            context = _build_jira_prefix(jira_context) + "\n\n" + finalized_cause
+        return await self.ask(user_context=context, instruction=instruction)

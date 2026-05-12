@@ -104,6 +104,16 @@ class Settings(BaseSettings):
     TC_LOOKBACK_MINUTES: int = 60
     TC_BACKEND_PROJECT_ID: str = "Wo_Backend_K8sNewCluster"
 
+    # Atlassian Jira — поиск известных инцидентов/задач по сервису.
+    # Basic Auth: email + API token (https://id.atlassian.com/manage-profile/security/api-tokens)
+    # Пусто = Jira отключена (graceful degrade).
+    JIRA_BASE_URL: str = Field("", description="Atlassian Jira base URL (e.g. https://org.atlassian.net)")
+    JIRA_EMAIL: str = Field("", description="Jira user email for API basic auth")
+    JIRA_API_TOKEN: str = Field("", description="Jira API token")
+    JIRA_PROJECT_KEY: str = Field("WO", description="Jira project key to search in")
+    JIRA_BACKEND_LABEL: str = Field("backend", description="Label marking backend/infra issues")
+    JIRA_SEARCH_DAYS: int = Field(30, description="Look-back window for Jira issue search")
+
     @model_validator(mode="after")
     def _enforce_prod_invariants(self) -> "Settings":
         if self.LLM_BACKEND == "anthropic" and not self.ANTHROPIC_API_KEY:
