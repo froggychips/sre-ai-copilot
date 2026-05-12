@@ -35,11 +35,13 @@ class DiscordService:
         namespace: str,
         pod: Optional[str],
         service: Optional[str],
+        node: Optional[str],
         severity: str,
         cause: Optional[str],
         resolution_quality: str,
         synthesis: str,
         is_recurrence: bool = False,
+        flap_count: int = 0,
     ) -> None:
         """Единый embed-отчёт, заменяющий сырой алерт от Spidey Bot.
 
@@ -53,13 +55,17 @@ class DiscordService:
 
         status_icon = "✅" if resolution_quality == "resolved" else "⚠️"
         recurrence_tag = " · 🔁 RECURRENCE" if is_recurrence else ""
-        title = f"{status_icon} {alertname} · {namespace}{recurrence_tag}"
+        flap_tag = f" · 🔄 ×{flap_count}" if flap_count > 0 else ""
+        title = f"{status_icon} {alertname} · {namespace}{recurrence_tag}{flap_tag}"
 
         fields = []
         if service:
             fields.append({"name": "Service", "value": f"`{service}`", "inline": True})
         if pod:
             fields.append({"name": "Pod", "value": f"`{pod}`", "inline": True})
+        if node and not pod:
+            # Node-level alerts (Node* family) don't have pod/namespace context
+            fields.append({"name": "Node", "value": f"`{node}`", "inline": True})
         fields.append({
             "name": "Root Cause",
             "value": (cause or "Manual triage required — no hypothesis survived")[:1024],
@@ -77,7 +83,24 @@ class DiscordService:
                 "description": description,
                 "footer": {"text": f"incident/{incident_id}"},
                 "timestamp": datetime.now(timezone.utc).isoformat(),
-            }]
+            }],
+            # Кнопки фидбека. 👍 сохраняется сразу; 👎 требует подтверждения
+            # (защита от случайного клика — см. discord_interactions.py).
+            "components": [{
+                "type": 1,  # ACTION_ROW
+                "components": [
+                    {
+                        "type": 2, "style": 3,  # BUTTON SUCCESS (green)
+                        "label": "👍 Верный анализ",
+                        "custom_id": f"feedback_pos_{incident_id}",
+                    },
+                    {
+                        "type": 2, "style": 4,  # BUTTON DANGER (red)
+                        "label": "👎 Анализ неверен",
+                        "custom_id": f"feedback_neg_{incident_id}",
+                    },
+                ],
+            }],
         }
 
         if settings.DISCORD_DRY_RUN:

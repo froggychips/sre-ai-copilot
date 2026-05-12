@@ -17,6 +17,7 @@ Stage order:
 """
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
@@ -111,6 +112,7 @@ class IncidentPipeline:
         self.fact_store: Optional[FactStore] = None
         self.similar_past: List[dict] = []
         self.is_recurrence: bool = False
+        self.flap_count: int = incident_data.get("flap_count", 0)
         self.critiqued = None
         self.best = None
         self.final_cause: str = ""
@@ -119,6 +121,7 @@ class IncidentPipeline:
         self.fix_suggestion: Optional[str] = None
         self.risk_report: Optional[str] = None
         self.synthesis: Optional[str] = None
+        self.cluster_health_context: Optional[str] = None
 
     # ------------------------------------------------------------------
     # State machine helpers
@@ -212,7 +215,17 @@ class IncidentPipeline:
             )
 
     async def _enrich_vm(self, diag_ctx: dict) -> None:
-        if not (settings.VICTORIA_METRICS_URL and self.incident.namespace):
+        if not settings.VICTORIA_METRICS_URL:
+            return
+        vm = VMClient(settings.VICTORIA_METRICS_URL, timeout=10.0)
+        await asyncio.gather(
+            self._enrich_pod_metrics(diag_ctx, vm),
+            self._enrich_cluster_health(diag_ctx, vm),
+            return_exceptions=True,
+        )
+
+    async def _enrich_pod_metrics(self, diag_ctx: dict, vm: VMClient) -> None:
+        if not self.incident.namespace:
             return
         try:
             incident_ts = None
@@ -223,7 +236,7 @@ class IncidentPipeline:
                     )
                 except ValueError:
                     pass
-            metrics = await VMClient(settings.VICTORIA_METRICS_URL, timeout=10.0).get_pod_metrics(
+            metrics = await vm.get_pod_metrics(
                 namespace=self.incident.namespace,
                 pod=self.incident.labels.get("pod", ""),
                 window_minutes=settings.VICTORIA_METRICS_WINDOW_MINUTES,
@@ -232,7 +245,19 @@ class IncidentPipeline:
             diag_ctx["metrics_summary"] = metrics
         except Exception as e:
             audit_service.log_event(
-                "VM_ENRICHMENT_FAILED",
+                "VM_POD_ENRICHMENT_FAILED",
+                {"incident_id": self.incident_id, "error": type(e).__name__},
+            )
+
+    async def _enrich_cluster_health(self, diag_ctx: dict, vm: VMClient) -> None:
+        try:
+            health = await vm.get_cluster_health()
+            diag_ctx["cluster_health"] = health.to_dict()
+            self.cluster_health_context = health.to_prompt_context()
+            diag_ctx["cluster_health_context"] = self.cluster_health_context
+        except Exception as e:
+            audit_service.log_event(
+                "VM_CLUSTER_HEALTH_FAILED",
                 {"incident_id": self.incident_id, "error": type(e).__name__},
             )
 
@@ -247,6 +272,23 @@ class IncidentPipeline:
         self.is_recurrence = any(p.get("recurrence") for p in self.similar_past)
 
         summary = self.analysis
+
+        # Flapping context: same alert fired→resolved→fired again.
+        # RESOLVED between cycles may be misleading — root cause not fixed.
+        if self.flap_count > 0:
+            summary = (
+                f"⚠️ FLAPPING ALERT — cycle #{self.flap_count}. "
+                f"This alert has fired, resolved, and re-fired {self.flap_count} time(s). "
+                f"The RESOLVED signal between cycles was likely premature — "
+                f"the underlying cause was not fully remediated. "
+                f"Focus hypotheses on why the fix did not hold.\n\n{summary}"
+            )
+
+        # Cluster-wide health snapshot: lets hypotheses distinguish "isolated
+        # pod issue" from "cluster-wide pressure" (e.g. 8 crashloops + disk 92%).
+        if self.cluster_health_context:
+            summary = f"{summary}\n\n{self.cluster_health_context}"
+
         if self.similar_past:
             bullets = []
             for p in self.similar_past:
@@ -256,7 +298,7 @@ class IncidentPipeline:
                     line += f" [RECURRENCE: {days}d ago]" if days is not None else " [RECURRENCE]"
                 bullets.append(line)
             summary = (
-                f"{self.analysis}\n\nSimilar past resolutions (consider as patterns, "
+                f"{summary}\n\nSimilar past resolutions (consider as patterns, "
                 f"verify against current facts):\n" + "\n".join(bullets)
             )
 
@@ -408,6 +450,7 @@ class IncidentPipeline:
                 "best_candidate": self.best.model_dump() if self.best else None,
                 "disagreement_signal": self.critiqued.disagreement_signal(),
                 "consensus_kinds": self.critiqued.consensus_kinds(),
+                "cluster_health_context": self.cluster_health_context,
             }
             self._safe_transition(IncidentState.RESOLVED, synth_snap)
             record.trace = self.traces + [synth_snap]
@@ -422,11 +465,14 @@ class IncidentPipeline:
             namespace=self.incident.namespace or "",
             pod=labels.get("pod"),
             service=labels.get("service") or labels.get("app"),
+            # Node* alerts carry instance/node label instead of pod/namespace
+            node=labels.get("node") or labels.get("instance"),
             severity=self.incident.severity or "warning",
             cause=self.best.cause if self.best else None,
             resolution_quality="resolved" if self.best else "unresolved",
             synthesis=self.synthesis or "",
             is_recurrence=self.is_recurrence,
+            flap_count=self.flap_count,
         )
 
     # ------------------------------------------------------------------
