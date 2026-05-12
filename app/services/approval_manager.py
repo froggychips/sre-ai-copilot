@@ -5,6 +5,8 @@ from typing import Any, Dict, Optional
 import structlog
 from redis.asyncio import Redis
 
+from app.services.telemetry_utils import approval_span
+
 logger = structlog.get_logger()
 
 
@@ -59,34 +61,39 @@ class ApprovalManager:
             "created_at": str(uuid.uuid1().time),
         }
         key = f"{self.prefix}{approval_id}"
-        await self.redis.set(key, json.dumps(data), ex=ttl)
-        logger.info(
-            "approval_request_created",
-            approval_id=approval_id,
-            risk=operation_details.get("risk"),
-        )
+        with approval_span(approval_id, "request", user_id=user_id,
+                           risk=str(operation_details.get("risk", ""))):
+            await self.redis.set(key, json.dumps(data), ex=ttl)
+            logger.info(
+                "approval_request_created",
+                approval_id=approval_id,
+                risk=operation_details.get("risk"),
+            )
         return approval_id
 
     async def _atomic_transition(self, approval_id: str, target: str) -> Optional[str]:
         """Возвращает новый статус или None, если переход невозможен."""
         key = f"{self.prefix}{approval_id}"
-        try:
-            result = await self._transition(keys=[key], args=[target, 300])
-        except Exception as e:  # redis.exceptions.ResponseError несёт текст ошибки
-            err = str(e)
-            if err in ("NOT_FOUND", "DECODE") or err.startswith("NOT_PENDING:"):
-                logger.warning(
-                    "approval_transition_rejected",
-                    approval_id=approval_id,
-                    target=target,
-                    reason=err,
-                )
-                return None
-            raise
-        new_status = result.decode() if isinstance(result, bytes) else result
-        logger.info(
-            "approval_status_updated", approval_id=approval_id, status=new_status
-        )
+        with approval_span(approval_id, target.lower()) as span:
+            try:
+                result = await self._transition(keys=[key], args=[target, 300])
+            except Exception as e:  # redis.exceptions.ResponseError несёт текст ошибки
+                err = str(e)
+                if err in ("NOT_FOUND", "DECODE") or err.startswith("NOT_PENDING:"):
+                    span.add_event("approval.transition_rejected", attributes={"reason": err})
+                    logger.warning(
+                        "approval_transition_rejected",
+                        approval_id=approval_id,
+                        target=target,
+                        reason=err,
+                    )
+                    return None
+                raise
+            new_status = result.decode() if isinstance(result, bytes) else result
+            span.set_attribute("sre.approval.status", new_status)
+            logger.info(
+                "approval_status_updated", approval_id=approval_id, status=new_status
+            )
         return new_status
 
     async def approve(self, approval_id: str) -> Optional[str]:
