@@ -27,7 +27,7 @@ import time
 from dataclasses import asdict, dataclass, field
 from typing import Any
 
-from app.observability.ai_metrics import API_ERRORS, LLM_LATENCY
+from app.observability.ai_metrics import API_ERRORS, LLM_LATENCY, track_stage_duration
 
 
 @dataclass
@@ -118,6 +118,7 @@ class StageTimer:
 
     async def __aexit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
         self._duration_ms = int((time.monotonic() - self._start) * 1000)
+        track_stage_duration(self.stage, self._duration_ms / 1000.0)
         if self._token is not None:
             _current_recorder.reset(self._token)
 

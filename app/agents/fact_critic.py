@@ -26,6 +26,7 @@
 from __future__ import annotations
 
 import json
+import time
 from typing import List, Optional
 
 import structlog
@@ -33,6 +34,7 @@ import structlog
 from app.agents.base import BaseAgent
 from app.agents.models.hypothesis import Hypothesis, HypothesisSet
 from app.diagnostics.facts import FactStore
+from app.observability.ai_metrics import track_refuted, track_stage_duration
 from app.services.telemetry_utils import trace_agent
 
 logger = structlog.get_logger()
@@ -140,20 +142,26 @@ class FactCriticAgent(BaseAgent):
             # Если уже на дешёвой проверке валится — LLM не дёргаем,
             # это экономит токены и даёт стабильный воспроизводимый
             # refutation для обвалившихся anchor-ов.
+            track_refuted("algo")
             return hypothesis.model_copy(update={"refutations": algo})
 
         user_context, instruction = _llm_refutation_prompt(hypothesis, facts)
+        _t0 = time.monotonic()
         try:
             raw = await self.ask(user_context=user_context, instruction=instruction)
         except Exception as e:
+            track_stage_duration("llm_critic", time.monotonic() - _t0)
             logger.warning(
                 "critic_llm_failed",
                 error=type(e).__name__,
                 hypothesis_cause=hypothesis.cause,
             )
             return hypothesis  # без LLM — критик молчит, не ставит ложные refutations
+        track_stage_duration("llm_critic", time.monotonic() - _t0)
 
         llm_refs = _parse_refutations(raw)
+        if llm_refs:
+            track_refuted("llm")
         return hypothesis.model_copy(update={"refutations": llm_refs})
 
     async def critique_all(

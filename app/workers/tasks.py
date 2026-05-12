@@ -19,6 +19,8 @@ from app.diagnostics.facts import FactStore
 from app.diagnostics.incident_ctx import build_diagnostics_ctx
 from app.knowledge_graph.auto_populator import populate_from_incident
 from app.models.incident import Incident
+from app.observability.ai_metrics import (track_disagreement,
+                                          track_no_survivor)
 from app.services.audit_logger import audit_service
 from app.services.discord_service import discord_service
 
@@ -209,8 +211,12 @@ async def async_process_incident(incident_data: dict):
         # HYPOTHESIS_GENERATED. Текст для последующих агентов формируется
         # из best_candidate; если выживших нет — pipeline всё равно идёт
         # до конца с явной пометкой «manual triage».
+        if critiqued.disagreement_signal() is not None:
+            track_disagreement()
+
         best = best_candidate(critiqued)
         if best is None:
+            track_no_survivor()
             final_cause = (
                 "No hypothesis survived adversarial critique. "
                 f"Observed facts: {sorted(fact_store.observed_kinds())}. "

@@ -23,6 +23,7 @@ from pydantic import ValidationError
 from app.agents.base import BaseAgent
 from app.agents.models.hypothesis import Hypothesis, HypothesisSet
 from app.diagnostics.facts import FactKind, FactStore
+from app.observability.ai_metrics import track_generated, track_grounded
 from app.services.telemetry_utils import trace_agent
 
 logger = structlog.get_logger()
@@ -202,7 +203,15 @@ class MultiHypothesisAgent:
             merged.extend(res)
 
         unfiltered = HypothesisSet(items=merged)
+        for h in unfiltered.items:
+            track_generated(perspective=h.perspective)
         grounded = unfiltered.filter_grounded(facts.observed_kinds())
+
+        # Каждая выжившая гипотеза → +1 в метрику по своей perspective.
+        # Это даёт картину «какая perspective реально что-то выдаёт на
+        # нашем потоке alert-ов».
+        for h in grounded.items:
+            track_grounded(perspective=h.perspective)
 
         logger.info(
             "multi_hypothesis.fanout_done",
