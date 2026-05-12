@@ -76,7 +76,7 @@ class Settings(BaseSettings):
     REPLAY_MODE: bool = False
 
     # Observability
-    OTLP_EXPORTER_ENDPOINT: str = "http://tempo:4317"
+    OTLP_EXPORTER_ENDPOINT: str = "http://jaeger.monitoring:4317"
     # AUDIT_LOG_PATH:
     #   "" / "-" / "stdout" → stdout (default, prod-acceptable: Fluent Bit / Loki ловят).
     #   "/path/to/file"     → файл (dev / local-e2e). Под readOnlyRootFilesystem
