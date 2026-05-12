@@ -27,7 +27,12 @@ import time
 from dataclasses import asdict, dataclass, field
 from typing import Any
 
+from opentelemetry import trace
+from opentelemetry.trace import Status, StatusCode
+
 from app.observability.ai_metrics import API_ERRORS, LLM_LATENCY, track_stage_duration
+
+_pipeline_tracer = trace.get_tracer("sre.copilot.pipeline")
 
 
 @dataclass
@@ -110,8 +115,15 @@ class StageTimer:
         self._token: contextvars.Token[list[LLMCallInfo] | None] | None = None
         self._start: float = 0.0
         self._duration_ms: int = 0
+        self._span_cm: Any = None
+        self._span: trace.Span | None = None
 
     async def __aenter__(self) -> "StageTimer":
+        self._span_cm = _pipeline_tracer.start_as_current_span(
+            f"sre.copilot.stage.{self.stage}",
+            attributes={"stage.name": self.stage},
+        )
+        self._span = self._span_cm.__enter__()
         self._token = _current_recorder.set(self._bucket)
         self._start = time.monotonic()
         return self
@@ -121,6 +133,14 @@ class StageTimer:
         track_stage_duration(self.stage, self._duration_ms / 1000.0)
         if self._token is not None:
             _current_recorder.reset(self._token)
+        if self._span is not None:
+            self._span.set_attribute("stage.duration_ms", self._duration_ms)
+            self._span.set_attribute("stage.llm_call_count", len(self._bucket))
+            if exc_type is not None:
+                self._span.record_exception(exc)
+                self._span.set_status(Status(StatusCode.ERROR, str(exc)))
+        if self._span_cm is not None:
+            self._span_cm.__exit__(exc_type, exc, tb)
 
     def snapshot(self) -> StageTrace:
         return StageTrace(
