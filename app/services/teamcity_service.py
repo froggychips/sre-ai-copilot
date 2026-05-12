@@ -75,6 +75,20 @@ def _parse_tc_date(s: str) -> Optional[datetime]:
         return None
 
 
+def _tc_to_iso(s: Optional[str]) -> Optional[str]:
+    """TC compact date → UTC ISO 8601 `YYYY-MM-DDTHH:MM:SSZ`.
+
+    Нормализует формат TC (`20260512T174418+0000`) к стандартному ISO
+    чтобы LLM мог сравнивать с incident.starts_at без путаницы форматов.
+    """
+    if not s:
+        return None
+    dt = _parse_tc_date(s)
+    if dt is None:
+        return s  # нераспознанный формат — возвращаем как есть
+    return dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
 def _fetch_builds_direct(
     branch: str,
     since: datetime,
@@ -138,7 +152,7 @@ def _build_summary_direct(b: dict[str, Any]) -> dict[str, Any]:
         {
             "version": (c.get("version") or "")[:12],
             "author": c.get("username"),
-            "date": c.get("date"),
+            "date": _tc_to_iso(c.get("date")),
             "comment": _trim_comment(c.get("comment", "")),
             "files": [
                 f.get("file") for f in (c.get("files") or {}).get("file", [])
@@ -155,8 +169,8 @@ def _build_summary_direct(b: dict[str, Any]) -> dict[str, Any]:
         "state": b.get("state"),
         "buildtype_id": b.get("buildTypeId"),
         "branch": b.get("branchName"),
-        "started": b.get("startDate"),
-        "finished": b.get("finishDate"),
+        "started": _tc_to_iso(b.get("startDate")),
+        "finished": _tc_to_iso(b.get("finishDate")),
         "agent": (b.get("agent") or {}).get("name"),
         "status_text": b.get("statusText"),
         "url": url,
@@ -327,8 +341,8 @@ def teamcity_context_to_prompt(tc_ctx: Optional[dict]) -> str:
         num = b.get("number", "?")
         btype = (b.get("buildtype_id") or "").split("_")[-1]  # short name
         status = b.get("status", "?")
-        finished = (b.get("finished_at") or "")[:16]
-        lines.append(f"Build #{num} — {btype} — {status} — {finished}")
+        finished = (b.get("finished_at") or "")[:19]  # YYYY-MM-DDTHH:MM:SS
+        lines.append(f"Build #{num} — {btype} — {status} — {finished}Z (UTC)")
         for c in b.get("changes") or []:
             rev = (c.get("version") or "")[:8]
             author = c.get("author") or c.get("username") or "?"
