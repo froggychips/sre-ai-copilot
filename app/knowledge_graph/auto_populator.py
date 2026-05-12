@@ -1,0 +1,135 @@
+"""Авто-наполнение knowledge graph из событий pipeline.
+
+Каждый инцидент проходит через `async_process_incident` — это единственная
+точка, где мы гарантированно видим Service + Alert + (опционально)
+Deployments из TeamCity context. Используем её для инкрементального
+заполнения графа БЕЗ отдельной cron-задачи.
+
+Что НЕ делается здесь (см. backfill_cli.py / отдельный populator):
+  * Service-edges (calls/reads_from/...) — требует service-mesh или
+    статического анализа, отдельная задача.
+  * Backfill за прошлый период — нужен dump alertmanager / TC API.
+  * Удаление сервисов которые ушли из k8s.
+
+Конструктивно: tolerant к ошибкам. Граф — best-effort enrichment,
+pipeline не должен падать, если populator упал.
+"""
+from __future__ import annotations
+
+from datetime import datetime, timezone
+from typing import Any, Dict, Optional
+
+import structlog
+from sqlalchemy.orm import Session
+
+from app.knowledge_graph.populator import (record_alert_event,
+                                           record_deployment, upsert_service)
+from app.models.incident import Incident
+
+logger = structlog.get_logger()
+
+
+def _parse_ts(raw: Any) -> Optional[datetime]:
+    if isinstance(raw, datetime):
+        return raw if raw.tzinfo else raw.replace(tzinfo=timezone.utc)
+    if isinstance(raw, str):
+        try:
+            return datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+    return None
+
+
+def populate_from_incident(db: Session, incident: Incident) -> Dict[str, int]:
+    """Записать узлы графа из одного инцидента.
+
+    Returns:
+        dict с количествами: services_touched, deploys_added, alerts_added.
+        Используется для логирования и audit.
+    """
+    stats = {"services_touched": 0, "deploys_added": 0, "alerts_added": 0}
+
+    labels = incident.labels or {}
+    service_name = labels.get("service") or labels.get("app") or labels.get("deployment")
+    namespace = incident.namespace
+    if not (namespace and service_name):
+        # Без identifiable service в графе хранить нечего.
+        logger.debug(
+            "kg.populate.skipped_no_service",
+            incident_id=incident.incident_id,
+            namespace=namespace,
+        )
+        return stats
+
+    try:
+        team = labels.get("team") or labels.get("squad")
+        svc = upsert_service(
+            db, namespace=namespace, name=service_name,
+            team_owner=team,
+            metadata={k: v for k, v in labels.items() if k in {"app", "component", "version"}},
+        )
+        stats["services_touched"] += 1
+    except Exception as e:
+        logger.warning(
+            "kg.populate.service_failed",
+            error=type(e).__name__, message=str(e),
+        )
+        return stats
+
+    # Deployments из TeamCity context (если был enrichment).
+    tc = incident.teamcity_context or {}
+    for b in tc.get("recent_builds") or []:
+        started_at = _parse_ts(b.get("started_at") or b.get("finished_at"))
+        if started_at is None:
+            continue
+        try:
+            record_deployment(
+                db,
+                service=svc,
+                started_at=started_at.replace(tzinfo=None),  # naive для SQLite
+                finished_at=_parse_ts(b.get("finished_at"))
+                .replace(tzinfo=None) if b.get("finished_at") else None,
+                sha=b.get("sha"),
+                repo=b.get("repo"),
+                buildtype_id=b.get("buildtype_id"),
+                build_number=str(b.get("number") or ""),
+                status=b.get("status"),
+                triggered_by=b.get("triggered_by"),
+                extras={"branch": b.get("branch")} if b.get("branch") else None,
+            )
+            stats["deploys_added"] += 1
+        except Exception as e:
+            logger.warning(
+                "kg.populate.deployment_failed",
+                error=type(e).__name__, message=str(e),
+            )
+
+    # AlertEvent — идемпотентен по fingerprint.
+    fired_at = _parse_ts(incident.starts_at)
+    if fired_at is not None:
+        try:
+            record_alert_event(
+                db,
+                service=svc,
+                alertname=labels.get("alertname") or "unknown",
+                severity=labels.get("severity") or incident.severity,
+                fingerprint=incident.incident_id,  # fingerprint == incident_id
+                fired_at=fired_at.replace(tzinfo=None),
+                incident_id=incident.incident_id,
+                raw={"description": incident.description},
+            )
+            stats["alerts_added"] += 1
+        except Exception as e:
+            logger.warning(
+                "kg.populate.alert_failed",
+                error=type(e).__name__, message=str(e),
+            )
+
+    logger.info(
+        "kg.populate.done",
+        incident_id=incident.incident_id,
+        service=service_name,
+        namespace=namespace,
+        **stats,
+    )
+    return stats
