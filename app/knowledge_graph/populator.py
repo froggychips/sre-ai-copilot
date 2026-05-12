@@ -106,6 +106,24 @@ def record_deployment(
     triggered_by: Optional[str] = None,
     extras: Optional[Dict[str, Any]] = None,
 ) -> Deployment:
+    # Dedup: один build (buildtype_id + build_number) не должен дублироваться
+    # если появляется в нескольких инцидентах.
+    if buildtype_id and build_number:
+        existing = (
+            db.query(Deployment)
+            .filter(
+                Deployment.service_id == service.id,
+                Deployment.buildtype_id == buildtype_id,
+                Deployment.build_number == build_number,
+            )
+            .one_or_none()
+        )
+        if existing is not None:
+            if sha and not existing.sha:
+                existing.sha = sha
+                db.flush()
+            return existing
+
     dep = Deployment(
         service_id=service.id,
         started_at=started_at,

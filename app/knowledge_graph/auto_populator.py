@@ -82,14 +82,17 @@ def populate_from_incident(db: Session, incident: Incident) -> Dict[str, int]:
         started_at = _parse_ts(b.get("started_at") or b.get("finished_at"))
         if started_at is None:
             continue
+        # SHA живёт в changes[0]["version"] — TC context не имеет поля "sha" напрямую
+        changes = b.get("changes") or []
+        sha = (changes[0].get("version") or None) if changes else None
         try:
             record_deployment(
                 db,
                 service=svc,
-                started_at=started_at.replace(tzinfo=None),  # naive для SQLite
+                started_at=started_at.replace(tzinfo=None),
                 finished_at=_parse_ts(b.get("finished_at"))
                 .replace(tzinfo=None) if b.get("finished_at") else None,
-                sha=b.get("sha"),
+                sha=sha,
                 repo=b.get("repo"),
                 buildtype_id=b.get("buildtype_id"),
                 build_number=str(b.get("number") or ""),
