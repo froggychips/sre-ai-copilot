@@ -3,7 +3,8 @@ from typing import Annotated, List
 import structlog
 from fastapi import Depends, HTTPException, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
-from jose import JWTError, jwt
+import jwt
+from jwt.exceptions import InvalidTokenError
 from pydantic import BaseModel, Field
 
 from app.config import settings
@@ -52,11 +53,11 @@ async def get_current_user(
         )
 
         if not user.sub:
-            raise JWTError("Missing 'sub' in payload")
+            raise InvalidTokenError("Missing 'sub' in payload")
 
         return user
 
-    except JWTError as e:
+    except InvalidTokenError as e:
         log.warning("auth_failed", error=str(e))
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
