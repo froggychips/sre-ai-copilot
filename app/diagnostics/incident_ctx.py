@@ -47,6 +47,7 @@ def _extract_deploys_from_tc(tc_ctx: Optional[Dict[str, Any]]) -> List[Dict[str,
             "number": b.get("number"),
             "status": b.get("status"),
             "branch": b.get("branch"),
+            "changes": b.get("changes") or [],
         })
     return out
 

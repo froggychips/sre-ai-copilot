@@ -85,16 +85,20 @@ def _fetch_builds_direct(
     """
     client = _TCClient(url=settings.TC_URL, token=settings.TC_TOKEN, timeout=settings.TC_TIMEOUT_SECONDS * 2)
     try:
+        _build_fields = (
+            "build(id,number,status,state,branchName,buildTypeId,startDate,finishDate,"
+            "agent(name),statusText,"
+            "lastChanges(change(id,version,username,date,comment,"
+            "files(count,file(file,changeType)))))"
+        )
+
         def _list(extra_locator: str = "") -> list[dict[str, Any]]:
             parts = f"affectedProject:(id:{settings.TC_BACKEND_PROJECT_ID}),state:finished,count:50"
             if extra_locator:
                 parts += f",{extra_locator}"
             data = client.get_json(
                 "/app/rest/builds",
-                params={
-                    "locator": parts,
-                    "fields": "build(id,number,status,state,branchName,buildTypeId,startDate,finishDate,agent(name),statusText)",
-                },
+                params={"locator": parts, "fields": _build_fields},
             )
             return [_build_summary_direct(b) for b in data.get("build", [])]
 
@@ -118,39 +122,32 @@ def _fetch_builds_direct(
         merged.sort(key=lambda b: b.get("finished", ""), reverse=True)
         builds = merged[:5]
 
-        for b in builds:
-            btype = b.get("buildtype_id")
-            if not btype:
-                b["changes"] = []
-                continue
-            try:
-                data = client.get_json(
-                    f"/app/rest/changes",
-                    params={"locator": f"buildType:(id:{btype}),count:5",
-                            "fields": "change(version,username,date,comment)"},
-                )
-                b["changes"] = [
-                    {
-                        "version": (c.get("version") or "")[:12],
-                        "author": c.get("username"),
-                        "date": c.get("date"),
-                        "comment": _trim_comment(c.get("comment", "")),
-                    }
-                    for c in data.get("change", [])
-                ]
-            except Exception:
-                b["changes"] = []
-
         return builds
     finally:
         client.close()
 
 
 def _build_summary_direct(b: dict[str, Any]) -> dict[str, Any]:
-    """Нормализует build из TC REST API в тот же формат что teamcity_mcp server."""
+    """Нормализует build из TC REST API, включая lastChanges → changes[]."""
     url = None
     if settings.TEAMCITY_WEB_URL and b.get("id"):
         url = f"{settings.TEAMCITY_WEB_URL.rstrip('/')}/viewLog.html?buildId={b['id']}"
+
+    raw_changes = (b.get("lastChanges") or {}).get("change", [])
+    changes = [
+        {
+            "version": (c.get("version") or "")[:12],
+            "author": c.get("username"),
+            "date": c.get("date"),
+            "comment": _trim_comment(c.get("comment", "")),
+            "files": [
+                f.get("file") for f in (c.get("files") or {}).get("file", [])
+                if f.get("file") and not (f.get("file") or "").endswith("/")
+            ][:20],
+        }
+        for c in raw_changes
+    ]
+
     return {
         "id": b.get("id"),
         "number": b.get("number"),
@@ -163,6 +160,7 @@ def _build_summary_direct(b: dict[str, Any]) -> dict[str, Any]:
         "agent": (b.get("agent") or {}).get("name"),
         "status_text": b.get("statusText"),
         "url": url,
+        "changes": changes,
     }
 
 
@@ -316,3 +314,31 @@ async def incident_teamcity_context(
         }
     finally:
         await mcp.aclose()
+
+
+def teamcity_context_to_prompt(tc_ctx: Optional[dict]) -> str:
+    """Форматирует TC-контекст для инжекта в LLM-промпт hypothesis-стадии."""
+    if not tc_ctx or not tc_ctx.get("recent_builds"):
+        return ""
+    branch = tc_ctx.get("branch", "?")
+    lookback = tc_ctx.get("lookback_minutes", 60)
+    lines = [f"=== TEAMCITY DEPLOYS ({branch}, lookback {lookback} min) ==="]
+    for b in tc_ctx["recent_builds"]:
+        num = b.get("number", "?")
+        btype = (b.get("buildtype_id") or "").split("_")[-1]  # short name
+        status = b.get("status", "?")
+        finished = (b.get("finished_at") or "")[:16]
+        lines.append(f"Build #{num} — {btype} — {status} — {finished}")
+        for c in b.get("changes") or []:
+            rev = (c.get("version") or "")[:8]
+            author = c.get("author") or c.get("username") or "?"
+            comment = c.get("comment") or ""
+            lines.append(f"  [{rev}] {author}: {comment}")
+            files = c.get("files") or []
+            if files:
+                lines.append(f"  Files ({len(files)}): {', '.join(files[:10])}")
+                if len(files) > 10:
+                    lines.append(f"         (+{len(files)-10} more)")
+        if b.get("url"):
+            lines.append(f"  URL: {b['url']}")
+    return "\n".join(lines)
