@@ -27,6 +27,7 @@ from app.observability.ai_metrics import (track_disagreement,
                                           track_no_survivor)
 from app.services.audit_logger import audit_service
 from app.services.discord_service import discord_service
+from app.services.telemetry_utils import incident_span
 
 
 # Legacy `status` strings that were used before IncidentState was hooked
@@ -116,6 +117,15 @@ def _serialize_hypotheses_for_synthesis(critiqued, facts: FactStore) -> str:
 
 
 async def async_process_incident(incident_data: dict):
+    incident_id = incident_data.get("incident_id", "")
+    _service = (incident_data.get("labels") or {}).get("service", "")
+    _namespace = incident_data.get("namespace", "")
+
+    with incident_span(incident_id, service=_service, namespace=_namespace) as _root_span:
+        return await _process_incident_inner(incident_data, _root_span)
+
+
+async def _process_incident_inner(incident_data: dict, _root_span):
     db = SessionLocal()
     incident_id = incident_data.get("incident_id")
     audit_service.log_event("CELERY_START", {"incident_id": incident_id})
@@ -386,6 +396,12 @@ async def async_process_incident(incident_data: dict):
             .filter(IncidentRecord.incident_id == incident_id)
             .first()
         )
+        _resolution_quality = "resolved" if best else "unresolved"
+        _root_span.set_attribute("sre.incident.resolution_quality", _resolution_quality)
+        _root_span.set_attribute("sre.incident.is_recurrence", is_recurrence)
+        if best:
+            _root_span.set_attribute("sre.incident.cause", best.cause[:500])
+
         if record:
             record.analysis = {
                 "summary": analysis,
@@ -396,7 +412,7 @@ async def async_process_incident(incident_data: dict):
                 # Полный pipeline-статус сохраняем в triage_note.
                 "cause": best.cause if best else None,
                 "triage_note": final_cause if best is None else None,
-                "resolution_quality": "resolved" if best else "unresolved",
+                "resolution_quality": _resolution_quality,
                 "fix": fix_suggestion,
                 "risk": risk_report,
                 "synthesis": synthesis,
