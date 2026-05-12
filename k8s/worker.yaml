@@ -57,3 +57,59 @@ spec:
   selector:
     matchLabels:
       app: copilot-worker
+
+---
+# Celery beat — планировщик периодических задач (kg_topology_sync hourly и др.).
+# ВСЕГДА replicas: 1 — несколько beat-инстансов будут дублировать задачи.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: copilot-beat
+  labels:
+    app: copilot-beat
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: copilot-beat
+  strategy:
+    type: Recreate   # при обновлении убиваем старый до старта нового — дубли недопустимы
+  template:
+    metadata:
+      labels:
+        app: copilot-beat
+    spec:
+      serviceAccountName: sre-ai
+      automountServiceAccountToken: true
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        fsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+      - name: beat
+        image: froggychips/sre-ai-copilot:latest
+        command:
+        - celery
+        - -A
+        - app.workers.tasks.celery_app
+        - beat
+        - --loglevel=info
+        - --scheduler=celery.beat:PersistentScheduler
+        - --schedule=/tmp/celerybeat-schedule   # /tmp — единственный writable dir
+        securityContext:
+          readOnlyRootFilesystem: true
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop: ["ALL"]
+        envFrom:
+        - secretRef:
+            name: sre-ai-secrets
+        resources:
+          limits:
+            cpu: 100m
+            memory: 128Mi
+          requests:
+            cpu: 50m
+            memory: 64Mi
