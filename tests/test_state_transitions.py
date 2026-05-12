@@ -16,7 +16,7 @@ from unittest.mock import AsyncMock, MagicMock
 from app.agents.models.hypothesis import Hypothesis, HypothesisSet
 from app.core.state_machine import IncidentState, StateMachine
 from app.diagnostics.facts import Fact, FactKind, FactStore
-from app.workers.tasks import _current_state, transition_to
+from app.workers.pipeline import _current_state, transition_to
 
 
 # MARK: - Helpers
@@ -54,23 +54,23 @@ def _fact_store():
 
 @pytest.fixture
 def happy_path_dependencies(mocker):
-    mocker.patch("app.workers.tasks.AnalyzerAgent.analyze",
+    mocker.patch("app.workers.pipeline.AnalyzerAgent.analyze",
                  new_callable=AsyncMock, return_value="a")
-    mocker.patch("app.workers.tasks.MultiHypothesisAgent.generate",
+    mocker.patch("app.workers.pipeline.MultiHypothesisAgent.generate",
                  new_callable=AsyncMock, return_value=_hyp_set())
-    mocker.patch("app.workers.tasks.FactCriticAgent.critique_all",
+    mocker.patch("app.workers.pipeline.FactCriticAgent.critique_all",
                  new_callable=AsyncMock, return_value=_hyp_set())
-    mocker.patch("app.workers.tasks.FixAgent.suggest",
+    mocker.patch("app.workers.pipeline.FixAgent.suggest",
                  new_callable=AsyncMock, return_value="f")
-    mocker.patch("app.workers.tasks.RiskAgent.assess",
+    mocker.patch("app.workers.pipeline.RiskAgent.assess",
                  new_callable=AsyncMock, return_value="r")
-    mocker.patch("app.workers.tasks.SynthesisAgent.synthesize",
+    mocker.patch("app.workers.pipeline.SynthesisAgent.synthesize",
                  new_callable=AsyncMock, return_value="s")
-    mocker.patch("app.workers.tasks.SimilarIncidentEngine.find", return_value=[])
-    mocker.patch("app.workers.tasks.diag_engine.run", return_value=_fact_store())
-    mocker.patch("app.workers.tasks.discord_service.send_report",
+    mocker.patch("app.workers.pipeline.SimilarIncidentEngine.find", return_value=[])
+    mocker.patch("app.workers.pipeline.diag_engine.run", return_value=_fact_store())
+    mocker.patch("app.workers.pipeline.discord_service.send_report",
                  new_callable=AsyncMock)
-    mocker.patch("app.workers.tasks.audit_service.log_event")
+    mocker.patch("app.workers.pipeline.audit_service.log_event")
 
     record = MagicMock()
     record.trace = None
@@ -231,7 +231,7 @@ async def test_pipeline_accepts_legacy_pending_status(happy_path_dependencies, i
 @pytest.mark.asyncio
 async def test_pipeline_marks_failed_on_agent_exception(mocker, happy_path_dependencies, incident_data):
     mocker.patch(
-        "app.workers.tasks.FixAgent.suggest",
+        "app.workers.pipeline.FixAgent.suggest",
         new_callable=AsyncMock,
         side_effect=RuntimeError("LLM exploded mid-fix"),
     )
@@ -247,23 +247,23 @@ async def test_pipeline_marks_failed_on_agent_exception(mocker, happy_path_depen
 @pytest.mark.asyncio
 async def test_pipeline_handles_no_record_gracefully(mocker, incident_data):
     """Webhook не пред-создал row (ad-hoc CLI run) — worker не должен крашиться."""
-    mocker.patch("app.workers.tasks.AnalyzerAgent.analyze",
+    mocker.patch("app.workers.pipeline.AnalyzerAgent.analyze",
                  new_callable=AsyncMock, return_value="a")
-    mocker.patch("app.workers.tasks.MultiHypothesisAgent.generate",
+    mocker.patch("app.workers.pipeline.MultiHypothesisAgent.generate",
                  new_callable=AsyncMock, return_value=_hyp_set())
-    mocker.patch("app.workers.tasks.FactCriticAgent.critique_all",
+    mocker.patch("app.workers.pipeline.FactCriticAgent.critique_all",
                  new_callable=AsyncMock, return_value=_hyp_set())
-    mocker.patch("app.workers.tasks.FixAgent.suggest",
+    mocker.patch("app.workers.pipeline.FixAgent.suggest",
                  new_callable=AsyncMock, return_value="f")
-    mocker.patch("app.workers.tasks.RiskAgent.assess",
+    mocker.patch("app.workers.pipeline.RiskAgent.assess",
                  new_callable=AsyncMock, return_value="r")
-    mocker.patch("app.workers.tasks.SynthesisAgent.synthesize",
+    mocker.patch("app.workers.pipeline.SynthesisAgent.synthesize",
                  new_callable=AsyncMock, return_value="s")
-    mocker.patch("app.workers.tasks.SimilarIncidentEngine.find", return_value=[])
-    mocker.patch("app.workers.tasks.diag_engine.run", return_value=_fact_store())
-    mocker.patch("app.workers.tasks.discord_service.send_report",
+    mocker.patch("app.workers.pipeline.SimilarIncidentEngine.find", return_value=[])
+    mocker.patch("app.workers.pipeline.diag_engine.run", return_value=_fact_store())
+    mocker.patch("app.workers.pipeline.discord_service.send_report",
                  new_callable=AsyncMock)
-    mocker.patch("app.workers.tasks.audit_service.log_event")
+    mocker.patch("app.workers.pipeline.audit_service.log_event")
 
     mock_session = MagicMock()
     mock_session.query.return_value.filter.return_value.first.return_value = None
