@@ -1,20 +1,21 @@
-"""TeamCity → recent-deploys context для incident-а, через mcp-teamcity-server.
+"""TeamCity → recent-deploys context для incident-а.
 
-Вместо прямого REST API теперь ходим через MCP-сервер
-(`external/mcp/teamcity-server` — см. MR !1). Это даёт полный набор 13 тулов
-(вместо 4 в tools-server) и единый auth-контур с остальными WO MCP-серверами.
+Два транспорта (в порядке приоритета):
+  1. Прямой TC REST API через TeamCityClient из локального пакета teamcity_mcp.
+     Активен когда TC_URL + TC_TOKEN заданы в конфиге.
+     Sync-клиент запускается в thread pool (run_in_executor).
+  2. MCP HTTP server (McpHttpClient) — если задан TEAMCITY_MCP_URL.
+     Нужен задеплоенный mcp-teamcity-server (пока не поднят).
 
-Публичный интерфейс `incident_teamcity_context()` не изменился — потребители
-(webhook ingestion → analyzer/hypothesis prompts) остаются без правок.
-
-Никакого write — только `teamcity_list_builds` + `teamcity_list_changes`.
-При недоступности MCP — graceful degrade (None).
+Публичный интерфейс `incident_teamcity_context()` не изменился.
+Graceful degrade (None) если ни один транспорт не доступен.
 """
 
 from __future__ import annotations
 
 import asyncio
 import re
+import sys
 from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 
@@ -23,6 +24,16 @@ import structlog
 
 from app.config import settings
 from app.services.mcp_client import McpHttpClient
+
+# Локальный пакет teamcity_mcp — лежит рядом с проектом.
+_TC_MCP_SRC = "/Users/yaroslav/projects/teamcity-mcp/src"
+if _TC_MCP_SRC not in sys.path:
+    sys.path.insert(0, _TC_MCP_SRC)
+try:
+    from teamcity_mcp.client import TeamCityClient as _TCClient
+    _TC_CLIENT_AVAILABLE = True
+except ImportError:
+    _TC_CLIENT_AVAILABLE = False
 
 logger = structlog.get_logger()
 
@@ -64,17 +75,108 @@ def _parse_tc_date(s: str) -> Optional[datetime]:
         return None
 
 
+def _fetch_builds_direct(
+    branch: str,
+    since: datetime,
+    wanted_branches: set[str],
+) -> list[dict[str, Any]]:
+    """Синхронный запрос к TC REST API через TeamCityClient.
+    Запускается в thread pool из async-контекста.
+    """
+    client = _TCClient(url=settings.TC_URL, token=settings.TC_TOKEN, timeout=settings.TC_TIMEOUT_SECONDS * 2)
+    try:
+        def _list(extra_locator: str = "") -> list[dict[str, Any]]:
+            parts = f"affectedProject:(id:{settings.TC_BACKEND_PROJECT_ID}),state:finished,count:50"
+            if extra_locator:
+                parts += f",{extra_locator}"
+            data = client.get_json(
+                "/app/rest/builds",
+                params={
+                    "locator": parts,
+                    "fields": "build(id,number,status,state,branchName,buildTypeId,startDate,finishDate,agent(name),statusText)",
+                },
+            )
+            return [_build_summary_direct(b) for b in data.get("build", [])]
+
+        default_builds = _list()
+        branch_builds = _list(f"branch:{branch}")
+
+        seen: set[int] = set()
+        merged: list[dict[str, Any]] = []
+        for b in default_builds + branch_builds:
+            bid = b.get("id")
+            if bid in seen:
+                continue
+            seen.add(bid)
+            if b.get("branch") not in wanted_branches:
+                continue
+            finished = _parse_tc_date(b.get("finished", ""))
+            if finished is None or finished < since:
+                continue
+            merged.append(b)
+
+        merged.sort(key=lambda b: b.get("finished", ""), reverse=True)
+        builds = merged[:5]
+
+        for b in builds:
+            btype = b.get("buildtype_id")
+            if not btype:
+                b["changes"] = []
+                continue
+            try:
+                data = client.get_json(
+                    f"/app/rest/changes",
+                    params={"locator": f"buildType:(id:{btype}),count:5",
+                            "fields": "change(version,username,date,comment)"},
+                )
+                b["changes"] = [
+                    {
+                        "version": (c.get("version") or "")[:12],
+                        "author": c.get("username"),
+                        "date": c.get("date"),
+                        "comment": _trim_comment(c.get("comment", "")),
+                    }
+                    for c in data.get("change", [])
+                ]
+            except Exception:
+                b["changes"] = []
+
+        return builds
+    finally:
+        client.close()
+
+
+def _build_summary_direct(b: dict[str, Any]) -> dict[str, Any]:
+    """Нормализует build из TC REST API в тот же формат что teamcity_mcp server."""
+    url = None
+    if settings.TEAMCITY_WEB_URL and b.get("id"):
+        url = f"{settings.TEAMCITY_WEB_URL.rstrip('/')}/viewLog.html?buildId={b['id']}"
+    return {
+        "id": b.get("id"),
+        "number": b.get("number"),
+        "status": b.get("status"),
+        "state": b.get("state"),
+        "buildtype_id": b.get("buildTypeId"),
+        "branch": b.get("branchName"),
+        "started": b.get("startDate"),
+        "finished": b.get("finishDate"),
+        "agent": (b.get("agent") or {}).get("name"),
+        "status_text": b.get("statusText"),
+        "url": url,
+    }
+
+
 async def incident_teamcity_context(
     namespace: Optional[str],
     incident_starts_at: Optional[str],
 ) -> Optional[dict[str, Any]]:
-    """Собрать TC-контекст к инциденту через mcp-teamcity-server.
+    """Собрать TC-контекст к инциденту.
 
     Возвращает dict с полями `branch`, `lookback_minutes`, `namespace`,
     `recent_builds` (≤ 5, каждый — c id/status/buildtype/branch/url + changes).
-    None — если MCP не сконфигурирован, namespace не маппится, MCP недоступен.
+    None — если ни один транспорт не доступен, namespace не маппится, или ошибка.
     """
-    if not settings.TEAMCITY_MCP_URL:
+    if not settings.TC_URL and not settings.TEAMCITY_MCP_URL:
         return None
     branch = branch_for_namespace(namespace)
     if branch is None:
@@ -90,88 +192,16 @@ async def incident_teamcity_context(
         end = datetime.now(timezone.utc)
     since = end - timedelta(minutes=settings.TC_LOOKBACK_MINUTES)
 
-    # Принятые ограничения mcp-teamcity-server v1 (MR !1):
-    #   1. teamcity_list_builds НЕ умеет default:any в branch locator —
-    #      одним вызовом покрыть и buildTypes с branchSpec (branch=`prod`),
-    #      и без него (branch=`refs/heads/preprod`) нельзя. Делаем 2 запроса:
-    #      без branch (default-ветки) + с branch=<logical> и объединяем.
-    #   2. teamcity_list_changes не принимает build_id. Берём общий поток коммитов
-    #      по buildtype_id — это «recent changes in this pipeline» (близко к
-    #      «changes in this build», достаточно для корреляции в analyzer-prompt-е).
     wanted_branches = {branch, f"refs/heads/{branch}"}
-    mcp = McpHttpClient(
-        url=settings.TEAMCITY_MCP_URL,
-        bearer_token=settings.TEAMCITY_MCP_TOKEN or None,
-        timeout=settings.TC_TIMEOUT_SECONDS,
-    )
-    try:
 
-        async def _list(extra: dict[str, Any]) -> list[dict[str, Any]]:
-            try:
-                rv = await mcp.call_tool(
-                    "teamcity_list_builds",
-                    {
-                        "project_id": settings.TC_BACKEND_PROJECT_ID,
-                        "state": "finished",
-                        "count": 50,
-                        **extra,
-                    },
-                )
-                return rv if isinstance(rv, list) else []
-            except (httpx.HTTPError, RuntimeError) as e:
-                logger.warning(
-                    "teamcity.list_builds (mcp) failed", error=str(e), extra=extra
-                )
-                return []
-
-        default_branch, logical_branch = await asyncio.gather(
-            _list(
-                {}
-            ),  # default branches (refs/heads/<x> для buildTypes без branchSpec)
-            _list({"branch": branch}),  # logical name (для buildTypes с branchSpec)
-        )
-
-        seen_ids: set[int] = set()
-        merged: list[dict[str, Any]] = []
-        for b in default_branch + logical_branch:
-            bid = b.get("id")
-            if bid in seen_ids:
-                continue
-            seen_ids.add(bid)
-            if b.get("branch") not in wanted_branches:
-                continue
-            finished = _parse_tc_date(b.get("finished", ""))
-            if finished is None or finished < since:
-                continue
-            merged.append(b)
-        # Сортируем по дате (свежее первым)
-        merged.sort(key=lambda b: b.get("finished", ""), reverse=True)
-        builds = merged[:5]
-
-        async def _changes(b: dict[str, Any]) -> list[dict[str, Any]]:
-            btype = b.get("buildtype_id")
-            if not btype:
-                return []
-            try:
-                rv = await mcp.call_tool(
-                    "teamcity_list_changes", {"buildtype_id": btype, "count": 5}
-                )
-                return rv if isinstance(rv, list) else []
-            except (httpx.HTTPError, RuntimeError) as e:
-                logger.warning(
-                    "teamcity.list_changes (mcp) failed",
-                    buildtype_id=btype,
-                    error=str(e),
-                )
-                return []
-
-        all_changes = (
-            await asyncio.gather(*[_changes(b) for b in builds]) if builds else []
-        )
-
-        recent_builds = []
-        for b, changes in zip(builds, all_changes):
-            recent_builds.append(
+    # Путь 1: прямой TC REST API (локальный пакет teamcity_mcp)
+    if settings.TC_URL and settings.TC_TOKEN and _TC_CLIENT_AVAILABLE:
+        try:
+            loop = asyncio.get_event_loop()
+            builds = await loop.run_in_executor(
+                None, _fetch_builds_direct, branch, since, wanted_branches
+            )
+            recent_builds = [
                 {
                     "id": b.get("id"),
                     "number": b.get("number"),
@@ -183,23 +213,101 @@ async def incident_teamcity_context(
                     "finished_at": b.get("finished"),
                     "agent": b.get("agent"),
                     "status_text": b.get("status_text"),
-                    "url": (
-                        f"{settings.TEAMCITY_WEB_URL.rstrip('/')}/viewLog.html?buildId={b.get('id')}"
-                        if settings.TEAMCITY_WEB_URL
-                        else None
-                    ),
-                    "changes": [
-                        {
-                            "version": (c.get("version") or "")[:12],
-                            "author": c.get("username") or c.get("author"),
-                            "date": c.get("date"),
-                            "comment": _trim_comment(c.get("comment", "")),
-                        }
-                        for c in changes
-                    ],
+                    "url": b.get("url"),
+                    "changes": b.get("changes", []),
                 }
-            )
+                for b in builds
+            ]
+            return {
+                "branch": branch,
+                "lookback_minutes": settings.TC_LOOKBACK_MINUTES,
+                "namespace": namespace,
+                "recent_builds": recent_builds,
+            }
+        except Exception as e:
+            logger.warning("teamcity.direct_client failed, trying MCP fallback", error=str(e))
 
+    # Путь 2: MCP HTTP server (если задан TEAMCITY_MCP_URL)
+    if not settings.TEAMCITY_MCP_URL:
+        return None
+
+    mcp = McpHttpClient(
+        url=settings.TEAMCITY_MCP_URL,
+        bearer_token=settings.TEAMCITY_MCP_TOKEN or None,
+        timeout=settings.TC_TIMEOUT_SECONDS,
+    )
+    try:
+        async def _list(extra: dict[str, Any]) -> list[dict[str, Any]]:
+            try:
+                rv = await mcp.call_tool(
+                    "teamcity_list_builds",
+                    {"project_id": settings.TC_BACKEND_PROJECT_ID, "state": "finished", "count": 50, **extra},
+                )
+                return rv if isinstance(rv, list) else []
+            except (httpx.HTTPError, RuntimeError) as e:
+                logger.warning("teamcity.list_builds (mcp) failed", error=str(e), extra=extra)
+                return []
+
+        default_branch_builds, logical_branch_builds = await asyncio.gather(
+            _list({}), _list({"branch": branch})
+        )
+        seen_ids: set[int] = set()
+        merged: list[dict[str, Any]] = []
+        for b in default_branch_builds + logical_branch_builds:
+            bid = b.get("id")
+            if bid in seen_ids:
+                continue
+            seen_ids.add(bid)
+            if b.get("branch") not in wanted_branches:
+                continue
+            finished = _parse_tc_date(b.get("finished", ""))
+            if finished is None or finished < since:
+                continue
+            merged.append(b)
+        merged.sort(key=lambda b: b.get("finished", ""), reverse=True)
+        builds = merged[:5]
+
+        async def _changes(b: dict[str, Any]) -> list[dict[str, Any]]:
+            btype = b.get("buildtype_id")
+            if not btype:
+                return []
+            try:
+                rv = await mcp.call_tool("teamcity_list_changes", {"buildtype_id": btype, "count": 5})
+                return rv if isinstance(rv, list) else []
+            except (httpx.HTTPError, RuntimeError) as e:
+                logger.warning("teamcity.list_changes (mcp) failed", buildtype_id=btype, error=str(e))
+                return []
+
+        all_changes = await asyncio.gather(*[_changes(b) for b in builds]) if builds else []
+
+        recent_builds = [
+            {
+                "id": b.get("id"),
+                "number": b.get("number"),
+                "status": b.get("status"),
+                "state": b.get("state"),
+                "buildtype_id": b.get("buildtype_id"),
+                "branch": b.get("branch"),
+                "started_at": b.get("started"),
+                "finished_at": b.get("finished"),
+                "agent": b.get("agent"),
+                "status_text": b.get("status_text"),
+                "url": (
+                    f"{settings.TEAMCITY_WEB_URL.rstrip('/')}/viewLog.html?buildId={b.get('id')}"
+                    if settings.TEAMCITY_WEB_URL else None
+                ),
+                "changes": [
+                    {
+                        "version": (c.get("version") or "")[:12],
+                        "author": c.get("username") or c.get("author"),
+                        "date": c.get("date"),
+                        "comment": _trim_comment(c.get("comment", "")),
+                    }
+                    for c in changes
+                ],
+            }
+            for b, changes in zip(builds, all_changes)
+        ]
         return {
             "branch": branch,
             "lookback_minutes": settings.TC_LOOKBACK_MINUTES,
