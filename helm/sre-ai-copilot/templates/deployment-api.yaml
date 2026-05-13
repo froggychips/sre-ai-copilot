@@ -49,6 +49,10 @@ spec:
           value: {{ .Values.env.logLevel | quote }}
         - name: SAFE_MODE
           value: {{ .Values.env.safeMode | quote }}
+        - name: EXECUTOR_ENABLED
+          value: {{ .Values.env.executorEnabled | default "false" | quote }}
+        - name: EXECUTOR_APPROVAL_ENABLED
+          value: {{ .Values.env.executorApprovalEnabled | default "false" | quote }}
         livenessProbe:
           httpGet:
             path: /healthz

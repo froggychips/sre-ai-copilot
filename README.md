@@ -4,7 +4,7 @@
 [![Python](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/)
 [![FastAPI](https://img.shields.io/badge/FastAPI-0.104-009688)](https://fastapi.tiangolo.com/)
 [![Celery](https://img.shields.io/badge/Celery-5.3-37814A)](https://docs.celeryq.dev/)
-[![Release](https://img.shields.io/badge/release-v0.6.0-blue)](CHANGELOG.md)
+[![Release](https://img.shields.io/badge/release-v0.7.0-blue)](CHANGELOG.md)
 
 > **[English](#english) · [Русский](#русский)**
 
@@ -13,9 +13,11 @@
 <a name="english"></a>
 ## English
 
-**SRE AI Copilot** is a backend service that turns Prometheus AlertManager webhooks into an **advisory analysis** of a Kubernetes incident — root cause + recommended actions, posted as a Discord embed.
+**SRE AI Copilot** is a backend service that turns Prometheus AlertManager webhooks into either an **advisory analysis** (default) or an **auto-remediation with human approval** (opt-in) of a Kubernetes incident — root cause + recommended actions, posted as a Discord embed.
 
-> **Advisory mode (current state).** The copilot does **not** call `kubectl`. The 8-stage pipeline produces a `cause` + textual `fix_suggestion` from `FixAgent`, posted to Discord for an engineer to act on. The `ExecutionIntent` DSL, `K8sSecurityGuard`, `K8sService.execute_intent` and the `/approvals/*` endpoints are **scaffolded but not wired into the pipeline** — they will gate a future executor. See [Roadmap → Execution](#roadmap--execution) below. Until then: think of this as a high-quality second opinion, not an auto-remediator.
+> **Default = advisory mode.** With out-of-the-box settings (`EXECUTOR_ENABLED=false`, `EXECUTOR_APPROVAL_ENABLED=false`) the copilot does **not** call `kubectl` — it analyzes, posts to Discord, and stops. Engineer acts manually.
+>
+> **Opt-in = auto-remediator with approval.** Setting `EXECUTOR_ENABLED=true` adds a 9th pipeline stage that validates the proposed action against `kube-apiserver` via `kubectl ... --dry-run=server`. Setting `EXECUTOR_APPROVAL_ENABLED=true` additionally shows an «⚙️ Apply» button on the Discord embed (only when dry-run passed and risk ≤ medium); two-click confirmation → real `kubectl` under `K8sSecurityGuard` with full OTEL audit. See [Roadmap → Execution](#roadmap--execution) below for the ramp-up plan.
 
 ### What it does
 
@@ -31,8 +33,10 @@
 - Detects **recurrence**: same service resolved < 7 days → `FixAgent` switches to investigative mode (no restart recommendations).
 - Posts a **single Discord embed** per incident (title + root cause + synthesis + feedback buttons), replacing the previous two-message flow.
 - **👍 / 👎 feedback buttons** on every embed: 👍 saves immediately; 👎 requires a two-step confirmation ("Confirm: was the model's *analysis* wrong?") to prevent accidental negative feedback. Stored in `IncidentRecord.user_feedback`.
-- Posts the final report (analysis + recommended actions) to Discord — **no `kubectl` is invoked**. The `K8sSecurityGuard`, `ExecutionIntent` DSL and `/approvals/*` endpoints are scaffolded for a future executor stage; today they are not part of the live request path.
-- Full **OTEL audit trail** of the analysis pipeline: `sre.copilot.incident.process` root span, per-stage child spans, `guardrail.blocked` events (emitted only if the guard is exercised directly, e.g. from a future executor or tests).
+- **Structured `ExecutionIntent`** alongside prose: `FixAgent` emits JSON in the `ExecutionIntent` schema (`action`, `resource_type`, `resource_name`, `namespace`, `params`, `risk`); pydantic-validated, `FORBIDDEN_NAMESPACES` rejected at parse time, persisted to `IncidentRecord.analysis.execution_intent`.
+- **Executor stage** (opt-in via `EXECUTOR_ENABLED=true`): server-side dry-run of the intent (`kubectl ... --dry-run=server`) under `K8sSecurityGuard`; result captured in `executor_result` and shown as a "Dry-run verdict" field on the Discord embed.
+- **Discord Apply button** (opt-in via `EXECUTOR_APPROVAL_ENABLED=true`): two-click confirmation on the embed → invokes `K8sService.execute_intent(intent, dry_run=False, post_approval=True)`; idempotency by `incident_id`, eligible only when dry-run passed and risk ∈ {low, medium}; HIGH-risk and ineligible incidents never get the button.
+- Full **OTEL audit trail**: `sre.copilot.incident.process` root span, per-stage child spans, `execution_intent_parsed` / `executor_status` attributes, `guardrail.blocked` events emitted when the guard rejects an operation, `EXECUTOR_APPLIED` / `EXECUTOR_APPLY_REFUSED` audit events.
 
 ### Tech stack
 
@@ -153,25 +157,34 @@ Full details: [docs/RUNBOOK.md](docs/RUNBOOK.md)
 
 ### Security
 
-- **AI never reaches kubectl on the live path** — advisory mode only (see top of README). The `ExecutionIntent` DSL + deterministic translator + `K8sSecurityGuard` are written and unit-tested, but no pipeline stage invokes them; they will gate a future executor.
-- Tiered namespace policy (already enforced by `K8sSecurityGuard.validate`, ready for the future executor): `prod`/`preprod` read-only; `squad-*` write via approval; `kube-*`/`mcp` forbidden.
-- `SAFE_MODE=true` enforced in `ENV=production` (config validator raises otherwise).
+- **Defence in depth around kubectl**: AI never calls kubectl directly — `FixAgent` emits structured `ExecutionIntent` (JSON, pydantic-validated, `FORBIDDEN_NAMESPACES` rejected at parse time), the `DSLTranslator` produces the canonical `kubectl` string deterministically, and `K8sSecurityGuard` validates `(verb, resource, namespace)` derived structurally from the action — not from text-parsing the command. Real writes (`dry_run=False`) additionally require `post_approval=True` set only by the Discord approval consumer.
+- Tiered namespace policy enforced by `K8sSecurityGuard.validate`: `prod`/`preprod` read-only; `squad-*` write via approval; `kube-*`/`mcp` forbidden.
+- `SAFE_MODE=true` enforced in `ENV=production` (config validator raises otherwise) — a real write outside an approved path returns `SAFE_MODE: Manual approval required.`
 - AlertManager webhook auth: HMAC-SHA256 on the body (`ALERTMANAGER_WEBHOOK_SECRET` is mandatory in production, the config validator refuses to start without it).
 - Prompt injection guard with `PROMPT_INPUT_MAX_CHARS` cap.
-- Discord interactions endpoint verifies Ed25519 signature on every request (Discord requirement).
-- Full OTEL audit trail of the analysis pipeline — see [docs/AUDIT.md](docs/AUDIT.md).
+- Discord interactions endpoint verifies Ed25519 signature on every request (Discord requirement). Apply button uses two-click confirmation (mirror of the 👎 feedback flow) to prevent accidental writes.
+- Full OTEL audit trail and `EXECUTOR_APPLIED` / `EXECUTOR_APPLY_REFUSED` events — see [docs/AUDIT.md](docs/AUDIT.md).
 
 ### Roadmap — Execution
 
-The advisory pipeline is the **stable** part of the project. Promoting it to an
-auto-remediator requires (in order):
+The executor track is **delivered and gated behind explicit opt-in flags** as of v0.7.0. The remaining work is operational, not code.
 
-1. Wire `FixAgent` output to also emit a structured `ExecutionIntent` (today it returns prose).
-2. Insert an `executor` stage after `risk` that calls `K8sService.execute_intent(...)` with `dry_run=True` by default and `K8sSecurityGuard.validate` in front.
-3. Block the executor on a Discord approval click (the `/approvals/{id}/approve` endpoint already exists; consumer side does not).
-4. End-to-end test on a non-prod cluster against the squad-write namespace tier before any `dry_run=False` is allowed in prod.
+| # | Step | Status |
+|---|---|---|
+| 1 | `FixAgent` emits structured `ExecutionIntent` alongside prose | ✅ v0.7.0 (PR #23) |
+| 2 | `executor` stage after `risk` with `dry_run=True` + `K8sSecurityGuard.validate` | ✅ v0.7.0 (PR #26) |
+| 3 | Discord Apply consumer with two-click confirm → real `kubectl` under guard | ✅ v0.7.0 (PR #27) |
+| 4 | End-to-end smoke on non-prod `squad-*` cluster + production ramp-up plan | 🟡 In progress (this PR) |
 
-Until those four items are done, the project will stay in advisory mode by design.
+**Ramp-up plan (post-merge):**
+
+1. **Dev**: `EXECUTOR_ENABLED=true`, `EXECUTOR_APPROVAL_ENABLED=true` on local dev with `DISCORD_DRY_RUN=true` — verify embed buttons appear correctly.
+2. **One preprod squad-N namespace**: enable both flags via Helm value override; trigger a synthetic alert (or wait for a real one); click Apply on a low-risk action (`get_logs`, `describe_resource`). Verify `executor_applied` row in DB and audit log.
+3. **All preprod-squad-***: gradual rollout one namespace per day, watch for `EXECUTOR_APPLY_REFUSED` rate.
+4. **Production-squad-N**: same procedure, `low`-risk only for first week, then `medium` after one clean incident.
+5. **No HIGH risk auto-apply ever** — by design. HIGH-risk intents never get the Apply button.
+
+See [docs/RUNBOOK.md → Executor incidents](docs/RUNBOOK.md#executor-incidents) for operational procedures.
 
 ### Documentation
 
@@ -203,9 +216,11 @@ Until those four items are done, the project will stay in advisory mode by desig
 <a name="русский"></a>
 ## Русский
 
-**SRE AI Copilot** — backend-сервис, который превращает webhook-и Prometheus AlertManager в **аналитическую справку** по инциденту в Kubernetes: root cause + рекомендуемые действия, постит embed-ом в Discord.
+**SRE AI Copilot** — backend-сервис, который превращает webhook-и Prometheus AlertManager либо в **аналитическую справку** (по дефолту), либо в **авто-ремедиатор с human approval** (opt-in) по инциденту в Kubernetes: root cause + рекомендуемые действия, постит embed-ом в Discord.
 
-> **Advisory-режим (текущее состояние).** Copilot **не** вызывает `kubectl`. Пайплайн из 8 стадий выдаёт `cause` + текстовый `fix_suggestion` от `FixAgent`, который постится в Discord, чтобы инженер действовал руками. DSL `ExecutionIntent`, `K8sSecurityGuard`, `K8sService.execute_intent` и эндпоинты `/approvals/*` **заскаффолжены, но не подключены к пайплайну** — они закроют будущий executor. См. [Roadmap — Execution](#roadmap--execution-1) ниже. Пока что это качественное «второе мнение», не авто-ремедиатор.
+> **Default = advisory-режим.** Со стандартными настройками (`EXECUTOR_ENABLED=false`, `EXECUTOR_APPROVAL_ENABLED=false`) copilot **не** вызывает `kubectl` — анализирует, постит в Discord, останавливается. Инженер действует руками.
+>
+> **Opt-in = auto-remediator с approval.** При `EXECUTOR_ENABLED=true` добавляется 9-я стадия пайплайна: предложенное действие валидируется через `kube-apiserver` командой `kubectl ... --dry-run=server`. При `EXECUTOR_APPROVAL_ENABLED=true` на embed дополнительно появляется кнопка «⚙️ Apply» (только если dry-run прошёл и risk ≤ medium); двухшаговое подтверждение → реальный `kubectl` под `K8sSecurityGuard` + полный OTEL audit. См. [Roadmap — Execution](#roadmap--execution-1) ниже для плана выкатки.
 
 ### Что умеет
 
@@ -221,8 +236,10 @@ Until those four items are done, the project will stay in advisory mode by desig
 - Детектирует **рецидивы**: тот же сервис resolved < 7 дней → `FixAgent` переключается в investigative-режим (не рекомендует рестарт).
 - Постит **один Discord embed** на инцидент (заголовок алерта + root cause + синтез + кнопки фидбека), заменяя прежние два сообщения.
 - **Кнопки 👍 / 👎** на каждом embed: 👍 сохраняется сразу; 👎 требует двухшагового подтверждения («Подтверди: выводы модели были ошибочными?») — защита от случайного клика. Результат сохраняется в `IncidentRecord.user_feedback`.
-- Постит финальный отчёт (analysis + рекомендуемые действия) в Discord — **никаких `kubectl`-вызовов**. `K8sSecurityGuard`, DSL `ExecutionIntent` и `/approvals/*` заскаффолжены под будущий executor; в текущем live-пути их нет.
-- Полный **OTEL audit trail** аналитического пайплайна: root span `sre.copilot.incident.process`, child-спан на каждую стадию; события `guardrail.blocked` появятся, когда guard станет вызываться (executor / тесты).
+- **Структурный `ExecutionIntent`** рядом с prose: `FixAgent` выдаёт JSON по схеме `ExecutionIntent` (`action`, `resource_type`, `resource_name`, `namespace`, `params`, `risk`); pydantic-валидация, `FORBIDDEN_NAMESPACES` отбрасываются на парсе, сохраняется в `IncidentRecord.analysis.execution_intent`.
+- **Executor-стадия** (opt-in `EXECUTOR_ENABLED=true`): server-side dry-run intent-а (`kubectl ... --dry-run=server`) под `K8sSecurityGuard`; результат в `executor_result` и на Discord-embed полем «Dry-run verdict».
+- **Discord Apply-кнопка** (opt-in `EXECUTOR_APPROVAL_ENABLED=true`): двухшаговое подтверждение на embed → `K8sService.execute_intent(intent, dry_run=False, post_approval=True)`; идемпотентность по `incident_id`, eligible только при dry-run ok и risk ∈ {low, medium}; HIGH-risk и ineligible инциденты кнопку не получают вообще.
+- Полный **OTEL audit trail**: root span `sre.copilot.incident.process`, child-спан на стадию, атрибуты `execution_intent_parsed` / `executor_status`, events `guardrail.blocked` при отказе guard-а, audit-события `EXECUTOR_APPLIED` / `EXECUTOR_APPLY_REFUSED`.
 
 ### Быстрый старт
 
@@ -332,25 +349,34 @@ helm install sre-ai-copilot helm/sre-ai-copilot/ \
 
 ### Безопасность
 
-- **AI вообще не доходит до kubectl на live-пути** — advisory-режим (см. начало README). DSL `ExecutionIntent` + детерминированный транслятор + `K8sSecurityGuard` написаны и покрыты unit-тестами, но ни одна стадия пайплайна их не вызывает; они нужны для будущего executor-а.
-- Tiered namespace policy (уже зашита в `K8sSecurityGuard.validate`, готова для будущего executor-а): `prod`/`preprod` — read-only; `squad-*` — write через approval; `kube-*`/`mcp` — forbidden.
-- `SAFE_MODE=true` принудительно в `ENV=production` (config-validator валит старт иначе).
+- **Defence in depth вокруг kubectl**: AI не вызывает kubectl напрямую — `FixAgent` выдаёт структурный `ExecutionIntent` (JSON, pydantic-валидирован, `FORBIDDEN_NAMESPACES` отбрасываются на парсе), `DSLTranslator` детерминированно строит kubectl-строку, `K8sSecurityGuard` валидирует `(verb, resource, namespace)` структурно (не через text-parsing). Реальный write (`dry_run=False`) дополнительно требует `post_approval=True`, который ставится только из Discord approval consumer-а.
+- Tiered namespace policy в `K8sSecurityGuard.validate`: `prod`/`preprod` — read-only; `squad-*` — write через approval; `kube-*`/`mcp` — forbidden.
+- `SAFE_MODE=true` принудительно в `ENV=production` (config-validator валит старт иначе) — реальный write вне утверждённого пути возвращает `SAFE_MODE: Manual approval required.`
 - AlertManager-webhook аутентификация: HMAC-SHA256 на body (`ALERTMANAGER_WEBHOOK_SECRET` обязателен в production, без него config-validator не даёт стартовать).
 - Защита от prompt injection с лимитом `PROMPT_INPUT_MAX_CHARS`.
-- Discord Interactions endpoint верифицирует Ed25519-подпись на каждом запросе (требование Discord).
-- Полный OTEL audit trail аналитического пайплайна — см. [docs/AUDIT.md](docs/AUDIT.md).
+- Discord Interactions endpoint верифицирует Ed25519-подпись на каждом запросе (требование Discord). Кнопка Apply имеет двухшаговое подтверждение (паттерн зеркал 👎) — защита от случайных кликов.
+- Полный OTEL audit trail + события `EXECUTOR_APPLIED` / `EXECUTOR_APPLY_REFUSED` — см. [docs/AUDIT.md](docs/AUDIT.md).
 
 ### Roadmap — Execution
 
-Advisory-пайплайн — **стабильная** часть. Чтобы выйти в auto-remediator,
-нужно по порядку:
+Executor-трек **сделан и закрыт за явные opt-in флаги** в v0.7.0. Оставшаяся работа — операционная, не кодовая.
 
-1. Подключить `FixAgent` к генерации структурированного `ExecutionIntent` (сейчас возвращается prose).
-2. Добавить стадию `executor` после `risk`, которая зовёт `K8sService.execute_intent(...)` с `dry_run=True` по умолчанию и `K8sSecurityGuard.validate` впереди.
-3. Заблокировать executor на нажатии кнопки в Discord (эндпоинт `/approvals/{id}/approve` есть, consumer-стороны нет).
-4. End-to-end прогон на non-prod кластере по тиру `squad-*` write до того, как `dry_run=False` будет разрешён в prod.
+| # | Шаг | Статус |
+|---|---|---|
+| 1 | `FixAgent` отдаёт структурный `ExecutionIntent` рядом с prose | ✅ v0.7.0 (PR #23) |
+| 2 | `executor`-стадия после `risk` с `dry_run=True` + `K8sSecurityGuard.validate` | ✅ v0.7.0 (PR #26) |
+| 3 | Discord Apply consumer с двухшаговым confirm → реальный `kubectl` под guard | ✅ v0.7.0 (PR #27) |
+| 4 | End-to-end smoke на non-prod `squad-*` кластере + production ramp-up план | 🟡 In progress (этот PR) |
 
-Пока эти четыре пункта не сделаны, проект остаётся в advisory-режиме осознанно.
+**Ramp-up план (после merge):**
+
+1. **Dev**: `EXECUTOR_ENABLED=true`, `EXECUTOR_APPROVAL_ENABLED=true` локально с `DISCORD_DRY_RUN=true` — убедиться что кнопки появляются на embed-е корректно.
+2. **Один preprod squad-N namespace**: включить оба флага через Helm value override; спровоцировать синтетический алерт (или дождаться реального); кликнуть Apply на low-risk действии (`get_logs`, `describe_resource`). Проверить `executor_applied` в БД и audit log.
+3. **Все preprod-squad-***: постепенный rollout по одному namespace в день, watch на rate `EXECUTOR_APPLY_REFUSED`.
+4. **Production-squad-N**: та же процедура, `low`-risk только первую неделю, потом `medium` после одного чистого инцидента.
+5. **HIGH-risk auto-apply никогда** — by design. HIGH-risk intent кнопку не получает.
+
+См. [docs/RUNBOOK.md → Executor incidents](docs/RUNBOOK.md#executor-incidents) для операционных процедур.
 
 ### Документация
 
