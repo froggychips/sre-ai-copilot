@@ -59,6 +59,10 @@ class Settings(BaseSettings):
     # Discord Interactions — для обработки нажатий кнопок 👍/👎.
     # Взять из Discord Developer Portal → Application → General Information.
     DISCORD_PUBLIC_KEY: Optional[str] = Field(None, description="Ed25519 публичный ключ приложения Discord")
+    # Application ID нужен для followup-webhook вызовов (deferred response):
+    # PATCH /webhooks/{app_id}/{interaction_token}/messages/@original.
+    # Взять там же где DISCORD_PUBLIC_KEY (General Information → Application ID).
+    DISCORD_APPLICATION_ID: Optional[str] = Field(None, description="Discord application ID for deferred responses")
 
     # Auth
     JWT_PUBLIC_KEY: str = Field("", description="RSA Public Key for JWT validation")

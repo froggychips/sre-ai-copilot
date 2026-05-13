@@ -170,3 +170,122 @@ Jira REST API v3 `GET /search` вернул `410 Gone`. Atlassian перешёл
 1. **Jira API endpoint**: `GET /rest/api/3/search` устарел; переключиться на `POST /rest/api/3/search/jql`.
 2. **Верификация core dump**: `CoreDumpRule` даёт слабый сигнал без реального `ls -la` на хосте. Debug-под с hostPath mount дал бы точные размеры файлов и timestamps.
 3. **TeamCity корреляция**: В прогоне 4 `teamcity_context=null` — TC MCP был недоступен в dev-окружении. В production контекст деплоя значительно обогащает анализ корневой причины.
+
+---
+
+## Executor-инциденты
+
+Применимо к v0.7.0+ когда `EXECUTOR_ENABLED=true` и/или `EXECUTOR_APPROVAL_ENABLED=true`. С дефолтами (оба `false`) пайплайн чисто advisory и эта секция N/A.
+
+### Как опознать executor-инцидент
+
+Смотрим Discord embed:
+
+| Режим | Сигналы в embed-е |
+|---|---|
+| Advisory only (default) | Нет «Dry-run verdict», нет Apply-кнопки. |
+| Executor dry-run only   | «Dry-run verdict» (✓/✗/🚫/⚠️). Apply кнопки нет. |
+| Executor + Apply         | Кнопка Apply присутствует если dry-run прошёл, risk ∈ {low, medium}, `executor_applied` не выставлен. |
+
+DB-запрос:
+
+```sql
+SELECT
+  incident_id,
+  analysis -> 'execution_intent' AS intent,
+  analysis -> 'executor_result'  AS dry_run_result,
+  analysis -> 'executor_applied' AS applied
+FROM incidents
+WHERE incident_id = '<id>';
+```
+
+| Поле | Смысл |
+|---|---|
+| `execution_intent` | Структурное действие от `FixAgent` (`NULL` если LLM не выдал). |
+| `executor_result.status` | Результат dry-run-а: `skipped` / `dry_run_ok` / `dry_run_failed` / `guardrail_blocked` / `error`. |
+| `executor_applied` | Заполнен только после успешного Apply-клика. `NULL` = реального write-а не было. |
+
+### Apply упал — что делать
+
+#### kubectl вернул не-ноль
+
+Симптом: ephemeral `❌ kubectl упал: …`, `executor_applied.result.success = false`, `stderr` содержит ошибку.
+
+- `deployments.apps "xxx" not found` — устаревшее имя (ресурс удалили между dry-run и apply). State не изменился. Перетриггерить если нужно.
+- `Operation cannot be fulfilled ... the object has been modified` — concurrent write. Безопасно retry-нуть.
+- `timed out` — kubectl держался > 30с. Действие могло применится частично. Проверить: `kubectl get deployment <name> -n <ns> -o yaml | grep restartedAt`.
+
+#### Guardrail заблокировал
+
+Симптом: ephemeral `❌ Не могу применить: …`, audit `EXECUTOR_APPLY_REFUSED` с `reason="dry_run_not_ok:guardrail_blocked"`.
+
+Это **ожидаемое поведение** — guard поймал policy violation (например, LLM предложил действие в `kube-*` или `prod-*` read-only tier). Никакого state change. Если кнопка Apply вообще появилась при таком state — баг.
+
+#### executor_applied есть, но действие было неверным
+
+Откат руками:
+
+```bash
+# rollout restart — откатить на предыдущий ReplicaSet:
+kubectl rollout undo deployment/<name> -n <ns>
+
+# scale — вернуть прежнее число реплик:
+kubectl scale deployment/<name> -n <ns> --replicas=<original>
+```
+
+Пометить инцидент как ошибочный (KG quality gate исключит из similar-incident lookup-ов):
+
+```sql
+UPDATE incidents
+   SET analysis = jsonb_set(analysis, '{resolution_quality}', '"wrong_apply"')
+ WHERE incident_id = '<id>';
+```
+
+Кликнуть 👎 на embed чтобы зафиксировать negative feedback структурно.
+
+### Killing executor
+
+#### Остановить новые applies (нормальный control)
+
+```bash
+helm upgrade sre-ai-copilot helm/sre-ai-copilot \
+  --reuse-values \
+  --set env.EXECUTOR_APPROVAL_ENABLED=false
+```
+
+Apply-кнопка исчезает с новых embed-ов. Уже выставленные embed-ы остаются в Discord history, но клик возвращает `❌ EXECUTOR_APPROVAL_ENABLED=false — apply отключён.`
+
+#### Emergency (быстрее всего)
+
+```bash
+kubectl scale deployment/sre-ai-copilot-worker -n sre-ai --replicas=0
+```
+
+Останавливает всё (dry-run, analysis, apply). Только если executor сильно misbehaviour.
+
+#### Permanent
+
+Поставить и `EXECUTOR_ENABLED=false`, и `EXECUTOR_APPROVAL_ENABLED=false`. Пайплайн опускается до advisory.
+
+### Audit trail
+
+OTEL root-span атрибуты:
+- `sre.incident.execution_intent_parsed: bool`
+- `sre.incident.execution_intent_action`
+- `sre.incident.executor_status`
+
+Span стадии `executor` испускает event `guardrail.blocked` при отказе K8sSecurityGuard.
+
+Audit log events (фильтр по `event`):
+
+| Event | Когда |
+|---|---|
+| `K8S_GUARDRAIL_BLOCK` | Guard отказал при execute_intent |
+| `K8S_COMMAND_ATTEMPT` | Перед запуском kubectl |
+| `K8S_COMMAND_RESULT` | kubectl завершился |
+| `K8S_COMMAND_TIMEOUT` | kubectl > 30с |
+| `K8S_BLOCKED_NO_APPROVAL` | `dry_run=False` вызван без `post_approval=True` |
+| `EXECUTOR_APPLIED` | Apply успешно |
+| `EXECUTOR_APPLY_REFUSED` | Apply ineligible |
+| `EXECUTOR_APPLY_EXCEPTION` | Неожиданная exception в apply-service |
+| `EXECUTOR_DRY_RUN_FAILED` | Exception в `stage_executor` |

@@ -2,6 +2,85 @@
 
 All notable changes to this project are documented in this file.
 
+## [0.7.0] — 2026-05-13
+
+### Added — Executor track
+
+The pipeline can now propose, validate, and (opt-in) execute Kubernetes actions
+with human approval. Out-of-the-box behaviour is unchanged (advisory-only) —
+both flags default to `false`.
+
+- **Structured `ExecutionIntent`** (`app/agents/fix.py`, `app/core/execution_dsl.py`):
+  `FixAgent.suggest()` now returns `(raw_text, Optional[ExecutionIntent])`.
+  `ExecutionIntent.from_llm_response()` parses LLM output (plain JSON, code-fence
+  wrapper, prose-prefix), validates via pydantic with `FORBIDDEN_NAMESPACES`
+  rejected at parse time. Persisted in `record.analysis.execution_intent`.
+  10 parser tests + 4 contract tests.
+- **Executor stage** (`app/workers/pipeline.py::stage_executor`, between `risk`
+  and `synthesize`): when `EXECUTOR_ENABLED=true` runs
+  `K8sService.execute_intent(intent, dry_run=True)` →
+  `kubectl ... --dry-run=server`. `K8sSecurityGuard.validate` fires first;
+  on `GUARDRAIL_BLOCK` → `status=guardrail_blocked`; exception → `status=error`
+  with advisory-fallback (pipeline doesn't fail). Result persisted in
+  `executor_result`. OTEL attribute `sre.incident.executor_status`. 5 tests.
+- **Discord Apply button** (`app/services/discord_service.py`,
+  `app/api/discord_interactions.py`): when `EXECUTOR_APPROVAL_ENABLED=true` and
+  `dry_run_ok` and `risk ∈ {low, medium}`, the embed gets a `⚙️ Apply (kubectl)`
+  button. Two-step confirmation (mirror of 👎 pattern). Discord deferred
+  response (type=5) handles >3s kubectl operations via PATCH followup webhook.
+  12 tests for the handler + deferred path.
+- **`app/services/executor_apply.py`**: canonical apply service. Eligibility
+  check (intent present, dry-run ok, risk ≤ medium, not already applied) →
+  `k8s_service.execute_intent(dry_run=False, post_approval=True)` → persists
+  `executor_applied` with timestamp + `applied_by` (Discord user). Idempotency
+  by `incident_id`. 8 tests.
+- **`K8sService` restructured** (`app/services/k8s_service.py`): guard validates
+  via structural `ActionType → (verb, resource)` mapping (`RESTART_DEPLOYMENT
+  → (patch, deployments)`, etc.) instead of brittle kubectl-string parsing.
+  Fixes pre-existing latent bug where `cmd_parts[2]="restart"` would fail
+  `ALLOWED_RESOURCES` check on every `rollout restart`. `post_approval=True`
+  required to bypass `SAFE_MODE` for real writes. 8 tests.
+- **Settings**: `EXECUTOR_ENABLED`, `EXECUTOR_APPROVAL_ENABLED`,
+  `DISCORD_APPLICATION_ID` (for Discord deferred-response followups).
+- **Helm chart**: `env.executorEnabled` / `env.executorApprovalEnabled`
+  wired into api + worker Deployments.
+
+### Added — Advisory-prod hygiene
+
+- **mypy: 176 → 0 errors, gate is blocking** in CI (`mypy.ini` with per-module
+  overrides for SQLAlchemy-ORM `Column[T]` noise + real fixes for `union-attr`
+  / `arg-type` in `auth.py`, `discord_service.py`, `llm_service.py`,
+  `teamcity_service.py`, `celery_worker.py`, `execution_dsl.py`).
+- **ruff: blocking** in CI (`continue-on-error` removed).
+- **bandit medium-blocking** preserved; SQL injection f-string in
+  `statics_service.py` replaced with `psycopg2.sql.Identifier`; 4 documented
+  `# nosec` annotations for false positives.
+- **pip-audit blocking** in CI (`protobuf 4.25 → 5.29.6` for CVE-2026-0994,
+  `python-dotenv 1.0 → 1.2.2` for CVE-2026-28684; OTEL 1.21 → 1.41.1 to
+  satisfy `protobuf<5.0` upper bound).
+- **FastAPI lifespan migration**: `@app.on_event` (deprecated since FastAPI
+  0.93) → `asynccontextmanager`. Also fixed latent `await engine.dispose()`
+  TypeError on a sync `Engine`.
+- **`asyncio.run` in Celery task** instead of deprecated `get_event_loop()`.
+- **Redis-backed rate limiter** (`app/api/rate_limit.py`): fixed-window 60s
+  via Redis INCR+EXPIRE, fail-open on Redis errors. Replaces in-memory
+  `defaultdict` that didn't work with multi-replica api.
+- **GitHub branch protection** on `master`: required check `Lint and Test`,
+  force-push and deletion forbidden, admin can bypass (single-author
+  pragmatism).
+- **4 pre-existing test failures fixed** (synthesis Russian markers,
+  auto_populator fixture, async_integration LLM_BACKEND patch).
+
+### Added — Documentation
+
+- `README.md` (EN + RU): rewritten "Advisory mode" → "Auto-remediator with
+  advisory-fallback (off by default)" with ramp-up plan. Roadmap → Execution
+  reflects 3/4 done.
+- `docs/RUNBOOK.md` (EN + RU): new "Executor incidents" section — how to
+  recognize an executor incident, recover from a failed apply, kill the
+  executor, audit-trail event types.
+- `CHANGELOG.md`: this entry.
+
 ## [0.5.0] — 2026-05-12
 
 ### Added
