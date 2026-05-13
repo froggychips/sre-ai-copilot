@@ -124,6 +124,7 @@ class IncidentPipeline:
         self.jira_context: Optional[Dict[str, Any]] = None
         self.fix_suggestion: Optional[str] = None
         self.execution_intent: Optional[ExecutionIntent] = None
+        self.executor_result: Optional[Dict[str, Any]] = None
         self.risk_report: Optional[str] = None
         self.synthesis: Optional[str] = None
         self.cluster_health_context: Optional[str] = None
@@ -481,6 +482,70 @@ class IncidentPipeline:
         self.traces.append(t.snapshot().to_dict())
 
     # ------------------------------------------------------------------
+    # Stage 7.5 — Executor (dry-run only, PR #2 executor track)
+    # ------------------------------------------------------------------
+
+    async def stage_executor(self) -> None:
+        """Server-side dry-run of the proposed ExecutionIntent.
+
+        Behaviour:
+          - settings.EXECUTOR_ENABLED=False → стадия пропускается полностью.
+          - self.execution_intent is None → пропускается с reason=no_intent.
+          - K8sService.execute_intent(intent, dry_run=True) →
+            kubectl ... --dry-run=server: kube-apiserver валидирует команду,
+            ничего не применяя. K8sSecurityGuard.validate вызывается внутри
+            K8sService.run_command первым шагом — guardrail.blocked event
+            попадает на текущий OTEL-span.
+          - Любая exception от kubectl/guard захватывается, executor_result
+            помечается blocked=True; пайплайн не падает (advisory-fallback).
+
+        Реальный write (dry_run=False) появится только в PR #3 после Discord
+        approval. До тех пор стадия — это «выглядит ли команда валидной для
+        кластера» проверка.
+        """
+        if not settings.EXECUTOR_ENABLED:
+            self.executor_result = {"status": "skipped", "reason": "executor_disabled"}
+            return
+        if self.execution_intent is None:
+            self.executor_result = {"status": "skipped", "reason": "no_intent"}
+            return
+
+        from app.services.k8s_service import k8s_service
+
+        async with StageTimer("executor") as t:
+            try:
+                # K8sService.execute_intent — sync (subprocess), не блокируем loop.
+                result = await asyncio.to_thread(
+                    k8s_service.execute_intent,
+                    self.execution_intent,
+                    True,  # dry_run=True
+                )
+                self.executor_result = {
+                    "status": "dry_run_ok" if result.get("success") else "dry_run_failed",
+                    "command": result.get("command"),
+                    "stdout": (result.get("stdout") or "")[:2048],
+                    "stderr": (result.get("stderr") or "")[:2048],
+                    "exit_code": None if "exit_code" not in result else int(result.get("exit_code") or 0),
+                }
+                if result.get("error", "").startswith("GUARDRAIL_BLOCK"):
+                    self.executor_result["status"] = "guardrail_blocked"
+                    self.executor_result["reason"] = result["error"]
+            except Exception as e:
+                self.executor_result = {
+                    "status": "error",
+                    "error_type": type(e).__name__,
+                    "error": str(e)[:512],
+                }
+                audit_service.log_event(
+                    "EXECUTOR_DRY_RUN_FAILED",
+                    {"incident_id": self.incident_id, "error": type(e).__name__},
+                )
+        self.traces.append(t.snapshot().to_dict())
+        self.root_span.set_attribute(
+            "sre.incident.executor_status", self.executor_result["status"]
+        )
+
+    # ------------------------------------------------------------------
     # Stage 8 — Synthesis + persist + Discord
     # ------------------------------------------------------------------
 
@@ -541,6 +606,7 @@ class IncidentPipeline:
                     if self.execution_intent is not None
                     else None
                 ),
+                "executor_result": self.executor_result,
             }
             self._safe_transition(IncidentState.RESOLVED, synth_snap)
             record.trace = self.traces + [synth_snap]
@@ -564,6 +630,7 @@ class IncidentPipeline:
             is_recurrence=self.is_recurrence,
             flap_count=self.flap_count,
             execution_intent=self.execution_intent,
+            executor_result=self.executor_result,
         )
 
     # ------------------------------------------------------------------
@@ -580,4 +647,5 @@ class IncidentPipeline:
         await self.stage_jira_enrich()
         await self.stage_fix()
         await self.stage_risk()
+        await self.stage_executor()
         await self.stage_synthesize()
