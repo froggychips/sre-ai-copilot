@@ -1,10 +1,19 @@
+import json
+import re
 from enum import Enum
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
-from pydantic import BaseModel, Field, field_validator
+import structlog
+from pydantic import BaseModel, Field, ValidationError, field_validator
 
 from app.security.namespaces import FORBIDDEN_NAMESPACES
 from app.services.telemetry_utils import execution_intent_span
+
+logger = structlog.get_logger()
+
+# Ловит первый JSON-объект в тексте: { ... } (с поддержкой вложенности до 1 уровня).
+# LLM иногда оборачивает JSON в ```json``` fences или добавляет лидер-текст.
+_JSON_OBJ_RE = re.compile(r"\{(?:[^{}]|\{[^{}]*\})*\}", re.DOTALL)
 
 
 class ActionType(str, Enum):
@@ -31,6 +40,61 @@ class ExecutionIntent(BaseModel):
                 f"Access to namespace '{v}' is forbidden by security policy."
             )
         return v
+
+    @classmethod
+    def from_llm_response(cls, text: str) -> Optional["ExecutionIntent"]:
+        """Распарсить JSON ExecutionIntent из LLM-ответа.
+
+        Допускает:
+          - чистый JSON-объект
+          - JSON в ```json ... ``` или ``` ... ``` code-fence
+          - prose с встроенным JSON-блоком
+
+        Возвращает None если:
+          - JSON не найден / невалидный
+          - pydantic-валидация не прошла (включая FORBIDDEN_NAMESPACES)
+
+        Никогда не бросает — caller-у проще обрабатывать advisory-режим.
+        """
+        if not text or not text.strip():
+            return None
+
+        # Снимаем code-fence, если есть.
+        cleaned = text.strip()
+        if cleaned.startswith("```"):
+            # ```json\n...\n``` или ```\n...\n```
+            cleaned = re.sub(r"^```(?:json)?\s*\n?", "", cleaned)
+            cleaned = re.sub(r"\n?```\s*$", "", cleaned)
+
+        # Прямой парс — нормальный happy path по нашему prompt-у.
+        try:
+            obj = json.loads(cleaned)
+            return cls.model_validate(obj)
+        except (json.JSONDecodeError, ValidationError):
+            pass
+
+        # Fallback: вытащить первый {...} из текста (LLM добавил prose-обёртку).
+        match = _JSON_OBJ_RE.search(text)
+        if not match:
+            logger.warning("execution_intent.no_json_found", text_preview=text[:200])
+            return None
+        try:
+            obj = json.loads(match.group(0))
+            return cls.model_validate(obj)
+        except json.JSONDecodeError as e:
+            logger.warning(
+                "execution_intent.json_invalid",
+                error=str(e),
+                snippet=match.group(0)[:200],
+            )
+            return None
+        except ValidationError as e:
+            logger.warning(
+                "execution_intent.schema_invalid",
+                error=str(e),
+                snippet=match.group(0)[:200],
+            )
+            return None
 
 
 class DSLTranslator:

@@ -1,6 +1,7 @@
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Tuple
 
 from app.agents.base import BaseAgent
+from app.core.execution_dsl import ExecutionIntent
 from app.services.telemetry_utils import trace_agent
 
 _BASE_INSTRUCTION = """
@@ -66,11 +67,19 @@ class FixAgent(BaseAgent):
         finalized_cause: str,
         is_recurrence: bool = False,
         jira_context: Optional[Dict[str, Any]] = None,
-    ) -> str:
+    ) -> Tuple[str, Optional[ExecutionIntent]]:
+        """Вернуть пару (raw LLM-ответ, распарсенный ExecutionIntent).
+
+        LLM инструктируется выдавать JSON по схеме ExecutionIntent. Если парсинг
+        или валидация не прошли — intent=None (advisory-fallback: prose всё равно
+        показывается в Discord-embed, executor-стадия просто пропускается).
+        """
         instruction = (
             _RECURRENCE_PREFIX + _BASE_INSTRUCTION if is_recurrence else _BASE_INSTRUCTION
         )
         context = finalized_cause
         if jira_context:
             context = _build_jira_prefix(jira_context) + "\n\n" + finalized_cause
-        return await self.ask(user_context=context, instruction=instruction)
+        raw = await self.ask(user_context=context, instruction=instruction)
+        intent = ExecutionIntent.from_llm_response(raw)
+        return raw, intent

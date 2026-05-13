@@ -68,7 +68,7 @@ def mocked_dependencies(mocker):
     mocker.patch(
         "app.workers.pipeline.FixAgent.suggest",
         new_callable=AsyncMock,
-        return_value="fix text",
+        return_value=("fix text", None),  # (raw_text, optional ExecutionIntent)
     )
     mocker.patch(
         "app.workers.pipeline.RiskAgent.assess",
