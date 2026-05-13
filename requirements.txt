@@ -80,3 +80,4 @@ wcwidth==0.7.0
 websockets==16.0
 wrapt==1.17.3
 zipp==3.23.1
+kubernetes==31.0.0

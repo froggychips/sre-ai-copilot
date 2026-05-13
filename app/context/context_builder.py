@@ -1,7 +1,14 @@
 import structlog
-from kubernetes import config
-from kubernetes.config.config_exception import ConfigException
 from starlette.concurrency import run_in_threadpool
+
+try:
+    from kubernetes import config
+    from kubernetes.config.config_exception import ConfigException
+    _K8S_LIB_AVAILABLE = True
+except ImportError:
+    _K8S_LIB_AVAILABLE = False
+    config = None
+    ConfigException = Exception
 
 from app.context.deployments import DeploymentCollector
 from app.context.logs import LogCollector
@@ -15,16 +22,20 @@ class ContextBuilder:
         # In-cluster config — основной путь в k8s. Fallback на local kubeconfig
         # для dev/e2e. Если не доступны оба — продолжаем без K8s API (для
         # тестов и replay-режима, где K8s не нужен).
-        try:
-            config.load_incluster_config()
-            self.k8s_available = True
-        except ConfigException:
+        if not _K8S_LIB_AVAILABLE:
+            logger.warning("k8s_lib_unavailable", fallback="kubernetes package not installed")
+            self.k8s_available = False
+        else:
             try:
-                config.load_kube_config()
+                config.load_incluster_config()
                 self.k8s_available = True
-            except (ConfigException, FileNotFoundError):
-                logger.warning("k8s_config_unavailable", fallback="no-k8s-context")
-                self.k8s_available = False
+            except ConfigException:
+                try:
+                    config.load_kube_config()
+                    self.k8s_available = True
+                except (ConfigException, FileNotFoundError):
+                    logger.warning("k8s_config_unavailable", fallback="no-k8s-context")
+                    self.k8s_available = False
 
         self.metrics = MetricsCollector(None)
         self.deps = DeploymentCollector()
