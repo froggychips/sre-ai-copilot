@@ -1,7 +1,12 @@
 import os
+import sys
 from logging.config import fileConfig
 from sqlalchemy import engine_from_config, pool
 from alembic import context
+
+# Гарантируем что родительская директория (где лежит package `app`) в sys.path.
+# Без этого `alembic upgrade head` в pod-е падает с ModuleNotFoundError.
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 # Import the models and settings
 from app.models import Base

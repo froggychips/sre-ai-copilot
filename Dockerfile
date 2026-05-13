@@ -27,6 +27,14 @@ RUN set -eux; \
     install -o root -g root -m 0755 /tmp/kubectl /usr/local/bin/kubectl; \
     rm -f /tmp/kubectl /tmp/kubectl.sha256
 
+# Тяжёлые бинарные пакеты — отдельный слой, чтобы не превышать лимит
+# TCP-upload за один раз (grpcio ~100MB).
+RUN pip install --no-cache-dir \
+    grpcio==1.80.0 \
+    cryptography==48.0.0 \
+    psycopg2-binary==2.9.12 \
+    pydantic-core==2.46.4
+
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
