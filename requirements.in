@@ -6,7 +6,8 @@ structlog
 sqlalchemy
 alembic
 celery[redis]
-python-jose[cryptography]
+# python-jose was replaced by PyJWT in commit 680b3d0 (CVE-2024-33663 / CVE-2024-33664).
+# PyJWT pin lives in requirements.txt — добавь сюда явно, если пересоберёшь lock с нуля.
 opentelemetry-api
 opentelemetry-sdk
 opentelemetry-instrumentation-fastapi
