@@ -29,9 +29,10 @@ spec:
         command:
         - celery
         - -A
-        - app.celery_worker.celery_app
+        - app.workers.tasks.celery_app
         - worker
         - --loglevel=info
+        - --concurrency=4
         securityContext:
           readOnlyRootFilesystem: true
           allowPrivilegeEscalation: false
