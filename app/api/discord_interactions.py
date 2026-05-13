@@ -117,6 +117,48 @@ def _confirm_neg_buttons(incident_id: str) -> list:
     }]
 
 
+def _confirm_apply_buttons(incident_id: str) -> list:
+    """Двухшаговое подтверждение запуска kubectl. Защита от случайного клика."""
+    return [{
+        "type": _ACTION_ROW,
+        "components": [
+            {
+                "type": _BUTTON,
+                "style": _BTN_DANGER,
+                "label": "Да, запустить kubectl",
+                "custom_id": f"apply_confirm_{incident_id}",
+            },
+            {
+                "type": _BUTTON,
+                "style": _BTN_SECONDARY,
+                "label": "Отмена",
+                "custom_id": f"apply_cancel_{incident_id}",
+            },
+        ],
+    }]
+
+
+_APPLY_REFUSAL_MESSAGES = {
+    "incident_not_found": "❌ Инцидент `{incident_id}` не найден.",
+    "no_intent":          "❌ Нет ExecutionIntent для применения — пайплайн не выдал структурный фикс.",
+    "already_applied":    "ℹ️ Уже применено ранее — действие идемпотентно.",
+    "dry_run_not_ok":     "❌ dry-run не прошёл — реальный запуск заблокирован.",
+}
+
+
+def _format_apply_refusal(incident_id: str, reason: str) -> str:
+    """Подобрать человекочитаемое сообщение для отказа apply-flow."""
+    # Ключ может быть составной: "risk_too_high:high", "dry_run_not_ok:guardrail_blocked" и т.п.
+    key = reason.split(":", 1)[0]
+    if key in _APPLY_REFUSAL_MESSAGES:
+        return _APPLY_REFUSAL_MESSAGES[key].format(incident_id=incident_id)
+    if key == "risk_too_high":
+        return "❌ Action risk=`high` — auto-apply запрещён, действуй вручную."
+    if key == "intent_invalid":
+        return "❌ ExecutionIntent невалиден после round-trip — manual triage."
+    return f"❌ Не могу применить: {reason}"
+
+
 @router.post("/interactions")
 async def discord_interactions(
     request: Request,
@@ -184,5 +226,49 @@ async def discord_interactions(
     # ── 👎 Отмена подтверждения ──────────────────────────────────────────────
     if custom_id.startswith("feedback_neg_cancel_"):
         return _ephemeral("Отменено.")
+
+    # ── ⚙️ Apply: шаг 1, ephemeral-подтверждение ────────────────────────────
+    if custom_id.startswith("apply_") and not custom_id.startswith("apply_confirm_") and not custom_id.startswith("apply_cancel_"):
+        incident_id = custom_id[len("apply_"):]
+        if not settings.EXECUTOR_APPROVAL_ENABLED:
+            return _ephemeral("❌ EXECUTOR_APPROVAL_ENABLED=false — apply отключён.")
+        return _ephemeral(
+            "⚠️ Запустить **kubectl** для этой команды? "
+            "dry-run уже прошёл (kube-apiserver валидировал команду), "
+            "сейчас будет реальный write.\n"
+            "-# Действие записывается в audit + OTEL.",
+            components=_confirm_apply_buttons(incident_id),
+        )
+
+    # ── ⚙️ Apply: шаг 2, выполнить kubectl ────────────────────────────────
+    if custom_id.startswith("apply_confirm_"):
+        incident_id = custom_id[len("apply_confirm_"):]
+        if not settings.EXECUTOR_APPROVAL_ENABLED:
+            return _ephemeral("❌ EXECUTOR_APPROVAL_ENABLED=false — apply отключён.")
+
+        # apply_intent — sync (subprocess внутри), запускаем в thread, чтобы не
+        # блокировать FastAPI event loop. Discord даёт ~3s до initial response,
+        # для быстрых kubectl-команд (rollout restart, scale) укладываемся.
+        # Для длинных операций понадобится deferred response — TODO PR #4.
+        import asyncio
+        from app.services.executor_apply import apply_intent
+        outcome = await asyncio.to_thread(apply_intent, incident_id, user_id)
+
+        if not outcome["ok"]:
+            return _ephemeral(_format_apply_refusal(incident_id, outcome.get("reason", "unknown")))
+
+        result = outcome.get("result") or {}
+        success = bool(result.get("success"))
+        emoji = "✅" if success else "❌"
+        command = result.get("command", "(unknown)")
+        out = (result.get("stdout") or result.get("stderr") or result.get("error") or "").strip()
+        msg = f"{emoji} kubectl {'выполнен' if success else 'упал'}: `{command}`"
+        if out:
+            msg += f"\n```\n{out[:600]}\n```"
+        return _ephemeral(msg)
+
+    # ── ⚙️ Apply: отмена ───────────────────────────────────────────────────
+    if custom_id.startswith("apply_cancel_"):
+        return _ephemeral("Apply отменён.")
 
     return _ephemeral("Неизвестное действие.")

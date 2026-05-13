@@ -142,6 +142,16 @@ class Settings(BaseSettings):
     # kubectl --dry-run=server: валидирует через kube-apiserver, ничего не пишет.
     EXECUTOR_ENABLED: bool = Field(False, description="Run executor stage in dry-run mode")
 
+    # Executor approval (PR #3 executor track). Если True — Discord-embed
+    # получает кнопку "Apply", которая после двухшагового подтверждения
+    # запускает kubectl с dry_run=False. Требует:
+    #   1. EXECUTOR_ENABLED=true (dry-run работает)
+    #   2. DISCORD_PUBLIC_KEY настроен (Interactions endpoint регистрирован)
+    #   3. executor_result.status=="dry_run_ok" на конкретном инциденте
+    #   4. execution_intent.risk in {"low", "medium"} (high — manual only)
+    # Default False — нужен явный опт-ин на проде.
+    EXECUTOR_APPROVAL_ENABLED: bool = Field(False, description="Show Apply button on Discord embed")
+
     # Atlassian Jira — поиск известных инцидентов/задач по сервису.
     # Basic Auth: email + API token (https://id.atlassian.com/manage-profile/security/api-tokens)
     # Пусто = Jira отключена (graceful degrade).
