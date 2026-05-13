@@ -34,6 +34,7 @@ from app.config import settings
 from app.context.jira_client import JiraClient, build_jira_context
 from app.context.k8s_facts import K8sFacts
 from app.context.vm_client import VMClient
+from app.core.execution_dsl import ExecutionIntent
 from app.core.intelligence.similar_incidents import SimilarIncidentEngine
 from app.core.state_machine import IncidentState, StateMachine
 from app.core.tracing import StageTimer
@@ -122,6 +123,7 @@ class IncidentPipeline:
         self.hypotheses_text: str = ""
         self.jira_context: Optional[Dict[str, Any]] = None
         self.fix_suggestion: Optional[str] = None
+        self.execution_intent: Optional[ExecutionIntent] = None
         self.risk_report: Optional[str] = None
         self.synthesis: Optional[str] = None
         self.cluster_health_context: Optional[str] = None
@@ -450,12 +452,22 @@ class IncidentPipeline:
 
     async def stage_fix(self) -> None:
         async with StageTimer("fix") as t:
-            self.fix_suggestion = await FixAgent().suggest(
+            self.fix_suggestion, self.execution_intent = await FixAgent().suggest(
                 self.final_cause,
                 is_recurrence=self.is_recurrence,
                 jira_context=self.jira_context,
             )
         snap = t.snapshot().to_dict()
+        # Метрика на root-span: смог ли LLM выдать structured-intent.
+        self.root_span.set_attribute(
+            "sre.incident.execution_intent_parsed",
+            self.execution_intent is not None,
+        )
+        if self.execution_intent is not None:
+            self.root_span.set_attribute(
+                "sre.incident.execution_intent_action",
+                self.execution_intent.action.value,
+            )
         self._safe_transition(IncidentState.FIX_PROPOSED, snap)
         self.traces.append(snap)
 
@@ -524,6 +536,11 @@ class IncidentPipeline:
                 "gitlab_context": self.gitlab_context,
                 "blast_radius_context": self.blast_radius_context,
                 "statics_check_context": self.statics_check_context,
+                "execution_intent": (
+                    self.execution_intent.model_dump(mode="json")
+                    if self.execution_intent is not None
+                    else None
+                ),
             }
             self._safe_transition(IncidentState.RESOLVED, synth_snap)
             record.trace = self.traces + [synth_snap]
@@ -546,6 +563,7 @@ class IncidentPipeline:
             synthesis=self.synthesis or "",
             is_recurrence=self.is_recurrence,
             flap_count=self.flap_count,
+            execution_intent=self.execution_intent,
         )
 
     # ------------------------------------------------------------------

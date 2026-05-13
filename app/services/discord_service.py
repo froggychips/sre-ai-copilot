@@ -1,10 +1,13 @@
 import logging
 from datetime import datetime, timezone
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
 
 import httpx
 
 from app.config import settings
+
+if TYPE_CHECKING:
+    from app.core.execution_dsl import ExecutionIntent
 
 # Discord embed colour codes
 _COLOR_CRITICAL = 0xE53935   # red
@@ -61,6 +64,7 @@ class DiscordService:
         synthesis: str,
         is_recurrence: bool = False,
         flap_count: int = 0,
+        execution_intent: Optional["ExecutionIntent"] = None,
     ) -> None:
         """Единый embed-отчёт, заменяющий сырой алерт от Spidey Bot.
 
@@ -91,6 +95,27 @@ class DiscordService:
             "value": (cause or "Manual triage required — no hypothesis survived")[:1024],
             "inline": False,
         })
+        # PR #1 executor track: показываем структурированный proposed action,
+        # если FixAgent сумел выдать ExecutionIntent. Пока ничего НЕ выполняется
+        # (advisory-mode), это просто визуальный сигнал.
+        if execution_intent is not None:
+            from app.core.execution_dsl import DSLTranslator
+            try:
+                kubectl_cmd = DSLTranslator.to_kubectl(execution_intent)
+            except Exception:
+                kubectl_cmd = "(translation failed)"
+            risk_emoji = {"low": "🟢", "medium": "🟡", "high": "🔴"}.get(
+                execution_intent.risk.lower(), "⚪"
+            )
+            fields.append({
+                "name": f"{risk_emoji} Proposed action (advisory)",
+                "value": (
+                    f"`{kubectl_cmd}`\n"
+                    f"_risk: {execution_intent.risk} · "
+                    f"action: {execution_intent.action.value}_"
+                )[:1024],
+                "inline": False,
+            })
 
         # Synthesis truncated — Discord limit 4096, но читаемость важнее.
         description = synthesis[:1200] + ("…" if len(synthesis) > 1200 else "")
