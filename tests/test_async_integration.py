@@ -42,18 +42,29 @@ class TestAsyncPatterns:
 
     @pytest.mark.asyncio
     async def test_exception_handling_with_context(self):
-        """Test exceptions are caught with proper context"""
+        """Test exceptions are caught with proper context.
+
+        Форсим anthropic-backend через patch settings: при LLM_BACKEND=claude_cli
+        (наш local default) код идёт мимо self.client, и патч-моки бесполезны.
+        """
         import asyncio
         from app.services.llm_service import LLMService
 
-        service = LLMService()
+        with patch("app.services.llm_service.settings") as mock_settings:
+            mock_settings.LLM_BACKEND = "anthropic"
+            mock_settings.MODEL_NAME = "claude-sonnet"
+            mock_settings.MAX_TOKENS = 1024
+            mock_settings.LLM_TIMEOUT_SECONDS = 30.0
+            mock_settings.ANTHROPIC_API_KEY = "test-key"
 
-        # Mock the client to raise timeout
-        with patch.object(service, "client") as mock_client:
-            mock_client.messages.create = AsyncMock(
+            service = LLMService()
+            service.client = MagicMock()
+            service.client.messages.create = AsyncMock(
                 side_effect=asyncio.TimeoutError()
             )
 
+            # generate_content конвертирует TimeoutError → ValueError("LLM timeout").
+            # llm_retry_strategy дальше может ре-raisить — принимаем оба варианта.
             with pytest.raises((ValueError, asyncio.TimeoutError)):
                 await service.generate_content("test prompt")
 
@@ -91,38 +102,54 @@ class TestApprovalFlow:
 
 
 class TestRateLimiting:
-    """Test rate limiting on webhook endpoint"""
+    """Test Redis-backed rate limiting on /webhooks/alertmanager.
 
-    def test_rate_limit_triggering(self):
-        """11-й запрос за минуту с одного IP получает 429."""
-        from app import main as main_module
+    Старая версия в защёлкой in-memory defaultdict не работала с multi-replica;
+    после перехода на Redis (app/api/rate_limit.py) проверяем интеграционный
+    контракт через mock Redis-клиента.
+    """
 
-        # Прямая проверка in-memory limiter-а: 10 запросов в окне, 11-й — ban.
-        store = main_module.rate_limit_store
-        store.clear()
-        client_ip = "203.0.113.10"
-        import time
-        now = time.time()
-        store[client_ip] = [now - i * 0.1 for i in range(10)]
-        # Текущее состояние: 10 запросов, окно не истекло.
-        recent = [t for t in store[client_ip] if now - t < 60]
-        assert len(recent) >= 10
+    @pytest.mark.asyncio
+    async def test_rate_limit_triggering(self):
+        """11-й INCR превышает limit=10 — check_alertmanager возвращает False."""
+        from app.api import rate_limit
 
-    def test_rate_limit_reset(self):
-        """После 60 секунд старые записи отбрасываются — лимит сбрасывается."""
-        from app import main as main_module
-        import time
+        fake = MagicMock()
+        # counter эмулирует server-side INCR.
+        state = {"count": 0}
 
-        store = main_module.rate_limit_store
-        store.clear()
-        client_ip = "203.0.113.20"
-        # 10 старых запросов > 60s назад + 1 свежий.
-        old = time.time() - 120
-        store[client_ip] = [old] * 10 + [time.time()]
-        # Симулируем фильтрацию.
-        now = time.time()
-        recent = [t for t in store[client_ip] if now - t < 60]
-        assert len(recent) == 1  # 10 старых выбросило
+        async def fake_incr(key):
+            state["count"] += 1
+            return state["count"]
+
+        async def fake_expire(key, ttl):
+            return True
+
+        fake.incr = fake_incr
+        fake.expire = fake_expire
+
+        with patch.object(rate_limit, "_get_client", return_value=fake):
+            results = [
+                await rate_limit.check_alertmanager("203.0.113.10")
+                for _ in range(11)
+            ]
+        # 10 пропускаются, 11-й отлуп.
+        assert results[:10] == [True] * 10
+        assert results[10] is False
+
+    @pytest.mark.asyncio
+    async def test_rate_limit_fail_open_on_redis_down(self):
+        """При недоступности Redis ratelimiter пропускает запрос (fail-open)."""
+        from app.api import rate_limit
+
+        fake = MagicMock()
+        async def fake_incr(key):
+            raise ConnectionError("redis unavailable")
+        fake.incr = fake_incr
+
+        with patch.object(rate_limit, "_get_client", return_value=fake):
+            ok = await rate_limit.check_alertmanager("203.0.113.20")
+        assert ok is True  # fail-open: HMAC всё ещё закрывает auth
 
 
 class TestSecurityValidation:

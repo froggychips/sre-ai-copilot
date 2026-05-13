@@ -1,5 +1,6 @@
 import asyncio
 import logging
+from typing import Optional
 
 from anthropic import AsyncAnthropic
 
@@ -19,6 +20,8 @@ class LLMService:
     def __init__(self) -> None:
         self.backend = (settings.LLM_BACKEND or "anthropic").lower()
         self.model = settings.MODEL_NAME
+        self.cli: Optional[ClaudeCliService] = None
+        self.client: Optional[AsyncAnthropic] = None
         if self.backend == "claude_cli":
             self.cli = ClaudeCliService(
                 model=settings.MODEL_NAME or None,
@@ -26,16 +29,16 @@ class LLMService:
                     getattr(settings, "CLAUDE_CLI_TIMEOUT_SECONDS", 180.0)
                 ),
             )
-            self.client = None
         else:
             self.client = AsyncAnthropic(api_key=settings.ANTHROPIC_API_KEY)
-            self.cli = None
 
     @llm_retry_strategy
     async def generate_content(self, prompt: str) -> str:
         try:
             if self.backend == "claude_cli":
+                assert self.cli is not None  # __init__ инициализирует под этот backend
                 return await self.cli.generate_content(prompt)
+            assert self.client is not None  # anthropic-backend гарантирует client
             # Add timeout for LLM calls
             llm_timeout = getattr(settings, "LLM_TIMEOUT_SECONDS", 30.0)
             response = await asyncio.wait_for(
@@ -46,8 +49,10 @@ class LLMService:
                 ),
                 timeout=llm_timeout,
             )
+            # Anthropic ContentBlock = TextBlock | ToolUseBlock; .text есть
+            # только у TextBlock — getattr с дефолтом и фильтром.
             text = "".join(
-                block.text
+                getattr(block, "text", "")
                 for block in response.content
                 if getattr(block, "type", None) == "text"
             )

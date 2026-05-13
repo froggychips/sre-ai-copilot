@@ -65,6 +65,8 @@ def test_populate_creates_service_and_alert(db):
 
 
 def test_populate_records_deployments_from_tc(db):
+    # auto_populator достаёт sha из changes[0].version (фикс 039c80c) — TC-context
+    # не выдаёт sha напрямую на верхнем уровне билда, только через changes.
     tc = {
         "recent_builds": [
             {
@@ -73,7 +75,7 @@ def test_populate_records_deployments_from_tc(db):
                 "branch": "master",
                 "finished_at": "2026-05-12T09:30:00Z",
                 "started_at": "2026-05-12T09:25:00Z",
-                "sha": "abc1234",
+                "changes": [{"version": "abc1234"}],
             },
             {
                 "number": "1235", "status": "RUNNING",

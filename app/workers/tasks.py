@@ -34,8 +34,11 @@ celery_app.conf.beat_schedule = {
 
 @celery_app.task(name="process_incident", bind=True, max_retries=3)
 def process_incident_task(self, incident_data: dict):
-    loop = asyncio.get_event_loop()
-    return loop.run_until_complete(async_process_incident(incident_data))
+    # asyncio.run создаёт чистый event loop на задачу — get_event_loop()
+    # на Python 3.10+ выкидывает DeprecationWarning, а в Python 3.14+
+    # без running loop возвращает ошибку. Celery worker — синхронный
+    # context, eager-режим (тесты) тоже работает корректно с asyncio.run.
+    return asyncio.run(async_process_incident(incident_data))
 
 
 async def async_process_incident(incident_data: dict):

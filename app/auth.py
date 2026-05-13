@@ -46,9 +46,11 @@ async def get_current_user(
             audience=settings.JWT_AUDIENCE,
         )
 
+        # sub обязателен — пустую строку всё равно отсекаем дальше через InvalidTokenError.
+        # email может быть None в claims; нормализуем в "" для типа.
         user = User(
-            sub=payload.get("sub"),
-            email=payload.get("email"),
+            sub=payload.get("sub") or "",
+            email=payload.get("email") or "",
             roles=payload.get("roles", []),
         )
 

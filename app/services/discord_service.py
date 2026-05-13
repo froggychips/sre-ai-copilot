@@ -24,9 +24,13 @@ class DiscordService:
         if settings.DISCORD_DRY_RUN:
             logging.info("[DISCORD_DRY_RUN] send_report:\n%s", report_text)
             return
+        url = settings.DISCORD_WEBHOOK_URL
+        if not url:
+            logging.warning("DISCORD_WEBHOOK_URL not set, skipping send_report")
+            return
         payload = {"content": report_text}
         async with httpx.AsyncClient() as client:
-            await client.post(settings.DISCORD_WEBHOOK_URL, json=payload)
+            await client.post(url, json=payload)
 
     async def send_stats_report(self, content: str) -> None:
         """Отправить текст в канал #stats (cluster health, daily report)."""
@@ -123,8 +127,12 @@ class DiscordService:
             logging.info("[DISCORD_DRY_RUN] send_incident_report: %s | cause=%s | rq=%s",
                          title, cause, resolution_quality)
             return
+        url = settings.DISCORD_WEBHOOK_URL
+        if not url:
+            logging.warning("DISCORD_WEBHOOK_URL not set, skipping incident report")
+            return
         async with httpx.AsyncClient() as client:
-            r = await client.post(settings.DISCORD_WEBHOOK_URL, json=payload)
+            r = await client.post(url, json=payload)
             if r.status_code >= 400:
                 logging.error("discord_incident_report_failed", extra={"status": r.status_code})
 
@@ -157,8 +165,12 @@ class DiscordService:
                 }
             ]
         }
+        url = settings.DISCORD_WEBHOOK_URL
+        if not url:
+            logging.warning("DISCORD_WEBHOOK_URL not set, skipping approval request")
+            return
         async with httpx.AsyncClient() as client:
-            response = await client.post(settings.DISCORD_WEBHOOK_URL, json=payload)
+            response = await client.post(url, json=payload)
             if response.status_code >= 400:
                 logging.error(
                     "discord_approval_request_failed",

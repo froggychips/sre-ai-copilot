@@ -38,10 +38,10 @@ jobs:
       - name: Run Ruff (Linting)
         run: .venv/bin/ruff check .
 
-      # Mypy остаётся non-blocking — 69+ pre-existing ошибок,
-      # cleanup tracked separately.
+      # Mypy — blocking. Долг расчищен (2026-05-13, 176 → 0) через mypy.ini
+      # с per-module overrides для SQLAlchemy-ORM-шума и реальных фиксов
+      # union-attr/arg-type в auth/discord/llm/teamcity/celery_worker.
       - name: Run Mypy (Type Checking)
-        continue-on-error: true
         run: .venv/bin/mypy .
 
       # Coverage gate. Текущий baseline после Э4.* — 58%. Gate с буфером в 3%
@@ -55,11 +55,10 @@ jobs:
       - name: Bandit (security static analysis)
         run: .venv/bin/bandit -r app -q --severity-level medium
 
-      # pip-audit — известные CVE в зависимостях. Не блокируем job,
-      # пока в долге pre-existing уязвимости; репортим в логах.
-      # Перевести в blocking, когда долг будет нулевой.
+      # pip-audit — blocking. Долг расчищен (2026-05-13, после bump-а
+      # protobuf 4.25→5.29.6 и dotenv 1.0→1.2.2). Любая новая известная
+      # CVE в зависимостях фейлит CI — fix через dependabot-PR или ручной bump.
       - name: pip-audit (dependency CVEs)
-        continue-on-error: true
         run: .venv/bin/pip-audit --requirement requirements.txt --strict
 
   build-and-push:

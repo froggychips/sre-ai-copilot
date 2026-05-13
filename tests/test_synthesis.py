@@ -68,7 +68,11 @@ async def test_synthesis_packs_all_five_sections(captured_ask):
 
 @pytest.mark.asyncio
 async def test_synthesis_instruction_includes_root_cause_check(captured_ask):
-    """Регрессия для f1fcd22 — Fix-addresses-root-cause пункт обязателен."""
+    """Регрессия для f1fcd22 — fix-addresses-root-cause пункт обязателен.
+
+    Инструкция переехала на русский в коммите 7ca5041, поэтому проверяем
+    русские формулировки.
+    """
     agent = SynthesisAgent()
     await agent.synthesize(
         incident_id="x",
@@ -79,25 +83,25 @@ async def test_synthesis_instruction_includes_root_cause_check(captured_ask):
         risk_report="",
     )
     instruction = captured_ask["instruction"]
-    assert "Fix addresses root cause?" in instruction
-    assert "YES or NO" in instruction
+    assert "Фикс устраняет причину?" in instruction
+    assert "ДА / НЕТ" in instruction
 
 
 @pytest.mark.asyncio
 async def test_synthesis_instruction_demands_structured_report(captured_ask):
+    """Все обязательные секции отчёта на месте (русские формулировки c 7ca5041)."""
     agent = SynthesisAgent()
     await agent.synthesize(
         incident_id="x", analysis="", hypotheses="",
         final_cause="", fix_suggestion="", risk_report="",
     )
     instruction = captured_ask["instruction"]
-    # Каждая обязательная секция итогового отчёта.
     for required in [
-        "What happened",
-        "Root cause",
-        "Fix",
-        "Risk",
-        "Confidence",
+        "Что случилось",
+        "Причина",
+        "Исправление",
+        "Риск",
+        "Уверенность",
     ]:
         assert required in instruction, f"missing section: {required}"
 

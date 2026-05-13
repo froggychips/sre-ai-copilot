@@ -69,8 +69,8 @@ class SimilarIncidentEngine:
 
         matches = []
         for record in history:
-            hist_data = record.data or {}
-            hist_analysis = record.analysis or {}
+            hist_data: dict[str, Any] = record.data or {}
+            hist_analysis: dict[str, Any] = record.analysis or {}
 
             # KG quality gate: пропускаем записи без actionable cause.
             cause = hist_analysis.get("cause")
