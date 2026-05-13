@@ -38,9 +38,15 @@ _PING              = 1
 _MESSAGE_COMPONENT = 3
 
 # Discord interaction callback types
-_PONG            = 1
-_CHANNEL_MESSAGE = 4   # immediate visible response
-_EPHEMERAL_FLAG  = 64  # only the clicker sees it
+_PONG                                  = 1
+_CHANNEL_MESSAGE                       = 4   # immediate visible response
+_DEFERRED_CHANNEL_MESSAGE              = 5   # "thinking…" loader, followup via PATCH
+_EPHEMERAL_FLAG                        = 64  # only the clicker sees it
+
+# Discord даёт ~3s до initial response от interactions endpoint. На дольше — type=5
+# (deferred) + PATCH followup в течение 15 минут. Apply-flow ≥ 3s в реальности
+# на сетевых вызовах kubectl, поэтому defer обязателен.
+_DISCORD_API_BASE = "https://discord.com/api/v10"
 
 # Discord component types
 _ACTION_ROW = 1
@@ -94,6 +100,60 @@ def _ephemeral(content: str, components: list | None = None) -> dict:
     if components:
         data["components"] = components
     return {"type": _CHANNEL_MESSAGE, "data": data}
+
+
+def _deferred_ephemeral() -> dict:
+    """Return-payload, который говорит Discord "показывай loader, ответ придёт followup-ом"."""
+    return {"type": _DEFERRED_CHANNEL_MESSAGE, "data": {"flags": _EPHEMERAL_FLAG}}
+
+
+async def _send_followup(interaction_token: str, content: str) -> None:
+    """PATCH @original — заменить deferred loader финальным ephemeral-сообщением.
+
+    Доступно в течение 15 минут после initial response. Не падаем наружу —
+    хуже всего получим лог-ошибку и пользователь увидит loading-бесконечно.
+    """
+    app_id = settings.DISCORD_APPLICATION_ID
+    if not app_id:
+        logger.warning("discord_followup_skipped reason=no_app_id")
+        return
+    import httpx
+    url = f"{_DISCORD_API_BASE}/webhooks/{app_id}/{interaction_token}/messages/@original"
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            r = await client.patch(url, json={"content": content[:2000]})
+            if r.status_code >= 400:
+                logger.error(
+                    "discord_followup_failed status=%s body=%s",
+                    r.status_code, r.text[:200],
+                )
+    except Exception as e:
+        logger.error("discord_followup_exception error=%s", str(e))
+
+
+async def _apply_in_background(incident_id: str, user_id: str, interaction_token: str) -> None:
+    """Запустить apply_intent + отправить followup-ответ.
+
+    apply_intent — sync (subprocess), запускаем в to_thread; результат форматируем
+    тем же _format_apply_result-style как раньше и PATCH в Discord.
+    """
+    import asyncio
+    from app.services.executor_apply import apply_intent
+    outcome = await asyncio.to_thread(apply_intent, incident_id, user_id)
+
+    if not outcome["ok"]:
+        content = _format_apply_refusal(incident_id, outcome.get("reason", "unknown"))
+    else:
+        result = outcome.get("result") or {}
+        success = bool(result.get("success"))
+        emoji = "✅" if success else "❌"
+        command = result.get("command", "(unknown)")
+        out = (result.get("stdout") or result.get("stderr") or result.get("error") or "").strip()
+        content = f"{emoji} kubectl {'выполнен' if success else 'упал'}: `{command}`"
+        if out:
+            content += f"\n```\n{out[:600]}\n```"
+
+    await _send_followup(interaction_token, content)
 
 
 def _confirm_neg_buttons(incident_id: str) -> list:
@@ -240,32 +300,23 @@ async def discord_interactions(
             components=_confirm_apply_buttons(incident_id),
         )
 
-    # ── ⚙️ Apply: шаг 2, выполнить kubectl ────────────────────────────────
+    # ── ⚙️ Apply: шаг 2, выполнить kubectl (deferred response) ──────────────
     if custom_id.startswith("apply_confirm_"):
         incident_id = custom_id[len("apply_confirm_"):]
         if not settings.EXECUTOR_APPROVAL_ENABLED:
             return _ephemeral("❌ EXECUTOR_APPROVAL_ENABLED=false — apply отключён.")
 
-        # apply_intent — sync (subprocess внутри), запускаем в thread, чтобы не
-        # блокировать FastAPI event loop. Discord даёт ~3s до initial response,
-        # для быстрых kubectl-команд (rollout restart, scale) укладываемся.
-        # Для длинных операций понадобится deferred response — TODO PR #4.
+        interaction_token = payload.get("token", "")
+        if not interaction_token:
+            # Без token-а не сможем сделать followup; fallback на sync-режим.
+            return _ephemeral("❌ Discord interaction token отсутствует — apply не запущен.")
+
+        # Сразу возвращаем "thinking..." (type=5), apply работает в background-task.
+        # Discord даёт 15 минут на followup через PATCH @original — этого хватит
+        # даже для большого rollout restart с тяжёлыми initContainers.
         import asyncio
-        from app.services.executor_apply import apply_intent
-        outcome = await asyncio.to_thread(apply_intent, incident_id, user_id)
-
-        if not outcome["ok"]:
-            return _ephemeral(_format_apply_refusal(incident_id, outcome.get("reason", "unknown")))
-
-        result = outcome.get("result") or {}
-        success = bool(result.get("success"))
-        emoji = "✅" if success else "❌"
-        command = result.get("command", "(unknown)")
-        out = (result.get("stdout") or result.get("stderr") or result.get("error") or "").strip()
-        msg = f"{emoji} kubectl {'выполнен' if success else 'упал'}: `{command}`"
-        if out:
-            msg += f"\n```\n{out[:600]}\n```"
-        return _ephemeral(msg)
+        asyncio.create_task(_apply_in_background(incident_id, user_id, interaction_token))
+        return _deferred_ephemeral()
 
     # ── ⚙️ Apply: отмена ───────────────────────────────────────────────────
     if custom_id.startswith("apply_cancel_"):

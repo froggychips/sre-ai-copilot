@@ -62,6 +62,16 @@ env:
   # Set to "true" to enable safe-mode (disables write k8s actions)
   safeMode: "false"
 
+  # Executor track (v0.7.0+). По дефолту оба false — пайплайн чисто advisory.
+  # Включать постепенно по ramp-up-плану (см. README → Roadmap → Execution):
+  #   1. dev / single preprod-squad-N: оба true, DISCORD_DRY_RUN=true для smoke
+  #   2. все preprod-squad-*: оба true, watch rate EXECUTOR_APPLY_REFUSED
+  #   3. prod-squad-N: оба true
+  #   4. all prod-squad-*: оба true
+  # HIGH-risk auto-apply никогда (by design — режется в apply-service).
+  executorEnabled: "false"          # 9-я стадия: kubectl --dry-run=server
+  executorApprovalEnabled: "false"  # Apply-кнопка на Discord embed → реальный kubectl
+
 # All secret keys — fill in before deploying.
 # In production prefer SealedSecrets or ExternalSecrets (see k8s/base/secrets.*.yaml.example).
 secrets:

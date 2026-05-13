@@ -171,3 +171,122 @@ Jira REST API v3 `GET /search` endpoint returned `410 Gone`. Atlassian migrated 
 1. **Jira API endpoint**: `GET /rest/api/3/search` is gone; switch to `POST /rest/api/3/search/jql`.
 2. **Core dump verification**: `CoreDumpRule` returns a weak signal without real `ls -la /proc/<pid>/coredump_filter` on the host. A `kubectl exec` debug pod with hostPath mount would give exact file sizes and timestamps.
 3. **TeamCity correlation**: `teamcity_context=null` in Run 4 — TC MCP was not available in this dev environment. In production, deploy context enriches the root-cause analysis significantly.
+
+---
+
+## Executor incidents
+
+Applies to v0.7.0+ when `EXECUTOR_ENABLED=true` and/or `EXECUTOR_APPROVAL_ENABLED=true` are set. With defaults (both `false`) the pipeline is purely advisory and this section is N/A.
+
+### Recognizing an executor incident
+
+Look at the Discord embed:
+
+| Mode | Embed signals |
+|---|---|
+| Advisory only (default) | No "Dry-run verdict" field, no Apply button. |
+| Executor dry-run only   | "Dry-run verdict" appears (✓/✗/🚫/⚠️). No Apply button. |
+| Executor + Apply         | Apply button present iff dry-run passed AND risk ∈ {low, medium} AND `executor_applied` not set. |
+
+DB query:
+
+```sql
+SELECT
+  incident_id,
+  analysis -> 'execution_intent' AS intent,
+  analysis -> 'executor_result'  AS dry_run_result,
+  analysis -> 'executor_applied' AS applied
+FROM incidents
+WHERE incident_id = '<id>';
+```
+
+| Field | Meaning |
+|---|---|
+| `execution_intent` | Structured action proposed by `FixAgent` (`NULL` if LLM didn't emit one). |
+| `executor_result.status` | dry-run outcome: `skipped` / `dry_run_ok` / `dry_run_failed` / `guardrail_blocked` / `error`. |
+| `executor_applied` | Set only after a successful Apply click. `NULL` = no real write happened. |
+
+### Apply failed — what to do
+
+#### kubectl exited non-zero
+
+Symptom: ephemeral shows `❌ kubectl упал: …`, `executor_applied.result.success = false`, `stderr` carries the error.
+
+- `deployments.apps "xxx" not found` — stale name (resource gone between dry-run and apply). No state change. Re-trigger if needed.
+- `Operation cannot be fulfilled ... the object has been modified` — concurrent write. Safe to retry.
+- `timed out` — kubectl held > 30s. Action may or may not have landed. Verify with `kubectl get deployment <name> -n <ns> -o yaml | grep restartedAt`.
+
+#### Guardrail blocked
+
+Symptom: ephemeral `❌ Не могу применить: …`, audit `EXECUTOR_APPLY_REFUSED` with `reason="dry_run_not_ok:guardrail_blocked"`.
+
+Expected — guard caught a policy violation (e.g., LLM proposed action in `kube-*` or `prod-*` read-only tier). No state change. If the Apply button appeared at all in this state, file a bug.
+
+#### executor_applied present but action was wrong
+
+Revert manually:
+
+```bash
+# rollout restart — roll back to previous ReplicaSet:
+kubectl rollout undo deployment/<name> -n <ns>
+
+# scale — restore previous count:
+kubectl scale deployment/<name> -n <ns> --replicas=<original>
+```
+
+Mark the incident as wrong so KG quality gate excludes it:
+
+```sql
+UPDATE incidents
+   SET analysis = jsonb_set(analysis, '{resolution_quality}', '"wrong_apply"')
+ WHERE incident_id = '<id>';
+```
+
+Click 👎 on the embed to store user feedback structurally.
+
+### Killing the executor
+
+#### Stop new applies (normal control)
+
+```bash
+helm upgrade sre-ai-copilot helm/sre-ai-copilot \
+  --reuse-values \
+  --set env.EXECUTOR_APPROVAL_ENABLED=false
+```
+
+Apply button disappears from new embeds. Already-posted embeds with the button stay in Discord history — clicking them returns `❌ EXECUTOR_APPROVAL_ENABLED=false — apply отключён.`
+
+#### Emergency (fastest, halts everything)
+
+```bash
+kubectl scale deployment/sre-ai-copilot-worker -n sre-ai --replicas=0
+```
+
+Halts dry-run, analysis, and apply. Use only if executor is misbehaving badly.
+
+#### Permanent
+
+Set both `EXECUTOR_ENABLED=false` and `EXECUTOR_APPROVAL_ENABLED=false`. Pipeline drops to advisory.
+
+### Audit trail
+
+OTEL root-span attributes:
+- `sre.incident.execution_intent_parsed: bool`
+- `sre.incident.execution_intent_action`
+- `sre.incident.executor_status`
+
+`executor` stage span emits `guardrail.blocked` event if K8sSecurityGuard rejected.
+
+Audit log event types (filter by `event` field):
+
+| Event | When |
+|---|---|
+| `K8S_GUARDRAIL_BLOCK` | Guard rejected during execute_intent |
+| `K8S_COMMAND_ATTEMPT` | About to run kubectl |
+| `K8S_COMMAND_RESULT` | kubectl finished |
+| `K8S_COMMAND_TIMEOUT` | kubectl > 30s |
+| `K8S_BLOCKED_NO_APPROVAL` | `dry_run=False` called without `post_approval=True` |
+| `EXECUTOR_APPLIED` | Apply succeeded |
+| `EXECUTOR_APPLY_REFUSED` | Apply ineligible |
+| `EXECUTOR_APPLY_EXCEPTION` | Unexpected exception in apply-service |
+| `EXECUTOR_DRY_RUN_FAILED` | Exception in `stage_executor` |
