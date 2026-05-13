@@ -148,6 +148,34 @@ class DiscordService:
         # Synthesis truncated — Discord limit 4096, но читаемость важнее.
         description = synthesis[:1200] + ("…" if len(synthesis) > 1200 else "")
 
+        # Базовые feedback-кнопки. Кнопка "Apply" появляется только когда
+        # EXECUTOR_APPROVAL_ENABLED + intent распарсен + dry-run ok + risk low/medium
+        # (см. PR #3 executor track). HIGH-risk и любая дисквалификация — manual.
+        action_row = [
+            {
+                "type": 2, "style": 3,  # BUTTON SUCCESS (green)
+                "label": "👍 Верный анализ",
+                "custom_id": f"feedback_pos_{incident_id}",
+            },
+            {
+                "type": 2, "style": 4,  # BUTTON DANGER (red)
+                "label": "👎 Анализ неверен",
+                "custom_id": f"feedback_neg_{incident_id}",
+            },
+        ]
+        if (
+            settings.EXECUTOR_APPROVAL_ENABLED
+            and execution_intent is not None
+            and execution_intent.risk.lower() in {"low", "medium"}
+            and executor_result is not None
+            and executor_result.get("status") == "dry_run_ok"
+        ):
+            action_row.append({
+                "type": 2, "style": 1,  # BUTTON PRIMARY (blurple)
+                "label": "⚙️ Apply (kubectl)",
+                "custom_id": f"apply_{incident_id}",
+            })
+
         payload = {
             "embeds": [{
                 "title": title,
@@ -157,23 +185,7 @@ class DiscordService:
                 "footer": {"text": f"incident/{incident_id}"},
                 "timestamp": datetime.now(timezone.utc).isoformat(),
             }],
-            # Кнопки фидбека. 👍 сохраняется сразу; 👎 требует подтверждения
-            # (защита от случайного клика — см. discord_interactions.py).
-            "components": [{
-                "type": 1,  # ACTION_ROW
-                "components": [
-                    {
-                        "type": 2, "style": 3,  # BUTTON SUCCESS (green)
-                        "label": "👍 Верный анализ",
-                        "custom_id": f"feedback_pos_{incident_id}",
-                    },
-                    {
-                        "type": 2, "style": 4,  # BUTTON DANGER (red)
-                        "label": "👎 Анализ неверен",
-                        "custom_id": f"feedback_neg_{incident_id}",
-                    },
-                ],
-            }],
+            "components": [{"type": 1, "components": action_row}],
         }
 
         if settings.DISCORD_DRY_RUN:
