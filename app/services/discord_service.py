@@ -65,6 +65,7 @@ class DiscordService:
         is_recurrence: bool = False,
         flap_count: int = 0,
         execution_intent: Optional["ExecutionIntent"] = None,
+        executor_result: Optional[dict] = None,
     ) -> None:
         """Единый embed-отчёт, заменяющий сырой алерт от Spidey Bot.
 
@@ -114,6 +115,33 @@ class DiscordService:
                     f"_risk: {execution_intent.risk} · "
                     f"action: {execution_intent.action.value}_"
                 )[:1024],
+                "inline": False,
+            })
+        # PR #2 executor track: показываем результат server-side dry-run.
+        # Это ВЕРИФИКАЦИЯ команды через kube-apiserver, не запуск (см. EXECUTOR_ENABLED).
+        if executor_result is not None and executor_result.get("status") != "skipped":
+            status_map = {
+                "dry_run_ok":         ("✓",  "dry-run OK (kube-apiserver валидировал)"),
+                "dry_run_failed":     ("✗",  "dry-run failed"),
+                "guardrail_blocked":  ("🚫", "K8sSecurityGuard заблокировал"),
+                "error":              ("⚠️", "executor exception"),
+            }
+            icon, label = status_map.get(
+                executor_result.get("status", ""), ("?", executor_result.get("status", "unknown"))
+            )
+            detail = (
+                executor_result.get("stderr")
+                or executor_result.get("reason")
+                or executor_result.get("error")
+                or executor_result.get("stdout")
+                or ""
+            )
+            value = f"{icon} {label}"
+            if detail:
+                value += f"\n```\n{detail[:600]}\n```"
+            fields.append({
+                "name": "Dry-run verdict",
+                "value": value[:1024],
                 "inline": False,
             })
 

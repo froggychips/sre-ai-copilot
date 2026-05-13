@@ -136,6 +136,12 @@ class Settings(BaseSettings):
     STATICS_PASSWORD: str = Field("", description="Statics Postgres password")
     STATICS_RECENT_VERSIONS: int = Field(5, description="How many recent statics versions to compare")
 
+    # Executor stage (PR #2 executor track). Если False — стадия пропускается,
+    # пайплайн остаётся чисто advisory. Включать осознанно после merge PR #2
+    # и smoke-теста на non-prod. На текущем этапе stage делает только
+    # kubectl --dry-run=server: валидирует через kube-apiserver, ничего не пишет.
+    EXECUTOR_ENABLED: bool = Field(False, description="Run executor stage in dry-run mode")
+
     # Atlassian Jira — поиск известных инцидентов/задач по сервису.
     # Basic Auth: email + API token (https://id.atlassian.com/manage-profile/security/api-tokens)
     # Пусто = Jira отключена (graceful degrade).
