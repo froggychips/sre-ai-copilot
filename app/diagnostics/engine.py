@@ -13,7 +13,7 @@ from typing import Any, Dict, List, Optional
 
 import structlog
 
-from app.diagnostics.facts import Fact, FactStore, MUTUALLY_EXCLUSIVE_PAIRS
+from app.diagnostics.facts import Fact, FactStore
 from app.diagnostics.rules import DEFAULT_RULES, Rule
 from app.observability.ai_metrics import track_fact_observed
 

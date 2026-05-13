@@ -18,6 +18,7 @@ from typing import List, Optional
 
 import psycopg2
 import psycopg2.extras
+from psycopg2 import sql as pgsql
 
 from app.config import settings
 
@@ -76,20 +77,12 @@ def _run_statics_check(error_text: str, recent_n: int) -> Optional[str]:
         migration_rows = cur.fetchall()
         migration_versions = [r["version"] for r in migration_rows]
 
-        # Найти таблицы, имена которых содержат ключевые слова
-        like_clauses = " OR ".join(
-            f"table_name ILIKE %s" for _ in keywords
-        )
-        cur.execute(
-            f"""
-            SELECT table_name
-            FROM information_schema.tables
-            WHERE table_schema = 'public'
-              AND ({like_clauses})
-            ORDER BY table_name
-            """,
-            [f"%{kw}%" for kw in keywords],
-        )
+        # Найти таблицы, имена которых содержат ключевые слова.
+        # f-string собирает только повторы плейсхолдера `%s` — реальные значения
+        # связываются через params-список, инъекция через keywords невозможна.
+        like_clauses = " OR ".join("table_name ILIKE %s" for _ in keywords)
+        sql_find_tables = f"SELECT table_name FROM information_schema.tables WHERE table_schema = 'public' AND ({like_clauses}) ORDER BY table_name"  # nosec B608 — like_clauses — только повторы `%s`, значения связываются ниже
+        cur.execute(sql_find_tables, [f"%{kw}%" for kw in keywords])
         matching_tables = [r["table_name"] for r in cur.fetchall()]
 
         lines = ["=== STATICS CHECK ==="]
@@ -105,11 +98,17 @@ def _run_statics_check(error_text: str, recent_n: int) -> Optional[str]:
 
         lines.append(f"Matching tables: {matching_tables}")
 
-        # Проверяем каждую таблицу на наличие данных
+        # Проверяем каждую таблицу на наличие данных.
+        # tbl приходит из information_schema (internal), но всё равно
+        # квотим через psycopg2.sql.Identifier — корректный escape ".
         verdicts = []
         for tbl in matching_tables[:5]:
             try:
-                cur.execute(f'SELECT count(*) AS cnt FROM "{tbl}"')
+                cur.execute(
+                    pgsql.SQL("SELECT count(*) AS cnt FROM {}").format(
+                        pgsql.Identifier(tbl)
+                    )
+                )
                 row = cur.fetchone()
                 cnt = row["cnt"] if row else 0
                 status = "OK" if cnt > 0 else "EMPTY"

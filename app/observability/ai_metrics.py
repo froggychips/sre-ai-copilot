@@ -1,4 +1,4 @@
-from prometheus_client import Counter, Histogram, Summary
+from prometheus_client import Counter, Histogram
 
 # --- LLM usage & performance ---------------------------------------------
 LLM_LATENCY = Histogram("llm_request_duration_seconds", "LLM API latency", ["model"])

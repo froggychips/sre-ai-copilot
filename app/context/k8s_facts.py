@@ -207,8 +207,9 @@ class K8sFacts:
                 all_pods = v1.list_namespaced_pod(namespace)
                 for p in all_pods.items:
                     if pod in p.metadata.name and p.status.phase == "Running":
+                        # Проверка mount_path в спеке пода, не создание tempfile.
                         has_dump_mount = any(
-                            (vm.mount_path or "").startswith("/tmp/dump")
+                            (vm.mount_path or "").startswith("/tmp/dump")  # nosec B108 — pod-spec inspection, not tempfile creation
                             for vm in (p.spec.containers[0].volume_mounts or [])
                             if p.spec.containers
                         )
