@@ -3,7 +3,6 @@ Async integration tests for SRE AI Copilot API endpoints
 """
 import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
-from fastapi.testclient import TestClient
 
 # Note: These tests are designed to validate async patterns
 # They require pytest-asyncio plugin
@@ -16,7 +15,6 @@ class TestAsyncPatterns:
     async def test_llm_timeout_handling(self):
         """Test LLM calls have proper timeout handling"""
         from app.services.llm_service import LLMService
-        from app.config import Settings
 
         # Mock settings
         with patch("app.services.llm_service.settings") as mock_settings:
@@ -135,7 +133,7 @@ class TestSecurityValidation:
         """Корректный HMAC проходит через verify_alertmanager_signature."""
         import hmac
         import hashlib
-        from unittest.mock import AsyncMock, MagicMock
+        from unittest.mock import AsyncMock
 
         from app.api.webhooks import verify_alertmanager_signature
         from app.config import settings
@@ -158,7 +156,7 @@ class TestSecurityValidation:
     @pytest.mark.asyncio
     async def test_webhook_signature_validation_reject(self):
         """Подделанная подпись → 401."""
-        from unittest.mock import AsyncMock, MagicMock
+        from unittest.mock import AsyncMock
 
         from fastapi import HTTPException
 
@@ -183,7 +181,7 @@ class TestSecurityValidation:
         """`sha256=<hex>` префикс корректно обрабатывается."""
         import hmac
         import hashlib
-        from unittest.mock import AsyncMock, MagicMock
+        from unittest.mock import AsyncMock
 
         from app.api.webhooks import verify_alertmanager_signature
         from app.config import settings

@@ -9,7 +9,6 @@
 """
 from datetime import datetime, timedelta, timezone
 
-import pytest
 
 from app.diagnostics import DiagnosticEngine, default_engine
 from app.diagnostics.facts import Fact, FactKind, FactStore, MUTUALLY_EXCLUSIVE_PAIRS
@@ -275,16 +274,16 @@ def test_engine_caps_confidence_on_conflict():
     """DiagnosticEngine понижает confidence конфликтующих фактов до 0.60."""
     from app.diagnostics.rules.process_crash import ProcessCrashRule
     engine = DiagnosticEngine(rules=[OOMKilledRule(), ProcessCrashRule()])
-    store = engine.run({
+    # Smoke: на non-OOM exit код OOMKilledRule подавляет text-match,
+    # поэтому естественного конфликта здесь нет. Результат не ассертим —
+    # реальный кап-сценарий форсируем через прямой FactStore ниже.
+    engine.run({
         "pod": "notificator-abc",
-        "description": "container OOMKilled",  # triggers OOMKilledRule text match
+        "description": "container OOMKilled",
         "k8s_pod_state": {
             "notificator-abc": {"reason": "Error", "exit_code": 139, "container": "app"},
         },
     })
-    # ProcessCrashRule → process_crash=✓; OOMKilledRule → non-OOM exit suppresses text
-    # (нет конфликта после фикса OOMKilledRule). Проверяем что при явном конфликте cap работает.
-    # Форсируем конфликт через прямой FactStore:
     conflict_store = FactStore([
         Fact(kind=FactKind.OOM_KILLED, observed=True, confidence=0.95),
         Fact(kind=FactKind.PROCESS_CRASH, observed=True, confidence=0.97),

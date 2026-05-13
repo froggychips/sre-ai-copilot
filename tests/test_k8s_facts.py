@@ -1,4 +1,3 @@
-import pytest
 
 from app.context.k8s_facts import K8sFacts
 

@@ -2,8 +2,6 @@
 """
 Auto-fix common lint errors
 """
-import re
-import sys
 from pathlib import Path
 
 # Map of file paths to fixes

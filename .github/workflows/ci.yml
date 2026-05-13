@@ -33,14 +33,13 @@ jobs:
           .venv/bin/pip install ruff mypy pytest pytest-cov pytest-asyncio pytest-mock bandit pip-audit
           if [ -f requirements.txt ]; then .venv/bin/pip install -r requirements.txt; fi
 
-      # Ruff and Mypy are non-blocking right now — the repo carries
-      # 27 ruff and 69 mypy errors of pre-existing lint debt. The
-      # test gate is pytest below. Cleanup of lint/type debt is
-      # tracked separately.
+      # Ruff — blocking. Долг расчищен (2026-05-13).
+      # Любая новая ruff-ошибка должна быть исправлена в PR, не накапливаться.
       - name: Run Ruff (Linting)
-        continue-on-error: true
         run: .venv/bin/ruff check .
 
+      # Mypy остаётся non-blocking — 69+ pre-existing ошибок,
+      # cleanup tracked separately.
       - name: Run Mypy (Type Checking)
         continue-on-error: true
         run: .venv/bin/mypy .

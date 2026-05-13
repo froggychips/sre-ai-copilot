@@ -2,7 +2,6 @@ import asyncio
 import logging
 
 from anthropic import AsyncAnthropic
-from httpx import AsyncClient, TimeoutException
 
 from app.config import settings
 from app.services.claude_cli_service import ClaudeCliService

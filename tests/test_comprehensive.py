@@ -1,9 +1,7 @@
 """
 Test suite for SRE AI Copilot - Unit and integration tests
 """
-import json
 import pytest
-from unittest.mock import MagicMock, patch, AsyncMock
 from pydantic import ValidationError
 
 from app.models.incident import (

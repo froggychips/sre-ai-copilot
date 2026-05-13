@@ -9,7 +9,7 @@ from app.database import Base
 from app.knowledge_graph.auto_populator import populate_from_incident
 from app.knowledge_graph.queries import (incidents_on, nearby_alerts,
                                          recent_deploys_for)
-from app.knowledge_graph.schema import (AlertEvent, Deployment, Service,
+from app.knowledge_graph.schema import (AlertEvent, Service,
                                         ServiceEdge)  # noqa: F401
 from app.models.incident import Incident
 

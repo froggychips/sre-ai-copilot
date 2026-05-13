@@ -1,9 +1,7 @@
 import logging
-import time
 
 from rq import Connection, Worker
 
-from app.agents.analyzer import AnalyzerAgent
 from app.queue.jobs import incident_queue, redis_conn
 
 

@@ -21,7 +21,6 @@ from typing import Any, Dict, List, Optional, Tuple
 from sqlalchemy.orm import Session
 
 from app.knowledge_graph.populator import upsert_service, upsert_edge
-from app.knowledge_graph.schema import Service
 
 logger = logging.getLogger(__name__)
 
@@ -31,9 +30,11 @@ _SVC_URL_RE = re.compile(
     re.IGNORECASE,
 )
 
-# Пропускаем явно внешние/нерелевантные сервисы
+# Пропускаем явно внешние/нерелевантные сервисы.
+# Это blacklist для фильтрации значений из env-переменных подов,
+# а не bind-адрес сервера — B104 здесь ложно-положительный.
 _SKIP_SERVICE_NAMES = frozenset({
-    "localhost", "127.0.0.1", "0.0.0.0",
+    "localhost", "127.0.0.1", "0.0.0.0",  # nosec B104 — blacklist value, not a bind call
 })
 _SKIP_VALUE_FRAGMENTS = ("azure", "google", "openai", "gpt", "amazonaws", "redis", "postgres", "nats")
 

@@ -110,6 +110,10 @@ async def get_blast_radius(
     def fmt(dt: datetime) -> str:
         return dt.strftime("%Y-%m-%d %H:%M:%S")
 
+    # Интерполируются только datetime-литералы, сформированные через
+    # strftime("%Y-%m-%d %H:%M:%S") из распарсенных ISO-строк инцидента.
+    # Attacker-controlled значения сюда не попадают, CH HTTP-клиент в
+    # этом проекте не поддерживает param-binding для DateTime.
     sql = f"""
 SELECT
     Minute,
@@ -119,7 +123,7 @@ WHERE Minute >= toDateTime('{fmt(baseline_start)}')
   AND Minute <= toDateTime('{fmt(window_end)}')
 GROUP BY Minute
 ORDER BY Minute
-"""
+"""  # nosec B608 — datetime-only interpolation, see note above
 
     client = ClickHouseClient(
         settings.CH_PROD_HOST,

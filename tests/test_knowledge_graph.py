@@ -10,8 +10,7 @@ from sqlalchemy.orm import sessionmaker
 
 from app.database import Base
 # Импортируем schema, чтобы ORM-классы зарегистрировались в Base.metadata
-from app.knowledge_graph.schema import (AlertEvent, Deployment, Service,
-                                        ServiceEdge)  # noqa: F401
+from app.knowledge_graph.schema import (ServiceEdge)  # noqa: F401
 from app.knowledge_graph.populator import (record_alert_event,
                                            record_deployment, upsert_edge,
                                            upsert_service)
@@ -171,7 +170,7 @@ def test_nearby_alerts_finds_upstream_in_window(db):
 
 def test_nearby_alerts_no_upstream(db):
     """Сервис без upstream — пустой результат."""
-    svc = upsert_service(db, "squad-1", "isolated")
+    upsert_service(db, "squad-1", "isolated")
     out = nearby_alerts(
         db, "squad-1", "isolated", around=datetime.now(timezone.utc)
     )
