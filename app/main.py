@@ -1,8 +1,9 @@
 import time
-from collections import defaultdict
+from contextlib import asynccontextmanager
 from typing import Optional
 from uuid import UUID
 
+import structlog
 from celery.result import AsyncResult
 from fastapi import Body, Depends, FastAPI, HTTPException, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
@@ -10,7 +11,7 @@ from prometheus_client import start_http_server
 from sqlalchemy import text
 
 from app import repository
-from app.api import approvals, discord_interactions, replay, webhooks
+from app.api import approvals, discord_interactions, rate_limit, replay, webhooks
 from app.evaluation import feedback
 from app.auth import User, get_current_user
 from app.celery_worker import celery_app, generate_reply
@@ -21,11 +22,38 @@ from app.middleware import RequestIDMiddleware
 from app.models import MessageRole
 from app.telemetry import setup_telemetry
 
-app_configs = {"title": "SRE AI Copilot", "version": "2.4.0"}
-if settings.ENV == "production":
-    app_configs.update({"docs_url": None, "redoc_url": None, "openapi_url": None})
+log = structlog.get_logger()
 
-app = FastAPI(**app_configs)
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Startup: поднимаем prometheus-сервер.
+    start_http_server(port=8001)
+    log.info("application_startup", prometheus_port=8001)
+    yield
+    # Shutdown: graceful Celery + закрытие DB-pool + Redis-клиент rate-limiter-а.
+    # engine — синхронный sqlalchemy.Engine (create_engine), dispose() не awaitable.
+    log.info("application_shutdown")
+    try:
+        celery_app.control.shutdown()
+    except Exception as e:
+        log.warning("celery_shutdown_failed", error=str(e))
+    await rate_limit.close()
+    engine.dispose()
+
+
+# В production отключаем интерактивные docs/openapi: меньше surface для probing.
+if settings.ENV == "production":
+    app = FastAPI(
+        title="SRE AI Copilot",
+        version="2.4.0",
+        lifespan=lifespan,
+        docs_url=None,
+        redoc_url=None,
+        openapi_url=None,
+    )
+else:
+    app = FastAPI(title="SRE AI Copilot", version="2.4.0", lifespan=lifespan)
 setup_telemetry(app)
 
 app.add_middleware(RequestIDMiddleware)
@@ -49,22 +77,15 @@ app.add_middleware(
     allow_headers=["Authorization", "Content-Type"],
 )
 
-# Simple in-memory rate limiter
-rate_limit_store = defaultdict(list)
-
-
 @app.middleware("http")
 async def rate_limit_middleware(request: Request, call_next):
+    # Redis-backed sliding window — общий счётчик между api-репликами.
+    # См. app/api/rate_limit.py. Fail-open: при недоступности Redis запрос
+    # пропускается с warning-логом (auth остаётся на HMAC-подписи).
     if request.url.path == "/webhooks/alertmanager":
-        client_ip = request.client.host
-        now = time.time()
-        # Keep only requests in last 60 seconds
-        rate_limit_store[client_ip] = [
-            t for t in rate_limit_store[client_ip] if now - t < 60
-        ]
-        if len(rate_limit_store[client_ip]) >= 10:  # 10 requests per minute
+        client_ip = request.client.host if request.client else ""
+        if not await rate_limit.check_alertmanager(client_ip):
             return Response(status_code=429, content="Rate limit exceeded")
-        rate_limit_store[client_ip].append(now)
     return await call_next(request)
 
 
@@ -74,25 +95,6 @@ async def metrics_middleware(request: Request, call_next):
     response = await call_next(request)
     observe_request_latency(time.time() - start_time)
     return response
-
-
-@app.on_event("startup")
-async def startup_event():
-    start_http_server(port=8001)
-
-
-@app.on_event("shutdown")
-async def shutdown_event():
-    import structlog
-
-    logger = structlog.get_logger()
-    logger.info("application_shutdown")
-
-    # Graceful Celery shutdown
-    celery_app.control.shutdown()
-
-    # Close DB pool
-    await engine.dispose()
 
 
 app.include_router(webhooks.router, prefix="/webhooks")

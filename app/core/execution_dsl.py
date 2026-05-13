@@ -67,4 +67,7 @@ class DSLTranslator:
                     f"-l {intent.params.get('label', '')}"
                 ),
             }
-            return mapping.get(intent.action)
+            cmd = mapping.get(intent.action)
+            if cmd is None:
+                raise ValueError(f"Unknown action type: {intent.action!r}")
+            return cmd

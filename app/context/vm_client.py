@@ -14,7 +14,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Union
 
 import httpx
 
@@ -179,7 +179,9 @@ class VMClient:
         step: str = "60s",
     ) -> List[Dict[str, Any]]:
         """Выполнить instant range-query. Возвращает список series."""
-        params = {
+        # Явная аннотация — httpx ждёт Mapping[str, str | int | float | bool | None | Sequence[...]],
+        # из dict-literal mypy выводит dict[str, object] и шумит.
+        params: Dict[str, Union[str, int, float]] = {
             "query": query,
             "start": start.timestamp(),
             "end": end.timestamp(),
@@ -225,7 +227,9 @@ class VMClient:
         }
 
         try:
-            mem_series, limit_series, throttle_series = await asyncio.gather(
+            # gather(return_exceptions=True) даёт tuple[list | BaseException, ...] —
+            # mypy теряет тип при unpacking, аннотируем явно.
+            gathered: tuple[Any, Any, Any] = await asyncio.gather(
                 self.query_range(
                     f'container_memory_working_set_bytes{{namespace="{namespace}",pod=~"{pod}.*",container!=""}}',
                     start, end,
@@ -241,6 +245,7 @@ class VMClient:
                 ),
                 return_exceptions=True,
             )
+            mem_series, limit_series, throttle_series = gathered
 
             # Memory working set
             if isinstance(mem_series, list) and mem_series:

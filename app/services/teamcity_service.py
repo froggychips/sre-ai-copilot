@@ -122,7 +122,7 @@ def _fetch_builds_direct(
         merged: list[dict[str, Any]] = []
         for b in default_builds + branch_builds:
             bid = b.get("id")
-            if bid in seen:
+            if bid is None or bid in seen:
                 continue
             seen.add(bid)
             if b.get("branch") not in wanted_branches:
@@ -266,7 +266,7 @@ async def incident_teamcity_context(
         merged: list[dict[str, Any]] = []
         for b in default_branch_builds + logical_branch_builds:
             bid = b.get("id")
-            if bid in seen_ids:
+            if bid is None or bid in seen_ids:
                 continue
             seen_ids.add(bid)
             if b.get("branch") not in wanted_branches:

@@ -43,6 +43,8 @@ async def _generate_reply_logic(
 ) -> str:
     db = SessionLocal()
     conv = db.query(Conversation).filter_by(id=conversation_id).first()
+    if conv is None:
+        raise ValueError(f"Conversation {conversation_id!r} not found")
 
     def transition(to_state: IncidentState):
         if not StateMachine.validate_transition(
@@ -69,7 +71,10 @@ async def _generate_reply_logic(
             enriched_ctx = snapshot.get("payload", {})
         else:
             builder = ContextBuilder()
-            enriched_ctx = await builder.build_context(conv.data)
+            # legacy /copilot-путь: Conversation-модель не имеет поля data
+            # (см. app/models/__init__.py); защищаемся через getattr,
+            # эта ветка не используется основным incident-pipeline-ом.
+            enriched_ctx = await builder.build_context(getattr(conv, "data", {}))
 
         # Reasoning Loop
         for iteration in range(3):
