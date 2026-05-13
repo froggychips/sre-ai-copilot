@@ -61,7 +61,7 @@ def happy_path_dependencies(mocker):
     mocker.patch("app.workers.pipeline.FactCriticAgent.critique_all",
                  new_callable=AsyncMock, return_value=_hyp_set())
     mocker.patch("app.workers.pipeline.FixAgent.suggest",
-                 new_callable=AsyncMock, return_value="f")
+                 new_callable=AsyncMock, return_value=("f", None))
     mocker.patch("app.workers.pipeline.RiskAgent.assess",
                  new_callable=AsyncMock, return_value="r")
     mocker.patch("app.workers.pipeline.SynthesisAgent.synthesize",
@@ -254,7 +254,7 @@ async def test_pipeline_handles_no_record_gracefully(mocker, incident_data):
     mocker.patch("app.workers.pipeline.FactCriticAgent.critique_all",
                  new_callable=AsyncMock, return_value=_hyp_set())
     mocker.patch("app.workers.pipeline.FixAgent.suggest",
-                 new_callable=AsyncMock, return_value="f")
+                 new_callable=AsyncMock, return_value=("f", None))
     mocker.patch("app.workers.pipeline.RiskAgent.assess",
                  new_callable=AsyncMock, return_value="r")
     mocker.patch("app.workers.pipeline.SynthesisAgent.synthesize",
