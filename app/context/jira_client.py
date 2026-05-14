@@ -18,6 +18,8 @@ import base64
 import logging
 from typing import Any, Dict, List, Optional
 
+from app.services.resilience import with_external_retry
+
 import httpx
 
 logger = logging.getLogger(__name__)
@@ -56,6 +58,7 @@ class JiraClient:
             "Accept": "application/json",
         }
 
+    @with_external_retry(max_attempts=3, initial_delay=0.5, name="jira.search_by_service")
     async def search_by_service(
         self,
         service: str,
