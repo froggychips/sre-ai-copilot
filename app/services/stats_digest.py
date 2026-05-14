@@ -106,13 +106,24 @@ def firing_alerts_section(
     return "\n".join(lines), unique_alerts, team_alerts
 
 
+# Noise-алерты Prometheus stack-а — не реальные проблемы, фильтруем
+# из top-N чтобы не зашумлять digest. InfoInhibitor/Watchdog — служебные
+# meta-alerts; CPUThrottlingHigh без severity критерия — часто false positive
+# на bursty workload.
+_NOISE_ALERTNAMES = frozenset({"InfoInhibitor", "Watchdog", "CPUThrottlingHigh"})
+
+
 def top_alert_types_section(unique_alerts: Counter) -> str:
-    """3. Top-5 alertname по числу series."""
-    lines = ["**📋 Top alert types**"]
-    if not unique_alerts:
+    """3. Top-3 alertname по числу series, без infrastructure-noise."""
+    filtered = Counter({
+        name: cnt for name, cnt in unique_alerts.items()
+        if name not in _NOISE_ALERTNAMES
+    })
+    lines = ["**📋 Top alert types** (без infra-noise)"]
+    if not filtered:
         lines.append("  _нет активных алертов_")
     else:
-        for name, cnt in unique_alerts.most_common(5):
+        for name, cnt in filtered.most_common(3):
             lines.append(f"  `{name}` × {cnt}")
     return "\n".join(lines)
 
@@ -138,26 +149,61 @@ def fragile_services_section(db: Session, ns_to_team: Dict[str, str]) -> str:
     return "\n".join(lines)
 
 
-def stale_deployments_section(
+async def _fetch_tc_deployer(namespace: str, last_update: datetime) -> Tuple[Optional[str], Optional[str]]:
+    """Async: получить (deployer_username, build_number) для recent TC build.
+
+    Использует существующий incident_teamcity_context — он ищет builds
+    в backend project около timestamp. Возвращает (None, None) при отказе
+    (TC недоступен, нет матчей, timeout). Идемпотентно: ошибка не падает наружу.
+    """
+    try:
+        from app.services.teamcity_service import incident_teamcity_context
+        ctx = await incident_teamcity_context(
+            namespace=namespace,
+            incident_starts_at=last_update.isoformat(),
+        )
+        if not ctx:
+            return None, None
+        builds = ctx.get("recent_builds") or []
+        if not builds:
+            return None, None
+        # Берём первый (ближайший к last_update) с непустым triggered_by.
+        for b in builds:
+            if b.get("triggered_by"):
+                return b.get("triggered_by"), str(b.get("number") or "?")
+        return None, str(builds[0].get("number") or "?")
+    except Exception as e:
+        log.warning("stats_digest.tc_deployer_failed", namespace=namespace, error=str(e))
+        return None, None
+
+
+async def stale_deployments_section(
     db: Session,
     ns_to_team: Dict[str, str],
     threshold_days: int,
     *,
     kubectl_fn=None,
+    tc_deployer_fn=None,
 ) -> str:
     """5. Deployments живые (replicas>0) но spec не апдейтился ≥ threshold_days.
 
-    Игнорирует системные namespace-ы (kube-*, monitoring и т.п. — берём
-    только те, что есть в KG). `kubectl_fn` — для DI в тестах.
+    Compact-rendering: deployments с одинаковым name и одинаковым idle_days
+    встречающиеся в 3+ namespace-ах рендерятся одной строкой
+    (`town-db-backup × 5 kingdoms · 62d`). Per-name делается ОДИН TC-lookup
+    для deployer-username и build-number.
+
+    `kubectl_fn` / `tc_deployer_fn` — для DI в тестах.
     """
     fn = kubectl_fn or _kubectl_get_deployments_json
+    deployer_fn = tc_deployer_fn or _fetch_tc_deployer
 
     wo_namespaces = sorted({
         ns for (ns,) in db.execute(text("SELECT DISTINCT namespace FROM kg_services")).fetchall()
     })
 
     now = datetime.now(timezone.utc)
-    stale: List[Tuple[int, str, str, str, int, str]] = []
+    # entries: (idle, ns, name, team, replicas, last_update_dt)
+    entries: List[Tuple[int, str, str, str, int, datetime]] = []
     for ns in wo_namespaces:
         items = fn(ns)
         for dep in items:
@@ -172,28 +218,64 @@ def stale_deployments_section(
             if idle < threshold_days:
                 continue
             team = ns_to_team.get(ns, "(unowned)")
-            helm = (dep["metadata"].get("annotations") or {}).get(
-                "meta.helm.sh/release-name", "?"
-            )
-            stale.append((idle, ns, name, team, replicas, helm))
+            entries.append((idle, ns, name, team, replicas, last))
 
-    stale.sort(key=lambda x: -x[0])
     lines = [f"**⏳ Stale deployments** (alive, не катились ≥{threshold_days}d)"]
-    if not stale:
+    if not entries:
         lines.append("  ✅ ничего не stale")
         return "\n".join(lines)
 
-    by_team: defaultdict = defaultdict(list)
-    for entry in stale[:15]:  # cap общий список
-        by_team[entry[3]].append(entry)
-    for team, items in sorted(by_team.items()):
-        lines.append(f"  `@{team}` — {len(items)} stale:")
-        for idle, ns, name, _t, replicas, helm in items[:5]:
-            lines.append(
-                f"    • `{name}` _{ns}_ — idle **{idle}d** · {replicas} rs · helm=`{helm}`"
-            )
-    if len(stale) > 15:
-        lines.append(f"  _… и ещё {len(stale) - 15} (скрыто)_")
+    # Group by (name, idle_days) — деплоится по всем kingdom-ам синхронно,
+    # это типичный case: 5 одинаковых backup-deployments × 62d.
+    by_group: defaultdict = defaultdict(list)
+    for e in entries:
+        key = (e[2], e[0])  # (name, idle_days)
+        by_group[key].append(e)
+
+    # Render: для groups с ≥3 namespace — squash; иначе детально.
+    rendered_groups: List[Tuple[int, str]] = []  # (max_idle для sort, rendered_line)
+    seen_namespaces: set = set()
+    # 1) Cross-namespace groups (squashed)
+    for (name, idle), group in by_group.items():
+        if len(group) >= 3:
+            namespaces = sorted({e[1] for e in group})
+            teams = sorted({e[3] for e in group})
+            seen_namespaces.update(namespaces)
+            user, build = await deployer_fn(namespaces[0], group[0][5])
+            deployer = f" · last by {user} (#{build})" if user else ""
+            teams_str = ",".join(f"@{t}" for t in teams[:3])
+            if len(teams) > 3:
+                teams_str += f"+{len(teams)-3}"
+            rendered_groups.append((
+                idle,
+                f"  • `{name}` × {len(group)} ns ({teams_str}) · idle **{idle}d**{deployer}",
+            ))
+
+    # 2) Singular/duo entries (per-namespace, до 10 строк max)
+    singular: List[Tuple[int, str, str, str, int, datetime]] = sorted(
+        (e for e in entries if e[1] not in seen_namespaces),
+        key=lambda e: (-e[0], e[2]),
+    )
+    # TC lookup для top-10 singular (cap на N TC-calls).
+    singular_cap = 10
+    for e in singular[:singular_cap]:
+        idle, ns, name, team, _r, last_dt = e
+        user, build = await deployer_fn(ns, last_dt)
+        deployer = f" · last by {user} (#{build})" if user else ""
+        rendered_groups.append((
+            idle,
+            f"  • `{name}` _{ns}_ (@{team}) · idle **{idle}d**{deployer}",
+        ))
+
+    # Сортируем итоговый блок по idle desc + cap всё ещё в 12 строк
+    rendered_groups.sort(key=lambda x: -x[0])
+    cap_total = 12
+    for _idle, line in rendered_groups[:cap_total]:
+        lines.append(line)
+
+    extra = len(rendered_groups) - cap_total + max(0, len(singular) - singular_cap)
+    if extra > 0:
+        lines.append(f"  _… и ещё {extra} (скрыто)_")
     return "\n".join(lines)
 
 
@@ -305,7 +387,7 @@ async def build_digest(db: Session) -> str:
     alerts_text, unique_alerts, _ = firing_alerts_section(fired_series, ns_to_team)
     top_types_text = top_alert_types_section(unique_alerts)
     fragile_text = fragile_services_section(db, ns_to_team)
-    stale_text = stale_deployments_section(
+    stale_text = await stale_deployments_section(
         db, ns_to_team, threshold_days=settings.STATS_DIGEST_STALE_DAYS
     )
     kg_text = kg_quality_section(db)
