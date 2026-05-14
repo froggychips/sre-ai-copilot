@@ -7,8 +7,8 @@ from __future__ import annotations
 
 from datetime import datetime
 
-from sqlalchemy import (JSON, Column, DateTime, ForeignKey, Index, Integer,
-                        String, UniqueConstraint)
+from sqlalchemy import (JSON, Boolean, Column, DateTime, ForeignKey, Index,
+                        Integer, String, UniqueConstraint)
 from sqlalchemy.orm import relationship
 
 from app.database import Base
@@ -28,6 +28,9 @@ class Service(Base):
     namespace = Column(String, nullable=False, index=True)
     team_owner = Column(String, nullable=True)   # squad, например `squad-gd`
     metadata_json = Column(JSON, nullable=True)  # labels, репо, runbook URL...
+    # Synthetic = по дизайну никогда не имеет edges (cron-backups, nats-tools,
+    # observability-exporters). Исключается из Orphan %-метрики в kg_quality.
+    synthetic = Column(Boolean, nullable=False, default=False, server_default="false")
 
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)

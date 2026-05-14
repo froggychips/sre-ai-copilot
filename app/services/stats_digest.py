@@ -325,13 +325,21 @@ def kg_quality_section(db: Session) -> str:
             text("SELECT kind, count(*) FROM kg_service_edges GROUP BY kind")
         ).fetchall()
     }
+    synthetic = db.execute(
+        text("SELECT count(*) FROM kg_services WHERE synthetic = true")
+    ).scalar() or 0
+    # Orphan = real services без edges. Synthetic (backup-cron'ы, nats-tools,
+    # observability-exporters) исключены: они никогда edges не имеют по дизайну
+    # и засчитывались бы как ложно-orphan.
     orphan = db.execute(text("""
         SELECT count(*) FROM kg_services s
-        WHERE s.id NOT IN (
-            SELECT src_id FROM kg_service_edges
-            UNION SELECT dst_id FROM kg_service_edges
-        )
+        WHERE NOT s.synthetic
+          AND s.id NOT IN (
+              SELECT src_id FROM kg_service_edges
+              UNION SELECT dst_id FROM kg_service_edges
+          )
     """)).scalar() or 0
+    real_total = services_total - synthetic
     teamed = db.execute(
         text("SELECT count(*) FROM kg_services WHERE team_owner IS NOT NULL")
     ).scalar() or 0
@@ -340,14 +348,15 @@ def kg_quality_section(db: Session) -> str:
         FROM kg_services GROUP BY team_owner ORDER BY count DESC LIMIT 6
     """)).fetchall()
 
-    pct_orphan = (100 * orphan // services_total) if services_total else 0
+    pct_orphan = (100 * orphan // real_total) if real_total else 0
     pct_team = (100 * teamed // services_total) if services_total else 0
     edges_str = ", ".join(f"{k}={v}" for k, v in sorted(edges_by_kind.items()))
     teams_str = ", ".join(f"@{t}={c}" for t, c in by_team)
 
+    synthetic_suffix = f" · synthetic скрыты: `{synthetic}`" if synthetic else ""
     return "\n".join([
         "**🧬 KG quality**",
-        f"  Services: `{services_total}` · Orphan: `{orphan}` ({pct_orphan}%)",
+        f"  Services: `{services_total}` · Orphan: `{orphan}`/`{real_total}` ({pct_orphan}%){synthetic_suffix}",
         f"  Edges: `{edges_total}` ({edges_str})",
         f"  Team-owned: `{teamed}` ({pct_team}%) → {teams_str}",
     ])

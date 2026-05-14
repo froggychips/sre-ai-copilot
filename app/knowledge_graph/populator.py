@@ -30,6 +30,7 @@ def upsert_service(
     name: str,
     team_owner: Optional[str] = None,
     metadata: Optional[Dict[str, Any]] = None,
+    synthetic: Optional[bool] = None,
 ) -> Service:
     svc = (
         db.query(Service)
@@ -42,6 +43,7 @@ def upsert_service(
             name=name,
             team_owner=team_owner,
             metadata_json=metadata,
+            synthetic=bool(synthetic) if synthetic is not None else False,
         )
         db.add(svc)
         db.flush()
@@ -53,6 +55,9 @@ def upsert_service(
             changed = True
         if metadata is not None:
             svc.metadata_json = metadata
+            changed = True
+        if synthetic is not None and svc.synthetic != synthetic:
+            svc.synthetic = synthetic
             changed = True
         if changed:
             db.flush()
