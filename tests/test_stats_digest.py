@@ -264,11 +264,13 @@ async def test_recent_deploys_shows_status_marker_on_failure():
 
 
 @pytest.mark.asyncio
-async def test_recent_deploys_empty_when_tc_returns_nothing():
+async def test_recent_deploys_hides_section_when_tc_returns_nothing():
+    """Если TC не сконфигурирован или нет deploy-билдов — секцию вообще
+    скрываем (header без данных = шум). Возвращаем пустую строку."""
     async def fake_fetch(*, lookback_hours, limit):
         return []
     text = await stats_digest.recent_deploys_section(fetch_fn=fake_fetch)
-    assert "TC недоступен" in text or "нет deploy-билдов" in text
+    assert text == ""
 
 
 @pytest.mark.asyncio
@@ -301,14 +303,12 @@ def test_top_alert_types_excludes_infrastructure_noise():
 # ── kg_quality_section ─────────────────────────────────────────────────────
 
 def test_kg_quality_renders_full_state():
-    """Order of execute-вызовов в kg_quality_section:
+    """Order of execute-вызовов в kg_quality_section (compact, без Team-owned):
        1. services_total .scalar
        2. edges_total .scalar
        3. edges_by_kind .fetchall
        4. synthetic .scalar
        5. orphan (исключая synthetic) .scalar
-       6. teamed .scalar
-       7. by_team .fetchall
     """
     db = MagicMock()
     call_results = [
@@ -317,8 +317,6 @@ def test_kg_quality_renders_full_state():
         MagicMock(fetchall=lambda: [("calls", 36), ("uses_nats", 660)]),
         MagicMock(scalar=lambda: 82),   # synthetic
         MagicMock(scalar=lambda: 47),   # real-orphan
-        MagicMock(scalar=lambda: 384),  # teamed
-        MagicMock(fetchall=lambda: [("kingdom1", 71), ("kingdom2", 71), ("shared", 77)]),
     ]
     db.execute.side_effect = call_results
 
@@ -329,7 +327,9 @@ def test_kg_quality_renders_full_state():
     assert "synthetic скрыты: `82`" in rendered
     assert "calls=36" in rendered
     assert "uses_nats=660" in rendered
-    assert "@kingdom1" in rendered
+    # Team-owned строка убрана (всегда 100% после KG team_owner enrichment) —
+    # она была шумом, занимала самую длинную строку в digest.
+    assert "Team-owned" not in rendered
 
 
 def test_kg_quality_no_synthetic_no_suffix():
@@ -341,8 +341,6 @@ def test_kg_quality_no_synthetic_no_suffix():
         MagicMock(fetchall=lambda: [("calls", 200)]),
         MagicMock(scalar=lambda: 0),   # synthetic = 0
         MagicMock(scalar=lambda: 10),
-        MagicMock(scalar=lambda: 100),
-        MagicMock(fetchall=lambda: []),
     ]
     rendered = stats_digest.kg_quality_section(db)
     assert "synthetic скрыты" not in rendered
