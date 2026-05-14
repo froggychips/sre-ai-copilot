@@ -1,4 +1,5 @@
-"""Тесты на kg_sync enrichment — team_owner + NATS-cluster edges.
+"""Тесты на kg_sync enrichment — team_owner + NATS-cluster edges
+плюс namespace discovery (после scrub-а DEFAULT_SCAN_NAMESPACES).
 
 Проверяем pure-функции вычленения (без работы с БД), плюс smoke на
 sync_namespace через моки upsert_service / upsert_edge / kubectl.
@@ -7,8 +8,10 @@ from unittest.mock import MagicMock, patch
 
 from app.knowledge_graph.kg_sync import (
     _derive_team_owner,
+    _discover_namespaces,
     _extract_nats_clusters,
     sync_namespace,
+    sync_topology,
 )
 
 
@@ -151,3 +154,80 @@ def test_sync_namespace_calls_upsert_with_team_owner_and_nats_edges():
 
     assert stats["services"] == 1
     assert stats["edges"] == 3
+
+
+# ── _discover_namespaces (после scrub DEFAULT_SCAN_NAMESPACES) ──────────────
+
+def _fake_kubectl_ns(stdout: str, returncode: int = 0):
+    """Helper для мока subprocess.run результата `kubectl get ns -o jsonpath=...`."""
+    fake = MagicMock()
+    fake.stdout = stdout
+    fake.stderr = ""
+    fake.returncode = returncode
+    return fake
+
+
+def test_discover_namespaces_excludes_system_prefixes():
+    fake_out = "kube-system kube-public kube-node-lease default monitoring squad-a squad-b cert-manager"
+    with patch("app.knowledge_graph.kg_sync.subprocess.run", return_value=_fake_kubectl_ns(fake_out)):
+        result = _discover_namespaces()
+    # System namespaces (kube-*, default, monitoring, cert-manager) исключены.
+    assert set(result) == {"squad-a", "squad-b"}
+
+
+def test_discover_namespaces_handles_kubectl_failure():
+    with patch("app.knowledge_graph.kg_sync.subprocess.run", return_value=_fake_kubectl_ns("", returncode=1)):
+        assert _discover_namespaces() == []
+
+
+def test_discover_namespaces_handles_exception():
+    with patch("app.knowledge_graph.kg_sync.subprocess.run", side_effect=OSError("no kubectl")):
+        assert _discover_namespaces() == []
+
+
+# ── sync_topology source-of-namespaces priority ─────────────────────────────
+
+def test_sync_topology_uses_explicit_argument():
+    """Аргумент `namespaces` — высший приоритет, ни settings ни discover не дёргаются."""
+    with patch("app.knowledge_graph.kg_sync.sync_namespace") as mock_sync_ns, \
+         patch("app.knowledge_graph.kg_sync._discover_namespaces") as mock_disc:
+        mock_sync_ns.return_value = {"services": 0, "edges": 0, "skipped": 0}
+        sync_topology(db=MagicMock(), namespaces=["a", "b"])
+    mock_disc.assert_not_called()
+    assert mock_sync_ns.call_count == 2
+
+
+def test_sync_topology_reads_settings_when_arg_none():
+    """namespaces=None → берём из settings.KG_SCAN_NAMESPACES (env-driven)."""
+    with patch("app.knowledge_graph.kg_sync.sync_namespace") as mock_sync_ns, \
+         patch("app.knowledge_graph.kg_sync._discover_namespaces") as mock_disc, \
+         patch("app.config.settings") as mock_settings:
+        mock_settings.KG_SCAN_NAMESPACES = "team-x, team-y , team-z"  # whitespace стрипается
+        mock_sync_ns.return_value = {"services": 0, "edges": 0, "skipped": 0}
+        sync_topology(db=MagicMock())
+    mock_disc.assert_not_called()
+    called_ns = [c.args[1] for c in mock_sync_ns.call_args_list]
+    assert sorted(called_ns) == ["team-x", "team-y", "team-z"]
+
+
+def test_sync_topology_falls_back_to_discovery_when_settings_empty():
+    """settings.KG_SCAN_NAMESPACES пусто → _discover_namespaces."""
+    with patch("app.knowledge_graph.kg_sync.sync_namespace") as mock_sync_ns, \
+         patch("app.knowledge_graph.kg_sync._discover_namespaces", return_value=["auto-1", "auto-2"]) as mock_disc, \
+         patch("app.config.settings") as mock_settings:
+        mock_settings.KG_SCAN_NAMESPACES = ""
+        mock_sync_ns.return_value = {"services": 0, "edges": 0, "skipped": 0}
+        sync_topology(db=MagicMock())
+    mock_disc.assert_called_once()
+    assert mock_sync_ns.call_count == 2
+
+
+def test_sync_topology_no_namespaces_returns_zero_stats():
+    """Пустой settings + пустой discover → no-op return, не падаем."""
+    with patch("app.knowledge_graph.kg_sync._discover_namespaces", return_value=[]), \
+         patch("app.config.settings") as mock_settings, \
+         patch("app.knowledge_graph.kg_sync.sync_namespace") as mock_sync_ns:
+        mock_settings.KG_SCAN_NAMESPACES = ""
+        result = sync_topology(db=MagicMock())
+    assert result == {"services": 0, "edges": 0, "namespaces": 0, "errors": 0}
+    mock_sync_ns.assert_not_called()

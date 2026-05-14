@@ -53,13 +53,11 @@ _SKIP_SERVICE_NAMES = frozenset({
 })
 _SKIP_VALUE_FRAGMENTS = ("azure", "google", "openai", "gpt", "amazonaws", "redis", "postgres", "nats")
 
-# Namespace'ы для сканирования по умолчанию (env-prefix → список)
-DEFAULT_SCAN_NAMESPACES = [
-    "preprod-kingdom1", "preprod-kingdom2", "preprod-kingdom3", "preprod-shared",
-    "preupdate-kingdom1", "preupdate-kingdom2", "preupdate-kingdom3", "preupdate-kingdom5", "preupdate-shared",
-    "prod-kingdom1", "prod-kingdom2", "prod-kingdom3", "prod-kingdom4", "prod-kingdom5",
-    "prod-lo-legal", "prod-shared",
-]
+# Namespace-list для KG-sync: тянется из settings.KG_SCAN_NAMESPACES
+# (env-var `KG_SCAN_NAMESPACES`, comma-separated). Если пусто — sync_topology
+# делает auto-discovery всех non-system namespaces через `kubectl get ns`.
+# Раньше тут был хардкоженный список — выпилили чтобы не утекали в репо
+# конкретные имена клиентской инфры.
 
 
 def _kubectl_get_deployments(namespace: str) -> List[Dict[str, Any]]:
@@ -212,12 +210,53 @@ def sync_namespace(db: Session, namespace: str) -> Dict[str, int]:
     return stats
 
 
+_SYSTEM_NAMESPACE_PREFIXES = ("kube-", "openshift-", "cattle-")
+_SYSTEM_NAMESPACES = frozenset({"default", "monitoring", "ingress-nginx", "cert-manager"})
+
+
+def _discover_namespaces() -> List[str]:
+    """Auto-discovery: `kubectl get ns` минус system-namespaces.
+
+    Используется когда settings.KG_SCAN_NAMESPACES не выставлен.
+    System-namespaces (kube-*, monitoring, cert-manager и т.п.) исключаются.
+    """
+    try:
+        result = subprocess.run(
+            ["kubectl", "get", "namespaces", "-o", "jsonpath={.items[*].metadata.name}"],
+            capture_output=True, text=True, timeout=15,
+        )
+        if result.returncode != 0:
+            logger.warning("kg_sync.discover_failed: %s", result.stderr[:200])
+            return []
+        all_ns = result.stdout.strip().split()
+        return [
+            ns for ns in all_ns
+            if ns not in _SYSTEM_NAMESPACES
+            and not any(ns.startswith(p) for p in _SYSTEM_NAMESPACE_PREFIXES)
+        ]
+    except Exception as e:
+        logger.warning("kg_sync.discover_exception: %s", e)
+        return []
+
+
 def sync_topology(
     db: Session,
     namespaces: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
-    """Синхронизировать топологию всех namespace'ов. Коммит — снаружи."""
-    namespaces = namespaces or DEFAULT_SCAN_NAMESPACES
+    """Синхронизировать топологию всех namespace'ов. Коммит — снаружи.
+
+    Приоритет источников списка namespaces:
+      1. Аргумент `namespaces` (override).
+      2. settings.KG_SCAN_NAMESPACES (env-var, comma-separated).
+      3. Auto-discovery через `kubectl get ns` минус system-namespaces.
+    """
+    if namespaces is None:
+        from app.config import settings
+        raw = (getattr(settings, "KG_SCAN_NAMESPACES", "") or "").strip()
+        namespaces = [n.strip() for n in raw.split(",") if n.strip()] if raw else _discover_namespaces()
+    if not namespaces:
+        logger.warning("kg_sync.no_namespaces_to_scan")
+        return {"services": 0, "edges": 0, "namespaces": 0, "errors": 0}
     total = {"services": 0, "edges": 0, "namespaces": 0, "errors": 0}
 
     for ns in namespaces:
@@ -242,12 +281,15 @@ if __name__ == "__main__":
     import sys
     from app.database import SessionLocal
 
+    # CLI: python -m app.knowledge_graph.kg_sync [prefix-filter]
+    # Без аргумента — sync по settings.KG_SCAN_NAMESPACES / auto-discovery.
+    # С prefix — фильтрует auto-discovery list по prefix-у.
     filter_prefix = sys.argv[1] if len(sys.argv) > 1 else None
-    namespaces = (
-        [ns for ns in DEFAULT_SCAN_NAMESPACES if ns.startswith(filter_prefix)]
-        if filter_prefix
-        else DEFAULT_SCAN_NAMESPACES
-    )
+    namespaces: Optional[List[str]] = None
+    if filter_prefix:
+        discovered = _discover_namespaces()
+        namespaces = [ns for ns in discovered if ns.startswith(filter_prefix)]
+    # else: sync_topology возьмёт из settings / auto-discovery
 
     db = SessionLocal()
     try:

@@ -4,7 +4,7 @@
 [![Python](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/)
 [![FastAPI](https://img.shields.io/badge/FastAPI-0.104-009688)](https://fastapi.tiangolo.com/)
 [![Celery](https://img.shields.io/badge/Celery-5.3-37814A)](https://docs.celeryq.dev/)
-[![Release](https://img.shields.io/badge/release-v0.7.0-blue)](CHANGELOG.md)
+[![Release](https://img.shields.io/badge/release-v0.7.3-blue)](CHANGELOG.md)
 
 > **[English](#english) · [Русский](#русский)**
 
