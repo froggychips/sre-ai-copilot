@@ -31,13 +31,14 @@ async def lifespan(app: FastAPI):
     start_http_server(port=8001)
     log.info("application_startup", prometheus_port=8001)
     yield
-    # Shutdown: graceful Celery + закрытие DB-pool + Redis-клиент rate-limiter-а.
+    # Shutdown: закрытие локальных ресурсов только.
     # engine — синхронный sqlalchemy.Engine (create_engine), dispose() не awaitable.
+    #
+    # ВАЖНО: НЕ вызываем celery_app.control.shutdown() — это broker-wide
+    # broadcast через Redis, который шатдаунит ВСЕ worker-ы в кластере при
+    # любом rolling restart api-pod. Worker-ы реагируют на SIGTERM от k8s сами.
+    # Обнаружено на проде после rolling restart api с v0.6 → v0.7.0.
     log.info("application_shutdown")
-    try:
-        celery_app.control.shutdown()
-    except Exception as e:
-        log.warning("celery_shutdown_failed", error=str(e))
     await rate_limit.close()
     engine.dispose()
 
