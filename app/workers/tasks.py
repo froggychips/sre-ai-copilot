@@ -47,6 +47,13 @@ celery_app.conf.beat_schedule = {
         "task": "daily_stats_digest",
         "schedule": crontab(hour=settings.STATS_DIGEST_HOUR_UTC, minute=0),
     },
+    # TC deploys → kg_deployments. БЕЗ LLM. Включает RecentDeployRule
+    # на live deploys без incident-flow. Каждые 15 минут берёт recent
+    # builds из TC за 24h и upsert-ит в kg_deployments по (service, sha).
+    "tc-deploys-to-kg": {
+        "task": "tc_deploys_to_kg",
+        "schedule": crontab(minute="*/15"),
+    },
 }
 
 
@@ -105,8 +112,125 @@ def kg_topology_sync_task():
     except Exception as e:
         logger.error("kg_topology_sync.failed: %s", e)
         raise
+
+
+@celery_app.task(name="tc_deploys_to_kg")
+def tc_deploys_to_kg_task():
+    """Pull recent TC deploys → upsert в kg_deployments. БЕЗ LLM-вызовов.
+
+    Stage 1: per-namespace attribution. Для каждого TC build с branch
+    соответствующим namespace берётся «ns-representative» service (первый
+    non-synthetic в этом ns) и пишется deployment-record. Это даёт
+    `RecentDeployRule` работающий сигнал «deploy в этом ns был N минут назад»
+    хотя и не per-service.
+
+    Per-service attribution через `TC.changes.files` — отдельная Stage 2.
+
+    Dedup: `record_deployment` идемпотентен по (service_id, buildtype_id,
+    build_number) — повторные cron-tick'и не плодят дубликаты.
+    """
+    return asyncio.run(_tc_deploys_to_kg_logic())
+
+
+async def _tc_deploys_to_kg_logic() -> dict:
+    from datetime import datetime, timezone
+
+    from app.knowledge_graph.populator import record_deployment
+    from app.knowledge_graph.schema import Service
+    from app.services.teamcity_service import branch_for_namespace, recent_deploys
+
+    # Берём builds за последние 24h. Cron каждые 15 мин — overkill по
+    # window, но dedup защищает и cheaply tolerant к беатам-пропускам.
+    builds = await recent_deploys(lookback_hours=24, limit=50)
+    if not builds:
+        return {"builds_fetched": 0, "kg_deployments_added": 0}
+
+    db = SessionLocal()
+    added = 0
+    try:
+        # Map branch → list of namespaces в KG. Реализуется через обратное
+        # отображение `branch_for_namespace`: проходим distinct namespaces
+        # из kg_services и группируем по branch.
+        all_ns = [
+            ns for (ns,) in db.query(Service.namespace).distinct().all()
+        ]
+        ns_by_branch: dict[str, list[str]] = {}
+        for ns in all_ns:
+            br = branch_for_namespace(ns)
+            if br:
+                ns_by_branch.setdefault(br, []).append(ns)
+
+        for b in builds:
+            branch_full = (b.get("branch") or "").replace("refs/heads/", "")
+            target_namespaces = ns_by_branch.get(branch_full, [])
+            if not target_namespaces:
+                continue
+
+            finished = b.get("finished_at")
+            started = b.get("finished_at")  # TC `recent_deploys` не отдаёт start; используем finish
+            if not started:
+                continue
+            try:
+                started_dt = datetime.fromisoformat(started.replace("Z", "+00:00"))
+            except ValueError:
+                continue
+            started_naive = started_dt.replace(tzinfo=None)
+            finished_naive = None
+            if finished:
+                try:
+                    finished_naive = datetime.fromisoformat(
+                        finished.replace("Z", "+00:00")
+                    ).replace(tzinfo=None)
+                except ValueError:
+                    pass
+
+            for ns in target_namespaces:
+                # «ns-representative» — первый non-synthetic service.
+                rep_svc = (
+                    db.query(Service)
+                    .filter_by(namespace=ns, synthetic=False)
+                    .order_by(Service.name)
+                    .first()
+                )
+                if rep_svc is None:
+                    continue
+                try:
+                    record_deployment(
+                        db,
+                        service=rep_svc,
+                        started_at=started_naive,
+                        finished_at=finished_naive,
+                        buildtype_id=b.get("buildtype_id"),
+                        build_number=str(b.get("number") or ""),
+                        status=b.get("status"),
+                        triggered_by=b.get("triggered_by"),
+                        extras={
+                            "branch": branch_full,
+                            "buildtype_name": b.get("buildtype_name"),
+                            "url": b.get("url"),
+                            "namespace_scope": True,  # маркер ns-wide attribution
+                        },
+                    )
+                    added += 1
+                except Exception as e:
+                    logger.warning(
+                        "tc_deploys_to_kg.record_failed ns=%s build=#%s: %s",
+                        ns, b.get("number"), e,
+                    )
+        db.commit()
+    except Exception as e:
+        logger.error("tc_deploys_to_kg.failed: %s", e)
+        db.rollback()
+        raise
     finally:
         db.close()
+
+    now_unix = datetime.now(timezone.utc).timestamp()
+    logger.info(
+        "tc_deploys_to_kg.done builds=%d added=%d at=%.0f",
+        len(builds), added, now_unix,
+    )
+    return {"builds_fetched": len(builds), "kg_deployments_added": added}
 
 
 @celery_app.task(name="daily_stats_digest")

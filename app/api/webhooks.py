@@ -188,6 +188,65 @@ async def alertmanager_webhook(
     return {"status": "accepted", "alerts": accepted}
 
 
+@router.post(
+    "/alertmanager/store",
+    status_code=202,
+    dependencies=[Depends(verify_alertmanager_signature)],
+)
+async def alertmanager_webhook_store_only(
+    payload: AlertManagerWebhook, db: Session = Depends(get_db)
+):
+    """KG event-store endpoint — БЕЗ LLM-pipeline'а.
+
+    Принимает AlertManager batch, записывает каждый alert в `kg_alerts`
+    через `populate_from_incident`, ACK 202. Никакого
+    `process_incident_task.delay()` — LLM-токены НЕ расходуются.
+
+    Цель: наполнить event-store чтобы `nearby_alerts`/`incidents_on`/
+    recurrence-detection заработали на live data. AlertManager рулится
+    сюда; основной `/alertmanager` endpoint остаётся отключенным до
+    запуска E2E-тестов и budget-cap'ов.
+
+    HMAC-подпись и signature-check те же что и у full pipeline endpoint.
+    """
+    from app.knowledge_graph.auto_populator import populate_from_incident
+
+    raw_payload = payload.model_dump()
+    raw_payload.setdefault("id", payload.groupKey)
+    raw_collector.ingest(raw_payload)
+
+    stored = []
+    for alert in payload.alerts:
+        try:
+            validate_alert_labels(alert)
+            incident = Incident.from_alertmanager(alert)
+        except HTTPException:
+            # Малформированные alerts skip-аем, не падаем на batch.
+            log.warning("kg_store.skipped_invalid_alert", labels=alert.labels)
+            continue
+
+        # Resolved-events тоже регистрируем — даёт recurrence/flapping
+        # сигнал, не только firing.
+        if alert.status == "resolved":
+            stored.append({"incident_id": incident.incident_id, "result": "resolved-skipped"})
+            continue
+
+        try:
+            stats = populate_from_incident(db, incident)
+            stored.append({"incident_id": incident.incident_id, "result": "stored", **stats})
+        except Exception as e:
+            log.warning(
+                "kg_store.populate_failed",
+                incident_id=incident.incident_id,
+                error=type(e).__name__,
+                message=str(e),
+            )
+            stored.append({"incident_id": incident.incident_id, "result": "failed"})
+
+    db.commit()
+    return {"status": "stored", "alerts": stored}
+
+
 @router.get("/status/{task_id}")
 async def get_task_status(task_id: str):
     res = celery_app.AsyncResult(task_id)
