@@ -30,6 +30,17 @@ _SVC_URL_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Env-name hint: после расширенного scan-а считаем `*_URL` / `*_HOST` /
+# `*_ENDPOINT` / `*_ADDR` / `*_SERVICE_HOST` / `*_DSN` сильным сигналом что
+# value содержит target host — даже без явной http-схемы.
+_ENV_URL_HINT_RE = re.compile(
+    r"(?:^|_)(URL|HOST|ENDPOINT|ADDR|SERVICE_HOST|DSN)$",
+    re.IGNORECASE,
+)
+
+# k8s service-name pattern: lowercase letters/digits/hyphens, длина ≥3.
+_SVC_NAME_RE = re.compile(r"^[a-z][a-z0-9-]{2,}$")
+
 # NATS env-pattern: SHARED_NATS_CONNECTION, KINGDOM_NATS_CLIENT_CONNECTION,
 # NATS_FOR_CLIENT_SERVICE_CREDS, etc. Значения обычно подставляются runtime
 # из ConfigMap-from-file и в env-dump пустые — но НАЛИЧИЕ переменной
@@ -106,7 +117,11 @@ def _extract_upstreams(
     deploy: Dict[str, Any],
     own_namespace: str,
 ) -> List[Tuple[str, str]]:
-    """Вернуть (service_name, namespace) из env vars деплоя."""
+    """LEGACY URL-based extractor (только http(s)://-values).
+
+    Сохранён для backward-compat и существующих тестов. Новый расширенный
+    scan делает `_extract_upstreams_extended` с `_parse_host_from_value`.
+    """
     envs: List[Dict[str, Any]] = []
     for c in deploy.get("spec", {}).get("template", {}).get("spec", {}).get("containers", []):
         envs += c.get("env") or []
@@ -132,6 +147,115 @@ def _extract_upstreams(
         upstreams.add((svc_name, ns))
 
     return sorted(upstreams)
+
+
+# ── Extended env-URL scan (PR B) ────────────────────────────────────────────
+
+
+def _parse_host_from_value(value: str, allow_no_scheme: bool) -> Optional[Tuple[str, Optional[str]]]:
+    """Достать (service_name, namespace_or_None) из env-value.
+
+    Распознаваемые форматы:
+      - `https?://svc(:port)?(/path)?`           — explicit scheme
+      - `https?://svc.ns(.svc.cluster.local)?...` — explicit scheme + ns
+      - `<driver>://user:pass@svc:port/db`        — DSN (postgres/mysql/redis/...)
+      - `svc(:port)?` или `svc.ns(:port)?`        — bare host (`allow_no_scheme=True` only,
+                                                    e.g. когда env-name=`*_HOST`)
+
+    Возвращает None для:
+      - пустой value
+      - значений без host-токена (одни цифры, paths, etc.)
+      - IP-адресов / localhost-fragments
+      - external hostnames без k8s-shape (cloud providers и т.п.)
+
+    Validation на service-name (k8s-shape) делается через `_SVC_NAME_RE` —
+    отсекает шумовые слова длиной <3, заглавные, IP, etc.
+    """
+    v = (value or "").strip()
+    if not v:
+        return None
+
+    # Срезаем схему:
+    if "://" in v:
+        _scheme, rest = v.split("://", 1)
+        # user:pass@host для DSN-стиля
+        if "@" in rest:
+            rest = rest.split("@", 1)[1]
+    elif allow_no_scheme:
+        rest = v
+    else:
+        return None
+
+    # Cut query: host?param=... → host
+    rest = rest.split("?", 1)[0]
+    # Cut path: host:port/path → host:port
+    rest = rest.split("/", 1)[0]
+    # Cut port: host:port → host
+    rest = rest.split(":", 1)[0]
+    # Cut k8s FQDN suffix
+    rest = re.sub(r"\.svc\.cluster\.local$", "", rest)
+
+    if not rest:
+        return None
+
+    # Cloud / external — проверяем по HOST части (не full value), чтобы
+    # не отсекать legit k8s DSN типа `postgres://finance-db.prod-shared`.
+    lower_host = rest.lower()
+    if any(frag in lower_host for frag in _SKIP_VALUE_FRAGMENTS):
+        return None
+
+    parts = rest.split(".", 1)
+    svc = parts[0].lower()
+    ns = parts[1].lower() if len(parts) > 1 else None
+
+    if not _SVC_NAME_RE.match(svc):
+        return None
+    if svc in _SKIP_SERVICE_NAMES:
+        return None
+    return (svc, ns)
+
+
+def _extract_upstreams_extended(
+    deploy: Dict[str, Any],
+    own_namespace: str,
+    known_index: Dict[str, set],
+) -> List[Tuple[str, str]]:
+    """Расширенный env-vars scan: возвращает (svc_name, namespace).
+
+    Шаги для каждого env:
+      1. Извлечь host из value (`_parse_host_from_value`). Без http-схемы
+         только если env-name матчит `_ENV_URL_HINT_RE`.
+      2. Резолвить namespace: если значение содержало `.ns` — берём его;
+         иначе `own_namespace`.
+      3. **Match only existing**: возвращаем только пары присутствующие в
+         `known_index[ns]` — не создаём фейк-ноды для external hostnames.
+
+    `known_index` — map ns → set of service-names в KG. Передаётся из
+    `sync_topology` после Pass 1.
+    """
+    envs: List[Dict[str, Any]] = []
+    for c in deploy.get("spec", {}).get("template", {}).get("spec", {}).get("containers", []):
+        envs += c.get("env") or []
+
+    own_name = deploy.get("metadata", {}).get("name", "") or ""
+    found: set[Tuple[str, str]] = set()
+    for e in envs:
+        v = str(e.get("value") or "")
+        n = str(e.get("name") or "")
+        if not v:
+            continue
+        is_url_hint = bool(_ENV_URL_HINT_RE.search(n))
+        host = _parse_host_from_value(v, allow_no_scheme=is_url_hint)
+        if host is None:
+            continue
+        svc, ns = host
+        ns = ns or own_namespace
+        if svc == own_name and ns == own_namespace:
+            continue  # self-reference
+        if svc not in known_index.get(ns, ()):
+            continue  # match only existing services (фильтр external hosts)
+        found.add((svc, ns))
+    return sorted(found)
 
 
 def _derive_team_owner(namespace: str) -> Optional[str]:
@@ -188,10 +312,19 @@ def _extract_nats_clusters(
     return sorted(found)
 
 
-def sync_namespace(db: Session, namespace: str) -> Dict[str, int]:
-    """Синхронизировать топологию одного namespace."""
+def sync_namespace(
+    db: Session,
+    namespace: str,
+    deploys: Optional[List[Dict[str, Any]]] = None,
+) -> Dict[str, int]:
+    """Синхронизировать топологию одного namespace.
+
+    `deploys` — опциональный pre-fetched список (для двухпроходного
+    sync_topology). Если None, тянем через `_kubectl_get_deployments` сами.
+    """
     stats = {"services": 0, "edges": 0, "skipped": 0}
-    deploys = _kubectl_get_deployments(namespace)
+    if deploys is None:
+        deploys = _kubectl_get_deployments(namespace)
 
     src_team = _derive_team_owner(namespace)
 
@@ -268,11 +401,60 @@ def _discover_namespaces() -> List[str]:
         return []
 
 
+def _build_known_index(db: Session) -> Dict[str, set]:
+    """Map namespace → set of service-names в KG.
+
+    Используется в Pass 2 для фильтрации «match only existing». Без этого
+    индекса extended-scan создавал бы фейк-ноды для external hostnames
+    (cloud providers, BAS endpoints), которые не имеют отношения к WO-графу.
+    """
+    from app.knowledge_graph.schema import Service
+    idx: Dict[str, set] = {}
+    for name, ns in db.query(Service.name, Service.namespace).all():
+        idx.setdefault(ns, set()).add(name)
+    return idx
+
+
+def _enrich_calls_edges_for_ns(
+    db: Session,
+    namespace: str,
+    deploys: List[Dict[str, Any]],
+    known_index: Dict[str, set],
+) -> int:
+    """Pass 2: extended env-scan + создание calls-edges только на existing.
+
+    Возвращает count новых edges (попыток upsert — дубликаты идемпотентны).
+    """
+    from app.knowledge_graph.schema import Service
+    edges_count = 0
+    for deploy in deploys:
+        name = deploy.get("metadata", {}).get("name", "")
+        if not name:
+            continue
+        src = db.query(Service).filter_by(namespace=namespace, name=name).one_or_none()
+        if src is None:
+            continue
+        for up_svc, up_ns in _extract_upstreams_extended(deploy, namespace, known_index):
+            dst = db.query(Service).filter_by(namespace=up_ns, name=up_svc).one_or_none()
+            if dst is None:
+                continue
+            upsert_edge(db, src=src, dst=dst, kind="calls", discovered_by="kg_sync/env_url_v2")
+            edges_count += 1
+    return edges_count
+
+
 def sync_topology(
     db: Session,
     namespaces: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
     """Синхронизировать топологию всех namespace'ов. Коммит — снаружи.
+
+    Два прохода:
+      Pass 1: per ns — services (+ synthetic flag) + NATS edges + legacy
+              URL-based calls-edges (только http(s)://-values).
+      Pass 2: после commit — расширенный env-scan (`*_HOST`/`*_DSN`/etc),
+              match только с already-existing services. Это даёт значительно
+              больше calls-edges и не создаёт фейк-нодов для external hosts.
 
     Приоритет источников списка namespaces:
       1. Аргумент `namespaces` (override).
@@ -286,22 +468,44 @@ def sync_topology(
     if not namespaces:
         logger.warning("kg_sync.no_namespaces_to_scan")
         return {"services": 0, "edges": 0, "namespaces": 0, "errors": 0}
-    total = {"services": 0, "edges": 0, "namespaces": 0, "errors": 0}
 
+    total: Dict[str, Any] = {
+        "services": 0, "edges": 0, "edges_extended": 0,
+        "namespaces": 0, "errors": 0,
+    }
+    deploys_cache: Dict[str, List[Dict[str, Any]]] = {}
+
+    # ── Pass 1: services + NATS edges + legacy calls ───────────────────
     for ns in namespaces:
         try:
-            stats = sync_namespace(db, ns)
+            deploys = _kubectl_get_deployments(ns)
+            deploys_cache[ns] = deploys
+            stats = sync_namespace(db, ns, deploys=deploys)
             total["services"] += stats["services"]
             total["edges"] += stats["edges"]
             total["namespaces"] += 1
             if stats["services"] > 0:
-                logger.info("kg_sync.ns_done ns=%s services=%d edges=%d",
+                logger.info("kg_sync.ns_pass1 ns=%s services=%d edges=%d",
                             ns, stats["services"], stats["edges"])
         except Exception as e:
-            logger.warning("kg_sync.ns_failed ns=%s: %s", ns, e)
+            logger.warning("kg_sync.ns_failed_pass1 ns=%s: %s", ns, e)
             total["errors"] += 1
-
     db.commit()
+
+    # ── Pass 2: extended env-scan ──────────────────────────────────────
+    known_index = _build_known_index(db)
+    for ns, deploys in deploys_cache.items():
+        try:
+            extra = _enrich_calls_edges_for_ns(db, ns, deploys, known_index)
+            total["edges_extended"] += extra
+            total["edges"] += extra
+            if extra > 0:
+                logger.info("kg_sync.ns_pass2 ns=%s extended_edges=%d", ns, extra)
+        except Exception as e:
+            logger.warning("kg_sync.ns_failed_pass2 ns=%s: %s", ns, e)
+            total["errors"] += 1
+    db.commit()
+
     logger.info("kg_sync.done total=%s", total)
     return total
 

@@ -10,7 +10,9 @@ from app.knowledge_graph.kg_sync import (
     _derive_team_owner,
     _discover_namespaces,
     _extract_nats_clusters,
+    _extract_upstreams_extended,
     _is_synthetic_service,
+    _parse_host_from_value,
     sync_namespace,
     sync_topology,
 )
@@ -45,6 +47,106 @@ def test_is_synthetic_rejects_real_services():
     assert not _is_synthetic_service("nats-streaming")  # не точное совпадение
     assert not _is_synthetic_service("")
     assert not _is_synthetic_service("redis")  # не -exporter
+
+
+# ── _parse_host_from_value (PR B — extended env scan) ───────────────────────
+
+
+def test_parse_host_http_url_with_port_and_path():
+    assert _parse_host_from_value("http://auth-service:8080/api/v1", allow_no_scheme=False) == ("auth-service", None)
+
+
+def test_parse_host_http_url_with_namespace():
+    assert _parse_host_from_value(
+        "https://auth-service.prod-shared.svc.cluster.local:8080", allow_no_scheme=False
+    ) == ("auth-service", "prod-shared")
+
+
+def test_parse_host_http_url_with_short_ns():
+    assert _parse_host_from_value("http://payment.prod-kingdom1:9000", allow_no_scheme=False) == ("payment", "prod-kingdom1")
+
+
+def test_parse_host_bare_host_requires_url_hint():
+    """`svc-name` без http-схемы — только когда env-name намекает (URL/HOST/etc)."""
+    assert _parse_host_from_value("auth-service", allow_no_scheme=True) == ("auth-service", None)
+    assert _parse_host_from_value("auth-service", allow_no_scheme=False) is None
+
+
+def test_parse_host_dsn_style():
+    """DSN-style: postgres://user:pass@host:port/db → host."""
+    assert _parse_host_from_value(
+        "postgres://user:secret@finance-db.prod-shared:5432/finance",
+        allow_no_scheme=True,
+    ) == ("finance-db", "prod-shared")
+
+
+def test_parse_host_rejects_cloud_fragments():
+    """Cloud / external — пропускаем рано (есть skip-fragments list)."""
+    assert _parse_host_from_value("https://api.openai.com/v1/chat", allow_no_scheme=False) is None
+    assert _parse_host_from_value("https://prod.amazonaws.com/...", allow_no_scheme=False) is None
+
+
+def test_parse_host_rejects_localhost_and_short_names():
+    assert _parse_host_from_value("http://localhost:3000", allow_no_scheme=False) is None
+    assert _parse_host_from_value("http://x:80", allow_no_scheme=False) is None  # name <3 chars
+    assert _parse_host_from_value("", allow_no_scheme=True) is None
+    assert _parse_host_from_value("http://127.0.0.1:8080", allow_no_scheme=False) is None  # invalid SVC name
+
+
+# ── _extract_upstreams_extended ─────────────────────────────────────────────
+
+
+def test_extract_upstreams_extended_match_only_existing():
+    """Если target в known_index — edge возвращается. Если нет — пропуск."""
+    deploy = _make_deploy([])
+    deploy["spec"]["template"]["spec"]["containers"][0]["env"] = [
+        {"name": "AUTH_URL", "value": "http://auth-service.prod-shared:8080"},  # известен
+        {"name": "PAYMENT_HOST", "value": "payment-svc"},                        # неизвестен
+        {"name": "EXTERNAL_API", "value": "https://api.openai.com/v1"},          # cloud — skipped
+    ]
+    deploy["metadata"] = {"name": "town-service"}
+    known = {
+        "prod-shared": {"auth-service"},
+        "prod-kingdom1": {"town-service"},  # тут только себя
+    }
+    out = _extract_upstreams_extended(deploy, "prod-kingdom1", known)
+    assert out == [("auth-service", "prod-shared")]
+
+
+def test_extract_upstreams_extended_skips_self_reference():
+    """Если env указывает на собственный сервис в собственном ns — skip."""
+    deploy = _make_deploy([])
+    deploy["spec"]["template"]["spec"]["containers"][0]["env"] = [
+        {"name": "SELF_URL", "value": "http://town-service:8080"},
+    ]
+    deploy["metadata"] = {"name": "town-service"}
+    known = {"prod-kingdom1": {"town-service"}}
+    assert _extract_upstreams_extended(deploy, "prod-kingdom1", known) == []
+
+
+def test_extract_upstreams_extended_requires_url_hint_for_bare_host():
+    """Bare host без env-name hint игнорируется (избежать false-positive)."""
+    deploy = _make_deploy([])
+    deploy["spec"]["template"]["spec"]["containers"][0]["env"] = [
+        # Нет _URL/_HOST/_DSN/etc — value=svc-name, но parse skip-нёт
+        {"name": "RANDOM_VAR", "value": "auth-service"},
+    ]
+    deploy["metadata"] = {"name": "town-service"}
+    known = {"prod-kingdom1": {"auth-service"}}
+    out = _extract_upstreams_extended(deploy, "prod-kingdom1", known)
+    assert out == []
+
+
+def test_extract_upstreams_extended_url_hint_unlocks_bare():
+    """env-name `*_HOST` → bare host матчится."""
+    deploy = _make_deploy([])
+    deploy["spec"]["template"]["spec"]["containers"][0]["env"] = [
+        {"name": "AUTH_HOST", "value": "auth-service"},
+    ]
+    deploy["metadata"] = {"name": "town-service"}
+    known = {"prod-kingdom1": {"auth-service", "town-service"}}
+    out = _extract_upstreams_extended(deploy, "prod-kingdom1", known)
+    assert out == [("auth-service", "prod-kingdom1")]
 
 
 # ── team_owner ──────────────────────────────────────────────────────────────
