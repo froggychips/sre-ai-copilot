@@ -30,6 +30,21 @@ _SVC_URL_RE = re.compile(
     re.IGNORECASE,
 )
 
+# NATS env-pattern: SHARED_NATS_CONNECTION, KINGDOM_NATS_CLIENT_CONNECTION,
+# NATS_FOR_CLIENT_SERVICE_CREDS, etc. Значения обычно подставляются runtime
+# из ConfigMap-from-file и в env-dump пустые — но НАЛИЧИЕ переменной
+# уже сигнал зависимости от NATS-cluster. На графе это синтетический
+# узел `nats-shared` / `nats-kingdom`, edge_kind=`uses_nats`.
+_NATS_ENV_RE = re.compile(
+    r"^(?P<scope>SHARED|KINGDOM)_NATS(?:_CLIENT)?_(?:CONNECTION|CREDS)$"
+    r"|^NATS_FOR_(?P<purpose>[A-Z_]+)_(?:CREDS|CONNECTION)$",
+    re.IGNORECASE,
+)
+
+# Env-prefix к namespace для определения "shared"-кластера NATS.
+# prod-kingdom1 → prod-shared, preprod-kingdom2 → preprod-shared, etc.
+_NAMESPACE_ENV_PREFIX_RE = re.compile(r"^(prod|preprod|preupdate)(?:-|$)")
+
 # Пропускаем явно внешние/нерелевантные сервисы.
 # Это blacklist для фильтрации значений из env-переменных подов,
 # а не bind-адрес сервера — B104 здесь ложно-положительный.
@@ -95,23 +110,103 @@ def _extract_upstreams(
     return sorted(upstreams)
 
 
+def _derive_team_owner(namespace: str) -> Optional[str]:
+    """team_owner = namespace без env-prefix.
+
+    prod-kingdom1   → "kingdom1"
+    preprod-shared  → "shared"
+    preupdate-kingdom3 → "kingdom3"
+    sre-ai          → None  (не WO-prefix)
+    """
+    m = re.match(r"^(?:prod|preprod|preupdate)-(.+)$", namespace)
+    return m.group(1) if m else None
+
+
+def _env_prefix(namespace: str) -> Optional[str]:
+    m = _NAMESPACE_ENV_PREFIX_RE.match(namespace)
+    return m.group(1) if m else None
+
+
+def _extract_nats_clusters(
+    deploy: Dict[str, Any],
+    own_namespace: str,
+) -> List[Tuple[str, str]]:
+    """Вернуть [(cluster_name, cluster_namespace)] из NATS-env-имён.
+
+    SHARED_NATS_*    → synthetic-node `nats-shared`  в `<env>-shared` namespace
+    KINGDOM_NATS_*   → synthetic-node `nats-kingdom` в собственном namespace
+    NATS_FOR_*_*     → synthetic-node `nats-purpose` в `<env>-shared` (общий)
+
+    Значения env-переменных не нужны — здесь регистрируется только сам факт
+    зависимости от NATS-cluster.
+    """
+    envs: List[Dict[str, Any]] = []
+    for c in deploy.get("spec", {}).get("template", {}).get("spec", {}).get("containers", []):
+        envs += c.get("env") or []
+
+    env_prefix = _env_prefix(own_namespace)
+    found: set[Tuple[str, str]] = set()
+    for e in envs:
+        n = str(e.get("name", "") or "")
+        m = _NATS_ENV_RE.match(n)
+        if not m:
+            continue
+        if m.group("scope"):
+            scope = m.group("scope").lower()
+            if scope == "shared" and env_prefix:
+                found.add(("nats-shared", f"{env_prefix}-shared"))
+            elif scope == "kingdom":
+                # kingdom NATS живёт в этом же namespace
+                found.add(("nats-kingdom", own_namespace))
+        elif m.group("purpose") and env_prefix:
+            # NATS_FOR_X_CREDS — general-purpose, относим в env-shared
+            found.add(("nats-purpose", f"{env_prefix}-shared"))
+    return sorted(found)
+
+
 def sync_namespace(db: Session, namespace: str) -> Dict[str, int]:
     """Синхронизировать топологию одного namespace."""
     stats = {"services": 0, "edges": 0, "skipped": 0}
     deploys = _kubectl_get_deployments(namespace)
+
+    src_team = _derive_team_owner(namespace)
 
     for deploy in deploys:
         name = deploy.get("metadata", {}).get("name", "")
         if not name:
             continue
 
-        src = upsert_service(db, namespace=namespace, name=name)
+        src = upsert_service(db, namespace=namespace, name=name, team_owner=src_team)
         stats["services"] += 1
 
+        # URL-based edges (existing flow)
         upstreams = _extract_upstreams(deploy, namespace)
         for up_svc, up_ns in upstreams:
-            dst = upsert_service(db, namespace=up_ns, name=up_svc)
+            dst = upsert_service(
+                db,
+                namespace=up_ns,
+                name=up_svc,
+                team_owner=_derive_team_owner(up_ns),
+            )
             upsert_edge(db, src=src, dst=dst, kind="calls", discovered_by="kg_sync/env_vars")
+            stats["edges"] += 1
+
+        # NATS-cluster edges (PR — KG enrichment).
+        # Synthetic nodes — представляют общий NATS-кластер в `<env>-shared`
+        # либо local-kingdom NATS в текущем namespace. team_owner="platform" —
+        # явный маркер что это инфра-узел, а не business-service.
+        for nats_name, nats_ns in _extract_nats_clusters(deploy, namespace):
+            dst = upsert_service(
+                db,
+                namespace=nats_ns,
+                name=nats_name,
+                team_owner="platform",
+            )
+            upsert_edge(
+                db, src=src, dst=dst,
+                kind="uses_nats",
+                discovered_by="kg_sync/nats_env",
+            )
             stats["edges"] += 1
 
     return stats
