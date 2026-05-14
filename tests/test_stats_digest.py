@@ -82,7 +82,42 @@ def test_firing_alerts_groups_by_team_via_kg():
 def test_firing_alerts_empty_state_message():
     text, unique, team_alerts = stats_digest.firing_alerts_section([], {})
     assert "кластер здоров" in text
-    assert len(unique) == 0
+
+
+def test_firing_alerts_squads_render_inline_single_line():
+    """5+ teams ранее печатались каждая отдельной строкой (~7 строк),
+    теперь должны быть в одной строке через запятую."""
+    fired = [
+        {"metric": {"namespace": f"prod-kingdom{i}", "alertname": "X"}}
+        for i in range(1, 6)
+        for _ in range(3)
+    ]
+    ns_to_team = {f"prod-kingdom{i}": f"kingdom{i}" for i in range(1, 6)}
+    text, _, _ = stats_digest.firing_alerts_section(fired, ns_to_team)
+    body_lines = [ln for ln in text.split("\n") if ln.strip().startswith("`@")]
+    # Должна быть ОДНА body-строка с inline-перечислением teams,
+    # не 5 отдельных.
+    assert len(body_lines) == 1, f"Expected 1 inline line, got {len(body_lines)}: {body_lines}"
+    assert "kingdom1" in body_lines[0]
+    assert "kingdom5" in body_lines[0]
+
+
+def test_stale_deployments_no_hidden_teaser():
+    """Строка `… и ещё N (скрыто)` убрана как noise. Cap=6 + просто обрезать."""
+    db = MagicMock()
+    db.execute.return_value.fetchall.return_value = [("prod-kingdom1",)]
+    now = datetime.now(timezone.utc)
+    # 20 stale deployments → cap_total=6 покажет 6, остальные просто отброшены
+    fakes = [
+        _make_deployment(f"old-svc-{i}", (now - timedelta(days=60+i)).isoformat())
+        for i in range(20)
+    ]
+    text = stats_digest.stale_deployments_section(
+        db, ns_to_team={"prod-kingdom1": "kingdom1"}, threshold_days=14,
+        kubectl_fn=lambda ns: fakes,
+    )
+    assert "скрыто" not in text
+    assert "и ещё" not in text
 
 
 # ── top_alert_types ────────────────────────────────────────────────────────

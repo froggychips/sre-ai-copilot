@@ -97,12 +97,16 @@ def firing_alerts_section(
     if not team_alerts and not unowned:
         lines.append("  ✅ ни одной серии — кластер здоров")
     else:
-        for team in sorted(team_alerts, key=lambda t: -team_alerts[t]):
-            lines.append(f"  `@{team}` — {team_alerts[team]} series")
+        # Inline-формат «@team Nс, ...» — раньше каждая team была отдельной
+        # строкой (6-7 строк), теперь одна.
+        sorted_teams = sorted(team_alerts, key=lambda t: -team_alerts[t])
+        if sorted_teams:
+            parts = ", ".join(f"`@{t}` {team_alerts[t]}с" for t in sorted_teams)
+            lines.append(f"  {parts}")
         if unowned:
             top = sorted(unowned.items(), key=lambda x: -x[1])[:3]
             parts = ", ".join(f"{n}={c}" for n, c in top)
-            lines.append(f"  _unowned ns_: {parts}")
+            lines.append(f"  _unowned_: {parts}")
     return "\n".join(lines), unique_alerts, team_alerts
 
 
@@ -236,10 +240,9 @@ def stale_deployments_section(
     cap_total = 6
     for _idle, line in rendered_groups[:cap_total]:
         lines.append(line)
-
-    extra = len(rendered_groups) - cap_total + max(0, len(singular) - singular_cap)
-    if extra > 0:
-        lines.append(f"  _… и ещё {extra} (скрыто)_")
+    # Строка «… и ещё N (скрыто)» убрана: счётчик не actionable, занимает
+    # место, провоцирует FOMO. Если хвост важен — в digest всё равно влезает
+    # с cap_total=6 + threshold ≥30d.
     return "\n".join(lines)
 
 
