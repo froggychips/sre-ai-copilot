@@ -26,16 +26,27 @@ import structlog
 from app.config import settings
 from app.services.mcp_client import McpHttpClient
 
-# Пакет teamcity_mcp — устанавливается отдельно (pip install teamcity-mcp).
-# В dev можно передать путь через TC_MCP_SRC env var.
+# Пакет teamcity_mcp:
+#   1. Если установлен системно (pip install teamcity-mcp / dev TC_MCP_SRC env)
+#      — используем его.
+#   2. Иначе — vendor-копия в app.vendor.teamcity_mcp (минимум, только client.py).
+# Vendor нужен потому что teamcity-mcp пока не публикуется на PyPI / git remote,
+# а direct TC REST API в проде должен работать без зависимости от dev-машины.
 _tc_mcp_src = os.environ.get("TC_MCP_SRC", "")
 if _tc_mcp_src and _tc_mcp_src not in sys.path:
     sys.path.insert(0, _tc_mcp_src)
 try:
     from teamcity_mcp.client import TeamCityClient as _TCClient
     _TC_CLIENT_AVAILABLE = True
+    _TC_CLIENT_SOURCE = "external"
 except ImportError:
-    _TC_CLIENT_AVAILABLE = False
+    try:
+        from app.vendor.teamcity_mcp.client import TeamCityClient as _TCClient
+        _TC_CLIENT_AVAILABLE = True
+        _TC_CLIENT_SOURCE = "vendor"
+    except ImportError:
+        _TC_CLIENT_AVAILABLE = False
+        _TC_CLIENT_SOURCE = "none"
 
 logger = structlog.get_logger()
 
