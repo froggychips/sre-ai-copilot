@@ -29,6 +29,12 @@ celery_app.conf.beat_schedule = {
         "task": "kg_topology_sync",
         "schedule": crontab(minute=0),  # каждый час
     },
+    # Daily stats digest (включается через STATS_DIGEST_ENABLED).
+    # БЕЗ LLM-вызовов — pure aggregation, шлёт в DISCORD_WEBHOOK_STATS_URL.
+    "daily-stats-digest": {
+        "task": "daily_stats_digest",
+        "schedule": crontab(hour=settings.STATS_DIGEST_HOUR_UTC, minute=0),
+    },
 }
 
 
@@ -82,5 +88,28 @@ def kg_topology_sync_task():
     except Exception as e:
         logger.error("kg_topology_sync.failed: %s", e)
         raise
+    finally:
+        db.close()
+
+
+@celery_app.task(name="daily_stats_digest")
+def daily_stats_digest_task():
+    """Daily Discord-stats report. Pure data-aggregation, БЕЗ LLM-вызовов.
+
+    Управляется флагом settings.STATS_DIGEST_ENABLED. Если False —
+    задача всё равно запускается по расписанию (контракт Celery beat),
+    но внутри `send_daily_digest()` сразу возвращает skipped.
+    """
+    from app.services.stats_digest import send_daily_digest
+
+    db = SessionLocal()
+    try:
+        result = asyncio.run(send_daily_digest(db))
+        logger.info("daily_stats_digest.done result=%s", result)
+        return result
+    except Exception as e:
+        logger.error("daily_stats_digest.failed: %s", e)
+        # Не падаем в Celery (retry бесполезен, это аналитический task).
+        return {"status": "error", "error": str(e)}
     finally:
         db.close()
