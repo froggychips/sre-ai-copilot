@@ -17,9 +17,13 @@ from app.agents.hypothesis import HypothesisAgent
 async def test_generate_without_similar_past_omits_history_section(mocker) -> None:
     agent = HypothesisAgent()
     mock_api = mocker.patch(
-        "app.services.llm_service.llm_client.generate_content", new_callable=AsyncMock
+        "app.services.llm_service.llm_client.generate_full", new_callable=AsyncMock
     )
-    mock_api.return_value = "1. cause-A\n2. cause-B\n3. cause-C"
+    mock_api.return_value = {
+        "text": "1. cause-A\n2. cause-B\n3. cause-C",
+        "input_tokens": 50, "output_tokens": 10,
+        "model": "test", "backend": "anthropic",
+    }
 
     await agent.generate("Analysis: pod restart loop")
 
@@ -31,9 +35,13 @@ async def test_generate_without_similar_past_omits_history_section(mocker) -> No
 async def test_generate_with_empty_similar_past_omits_history_section(mocker) -> None:
     agent = HypothesisAgent()
     mock_api = mocker.patch(
-        "app.services.llm_service.llm_client.generate_content", new_callable=AsyncMock
+        "app.services.llm_service.llm_client.generate_full", new_callable=AsyncMock
     )
-    mock_api.return_value = "x"
+    mock_api.return_value = {
+        "text": "x",
+        "input_tokens": 50, "output_tokens": 10,
+        "model": "test", "backend": "anthropic",
+    }
 
     await agent.generate("Analysis: x", similar_past=[])
 
@@ -45,9 +53,13 @@ async def test_generate_with_empty_similar_past_omits_history_section(mocker) ->
 async def test_generate_with_similar_past_injects_bullet_list(mocker) -> None:
     agent = HypothesisAgent()
     mock_api = mocker.patch(
-        "app.services.llm_service.llm_client.generate_content", new_callable=AsyncMock
+        "app.services.llm_service.llm_client.generate_full", new_callable=AsyncMock
     )
-    mock_api.return_value = "x"
+    mock_api.return_value = {
+        "text": "x",
+        "input_tokens": 50, "output_tokens": 10,
+        "model": "test", "backend": "anthropic",
+    }
 
     similar = [
         {
@@ -81,9 +93,13 @@ async def test_generate_with_similar_past_injects_bullet_list(mocker) -> None:
 async def test_generate_caps_oversized_past_fields(mocker) -> None:
     agent = HypothesisAgent()
     mock_api = mocker.patch(
-        "app.services.llm_service.llm_client.generate_content", new_callable=AsyncMock
+        "app.services.llm_service.llm_client.generate_full", new_callable=AsyncMock
     )
-    mock_api.return_value = "x"
+    mock_api.return_value = {
+        "text": "x",
+        "input_tokens": 50, "output_tokens": 10,
+        "model": "test", "backend": "anthropic",
+    }
 
     long_text = "x" * 5000
     similar = [{"score": 0.5, "root_cause": long_text, "summary": long_text}]
@@ -101,9 +117,13 @@ async def test_generate_handles_missing_fields_gracefully(mocker) -> None:
     """Real SimilarIncidentEngine sometimes returns sparse dicts."""
     agent = HypothesisAgent()
     mock_api = mocker.patch(
-        "app.services.llm_service.llm_client.generate_content", new_callable=AsyncMock
+        "app.services.llm_service.llm_client.generate_full", new_callable=AsyncMock
     )
-    mock_api.return_value = "x"
+    mock_api.return_value = {
+        "text": "x",
+        "input_tokens": 50, "output_tokens": 10,
+        "model": "test", "backend": "anthropic",
+    }
 
     # Sparse: only score is present.
     similar = [{"score": 0.5}]
