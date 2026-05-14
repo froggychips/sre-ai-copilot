@@ -101,6 +101,7 @@ def _fetch_builds_direct(
         _build_fields = (
             "build(id,number,status,state,branchName,buildTypeId,startDate,finishDate,"
             "agent(name),statusText,"
+            "triggered(type,date,user(username,name)),"
             "lastChanges(change(id,version,username,date,comment,"
             "files(count,file(file,changeType)))))"
         )
@@ -161,6 +162,10 @@ def _build_summary_direct(b: dict[str, Any]) -> dict[str, Any]:
         for c in raw_changes
     ]
 
+    # triggered.user — деплойщик (тот кто запустил билд). Может быть None для
+    # auto-triggered (vcs / schedule / dependency) — фиксируем тип в `triggered_by_type`.
+    triggered = b.get("triggered") or {}
+    trig_user = (triggered.get("user") or {})
     return {
         "id": b.get("id"),
         "number": b.get("number"),
@@ -174,6 +179,8 @@ def _build_summary_direct(b: dict[str, Any]) -> dict[str, Any]:
         "status_text": b.get("statusText"),
         "url": url,
         "changes": changes,
+        "triggered_by": trig_user.get("username") or trig_user.get("name"),
+        "triggered_by_type": triggered.get("type"),  # 'user' | 'vcs' | 'schedule' | 'buildDependency' | ...
     }
 
 
