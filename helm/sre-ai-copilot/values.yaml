@@ -72,6 +72,13 @@ env:
   executorEnabled: "false"          # 9-я стадия: kubectl --dry-run=server
   executorApprovalEnabled: "false"  # Apply-кнопка на Discord embed → реальный kubectl
 
+  # Daily Discord stats digest (Celery beat task daily_stats_digest).
+  # Pure data-aggregation, БЕЗ LLM-вызовов. Шлёт в DISCORD_WEBHOOK_STATS_URL.
+  # См. tests/test_stats_digest_no_llm.py — инвариант что LLM не дёргается.
+  statsDigestEnabled: "false"
+  statsDigestHourUtc: "9"           # ежедневно в HH:00 UTC
+  statsDigestStaleDays: "14"        # threshold для stale-deployment секции
+
 # All secret keys — fill in before deploying.
 # In production prefer SealedSecrets or ExternalSecrets (see k8s/base/secrets.*.yaml.example).
 secrets:

@@ -55,5 +55,11 @@ spec:
           value: {{ .Values.env.executorEnabled | default "false" | quote }}
         - name: EXECUTOR_APPROVAL_ENABLED
           value: {{ .Values.env.executorApprovalEnabled | default "false" | quote }}
+        - name: STATS_DIGEST_ENABLED
+          value: {{ .Values.env.statsDigestEnabled | default "false" | quote }}
+        - name: STATS_DIGEST_HOUR_UTC
+          value: {{ .Values.env.statsDigestHourUtc | default "9" | quote }}
+        - name: STATS_DIGEST_STALE_DAYS
+          value: {{ .Values.env.statsDigestStaleDays | default "14" | quote }}
         resources:
           {{- toYaml .Values.resources.worker | nindent 10 }}
