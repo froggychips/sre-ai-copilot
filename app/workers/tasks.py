@@ -18,6 +18,18 @@ logger = logging.getLogger(__name__)
 
 celery_app = Celery("sre_tasks", broker=settings.REDIS_URL, backend=settings.REDIS_URL)
 
+# Backpressure-настройки (см. config.py для пояснений).
+# Не применяются в eager-mode чтобы тесты не упирались в time-limit'ы.
+if not settings.CELERY_TASK_ALWAYS_EAGER:
+    celery_app.conf.update(
+        worker_prefetch_multiplier=settings.CELERY_WORKER_PREFETCH_MULTIPLIER,
+        worker_max_tasks_per_child=settings.CELERY_WORKER_MAX_TASKS_PER_CHILD,
+        task_time_limit=settings.CELERY_TASK_TIME_LIMIT_SECONDS,
+        task_soft_time_limit=settings.CELERY_TASK_SOFT_TIME_LIMIT_SECONDS,
+        # Celery 6 deprecation — без этого warning на старте worker'а.
+        broker_connection_retry_on_startup=True,
+    )
+
 if settings.CELERY_TASK_ALWAYS_EAGER:
     # Inline-режим для локального e2e: process_incident_task.delay(...)
     # выполняется синхронно в текущем процессе, без Redis/worker-а.
@@ -38,7 +50,12 @@ celery_app.conf.beat_schedule = {
 }
 
 
-@celery_app.task(name="process_incident", bind=True, max_retries=3)
+@celery_app.task(
+    name="process_incident",
+    bind=True,
+    max_retries=3,
+    rate_limit=settings.CELERY_PROCESS_INCIDENT_RATE_LIMIT,
+)
 def process_incident_task(self, incident_data: dict):
     # asyncio.run создаёт чистый event loop на задачу — get_event_loop()
     # на Python 3.10+ выкидывает DeprecationWarning, а в Python 3.14+
