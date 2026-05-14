@@ -148,13 +148,7 @@ def _make_deployment(name: str, last_update_iso: str, replicas: int = 1) -> dict
     }
 
 
-async def _noop_deployer(ns, dt):
-    """Default deployer-fn для тестов где TC недоступен/неинтересен."""
-    return None, None
-
-
-@pytest.mark.asyncio
-async def test_stale_deployments_groups_by_team_and_excludes_fresh():
+def test_stale_deployments_groups_by_team_and_excludes_fresh():
     db = MagicMock()
     db.execute.return_value.fetchall.return_value = [("prod-kingdom1",), ("prod-kingdom2",)]
 
@@ -168,12 +162,11 @@ async def test_stale_deployments_groups_by_team_and_excludes_fresh():
             _make_deployment("legacy-cron", (now - timedelta(days=90)).isoformat()),
         ],
     }
-    text = await stats_digest.stale_deployments_section(
+    text = stats_digest.stale_deployments_section(
         db,
         ns_to_team={"prod-kingdom1": "kingdom1", "prod-kingdom2": "kingdom2"},
         threshold_days=14,
         kubectl_fn=lambda ns: fake_deploys.get(ns, []),
-        tc_deployer_fn=_noop_deployer,
     )
     assert "town-service" in text
     assert "legacy-cron" in text
@@ -182,8 +175,7 @@ async def test_stale_deployments_groups_by_team_and_excludes_fresh():
     assert "@kingdom2" in text
 
 
-@pytest.mark.asyncio
-async def test_stale_deployments_squashes_cross_namespace_groups():
+def test_stale_deployments_squashes_cross_namespace_groups():
     """Same name в 3+ namespace-ах → одна squash-строка."""
     db = MagicMock()
     db.execute.return_value.fetchall.return_value = [
@@ -196,12 +188,11 @@ async def test_stale_deployments_squashes_cross_namespace_groups():
         f"prod-kingdom{i}": [_make_deployment("db-backup", last_iso)]
         for i in range(1, 6)
     }
-    text = await stats_digest.stale_deployments_section(
+    text = stats_digest.stale_deployments_section(
         db,
         ns_to_team={f"prod-kingdom{i}": f"kingdom{i}" for i in range(1, 6)},
         threshold_days=14,
         kubectl_fn=lambda ns: fake_deploys.get(ns, []),
-        tc_deployer_fn=_noop_deployer,
     )
     # Один squash вместо 5 отдельных строк
     assert "× 5 ns" in text
@@ -210,44 +201,82 @@ async def test_stale_deployments_squashes_cross_namespace_groups():
     assert text.count("62d") == 1
 
 
-@pytest.mark.asyncio
-async def test_stale_deployments_shows_deployer_when_tc_returns():
-    """Если TC возвращает username → render `last by <user> (#<num>)`."""
-    db = MagicMock()
-    db.execute.return_value.fetchall.return_value = [("prod-kingdom1",), ("prod-kingdom2",), ("prod-kingdom3",)]
-    now = datetime.now(timezone.utc)
-    last_iso = (now - timedelta(days=62)).isoformat()
-    fake_deploys = {
-        f"prod-kingdom{i}": [_make_deployment("db-backup", last_iso)]
-        for i in range(1, 4)
-    }
-
-    async def fake_deployer(ns, dt):
-        return "yaroslav.shulgin", "2074"
-
-    text = await stats_digest.stale_deployments_section(
-        db,
-        ns_to_team={f"prod-kingdom{i}": f"kingdom{i}" for i in range(1, 4)},
-        threshold_days=14,
-        kubectl_fn=lambda ns: fake_deploys.get(ns, []),
-        tc_deployer_fn=fake_deployer,
-    )
-    assert "last by yaroslav.shulgin (#2074)" in text
-
-
-@pytest.mark.asyncio
-async def test_stale_deployments_ignores_zero_replicas():
+def test_stale_deployments_ignores_zero_replicas():
     db = MagicMock()
     db.execute.return_value.fetchall.return_value = [("prod-kingdom1",)]
     now = datetime.now(timezone.utc)
     fake = _make_deployment("scaled-zero", (now - timedelta(days=100)).isoformat(), replicas=0)
-    text = await stats_digest.stale_deployments_section(
+    text = stats_digest.stale_deployments_section(
         db, ns_to_team={"prod-kingdom1": "kingdom1"}, threshold_days=14,
         kubectl_fn=lambda ns: [fake],
-        tc_deployer_fn=_noop_deployer,
     )
     assert "scaled-zero" not in text
     assert "ничего не stale" in text
+
+
+# ── recent_deploys_section ─────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_recent_deploys_renders_user_and_buildtype():
+    now = datetime.now(timezone.utc)
+    async def fake_fetch(*, lookback_hours, limit):
+        return [
+            {
+                "id": 119313, "number": "488", "status": "SUCCESS",
+                "branch": "refs/heads/preprod",
+                "buildtype_name": "Build and update",
+                "finished_at": (now - timedelta(hours=2)).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "triggered_by": "yaroslav.shulgin",
+                "triggered_type": "user",
+            },
+            {
+                "id": 119270, "number": "486", "status": "SUCCESS",
+                "branch": "refs/heads/preprod",
+                "buildtype_name": "Kingdom deploy",
+                "finished_at": (now - timedelta(hours=4)).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "triggered_by": None,
+                "triggered_type": "vcs",  # auto-triggered, no user
+            },
+        ]
+    text = await stats_digest.recent_deploys_section(fetch_fn=fake_fetch)
+    assert "Recent deploys" in text
+    assert "yaroslav.shulgin" in text
+    assert "Build and update" in text
+    assert "preprod #488" in text
+    assert "2h ago" in text
+    # auto-trigger без user — показываем type
+    assert "_vcs_" in text or "vcs" in text
+
+
+@pytest.mark.asyncio
+async def test_recent_deploys_shows_status_marker_on_failure():
+    async def fake_fetch(*, lookback_hours, limit):
+        return [{
+            "number": "500", "status": "FAILURE",
+            "branch": "refs/heads/preprod",
+            "buildtype_name": "Build and update",
+            "finished_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "triggered_by": "user1", "triggered_type": "user",
+        }]
+    text = await stats_digest.recent_deploys_section(fetch_fn=fake_fetch)
+    assert "FAILURE" in text
+
+
+@pytest.mark.asyncio
+async def test_recent_deploys_empty_when_tc_returns_nothing():
+    async def fake_fetch(*, lookback_hours, limit):
+        return []
+    text = await stats_digest.recent_deploys_section(fetch_fn=fake_fetch)
+    assert "TC недоступен" in text or "нет deploy-билдов" in text
+
+
+@pytest.mark.asyncio
+async def test_recent_deploys_graceful_on_fetch_error():
+    async def boom(*, lookback_hours, limit):
+        raise RuntimeError("TC down")
+    text = await stats_digest.recent_deploys_section(fetch_fn=boom)
+    assert text == ""  # пустая строка — секция скрывается без шума
 
 
 # ── top_alert_types_section: noise-filter (Grok review compaction) ─────────
