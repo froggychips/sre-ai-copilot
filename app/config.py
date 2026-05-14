@@ -35,6 +35,27 @@ class Settings(BaseSettings):
     # Eager Celery — для in-process e2e без Redis/worker'а
     CELERY_TASK_ALWAYS_EAGER: bool = False
 
+    # Celery backpressure / resilience (PR — protect prod worker от перегрузки,
+    # memory-leak'ов, висящих задач, OOM при flood incident-ов).
+    #
+    # `prefetch_multiplier=1` — fair scheduling: worker берёт по одной задаче
+    #     зараз. Без этого при flood'е (>2 incidents в секунду) один worker
+    #     забирает 4× и другие ждут.
+    # `max_tasks_per_child=50` — после 50 задач worker-process restart-ится.
+    #     Защита от memory-leak'ов (LLM-агенты держат стейт).
+    # `task_time_limit=1800` (30 мин hard) — incident pipeline в худшем случае
+    #     5-7 минут; 30 минут — это уже зависание, лучше kill + retry.
+    # `task_soft_time_limit=1500` (25 мин soft) — SoftTimeLimitExceeded
+    #     можно поймать в task, корректно закрыть, записать в audit.
+    # `process_incident_rate_limit` — не больше N в минуту (LLM budget guard).
+    CELERY_WORKER_PREFETCH_MULTIPLIER: int = Field(1, description="Fair scheduling: 1 task per worker at a time")
+    CELERY_WORKER_MAX_TASKS_PER_CHILD: int = Field(50, description="Worker restart after N tasks (memory leak protection)")
+    CELERY_TASK_TIME_LIMIT_SECONDS: int = Field(1800, description="Hard task timeout (30 min)")
+    CELERY_TASK_SOFT_TIME_LIMIT_SECONDS: int = Field(1500, description="Soft task timeout (25 min)")
+    CELERY_PROCESS_INCIDENT_RATE_LIMIT: str = Field(
+        "30/m", description="Rate limit для process_incident — защита LLM-бюджета"
+    )
+
     # Прямой вызов async_process_incident прямо из вебхука (минуя Celery).
     # Полезно в локальном e2e без Redis: блокирует curl, но возвращает реальный
     # результат, виден в логах + persists в DB. Eager-mode Celery несовместим
