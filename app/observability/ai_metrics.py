@@ -5,6 +5,33 @@ LLM_LATENCY = Histogram("llm_request_duration_seconds", "LLM API latency", ["mod
 TOKEN_USAGE = Counter("llm_tokens_total", "Total tokens used", ["model", "type"])
 API_ERRORS = Counter("llm_api_errors_total", "API error count", ["model", "error_type"])
 
+# Per-agent token attribution: какой агент сколько тратит. Label `direction`:
+#   "input"  — prompt tokens (то что отправили модели)
+#   "output" — completion tokens (то что модель сгенерила)
+# Этот counter позволяет видеть кто из 6 агентов жжёт больше (Analyzer,
+# Hypothesis, FactCritic, Fix, Risk, Synthesis), и сравнивать стоимость
+# до/после prompt-оптимизаций. Bill = sum(input × $/in) + sum(output × $/out).
+LLM_TOKENS_PER_AGENT = Counter(
+    "llm_tokens_per_agent_total",
+    "Tokens used by each agent (real numbers from provider response, not char-approx)",
+    ["agent", "model", "direction"],
+)
+
+# Per-agent latency — для понимания где узкое место в reasoning chain.
+LLM_LATENCY_PER_AGENT = Histogram(
+    "llm_latency_per_agent_seconds",
+    "LLM round-trip latency by agent",
+    ["agent", "model"],
+)
+
+# Per-agent error rate. Полезно когда retry-strategy скрывает шум:
+# по labels можно увидеть что Synthesis даёт rate_limit чаще чем Analyzer.
+LLM_ERRORS_PER_AGENT = Counter(
+    "llm_errors_per_agent_total",
+    "LLM call errors by agent",
+    ["agent", "model", "error_type"],
+)
+
 # --- Pipeline stage latency -----------------------------------------------
 #
 # Основные стадии — из StageTimer (analyzer / diagnostics / hypothesis /
@@ -25,6 +52,32 @@ def track_llm_metrics(
     LLM_LATENCY.labels(model=model).observe(latency)
     TOKEN_USAGE.labels(model=model, type="prompt").inc(prompt_tokens)
     TOKEN_USAGE.labels(model=model, type="completion").inc(completion_tokens)
+
+
+def track_llm_usage_per_agent(
+    *,
+    agent: str,
+    model: str,
+    input_tokens: int,
+    output_tokens: int,
+    latency_s: float,
+    error_type: str | None = None,
+) -> None:
+    """Per-agent attribution of LLM cost. Вызывается из BaseAgent.ask()
+    с реальными числами из provider-response (не char-approximation)."""
+    LLM_LATENCY_PER_AGENT.labels(agent=agent, model=model).observe(latency_s)
+    if input_tokens > 0:
+        LLM_TOKENS_PER_AGENT.labels(
+            agent=agent, model=model, direction="input"
+        ).inc(input_tokens)
+    if output_tokens > 0:
+        LLM_TOKENS_PER_AGENT.labels(
+            agent=agent, model=model, direction="output"
+        ).inc(output_tokens)
+    if error_type:
+        LLM_ERRORS_PER_AGENT.labels(
+            agent=agent, model=model, error_type=error_type
+        ).inc()
 
 
 # --- Fact-anchored reasoning pipeline ------------------------------------

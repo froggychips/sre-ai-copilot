@@ -30,11 +30,19 @@ def mock_incident() -> Incident:
 
 @pytest.mark.asyncio
 async def test_analyzer_prompt_structure(mocker, mock_incident):
+    # BaseAgent.ask теперь идёт через generate_full → возвращает dict
+    # с {text, input_tokens, output_tokens, model, backend}.
     agent = AnalyzerAgent()
     mock_api = mocker.patch(
-        "app.services.llm_service.llm_client.generate_content", new_callable=AsyncMock
+        "app.services.llm_service.llm_client.generate_full", new_callable=AsyncMock
     )
-    mock_api.return_value = "Summary"
+    mock_api.return_value = {
+        "text": "Summary",
+        "input_tokens": 100,
+        "output_tokens": 50,
+        "model": "test-model",
+        "backend": "anthropic",
+    }
 
     await agent.analyze(mock_incident)
 
@@ -61,9 +69,15 @@ async def test_analyzer_injection_block(mocker, mock_incident):
 async def test_agent_error_on_empty_api_response(mocker, mock_incident):
     agent = AnalyzerAgent()
     mocker.patch(
-        "app.services.llm_service.llm_client.generate_content",
+        "app.services.llm_service.llm_client.generate_full",
         new_callable=AsyncMock,
-        return_value="",
+        return_value={
+            "text": "",  # empty → BaseAgent.ask raises ValueError
+            "input_tokens": 200,
+            "output_tokens": 0,
+            "model": "test-model",
+            "backend": "anthropic",
+        },
     )
 
     with pytest.raises(ValueError):
