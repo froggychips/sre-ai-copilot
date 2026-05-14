@@ -142,6 +142,72 @@ PIPELINE_NO_SURVIVOR = Counter(
     "Pipeline runs where all hypotheses were refuted",
 )
 
+# ── Pipeline quality metrics (Grok review #7) ──────────────────────────────
+#
+# Эти счётчики формируют картину «что делает копайлот за неделю/месяц» —
+# показатели, на которые можно вешать SLO и тюнить prompts/agents:
+#   - resolution_quality_total — итоговая раскладка resolved/unresolved
+#   - execution_intent_total{parsed} — FixAgent даёт structured-output?
+#   - executor_status_total — dry_run-результаты (ok/failed/guard-blocked)
+#   - executor_applied_total{success} — реальные kubectl-write outcomes
+#   - recurrence_total / flapping_total — частота повторов
+#   - hypotheses_count / survivors_count — distribution числа гипотез/выживших
+
+PIPELINE_FACT_CONFLICTS = Counter(
+    "pipeline_fact_conflicts_total",
+    "Pipeline runs where MUTUALLY_EXCLUSIVE_PAIRS обе observed=True",
+    ["kind_a", "kind_b"],
+)
+
+PIPELINE_RESOLUTION_QUALITY = Counter(
+    "pipeline_resolution_quality_total",
+    "Pipeline outcomes by quality category (resolved/unresolved/wrong_apply/error)",
+    ["quality"],
+)
+
+# parsed=true/false — смог ли FixAgent выдать structured ExecutionIntent.
+# action="restart_deployment"/"scale_deployment"/"get_logs"/etc. → "none" если не parsed.
+EXECUTION_INTENT_EMITTED = Counter(
+    "pipeline_execution_intent_total",
+    "Number of pipeline runs where FixAgent emitted ExecutionIntent",
+    ["parsed", "action"],
+)
+
+EXECUTOR_STATUS = Counter(
+    "pipeline_executor_status_total",
+    "Outcomes of the executor stage (dry-run server-side validation)",
+    ["status"],
+)
+
+EXECUTOR_APPLIED = Counter(
+    "pipeline_executor_applied_total",
+    "Real kubectl apply outcomes (post-approval)",
+    ["success"],
+)
+
+INCIDENT_RECURRENCE = Counter(
+    "pipeline_incident_recurrence_total",
+    "Pipeline runs marked as recurring (same service resolved < 7d)",
+    ["is_recurrence"],
+)
+
+INCIDENT_FLAPPING = Counter(
+    "pipeline_incident_flapping_total",
+    "Pipeline runs marked as flapping (fired→resolved→fired)",
+)
+
+HYPOTHESES_COUNT_PER_RUN = Histogram(
+    "pipeline_hypotheses_count",
+    "How many hypotheses each pipeline run generated (across all perspectives)",
+    buckets=(0, 1, 2, 3, 4, 5, 7, 10, 15, float("inf")),
+)
+
+SURVIVORS_COUNT_PER_RUN = Histogram(
+    "pipeline_survivors_count",
+    "How many hypotheses survived FactCritic adversarial grounding",
+    buckets=(0, 1, 2, 3, 5, float("inf")),
+)
+
 
 def track_fact_observed(kind: str, observed: bool) -> None:
     FACTS_OBSERVED.labels(kind=kind, observed=str(observed).lower()).inc()
@@ -170,3 +236,48 @@ def track_generated(perspective: str) -> None:
 
 def track_stage_duration(stage: str, duration_s: float) -> None:
     PIPELINE_STAGE_DURATION.labels(stage=stage).observe(duration_s)
+
+
+# ── Pipeline-quality track helpers (Grok review #7) ────────────────────────
+
+def track_fact_conflict(kind_a: str, kind_b: str) -> None:
+    """Один конфликт = один inc для нормализованной пары (sorted)."""
+    a, b = sorted([kind_a, kind_b])
+    PIPELINE_FACT_CONFLICTS.labels(kind_a=a, kind_b=b).inc()
+
+
+def track_resolution_quality(quality: str) -> None:
+    """quality ∈ {"resolved", "unresolved", "wrong_apply", "error"}."""
+    PIPELINE_RESOLUTION_QUALITY.labels(quality=quality).inc()
+
+
+def track_execution_intent(parsed: bool, action: str = "none") -> None:
+    """parsed=False → action='none'. Иначе action = ExecutionIntent.action.value."""
+    EXECUTION_INTENT_EMITTED.labels(
+        parsed=str(parsed).lower(), action=action if parsed else "none"
+    ).inc()
+
+
+def track_executor_status(status: str) -> None:
+    """status ∈ {dry_run_ok, dry_run_failed, guardrail_blocked, error, skipped}."""
+    EXECUTOR_STATUS.labels(status=status).inc()
+
+
+def track_executor_applied(success: bool) -> None:
+    EXECUTOR_APPLIED.labels(success=str(success).lower()).inc()
+
+
+def track_incident_recurrence(is_recurrence: bool) -> None:
+    INCIDENT_RECURRENCE.labels(is_recurrence=str(is_recurrence).lower()).inc()
+
+
+def track_incident_flapping() -> None:
+    INCIDENT_FLAPPING.inc()
+
+
+def track_hypotheses_count(n: int) -> None:
+    HYPOTHESES_COUNT_PER_RUN.observe(n)
+
+
+def track_survivors_count(n: int) -> None:
+    SURVIVORS_COUNT_PER_RUN.observe(n)

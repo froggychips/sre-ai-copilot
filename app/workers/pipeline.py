@@ -44,7 +44,18 @@ from app.diagnostics.facts import FactStore
 from app.diagnostics.incident_ctx import build_diagnostics_ctx
 from app.knowledge_graph.auto_populator import populate_from_incident
 from app.models.incident import Incident
-from app.observability.ai_metrics import track_disagreement, track_no_survivor
+from app.observability.ai_metrics import (
+    track_disagreement,
+    track_execution_intent,
+    track_executor_status,
+    track_fact_conflict,
+    track_hypotheses_count,
+    track_incident_flapping,
+    track_incident_recurrence,
+    track_no_survivor,
+    track_resolution_quality,
+    track_survivors_count,
+)
 from app.services.audit_logger import audit_service
 from app.services.clickhouse_service import get_blast_radius
 from app.services.discord_service import discord_service
@@ -329,6 +340,9 @@ class IncidentPipeline:
             current_incident=self.incident_data, limit=3
         )
         self.is_recurrence = any(p.get("recurrence") for p in self.similar_past)
+        track_incident_recurrence(self.is_recurrence)
+        if self.flap_count > 0:
+            track_incident_flapping()
 
         summary = self.analysis
 
@@ -392,6 +406,12 @@ class IncidentPipeline:
                 self._hypothesis_set, self.fact_store
             )
         self.traces.append(t.snapshot().to_dict())
+
+        # Distribution number-of-hypotheses per run (cardinality сигнал
+        # того, сколько даёт fan-out перед adversarial grounding).
+        track_hypotheses_count(len(self.critiqued.items))
+        # Survivors после critic-а — узкое место reasoning-цепочки.
+        track_survivors_count(len(survivors(self.critiqued).items))
 
         if self.critiqued.disagreement_signal() is not None:
             track_disagreement()
@@ -469,6 +489,9 @@ class IncidentPipeline:
                 "sre.incident.execution_intent_action",
                 self.execution_intent.action.value,
             )
+            track_execution_intent(parsed=True, action=self.execution_intent.action.value)
+        else:
+            track_execution_intent(parsed=False)
         self._safe_transition(IncidentState.FIX_PROPOSED, snap)
         self.traces.append(snap)
 
@@ -505,9 +528,11 @@ class IncidentPipeline:
         """
         if not settings.EXECUTOR_ENABLED:
             self.executor_result = {"status": "skipped", "reason": "executor_disabled"}
+            track_executor_status("skipped")
             return
         if self.execution_intent is None:
             self.executor_result = {"status": "skipped", "reason": "no_intent"}
+            track_executor_status("skipped")
             return
 
         from app.services.k8s_service import k8s_service
@@ -544,6 +569,7 @@ class IncidentPipeline:
         self.root_span.set_attribute(
             "sre.incident.executor_status", self.executor_result["status"]
         )
+        track_executor_status(self.executor_result["status"])
 
     # ------------------------------------------------------------------
     # Stage 8 — Synthesis + persist + Discord
@@ -573,6 +599,12 @@ class IncidentPipeline:
         self.root_span.set_attribute("sre.incident.is_recurrence", self.is_recurrence)
         if self.best:
             self.root_span.set_attribute("sre.incident.cause", self.best.cause[:500])
+
+        # Quality metrics (Grok review #7) — финальный аккорд per-incident.
+        track_resolution_quality(resolution_quality)
+        if self.fact_store is not None:
+            for a, b in self.fact_store.conflicts():
+                track_fact_conflict(a.kind, b.kind)
 
         if record:
             record.analysis = {

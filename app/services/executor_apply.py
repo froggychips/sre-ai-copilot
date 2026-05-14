@@ -31,6 +31,7 @@ from sqlalchemy.orm.attributes import flag_modified
 
 from app.core.execution_dsl import ExecutionIntent
 from app.database import IncidentRecord, SessionLocal
+from app.observability.ai_metrics import track_executor_applied
 from app.services.audit_logger import audit_service
 from app.services.k8s_service import k8s_service
 
@@ -118,6 +119,7 @@ def apply_intent(incident_id: str, applied_by: str) -> Dict[str, Any]:
                 "success": result.get("success", False),
             },
         )
+        track_executor_applied(bool(result.get("success", False)))
         log.info(
             "executor_apply.done",
             incident_id=incident_id,
