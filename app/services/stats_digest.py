@@ -100,7 +100,7 @@ def firing_alerts_section(
         for team in sorted(team_alerts, key=lambda t: -team_alerts[t]):
             lines.append(f"  `@{team}` — {team_alerts[team]} series")
         if unowned:
-            top = sorted(unowned.items(), key=lambda x: -x[1])[:5]
+            top = sorted(unowned.items(), key=lambda x: -x[1])[:3]
             parts = ", ".join(f"{n}={c}" for n, c in top)
             lines.append(f"  _unowned ns_: {parts}")
     return "\n".join(lines), unique_alerts, team_alerts
@@ -137,7 +137,7 @@ def fragile_services_section(db: Session, ns_to_team: Dict[str, str]) -> str:
         WHERE s.team_owner IS NULL OR s.team_owner != 'platform'
         GROUP BY s.id
         ORDER BY callers DESC
-        LIMIT 5
+        LIMIT 3
     """)).fetchall()
     lines = ["**🔗 Top fragile services** (inbound callers из KG)"]
     if not rows:
@@ -224,7 +224,7 @@ def stale_deployments_section(
         (e for e in entries if e[1] not in seen_namespaces),
         key=lambda e: (-e[0], e[2]),
     )
-    singular_cap = 10
+    singular_cap = 5
     for e in singular[:singular_cap]:
         idle, ns, name, team, _r, _last_dt = e
         rendered_groups.append((
@@ -233,7 +233,7 @@ def stale_deployments_section(
         ))
 
     rendered_groups.sort(key=lambda x: -x[0])
-    cap_total = 12
+    cap_total = 6
     for _idle, line in rendered_groups[:cap_total]:
         lines.append(line)
 
@@ -289,10 +289,11 @@ async def recent_deploys_section(
         log.warning("stats_digest.recent_deploys_failed", error=str(e))
         return ""
 
-    lines = [f"**🔧 Recent deploys** (последние {lookback_hours}h)"]
+    # Если TC не сконфигурирован или за окно нет deploy-билдов — секцию вообще
+    # не показываем, чтобы не шуметь в digest. Header без данных бесполезен.
     if not builds:
-        lines.append("  _TC недоступен или нет deploy-билдов за окно_")
-        return "\n".join(lines)
+        return ""
+    lines = [f"**🔧 Recent deploys** (последние {lookback_hours}h)"]
 
     now = datetime.now(timezone.utc)
     for b in builds:
@@ -340,25 +341,14 @@ def kg_quality_section(db: Session) -> str:
           )
     """)).scalar() or 0
     real_total = services_total - synthetic
-    teamed = db.execute(
-        text("SELECT count(*) FROM kg_services WHERE team_owner IS NOT NULL")
-    ).scalar() or 0
-    by_team = db.execute(text("""
-        SELECT COALESCE(team_owner, '(unowned)') AS t, count(*)
-        FROM kg_services GROUP BY team_owner ORDER BY count DESC LIMIT 6
-    """)).fetchall()
-
     pct_orphan = (100 * orphan // real_total) if real_total else 0
-    pct_team = (100 * teamed // services_total) if services_total else 0
     edges_str = ", ".join(f"{k}={v}" for k, v in sorted(edges_by_kind.items()))
-    teams_str = ", ".join(f"@{t}={c}" for t, c in by_team)
-
     synthetic_suffix = f" · synthetic скрыты: `{synthetic}`" if synthetic else ""
+
     return "\n".join([
         "**🧬 KG quality**",
         f"  Services: `{services_total}` · Orphan: `{orphan}`/`{real_total}` ({pct_orphan}%){synthetic_suffix}",
         f"  Edges: `{edges_total}` ({edges_str})",
-        f"  Team-owned: `{teamed}` ({pct_team}%) → {teams_str}",
     ])
 
 
@@ -435,7 +425,9 @@ async def build_digest(db: Session) -> str:
     kg_text = kg_quality_section(db)
 
     now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-    return "\n\n".join([
+    # Пустые секции (вернувшие "") пропускаем — иначе \n\n.join создаст
+    # двойной перевод строки и в Discord будет пустая дыра.
+    sections = [
         f"📊 **Cluster Daily Digest** · {now}",
         health_text,
         alerts_text,
@@ -444,7 +436,8 @@ async def build_digest(db: Session) -> str:
         fragile_text,
         stale_text,
         kg_text,
-    ])
+    ]
+    return "\n\n".join(s for s in sections if s)
 
 
 async def send_daily_digest(db: Session) -> Dict[str, Any]:
