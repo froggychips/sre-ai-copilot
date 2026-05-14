@@ -80,7 +80,9 @@ class Settings(BaseSettings):
     REPLAY_MODE: bool = False
 
     # Observability
-    OTLP_EXPORTER_ENDPOINT: str = "http://jaeger.monitoring:4317"
+    # OTLP gRPC endpoint. Пусто → traces не экспортируются (см. setup_telemetry —
+    # probe-reachability + graceful-degrade). Пример: "http://jaeger.<ns>:4317".
+    OTLP_EXPORTER_ENDPOINT: str = ""
     # AUDIT_LOG_PATH:
     #   "" / "-" / "stdout" → stdout (default, prod-acceptable: Fluent Bit / Loki ловят).
     #   "/path/to/file"     → файл (dev / local-e2e). Под readOnlyRootFilesystem
@@ -121,8 +123,8 @@ class Settings(BaseSettings):
     GITLAB_URL: str = Field("", description="GitLab base URL")
     GITLAB_TOKEN: str = Field("", description="GitLab Personal Access Token (read_api)")
     # Проекты для поиска MR по sha: project_id (числовой) или namespace/name.
-    # backend-services живёт в new-wo/backend-services (id найдём динамически).
-    GITLAB_BACKEND_PROJECT: str = Field("new-wo/backend-services", description="GitLab project path для backend MR-поиска")
+    # Пусто → GitLab-enrichment отключён.
+    GITLAB_BACKEND_PROJECT: str = Field("", description="GitLab project path (e.g. <group>/<repo>) для backend MR-поиска")
 
     # ClickHouse prod — blast radius (активные игроки вокруг времени инцидента).
     # Внешний хост, не требует port-forward.
@@ -146,6 +148,11 @@ class Settings(BaseSettings):
     # kubectl --dry-run=server: валидирует через kube-apiserver, ничего не пишет.
     EXECUTOR_ENABLED: bool = Field(False, description="Run executor stage in dry-run mode")
 
+    # KG topology auto-sync — список namespace-ов для скана.
+    # Пусто → auto-discovery через `kubectl get ns` минус kube-/monitoring-etc.
+    # Заполняй через env: KG_SCAN_NAMESPACES="prod-a,prod-b,staging-c"
+    KG_SCAN_NAMESPACES: str = Field("", description="Comma-separated namespaces для kg_topology_sync (пусто → auto-discovery)")
+
     # Executor approval (PR #3 executor track). Если True — Discord-embed
     # получает кнопку "Apply", которая после двухшагового подтверждения
     # запускает kubectl с dry_run=False. Требует:
@@ -162,7 +169,7 @@ class Settings(BaseSettings):
     JIRA_BASE_URL: str = Field("", description="Atlassian Jira base URL (e.g. https://org.atlassian.net)")
     JIRA_EMAIL: str = Field("", description="Jira user email for API basic auth")
     JIRA_API_TOKEN: str = Field("", description="Jira API token")
-    JIRA_PROJECT_KEY: str = Field("WO", description="Jira project key to search in")
+    JIRA_PROJECT_KEY: str = Field("", description="Jira project key to search in (e.g. PROJ)")
     JIRA_BACKEND_LABEL: str = Field("backend", description="Label marking backend/infra issues")
     JIRA_SEARCH_DAYS: int = Field(30, description="Look-back window for Jira issue search")
 

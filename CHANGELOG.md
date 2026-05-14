@@ -2,6 +2,70 @@
 
 All notable changes to this project are documented in this file.
 
+## [0.7.3] — 2026-05-14
+
+### Changed — Light scrub of internal infrastructure references
+
+Pet-проект становится переносимым на любую инфру; defaults в коде не несут
+больше имён клиентской инфраструктуры.
+
+- `app/config.py` defaults:
+  - `OTLP_EXPORTER_ENDPOINT`: было `"http://jaeger.monitoring:4317"` → `""`
+    (пустой → setup_telemetry probe-skip exporter, см. v0.7.2).
+  - `GITLAB_BACKEND_PROJECT`: было `"new-wo/backend-services"` → `""`.
+  - `JIRA_PROJECT_KEY`: было `"WO"` → `""`.
+  - Новый `KG_SCAN_NAMESPACES: str` (comma-separated, default `""`).
+- `app/knowledge_graph/kg_sync.py`:
+  - Хардкоженный `DEFAULT_SCAN_NAMESPACES` со списком 16 namespace-ов
+    выпилен. Источник списка теперь:
+    1. Аргумент `namespaces` функции `sync_topology`.
+    2. `settings.KG_SCAN_NAMESPACES` (env, comma-separated).
+    3. `_discover_namespaces()` — `kubectl get ns` минус
+       `kube-*`/`openshift-*`/`cattle-*`/`monitoring`/`default` etc.
+- `.env.example` переписан в generic-форму: убраны `lastoasisgame-local`,
+  `mcp-teamcity.lastoasisgame.com`, `wo-teamcity.lastoasisgame.com`,
+  `Wo_Backend_K8sNewCluster`, `prod-shared`-примеры.
+- Тесты: +7 кейсов в `tests/test_kg_enrichment.py` на
+  `_discover_namespaces` (system-prefix exclusion, kubectl-failure handling)
+  и `sync_topology` priority (explicit arg / settings / fallback discovery).
+
+### Note — history rewrite не делался
+
+Прошлые commit messages и PR-описания (#28-#31) могли содержать
+internal-infra строки; они остаются в git-log как есть. Scrub только
+для новых коммитов вперёд и текущего tracked состояния.
+
+## [0.7.2] — 2026-05-14
+
+### Added
+
+- **OTEL graceful-degrade на unreachable collector** (`app/telemetry.py`, PR #31):
+  при `setup_telemetry` quick TCP-probe (`socket.create_connection`, timeout=2s)
+  к OTLP-endpoint. Если недоступен → log.warning + НЕ подключаем
+  `BatchSpanProcessor`. Убирает `Transient error... StatusCode.UNAVAILABLE`
+  спам в логах api/worker. TracerProvider всё равно set'ится — spans
+  создаются в памяти (StageTimer, incident_span работают), просто не
+  экспортируются. +11 тестов в `tests/test_telemetry_graceful_degrade.py`.
+- **KG topology enrichment** (`app/knowledge_graph/kg_sync.py`, PR #30):
+  - `_derive_team_owner(namespace)`: regex по env-prefix
+    (`prod-/preprod-/preupdate-`) извлекает team-имя.
+  - `_extract_nats_clusters(deploy, namespace)`: парсит env-имена
+    с NATS-prefix (`SHARED_NATS_*`, `KINGDOM_NATS_*`, `NATS_FOR_*`)
+    и создаёт synthetic-node `nats-{shared|kingdom|purpose}` +
+    `edge_kind="uses_nats"`. Synthetic-узлы помечаются
+    `team_owner="platform"`.
+  - Adds: 16 team_owner-аннотированных WO-namespace-ов → ~95% coverage,
+    ~600+ `uses_nats` edges (по сэмплингу real env-vars).
+  - +11 тестов в `tests/test_kg_enrichment.py`.
+
+### Fixed
+
+- **Prod hotfix: убран `celery_app.control.shutdown()` из FastAPI lifespan**
+  (`app/main.py`, PR #29). Это был broker-wide broadcast через Redis,
+  который шатдаунил ВСЕ worker-pods при rolling restart любого api-pod.
+  Обнаружено после deploy v0.7.0 → RESTARTS 2/3 у worker-pods. Worker-ы
+  реагируют на SIGTERM от k8s сами. +1 regression-тест.
+
 ## [0.7.0] — 2026-05-13
 
 ### Added — Executor track
