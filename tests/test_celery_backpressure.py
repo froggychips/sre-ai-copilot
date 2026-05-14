@@ -33,3 +33,28 @@ def test_process_incident_has_rate_limit():
     assert process_incident_task.rate_limit is not None
     # Default = "30/m"
     assert "/m" in str(process_incident_task.rate_limit)
+
+
+def test_tc_deploys_to_kg_beat_scheduled():
+    """Новый KG event-store beat: tc_deploys_to_kg каждые 15 мин."""
+    from app.workers.tasks import celery_app
+
+    schedule = celery_app.conf.beat_schedule
+    assert "tc-deploys-to-kg" in schedule
+    assert schedule["tc-deploys-to-kg"]["task"] == "tc_deploys_to_kg"
+
+
+def test_tc_deploys_to_kg_task_no_op_without_tc():
+    """Когда TC ничего не вернул — task завершается без edges-added."""
+    from unittest.mock import AsyncMock, patch
+
+    from app.workers.tasks import _tc_deploys_to_kg_logic
+
+    with patch(
+        "app.services.teamcity_service.recent_deploys",
+        new=AsyncMock(return_value=[]),
+    ):
+        import asyncio
+        result = asyncio.run(_tc_deploys_to_kg_logic())
+    assert result["builds_fetched"] == 0
+    assert result["kg_deployments_added"] == 0
