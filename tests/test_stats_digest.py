@@ -148,7 +148,13 @@ def _make_deployment(name: str, last_update_iso: str, replicas: int = 1) -> dict
     }
 
 
-def test_stale_deployments_groups_by_team_and_excludes_fresh():
+async def _noop_deployer(ns, dt):
+    """Default deployer-fn для тестов где TC недоступен/неинтересен."""
+    return None, None
+
+
+@pytest.mark.asyncio
+async def test_stale_deployments_groups_by_team_and_excludes_fresh():
     db = MagicMock()
     db.execute.return_value.fetchall.return_value = [("prod-kingdom1",), ("prod-kingdom2",)]
 
@@ -162,11 +168,12 @@ def test_stale_deployments_groups_by_team_and_excludes_fresh():
             _make_deployment("legacy-cron", (now - timedelta(days=90)).isoformat()),
         ],
     }
-    text = stats_digest.stale_deployments_section(
+    text = await stats_digest.stale_deployments_section(
         db,
         ns_to_team={"prod-kingdom1": "kingdom1", "prod-kingdom2": "kingdom2"},
         threshold_days=14,
         kubectl_fn=lambda ns: fake_deploys.get(ns, []),
+        tc_deployer_fn=_noop_deployer,
     )
     assert "town-service" in text
     assert "legacy-cron" in text
@@ -175,29 +182,91 @@ def test_stale_deployments_groups_by_team_and_excludes_fresh():
     assert "@kingdom2" in text
 
 
-def test_stale_deployments_ignores_zero_replicas():
+@pytest.mark.asyncio
+async def test_stale_deployments_squashes_cross_namespace_groups():
+    """Same name в 3+ namespace-ах → одна squash-строка."""
+    db = MagicMock()
+    db.execute.return_value.fetchall.return_value = [
+        ("prod-kingdom1",), ("prod-kingdom2",),
+        ("prod-kingdom3",), ("prod-kingdom4",), ("prod-kingdom5",),
+    ]
+    now = datetime.now(timezone.utc)
+    last_iso = (now - timedelta(days=62)).isoformat()
+    fake_deploys = {
+        f"prod-kingdom{i}": [_make_deployment("db-backup", last_iso)]
+        for i in range(1, 6)
+    }
+    text = await stats_digest.stale_deployments_section(
+        db,
+        ns_to_team={f"prod-kingdom{i}": f"kingdom{i}" for i in range(1, 6)},
+        threshold_days=14,
+        kubectl_fn=lambda ns: fake_deploys.get(ns, []),
+        tc_deployer_fn=_noop_deployer,
+    )
+    # Один squash вместо 5 отдельных строк
+    assert "× 5 ns" in text
+    assert "db-backup" in text
+    # idle отображается single number, не 5 раз
+    assert text.count("62d") == 1
+
+
+@pytest.mark.asyncio
+async def test_stale_deployments_shows_deployer_when_tc_returns():
+    """Если TC возвращает username → render `last by <user> (#<num>)`."""
+    db = MagicMock()
+    db.execute.return_value.fetchall.return_value = [("prod-kingdom1",), ("prod-kingdom2",), ("prod-kingdom3",)]
+    now = datetime.now(timezone.utc)
+    last_iso = (now - timedelta(days=62)).isoformat()
+    fake_deploys = {
+        f"prod-kingdom{i}": [_make_deployment("db-backup", last_iso)]
+        for i in range(1, 4)
+    }
+
+    async def fake_deployer(ns, dt):
+        return "yaroslav.shulgin", "2074"
+
+    text = await stats_digest.stale_deployments_section(
+        db,
+        ns_to_team={f"prod-kingdom{i}": f"kingdom{i}" for i in range(1, 4)},
+        threshold_days=14,
+        kubectl_fn=lambda ns: fake_deploys.get(ns, []),
+        tc_deployer_fn=fake_deployer,
+    )
+    assert "last by yaroslav.shulgin (#2074)" in text
+
+
+@pytest.mark.asyncio
+async def test_stale_deployments_ignores_zero_replicas():
     db = MagicMock()
     db.execute.return_value.fetchall.return_value = [("prod-kingdom1",)]
     now = datetime.now(timezone.utc)
     fake = _make_deployment("scaled-zero", (now - timedelta(days=100)).isoformat(), replicas=0)
-    text = stats_digest.stale_deployments_section(
+    text = await stats_digest.stale_deployments_section(
         db, ns_to_team={"prod-kingdom1": "kingdom1"}, threshold_days=14,
         kubectl_fn=lambda ns: [fake],
+        tc_deployer_fn=_noop_deployer,
     )
     assert "scaled-zero" not in text
     assert "ничего не stale" in text
 
 
-def test_stale_deployments_caps_total_at_15():
-    db = MagicMock()
-    db.execute.return_value.fetchall.return_value = [("prod-kingdom1",)]
-    now = datetime.now(timezone.utc)
-    many = [_make_deployment(f"dep-{i}", (now - timedelta(days=30+i)).isoformat()) for i in range(25)]
-    text = stats_digest.stale_deployments_section(
-        db, ns_to_team={"prod-kingdom1": "kingdom1"}, threshold_days=14,
-        kubectl_fn=lambda ns: many,
-    )
-    assert "и ещё 10 (скрыто)" in text
+# ── top_alert_types_section: noise-filter (Grok review compaction) ─────────
+
+def test_top_alert_types_excludes_infrastructure_noise():
+    """InfoInhibitor / Watchdog / CPUThrottlingHigh — служебные, не показываем."""
+    counter = Counter({
+        "InfoInhibitor": 250,         # noise
+        "CPUThrottlingHigh": 175,     # noise
+        "Watchdog": 50,               # noise
+        "KubePodCrashLooping": 10,    # real
+        "etcdInsufficientMembers": 8,  # real
+    })
+    text = stats_digest.top_alert_types_section(counter)
+    assert "InfoInhibitor" not in text
+    assert "CPUThrottlingHigh" not in text
+    assert "Watchdog" not in text
+    assert "KubePodCrashLooping" in text
+    assert "etcdInsufficientMembers" in text
 
 
 # ── kg_quality_section ─────────────────────────────────────────────────────
