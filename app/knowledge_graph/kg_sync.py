@@ -45,6 +45,32 @@ _NATS_ENV_RE = re.compile(
 # prod-kingdom1 → prod-shared, preprod-kingdom2 → preprod-shared, etc.
 _NAMESPACE_ENV_PREFIX_RE = re.compile(r"^(prod|preprod|preupdate)(?:-|$)")
 
+# Synthetic-сервисы — по дизайну никогда не имеют edges (backup-cron'ы,
+# nats-tools, observability-exporters). Раньше засчитывались в Orphan %
+# и раздували её до 33%. Теперь помечаются `synthetic=true` и исключаются
+# из `kg_quality_section`. Паттерны намеренно узкие.
+_SYNTHETIC_EXACT_NAMES = frozenset({
+    "nats-box",
+    "nats-client-box",
+    "nats-exporter-prometheus-nats-exporter",
+    "seq",
+    "redis-exporter",
+})
+_SYNTHETIC_SUFFIXES = ("-db-backup", "-cron")
+
+
+def _is_synthetic_service(name: str) -> bool:
+    """True если service по имени попадает под synthetic-паттерн.
+
+    Изолированные cron-backups / NATS-tools / observability-exporters —
+    они НЕ ожидают edges, не должны считаться orphan.
+    """
+    if not name:
+        return False
+    if name in _SYNTHETIC_EXACT_NAMES:
+        return True
+    return any(name.endswith(s) for s in _SYNTHETIC_SUFFIXES)
+
 # Пропускаем явно внешние/нерелевантные сервисы.
 # Это blacklist для фильтрации значений из env-переменных подов,
 # а не bind-адрес сервера — B104 здесь ложно-положительный.
@@ -174,7 +200,10 @@ def sync_namespace(db: Session, namespace: str) -> Dict[str, int]:
         if not name:
             continue
 
-        src = upsert_service(db, namespace=namespace, name=name, team_owner=src_team)
+        src = upsert_service(
+            db, namespace=namespace, name=name, team_owner=src_team,
+            synthetic=_is_synthetic_service(name),
+        )
         stats["services"] += 1
 
         # URL-based edges (existing flow)

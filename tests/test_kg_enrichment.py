@@ -10,9 +10,41 @@ from app.knowledge_graph.kg_sync import (
     _derive_team_owner,
     _discover_namespaces,
     _extract_nats_clusters,
+    _is_synthetic_service,
     sync_namespace,
     sync_topology,
 )
+
+
+# ── synthetic-service detection ─────────────────────────────────────────────
+
+def test_is_synthetic_db_backup_suffix():
+    assert _is_synthetic_service("chat-db-backup")
+    assert _is_synthetic_service("config-worker-db-backup")
+    assert _is_synthetic_service("chat-messages-global-db-backup")
+
+
+def test_is_synthetic_cron_suffix():
+    assert _is_synthetic_service("nightly-cleanup-cron")
+    assert _is_synthetic_service("backup-cron")
+
+
+def test_is_synthetic_exact_names():
+    assert _is_synthetic_service("nats-box")
+    assert _is_synthetic_service("nats-client-box")
+    assert _is_synthetic_service("nats-exporter-prometheus-nats-exporter")
+    assert _is_synthetic_service("seq")
+    assert _is_synthetic_service("redis-exporter")
+
+
+def test_is_synthetic_rejects_real_services():
+    """Backup-related НЕ-cron сервисы — не synthetic."""
+    assert not _is_synthetic_service("backup-service")  # это API, не cron
+    assert not _is_synthetic_service("auth-service")
+    assert not _is_synthetic_service("town-service")
+    assert not _is_synthetic_service("nats-streaming")  # не точное совпадение
+    assert not _is_synthetic_service("")
+    assert not _is_synthetic_service("redis")  # не -exporter
 
 
 # ── team_owner ──────────────────────────────────────────────────────────────
