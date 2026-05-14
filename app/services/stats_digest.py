@@ -149,53 +149,26 @@ def fragile_services_section(db: Session, ns_to_team: Dict[str, str]) -> str:
     return "\n".join(lines)
 
 
-async def _fetch_tc_deployer(namespace: str, last_update: datetime) -> Tuple[Optional[str], Optional[str]]:
-    """Async: получить (deployer_username, build_number) для recent TC build.
-
-    Использует существующий incident_teamcity_context — он ищет builds
-    в backend project около timestamp. Возвращает (None, None) при отказе
-    (TC недоступен, нет матчей, timeout). Идемпотентно: ошибка не падает наружу.
-    """
-    try:
-        from app.services.teamcity_service import incident_teamcity_context
-        ctx = await incident_teamcity_context(
-            namespace=namespace,
-            incident_starts_at=last_update.isoformat(),
-        )
-        if not ctx:
-            return None, None
-        builds = ctx.get("recent_builds") or []
-        if not builds:
-            return None, None
-        # Берём первый (ближайший к last_update) с непустым triggered_by.
-        for b in builds:
-            if b.get("triggered_by"):
-                return b.get("triggered_by"), str(b.get("number") or "?")
-        return None, str(builds[0].get("number") or "?")
-    except Exception as e:
-        log.warning("stats_digest.tc_deployer_failed", namespace=namespace, error=str(e))
-        return None, None
-
-
-async def stale_deployments_section(
+def stale_deployments_section(
     db: Session,
     ns_to_team: Dict[str, str],
     threshold_days: int,
     *,
     kubectl_fn=None,
-    tc_deployer_fn=None,
 ) -> str:
     """5. Deployments живые (replicas>0) но spec не апдейтился ≥ threshold_days.
 
     Compact-rendering: deployments с одинаковым name и одинаковым idle_days
     встречающиеся в 3+ namespace-ах рендерятся одной строкой
-    (`town-db-backup × 5 kingdoms · 62d`). Per-name делается ОДИН TC-lookup
-    для deployer-username и build-number.
+    (`town-db-backup × 5 kingdoms · 62d`).
 
-    `kubectl_fn` / `tc_deployer_fn` — для DI в тестах.
+    Per-release deployer name через TC недостижим (TC устроен «buildtype per
+    pipeline action», не «buildtype per helm-release»), поэтому not shown.
+    Кто что катил отображается в `recent_deploys_section` отдельно.
+
+    `kubectl_fn` — для DI в тестах.
     """
     fn = kubectl_fn or _kubectl_get_deployments_json
-    deployer_fn = tc_deployer_fn or _fetch_tc_deployer
 
     wo_namespaces = sorted({
         ns for (ns,) in db.execute(text("SELECT DISTINCT namespace FROM kg_services")).fetchall()
@@ -232,42 +205,33 @@ async def stale_deployments_section(
         key = (e[2], e[0])  # (name, idle_days)
         by_group[key].append(e)
 
-    # Render: для groups с ≥3 namespace — squash; иначе детально.
     rendered_groups: List[Tuple[int, str]] = []  # (max_idle для sort, rendered_line)
     seen_namespaces: set = set()
-    # 1) Cross-namespace groups (squashed)
     for (name, idle), group in by_group.items():
         if len(group) >= 3:
             namespaces = sorted({e[1] for e in group})
             teams = sorted({e[3] for e in group})
             seen_namespaces.update(namespaces)
-            user, build = await deployer_fn(namespaces[0], group[0][5])
-            deployer = f" · last by {user} (#{build})" if user else ""
             teams_str = ",".join(f"@{t}" for t in teams[:3])
             if len(teams) > 3:
                 teams_str += f"+{len(teams)-3}"
             rendered_groups.append((
                 idle,
-                f"  • `{name}` × {len(group)} ns ({teams_str}) · idle **{idle}d**{deployer}",
+                f"  • `{name}` × {len(group)} ns ({teams_str}) · idle **{idle}d**",
             ))
 
-    # 2) Singular/duo entries (per-namespace, до 10 строк max)
     singular: List[Tuple[int, str, str, str, int, datetime]] = sorted(
         (e for e in entries if e[1] not in seen_namespaces),
         key=lambda e: (-e[0], e[2]),
     )
-    # TC lookup для top-10 singular (cap на N TC-calls).
     singular_cap = 10
     for e in singular[:singular_cap]:
-        idle, ns, name, team, _r, last_dt = e
-        user, build = await deployer_fn(ns, last_dt)
-        deployer = f" · last by {user} (#{build})" if user else ""
+        idle, ns, name, team, _r, _last_dt = e
         rendered_groups.append((
             idle,
-            f"  • `{name}` _{ns}_ (@{team}) · idle **{idle}d**{deployer}",
+            f"  • `{name}` _{ns}_ (@{team}) · idle **{idle}d**",
         ))
 
-    # Сортируем итоговый блок по idle desc + cap всё ещё в 12 строк
     rendered_groups.sort(key=lambda x: -x[0])
     cap_total = 12
     for _idle, line in rendered_groups[:cap_total]:
@@ -276,6 +240,74 @@ async def stale_deployments_section(
     extra = len(rendered_groups) - cap_total + max(0, len(singular) - singular_cap)
     if extra > 0:
         lines.append(f"  _… и ещё {extra} (скрыто)_")
+    return "\n".join(lines)
+
+
+# ── recent TC deploys (cluster-wide deployer activity) ──────────────────────
+
+
+def _humanize_ago(iso_str: Optional[str], now: Optional[datetime] = None) -> str:
+    """ISO timestamp → '5m ago' / '2h ago' / '3d ago'."""
+    if not iso_str:
+        return "?"
+    try:
+        dt = datetime.fromisoformat(iso_str.replace("Z", "+00:00"))
+    except ValueError:
+        return "?"
+    now = now or datetime.now(timezone.utc)
+    delta = now - dt
+    secs = int(delta.total_seconds())
+    if secs < 60:
+        return f"{secs}s ago"
+    if secs < 3600:
+        return f"{secs // 60}m ago"
+    if secs < 86400:
+        return f"{secs // 3600}h ago"
+    return f"{secs // 86400}d ago"
+
+
+async def recent_deploys_section(
+    *,
+    lookback_hours: int = 24,
+    limit: int = 5,
+    fetch_fn=None,
+) -> str:
+    """6. Cluster-wide TC deployer activity за последние N часов.
+
+    Per-release deployer не работает (см. stale_deployments_section), но
+    «кто что катил» — рабочий запрос: top-N finished deploy-builds, sorted
+    by finished_at. Показывает trigger-user (или type для auto-triggered).
+
+    `fetch_fn` — для DI в тестах. По умолчанию `teamcity_service.recent_deploys`.
+    """
+    if fetch_fn is None:
+        from app.services.teamcity_service import recent_deploys as _rd
+        fetch_fn = _rd
+    try:
+        builds = await fetch_fn(lookback_hours=lookback_hours, limit=limit)
+    except Exception as e:
+        log.warning("stats_digest.recent_deploys_failed", error=str(e))
+        return ""
+
+    lines = [f"**🔧 Recent deploys** (последние {lookback_hours}h)"]
+    if not builds:
+        lines.append("  _TC недоступен или нет deploy-билдов за окно_")
+        return "\n".join(lines)
+
+    now = datetime.now(timezone.utc)
+    for b in builds:
+        user = b.get("triggered_by")
+        trig_type = b.get("triggered_type") or "?"
+        actor = f"`{user}`" if user else f"_{trig_type}_"
+        btype = b.get("buildtype_name") or "?"
+        branch = (b.get("branch") or "?").replace("refs/heads/", "")
+        num = b.get("number") or "?"
+        status = b.get("status") or "?"
+        ago = _humanize_ago(b.get("finished_at"), now)
+        status_marker = "" if status == "SUCCESS" else f" · ⚠️ {status}"
+        lines.append(
+            f"  • by {actor} · `{btype}` ({branch} #{num}) · {ago}{status_marker}"
+        )
     return "\n".join(lines)
 
 
@@ -387,9 +419,10 @@ async def build_digest(db: Session) -> str:
     alerts_text, unique_alerts, _ = firing_alerts_section(fired_series, ns_to_team)
     top_types_text = top_alert_types_section(unique_alerts)
     fragile_text = fragile_services_section(db, ns_to_team)
-    stale_text = await stale_deployments_section(
+    stale_text = stale_deployments_section(
         db, ns_to_team, threshold_days=settings.STATS_DIGEST_STALE_DAYS
     )
+    deploys_text = await recent_deploys_section(lookback_hours=24, limit=5)
     kg_text = kg_quality_section(db)
 
     now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
@@ -398,6 +431,7 @@ async def build_digest(db: Session) -> str:
         health_text,
         alerts_text,
         top_types_text,
+        deploys_text,
         fragile_text,
         stale_text,
         kg_text,
