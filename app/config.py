@@ -159,7 +159,7 @@ class Settings(BaseSettings):
     # Default False — opt-in через Helm value env.statsDigestEnabled.
     STATS_DIGEST_ENABLED: bool = Field(False, description="Enable daily stats digest beat task")
     STATS_DIGEST_HOUR_UTC: int = Field(9, description="UTC hour to run daily digest (0-23)")
-    STATS_DIGEST_STALE_DAYS: int = Field(14, description="Threshold days for stale-deployment detection")
+    STATS_DIGEST_STALE_DAYS: int = Field(30, description="Threshold days for stale-deployment detection")
 
     # Executor approval (PR #3 executor track). Если True — Discord-embed
     # получает кнопку "Apply", которая после двухшагового подтверждения
