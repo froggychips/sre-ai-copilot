@@ -36,7 +36,14 @@ class DiscordService:
             await client.post(url, json=payload)
 
     async def send_stats_report(self, content: str) -> None:
-        """Отправить текст в канал #stats (cluster health, daily report)."""
+        """Отправить markdown-content в канал #stats как Discord embed.
+
+        Используем embed (description-limit 4096) вместо content (limit 2000).
+        Daily-digest сейчас ~2800 chars — в content не влезет.
+
+        Первая строка контента вынесена в embed.title (если bold + emoji),
+        остальное — в description.
+        """
         url = settings.DISCORD_WEBHOOK_STATS_URL
         if not url:
             logging.warning("DISCORD_WEBHOOK_STATS_URL not set, skipping stats report")
@@ -44,11 +51,32 @@ class DiscordService:
         if settings.DISCORD_DRY_RUN:
             logging.info("[DISCORD_DRY_RUN] send_stats_report:\n%s", content)
             return
-        payload = {"content": content}
+
+        lines = content.split("\n", 1)
+        if len(lines) == 2 and lines[0].strip():
+            title = lines[0].strip()[:256]  # Discord title-limit
+            description = lines[1].lstrip("\n")
+        else:
+            title = "Stats digest"
+            description = content
+        # Embed description hard-limit 4096; truncate с маркером.
+        if len(description) > 4000:
+            description = description[:3990] + "\n_…truncated_"
+
+        payload = {
+            "embeds": [{
+                "title": title,
+                "description": description,
+                "color": 0x607D8B,  # blue-grey, нейтральный для аналитики
+            }]
+        }
         async with httpx.AsyncClient() as client:
             r = await client.post(url, json=payload)
             if r.status_code >= 400:
-                logging.error("discord_stats_report_failed", extra={"status": r.status_code})
+                logging.error(
+                    "discord_stats_report_failed",
+                    extra={"status": r.status_code, "body": r.text[:200]},
+                )
 
     async def send_incident_report(
         self,
