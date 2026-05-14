@@ -362,3 +362,111 @@ def teamcity_context_to_prompt(tc_ctx: Optional[dict]) -> str:
         if b.get("url"):
             lines.append(f"  URL: {b['url']}")
     return "\n".join(lines)
+
+
+# ── recent deploys (для cluster-wide дайджеста) ─────────────────────────────
+#
+# В отличие от incident_teamcity_context (поиск вокруг конкретного timestamp,
+# узкое окно), здесь нужно: «кто что катил за последние N часов».
+# Используется в Daily Cluster Digest. Per-helm-release lookup не работает —
+# TC устроен «buildtype per pipeline action» (Build and update / Kingdom
+# deploy / Shared deploy / Backup all db), не «buildtype per service».
+# Поэтому показываем top deploy-builds глобально.
+
+_DEPLOY_NAME_TOKENS = ("deploy", "update", "backup")
+_DEPLOY_NAME_EXCLUDE = ("set client min", "set ab test", "update terrain",
+                        "update secret", "delete namespace")
+
+
+def _is_deploy_buildtype_name(name: Optional[str]) -> bool:
+    if not name:
+        return False
+    lower = name.lower()
+    if any(ex in lower for ex in _DEPLOY_NAME_EXCLUDE):
+        return False
+    return any(tok in lower for tok in _DEPLOY_NAME_TOKENS)
+
+
+def _fetch_recent_deploys_direct(
+    project_id: str,
+    since: datetime,
+    limit: int,
+) -> list[dict[str, Any]]:
+    """Sync TC REST: finished builds в проекте с `triggered.user` и `buildType.name`.
+
+    Запускается в thread pool из async-контекста. Фильтр по deploy-name
+    делается на стороне Python — TC locator не поддерживает name-pattern
+    на buildType.
+    """
+    client = _TCClient(url=settings.TC_URL, token=settings.TC_TOKEN,
+                       timeout=settings.TC_TIMEOUT_SECONDS * 2)
+    try:
+        fields = (
+            "build(id,number,status,state,branchName,buildTypeId,"
+            "buildType(name),startDate,finishDate,"
+            "triggered(type,date,user(username,name)))"
+        )
+        # TC sinceDate format: yyyyMMdd'T'HHmmss±HHmm
+        since_str = since.astimezone(timezone.utc).strftime("%Y%m%dT%H%M%S+0000")
+        locator = (
+            f"affectedProject:(id:{project_id}),"
+            f"state:finished,sinceDate:{since_str},count:200"
+        )
+        data = client.get_json("/app/rest/builds",
+                               params={"locator": locator, "fields": fields})
+        raw = data.get("build", [])
+
+        out: list[dict[str, Any]] = []
+        for b in raw:
+            btype_name = (b.get("buildType") or {}).get("name")
+            if not _is_deploy_buildtype_name(btype_name):
+                continue
+            triggered = b.get("triggered") or {}
+            trig_user = triggered.get("user") or {}
+            out.append({
+                "id": b.get("id"),
+                "number": b.get("number"),
+                "status": b.get("status"),
+                "branch": b.get("branchName"),
+                "buildtype_id": b.get("buildTypeId"),
+                "buildtype_name": btype_name,
+                "finished_at": _tc_to_iso(b.get("finishDate")),
+                "triggered_by": trig_user.get("username") or trig_user.get("name"),
+                "triggered_type": triggered.get("type"),
+                "url": (
+                    f"{settings.TEAMCITY_WEB_URL.rstrip('/')}/viewLog.html?buildId={b.get('id')}"
+                    if settings.TEAMCITY_WEB_URL and b.get("id") else None
+                ),
+            })
+
+        out.sort(key=lambda x: x.get("finished_at") or "", reverse=True)
+        return out[:limit]
+    finally:
+        client.close()
+
+
+async def recent_deploys(
+    *,
+    lookback_hours: int = 24,
+    limit: int = 5,
+) -> list[dict[str, Any]]:
+    """Top-N deploy-builds (finished) за последние `lookback_hours` часов.
+
+    Каждый dict: id/number/status/branch/buildtype_id/buildtype_name/
+    finished_at/triggered_by/triggered_type/url. Пустой список — если TC
+    не настроен / direct client недоступен / ошибка.
+    """
+    if not (settings.TC_URL and settings.TC_TOKEN and _TC_CLIENT_AVAILABLE):
+        return []
+    if not settings.TC_BACKEND_PROJECT_ID:
+        return []
+    since = datetime.now(timezone.utc) - timedelta(hours=lookback_hours)
+    try:
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(
+            None, _fetch_recent_deploys_direct,
+            settings.TC_BACKEND_PROJECT_ID, since, limit,
+        )
+    except Exception as e:
+        logger.warning("teamcity.recent_deploys_failed", error=str(e))
+        return []
