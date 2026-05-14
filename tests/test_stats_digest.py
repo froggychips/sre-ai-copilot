@@ -305,28 +305,48 @@ def test_kg_quality_renders_full_state():
        1. services_total .scalar
        2. edges_total .scalar
        3. edges_by_kind .fetchall
-       4. orphan .scalar
-       5. teamed .scalar
-       6. by_team .fetchall
+       4. synthetic .scalar
+       5. orphan (исключая synthetic) .scalar
+       6. teamed .scalar
+       7. by_team .fetchall
     """
     db = MagicMock()
     call_results = [
-        MagicMock(scalar=lambda: 363),
-        MagicMock(scalar=lambda: 712),
-        MagicMock(fetchall=lambda: [("calls", 36), ("uses_nats", 676)]),
-        MagicMock(scalar=lambda: 47),
-        MagicMock(scalar=lambda: 348),
-        MagicMock(fetchall=lambda: [("kingdom1", 24), ("kingdom2", 24), ("shared", 26)]),
+        MagicMock(scalar=lambda: 384),
+        MagicMock(scalar=lambda: 696),
+        MagicMock(fetchall=lambda: [("calls", 36), ("uses_nats", 660)]),
+        MagicMock(scalar=lambda: 82),   # synthetic
+        MagicMock(scalar=lambda: 47),   # real-orphan
+        MagicMock(scalar=lambda: 384),  # teamed
+        MagicMock(fetchall=lambda: [("kingdom1", 71), ("kingdom2", 71), ("shared", 77)]),
     ]
     db.execute.side_effect = call_results
 
     rendered = stats_digest.kg_quality_section(db)
-    assert "`363`" in rendered
-    assert "`47`" in rendered  # orphan
-    assert "(12%)" in rendered or "(13%)" in rendered  # 47/363 ≈ 12.94%
+    assert "`384`" in rendered
+    assert "`47`/`302`" in rendered  # orphan / (total - synthetic)
+    assert "(15%)" in rendered  # 47/302 = 15.56% → 15
+    assert "synthetic скрыты: `82`" in rendered
     assert "calls=36" in rendered
-    assert "uses_nats=676" in rendered
+    assert "uses_nats=660" in rendered
     assert "@kingdom1" in rendered
+
+
+def test_kg_quality_no_synthetic_no_suffix():
+    """Если synthetic=0 — не показывать пустую подпись."""
+    db = MagicMock()
+    db.execute.side_effect = [
+        MagicMock(scalar=lambda: 100),
+        MagicMock(scalar=lambda: 200),
+        MagicMock(fetchall=lambda: [("calls", 200)]),
+        MagicMock(scalar=lambda: 0),   # synthetic = 0
+        MagicMock(scalar=lambda: 10),
+        MagicMock(scalar=lambda: 100),
+        MagicMock(fetchall=lambda: []),
+    ]
+    rendered = stats_digest.kg_quality_section(db)
+    assert "synthetic скрыты" not in rendered
+    assert "`10`/`100`" in rendered
 
 
 def test_kg_quality_empty_kg():
