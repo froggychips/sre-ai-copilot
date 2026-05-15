@@ -82,6 +82,40 @@ def _is_synthetic_service(name: str) -> bool:
         return True
     return any(name.endswith(s) for s in _SYNTHETIC_SUFFIXES)
 
+
+# ── Edge metadata: confidence + semantics ──────────────────────────────────
+#
+# Все edges из env-parsing помечаем `confidence="inferred_env"` — это
+# config-derived, не подтверждено runtime-trace'ами. Будущие L7-источники
+# (OTEL spans, VM client-request метрики) будут писать "runtime_seen"
+# (через JSON merge — наш upsert_edge сохранит обе пометки если они идут
+# из разных passes).
+#
+# `semantics` (sync|async) выводим из kind:
+#   - calls (HTTP/gRPC env URLs)        → sync
+#   - uses_nats (NATS pub/sub)          → async
+# Когда добавятся reads_from / consumes_kafka — расширим map.
+
+_KIND_TO_SEMANTICS = {
+    "calls": "sync",
+    "uses_nats": "async",
+    "consumes_kafka": "async",
+    "reads_from": "sync",
+}
+
+
+def _inferred_extras(kind: str) -> Dict[str, Any]:
+    """Default extras для edge, созданного из env-parsing (config-derived).
+
+    Используется во всех точках где kg_sync создаёт ребро. Будущие
+    runtime-источники должны передавать `{"confidence": "runtime_seen", ...}`
+    — merge сохранит обе пометки в JSON через upsert_edge.
+    """
+    return {
+        "confidence": "inferred_env",
+        "semantics": _KIND_TO_SEMANTICS.get(kind, "unknown"),
+    }
+
 # Пропускаем явно внешние/нерелевантные сервисы.
 # Это blacklist для фильтрации значений из env-переменных подов,
 # а не bind-адрес сервера — B104 здесь ложно-положительный.
@@ -348,7 +382,11 @@ def sync_namespace(
                 name=up_svc,
                 team_owner=_derive_team_owner(up_ns),
             )
-            upsert_edge(db, src=src, dst=dst, kind="calls", discovered_by="kg_sync/env_vars")
+            upsert_edge(
+                db, src=src, dst=dst, kind="calls",
+                discovered_by="kg_sync/env_vars",
+                extras=_inferred_extras("calls"),
+            )
             stats["edges"] += 1
 
         # NATS-cluster edges (PR — KG enrichment).
@@ -366,6 +404,7 @@ def sync_namespace(
                 db, src=src, dst=dst,
                 kind="uses_nats",
                 discovered_by="kg_sync/nats_env",
+                extras=_inferred_extras("uses_nats"),
             )
             stats["edges"] += 1
 
@@ -438,7 +477,11 @@ def _enrich_calls_edges_for_ns(
             dst = db.query(Service).filter_by(namespace=up_ns, name=up_svc).one_or_none()
             if dst is None:
                 continue
-            upsert_edge(db, src=src, dst=dst, kind="calls", discovered_by="kg_sync/env_url_v2")
+            upsert_edge(
+                db, src=src, dst=dst, kind="calls",
+                discovered_by="kg_sync/env_url_v2",
+                extras=_inferred_extras("calls"),
+            )
             edges_count += 1
     return edges_count
 

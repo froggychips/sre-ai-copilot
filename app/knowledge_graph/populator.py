@@ -71,7 +71,16 @@ def upsert_edge(
     kind: str,
     weight: int = 1,
     discovered_by: Optional[str] = None,
+    extras: Optional[Dict[str, Any]] = None,
 ) -> ServiceEdge:
+    """Idempotent upsert по (src_id, dst_id, kind).
+
+    `extras` (JSON) — место для метаданных, которые не заслуживают отдельной
+    колонки: confidence (inferred_env / runtime_seen / stale / confirmed),
+    semantics (sync / async), retry, timeout, etc. На update — JSON merge,
+    не overwrite, чтобы более поздний (runtime) источник не стёр манульные
+    annotations.
+    """
     edge = (
         db.query(ServiceEdge)
         .filter(
@@ -88,12 +97,22 @@ def upsert_edge(
             kind=kind,
             weight=weight,
             discovered_by=discovered_by,
+            extras=extras or None,
         )
         db.add(edge)
         db.flush()
     else:
+        changed = False
         if edge.weight != weight:
             edge.weight = weight
+            changed = True
+        if extras:
+            merged = dict(edge.extras or {})
+            merged.update(extras)
+            if merged != (edge.extras or {}):
+                edge.extras = merged
+                changed = True
+        if changed:
             db.flush()
     return edge
 
