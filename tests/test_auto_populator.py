@@ -138,6 +138,38 @@ def test_populate_picks_app_label_when_no_service(db):
     assert db.query(Service).filter(Service.name == "auth-svc").one() is not None
 
 
+def test_upsert_edge_merges_extras_does_not_overwrite(db):
+    """Когда runtime-источник (OTEL spans, VM client-requests) перезапишет
+    edge — он должен ДОПОЛНИТЬ extras (добавить confidence='runtime_seen'),
+    а не стереть существующие inferred-аннотации."""
+    from app.knowledge_graph.populator import upsert_edge, upsert_service
+
+    town = upsert_service(db, namespace="ns1", name="town")
+    auth = upsert_service(db, namespace="ns1", name="auth")
+
+    # 1-й pass: env-derived
+    upsert_edge(
+        db, town, auth, kind="calls",
+        extras={"confidence": "inferred_env", "semantics": "sync"},
+    )
+    edge = db.query(ServiceEdge).filter_by(src_id=town.id, dst_id=auth.id).one()
+    assert edge.extras == {"confidence": "inferred_env", "semantics": "sync"}
+
+    # 2-й pass: runtime-источник видит то же ребро + добавляет traffic_share
+    upsert_edge(
+        db, town, auth, kind="calls",
+        extras={"confidence": "runtime_seen", "traffic_share": 0.92},
+    )
+    edge2 = db.query(ServiceEdge).filter_by(src_id=town.id, dst_id=auth.id).one()
+    # confidence перезаписан (более поздний источник — более доверенный),
+    # semantics СОХРАНЕНА (не было в new extras → merge), traffic_share добавлен.
+    assert edge2.extras == {
+        "confidence": "runtime_seen",
+        "semantics": "sync",
+        "traffic_share": 0.92,
+    }
+
+
 def test_populate_after_full_cycle_enables_nearby_alerts(db):
     """E2E: 2 инцидента на разные сервисы + edge между ними → nearby_alerts работает."""
     populate_from_incident(db, _incident(

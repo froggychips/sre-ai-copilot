@@ -11,6 +11,7 @@ from app.knowledge_graph.kg_sync import (
     _discover_namespaces,
     _extract_nats_clusters,
     _extract_upstreams_extended,
+    _inferred_extras,
     _is_synthetic_service,
     _parse_host_from_value,
     sync_namespace,
@@ -147,6 +148,38 @@ def test_extract_upstreams_extended_url_hint_unlocks_bare():
     known = {"prod-kingdom1": {"auth-service", "town-service"}}
     out = _extract_upstreams_extended(deploy, "prod-kingdom1", known)
     assert out == [("auth-service", "prod-kingdom1")]
+
+
+# ── Edge confidence + semantics (extras scaffold для L7-источников) ─────────
+
+
+def test_inferred_extras_calls_is_sync():
+    """HTTP/gRPC calls — sync semantics."""
+    e = _inferred_extras("calls")
+    assert e == {"confidence": "inferred_env", "semantics": "sync"}
+
+
+def test_inferred_extras_nats_is_async():
+    """uses_nats — async semantics (pub/sub)."""
+    e = _inferred_extras("uses_nats")
+    assert e == {"confidence": "inferred_env", "semantics": "async"}
+
+
+def test_inferred_extras_unknown_kind_falls_back_to_unknown_semantics():
+    """Future edge kinds, не описанные в map → semantics='unknown'."""
+    e = _inferred_extras("custom_future_kind")
+    assert e["confidence"] == "inferred_env"
+    assert e["semantics"] == "unknown"
+
+
+def test_inferred_extras_reads_from_is_sync():
+    """Future reads_from (DB queries) — sync."""
+    assert _inferred_extras("reads_from")["semantics"] == "sync"
+
+
+def test_inferred_extras_kafka_is_async():
+    """Future consumes_kafka — async."""
+    assert _inferred_extras("consumes_kafka")["semantics"] == "async"
 
 
 # ── team_owner ──────────────────────────────────────────────────────────────
