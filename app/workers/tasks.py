@@ -64,6 +64,8 @@ celery_app.conf.beat_schedule = {
     rate_limit=settings.CELERY_PROCESS_INCIDENT_RATE_LIMIT,
 )
 def process_incident_task(self, incident_data: dict):
+    # Hard-gate проверяется внутри `async_process_incident` чтобы закрыть
+    # оба entry-point (Celery task + PIPELINE_DIRECT_INVOKE из webhook).
     # asyncio.run создаёт чистый event loop на задачу — get_event_loop()
     # на Python 3.10+ выкидывает DeprecationWarning, а в Python 3.14+
     # без running loop возвращает ошибку. Celery worker — синхронный
@@ -75,6 +77,22 @@ async def async_process_incident(incident_data: dict):
     incident_id = incident_data.get("incident_id", "")
     _service = (incident_data.get("labels") or {}).get("service", "")
     _namespace = incident_data.get("namespace", "")
+
+    # ── HARD GATE: защита от случайного LLM-burn ───────────────────────
+    # См. settings.LLM_PIPELINE_ENABLED. Default=False закрывает оба
+    # entry-point: Celery task + PIPELINE_DIRECT_INVOKE из webhook.
+    # Audit-event обнаруживает unintended-routing на дашборде.
+    if not settings.LLM_PIPELINE_ENABLED:
+        logger.warning(
+            "pipeline.skipped_disabled incident_id=%s ns=%s",
+            incident_id, _namespace,
+        )
+        audit_service.log_event("PIPELINE_DISABLED_SKIP", {
+            "incident_id": incident_id,
+            "namespace": _namespace,
+            "reason": "LLM_PIPELINE_ENABLED=false",
+        })
+        return {"status": "skipped", "reason": "LLM_PIPELINE_ENABLED=false"}
 
     with incident_span(incident_id, service=_service, namespace=_namespace) as _root_span:
         db = SessionLocal()

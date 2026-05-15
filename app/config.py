@@ -35,6 +35,26 @@ class Settings(BaseSettings):
     # Eager Celery — для in-process e2e без Redis/worker'а
     CELERY_TASK_ALWAYS_EAGER: bool = False
 
+    # ┌─ HARD GATE: запуск LLM-pipeline ─┐
+    # Двойная защита от случайного запуска full incident-pipeline'а:
+    #  1. AlertManager route (вне copilot — VMAlertmanagerConfig).
+    #  2. ЭТА переменная (в коде, не route-зависимая).
+    #
+    # Сценарий аварии: кто-то меняет VMAlertmanagerConfig URL с
+    # /webhooks/alertmanager/store на /webhooks/alertmanager. Без этого
+    # флага все 50 alerts/мин из prod-* идут в process_incident_task →
+    # 5 LLM-calls × $0.05 × 50 = ~$12.5/мин = $750/час burn до того как
+    # кто-то заметит.
+    #
+    # Default False: даже при route-misconfiguration пайплайн
+    # exit'нется без LLM-вызовов. Включается ОСОЗНАННО через
+    # `kubectl set env deployment/copilot-worker LLM_PIPELINE_ENABLED=true`
+    # ПОСЛЕ:
+    #   - E2E + replay тесты прошли (#30 в roadmap)
+    #   - Budget cap в Anthropic console установлен
+    #   - severity-фильтр сужен до critical + prod-*
+    LLM_PIPELINE_ENABLED: bool = False
+
     # Celery backpressure / resilience (PR — protect prod worker от перегрузки,
     # memory-leak'ов, висящих задач, OOM при flood incident-ов).
     #
