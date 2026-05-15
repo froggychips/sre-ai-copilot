@@ -1,0 +1,24 @@
+{
+  "_fixture_id": "highlatency",
+  "_description": "p99 latency > 1s на auth-service. Hypothesis-стадия должна рассмотреть upstream issues и недавние deploys как причины.",
+  "incident_id": "fixture-highlatency-1",
+  "severity": "warning",
+  "status": "firing",
+  "summary": "auth-service p99 latency > 1.5s for 10m",
+  "description": "Sustained request_duration_seconds{quantile=0.99} > 1.5 on auth-service in prod-shared",
+  "namespace": "prod-shared",
+  "labels": {
+    "alertname": "HighLatency",
+    "namespace": "prod-shared",
+    "service": "auth-service",
+    "severity": "warning"
+  },
+  "annotations": {
+    "summary": "auth-service latency degradation",
+    "description": "p99 of /authenticate endpoint = 1.84s (threshold 1s)"
+  },
+  "starts_at": "2026-05-15T11:30:00Z",
+  "ends_at": null,
+  "generator_url": "https://prometheus.local/graph?g0.expr=...",
+  "raw": {}
+}
