@@ -311,7 +311,11 @@ async def alertmanager_webhook_enrich_and_forward(
     # Discord-enrich tier. Под фичефлагом — чтобы /store-style behaviour
     # сохранялся, пока канарейка не подтвердит безвредность.
     enriched_groups = 0
+    suppressed_chronic = 0
+    suppressed_rollout = 0
     if settings.DISCORD_ENRICH_ENABLED and firing_incidents:
+        from app.services.alert_dedup import Decision, decide_send
+
         # Группировка по (alertname, severity) — несколько ns в одном embed.
         groups: dict[tuple, list] = {}
         for inc in firing_incidents:
@@ -333,9 +337,41 @@ async def alertmanager_webhook_enrich_and_forward(
         discord_service = DiscordService()
         for (alertname, sev), incs in groups.items():
             try:
+                # Дедуп решается per первой incident-у группы (один service —
+                # один state-ключ; namespace-агрегацию уже сделал AM group_by).
+                head_inc = incs[0]
+                head_service = (
+                    head_inc.labels.get("service")
+                    or head_inc.labels.get("deployment")
+                )
+                decision = await decide_send(
+                    alertname=alertname,
+                    namespace=head_inc.namespace,
+                    service=head_service,
+                    severity=sev,
+                    db=db,
+                )
+                if decision == Decision.SUPPRESS_CHRONIC:
+                    suppressed_chronic += 1
+                    log.info(
+                        "enrich_forward.suppress_chronic",
+                        alertname=alertname, service=head_service,
+                    )
+                    continue
+                if decision == Decision.SUPPRESS_ROLLOUT:
+                    suppressed_rollout += 1
+                    log.info(
+                        "enrich_forward.suppress_rollout",
+                        alertname=alertname, service=head_service,
+                    )
+                    continue
+
                 ctxs = [enrich_alert(db, inc) for inc in incs]
                 env_hint = _env_hint(incs[0].namespace)
-                await discord_service.send_enriched_alert(ctxs, env=env_hint)
+                resurfaced = (decision == Decision.SEND_RESURFACED)
+                await discord_service.send_enriched_alert(
+                    ctxs, env=env_hint, resurfaced=resurfaced,
+                )
                 enriched_groups += 1
             except Exception as e:
                 log.warning(
@@ -350,6 +386,8 @@ async def alertmanager_webhook_enrich_and_forward(
         "status": "stored-and-forwarded",
         "alerts": stored,
         "enriched_groups": enriched_groups,
+        "suppressed_chronic": suppressed_chronic,
+        "suppressed_rollout": suppressed_rollout,
         "enrich_enabled": settings.DISCORD_ENRICH_ENABLED,
     }
 

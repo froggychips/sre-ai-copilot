@@ -234,6 +234,7 @@ class DiscordService:
         self,
         contexts: List["EnrichedContext"],
         env: Optional[str] = None,
+        resurfaced: bool = False,
     ) -> None:
         """Детерминированный embed с KG-контекстом, БЕЗ LLM.
 
@@ -277,9 +278,11 @@ class DiscordService:
             recurrence_tag = f" · 🔁 ×{rec_max} за 24h"
         noise_tag = " · 🤖 ROLLOUT-NORMAL" if head.rollout_noise else ""
         ns_tag = f" ({len(namespaces)} ns)" if len(namespaces) > 1 else ""
+        resurfaced_tag = " · 🌀 RESURFACED" if resurfaced else ""
 
         title = (
-            f"{icon} {env_part}{alertname} · {svc_or_pod}{ns_tag}{recurrence_tag}{noise_tag}"
+            f"{icon} {env_part}{alertname} · {svc_or_pod}{ns_tag}"
+            f"{recurrence_tag}{noise_tag}{resurfaced_tag}"
         )
 
         fields: List[Dict[str, Any]] = []
