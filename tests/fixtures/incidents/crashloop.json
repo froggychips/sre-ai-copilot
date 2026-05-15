@@ -1,0 +1,26 @@
+{
+  "_fixture_id": "crashloop",
+  "_description": "CrashLoopBackOff на пода town-service — exit code 137 (OOM signal). Один из самых частых WO incidents.",
+  "incident_id": "fixture-crashloop-1",
+  "severity": "critical",
+  "status": "firing",
+  "summary": "Pod town-service-7d8f9 in CrashLoopBackOff",
+  "description": "Pod restarted 5 times in last 10 minutes with exit code 137",
+  "namespace": "prod-kingdom1",
+  "labels": {
+    "alertname": "KubePodCrashLooping",
+    "namespace": "prod-kingdom1",
+    "pod": "town-service-7d8f9",
+    "service": "town-service",
+    "severity": "critical",
+    "container": "town"
+  },
+  "annotations": {
+    "summary": "Pod town-service-7d8f9 (town) is restarting 5 times / 10 minutes",
+    "description": "exit code 137 — SIGKILL by OOM-killer or liveness probe failure"
+  },
+  "starts_at": "2026-05-15T10:00:00Z",
+  "ends_at": null,
+  "generator_url": "https://prometheus.local/graph?g0.expr=...",
+  "raw": {}
+}

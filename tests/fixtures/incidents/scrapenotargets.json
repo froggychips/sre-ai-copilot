@@ -1,0 +1,24 @@
+{
+  "_fixture_id": "scrapenotargets",
+  "_description": "ScrapePoolHasNoTargets — Prometheus не может найти targets для service-monitor'а. Сигнал миграции/переименования, не падения сервиса.",
+  "incident_id": "fixture-scrapenotargets-1",
+  "severity": "warning",
+  "status": "firing",
+  "summary": "ScrapePool 'finance-service' has no active targets",
+  "description": "vm-scrape-config finance-service-monitor — 0 active endpoints for 10m",
+  "namespace": "monitoring",
+  "labels": {
+    "alertname": "ScrapePoolHasNoTargets",
+    "scrape_pool": "finance-service-monitor",
+    "service": "finance-service",
+    "severity": "warning"
+  },
+  "annotations": {
+    "summary": "No scrape targets for finance-service",
+    "description": "Prometheus servicemonitor нашёл 0 endpoints. Service был переименован или удалён?"
+  },
+  "starts_at": "2026-05-15T13:30:00Z",
+  "ends_at": null,
+  "generator_url": "https://prometheus.local/graph?g0.expr=...",
+  "raw": {}
+}

@@ -1,0 +1,27 @@
+{
+  "_fixture_id": "oomkilled",
+  "_description": "Explicit OOMKilled событие. Отличается от crashloop тем что есть metric kube_pod_container_status_last_terminated_reason=OOMKilled.",
+  "incident_id": "fixture-oomkilled-1",
+  "severity": "critical",
+  "status": "firing",
+  "summary": "Container chat-service OOMKilled in prod-kingdom2",
+  "description": "Memory limit 512Mi exceeded, container terminated",
+  "namespace": "prod-kingdom2",
+  "labels": {
+    "alertname": "KubeContainerOOMKilled",
+    "namespace": "prod-kingdom2",
+    "pod": "chat-service-5a6b3",
+    "service": "chat-service",
+    "container": "chat",
+    "reason": "OOMKilled",
+    "severity": "critical"
+  },
+  "annotations": {
+    "summary": "Container chat-service OOMKilled",
+    "description": "memory.working_set_bytes hit limit_in_bytes=512Mi"
+  },
+  "starts_at": "2026-05-15T10:15:00Z",
+  "ends_at": null,
+  "generator_url": "https://prometheus.local/graph?g0.expr=...",
+  "raw": {}
+}

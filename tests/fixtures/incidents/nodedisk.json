@@ -1,0 +1,24 @@
+{
+  "_fixture_id": "nodedisk",
+  "_description": "NodeDiskIOSaturation — node-level (не pod). Pipeline должен распознать что service-attribution невозможен и реагировать аккуратно.",
+  "incident_id": "fixture-nodedisk-1",
+  "severity": "warning",
+  "status": "firing",
+  "summary": "dev-3 disk I/O saturated (>80% util)",
+  "description": "node_disk_io_time_seconds_total rate > 0.8 for 15 min on dev-3",
+  "namespace": "monitoring",
+  "labels": {
+    "alertname": "NodeDiskIOSaturation",
+    "instance": "dev-3",
+    "device": "sda",
+    "severity": "warning"
+  },
+  "annotations": {
+    "summary": "Disk I/O saturation on dev-3",
+    "description": "rate(node_disk_io_time_seconds_total[5m]) > 0.8 — диск работает >80% времени"
+  },
+  "starts_at": "2026-05-15T13:00:00Z",
+  "ends_at": null,
+  "generator_url": "https://prometheus.local/graph?g0.expr=...",
+  "raw": {}
+}
