@@ -1,0 +1,26 @@
+{
+  "_fixture_id": "imagepull",
+  "_description": "ImagePullBackOff — обычно: deploy-time с неверным тегом, либо отозванный credentials registry. Pipeline должен заподозрить недавний deploy.",
+  "incident_id": "fixture-imagepull-1",
+  "severity": "warning",
+  "status": "firing",
+  "summary": "Pod map-service can't pull image — ImagePullBackOff",
+  "description": "Failed to pull docker.lastoasisgame.com/wo/map-service:v2025.12.14: not found",
+  "namespace": "preprod-kingdom1",
+  "labels": {
+    "alertname": "KubePodImagePullBackOff",
+    "namespace": "preprod-kingdom1",
+    "pod": "map-service-9d2e1",
+    "service": "map-service",
+    "severity": "warning",
+    "reason": "ImagePullBackOff"
+  },
+  "annotations": {
+    "summary": "Cannot pull image for map-service",
+    "description": "ErrImagePull: manifest for docker.lastoasisgame.com/wo/map-service:v2025.12.14 not found"
+  },
+  "starts_at": "2026-05-15T11:00:00Z",
+  "ends_at": null,
+  "generator_url": "https://prometheus.local/graph?g0.expr=...",
+  "raw": {}
+}

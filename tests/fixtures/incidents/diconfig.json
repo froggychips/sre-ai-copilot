@@ -1,0 +1,27 @@
+{
+  "_fixture_id": "diconfig",
+  "_description": "DI / IStatics misconfiguration — error в pod logs upon startup. WO-специфичный сценарий, статика-БД ошибка resolve.",
+  "incident_id": "fixture-diconfig-1",
+  "severity": "critical",
+  "status": "firing",
+  "summary": "town-service fails to start: IStatics CityEffectListProvider unresolved",
+  "description": "Container exited with: Unable to resolve IStatics CityEffectListProvider — empty statics table",
+  "namespace": "prod-kingdom3",
+  "labels": {
+    "alertname": "KubePodCrashLooping",
+    "namespace": "prod-kingdom3",
+    "pod": "town-service-1f4c8",
+    "service": "town-service",
+    "severity": "critical",
+    "container": "town",
+    "reason": "Error"
+  },
+  "annotations": {
+    "summary": "town-service startup error",
+    "description": "Unhandled exception during DI: Unable to resolve IStatics CityEffectListProvider. Check statics gd table effectList_base."
+  },
+  "starts_at": "2026-05-15T12:00:00Z",
+  "ends_at": null,
+  "generator_url": "https://prometheus.local/graph?g0.expr=...",
+  "raw": {}
+}
