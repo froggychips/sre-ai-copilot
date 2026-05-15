@@ -54,6 +54,13 @@ celery_app.conf.beat_schedule = {
         "task": "tc_deploys_to_kg",
         "schedule": crontab(minute="*/15"),
     },
+    # L5 (alert-fatigue): chronic-alerts digest в канал #stats каждые 6h.
+    # Гасит mute-эффект от suppress-chronic — даёт видимость сервисов
+    # которые тлеют под suppress. Управляется CHRONIC_DIGEST_ENABLED.
+    "chronic-alerts-digest": {
+        "task": "chronic_alerts_digest",
+        "schedule": crontab(minute=0, hour="*/6"),
+    },
 }
 
 
@@ -249,6 +256,27 @@ async def _tc_deploys_to_kg_logic() -> dict:
         len(builds), added, now_unix,
     )
     return {"builds_fetched": len(builds), "kg_deployments_added": added}
+
+
+@celery_app.task(name="chronic_alerts_digest")
+def chronic_alerts_digest_task():
+    """L5: список «хронически тлеющих» сервисов в канал #stats.
+
+    Гасит mute-эффект от L2 suppress-chronic. БЕЗ LLM — простой
+    SQL-aggregate по kg_alerts + markdown через send_stats_report.
+    """
+    from app.services.chronic_digest import send_chronic_digest
+
+    db = SessionLocal()
+    try:
+        result = asyncio.run(send_chronic_digest(db))
+        logger.info("chronic_alerts_digest.done result=%s", result)
+        return result
+    except Exception as e:
+        logger.error("chronic_alerts_digest.failed: %s", e)
+        return {"status": "error", "error": str(e)}
+    finally:
+        db.close()
 
 
 @celery_app.task(name="daily_stats_digest")

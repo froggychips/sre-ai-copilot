@@ -136,6 +136,72 @@ def test_enrich_endpoint_groups_by_alertname_severity(app_client):
     assert mock_send.await_count == 2
 
 
+def test_enrich_endpoint_suppresses_chronic(app_client):
+    """Когда dedup.decide_send → SUPPRESS_CHRONIC, embed не уходит."""
+    from app.config import settings
+    from app.services.alert_dedup import Decision
+
+    payload = _batch([_alert_payload(fingerprint="chronic-1")])
+    async def fake_decide(**kw):
+        return Decision.SUPPRESS_CHRONIC
+
+    with patch("app.services.alert_dedup.decide_send", new=fake_decide), \
+         patch("app.services.discord_service.DiscordService.send_enriched_alert",
+               new_callable=AsyncMock) as mock_send, \
+         patch.object(settings, "DISCORD_ENRICH_ENABLED", True):
+        resp = app_client.post("/webhooks/alertmanager/enrich-and-forward", json=payload)
+    assert resp.status_code == 202
+    body = resp.json()
+    assert body["suppressed_chronic"] == 1
+    assert body["enriched_groups"] == 0
+    mock_send.assert_not_called()
+
+
+def test_enrich_endpoint_suppresses_rollout(app_client):
+    """Когда dedup.decide_send → SUPPRESS_ROLLOUT, embed не уходит."""
+    from app.config import settings
+    from app.services.alert_dedup import Decision
+
+    payload = _batch([_alert_payload(
+        alertname="KubeDeploymentGenerationMismatch",
+        severity="warning",
+        fingerprint="rollout-1",
+    )])
+    async def fake_decide(**kw):
+        return Decision.SUPPRESS_ROLLOUT
+
+    with patch("app.services.alert_dedup.decide_send", new=fake_decide), \
+         patch("app.services.discord_service.DiscordService.send_enriched_alert",
+               new_callable=AsyncMock) as mock_send, \
+         patch.object(settings, "DISCORD_ENRICH_ENABLED", True):
+        resp = app_client.post("/webhooks/alertmanager/enrich-and-forward", json=payload)
+    assert resp.status_code == 202
+    body = resp.json()
+    assert body["suppressed_rollout"] == 1
+    assert body["enriched_groups"] == 0
+    mock_send.assert_not_called()
+
+
+def test_enrich_endpoint_resurfaced_flag(app_client):
+    """SEND_RESURFACED → send_enriched_alert(resurfaced=True)."""
+    from app.config import settings
+    from app.services.alert_dedup import Decision
+
+    payload = _batch([_alert_payload(fingerprint="resurfaced-1")])
+    async def fake_decide(**kw):
+        return Decision.SEND_RESURFACED
+
+    with patch("app.services.alert_dedup.decide_send", new=fake_decide), \
+         patch("app.services.discord_service.DiscordService.send_enriched_alert",
+               new_callable=AsyncMock) as mock_send, \
+         patch.object(settings, "DISCORD_ENRICH_ENABLED", True):
+        resp = app_client.post("/webhooks/alertmanager/enrich-and-forward", json=payload)
+    assert resp.status_code == 202
+    assert resp.json()["enriched_groups"] == 1
+    assert mock_send.await_count == 1
+    assert mock_send.await_args.kwargs.get("resurfaced") is True
+
+
 def test_enrich_endpoint_skips_resolved(app_client):
     """Resolved-events не идут в Discord."""
     alert = _alert_payload()

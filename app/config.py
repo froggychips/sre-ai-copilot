@@ -213,6 +213,14 @@ class Settings(BaseSettings):
     # Default False — opt-in через Helm value env.statsDigestEnabled.
     STATS_DIGEST_ENABLED: bool = Field(False, description="Enable daily stats digest beat task")
     STATS_DIGEST_HOUR_UTC: int = Field(9, description="UTC hour to run daily digest (0-23)")
+
+    # Chronic-alerts digest (L5) — каждые 6 часов список «хронических»
+    # сервисов: alert повторяется ≥CHRONIC_DIGEST_MIN_FIRES за 24h. Идёт
+    # в #stats канал (DISCORD_WEBHOOK_STATS_URL), а не в #error — анти-mute.
+    CHRONIC_DIGEST_ENABLED: bool = False
+    CHRONIC_DIGEST_INTERVAL_HOURS: int = 6
+    CHRONIC_DIGEST_WINDOW_HOURS: int = 24
+    CHRONIC_DIGEST_MIN_FIRES: int = 5
     STATS_DIGEST_STALE_DAYS: int = Field(30, description="Threshold days for stale-deployment detection")
 
     # Executor approval (PR #3 executor track). Если True — Discord-embed
