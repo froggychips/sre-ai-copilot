@@ -1,6 +1,6 @@
 import logging
 from datetime import datetime, timezone
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 import httpx
 
@@ -8,6 +8,7 @@ from app.config import settings
 
 if TYPE_CHECKING:
     from app.core.execution_dsl import ExecutionIntent
+    from app.services.alert_enrichment import EnrichedContext
 
 # Discord embed colour codes
 _COLOR_CRITICAL = 0xE53935   # red
@@ -228,6 +229,184 @@ class DiscordService:
             r = await client.post(url, json=payload)
             if r.status_code >= 400:
                 logging.error("discord_incident_report_failed", extra={"status": r.status_code})
+
+    async def send_enriched_alert(
+        self,
+        contexts: List["EnrichedContext"],
+        env: Optional[str] = None,
+    ) -> None:
+        """Детерминированный embed с KG-контекстом, БЕЗ LLM.
+
+        Принимает batch `EnrichedContext` (несколько алертов одного типа в
+        одном AM-batch'е сворачиваются в один embed). Старый Spidey Bot
+        слал по сообщению на каждый алерт; здесь один embed на logical-group.
+
+        Не вызывает модель. Latency бюджет — <500ms p95 синхронно
+        в HTTP-handler'е /webhooks/alertmanager/enrich-and-forward.
+        """
+        if not contexts:
+            return
+        head = contexts[0]
+        incident = head.incident
+        labels = incident.labels
+        alertname = labels.get("alertname", "unknown")
+        severity = (incident.severity or "unknown").lower()
+
+        # Цвет + emoji
+        color = _SEVERITY_COLORS.get(severity, _COLOR_UNKNOWN)
+        if head.rollout_noise:
+            color = _COLOR_UNKNOWN
+        icon = {"critical": "🔴", "warning": "🟡"}.get(severity, "⚪")
+        env_part = f"{env.upper()} · " if env else ""
+
+        # namespace список (если несколько алертов одного типа в разных ns)
+        namespaces = []
+        seen_ns = set()
+        for c in contexts:
+            ns = c.incident.namespace or c.incident.labels.get("namespace") or "?"
+            if ns not in seen_ns:
+                seen_ns.add(ns)
+                namespaces.append(ns)
+
+        ns_str = ", ".join(namespaces[:4]) + (f" (+{len(namespaces) - 4})" if len(namespaces) > 4 else "")
+        svc_or_pod = head.service or head.pod or "?"
+
+        recurrence_tag = ""
+        rec_max = max((len(c.recurrence_24h) for c in contexts), default=0)
+        if rec_max >= 2:
+            recurrence_tag = f" · 🔁 ×{rec_max} за 24h"
+        noise_tag = " · 🤖 ROLLOUT-NORMAL" if head.rollout_noise else ""
+        ns_tag = f" ({len(namespaces)} ns)" if len(namespaces) > 1 else ""
+
+        title = (
+            f"{icon} {env_part}{alertname} · {svc_or_pod}{ns_tag}{recurrence_tag}{noise_tag}"
+        )
+
+        fields: List[Dict[str, Any]] = []
+        fields.append({
+            "name": "Namespaces",
+            "value": f"`{ns_str}`",
+            "inline": True,
+        })
+        if head.team_owner:
+            fields.append({
+                "name": "Owner",
+                "value": f"`{head.team_owner}`",
+                "inline": True,
+            })
+        if not head.in_kg:
+            fields.append({
+                "name": "KG",
+                "value": "_сервис не в graph — topology unknown_",
+                "inline": True,
+            })
+
+        # Recent deploys
+        if head.recent_deploys:
+            lines = []
+            for d in head.recent_deploys[:3]:
+                mins = d.get("minutes_before_incident", "?")
+                sha = (d.get("sha") or "")[:7]
+                num = d.get("number") or "?"
+                bt = d.get("buildtype_id") or ""
+                status = d.get("status") or ""
+                lines.append(
+                    f"• `{num}` {sha} — {mins} мин назад"
+                    + (f" ({bt})" if bt else "")
+                    + (f" — {status}" if status else "")
+                )
+            fields.append({
+                "name": f"Recent deploys (lookback {settings.ENRICH_DEPLOY_LOOKBACK_MIN}m)",
+                "value": "\n".join(lines)[:1024],
+                "inline": False,
+            })
+
+        # Upstream алертит сейчас
+        if head.upstream_alerts:
+            lines = []
+            for a in head.upstream_alerts[:5]:
+                svc = a.get("service") or "?"
+                ns = a.get("namespace") or "?"
+                an = a.get("alertname") or "?"
+                mins = a.get("minutes_before", "?")
+                ek = a.get("edge_kind") or ""
+                lines.append(f"• ✗ `{svc}` @ `{ns}` — `{an}` ({mins}m назад, edge={ek})")
+            fields.append({
+                "name": "Upstream сейчас (KG)",
+                "value": "\n".join(lines)[:1024],
+                "inline": False,
+            })
+
+        # Downstream impact
+        if head.downstream_count_by_kind:
+            parts = [f"{cnt} через `{k}`" for k, cnt in head.downstream_count_by_kind.items()]
+            fields.append({
+                "name": "Downstream impact (KG)",
+                "value": ", ".join(parts),
+                "inline": False,
+            })
+
+        # Hypothesis — rule-based, без LLM
+        hyp = head.primary_hypothesis()
+        if hyp:
+            fields.append({
+                "name": "Гипотеза (rule-based, без LLM)",
+                "value": hyp[:1024],
+                "inline": False,
+            })
+
+        # Generator link (Grafana) — если есть
+        if incident.generator_url:
+            fields.append({
+                "name": "Source",
+                "value": f"[Prometheus query]({incident.generator_url})",
+                "inline": False,
+            })
+
+        description_lines = []
+        if incident.description:
+            description_lines.append(incident.description[:600])
+        if head.rollout_noise:
+            description_lines.append(
+                "_Rollout в процессе (deploy <5 мин назад) — обычно безобидно._"
+            )
+        if head.kg_data_age_sec is not None and head.kg_data_age_sec > 2 * 3600:
+            description_lines.append(
+                f"_KG topology snapshot {head.kg_data_age_sec // 60} мин назад — может быть stale._"
+            )
+        description = "\n".join(description_lines)[:1200]
+
+        payload = {
+            "embeds": [{
+                "title": title[:256],
+                "color": color,
+                "fields": fields,
+                "description": description,
+                "footer": {"text": f"copilot/enrich · groupKey={(labels.get('alertname') or '?')}"},
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+            }],
+            # Mention-payload пуст: даже если в будущем добавим <@&role> в title,
+            # пользователей не пинговать пока owner-mapping не проверен на проде.
+            "allowed_mentions": {"parse": []},
+        }
+
+        if settings.DISCORD_DRY_RUN:
+            logging.info(
+                "[DISCORD_DRY_RUN] send_enriched_alert: %s | ns=%s | hyp=%s",
+                title, ns_str, hyp,
+            )
+            return
+        url = settings.DISCORD_WEBHOOK_URL
+        if not url:
+            logging.warning("DISCORD_WEBHOOK_URL not set, skipping enriched alert")
+            return
+        async with httpx.AsyncClient() as client:
+            r = await client.post(url, json=payload)
+            if r.status_code >= 400:
+                logging.error(
+                    "discord_enriched_alert_failed",
+                    extra={"status": r.status_code, "body": r.text[:200]},
+                )
 
     async def send_approval_request(self, approval_id: str, details: dict):
         """Отправляет Rich Embed с информацией об опасной операции и ссылками для подтверждения."""
