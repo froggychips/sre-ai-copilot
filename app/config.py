@@ -85,6 +85,19 @@ class Settings(BaseSettings):
     # Не отправлять реальный Discord webhook, только логировать (для local e2e).
     DISCORD_DRY_RUN: bool = False
 
+    # Discord-enrich tier — детерминированный embed с KG-контекстом,
+    # без LLM. Принимает alert на /webhooks/alertmanager/enrich-and-forward,
+    # обогащает recent_deploys/upstream-alerts/recurrence/owner-team и
+    # шлёт один embed на DISCORD_WEBHOOK_URL.
+    #
+    # Default False — включается отдельно после канареечного прогона,
+    # чтобы `/store`-route не получил Discord-побочку случайно.
+    DISCORD_ENRICH_ENABLED: bool = False
+    # Окно поиска recent_deploys/incidents_on (минуты).
+    ENRICH_DEPLOY_LOOKBACK_MIN: int = 60
+    ENRICH_RECURRENCE_LOOKBACK_MIN: int = 1440  # 24 ч
+    ENRICH_UPSTREAM_WINDOW_MIN: int = 15
+
     # Anti-DoS cap для prompt_guard.detect_injection. Поднимать только
     # осознанно — каждый LLM-вызов биллится по входным токенам.
     PROMPT_INPUT_MAX_CHARS: int = 20000

@@ -1,6 +1,7 @@
 import hashlib
 import hmac
 import re
+from typing import Optional
 
 import structlog
 from fastapi import APIRouter, Depends, HTTPException, Request
@@ -245,6 +246,112 @@ async def alertmanager_webhook_store_only(
 
     db.commit()
     return {"status": "stored", "alerts": stored}
+
+
+@router.post(
+    "/alertmanager/enrich-and-forward",
+    status_code=202,
+    dependencies=[Depends(verify_alertmanager_signature)],
+)
+async def alertmanager_webhook_enrich_and_forward(
+    payload: AlertManagerWebhook, db: Session = Depends(get_db)
+):
+    """KG-enriched Discord-forward, БЕЗ LLM.
+
+    Делает то же, что /store (пишет alert-event в kg_alerts), и
+    дополнительно для каждого FIRING alert-а собирает KG-контекст
+    (recent_deploys, nearby_alerts, recurrence, downstream, owner) и
+    отправляет один embed в Discord webhook.
+
+    Группировка: alerts с одинаковым (alertname, severity) в одном
+    AM-batch сворачиваются в один embed (несколько ns в одном сообщении).
+    Это снижает шум типа «3 одинаковых KubePodCrashLooping подряд».
+
+    Если DISCORD_ENRICH_ENABLED=false — поведение идентично /store.
+    """
+    from app.knowledge_graph.auto_populator import populate_from_incident
+    from app.services.alert_enrichment import enrich_alert
+    from app.services.discord_service import DiscordService
+
+    raw_payload = payload.model_dump()
+    raw_payload.setdefault("id", payload.groupKey)
+    raw_collector.ingest(raw_payload)
+
+    stored = []
+    firing_incidents = []  # (incident, env-hint) — для post-store enrich.
+
+    for alert in payload.alerts:
+        try:
+            validate_alert_labels(alert)
+            incident = Incident.from_alertmanager(alert)
+        except HTTPException:
+            log.warning("enrich_forward.skipped_invalid_alert", labels=alert.labels)
+            continue
+
+        if alert.status == "resolved":
+            # Resolved-events не идут в Discord (можно расширить позже).
+            stored.append({"incident_id": incident.incident_id, "result": "resolved-skipped"})
+            continue
+
+        try:
+            stats = populate_from_incident(db, incident)
+            stored.append({"incident_id": incident.incident_id, "result": "stored", **stats})
+        except Exception as e:
+            log.warning(
+                "enrich_forward.populate_failed",
+                incident_id=incident.incident_id,
+                error=type(e).__name__,
+                message=str(e),
+            )
+            stored.append({"incident_id": incident.incident_id, "result": "failed"})
+        firing_incidents.append(incident)
+
+    db.commit()
+
+    # Discord-enrich tier. Под фичефлагом — чтобы /store-style behaviour
+    # сохранялся, пока канарейка не подтвердит безвредность.
+    enriched_groups = 0
+    if settings.DISCORD_ENRICH_ENABLED and firing_incidents:
+        # Группировка по (alertname, severity) — несколько ns в одном embed.
+        groups: dict[tuple, list] = {}
+        for inc in firing_incidents:
+            key = (
+                inc.labels.get("alertname", "unknown"),
+                (inc.severity or "unknown").lower(),
+            )
+            groups.setdefault(key, []).append(inc)
+
+        # Hint про env берём из namespace prefix первого incident-а.
+        def _env_hint(ns: Optional[str]) -> Optional[str]:
+            if not ns:
+                return None
+            for p in ("prod", "preprod", "preupdate", "squad", "dev"):
+                if ns.startswith(p + "-"):
+                    return p
+            return None
+
+        discord_service = DiscordService()
+        for (alertname, sev), incs in groups.items():
+            try:
+                ctxs = [enrich_alert(db, inc) for inc in incs]
+                env_hint = _env_hint(incs[0].namespace)
+                await discord_service.send_enriched_alert(ctxs, env=env_hint)
+                enriched_groups += 1
+            except Exception as e:
+                log.warning(
+                    "enrich_forward.send_failed",
+                    alertname=alertname,
+                    severity=sev,
+                    error=type(e).__name__,
+                    message=str(e),
+                )
+
+    return {
+        "status": "stored-and-forwarded",
+        "alerts": stored,
+        "enriched_groups": enriched_groups,
+        "enrich_enabled": settings.DISCORD_ENRICH_ENABLED,
+    }
 
 
 @router.get("/status/{task_id}")
