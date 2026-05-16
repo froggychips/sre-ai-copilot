@@ -61,6 +61,36 @@ celery_app.conf.beat_schedule = {
         "task": "chronic_alerts_digest",
         "schedule": crontab(minute=0, hour="*/6"),
     },
+    # A4: k8s pod-events → kg_pod_events. Каждые 10 мин тянем Warning-events
+    # из всех ns с deployments в KG. Idempotent по event_uid. Источник
+    # OOMKilled / FailedScheduling / ImagePullBackOff / Unhealthy / etc.
+    "k8s-pod-events-sync": {
+        "task": "k8s_pod_events_sync",
+        "schedule": crontab(minute="*/10"),
+    },
+    # D2-auto: drift cleanup. Раз в час пересинхронизирует kg_services со
+    # списком существующих в k8s ns. Safety threshold 20% — защита от
+    # mass-mark при временной недоступности API server.
+    "kg-drift-cleanup": {
+        "task": "kg_drift_cleanup",
+        "schedule": crontab(minute=17),  # ежечасно в 17 мин
+    },
+    # Точка роста #2 (Phase 2): AlertEvent resolve sync. Каждые 15 мин
+    # сравниваем kg_alerts.fingerprint с активными на AM, не-firing
+    # помечаем resolved_at=NOW. Без этого stale firing alerts копятся
+    # годами (см. etcdMembersDown от 10 апреля).
+    "kg-alerts-resolve-sync": {
+        "task": "kg_alerts_resolve_sync",
+        "schedule": crontab(minute="*/15"),
+    },
+    # Phase 3-B: k8s Ingress → external entrypoint edges. Раз в час
+    # синхронизирует Ingress resources cluster-wide. Создаёт synthetic-узлы
+    # `ingress:<host>` + edges на backend services. Это первый источник
+    # «откуда приходит трафик» вне cluster-internal env-scan.
+    "kg-ingress-sync": {
+        "task": "kg_ingress_sync",
+        "schedule": crontab(minute=37),  # ежечасно в 37 мин (offset от других)
+    },
 }
 
 
@@ -139,6 +169,70 @@ def kg_topology_sync_task():
         raise
 
 
+@celery_app.task(name="k8s_pod_events_sync")
+def k8s_pod_events_sync_task():
+    """A4: pull Warning k8s-events → kg_pod_events. БЕЗ LLM."""
+    from app.knowledge_graph.k8s_events_sync import sync_all_events
+
+    db = SessionLocal()
+    try:
+        result = sync_all_events(db)
+    finally:
+        db.close()
+    return result
+
+
+@celery_app.task(name="kg_ingress_sync")
+def kg_ingress_sync_task():
+    """Phase 3-B: sync k8s Ingress → external entrypoint edges."""
+    from app.knowledge_graph.k8s_ingress_sync import sync_all_ingresses
+
+    db = SessionLocal()
+    try:
+        return sync_all_ingresses(db)
+    except Exception as e:
+        logger.warning("kg_ingress_sync.failed: %s", e)
+        return {"error": str(e)}
+    finally:
+        db.close()
+
+
+@celery_app.task(name="kg_alerts_resolve_sync")
+def kg_alerts_resolve_sync_task():
+    """Точка роста #2: AlertEvent.resolved_at refresh из AM API."""
+    import asyncio as _aio
+    from app.knowledge_graph.alerts_resolve_sync import run_alerts_resolve_sync
+
+    db = SessionLocal()
+    try:
+        return _aio.run(run_alerts_resolve_sync(db))
+    except Exception as e:
+        logger.warning("kg_alerts_resolve_sync.failed: %s", e)
+        return {"error": str(e)}
+    finally:
+        db.close()
+
+
+@celery_app.task(name="kg_drift_cleanup")
+def kg_drift_cleanup_task():
+    """D2-auto: пометить services из несуществующих ns как synthetic.
+
+    Safety: max_drift_pct=20% — при kubectl-failure / временной недоступности
+    API server вернётся пустой ns-set, drift станет 100%, threshold заблокирует
+    UPDATE. Manual run для override: `python -m app.scripts.cleanup_drift --apply`.
+    """
+    from app.knowledge_graph.drift_cleanup import run_drift_cleanup
+
+    db = SessionLocal()
+    try:
+        return run_drift_cleanup(db, max_drift_pct=20.0, apply=True)
+    except Exception as e:
+        logger.warning("kg_drift_cleanup.failed: %s", e)
+        return {"error": str(e)}
+    finally:
+        db.close()
+
+
 @celery_app.task(name="tc_deploys_to_kg")
 def tc_deploys_to_kg_task():
     """Pull recent TC deploys → upsert в kg_deployments. БЕЗ LLM-вызовов.
@@ -166,7 +260,7 @@ async def _tc_deploys_to_kg_logic() -> dict:
 
     # Берём builds за последние 24h. Cron каждые 15 мин — overkill по
     # window, но dedup защищает и cheaply tolerant к беатам-пропускам.
-    builds = await recent_deploys(lookback_hours=24, limit=50)
+    builds = await recent_deploys(lookback_hours=24, limit=200)
     if not builds:
         return {"builds_fetched": 0, "kg_deployments_added": 0}
 
@@ -192,7 +286,11 @@ async def _tc_deploys_to_kg_logic() -> dict:
                 continue
 
             finished = b.get("finished_at")
-            started = b.get("finished_at")  # TC `recent_deploys` не отдаёт start; используем finish
+            # startDate из TC (A3 fix) — без него RecentDeployRule матчит окно
+            # по finishDate и пропускает alert'ы, прилетевшие пока деплой ещё
+            # идёт. Fallback на finished_at — для совместимости со старыми
+            # builds, где startDate не приехал.
+            started = b.get("started_at") or b.get("finished_at")
             if not started:
                 continue
             try:
@@ -210,38 +308,40 @@ async def _tc_deploys_to_kg_logic() -> dict:
                     pass
 
             for ns in target_namespaces:
-                # «ns-representative» — первый non-synthetic service.
-                rep_svc = (
+                # A3: ns-wide broadcast. Раньше писали только на «ns-representative»
+                # (первый non-synthetic) — из-за этого 98% сервисов в KG не
+                # имели deploy-истории. RecentDeployRule работает per-service,
+                # значит каждый сервис в ns должен видеть тот же deploy event.
+                # Dedup защищён уникальностью (service_id, buildtype_id, build_number).
+                ns_services = (
                     db.query(Service)
                     .filter_by(namespace=ns, synthetic=False)
-                    .order_by(Service.name)
-                    .first()
+                    .all()
                 )
-                if rep_svc is None:
-                    continue
-                try:
-                    record_deployment(
-                        db,
-                        service=rep_svc,
-                        started_at=started_naive,
-                        finished_at=finished_naive,
-                        buildtype_id=b.get("buildtype_id"),
-                        build_number=str(b.get("number") or ""),
-                        status=b.get("status"),
-                        triggered_by=b.get("triggered_by"),
-                        extras={
-                            "branch": branch_full,
-                            "buildtype_name": b.get("buildtype_name"),
-                            "url": b.get("url"),
-                            "namespace_scope": True,  # маркер ns-wide attribution
-                        },
-                    )
-                    added += 1
-                except Exception as e:
-                    logger.warning(
-                        "tc_deploys_to_kg.record_failed ns=%s build=#%s: %s",
-                        ns, b.get("number"), e,
-                    )
+                for svc in ns_services:
+                    try:
+                        record_deployment(
+                            db,
+                            service=svc,
+                            started_at=started_naive,
+                            finished_at=finished_naive,
+                            buildtype_id=b.get("buildtype_id"),
+                            build_number=str(b.get("number") or ""),
+                            status=b.get("status"),
+                            triggered_by=b.get("triggered_by"),
+                            extras={
+                                "branch": branch_full,
+                                "buildtype_name": b.get("buildtype_name"),
+                                "url": b.get("url"),
+                                "namespace_scope": True,  # маркер ns-wide attribution
+                            },
+                        )
+                        added += 1
+                    except Exception as e:
+                        logger.warning(
+                            "tc_deploys_to_kg.record_failed ns=%s svc=%s build=#%s: %s",
+                            ns, svc.name, b.get("number"), e,
+                        )
         db.commit()
     except Exception as e:
         logger.error("tc_deploys_to_kg.failed: %s", e)

@@ -18,8 +18,8 @@ from typing import Any, Dict, Optional
 import structlog
 from sqlalchemy.orm import Session
 
-from app.knowledge_graph.schema import (AlertEvent, Deployment, Service,
-                                        ServiceEdge)
+from app.knowledge_graph.schema import (AlertEvent, Deployment, PodEvent,
+                                        Service, ServiceEdge)
 
 logger = structlog.get_logger()
 
@@ -90,6 +90,14 @@ def upsert_edge(
         )
         .one_or_none()
     )
+    now = datetime.utcnow()
+    # C3: список discovery_sources для confidence-tracking. Edge увиденный
+    # из 2+ источников (например env_url_v2 + nats_env) — выше confidence
+    # чем одиночный inference.
+    initial_extras = dict(extras or {})
+    if discovered_by:
+        initial_extras.setdefault("discovery_sources", [discovered_by])
+
     if edge is None:
         edge = ServiceEdge(
             src_id=src.id,
@@ -97,23 +105,30 @@ def upsert_edge(
             kind=kind,
             weight=weight,
             discovered_by=discovered_by,
-            extras=extras or None,
+            extras=initial_extras or None,
+            last_seen_at=now,
         )
         db.add(edge)
         db.flush()
     else:
-        changed = False
+        # C1: каждый upsert — refresh last_seen_at. Edges, не подтверждённые
+        # N дней, попадут в decay-task (см. queries.upstream_of(fresh_only=)).
+        edge.last_seen_at = now
+        changed = True
         if edge.weight != weight:
             edge.weight = weight
-            changed = True
+        # C3: merge discovery_sources unique-list, не overwrite одним источником.
+        merged = dict(edge.extras or {})
         if extras:
-            merged = dict(edge.extras or {})
             merged.update(extras)
-            if merged != (edge.extras or {}):
-                edge.extras = merged
-                changed = True
-        if changed:
-            db.flush()
+        if discovered_by:
+            existing_sources = list(merged.get("discovery_sources") or [])
+            if discovered_by not in existing_sources:
+                existing_sources.append(discovered_by)
+            merged["discovery_sources"] = existing_sources
+        if merged != (edge.extras or {}):
+            edge.extras = merged
+        db.flush()
     return edge
 
 
@@ -197,6 +212,53 @@ def record_alert_event(
         fired_at=fired_at,
         incident_id=incident_id,
         raw=raw,
+    )
+    db.add(ev)
+    db.flush()
+    return ev
+
+
+def record_pod_event(
+    db: Session,
+    service: Optional[Service],
+    namespace: str,
+    pod_name: str,
+    reason: str,
+    event_uid: str,
+    first_seen: datetime,
+    last_seen: Optional[datetime] = None,
+    count: Optional[int] = None,
+    message: Optional[str] = None,
+    type_: Optional[str] = None,
+    extras: Optional[Dict[str, Any]] = None,
+) -> PodEvent:
+    """A4: идемпотентно по `event_uid` (k8s Event UID).
+
+    Повторный sync того же события → обновляем `last_seen` и `count`
+    (k8s агрегирует одинаковые события и инкрементит count).
+    """
+    existing = (
+        db.query(PodEvent).filter(PodEvent.event_uid == event_uid).one_or_none()
+    )
+    if existing is not None:
+        if last_seen is not None:
+            existing.last_seen = last_seen
+        if count is not None:
+            existing.count = count
+        return existing
+
+    ev = PodEvent(
+        service_id=service.id if service else None,
+        namespace=namespace,
+        pod_name=pod_name,
+        reason=reason,
+        message=message,
+        type=type_,
+        event_uid=event_uid,
+        first_seen=first_seen,
+        last_seen=last_seen,
+        count=count,
+        extras=extras,
     )
     db.add(ev)
     db.flush()

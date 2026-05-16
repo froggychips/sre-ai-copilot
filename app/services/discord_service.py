@@ -3,8 +3,15 @@ from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 import httpx
+import structlog
 
 from app.config import settings
+
+# structlog для DRY_RUN-логов — стандартный python `logging` отфильтровывается
+# на корневом WARNING level в production, поэтому [DISCORD_DRY_RUN] раньше
+# не появлялись в kubectl logs. structlog идёт через тот же sink что и
+# kg.populate.done / enrich_forward.suppress_chronic — visibility гарантирована.
+_dry_run_log = structlog.get_logger("discord.dry_run")
 
 if TYPE_CHECKING:
     from app.core.execution_dsl import ExecutionIntent
@@ -26,7 +33,7 @@ _SEVERITY_COLORS = {
 class DiscordService:
     async def send_report(self, report_text: str):
         if settings.DISCORD_DRY_RUN:
-            logging.info("[DISCORD_DRY_RUN] send_report:\n%s", report_text)
+            _dry_run_log.info("discord.dry_run.send_report", text=report_text[:500])
             return
         url = settings.DISCORD_WEBHOOK_URL
         if not url:
@@ -50,7 +57,7 @@ class DiscordService:
             logging.warning("DISCORD_WEBHOOK_STATS_URL not set, skipping stats report")
             return
         if settings.DISCORD_DRY_RUN:
-            logging.info("[DISCORD_DRY_RUN] send_stats_report:\n%s", content)
+            _dry_run_log.info("discord.dry_run.send_stats_report", content=content[:500])
             return
 
         lines = content.split("\n", 1)
@@ -218,8 +225,10 @@ class DiscordService:
         }
 
         if settings.DISCORD_DRY_RUN:
-            logging.info("[DISCORD_DRY_RUN] send_incident_report: %s | cause=%s | rq=%s",
-                         title, cause, resolution_quality)
+            _dry_run_log.info(
+                "discord.dry_run.send_incident_report",
+                title=title, cause=cause, resolution_quality=resolution_quality,
+            )
             return
         url = settings.DISCORD_WEBHOOK_URL
         if not url:
@@ -285,6 +294,12 @@ class DiscordService:
             f"{recurrence_tag}{noise_tag}{resurfaced_tag}"
         )
 
+        # Phase 3-A: severity-aware enrichment depth.
+        # Warning embed'ов в 5-10× больше чем critical → noise сосредоточен
+        # там. Для warning показываем «minimum viable» — title + owner +
+        # most-likely-cause + why-this-matters. Для critical — полный embed.
+        is_critical = severity == "critical"
+
         fields: List[Dict[str, Any]] = []
         fields.append({
             "name": "Namespaces",
@@ -304,22 +319,67 @@ class DiscordService:
                 "inline": True,
             })
 
-        # Recent deploys
+        # Phase 3-A: Most likely cause — deterministic, top-1 rule fact.
+        # Это превращает embed из «вот данные» в «вот ответ». Главная
+        # ценность для скорости triage.
+        hyp_text = head.primary_hypothesis()
+        if hyp_text:
+            fields.append({
+                "name": "🎯 Скорее всего",
+                "value": hyp_text[:1024],
+                "inline": False,
+            })
+
+        # Phase 3-A: Why this matters — derived signals (shared dep, chronic,
+        # recurrence). Прирост priorization без LLM, из существующих данных.
+        matter_bullets = head.why_this_matters()
+        if matter_bullets:
+            fields.append({
+                "name": "⭐ Почему важно",
+                "value": "\n".join(matter_bullets)[:1024],
+                "inline": False,
+            })
+
+        # Recent deploys. Окно вычисляется из самого дальнего deploy —
+        # alert_enrichment может использовать fallback 7д если узкое окно
+        # пусто; заголовок честно показывает фактический диапазон.
+        # Phase 3-A: для warning — top-1 строка, для critical — full 3.
         if head.recent_deploys:
             lines = []
-            for d in head.recent_deploys[:3]:
-                mins = d.get("minutes_before_incident", "?")
+            max_min = 0
+            top_n = 3 if is_critical else 1
+            for d in head.recent_deploys[:top_n]:
+                mins = d.get("minutes_before_incident", 0)
+                try:
+                    max_min = max(max_min, int(mins))
+                except (ValueError, TypeError):
+                    pass
                 sha = (d.get("sha") or "")[:7]
                 num = d.get("number") or "?"
-                bt = d.get("buildtype_id") or ""
+                bt_name = d.get("buildtype_name") or d.get("buildtype_id") or "?"
                 status = d.get("status") or ""
+                triggered = d.get("triggered_by") or ""
+                url = d.get("url")
+                by_part = f" by `{triggered}`" if triggered else ""
+                # Build label — кликабельный если есть TC URL.
+                if url:
+                    build_label = f"[{bt_name} #{num}]({url})"
+                else:
+                    build_label = f"`#{num}` ({bt_name})"
+                sha_part = f" {sha}" if sha else ""
+                status_part = f" — {status}" if status else ""
                 lines.append(
-                    f"• `{num}` {sha} — {mins} мин назад"
-                    + (f" ({bt})" if bt else "")
-                    + (f" — {status}" if status else "")
+                    f"• {build_label}{by_part}{sha_part} — {mins} мин назад{status_part}"
                 )
+            # Человекочитаемая шкала окна: «60м» / «24ч» / «3д».
+            if max_min < 120:
+                window_label = f"~{max_min}м"
+            elif max_min < 60 * 48:
+                window_label = f"~{max_min // 60}ч"
+            else:
+                window_label = f"~{max_min // (60 * 24)}д"
             fields.append({
-                "name": f"Recent deploys (lookback {settings.ENRICH_DEPLOY_LOOKBACK_MIN}m)",
+                "name": f"Recent deploys ({window_label})",
                 "value": "\n".join(lines)[:1024],
                 "inline": False,
             })
@@ -340,23 +400,134 @@ class DiscordService:
                 "inline": False,
             })
 
-        # Downstream impact
-        if head.downstream_count_by_kind:
-            parts = [f"{cnt} через `{k}`" for k, cnt in head.downstream_count_by_kind.items()]
+        # Outgoing deps — куда сервис сам ходит. Для leaf-сервисов (как
+        # bot-service) это главная диагностика при падении: «упал —
+        # потому что зависит от X». Группируем по kind, badge confidence.
+        # Phase 3-A: для warning — counts only (одна строка), для critical — full.
+        if head.outgoing_deps and is_critical:
+            from app.knowledge_graph.confidence import confidence_badge
+
+            # Phase 3-A: short provenance label из discovery_sources, чтобы
+            # семантика badge была явной. `kg_sync/env_vars` → `env`,
+            # `kg_sync/secret_hint` → `secret`, etc.
+            def _provenance_short(srcs: list) -> str:
+                if not srcs:
+                    return ""
+                shorts = []
+                for s in srcs:
+                    s_low = (s or "").lower()
+                    if "secret" in s_low: shorts.append("secret")
+                    elif "nats" in s_low: shorts.append("nats")
+                    elif "url" in s_low: shorts.append("url")
+                    elif "env" in s_low: shorts.append("env")
+                    elif "dsn" in s_low: shorts.append("dsn")
+                    elif "runtime" in s_low: shorts.append("runtime")
+                    else: shorts.append("?")
+                return "+".join(dict.fromkeys(shorts))  # unique-preserved-order
+
+            by_kind: Dict[str, List[str]] = {}
+            for d in head.outgoing_deps:
+                k = d.get("kind", "?")
+                target = f"`{d.get('service','?')}`"
+                target_ns = d.get("namespace") or ""
+                if target_ns and target_ns != (head.incident.namespace or ""):
+                    target = f"{target} @ `{target_ns}`"
+                # G5: confidence-badge. ●●● multi-source+fresh → high.
+                # ●○○ single-source+stale → low. LLM-pipeline (когда включится)
+                # видит «inferred с confidence 0.4», а не «факт».
+                score = d.get("confidence_score") or 0.0
+                badge = confidence_badge(score)
+                # Phase 3-A: subscript provenance — `(env+url)` рядом с badge.
+                prov = _provenance_short(d.get("discovery_sources") or [])
+                prov_part = f" ({prov})" if prov else ""
+                target = f"{target} {badge}{prov_part}"
+                by_kind.setdefault(k, []).append(target)
+            lines = []
+            kind_icons = {"calls": "→", "uses_db": "🗄", "uses_nats": "📡"}
+            for k in sorted(by_kind):
+                icon_k = kind_icons.get(k, "·")
+                items = by_kind[k]
+                value_str = ", ".join(items[:6])
+                if len(items) > 6:
+                    value_str += f" (+{len(items)-6})"
+                lines.append(f"{icon_k} **{k}** ({len(items)}): {value_str}")
             fields.append({
-                "name": "Downstream impact (KG)",
+                "name": "🔗 Зависит от · ●●●high ●●○med ●○○low",
+                "value": "\n".join(lines)[:1024],
+                "inline": False,
+            })
+        elif head.outgoing_deps and not is_critical:
+            # Warning compact: counts only inline.
+            by_kind_count: Dict[str, int] = {}
+            for d in head.outgoing_deps:
+                by_kind_count[d.get("kind", "?")] = by_kind_count.get(d.get("kind", "?"), 0) + 1
+            parts = [f"{cnt} {k}" for k, cnt in by_kind_count.items()]
+            fields.append({
+                "name": "🔗 Deps",
+                "value": " · ".join(parts) + " _(full в critical)_",
+                "inline": True,
+            })
+
+        # Inbound callers — сколько сервисов вызывают этот.
+        # Для high-fan-in узлов (общая БД, NATS cluster) это сигнал blast radius.
+        # Phase 3-A: показываем только если sum > 5 (blast radius signal) ИЛИ critical.
+        total_inbound = sum((head.inbound_count_by_kind or {}).values())
+        if head.inbound_count_by_kind and (is_critical or total_inbound > 5):
+            parts = [f"{cnt} через `{k}`" for k, cnt in head.inbound_count_by_kind.items()]
+            fields.append({
+                "name": "Inbound callers (KG)",
                 "value": ", ".join(parts),
                 "inline": False,
             })
 
-        # Hypothesis — rule-based, без LLM
-        hyp = head.primary_hypothesis()
-        if hyp:
+        # A6: Jira tickets linkback. Тикеты project_key+label=backend
+        # с service в summary за JIRA_SEARCH_DAYS. Прямые URL.
+        # Phase 3-A: для warning — только если есть open тикет (priority signal).
+        if head.jira_issues and (is_critical or any(j.get("status") == "open" for j in head.jira_issues)):
+            lines = []
+            for j in head.jira_issues[:4]:
+                key = j.get("key", "?")
+                summary = (j.get("summary") or "")[:80]
+                status = j.get("status", "?")
+                pri = j.get("priority", "")
+                url = j.get("url", "")
+                pri_part = f" {pri}" if pri else ""
+                status_icon = {"resolved": "✅", "open": "🟡"}.get(status, "⚪")
+                if url:
+                    lines.append(f"• {status_icon} [`{key}`]({url}){pri_part} — {summary}")
+                else:
+                    lines.append(f"• {status_icon} `{key}`{pri_part} — {summary}")
             fields.append({
-                "name": "Гипотеза (rule-based, без LLM)",
-                "value": hyp[:1024],
+                "name": f"🎫 Tickets (Jira, last {settings.JIRA_SEARCH_DAYS}d)",
+                "value": "\n".join(lines)[:1024],
                 "inline": False,
             })
+
+        # Recent pod_events (kg_pod_events) — k8s diagnostic signal
+        # (OOMKilled / ImagePullBackOff / BackOff / Unhealthy / ...).
+        # Phase 3-A: для warning — top-1 без message (most-likely-cause уже
+        # выше); для critical — full top-5 с message.
+        if head.pod_events:
+            lines = []
+            top_n = 5 if is_critical else 1
+            for ev in head.pod_events[:top_n]:
+                reason = ev.get("reason", "?")
+                count = ev.get("count")
+                mins = ev.get("minutes_before", "?")
+                cnt_part = f" ×{count}" if count and count > 1 else ""
+                if is_critical:
+                    msg = (ev.get("message") or "").replace("\n", " ")[:80]
+                    lines.append(f"• 🩺 `{reason}`{cnt_part} — {mins} мин назад: {msg}")
+                else:
+                    lines.append(f"• 🩺 `{reason}`{cnt_part} — {mins} мин назад")
+            fields.append({
+                "name": "Recent pod events (k8s)",
+                "value": "\n".join(lines)[:1024],
+                "inline": False,
+            })
+
+        # Phase 3-A: "Гипотеза" (legacy field) удалена — теперь
+        # «🎯 Скорее всего» выше по полю primary_hypothesis(). Дубликат не нужен.
 
         # Generator link (Grafana) — если есть
         if incident.generator_url:
@@ -394,9 +565,18 @@ class DiscordService:
         }
 
         if settings.DISCORD_DRY_RUN:
-            logging.info(
-                "[DISCORD_DRY_RUN] send_enriched_alert: %s | ns=%s | hyp=%s",
-                title, ns_str, hyp,
+            # Главный путь — это то место где видно фактический embed-output
+            # KG-enrichment. Структурированные поля позволяют отфильтровать
+            # ровно тот логи-stream в kubectl logs / VictoriaLogs.
+            _dry_run_log.info(
+                "discord.dry_run.send_enriched_alert",
+                title=title,
+                namespaces=ns_str,
+                hypothesis=head.primary_hypothesis(),
+                contexts_count=len(contexts),
+                severity=severity,
+                resurfaced=resurfaced,
+                rollout_noise=head.rollout_noise,
             )
             return
         url = settings.DISCORD_WEBHOOK_URL

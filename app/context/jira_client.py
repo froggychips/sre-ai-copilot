@@ -125,6 +125,56 @@ class JiraClient:
 
         return results
 
+    def search_by_service_sync(
+        self,
+        service: str,
+        namespace: Optional[str] = None,
+        days: int = 30,
+    ) -> List[Dict[str, Any]]:
+        """A6 (Phase 2): sync-вариант для использования из enrich_alert
+        (синхронный SQLAlchemy context). Та же JQL что в async-методе.
+        """
+        jql_parts = [
+            f'project = "{self._project}"',
+            f'labels = "{self._label}"',
+            f'summary ~ "{service}"',
+            f'created >= "-{days}d"',
+        ]
+        jql = " AND ".join(jql_parts) + " ORDER BY created DESC"
+        payload = {
+            "jql": jql,
+            "maxResults": 5,
+            "fields": ["summary", "status", "priority", "created", "labels"],
+        }
+        try:
+            with httpx.Client(timeout=self._timeout) as client:
+                r = client.post(
+                    f"{self._base}/rest/api/3/search/jql",
+                    json=payload, headers=self._headers,
+                )
+                r.raise_for_status()
+                data = r.json()
+        except Exception as e:
+            logger.warning("jira_client.search_sync_failed service=%s error=%s", service, e)
+            return []
+
+        results = []
+        for issue in data.get("issues") or []:
+            fields = issue.get("fields") or {}
+            st = fields.get("status") or {}
+            cat_key = (st.get("statusCategory") or {}).get("key", "new")
+            priority = (fields.get("priority") or {}).get("name", "")
+            results.append({
+                "key": issue.get("key", ""),
+                "summary": fields.get("summary", ""),
+                "status": _jira_status(cat_key),
+                "status_name": st.get("name", ""),
+                "priority": priority,
+                "url": f"{self._base}/browse/{issue.get('key', '')}",
+                "created": fields.get("created", ""),
+            })
+        return results
+
 
 def build_jira_context(issues: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
     """Сворачивает список тикетов в summary для FixAgent.

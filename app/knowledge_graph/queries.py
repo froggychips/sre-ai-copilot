@@ -11,8 +11,10 @@ from typing import Any, Dict, List, Optional
 
 from sqlalchemy.orm import Session
 
-from app.knowledge_graph.schema import (AlertEvent, Deployment, Service,
-                                        ServiceEdge)
+from app.knowledge_graph.confidence import (confidence_label,
+                                            confidence_score)
+from app.knowledge_graph.schema import (AlertEvent, Deployment, PodEvent,
+                                        Service, ServiceEdge)
 
 
 def _ensure_aware(dt: datetime) -> datetime:
@@ -62,27 +64,39 @@ def recent_deploys_for(
         delta_min = int(
             (before_aware - d.started_at.replace(tzinfo=timezone.utc)).total_seconds() // 60
         )
+        extras = d.extras if isinstance(d.extras, dict) else {}
         out.append({
             "name": service_name,
             "ts": d.started_at,
             "sha": d.sha,
             "repo": d.repo,
             "buildtype_id": d.buildtype_id,
+            "buildtype_name": extras.get("buildtype_name") or d.buildtype_id,
             "number": d.build_number,
             "status": d.status,
+            "triggered_by": d.triggered_by,
+            "url": extras.get("url"),
             "minutes_before_incident": delta_min,
         })
     return out
 
 
 def upstream_of(
-    db: Session, namespace: str, service_name: str, kinds: Optional[List[str]] = None
+    db: Session,
+    namespace: str,
+    service_name: str,
+    kinds: Optional[List[str]] = None,
+    fresh_only_days: Optional[int] = None,
 ) -> List[Dict[str, Any]]:
     """Сервисы, от которых зависит данный.
 
     Если town `calls` auth → upstream_of(town) включает auth. Семантически
     это «если эти сервисы лягут, то текущий с большой вероятностью тоже».
     Используется UpstreamDegradedRule для поиска alert-ов на upstream.
+
+    `fresh_only_days` (C1): если задано — фильтр edges по
+    `last_seen_at >= now() - fresh_only_days`. Защита от stale-зависимостей
+    (сервис убрал env-var, но edge остался в KG).
     """
     svc = _service_by_namespace_name(db, namespace, service_name)
     if svc is None:
@@ -90,15 +104,23 @@ def upstream_of(
     q = db.query(ServiceEdge).filter(ServiceEdge.src_id == svc.id)
     if kinds:
         q = q.filter(ServiceEdge.kind.in_(kinds))
+    if fresh_only_days is not None:
+        fresh_cutoff = datetime.utcnow() - timedelta(days=fresh_only_days)
+        q = q.filter(ServiceEdge.last_seen_at >= fresh_cutoff)
     out: List[Dict[str, Any]] = []
     for edge in q.all():
         if edge.dst is None:
             continue
+        score = confidence_score(edge.extras, edge.last_seen_at)
         out.append({
             "service": edge.dst.name,
             "namespace": edge.dst.namespace,
             "kind": edge.kind,
             "weight": edge.weight,
+            "last_seen_at": edge.last_seen_at,
+            "discovery_sources": (edge.extras or {}).get("discovery_sources") or [],
+            "confidence_score": score,
+            "confidence_label": confidence_label(score),
         })
     return out
 
@@ -171,4 +193,55 @@ def nearby_alerts(
                 "minutes_before": delta_min,
                 "edge_kind": u["kind"],
             })
+    return out
+
+
+def recent_pod_events_for(
+    db: Session,
+    namespace: str,
+    service_name: str,
+    around: datetime,
+    window_minutes: int = 30,
+    limit: int = 20,
+) -> List[Dict[str, Any]]:
+    """A4: PodEvent для сервиса в окне [around-window, around+window].
+
+    Используется в alert_enrichment чтобы дополнить embed строкой типа
+    "OOMKilled ×3 (last 12m ago)" — k8s-level signal, который AlertManager
+    upstream-rule может не отразить.
+
+    Возвращает [{reason, pod_name, first_seen, last_seen, count,
+                  minutes_before, message}] по убыванию first_seen.
+    """
+    svc = _service_by_namespace_name(db, namespace, service_name)
+    if svc is None:
+        return []
+    around_aware = _ensure_aware(around)
+    since = around_aware - timedelta(minutes=window_minutes)
+    until = around_aware + timedelta(minutes=window_minutes)
+
+    rows = (
+        db.query(PodEvent)
+        .filter(
+            PodEvent.service_id == svc.id,
+            PodEvent.first_seen >= since.replace(tzinfo=None),
+            PodEvent.first_seen <= until.replace(tzinfo=None),
+        )
+        .order_by(PodEvent.first_seen.desc())
+        .limit(limit)
+        .all()
+    )
+    out: List[Dict[str, Any]] = []
+    for r in rows:
+        first_aware = _ensure_aware(r.first_seen)
+        delta_min = int((around_aware - first_aware).total_seconds() // 60)
+        out.append({
+            "reason": r.reason,
+            "pod_name": r.pod_name,
+            "first_seen": r.first_seen,
+            "last_seen": r.last_seen,
+            "count": r.count,
+            "minutes_before": delta_min,
+            "message": (r.message or "")[:200],
+        })
     return out
