@@ -407,6 +407,28 @@ class DiscordService:
                 "inline": False,
             })
 
+        # A6: Jira tickets linkback. Тикеты project_key+label=backend
+        # с service в summary за JIRA_SEARCH_DAYS. Прямые URL.
+        if head.jira_issues:
+            lines = []
+            for j in head.jira_issues[:4]:
+                key = j.get("key", "?")
+                summary = (j.get("summary") or "")[:80]
+                status = j.get("status", "?")
+                pri = j.get("priority", "")
+                url = j.get("url", "")
+                pri_part = f" {pri}" if pri else ""
+                status_icon = {"resolved": "✅", "open": "🟡"}.get(status, "⚪")
+                if url:
+                    lines.append(f"• {status_icon} [`{key}`]({url}){pri_part} — {summary}")
+                else:
+                    lines.append(f"• {status_icon} `{key}`{pri_part} — {summary}")
+            fields.append({
+                "name": f"🎫 Tickets (Jira, last {settings.JIRA_SEARCH_DAYS}d)",
+                "value": "\n".join(lines)[:1024],
+                "inline": False,
+            })
+
         # Recent pod_events (kg_pod_events) — k8s diagnostic signal
         # (OOMKilled / ImagePullBackOff / BackOff / Unhealthy / ...).
         if head.pod_events:

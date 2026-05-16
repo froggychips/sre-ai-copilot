@@ -75,6 +75,14 @@ celery_app.conf.beat_schedule = {
         "task": "kg_drift_cleanup",
         "schedule": crontab(minute=17),  # ежечасно в 17 мин
     },
+    # Точка роста #2 (Phase 2): AlertEvent resolve sync. Каждые 15 мин
+    # сравниваем kg_alerts.fingerprint с активными на AM, не-firing
+    # помечаем resolved_at=NOW. Без этого stale firing alerts копятся
+    # годами (см. etcdMembersDown от 10 апреля).
+    "kg-alerts-resolve-sync": {
+        "task": "kg_alerts_resolve_sync",
+        "schedule": crontab(minute="*/15"),
+    },
 }
 
 
@@ -164,6 +172,22 @@ def k8s_pod_events_sync_task():
     finally:
         db.close()
     return result
+
+
+@celery_app.task(name="kg_alerts_resolve_sync")
+def kg_alerts_resolve_sync_task():
+    """Точка роста #2: AlertEvent.resolved_at refresh из AM API."""
+    import asyncio as _aio
+    from app.knowledge_graph.alerts_resolve_sync import run_alerts_resolve_sync
+
+    db = SessionLocal()
+    try:
+        return _aio.run(run_alerts_resolve_sync(db))
+    except Exception as e:
+        logger.warning("kg_alerts_resolve_sync.failed: %s", e)
+        return {"error": str(e)}
+    finally:
+        db.close()
 
 
 @celery_app.task(name="kg_drift_cleanup")

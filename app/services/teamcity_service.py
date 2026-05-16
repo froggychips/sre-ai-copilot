@@ -457,6 +457,17 @@ def _fetch_recent_deploys_direct(
         client.close()
 
 
+def _tc_project_ids() -> list[str]:
+    """G3.1: список TC projects для sync. TC_PROJECT_IDS (CSV) приоритетнее,
+    fallback на TC_BACKEND_PROJECT_ID для обратной совместимости."""
+    csv = (settings.TC_PROJECT_IDS or "").strip()
+    if csv:
+        return [p.strip() for p in csv.split(",") if p.strip()]
+    if settings.TC_BACKEND_PROJECT_ID:
+        return [settings.TC_BACKEND_PROJECT_ID]
+    return []
+
+
 async def recent_deploys(
     *,
     lookback_hours: int = 24,
@@ -464,21 +475,33 @@ async def recent_deploys(
 ) -> list[dict[str, Any]]:
     """Top-N deploy-builds (finished) за последние `lookback_hours` часов.
 
+    G3.1: итерирует все TC projects из `_tc_project_ids()` (TC_PROJECT_IDS
+    CSV → fallback TC_BACKEND_PROJECT_ID). Объединяет результаты,
+    сортирует по finished_at DESC, режет до limit. `limit` применяется к
+    общему списку, не к каждому project (избегаем 1k-build flood).
+
     Каждый dict: id/number/status/branch/buildtype_id/buildtype_name/
-    finished_at/triggered_by/triggered_type/url. Пустой список — если TC
-    не настроен / direct client недоступен / ошибка.
+    started_at/finished_at/triggered_by/triggered_type/url. Пустой
+    список — если TC не настроен / direct client недоступен / ошибка.
     """
     if not (settings.TC_URL and settings.TC_TOKEN and _TC_CLIENT_AVAILABLE):
         return []
-    if not settings.TC_BACKEND_PROJECT_ID:
+    projects = _tc_project_ids()
+    if not projects:
         return []
     since = datetime.now(timezone.utc) - timedelta(hours=lookback_hours)
-    try:
-        loop = asyncio.get_event_loop()
-        return await loop.run_in_executor(
-            None, _fetch_recent_deploys_direct,
-            settings.TC_BACKEND_PROJECT_ID, since, limit,
-        )
-    except Exception as e:
-        logger.warning("teamcity.recent_deploys_failed", error=str(e))
-        return []
+    loop = asyncio.get_event_loop()
+    combined: list[dict[str, Any]] = []
+    for pid in projects:
+        try:
+            project_builds = await loop.run_in_executor(
+                None, _fetch_recent_deploys_direct, pid, since, limit,
+            )
+            combined.extend(project_builds)
+        except Exception as e:
+            logger.warning(
+                "teamcity.recent_deploys_failed project=%s error=%s",
+                pid, str(e),
+            )
+    combined.sort(key=lambda x: x.get("finished_at") or "", reverse=True)
+    return combined[:limit]

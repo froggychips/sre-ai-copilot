@@ -57,6 +57,10 @@ class EnrichedContext:
     outgoing_deps: List[Dict[str, Any]] = field(default_factory=list)
     # Pod-events (kg_pod_events) — k8s diagnostic signal в окне инцидента.
     pod_events: List[Dict[str, Any]] = field(default_factory=list)
+    # A6 (Phase 2): Jira-issues linkback. Тикеты с label=backend и service
+    # в summary за последние JIRA_SEARCH_DAYS дней. Embed-секция «Ticketsy»
+    # с прямыми URL на issue.
+    jira_issues: List[Dict[str, Any]] = field(default_factory=list)
 
     rule_facts: List[Fact] = field(default_factory=list)
 
@@ -171,6 +175,16 @@ def enrich_alert(db: Session, incident: Incident) -> EnrichedContext:
         return ctx
 
     incident_at = _parse_starts_at(incident.starts_at)
+    # Точка роста #1: для длительных хроник (alert firing 3+ суток —
+    # bot-service например) `before=incident.starts_at` указывает на
+    # «когда впервые зафайрило», а это может быть 14 мая. Для current
+    # embed более релевантно «recent deploys before now», а не «before
+    # incident_at_3_days_ago». Используем max(starts_at, now-30д) как
+    # adaptive окно: для свежих alerts (часы) — как было, для хроник
+    # (дни) — relative к now.
+    now = datetime.now(timezone.utc)
+    starts_age_hours = (now - incident_at).total_seconds() / 3600
+    effective_at = now if starts_age_hours > 24 else incident_at
 
     # 1. Recent deploys: сначала узкое окно (для regression-сигнала
     # «deploy за N минут до alert-а»), если пусто — расширяем до 7 дней,
@@ -178,12 +192,12 @@ def enrich_alert(db: Session, incident: Incident) -> EnrichedContext:
     # сервисов 60-мин окно почти всегда пустое).
     try:
         ctx.recent_deploys = recent_deploys_for(
-            db, namespace, service, before=incident_at,
+            db, namespace, service, before=effective_at,
             lookback_minutes=settings.ENRICH_DEPLOY_LOOKBACK_MIN,
         )
         if not ctx.recent_deploys:
             ctx.recent_deploys = recent_deploys_for(
-                db, namespace, service, before=incident_at,
+                db, namespace, service, before=effective_at,
                 lookback_minutes=7 * 24 * 60,  # 7 дней fallback
             )
     except Exception as e:
@@ -224,19 +238,41 @@ def enrich_alert(db: Session, incident: Incident) -> EnrichedContext:
     except Exception as e:
         log.warning("enrich.outgoing_deps_failed", error=str(e))
 
+    # 4d. A6: Jira-issues linkback. Сервисная корреляция через label+summary
+    # search. Только если Jira настроен (JIRA_BASE_URL+EMAIL+TOKEN+PROJECT).
+    # Не обязательная зависимость — silent fail OK.
+    try:
+        if (settings.JIRA_BASE_URL and settings.JIRA_EMAIL
+                and settings.JIRA_API_TOKEN and settings.JIRA_PROJECT_KEY):
+            from app.context.jira_client import JiraClient
+            jira = JiraClient(
+                base_url=settings.JIRA_BASE_URL,
+                email=settings.JIRA_EMAIL,
+                api_token=settings.JIRA_API_TOKEN,
+                project_key=settings.JIRA_PROJECT_KEY,
+                backend_label=settings.JIRA_BACKEND_LABEL,
+            )
+            ctx.jira_issues = jira.search_by_service_sync(
+                service=service,
+                namespace=namespace,
+                days=settings.JIRA_SEARCH_DAYS,
+            )
+    except Exception as e:
+        log.warning("enrich.jira_search_failed", error=str(e))
+
     # 4c. Recent pod events (kg_pod_events) — k8s diagnostic signal.
     # Сначала узкое окно 60м (для свежих CrashLoop / OOMKilled / Unhealthy
     # как причины текущего alert-а). Если пусто — расширяем до 7д fallback,
     # чтобы embed для длительных хроник всё равно показывал последние k8s
-    # события (для bot-service крон-крэшится 2+ суток → 60m не покрывает).
+    # события. effective_at (точка роста #1) — same adapt для хроник.
     try:
         ctx.pod_events = recent_pod_events_for(
-            db, namespace, service, around=incident_at,
+            db, namespace, service, around=effective_at,
             window_minutes=60, limit=5,
         )
         if not ctx.pod_events:
             ctx.pod_events = recent_pod_events_for(
-                db, namespace, service, around=incident_at,
+                db, namespace, service, around=effective_at,
                 window_minutes=7 * 24 * 60, limit=5,
             )
     except Exception as e:
