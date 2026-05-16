@@ -295,12 +295,14 @@ def _extract_upstreams_extended(
 def _derive_team_owner(namespace: str) -> Optional[str]:
     """team_owner = namespace без env-prefix.
 
-    prod-kingdom1   → "kingdom1"
-    preprod-shared  → "shared"
+    prod-kingdom1     → "kingdom1"
+    preprod-shared    → "shared"
     preupdate-kingdom3 → "kingdom3"
-    sre-ai          → None  (не WO-prefix)
+    squad-3-shared    → "shared"
+    squad-19-kingdom2 → "kingdom2"
+    sre-ai            → None  (не WO-env-prefix)
     """
-    m = re.match(r"^(?:prod|preprod|preupdate)-(.+)$", namespace)
+    m = re.match(r"^(?:prod|preprod|preupdate|squad-\d+)-(.+)$", namespace)
     return m.group(1) if m else None
 
 
