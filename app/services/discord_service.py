@@ -313,11 +313,18 @@ class DiscordService:
                 "inline": True,
             })
 
-        # Recent deploys
+        # Recent deploys. Окно вычисляется из самого дальнего deploy —
+        # alert_enrichment может использовать fallback 7д если узкое окно
+        # пусто; заголовок честно показывает фактический диапазон.
         if head.recent_deploys:
             lines = []
+            max_min = 0
             for d in head.recent_deploys[:3]:
-                mins = d.get("minutes_before_incident", "?")
+                mins = d.get("minutes_before_incident", 0)
+                try:
+                    max_min = max(max_min, int(mins))
+                except (ValueError, TypeError):
+                    pass
                 sha = (d.get("sha") or "")[:7]
                 num = d.get("number") or "?"
                 bt = d.get("buildtype_id") or ""
@@ -327,8 +334,15 @@ class DiscordService:
                     + (f" ({bt})" if bt else "")
                     + (f" — {status}" if status else "")
                 )
+            # Человекочитаемая шкала окна: «60м» / «24ч» / «3д».
+            if max_min < 120:
+                window_label = f"~{max_min}м"
+            elif max_min < 60 * 48:
+                window_label = f"~{max_min // 60}ч"
+            else:
+                window_label = f"~{max_min // (60 * 24)}д"
             fields.append({
-                "name": f"Recent deploys (lookback {settings.ENRICH_DEPLOY_LOOKBACK_MIN}m)",
+                "name": f"Recent deploys ({window_label})",
                 "value": "\n".join(lines)[:1024],
                 "inline": False,
             })

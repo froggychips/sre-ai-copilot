@@ -224,15 +224,21 @@ def enrich_alert(db: Session, incident: Incident) -> EnrichedContext:
     except Exception as e:
         log.warning("enrich.outgoing_deps_failed", error=str(e))
 
-    # 4c. Recent pod events (kg_pod_events) — k8s diagnostic signal
-    # в окне инцидента ±60 мин. Особенно важно для CrashLooping/Unhealthy,
-    # где AM rule показывает следствие, а pod_events — причину
-    # (OOMKilled/ImagePullBackOff/FailedScheduling/etc.).
+    # 4c. Recent pod events (kg_pod_events) — k8s diagnostic signal.
+    # Сначала узкое окно 60м (для свежих CrashLoop / OOMKilled / Unhealthy
+    # как причины текущего alert-а). Если пусто — расширяем до 7д fallback,
+    # чтобы embed для длительных хроник всё равно показывал последние k8s
+    # события (для bot-service крон-крэшится 2+ суток → 60m не покрывает).
     try:
         ctx.pod_events = recent_pod_events_for(
             db, namespace, service, around=incident_at,
             window_minutes=60, limit=5,
         )
+        if not ctx.pod_events:
+            ctx.pod_events = recent_pod_events_for(
+                db, namespace, service, around=incident_at,
+                window_minutes=7 * 24 * 60, limit=5,
+            )
     except Exception as e:
         log.warning("enrich.pod_events_failed", error=str(e))
 
