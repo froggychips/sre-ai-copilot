@@ -16,9 +16,24 @@ The application consists of: an HTTP API (FastAPI), background tasks (Celery), a
 - **FixAgent (`app.agents.fix`)**: generates a structured `ExecutionIntent`; recurrence-aware and Jira-enriched.
 - **SimilarIncidentEngine (`app.core.intelligence.similar_incidents`)**: KG-based recurrence detection (7-day window).
 - **JiraClient (`app.context.jira_client`)**: Atlassian REST API enrichment for FixAgent context.
+- **Knowledge Graph (`app.knowledge_graph.*`)**: auto-populating directed graph in Postgres (5 tables: `kg_services`, `kg_service_edges`, `kg_deployments`, `kg_alerts`, `kg_pod_events`); 5 sync sources (env-vars, NATS env, DSN-from-secret-key, k8s events, k8s ingresses); confidence scoring with multi-source provenance.
+- **Alert enrichment (`app.services.alert_enrichment`)**: deterministic KG-based enrichment for `/webhooks/alertmanager/enrich-and-forward` — runs without LLM, ~5 SQL queries, builds `EnrichedContext` (recent_deploys, upstream_alerts, outgoing_deps, pod_events, jira_issues, primary_hypothesis, why_this_matters).
 - **Data layer (`app.database`, `app.repository`)**: SQLAlchemy models and CRUD operations.
 - **Integration layer (`app.services.mcp_client`)**: MCP client for k8s, TeamCity, and other external tools.
 - **Safety services**: approval manager, K8s guard, execution DSL.
+
+### Beat tasks (Celery, periodic)
+
+| Task | Schedule | Purpose |
+|---|---|---|
+| `kg_topology_sync` | hourly @ :00 | k8s deployments → `kg_services` + edges (calls/uses_nats/uses_db) |
+| `tc_deploys_to_kg` | every 15 min | TC builds → `kg_deployments` (multi-project, SUCCESS+FAILURE) |
+| `k8s_pod_events_sync` | every 10 min | k8s Warning events → `kg_pod_events` |
+| `kg_ingress_sync` | hourly @ :37 | k8s Ingresses → external entrypoint edges |
+| `kg_alerts_resolve_sync` | every 15 min | refresh `kg_alerts.resolved_at` from AM API |
+| `kg_drift_cleanup` | hourly @ :17 | services from missing namespaces → `synthetic=true` |
+| `daily_stats_digest` | daily | KG-summary digest to Discord #stats |
+| `chronic_alerts_digest` | every 6h | chronic-suppressed alerts visibility digest |
 
 ## 3. Data Flow (Webhook Incident Pipeline)
 
@@ -56,6 +71,35 @@ AlertManager webhook
   Stage 7: IncidentRecord(status=COMPLETED, analysis=…)
   Stage 8: KG update (_is_quality_cause filter)
 ```
+
+## 3a. KG-only Enrichment Flow (without LLM)
+
+A parallel webhook path provides deterministic alert enrichment without LLM. Used as the primary Discord output channel; the full LLM pipeline above is gated behind `LLM_PIPELINE_ENABLED=False` by default.
+
+```
+AlertManager webhook
+  → POST /webhooks/alertmanager/enrich-and-forward
+  → store incident → KG (populate_from_incident)
+  → group alerts by (alertname, severity)
+  → for each group:
+     → alert_enrichment.enrich_alert(db, incident)
+        → recent_deploys_for(...)         # with adaptive effective_at
+        → nearby_alerts(...)              # upstream alert correlation
+        → incidents_on(...)               # recurrence window
+        → _downstream_count_by_kind(...)  # inbound callers
+        → upstream_of(..., fresh_only_days=30)  # outgoing deps with confidence
+        → recent_pod_events_for(...)      # k8s diagnostic signal
+        → JiraClient.search_by_service_sync(...)  # ticket linkback
+        → PodEventsRule + RecentDeployRule + UpstreamDegradedRule
+        → primary_hypothesis() + why_this_matters()
+     → decide_send() (chronic suppress / rollout-silent)
+     → DiscordService.send_enriched_alert(contexts, env, resurfaced)
+        → severity-aware embed
+        → confidence badges (●●●/●●○/●○○) with provenance
+        → clickable TC build links + deployer name
+```
+
+Latency budget: <500ms p95 synchronous in HTTP handler. No LLM tokens. Total cost: 0 per alert.
 
 ## 4. Fact-Anchored Reasoning
 

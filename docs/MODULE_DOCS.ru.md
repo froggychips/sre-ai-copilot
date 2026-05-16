@@ -36,6 +36,48 @@
 - `app/core/intelligence/similar_incidents.py`: `SimilarIncidentEngine` — поиск по KG с фильтром `_is_quality_cause()`, `RECURRENCE_WINDOW_DAYS=7`, флаг `recurrence` в каждом результате.
 - `app/core/intelligence/blast_radius.py`, `temporal_diff.py`, `next_steps.py`: вспомогательные аналитические функции.
 
+## Knowledge Graph
+
+### Schema (`app/knowledge_graph/schema.py`)
+- `Service` — узлы (`kg_services`, unique `(namespace, name)`); флаг `synthetic` скрывает инфра/observability/drift-узлы из KG-запросов; `team_owner` выводится из namespace prefix.
+- `ServiceEdge` — направленные рёбра (`kg_service_edges`); `kind` ∈ `calls` / `uses_nats` / `uses_db`; `last_seen_at` для TTL/decay; `extras.discovery_sources` (list) копит все источники (multi-source = выше confidence).
+- `Deployment` — история TC builds (`kg_deployments`); `started_at` из TC API (не `finishDate`), `triggered_by`, статус `SUCCESS`/`FAILURE`/etc.
+- `AlertEvent` — алерты от AM (`kg_alerts`); идемпотентно по `fingerprint`; `resolved_at` обновляется через `kg_alerts_resolve_sync`.
+- `PodEvent` — k8s Warning-события (`kg_pod_events`); идемпотентно по `event_uid`; `count` копит kubelet-retries.
+
+### Sync (auto-populating beat tasks)
+- `app/knowledge_graph/kg_sync.py`: `sync_topology()` — раз в час `kubectl get deployments -A` → `kg_services` + рёбра из env-vars (HTTP URLs, NATS-кластеры) и `secretKeyRef.key` heuristic (DB-DSN без чтения значений secret).
+- `app/knowledge_graph/k8s_events_sync.py`: `sync_all_events()` — каждые 10 мин `kubectl get events --field-selector type=Warning` → `kg_pod_events`. Pod-name → service резолвится regex'ом стандартного k8s pod-hash паттерна.
+- `app/knowledge_graph/k8s_ingress_sync.py`: `sync_all_ingresses()` — раз в час `kubectl get ingresses -A` → synthetic-узлы `ingress:<host>` + рёбра `calls` к backend-сервисам.
+- `app/knowledge_graph/alerts_resolve_sync.py`: `run_alerts_resolve_sync()` — каждые 15 мин сравнивает `kg_alerts.fingerprint` с `GET AM /api/v2/alerts` → не-firing → `resolved_at=NOW`. Safety: min 1 active fingerprint.
+- `app/knowledge_graph/drift_cleanup.py`: `run_drift_cleanup()` — раз в час; services из несуществующих ns → `synthetic=true` + `metadata.drift_reason`. Safety threshold 20% drift_pct.
+
+### Population (`app/knowledge_graph/populator.py`)
+Идемпотентные upsert'ы, используются всеми sync'ами:
+- `upsert_service(namespace, name, team_owner, synthetic, metadata)` — идемпотентно по `(namespace, name)`.
+- `upsert_edge(src, dst, kind, discovered_by, extras)` — обновляет `last_seen_at` и merge `discovery_sources` (unique-preserved-order list).
+- `record_deployment` / `record_alert_event` / `record_pod_event` — идемпотентны по соответствующим natural keys.
+
+### Queries (`app/knowledge_graph/queries.py`)
+- `recent_deploys_for(ns, svc, before, lookback_minutes)` — deploy-записи с `triggered_by` и TC build URL.
+- `upstream_of(ns, svc, kinds=None, fresh_only_days=N)` — outgoing edges с `confidence_score`/`confidence_label`.
+- `incidents_on` / `nearby_alerts` / `recent_pod_events_for` — оставшиеся read-side queries для enrichment.
+
+### Confidence (`app/knowledge_graph/confidence.py`)
+- `confidence_score(extras, last_seen_at)` → [0, 1]. Формула: `base × source_count_mul × freshness_mul`.
+- `confidence_label` (`high`/`medium`/`low`) + `confidence_badge` (`●●●`/`●●○`/`●○○`).
+- LLM-readiness: при включении LLM-пайплайна модель видит «inferred с env+url confidence 0.7».
+
+### Alert enrichment (`app/services/alert_enrichment.py`)
+- `enrich_alert(db, incident)` → `EnrichedContext`. Синхронно, ~5 SQL-запросов, **без LLM**. Путь: `/webhooks/alertmanager/enrich-and-forward`.
+- Adaptive `effective_at = max(starts_at, now-24h)` — для длительных хроник anchor на `now`.
+- `primary_hypothesis()` — top-1 observed Fact; `why_this_matters()` — derived priorization (shared dep, chronic, recurrence, infra-critical team).
+
+### CLI tools (`app/scripts/`)
+- `backfill_team_owner.py` — one-shot UPDATE `team_owner` для legacy строк.
+- `backfill_tc_deploys.py` — расширенный TC history backfill (default 30 дней).
+- `cleanup_drift.py` — thin wrapper над `drift_cleanup.py` для ручного dry-run / apply.
+
 ## Данные и персистентность
 - `app/database.py`, `app/db/*`: engine/session helpers и интеграция БД.
 - `app/models/*` и `app/models.py`: Pydantic/ORM-модели домена.
