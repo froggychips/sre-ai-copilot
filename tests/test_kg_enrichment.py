@@ -823,3 +823,150 @@ def test_drift_cleanup_already_marked_idempotent():
         result = run_drift_cleanup(db, max_drift_pct=25.0, apply=True)
 
     assert result["marked_services"] == 0  # уже помечен, skip
+
+
+# ── ChatGPT review #3.1: precedence-based confidence_score ─────────────────
+
+
+def test_confidence_runtime_beats_inferred():
+    """runtime source (precedence 1.0) >> env (precedence 0.5)."""
+    from datetime import datetime, timedelta
+    from app.knowledge_graph.confidence import confidence_score
+    fresh = datetime.utcnow() - timedelta(minutes=5)
+    runtime = confidence_score({"discovery_sources": ["kg_sync/otel_runtime"]}, fresh)
+    env_only = confidence_score({"discovery_sources": ["kg_sync/env_vars"]}, fresh)
+    assert runtime >= 0.9
+    assert env_only <= 0.55
+    assert runtime > env_only
+
+
+def test_confidence_ingress_higher_than_secret():
+    """k8s manifest declared (0.85) > secret-key heuristic (0.65)."""
+    from datetime import datetime, timedelta
+    from app.knowledge_graph.confidence import confidence_score
+    fresh = datetime.utcnow() - timedelta(minutes=5)
+    ingress = confidence_score({"discovery_sources": ["kg_sync/ingress"]}, fresh)
+    secret_only = confidence_score({"discovery_sources": ["kg_sync/secret_hint"]}, fresh)
+    assert ingress > secret_only
+
+
+def test_confidence_corroboration_bonus():
+    """2 unique sources → +0.10 corroboration; 3+ → +0.20 cap."""
+    from datetime import datetime, timedelta
+    from app.knowledge_graph.confidence import confidence_score
+    fresh = datetime.utcnow() - timedelta(minutes=5)
+    single = confidence_score({"discovery_sources": ["kg_sync/env_vars"]}, fresh)
+    two = confidence_score({"discovery_sources": ["kg_sync/env_vars", "kg_sync/env_url_v2"]}, fresh)
+    three = confidence_score({"discovery_sources": ["kg_sync/env_vars", "kg_sync/env_url_v2", "kg_sync/nats_env"]}, fresh)
+    assert two > single
+    assert three > two
+    # bonus capped at 0.20 — 4-й источник не должен поднимать дальше
+    four = confidence_score({"discovery_sources": ["kg_sync/env_vars", "kg_sync/env_url_v2", "kg_sync/nats_env", "kg_sync/dsn_env"]}, fresh)
+    # three и four содержат разные tier источников; bonus уже capped
+    # → max precedence отвечает за рост (dsn_env = 0.65), не corroboration
+    # Минимально требуем: four > three при добавлении более сильного source
+    assert four >= three
+
+
+def test_confidence_unknown_source_below_known():
+    """unknown source — _SOURCE_PRECEDENCE_DEFAULT (0.40), ниже weakest known."""
+    from datetime import datetime, timedelta
+    from app.knowledge_graph.confidence import confidence_score
+    fresh = datetime.utcnow() - timedelta(minutes=5)
+    unknown = confidence_score({"discovery_sources": ["kg_sync/some_future_thing"]}, fresh)
+    env_known = confidence_score({"discovery_sources": ["kg_sync/env_vars"]}, fresh)
+    assert unknown < env_known
+
+
+def test_confidence_stale_runtime_loses_to_fresh_env():
+    """Stale runtime (>30d) теряет на freshness multiplier — fresh env-only выигрывает."""
+    from datetime import datetime, timedelta
+    from app.knowledge_graph.confidence import confidence_score
+    stale = datetime.utcnow() - timedelta(days=60)
+    fresh = datetime.utcnow() - timedelta(minutes=5)
+    stale_runtime = confidence_score({"discovery_sources": ["kg_sync/otel_runtime"]}, stale)
+    fresh_env = confidence_score({"discovery_sources": ["kg_sync/env_vars"]}, fresh)
+    assert fresh_env > stale_runtime
+
+
+# ── ChatGPT review #4.3: health score ─────────────────────────────────────
+
+
+def test_health_perfect_when_no_signals():
+    """Сервис без alerts / pod_events / recurrence → score 1.0."""
+    from unittest.mock import MagicMock
+    from app.knowledge_graph.health_score import compute_health_for_service
+    from app.knowledge_graph.schema import Service
+    svc = Service(id=1, namespace="ns", name="svc")
+    db = MagicMock()
+    db.query.return_value.filter.return_value.all.return_value = []
+    db.query.return_value.filter.return_value.count.return_value = 0
+    score, signals = compute_health_for_service(db, svc)
+    assert score == 1.0
+    assert signals == {"open_critical": 0, "open_warning": 0, "chronic_pod_events": 0, "recurrence_24h": 0}
+
+
+def test_health_critical_alert_penalty():
+    """1 open critical alert — score падает на 0.40."""
+    from unittest.mock import MagicMock
+    from app.knowledge_graph.health_score import compute_health_for_service
+    from app.knowledge_graph.schema import AlertEvent, Service
+    svc = Service(id=1, namespace="ns", name="svc")
+    critical = MagicMock(spec=AlertEvent)
+    critical.severity = "critical"
+    db = MagicMock()
+    # query.filter().all() возвращает open alerts (1 critical)
+    # query.filter().count() возвращает 0 для pod_events и recurrence
+    counts_returns = iter([0, 0])
+    db.query.return_value.filter.return_value.all.return_value = [critical]
+    db.query.return_value.filter.return_value.count.side_effect = lambda: next(counts_returns)
+    score, signals = compute_health_for_service(db, svc)
+    assert score == 0.60
+    assert signals["open_critical"] == 1
+
+
+def test_health_chronic_pod_event_penalty():
+    """Chronic pod_event (count > 1000) → -0.35."""
+    from unittest.mock import MagicMock
+    from app.knowledge_graph.health_score import compute_health_for_service
+    from app.knowledge_graph.schema import Service
+    svc = Service(id=1, namespace="ns", name="svc")
+    db = MagicMock()
+    db.query.return_value.filter.return_value.all.return_value = []
+    counts_returns = iter([2, 0])  # 2 chronic events, 0 recurrence
+    db.query.return_value.filter.return_value.count.side_effect = lambda: next(counts_returns)
+    score, signals = compute_health_for_service(db, svc)
+    # 1.0 - 2*0.35 = 0.30
+    assert abs(score - 0.30) < 0.01
+    assert signals["chronic_pod_events"] == 2
+
+
+def test_health_recurrence_penalty():
+    """20 алертов в 24h → 4 group of 5 → -0.40."""
+    from unittest.mock import MagicMock
+    from app.knowledge_graph.health_score import compute_health_for_service
+    from app.knowledge_graph.schema import Service
+    svc = Service(id=1, namespace="ns", name="svc")
+    db = MagicMock()
+    db.query.return_value.filter.return_value.all.return_value = []
+    counts_returns = iter([0, 20])  # 0 chronic, 20 recurrences
+    db.query.return_value.filter.return_value.count.side_effect = lambda: next(counts_returns)
+    score, _ = compute_health_for_service(db, svc)
+    # 1.0 - (20 // 5) * 0.10 = 1.0 - 4*0.10 = 0.60
+    assert abs(score - 0.60) < 0.01
+
+
+def test_health_score_clamped_to_zero():
+    """Множественные penalty не уводят score ниже 0."""
+    from unittest.mock import MagicMock
+    from app.knowledge_graph.health_score import compute_health_for_service
+    from app.knowledge_graph.schema import AlertEvent, Service
+    svc = Service(id=1, namespace="ns", name="svc")
+    # 5 critical alerts + 3 chronic + 20 recurrence — overflow penalty
+    alerts = [MagicMock(spec=AlertEvent, severity="critical") for _ in range(5)]
+    db = MagicMock()
+    db.query.return_value.filter.return_value.all.return_value = alerts
+    counts_returns = iter([3, 20])
+    db.query.return_value.filter.return_value.count.side_effect = lambda: next(counts_returns)
+    score, _ = compute_health_for_service(db, svc)
+    assert score == 0.0
