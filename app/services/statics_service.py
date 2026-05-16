@@ -21,6 +21,7 @@ import psycopg2.extras
 from psycopg2 import sql as pgsql
 
 from app.config import settings
+from app.services.resilience import with_external_retry
 
 logger = logging.getLogger(__name__)
 
@@ -58,8 +59,16 @@ def _conn_kwargs() -> dict:
     }
 
 
+@with_external_retry(
+    max_attempts=3, initial_delay=0.5, name="statics.run_check",
+    retry_on=(psycopg2.OperationalError, psycopg2.InterfaceError),
+)
 def _run_statics_check(error_text: str, recent_n: int) -> Optional[str]:
-    """Sync check: подключаемся к statics, ищем таблицы по ключевым словам."""
+    """Sync check: подключаемся к statics, ищем таблицы по ключевым словам.
+
+    Retry-ится только на connection-class ошибках (OperationalError/
+    InterfaceError) — semantic SQL errors (broken query, missing table)
+    retry-ить смысла нет."""
     keywords = _extract_keywords(error_text)
     if not keywords:
         return None

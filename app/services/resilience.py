@@ -1,6 +1,8 @@
 import asyncio
+import inspect
 import time
 from functools import wraps
+from typing import Any, Callable, Tuple, Type
 
 import structlog
 from redis.asyncio import Redis
@@ -27,6 +29,118 @@ def llm_retry_strategy(func):
         raise last_exc
 
     return wrapper
+
+
+def with_external_retry(
+    *,
+    max_attempts: int = 3,
+    initial_delay: float = 0.5,
+    backoff_factor: float = 2.0,
+    retry_on: Tuple[Type[BaseException], ...] = (Exception,),
+    name: str = "",
+) -> Callable[[Callable], Callable]:
+    """Универсальный retry-декоратор для enrichment-integrations.
+
+    Применяется к Jira/TeamCity/VictoriaMetrics/ClickHouse/Statics клиентам —
+    transient network/timeout ошибки ретрайнятся с exponential backoff,
+    финальное исключение пробрасывается (graceful-degrade на стороне caller-а
+    уже есть — `try/except`-фолбэк превращает `None` в "feature недоступна").
+
+    Поддерживает и async и sync функции (определяется через
+    inspect.iscoroutinefunction). Sync-вариант используется в
+    `app/services/clickhouse_service.py` / `app/services/statics_service.py`
+    которые вызываются через `asyncio.to_thread`.
+
+    Параметры:
+      max_attempts: общее число попыток (1 = no retry).
+      initial_delay: первая пауза в секундах.
+      backoff_factor: множитель delay для каждой следующей попытки
+        (2.0 = exponential: 0.5s, 1.0s, 2.0s).
+      retry_on: tuple типов исключений, на которых retry-имся.
+        По дефолту любая Exception. Узкий список (TimeoutError,
+        ConnectionError) — для случаев когда нужно НЕ ретраить
+        bug-and-permanent-fail-ы.
+      name: имя для structlog (по дефолту имя функции).
+
+    Когда НЕ применять:
+      - Long-running операции (read-once dump, full-resync) — retry
+        масштабирует cost.
+      - Idempotent-uncertain writes (POST без idempotency-key).
+    """
+    def decorator(func: Callable) -> Callable:
+        retry_name = name or func.__name__
+
+        if inspect.iscoroutinefunction(func):
+            @wraps(func)
+            async def async_wrapper(*args: Any, **kwargs: Any) -> Any:
+                delay = initial_delay
+                last_exc: BaseException | None = None
+                for attempt in range(1, max_attempts + 1):
+                    try:
+                        return await func(*args, **kwargs)
+                    except retry_on as exc:
+                        last_exc = exc
+                        if attempt < max_attempts:
+                            logger.warning(
+                                "external_retry",
+                                fn=retry_name,
+                                attempt=attempt,
+                                max_attempts=max_attempts,
+                                next_delay_s=delay,
+                                error_type=type(exc).__name__,
+                                error=str(exc)[:200],
+                            )
+                            await asyncio.sleep(delay)
+                            delay *= backoff_factor
+                        else:
+                            logger.error(
+                                "external_retry_exhausted",
+                                fn=retry_name,
+                                attempts=max_attempts,
+                                error_type=type(exc).__name__,
+                                error=str(exc)[:200],
+                            )
+                assert last_exc is not None
+                raise last_exc
+
+            return async_wrapper
+
+        # sync branch
+        @wraps(func)
+        def sync_wrapper(*args: Any, **kwargs: Any) -> Any:
+            delay = initial_delay
+            last_exc: BaseException | None = None
+            for attempt in range(1, max_attempts + 1):
+                try:
+                    return func(*args, **kwargs)
+                except retry_on as exc:
+                    last_exc = exc
+                    if attempt < max_attempts:
+                        logger.warning(
+                            "external_retry",
+                            fn=retry_name,
+                            attempt=attempt,
+                            max_attempts=max_attempts,
+                            next_delay_s=delay,
+                            error_type=type(exc).__name__,
+                            error=str(exc)[:200],
+                        )
+                        time.sleep(delay)
+                        delay *= backoff_factor
+                    else:
+                        logger.error(
+                            "external_retry_exhausted",
+                            fn=retry_name,
+                            attempts=max_attempts,
+                            error_type=type(exc).__name__,
+                            error=str(exc)[:200],
+                        )
+            assert last_exc is not None
+            raise last_exc
+
+        return sync_wrapper
+
+    return decorator
 
 
 class LLMResilienceManager:

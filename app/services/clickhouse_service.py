@@ -18,6 +18,8 @@ from typing import Any, Dict, List, Optional
 
 import httpx
 
+from app.services.resilience import with_external_retry
+
 from app.config import settings
 
 logger = logging.getLogger(__name__)
@@ -59,6 +61,7 @@ class ClickHouseClient:
         self._auth = (user, password)
         self._timeout = timeout
 
+    @with_external_retry(max_attempts=3, initial_delay=0.5, name="clickhouse.query")
     async def query(self, sql: str) -> List[Dict[str, Any]]:
         """Выполнить SELECT, вернуть список dicts (column→value)."""
         params = {
