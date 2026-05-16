@@ -294,6 +294,12 @@ class DiscordService:
             f"{recurrence_tag}{noise_tag}{resurfaced_tag}"
         )
 
+        # Phase 3-A: severity-aware enrichment depth.
+        # Warning embed'ов в 5-10× больше чем critical → noise сосредоточен
+        # там. Для warning показываем «minimum viable» — title + owner +
+        # most-likely-cause + why-this-matters. Для critical — полный embed.
+        is_critical = severity == "critical"
+
         fields: List[Dict[str, Any]] = []
         fields.append({
             "name": "Namespaces",
@@ -313,13 +319,36 @@ class DiscordService:
                 "inline": True,
             })
 
+        # Phase 3-A: Most likely cause — deterministic, top-1 rule fact.
+        # Это превращает embed из «вот данные» в «вот ответ». Главная
+        # ценность для скорости triage.
+        hyp_text = head.primary_hypothesis()
+        if hyp_text:
+            fields.append({
+                "name": "🎯 Скорее всего",
+                "value": hyp_text[:1024],
+                "inline": False,
+            })
+
+        # Phase 3-A: Why this matters — derived signals (shared dep, chronic,
+        # recurrence). Прирост priorization без LLM, из существующих данных.
+        matter_bullets = head.why_this_matters()
+        if matter_bullets:
+            fields.append({
+                "name": "⭐ Почему важно",
+                "value": "\n".join(matter_bullets)[:1024],
+                "inline": False,
+            })
+
         # Recent deploys. Окно вычисляется из самого дальнего deploy —
         # alert_enrichment может использовать fallback 7д если узкое окно
         # пусто; заголовок честно показывает фактический диапазон.
+        # Phase 3-A: для warning — top-1 строка, для critical — full 3.
         if head.recent_deploys:
             lines = []
             max_min = 0
-            for d in head.recent_deploys[:3]:
+            top_n = 3 if is_critical else 1
+            for d in head.recent_deploys[:top_n]:
                 mins = d.get("minutes_before_incident", 0)
                 try:
                     max_min = max(max_min, int(mins))
@@ -366,8 +395,28 @@ class DiscordService:
         # Outgoing deps — куда сервис сам ходит. Для leaf-сервисов (как
         # bot-service) это главная диагностика при падении: «упал —
         # потому что зависит от X». Группируем по kind, badge confidence.
-        if head.outgoing_deps:
+        # Phase 3-A: для warning — counts only (одна строка), для critical — full.
+        if head.outgoing_deps and is_critical:
             from app.knowledge_graph.confidence import confidence_badge
+
+            # Phase 3-A: short provenance label из discovery_sources, чтобы
+            # семантика badge была явной. `kg_sync/env_vars` → `env`,
+            # `kg_sync/secret_hint` → `secret`, etc.
+            def _provenance_short(srcs: list) -> str:
+                if not srcs:
+                    return ""
+                shorts = []
+                for s in srcs:
+                    s_low = (s or "").lower()
+                    if "secret" in s_low: shorts.append("secret")
+                    elif "nats" in s_low: shorts.append("nats")
+                    elif "url" in s_low: shorts.append("url")
+                    elif "env" in s_low: shorts.append("env")
+                    elif "dsn" in s_low: shorts.append("dsn")
+                    elif "runtime" in s_low: shorts.append("runtime")
+                    else: shorts.append("?")
+                return "+".join(dict.fromkeys(shorts))  # unique-preserved-order
+
             by_kind: Dict[str, List[str]] = {}
             for d in head.outgoing_deps:
                 k = d.get("kind", "?")
@@ -380,7 +429,10 @@ class DiscordService:
                 # видит «inferred с confidence 0.4», а не «факт».
                 score = d.get("confidence_score") or 0.0
                 badge = confidence_badge(score)
-                target = f"{target} {badge}"
+                # Phase 3-A: subscript provenance — `(env+url)` рядом с badge.
+                prov = _provenance_short(d.get("discovery_sources") or [])
+                prov_part = f" ({prov})" if prov else ""
+                target = f"{target} {badge}{prov_part}"
                 by_kind.setdefault(k, []).append(target)
             lines = []
             kind_icons = {"calls": "→", "uses_db": "🗄", "uses_nats": "📡"}
@@ -396,10 +448,23 @@ class DiscordService:
                 "value": "\n".join(lines)[:1024],
                 "inline": False,
             })
+        elif head.outgoing_deps and not is_critical:
+            # Warning compact: counts only inline.
+            by_kind_count: Dict[str, int] = {}
+            for d in head.outgoing_deps:
+                by_kind_count[d.get("kind", "?")] = by_kind_count.get(d.get("kind", "?"), 0) + 1
+            parts = [f"{cnt} {k}" for k, cnt in by_kind_count.items()]
+            fields.append({
+                "name": "🔗 Deps",
+                "value": " · ".join(parts) + " _(full в critical)_",
+                "inline": True,
+            })
 
         # Inbound callers — сколько сервисов вызывают этот.
         # Для high-fan-in узлов (общая БД, NATS cluster) это сигнал blast radius.
-        if head.inbound_count_by_kind:
+        # Phase 3-A: показываем только если sum > 5 (blast radius signal) ИЛИ critical.
+        total_inbound = sum((head.inbound_count_by_kind or {}).values())
+        if head.inbound_count_by_kind and (is_critical or total_inbound > 5):
             parts = [f"{cnt} через `{k}`" for k, cnt in head.inbound_count_by_kind.items()]
             fields.append({
                 "name": "Inbound callers (KG)",
@@ -409,7 +474,8 @@ class DiscordService:
 
         # A6: Jira tickets linkback. Тикеты project_key+label=backend
         # с service в summary за JIRA_SEARCH_DAYS. Прямые URL.
-        if head.jira_issues:
+        # Phase 3-A: для warning — только если есть open тикет (priority signal).
+        if head.jira_issues and (is_critical or any(j.get("status") == "open" for j in head.jira_issues)):
             lines = []
             for j in head.jira_issues[:4]:
                 key = j.get("key", "?")
@@ -431,29 +497,29 @@ class DiscordService:
 
         # Recent pod_events (kg_pod_events) — k8s diagnostic signal
         # (OOMKilled / ImagePullBackOff / BackOff / Unhealthy / ...).
+        # Phase 3-A: для warning — top-1 без message (most-likely-cause уже
+        # выше); для critical — full top-5 с message.
         if head.pod_events:
             lines = []
-            for ev in head.pod_events[:5]:
+            top_n = 5 if is_critical else 1
+            for ev in head.pod_events[:top_n]:
                 reason = ev.get("reason", "?")
                 count = ev.get("count")
                 mins = ev.get("minutes_before", "?")
-                msg = (ev.get("message") or "").replace("\n", " ")[:80]
                 cnt_part = f" ×{count}" if count and count > 1 else ""
-                lines.append(f"• 🩺 `{reason}`{cnt_part} — {mins} мин назад: {msg}")
+                if is_critical:
+                    msg = (ev.get("message") or "").replace("\n", " ")[:80]
+                    lines.append(f"• 🩺 `{reason}`{cnt_part} — {mins} мин назад: {msg}")
+                else:
+                    lines.append(f"• 🩺 `{reason}`{cnt_part} — {mins} мин назад")
             fields.append({
                 "name": "Recent pod events (k8s)",
                 "value": "\n".join(lines)[:1024],
                 "inline": False,
             })
 
-        # Hypothesis — rule-based, без LLM
-        hyp = head.primary_hypothesis()
-        if hyp:
-            fields.append({
-                "name": "Гипотеза (rule-based, без LLM)",
-                "value": hyp[:1024],
-                "inline": False,
-            })
+        # Phase 3-A: "Гипотеза" (legacy field) удалена — теперь
+        # «🎯 Скорее всего» выше по полю primary_hypothesis(). Дубликат не нужен.
 
         # Generator link (Grafana) — если есть
         if incident.generator_url:

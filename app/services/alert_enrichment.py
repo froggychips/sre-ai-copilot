@@ -30,6 +30,44 @@ from app.models.incident import Incident
 log = structlog.get_logger()
 
 
+def _matter_signals(
+    inbound_count_by_kind: Dict[str, int],
+    team_owner: Optional[str],
+    pod_events: List[Dict[str, Any]],
+    recurrence_24h: List[Dict[str, Any]],
+) -> List[str]:
+    """Phase 3-A «Why this alert matters» — deterministic signals over
+    available KG context. No LLM. Возвращает list строк (2-4 max),
+    embed render берёт top-3.
+    """
+    out: List[str] = []
+    # Inbound importance — shared dep, high blast radius
+    total_inbound = sum((inbound_count_by_kind or {}).values())
+    if total_inbound >= 20:
+        out.append(f"🌐 **Shared dep**: {total_inbound} inbound callers — blast radius широкий")
+    elif total_inbound >= 5:
+        out.append(f"📍 **{total_inbound} inbound callers** зависят от этого сервиса")
+    # Team criticality
+    if team_owner == "platform":
+        out.append("⚙️ **Infra-critical**: team_owner=`platform` — обычно shared/foundational")
+    elif team_owner == "shared":
+        out.append("🔗 **Shared tier**: services из этого ns обычно cross-realm")
+    # Pod event severity (BackOff×1000+ — chronic)
+    for pe in (pod_events or [])[:2]:
+        count = pe.get("count") or 0
+        if count >= 1000:
+            out.append(
+                f"🔥 **Хроник**: pod_event `{pe.get('reason','?')}` × {count} retries — "
+                "несколько суток крашится, нужен owner"
+            )
+            break
+    # Recurrence
+    rec = len(recurrence_24h or [])
+    if rec >= 5:
+        out.append(f"🔁 **{rec} раз за 24h** — повторяющийся pattern, не одноразовое")
+    return out[:3]
+
+
 @dataclass
 class EnrichedContext:
     """Готовая структура для рисовалки Discord-embed.
@@ -78,6 +116,15 @@ class EnrichedContext:
         top = max(observed, key=lambda f: f.confidence)
         return _fact_to_short_text(top)
 
+    def why_this_matters(self) -> List[str]:
+        """Phase 3-A: bullets «почему этот alert важен» — для embed-секции."""
+        return _matter_signals(
+            inbound_count_by_kind=self.inbound_count_by_kind,
+            team_owner=self.team_owner,
+            pod_events=self.pod_events,
+            recurrence_24h=self.recurrence_24h,
+        )
+
 
 def _fact_to_short_text(fact: Fact) -> str:
     ev = fact.evidence or {}
@@ -88,7 +135,9 @@ def _fact_to_short_text(fact: Fact) -> str:
             mins = d.get("minutes_before_incident", "?")
             sha = (d.get("sha") or "")[:7]
             build = d.get("number") or d.get("buildtype_id") or "?"
-            return f"Deploy #{build} ({sha}) {mins} мин назад — возможный регресс"
+            triggered = d.get("triggered_by") or ""
+            by = f" by {triggered}" if triggered else ""
+            return f"Deploy #{build}{by} ({sha}) {mins} мин назад — возможный регресс"
     if fact.source_rule == "UpstreamDegradedRule":
         cnt = ev.get("count", 0)
         alerts = ev.get("alerts") or []
@@ -97,6 +146,29 @@ def _fact_to_short_text(fact: Fact) -> str:
             svc = first.get("service") or "?"
             an = first.get("alertname") or "?"
             return f"Upstream `{svc}` алертит `{an}` ({cnt} cascading)"
+    # Phase 3-A: PodEventsRule → reason-specific descriptions
+    if fact.source_rule == "PodEventsRule":
+        reason = ev.get("reason", "")
+        count = ev.get("count", 1)
+        message = (ev.get("message") or "")[:90]
+        count_part = f" ×{count}" if count > 1 else ""
+        # Pretty descriptions per FactKind
+        if fact.kind == "oom_killed":
+            return f"OOMKilled{count_part}: container превышает memory limit"
+        if fact.kind == "crashloop":
+            chronic = " (хроник 1000+ retries)" if count > 1000 else ""
+            return f"k8s `{reason}`{count_part}{chronic} — pod не запускается"
+        if fact.kind == "failed_scheduling":
+            return f"FailedScheduling{count_part}: нет nodes под requested resources"
+        if fact.kind == "resource_pressure":
+            return f"`{reason}` на node — нехватка ресурсов кластера"
+        return f"k8s `{reason}`{count_part}: {message}"
+    if fact.source_rule == "OOMKilledRule":
+        return "OOMKilled: container превышает memory limit (из logs/exit-code)"
+    if fact.source_rule == "CrashLoopBackOffRule":
+        return "Pod в CrashLoopBackOff — startup ошибка / зависимости недоступны"
+    if fact.source_rule == "FailedSchedulingRule":
+        return "FailedScheduling — нет nodes для pod (resource constraints)"
     return f"{fact.source_rule}: observed"
 
 
@@ -306,6 +378,10 @@ def enrich_alert(db: Session, incident: Incident) -> EnrichedContext:
         "recent_deployments": ctx.recent_deploys,
         "upstream_alerts": ctx.upstream_alerts if ctx.upstream_alerts else None,
         "incident_starts_at": incident_at,
+        # Phase 3-A: pod_events для PodEventsRule (mapping reason→FactKind).
+        # OOMKilled / CrashLoop / FailedScheduling — это и есть deterministic
+        # «most likely cause» для AM-based alerts типа KubePodCrashLooping.
+        "k8s_events": ctx.pod_events,
     }
     try:
         ctx.rule_facts.extend(RecentDeployRule().evaluate(rule_ctx))
@@ -315,6 +391,13 @@ def enrich_alert(db: Session, incident: Incident) -> EnrichedContext:
         ctx.rule_facts.extend(UpstreamDegradedRule().evaluate(rule_ctx))
     except Exception as e:
         log.warning("enrich.upstream_rule_failed", error=str(e))
+    # Phase 3-A: PodEventsRule даёт «причина из k8s» (OOM/CRASH/SCHED/...).
+    # Это самый сильный root-cause signal на live alerts.
+    try:
+        from app.diagnostics.rules.pod_events import PodEventsRule
+        ctx.rule_facts.extend(PodEventsRule().evaluate(rule_ctx))
+    except Exception as e:
+        log.warning("enrich.pod_events_rule_failed", error=str(e))
 
     # 7. Rollout-noise heuristic — `KubeDeploymentGenerationMismatch` сразу
     # после деплоя обычно безобиден (rollout в процессе).
