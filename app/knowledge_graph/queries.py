@@ -76,13 +76,21 @@ def recent_deploys_for(
 
 
 def upstream_of(
-    db: Session, namespace: str, service_name: str, kinds: Optional[List[str]] = None
+    db: Session,
+    namespace: str,
+    service_name: str,
+    kinds: Optional[List[str]] = None,
+    fresh_only_days: Optional[int] = None,
 ) -> List[Dict[str, Any]]:
     """Сервисы, от которых зависит данный.
 
     Если town `calls` auth → upstream_of(town) включает auth. Семантически
     это «если эти сервисы лягут, то текущий с большой вероятностью тоже».
     Используется UpstreamDegradedRule для поиска alert-ов на upstream.
+
+    `fresh_only_days` (C1): если задано — фильтр edges по
+    `last_seen_at >= now() - fresh_only_days`. Защита от stale-зависимостей
+    (сервис убрал env-var, но edge остался в KG).
     """
     svc = _service_by_namespace_name(db, namespace, service_name)
     if svc is None:
@@ -90,6 +98,9 @@ def upstream_of(
     q = db.query(ServiceEdge).filter(ServiceEdge.src_id == svc.id)
     if kinds:
         q = q.filter(ServiceEdge.kind.in_(kinds))
+    if fresh_only_days is not None:
+        fresh_cutoff = datetime.utcnow() - timedelta(days=fresh_only_days)
+        q = q.filter(ServiceEdge.last_seen_at >= fresh_cutoff)
     out: List[Dict[str, Any]] = []
     for edge in q.all():
         if edge.dst is None:
@@ -99,6 +110,8 @@ def upstream_of(
             "namespace": edge.dst.namespace,
             "kind": edge.kind,
             "weight": edge.weight,
+            "last_seen_at": edge.last_seen_at,
+            "discovery_sources": (edge.extras or {}).get("discovery_sources") or [],
         })
     return out
 

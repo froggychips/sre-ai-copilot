@@ -90,6 +90,14 @@ def upsert_edge(
         )
         .one_or_none()
     )
+    now = datetime.utcnow()
+    # C3: список discovery_sources для confidence-tracking. Edge увиденный
+    # из 2+ источников (например env_url_v2 + nats_env) — выше confidence
+    # чем одиночный inference.
+    initial_extras = dict(extras or {})
+    if discovered_by:
+        initial_extras.setdefault("discovery_sources", [discovered_by])
+
     if edge is None:
         edge = ServiceEdge(
             src_id=src.id,
@@ -97,23 +105,30 @@ def upsert_edge(
             kind=kind,
             weight=weight,
             discovered_by=discovered_by,
-            extras=extras or None,
+            extras=initial_extras or None,
+            last_seen_at=now,
         )
         db.add(edge)
         db.flush()
     else:
-        changed = False
+        # C1: каждый upsert — refresh last_seen_at. Edges, не подтверждённые
+        # N дней, попадут в decay-task (см. queries.upstream_of(fresh_only=)).
+        edge.last_seen_at = now
+        changed = True
         if edge.weight != weight:
             edge.weight = weight
-            changed = True
+        # C3: merge discovery_sources unique-list, не overwrite одним источником.
+        merged = dict(edge.extras or {})
         if extras:
-            merged = dict(edge.extras or {})
             merged.update(extras)
-            if merged != (edge.extras or {}):
-                edge.extras = merged
-                changed = True
-        if changed:
-            db.flush()
+        if discovered_by:
+            existing_sources = list(merged.get("discovery_sources") or [])
+            if discovered_by not in existing_sources:
+                existing_sources.append(discovered_by)
+            merged["discovery_sources"] = existing_sources
+        if merged != (edge.extras or {}):
+            edge.extras = merged
+        db.flush()
     return edge
 
 

@@ -148,6 +148,11 @@ class ServiceEdge(Base):
     discovered_by = Column(String, nullable=True)  # populator/method, для отладки
     extras = Column(JSON, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
+    # C1: refresh timestamp. Каждый upsert_edge → last_seen_at = now().
+    # Edges, не подтверждённые за N дней — кандидаты на soft-cleanup
+    # (см. queries.upstream_of(..., fresh_only=True) и beat-task
+    # kg_edges_decay в будущем).
+    last_seen_at = Column(DateTime, nullable=True, index=True)
 
     src = relationship("Service", foreign_keys=[src_id])
     dst = relationship("Service", foreign_keys=[dst_id])

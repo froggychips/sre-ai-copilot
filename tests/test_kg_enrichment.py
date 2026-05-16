@@ -641,3 +641,79 @@ def test_warn_reasons_excludes_info_events():
     from app.knowledge_graph.k8s_events_sync import _WARN_REASONS
     for r in ("Pulled", "Created", "Scheduled", "Started", "Killing"):
         assert r not in _WARN_REASONS
+
+
+# ── C1+C3: last_seen_at refresh + discovery_sources merge ──────────────────
+
+def test_upsert_edge_sets_last_seen_at_on_create():
+    """C1: new edge получает last_seen_at = now."""
+    from datetime import datetime
+    from app.knowledge_graph.populator import upsert_edge
+    from app.knowledge_graph.schema import Service, ServiceEdge
+
+    # in-memory SQLite через fixture conftest.py?
+    # Простой smoke через MagicMock + capture аргумента db.add.
+    from unittest.mock import MagicMock
+    db = MagicMock()
+    db.query.return_value.filter.return_value.one_or_none.return_value = None
+    src = Service(id=1, namespace="ns", name="src")
+    dst = Service(id=2, namespace="ns", name="dst")
+
+    before = datetime.utcnow()
+    upsert_edge(db, src=src, dst=dst, kind="calls", discovered_by="kg_sync/env_vars")
+    after = datetime.utcnow()
+
+    add_call = db.add.call_args
+    assert add_call is not None
+    edge_arg = add_call.args[0]
+    assert isinstance(edge_arg, ServiceEdge)
+    assert edge_arg.last_seen_at is not None
+    assert before <= edge_arg.last_seen_at <= after
+    # C3: discovery_sources проинициализирован одним источником
+    assert edge_arg.extras["discovery_sources"] == ["kg_sync/env_vars"]
+
+
+def test_upsert_edge_accumulates_discovery_sources():
+    """C3: повторный upsert с другим discovered_by — accumulates."""
+    from app.knowledge_graph.populator import upsert_edge
+    from app.knowledge_graph.schema import Service, ServiceEdge
+    from unittest.mock import MagicMock
+
+    # Existing edge с одним источником
+    existing = ServiceEdge(
+        src_id=1, dst_id=2, kind="calls",
+        weight=1,
+        extras={"discovery_sources": ["kg_sync/env_vars"], "confidence": "inferred_env"},
+    )
+    db = MagicMock()
+    db.query.return_value.filter.return_value.one_or_none.return_value = existing
+    src = Service(id=1, namespace="ns", name="src")
+    dst = Service(id=2, namespace="ns", name="dst")
+
+    upsert_edge(db, src=src, dst=dst, kind="calls", discovered_by="kg_sync/nats_env")
+
+    assert sorted(existing.extras["discovery_sources"]) == [
+        "kg_sync/env_vars", "kg_sync/nats_env",
+    ]
+
+
+def test_upsert_edge_idempotent_for_same_source():
+    """C3: повтор того же источника — без дублирования в discovery_sources."""
+    from app.knowledge_graph.populator import upsert_edge
+    from app.knowledge_graph.schema import Service, ServiceEdge
+    from unittest.mock import MagicMock
+
+    existing = ServiceEdge(
+        src_id=1, dst_id=2, kind="calls",
+        weight=1,
+        extras={"discovery_sources": ["kg_sync/env_vars"]},
+    )
+    db = MagicMock()
+    db.query.return_value.filter.return_value.one_or_none.return_value = existing
+    src = Service(id=1, namespace="ns", name="src")
+    dst = Service(id=2, namespace="ns", name="dst")
+
+    upsert_edge(db, src=src, dst=dst, kind="calls", discovered_by="kg_sync/env_vars")
+
+    # Не задублился
+    assert existing.extras["discovery_sources"] == ["kg_sync/env_vars"]

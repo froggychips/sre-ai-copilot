@@ -3,8 +3,15 @@ from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 import httpx
+import structlog
 
 from app.config import settings
+
+# structlog для DRY_RUN-логов — стандартный python `logging` отфильтровывается
+# на корневом WARNING level в production, поэтому [DISCORD_DRY_RUN] раньше
+# не появлялись в kubectl logs. structlog идёт через тот же sink что и
+# kg.populate.done / enrich_forward.suppress_chronic — visibility гарантирована.
+_dry_run_log = structlog.get_logger("discord.dry_run")
 
 if TYPE_CHECKING:
     from app.core.execution_dsl import ExecutionIntent
@@ -26,7 +33,7 @@ _SEVERITY_COLORS = {
 class DiscordService:
     async def send_report(self, report_text: str):
         if settings.DISCORD_DRY_RUN:
-            logging.info("[DISCORD_DRY_RUN] send_report:\n%s", report_text)
+            _dry_run_log.info("discord.dry_run.send_report", text=report_text[:500])
             return
         url = settings.DISCORD_WEBHOOK_URL
         if not url:
@@ -50,7 +57,7 @@ class DiscordService:
             logging.warning("DISCORD_WEBHOOK_STATS_URL not set, skipping stats report")
             return
         if settings.DISCORD_DRY_RUN:
-            logging.info("[DISCORD_DRY_RUN] send_stats_report:\n%s", content)
+            _dry_run_log.info("discord.dry_run.send_stats_report", content=content[:500])
             return
 
         lines = content.split("\n", 1)
@@ -218,8 +225,10 @@ class DiscordService:
         }
 
         if settings.DISCORD_DRY_RUN:
-            logging.info("[DISCORD_DRY_RUN] send_incident_report: %s | cause=%s | rq=%s",
-                         title, cause, resolution_quality)
+            _dry_run_log.info(
+                "discord.dry_run.send_incident_report",
+                title=title, cause=cause, resolution_quality=resolution_quality,
+            )
             return
         url = settings.DISCORD_WEBHOOK_URL
         if not url:
@@ -394,9 +403,18 @@ class DiscordService:
         }
 
         if settings.DISCORD_DRY_RUN:
-            logging.info(
-                "[DISCORD_DRY_RUN] send_enriched_alert: %s | ns=%s | hyp=%s",
-                title, ns_str, hyp,
+            # Главный путь — это то место где видно фактический embed-output
+            # KG-enrichment. Структурированные поля позволяют отфильтровать
+            # ровно тот логи-stream в kubectl logs / VictoriaLogs.
+            _dry_run_log.info(
+                "discord.dry_run.send_enriched_alert",
+                title=title,
+                namespaces=ns_str,
+                hypotheses=hyp,
+                contexts_count=len(contexts),
+                severity=severity,
+                resurfaced=resurfaced,
+                rollout_noise=head.rollout_noise,
             )
             return
         url = settings.DISCORD_WEBHOOK_URL
