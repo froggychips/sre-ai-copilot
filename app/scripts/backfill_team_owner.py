@@ -22,9 +22,10 @@ def main() -> int:
         rows = db.query(Service).filter(Service.team_owner.is_(None)).all()
         plan: list[tuple[int, str, str, str]] = []
         for s in rows:
-            derived = _derive_team_owner(s.namespace)
+            ns = str(s.namespace)
+            derived = _derive_team_owner(ns)
             if derived:
-                plan.append((s.id, s.namespace, s.name, derived))
+                plan.append((int(s.id), ns, str(s.name), derived))
 
         by_team: dict[str, int] = {}
         for _, _, _, t in plan:

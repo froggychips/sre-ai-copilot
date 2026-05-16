@@ -207,6 +207,13 @@ def test_team_owner_non_wo_namespace():
     assert _derive_team_owner("default") is None
 
 
+def test_team_owner_squad_realms():
+    """A1: squad-N-shared/kingdom* — owner = последний компонент."""
+    assert _derive_team_owner("squad-3-shared") == "shared"
+    assert _derive_team_owner("squad-19-kingdom2") == "kingdom2"
+    assert _derive_team_owner("squad-1-payments") == "payments"
+
+
 # ── NATS cluster extraction ─────────────────────────────────────────────────
 
 def _make_deploy(env_names):
@@ -398,3 +405,65 @@ def test_sync_topology_no_namespaces_returns_zero_stats():
         result = sync_topology(db=MagicMock())
     assert result == {"services": 0, "edges": 0, "namespaces": 0, "errors": 0}
     mock_sync_ns.assert_not_called()
+
+
+# ── A2: _extract_db_targets (DSN sniffing) ─────────────────────────────────
+
+def _mk_deploy_with_env(envs: dict) -> dict:
+    return {"spec": {"template": {"spec": {"containers": [
+        {"env": [{"name": k, "value": v} for k, v in envs.items()]}
+    ]}}}}
+
+
+def test_db_targets_postgres_with_explicit_ns():
+    from app.knowledge_graph.kg_sync import _extract_db_targets
+    out = _extract_db_targets(
+        _mk_deploy_with_env({"DSN": "postgres://u:p@finance-db.prod-shared:5432/f"}),
+        own_namespace="prod-kingdom1",
+    )
+    assert out == [("db:postgres:finance-db", "prod-shared", "postgres")]
+
+
+def test_db_targets_redis_bare_host_uses_own_ns():
+    from app.knowledge_graph.kg_sync import _extract_db_targets
+    out = _extract_db_targets(
+        _mk_deploy_with_env({"CACHE_URL": "redis://redis-cluster:6379/0"}),
+        own_namespace="prod-kingdom1",
+    )
+    assert out == [("db:redis:redis-cluster", "prod-kingdom1", "redis")]
+
+
+def test_db_targets_driver_canonization():
+    """postgresql→postgres, rediss→redis, mariadb→mysql, amqps→amqp."""
+    from app.knowledge_graph.kg_sync import _extract_db_targets
+    cases = [
+        ({"X": "postgresql://u@finance-db:5432/d"}, "postgres"),
+        ({"X": "rediss://secure-redis:6380/0"}, "redis"),
+        ({"X": "mariadb://app@mysql-payments:3306/db"}, "mysql"),
+        ({"X": "amqps://rabbit-broker:5671/"}, "amqp"),
+    ]
+    for envs, want_driver in cases:
+        out = _extract_db_targets(_mk_deploy_with_env(envs), "ns")
+        assert len(out) == 1 and out[0][2] == want_driver, (envs, out)
+
+
+def test_db_targets_skip_external_cloud():
+    from app.knowledge_graph.kg_sync import _extract_db_targets
+    cases = [
+        {"X": "postgres://u@db.amazonaws.com:5432/d"},
+        {"X": "mongodb://atlas.cloud.google:27017/d"},
+        {"X": "redis://x.azure:6379/0"},
+    ]
+    for envs in cases:
+        assert _extract_db_targets(_mk_deploy_with_env(envs), "ns") == []
+
+
+def test_db_targets_skip_non_dsn():
+    """HTTP URL, bare-host без DSN-схемы — не должны быть DB-targets."""
+    from app.knowledge_graph.kg_sync import _extract_db_targets
+    cases = [
+        {"API_URL": "http://api-service:8080/v1"},  # HTTP — не DSN
+        {"HOST": "finance-db.prod-shared:5432"},     # bare без схемы
+    ]
+    for envs in cases:
+        assert _extract_db_targets(_mk_deploy_with_env(envs), "ns") == []
