@@ -101,6 +101,21 @@ _KIND_TO_SEMANTICS = {
     "uses_nats": "async",
     "consumes_kafka": "async",
     "reads_from": "sync",
+    "uses_db": "sync",  # A2: DSN-targets (postgres/redis/clickhouse/mysql/mongodb)
+}
+
+# A2: DSN-схема в начале env-value → driver. Имя driver канонизируется в
+# _DSN_DRIVER_CANON (postgresql → postgres; clickhouse+native → clickhouse).
+_DSN_RE = re.compile(
+    r"^(?P<scheme>postgres(?:ql)?|mysql|mariadb|mongodb|redis|rediss|clickhouse|"
+    r"amqp|amqps|elasticsearch)[+\w]*://",
+    re.IGNORECASE,
+)
+_DSN_DRIVER_CANON = {
+    "postgresql": "postgres",
+    "rediss": "redis",
+    "amqps": "amqp",
+    "mariadb": "mysql",
 }
 
 
@@ -292,6 +307,71 @@ def _extract_upstreams_extended(
     return sorted(found)
 
 
+def _extract_db_targets(
+    deploy: Dict[str, Any],
+    own_namespace: str,
+) -> List[Tuple[str, str, str]]:
+    """A2: scan env-values на DSN-схему БД.
+
+    Возвращает [(db_node_name, namespace, driver)]. Параллельный
+    _extract_upstreams_extended путь — без known_index фильтра, потому что
+    БД-узлы создаются synthetic'ами на лету (реальный deployment у БД может
+    жить в чужом ns или быть managed-сервисом).
+
+    Канонический формат db_node_name: `db:<driver>:<host>` — отделяет узел
+    БД от deployment-сервиса с тем же именем (например, БД-кластер
+    `finance-db` ≠ приложение `finance-db`).
+
+    External cloud-БД (RDS / CloudSQL / Atlas) исключаются по hostname:
+    содержит `amazonaws|azure|gcp|cloud.google` → skip.
+    """
+    envs: List[Dict[str, Any]] = []
+    for c in deploy.get("spec", {}).get("template", {}).get("spec", {}).get("containers", []):
+        envs += c.get("env") or []
+
+    found: set[Tuple[str, str, str]] = set()
+    for e in envs:
+        v = str(e.get("value") or "").strip()
+        if not v:
+            continue
+        m = _DSN_RE.match(v)
+        if not m:
+            continue
+        driver = m.group("scheme").lower()
+        driver = _DSN_DRIVER_CANON.get(driver, driver)
+
+        # DSN ветка `_parse_host_from_value` уже умеет вырезать user:pass@,
+        # порт, path и .svc.cluster.local. Используем его, но обходим
+        # _SKIP_VALUE_FRAGMENTS-фильтр сами (там 'redis'/'postgres' помечены
+        # как noise — справедливо для HTTP, но не для DSN).
+        host = _parse_host_from_value(v, allow_no_scheme=False)
+        if host is None:
+            # _parse мог отбросить из-за SKIP_FRAGMENTS. Fallback-парсинг
+            # достаточно для bare-host без cloud-markers:
+            rest = v.split("://", 1)[1]
+            if "@" in rest:
+                rest = rest.split("@", 1)[1]
+            rest = rest.split("?", 1)[0].split("/", 1)[0].split(":", 1)[0]
+            rest = re.sub(r"\.svc\.cluster\.local$", "", rest)
+            if not rest:
+                continue
+            lower_host = rest.lower()
+            if any(frag in lower_host for frag in ("amazonaws", "azure", "googleapis", "cloud.google")):
+                continue
+            parts = rest.split(".", 1)
+            svc = parts[0].lower()
+            ns = parts[1].lower() if len(parts) > 1 else None
+            if not _SVC_NAME_RE.match(svc) or svc in _SKIP_SERVICE_NAMES:
+                continue
+        else:
+            svc, ns = host
+
+        ns = ns or own_namespace
+        db_node = f"db:{driver}:{svc}"
+        found.add((db_node, ns, driver))
+    return sorted(found)
+
+
 def _derive_team_owner(namespace: str) -> Optional[str]:
     """team_owner = namespace без env-prefix.
 
@@ -407,6 +487,26 @@ def sync_namespace(
                 kind="uses_nats",
                 discovered_by="kg_sync/nats_env",
                 extras=_inferred_extras("uses_nats"),
+            )
+            stats["edges"] += 1
+
+        # A2: DB-edges из DSN-схем (postgres/redis/clickhouse/mysql/mongodb).
+        # Synthetic-узел `db:<driver>:<host>` — отделяет узел БД от
+        # одноимённого application-deployment. team_owner="data" — маркер
+        # инфра-узла данных. Driver кладём в extras для embed-вывода.
+        for db_node, db_ns, driver in _extract_db_targets(deploy, namespace):
+            dst = upsert_service(
+                db,
+                namespace=db_ns,
+                name=db_node,
+                team_owner="data",
+                synthetic=True,
+            )
+            upsert_edge(
+                db, src=src, dst=dst,
+                kind="uses_db",
+                discovered_by="kg_sync/dsn_env",
+                extras={"driver": driver, **_inferred_extras("uses_db")},
             )
             stats["edges"] += 1
 
