@@ -349,12 +349,57 @@ class DiscordService:
                 "inline": False,
             })
 
-        # Downstream impact
-        if head.downstream_count_by_kind:
-            parts = [f"{cnt} через `{k}`" for k, cnt in head.downstream_count_by_kind.items()]
+        # Outgoing deps — куда сервис сам ходит. Для leaf-сервисов (как
+        # bot-service) это главная диагностика при падении: «упал —
+        # потому что зависит от X». Группируем по kind.
+        if head.outgoing_deps:
+            by_kind: Dict[str, List[str]] = {}
+            for d in head.outgoing_deps:
+                k = d.get("kind", "?")
+                target = f"`{d.get('service','?')}`"
+                target_ns = d.get("namespace") or ""
+                if target_ns and target_ns != (head.incident.namespace or ""):
+                    target = f"{target} @ `{target_ns}`"
+                by_kind.setdefault(k, []).append(target)
+            lines = []
+            kind_icons = {"calls": "→", "uses_db": "🗄", "uses_nats": "📡"}
+            for k in sorted(by_kind):
+                icon_k = kind_icons.get(k, "·")
+                items = by_kind[k]
+                value_str = ", ".join(items[:6])
+                if len(items) > 6:
+                    value_str += f" (+{len(items)-6})"
+                lines.append(f"{icon_k} **{k}** ({len(items)}): {value_str}")
             fields.append({
-                "name": "Downstream impact (KG)",
+                "name": "🔗 Зависит от (outgoing, KG)",
+                "value": "\n".join(lines)[:1024],
+                "inline": False,
+            })
+
+        # Inbound callers — сколько сервисов вызывают этот.
+        # Для high-fan-in узлов (общая БД, NATS cluster) это сигнал blast radius.
+        if head.inbound_count_by_kind:
+            parts = [f"{cnt} через `{k}`" for k, cnt in head.inbound_count_by_kind.items()]
+            fields.append({
+                "name": "Inbound callers (KG)",
                 "value": ", ".join(parts),
+                "inline": False,
+            })
+
+        # Recent pod_events (kg_pod_events) — k8s diagnostic signal
+        # (OOMKilled / ImagePullBackOff / BackOff / Unhealthy / ...).
+        if head.pod_events:
+            lines = []
+            for ev in head.pod_events[:5]:
+                reason = ev.get("reason", "?")
+                count = ev.get("count")
+                mins = ev.get("minutes_before", "?")
+                msg = (ev.get("message") or "").replace("\n", " ")[:80]
+                cnt_part = f" ×{count}" if count and count > 1 else ""
+                lines.append(f"• 🩺 `{reason}`{cnt_part} — {mins} мин назад: {msg}")
+            fields.append({
+                "name": "Recent pod events (k8s)",
+                "value": "\n".join(lines)[:1024],
                 "inline": False,
             })
 

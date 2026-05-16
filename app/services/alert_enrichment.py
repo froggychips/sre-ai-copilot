@@ -22,7 +22,8 @@ from app.diagnostics.facts import Fact
 from app.diagnostics.rules.recent_deploy import RecentDeployRule
 from app.diagnostics.rules.upstream_degraded import UpstreamDegradedRule
 from app.knowledge_graph.queries import (incidents_on, nearby_alerts,
-                                         recent_deploys_for, upstream_of)
+                                         recent_deploys_for,
+                                         recent_pod_events_for, upstream_of)
 from app.knowledge_graph.schema import Service, ServiceEdge
 from app.models.incident import Incident
 
@@ -46,7 +47,16 @@ class EnrichedContext:
     recent_deploys: List[Dict[str, Any]] = field(default_factory=list)
     upstream_alerts: List[Dict[str, Any]] = field(default_factory=list)
     recurrence_24h: List[Dict[str, Any]] = field(default_factory=list)
-    downstream_count_by_kind: Dict[str, int] = field(default_factory=dict)
+    # Inbound: сколько сервисов вызывают/зависят от этого. Раньше поле
+    # называлось `downstream_count_by_kind` — это была семантическая ошибка
+    # (граф: src→dst, edges с dst=svc означают "кто меня вызывает" =
+    # inbound callers, не downstream).
+    inbound_count_by_kind: Dict[str, int] = field(default_factory=dict)
+    # Outgoing: куда сервис сам ходит (edges с src=svc). Это «зависимости» —
+    # для leaf-сервисов это самая важная диагностика при падении.
+    outgoing_deps: List[Dict[str, Any]] = field(default_factory=list)
+    # Pod-events (kg_pod_events) — k8s diagnostic signal в окне инцидента.
+    pod_events: List[Dict[str, Any]] = field(default_factory=list)
 
     rule_facts: List[Fact] = field(default_factory=list)
 
@@ -162,12 +172,20 @@ def enrich_alert(db: Session, incident: Incident) -> EnrichedContext:
 
     incident_at = _parse_starts_at(incident.starts_at)
 
-    # 1. Recent deploys (lookback 60 мин по дефолту)
+    # 1. Recent deploys: сначала узкое окно (для regression-сигнала
+    # «deploy за N минут до alert-а»), если пусто — расширяем до 7 дней,
+    # чтобы embed всё равно показал последние deploys (для редко-катящихся
+    # сервисов 60-мин окно почти всегда пустое).
     try:
         ctx.recent_deploys = recent_deploys_for(
             db, namespace, service, before=incident_at,
             lookback_minutes=settings.ENRICH_DEPLOY_LOOKBACK_MIN,
         )
+        if not ctx.recent_deploys:
+            ctx.recent_deploys = recent_deploys_for(
+                db, namespace, service, before=incident_at,
+                lookback_minutes=7 * 24 * 60,  # 7 дней fallback
+            )
     except Exception as e:
         log.warning("enrich.recent_deploys_failed", error=str(e))
 
@@ -190,11 +208,33 @@ def enrich_alert(db: Session, incident: Incident) -> EnrichedContext:
     except Exception as e:
         log.warning("enrich.incidents_on_failed", error=str(e))
 
-    # 4. Downstream count (по kind)
+    # 4. Inbound: кто вызывает этот сервис (по kind).
     try:
-        ctx.downstream_count_by_kind = _downstream_count_by_kind(db, namespace, service)
+        ctx.inbound_count_by_kind = _downstream_count_by_kind(db, namespace, service)
     except Exception as e:
-        log.warning("enrich.downstream_count_failed", error=str(e))
+        log.warning("enrich.inbound_count_failed", error=str(e))
+
+    # 4b. Outgoing dependencies: куда сервис сам ходит. Для leaf-сервисов
+    # это главная диагностика «упал — потому что зависит от X». Fresh-only
+    # 30 дней — отсекает stale edges (см. C1 last_seen_at).
+    try:
+        ctx.outgoing_deps = upstream_of(
+            db, namespace, service, fresh_only_days=30,
+        )
+    except Exception as e:
+        log.warning("enrich.outgoing_deps_failed", error=str(e))
+
+    # 4c. Recent pod events (kg_pod_events) — k8s diagnostic signal
+    # в окне инцидента ±60 мин. Особенно важно для CrashLooping/Unhealthy,
+    # где AM rule показывает следствие, а pod_events — причину
+    # (OOMKilled/ImagePullBackOff/FailedScheduling/etc.).
+    try:
+        ctx.pod_events = recent_pod_events_for(
+            db, namespace, service, around=incident_at,
+            window_minutes=60, limit=5,
+        )
+    except Exception as e:
+        log.warning("enrich.pod_events_failed", error=str(e))
 
     # 5. Service metadata (team_owner, in_kg flag, data freshness)
     try:
