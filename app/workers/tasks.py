@@ -83,6 +83,14 @@ celery_app.conf.beat_schedule = {
         "task": "kg_alerts_resolve_sync",
         "schedule": crontab(minute="*/15"),
     },
+    # Phase 3-B: k8s Ingress → external entrypoint edges. Раз в час
+    # синхронизирует Ingress resources cluster-wide. Создаёт synthetic-узлы
+    # `ingress:<host>` + edges на backend services. Это первый источник
+    # «откуда приходит трафик» вне cluster-internal env-scan.
+    "kg-ingress-sync": {
+        "task": "kg_ingress_sync",
+        "schedule": crontab(minute=37),  # ежечасно в 37 мин (offset от других)
+    },
 }
 
 
@@ -172,6 +180,21 @@ def k8s_pod_events_sync_task():
     finally:
         db.close()
     return result
+
+
+@celery_app.task(name="kg_ingress_sync")
+def kg_ingress_sync_task():
+    """Phase 3-B: sync k8s Ingress → external entrypoint edges."""
+    from app.knowledge_graph.k8s_ingress_sync import sync_all_ingresses
+
+    db = SessionLocal()
+    try:
+        return sync_all_ingresses(db)
+    except Exception as e:
+        logger.warning("kg_ingress_sync.failed: %s", e)
+        return {"error": str(e)}
+    finally:
+        db.close()
 
 
 @celery_app.task(name="kg_alerts_resolve_sync")
