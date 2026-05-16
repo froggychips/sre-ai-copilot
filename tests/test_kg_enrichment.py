@@ -40,6 +40,24 @@ def test_is_synthetic_exact_names():
     assert _is_synthetic_service("redis-exporter")
 
 
+def test_is_synthetic_observability_agents():
+    """G1.1: vm-* / prometheus-kube-prometheus-* / legal-pages — observability,
+    никогда не имеют edges. Без флага засчитывались как pure_orphan."""
+    for name in (
+        "vm-node-exporter",
+        "vm-kube-state-metrics",
+        "vmagent-vm-victoria-metrics-k8s-stack",
+        "vm-victoria-metrics-k8s-stack-kube-controller-manager",
+        "vm-victoria-metrics-k8s-stack-kube-etcd",
+        "prometheus-kube-prometheus-kubelet",
+        "prometheus-kube-prometheus-kube-controller-manager",
+        "prometheus-kube-prometheus-kube-etcd",
+        "prometheus-kube-prometheus-kube-scheduler",
+        "legal-pages",
+    ):
+        assert _is_synthetic_service(name), f"{name} должен быть synthetic"
+
+
 def test_is_synthetic_rejects_real_services():
     """Backup-related НЕ-cron сервисы — не synthetic."""
     assert not _is_synthetic_service("backup-service")  # это API, не cron
@@ -205,6 +223,13 @@ def test_team_owner_non_wo_namespace():
     assert _derive_team_owner("monitoring") is None
     assert _derive_team_owner("kube-system") is None
     assert _derive_team_owner("default") is None
+
+
+def test_team_owner_squad_realms():
+    """A1: squad-N-shared/kingdom* — owner = последний компонент."""
+    assert _derive_team_owner("squad-3-shared") == "shared"
+    assert _derive_team_owner("squad-19-kingdom2") == "kingdom2"
+    assert _derive_team_owner("squad-1-payments") == "payments"
 
 
 # ── NATS cluster extraction ─────────────────────────────────────────────────
@@ -398,3 +423,403 @@ def test_sync_topology_no_namespaces_returns_zero_stats():
         result = sync_topology(db=MagicMock())
     assert result == {"services": 0, "edges": 0, "namespaces": 0, "errors": 0}
     mock_sync_ns.assert_not_called()
+
+
+# ── A2: _extract_db_targets (DSN sniffing) ─────────────────────────────────
+
+def _mk_deploy_with_env(envs: dict) -> dict:
+    return {"spec": {"template": {"spec": {"containers": [
+        {"env": [{"name": k, "value": v} for k, v in envs.items()]}
+    ]}}}}
+
+
+def test_db_targets_postgres_with_explicit_ns():
+    from app.knowledge_graph.kg_sync import _extract_db_targets
+    out = _extract_db_targets(
+        _mk_deploy_with_env({"DSN": "postgres://u:p@finance-db.prod-shared:5432/f"}),
+        own_namespace="prod-kingdom1",
+    )
+    assert out == [("db:postgres:finance-db", "prod-shared", "postgres", "dsn_env")]
+
+
+def test_db_targets_redis_bare_host_uses_own_ns():
+    from app.knowledge_graph.kg_sync import _extract_db_targets
+    out = _extract_db_targets(
+        _mk_deploy_with_env({"CACHE_URL": "redis://redis-cluster:6379/0"}),
+        own_namespace="prod-kingdom1",
+    )
+    assert out == [("db:redis:redis-cluster", "prod-kingdom1", "redis", "dsn_env")]
+
+
+def test_db_targets_driver_canonization():
+    """postgresql→postgres, rediss→redis, mariadb→mysql, amqps→amqp."""
+    from app.knowledge_graph.kg_sync import _extract_db_targets
+    cases = [
+        ({"X": "postgresql://u@finance-db:5432/d"}, "postgres"),
+        ({"X": "rediss://secure-redis:6380/0"}, "redis"),
+        ({"X": "mariadb://app@mysql-payments:3306/db"}, "mysql"),
+        ({"X": "amqps://rabbit-broker:5671/"}, "amqp"),
+    ]
+    for envs, want_driver in cases:
+        out = _extract_db_targets(_mk_deploy_with_env(envs), "ns")
+        assert len(out) == 1 and out[0][2] == want_driver, (envs, out)
+
+
+def test_db_targets_skip_external_cloud():
+    from app.knowledge_graph.kg_sync import _extract_db_targets
+    cases = [
+        {"X": "postgres://u@db.amazonaws.com:5432/d"},
+        {"X": "mongodb://atlas.cloud.google:27017/d"},
+        {"X": "redis://x.azure:6379/0"},
+    ]
+    for envs in cases:
+        assert _extract_db_targets(_mk_deploy_with_env(envs), "ns") == []
+
+
+def test_db_targets_skip_non_dsn():
+    """HTTP URL, bare-host без DSN-схемы — не должны быть DB-targets."""
+    from app.knowledge_graph.kg_sync import _extract_db_targets
+    cases = [
+        {"API_URL": "http://api-service:8080/v1"},  # HTTP — не DSN
+        {"HOST": "finance-db.prod-shared:5432"},     # bare без схемы
+    ]
+    for envs in cases:
+        assert _extract_db_targets(_mk_deploy_with_env(envs), "ns") == []
+
+
+# ── A2-v2: secret-name heuristic ────────────────────────────────────────────
+
+def _mk_deploy_with_secret_envs(envs: dict) -> dict:
+    """envs: {env_name: secret_name} → deployment с valueFrom.secretKeyRef."""
+    return {"spec": {"template": {"spec": {"containers": [{"env": [
+        {"name": k, "valueFrom": {"secretKeyRef": {"name": v, "key": "url"}}}
+        for k, v in envs.items()
+    ]}]}}}}
+
+
+def test_secret_hint_postgres():
+    from app.knowledge_graph.kg_sync import _parse_db_hint_from_secret_name
+    assert _parse_db_hint_from_secret_name("postgres-finance-secret") == ("postgres", "finance")
+    # `rw`/`ro` (read-write / read-only) — noise; вырезаются, остаётся бизнес-имя.
+    assert _parse_db_hint_from_secret_name("finance-postgres-rw-creds") == ("postgres", "finance")
+    assert _parse_db_hint_from_secret_name("postgres-orders-ro-secret") == ("postgres", "orders")
+
+
+def test_secret_hint_mongo_canonical():
+    """`mongo` в имени → driver канонизируется в mongodb."""
+    from app.knowledge_graph.kg_sync import _parse_db_hint_from_secret_name
+    assert _parse_db_hint_from_secret_name("mongo-sessions-config") == ("mongodb", "sessions")
+
+
+def test_secret_hint_rabbit_to_amqp():
+    from app.knowledge_graph.kg_sync import _parse_db_hint_from_secret_name
+    assert _parse_db_hint_from_secret_name("rabbit-events-creds") == ("amqp", "events")
+
+
+def test_secret_hint_no_driver_token_returns_none():
+    """Имя без driver-токена не парсится."""
+    from app.knowledge_graph.kg_sync import _parse_db_hint_from_secret_name
+    assert _parse_db_hint_from_secret_name("app-db-credentials") is None
+    assert _parse_db_hint_from_secret_name("api-config") is None
+    assert _parse_db_hint_from_secret_name("") is None
+    assert _parse_db_hint_from_secret_name("random-string") is None
+
+
+def test_secret_hint_all_noise_returns_none():
+    """Только driver + noise-токены → нет host hint."""
+    from app.knowledge_graph.kg_sync import _parse_db_hint_from_secret_name
+    assert _parse_db_hint_from_secret_name("postgres-secret") is None
+    assert _parse_db_hint_from_secret_name("redis-creds") is None
+    assert _parse_db_hint_from_secret_name("mongo-config") is None
+
+
+def test_db_targets_secret_hint_e2e():
+    """A2-v2: valueFrom.secretKeyRef.name → uses_db edge со source=secret_hint."""
+    from app.knowledge_graph.kg_sync import _extract_db_targets
+    out = _extract_db_targets(
+        _mk_deploy_with_secret_envs({
+            "DB_URL": "postgres-finance-secret",
+            "CACHE_URL": "redis-cache-creds",
+        }),
+        own_namespace="prod-kingdom1",
+    )
+    assert ("db:postgres:finance", "prod-kingdom1", "postgres", "secret_hint") in out
+    assert ("db:redis:cache", "prod-kingdom1", "redis", "secret_hint") in out
+
+
+# ── A2-v2: secret-key heuristic (важнее secret-name в WO) ──────────────────
+
+def test_secret_key_postgres_explicit_driver():
+    from app.knowledge_graph.kg_sync import _parse_db_hint_from_secret_key
+    assert _parse_db_hint_from_secret_key("MV_POSTGRES_DB_CONNECTION") == ("postgres", "mv")
+    assert _parse_db_hint_from_secret_key("ANALYTICS_DB_CLICKHOUSE_CONNECTION") == ("clickhouse", "analytics")
+
+
+def test_secret_key_generic_db_defaults_to_postgres():
+    """Generic *_DB_CONNECTION без driver-токена → postgres (WO default)."""
+    from app.knowledge_graph.kg_sync import _parse_db_hint_from_secret_key
+    assert _parse_db_hint_from_secret_key("TOWN_DB_CONNECTION") == ("postgres", "town")
+    assert _parse_db_hint_from_secret_key("CONFIG_DB_CONNECTION") == ("postgres", "config")
+    assert _parse_db_hint_from_secret_key("FINANCE_DB_CONNECTION") == ("postgres", "finance")
+
+
+def test_secret_key_multi_word_host():
+    """CHAT_MESSAGE_ADDITIONAL_DB_CONNECTION → chat-message (additional — noise)."""
+    from app.knowledge_graph.kg_sync import _parse_db_hint_from_secret_key
+    assert _parse_db_hint_from_secret_key("CHAT_MESSAGE_ADDITIONAL_DB_CONNECTION") == ("postgres", "chat-message")
+
+
+def test_secret_key_requires_endpoint_marker():
+    """Без CONNECTION/CONN/URI/URL/DSN — не endpoint, skip (creds, тех значения)."""
+    from app.knowledge_graph.kg_sync import _parse_db_hint_from_secret_key
+    assert _parse_db_hint_from_secret_key("PG_USER") is None
+    assert _parse_db_hint_from_secret_key("PG_PASSWORD") is None
+    assert _parse_db_hint_from_secret_key("ACCESS_TOKEN_SECRET") is None
+    assert _parse_db_hint_from_secret_key("S3_REGION") is None
+
+
+def test_secret_key_no_db_token_returns_none():
+    from app.knowledge_graph.kg_sync import _parse_db_hint_from_secret_key
+    # endpoint-marker есть, но нет ни DB, ни driver-токена → не DB endpoint.
+    assert _parse_db_hint_from_secret_key("CDN_BASE_URI") is None
+    assert _parse_db_hint_from_secret_key("UPDATE_SERVICE_REST_ENDPOINT") is None
+    assert _parse_db_hint_from_secret_key("") is None
+
+
+def test_secret_ref_combined_prefers_key():
+    """secret_name тоже передаётся, но key информативнее → его и используем."""
+    from app.knowledge_graph.kg_sync import _parse_db_hint_from_secret_ref
+    # name='database' (generic), key точный → берём key.
+    assert _parse_db_hint_from_secret_ref("database", "TOWN_DB_CONNECTION") == ("postgres", "town")
+
+
+def test_secret_ref_falls_back_to_name():
+    """Если key не парсится, проверяем name (для других конвенций)."""
+    from app.knowledge_graph.kg_sync import _parse_db_hint_from_secret_ref
+    assert _parse_db_hint_from_secret_ref("postgres-finance-secret", "url") == ("postgres", "finance")
+
+
+def test_db_targets_dsn_env_wins_over_secret_hint():
+    """Если у env есть и value, и valueFrom, priority — plain DSN."""
+    from app.knowledge_graph.kg_sync import _extract_db_targets
+    deploy = {"spec": {"template": {"spec": {"containers": [{"env": [
+        {
+            "name": "DB_URL",
+            "value": "postgres://u@real-host:5432/d",
+            "valueFrom": {"secretKeyRef": {"name": "postgres-fake-secret", "key": "x"}},
+        }
+    ]}]}}}}
+    out = _extract_db_targets(deploy, "ns")
+    assert out == [("db:postgres:real-host", "ns", "postgres", "dsn_env")]
+
+
+# ── A4: k8s_events_sync ─────────────────────────────────────────────────────
+
+
+def test_deployment_from_pod_name_standard_deployment():
+    from app.knowledge_graph.k8s_events_sync import _deployment_from_pod_name
+    assert _deployment_from_pod_name("bot-service-5476d85d74-f626c") == "bot-service"
+    # 8-char RS hash + 5-char pod hash — стандарт k8s.
+    assert _deployment_from_pod_name("town-service-abc12345-9wxyz") == "town-service"
+
+
+def test_deployment_from_pod_name_multipart():
+    from app.knowledge_graph.k8s_events_sync import _deployment_from_pod_name
+    # Многословные имена deployment'ов корректно отделяются
+    assert _deployment_from_pod_name("chat-message-service-7d4fdbb455-l6md8") == "chat-message-service"
+
+
+def test_deployment_from_pod_name_statefulset_pattern():
+    """StatefulSet `pg-cluster-0` — не наш кейс (нет 2 hash-суффиксов)."""
+    from app.knowledge_graph.k8s_events_sync import _deployment_from_pod_name
+    assert _deployment_from_pod_name("pg-cluster-0") is None
+    assert _deployment_from_pod_name("redis-0") is None
+    assert _deployment_from_pod_name("") is None
+
+
+def test_parse_k8s_timestamp():
+    from app.knowledge_graph.k8s_events_sync import _parse_k8s_timestamp
+    dt = _parse_k8s_timestamp("2026-05-16T07:30:03Z")
+    assert dt is not None and dt.year == 2026 and dt.minute == 30
+    assert _parse_k8s_timestamp(None) is None
+    assert _parse_k8s_timestamp("invalid") is None
+
+
+def test_warn_reasons_includes_critical_diagnostic_events():
+    """OOMKilled / FailedScheduling / ImagePullBackOff / Unhealthy — must-have."""
+    from app.knowledge_graph.k8s_events_sync import _WARN_REASONS
+    for r in ("OOMKilled", "FailedScheduling", "ImagePullBackOff",
+              "FailedMount", "BackOff", "CrashLoopBackOff", "Unhealthy",
+              "Evicted", "NodeNotReady"):
+        assert r in _WARN_REASONS, f"missing diagnostic reason: {r}"
+
+
+def test_warn_reasons_excludes_info_events():
+    """Pulled / Created / Scheduled — info noise, не нужны в KG."""
+    from app.knowledge_graph.k8s_events_sync import _WARN_REASONS
+    for r in ("Pulled", "Created", "Scheduled", "Started", "Killing"):
+        assert r not in _WARN_REASONS
+
+
+# ── C1+C3: last_seen_at refresh + discovery_sources merge ──────────────────
+
+def test_upsert_edge_sets_last_seen_at_on_create():
+    """C1: new edge получает last_seen_at = now."""
+    from datetime import datetime
+    from app.knowledge_graph.populator import upsert_edge
+    from app.knowledge_graph.schema import Service, ServiceEdge
+
+    # in-memory SQLite через fixture conftest.py?
+    # Простой smoke через MagicMock + capture аргумента db.add.
+    from unittest.mock import MagicMock
+    db = MagicMock()
+    db.query.return_value.filter.return_value.one_or_none.return_value = None
+    src = Service(id=1, namespace="ns", name="src")
+    dst = Service(id=2, namespace="ns", name="dst")
+
+    before = datetime.utcnow()
+    upsert_edge(db, src=src, dst=dst, kind="calls", discovered_by="kg_sync/env_vars")
+    after = datetime.utcnow()
+
+    add_call = db.add.call_args
+    assert add_call is not None
+    edge_arg = add_call.args[0]
+    assert isinstance(edge_arg, ServiceEdge)
+    assert edge_arg.last_seen_at is not None
+    assert before <= edge_arg.last_seen_at <= after
+    # C3: discovery_sources проинициализирован одним источником
+    assert edge_arg.extras["discovery_sources"] == ["kg_sync/env_vars"]
+
+
+def test_upsert_edge_accumulates_discovery_sources():
+    """C3: повторный upsert с другим discovered_by — accumulates."""
+    from app.knowledge_graph.populator import upsert_edge
+    from app.knowledge_graph.schema import Service, ServiceEdge
+    from unittest.mock import MagicMock
+
+    # Existing edge с одним источником
+    existing = ServiceEdge(
+        src_id=1, dst_id=2, kind="calls",
+        weight=1,
+        extras={"discovery_sources": ["kg_sync/env_vars"], "confidence": "inferred_env"},
+    )
+    db = MagicMock()
+    db.query.return_value.filter.return_value.one_or_none.return_value = existing
+    src = Service(id=1, namespace="ns", name="src")
+    dst = Service(id=2, namespace="ns", name="dst")
+
+    upsert_edge(db, src=src, dst=dst, kind="calls", discovered_by="kg_sync/nats_env")
+
+    assert sorted(existing.extras["discovery_sources"]) == [
+        "kg_sync/env_vars", "kg_sync/nats_env",
+    ]
+
+
+def test_upsert_edge_idempotent_for_same_source():
+    """C3: повтор того же источника — без дублирования в discovery_sources."""
+    from app.knowledge_graph.populator import upsert_edge
+    from app.knowledge_graph.schema import Service, ServiceEdge
+    from unittest.mock import MagicMock
+
+    existing = ServiceEdge(
+        src_id=1, dst_id=2, kind="calls",
+        weight=1,
+        extras={"discovery_sources": ["kg_sync/env_vars"]},
+    )
+    db = MagicMock()
+    db.query.return_value.filter.return_value.one_or_none.return_value = existing
+    src = Service(id=1, namespace="ns", name="src")
+    dst = Service(id=2, namespace="ns", name="dst")
+
+    upsert_edge(db, src=src, dst=dst, kind="calls", discovered_by="kg_sync/env_vars")
+
+    # Не задублился
+    assert existing.extras["discovery_sources"] == ["kg_sync/env_vars"]
+
+
+# ── D2-auto: drift cleanup safety threshold ───────────────────────────────
+
+
+def test_drift_cleanup_skipped_threshold():
+    """Когда drift > max_drift_pct — no-op, защита от false-wipe."""
+    from unittest.mock import patch
+    from app.knowledge_graph.drift_cleanup import run_drift_cleanup
+
+    # Mock: k8s has 1 ns, kg has 5 ns (4 drift = 80% > 20% threshold).
+    with patch("app.knowledge_graph.drift_cleanup._k8s_live_namespaces",
+               return_value={"only-this"}):
+        db = MagicMock()
+        db.query.return_value.distinct.return_value.all.return_value = [
+            ("ns-a",), ("ns-b",), ("ns-c",), ("ns-d",), ("only-this",),
+        ]
+        result = run_drift_cleanup(db, max_drift_pct=20.0, apply=True)
+
+    assert result["skipped_threshold"] is True
+    assert result["drift_pct"] == 80.0
+    assert result["marked_services"] == 0
+    assert result["applied"] is False
+    # UPDATE не должен быть вызван
+    db.commit.assert_not_called()
+
+
+def test_drift_cleanup_within_threshold_apply():
+    """Когда drift ≤ threshold — UPDATE применяется."""
+    from unittest.mock import patch, MagicMock
+    from app.knowledge_graph.drift_cleanup import run_drift_cleanup
+    from app.knowledge_graph.schema import Service
+
+    # Mock: 5 ns в KG, 4 в k8s → drift 1/5 = 20% (на границе, проходит).
+    svc = MagicMock(spec=Service)
+    svc.synthetic = False
+    svc.metadata_json = None
+
+    with patch("app.knowledge_graph.drift_cleanup._k8s_live_namespaces",
+               return_value={"a", "b", "c", "d"}):
+        db = MagicMock()
+        db.query.return_value.distinct.return_value.all.return_value = [
+            ("a",), ("b",), ("c",), ("d",), ("drift-ns",),
+        ]
+        db.query.return_value.filter.return_value.all.return_value = [svc]
+        result = run_drift_cleanup(db, max_drift_pct=25.0, apply=True)
+
+    assert result["skipped_threshold"] is False
+    assert result["drift_pct"] == 20.0
+    assert result["applied"] is True
+    assert result["marked_services"] == 1
+    assert svc.synthetic is True
+    assert svc.metadata_json["drift_reason"] == "ns_not_in_k8s"
+    db.commit.assert_called_once()
+
+
+def test_drift_cleanup_kubectl_failure_raises():
+    """kubectl-failure → RuntimeError. Beat task ловит и логирует."""
+    from unittest.mock import patch
+    from app.knowledge_graph.drift_cleanup import run_drift_cleanup
+    import pytest
+
+    with patch("app.knowledge_graph.drift_cleanup.subprocess.run") as mr:
+        mr.return_value = MagicMock(returncode=1, stderr="connection refused")
+        with pytest.raises(RuntimeError, match="kubectl get ns failed"):
+            run_drift_cleanup(MagicMock(), apply=True)
+
+
+def test_drift_cleanup_already_marked_idempotent():
+    """Services с drift_reason уже помечены — skip повтор."""
+    from unittest.mock import patch, MagicMock
+    from app.knowledge_graph.drift_cleanup import run_drift_cleanup
+    from app.knowledge_graph.schema import Service
+
+    already = MagicMock(spec=Service)
+    already.synthetic = True
+    already.metadata_json = {"drift_reason": "ns_not_in_k8s"}
+
+    with patch("app.knowledge_graph.drift_cleanup._k8s_live_namespaces",
+               return_value={"a", "b", "c", "d"}):
+        db = MagicMock()
+        db.query.return_value.distinct.return_value.all.return_value = [
+            ("a",), ("b",), ("c",), ("d",), ("drift-ns",),
+        ]
+        db.query.return_value.filter.return_value.all.return_value = [already]
+        result = run_drift_cleanup(db, max_drift_pct=25.0, apply=True)
+
+    assert result["marked_services"] == 0  # уже помечен, skip

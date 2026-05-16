@@ -127,7 +127,7 @@ def test_enrich_alert_builds_full_context(
     assert ctx.recent_deploys[0]["number"] == "2841"
     assert len(ctx.upstream_alerts) == 1
     assert ctx.upstream_alerts[0]["service"] == "town-db-postgresql"
-    assert ctx.downstream_count_by_kind == {"calls": 18, "uses_nats": 4}
+    assert ctx.inbound_count_by_kind == {"calls": 18, "uses_nats": 4}
     assert len(ctx.recurrence_24h) == 3
 
     # Hypothesis из RecentDeployRule должен быть top-1
@@ -154,7 +154,7 @@ async def test_send_enriched_alert_builds_grouped_embed():
             recent_deploys=[],
             upstream_alerts=[],
             recurrence_24h=[],
-            downstream_count_by_kind={},
+            inbound_count_by_kind={},
             rule_facts=[],
         ))
 

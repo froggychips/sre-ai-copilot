@@ -129,6 +129,15 @@ class Settings(BaseSettings):
 
     # Security
     ALERTMANAGER_WEBHOOK_SECRET: Optional[str] = None
+    # Точка роста #2 (Phase 2): AlertManager API URL для resolve-sync.
+    # Сейчас kg_alerts держит `firing` записи без resolved_at годами (видим
+    # etcd alerts от 10 апреля). Beat task kg_alerts_resolve_sync периодически
+    # сравнивает kg_alerts.fingerprint со списком firing на AM, не-firing
+    # пишет resolved_at = NOW().
+    ALERTMANAGER_API_URL: str = Field(
+        "http://vmalertmanager-vm-victoria-metrics-k8s-stack.monitoring:9093",
+        description="AlertManager API root URL (без /api/v2 — добавится в client)",
+    )
     SAFE_MODE: bool = True
     APPROVAL_REQUIRED: bool = True
     REPLAY_MODE: bool = False
@@ -172,6 +181,14 @@ class Settings(BaseSettings):
     TC_TIMEOUT_SECONDS: float = 5.0
     TC_LOOKBACK_MINUTES: int = 60
     TC_BACKEND_PROJECT_ID: str = Field("", description="TeamCity project ID для поиска билдов")
+    # G3.1 (Phase 2): расширение покрытия. Раньше sync шёл только по
+    # TC_BACKEND_PROJECT_ID, deploys coverage держалась на 17%. Теперь
+    # comma-separated list дополнительных projects (например `Wo_Auth,Wo_Infra`).
+    # Если пусто — fallback на TC_BACKEND_PROJECT_ID.
+    TC_PROJECT_IDS: str = Field(
+        "",
+        description="TeamCity project IDs (comma-separated). Fallback на TC_BACKEND_PROJECT_ID если пусто.",
+    )
 
     # GitLab — обогащение MR-метаданными по SHA из TC-деплоев.
     GITLAB_URL: str = Field("", description="GitLab base URL")

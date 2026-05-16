@@ -11,3 +11,4 @@ build/
 *.log
 e2e-local.db
 sre_copilot.db
+docs/kg-presentation.html
