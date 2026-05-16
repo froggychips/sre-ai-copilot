@@ -356,12 +356,20 @@ class DiscordService:
                     pass
                 sha = (d.get("sha") or "")[:7]
                 num = d.get("number") or "?"
-                bt = d.get("buildtype_id") or ""
+                bt_name = d.get("buildtype_name") or d.get("buildtype_id") or "?"
                 status = d.get("status") or ""
+                triggered = d.get("triggered_by") or ""
+                url = d.get("url")
+                by_part = f" by `{triggered}`" if triggered else ""
+                # Build label — кликабельный если есть TC URL.
+                if url:
+                    build_label = f"[{bt_name} #{num}]({url})"
+                else:
+                    build_label = f"`#{num}` ({bt_name})"
+                sha_part = f" {sha}" if sha else ""
+                status_part = f" — {status}" if status else ""
                 lines.append(
-                    f"• `{num}` {sha} — {mins} мин назад"
-                    + (f" ({bt})" if bt else "")
-                    + (f" — {status}" if status else "")
+                    f"• {build_label}{by_part}{sha_part} — {mins} мин назад{status_part}"
                 )
             # Человекочитаемая шкала окна: «60м» / «24ч» / «3д».
             if max_min < 120:
@@ -564,7 +572,7 @@ class DiscordService:
                 "discord.dry_run.send_enriched_alert",
                 title=title,
                 namespaces=ns_str,
-                hypotheses=hyp,
+                hypothesis=head.primary_hypothesis(),
                 contexts_count=len(contexts),
                 severity=severity,
                 resurfaced=resurfaced,
