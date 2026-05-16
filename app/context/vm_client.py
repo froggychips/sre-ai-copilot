@@ -18,6 +18,8 @@ from typing import Any, Dict, List, Optional, Union
 
 import httpx
 
+from app.services.resilience import with_external_retry
+
 logger = logging.getLogger(__name__)
 
 # Пороги для структурных флагов.
@@ -128,6 +130,7 @@ class VMClient:
             logger.debug("vm_client.query_instant failed query=%r: %s", query, e)
         return 0.0
 
+    @with_external_retry(max_attempts=3, initial_delay=0.5, name="vm.cluster_health")
     async def get_cluster_health(self) -> ClusterHealth:
         """Cluster-wide health snapshot — те же метрики что в #stats daily report.
 
@@ -171,6 +174,7 @@ class VMClient:
 
         return ClusterHealth(metrics)
 
+    @with_external_retry(max_attempts=3, initial_delay=0.5, name="vm.query_range")
     async def query_range(
         self,
         query: str,
