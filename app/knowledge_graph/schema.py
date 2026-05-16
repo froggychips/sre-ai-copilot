@@ -92,6 +92,41 @@ class AlertEvent(Base):
     )
 
 
+class PodEvent(Base):
+    """A4: k8s Event для pod-а (OOMKilled / FailedScheduling / ImagePullBackOff /
+    FailedMount / BackOff / Unhealthy / NodeNotReady и т.п.).
+
+    Источник — `kubectl get events` или `client.CoreV1Api.list_namespaced_event`.
+    События k8s — параллельный signal к kg_alerts (которые приходят только
+    из AlertManager и упускают диагностические события на pod-уровне).
+
+    Dedup: уникальность по `event_uid` (k8s UID события). Один и тот же
+    Event может быть прочитан несколько раз — пишем один раз, обновляем
+    last_seen + count.
+    """
+    __tablename__ = "kg_pod_events"
+
+    id = Column(Integer, primary_key=True, index=True)
+    service_id = Column(Integer, ForeignKey("kg_services.id"), nullable=True, index=True)
+    namespace = Column(String, nullable=False, index=True)
+    pod_name = Column(String, nullable=False, index=True)
+    reason = Column(String, nullable=False, index=True)   # OOMKilled / FailedScheduling / ...
+    message = Column(String, nullable=True)
+    type = Column(String, nullable=True)                  # Warning / Normal
+    event_uid = Column(String, nullable=False, unique=True, index=True)
+    first_seen = Column(DateTime, nullable=False, index=True)
+    last_seen = Column(DateTime, nullable=True)
+    count = Column(Integer, nullable=True)                # сколько раз k8s видел event
+    extras = Column(JSON, nullable=True)
+
+    service = relationship("Service")
+
+    __table_args__ = (
+        Index("ix_kg_pod_event_service_time", "service_id", "first_seen"),
+        Index("ix_kg_pod_event_ns_reason_time", "namespace", "reason", "first_seen"),
+    )
+
+
 class ServiceEdge(Base):
     """Ребро графа: src сервис вызывает / зависит от dst сервиса.
 

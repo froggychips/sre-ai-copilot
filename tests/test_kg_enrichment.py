@@ -593,3 +593,51 @@ def test_db_targets_dsn_env_wins_over_secret_hint():
     ]}]}}}}
     out = _extract_db_targets(deploy, "ns")
     assert out == [("db:postgres:real-host", "ns", "postgres", "dsn_env")]
+
+
+# ── A4: k8s_events_sync ─────────────────────────────────────────────────────
+
+
+def test_deployment_from_pod_name_standard_deployment():
+    from app.knowledge_graph.k8s_events_sync import _deployment_from_pod_name
+    assert _deployment_from_pod_name("bot-service-5476d85d74-f626c") == "bot-service"
+    # 8-char RS hash + 5-char pod hash — стандарт k8s.
+    assert _deployment_from_pod_name("town-service-abc12345-9wxyz") == "town-service"
+
+
+def test_deployment_from_pod_name_multipart():
+    from app.knowledge_graph.k8s_events_sync import _deployment_from_pod_name
+    # Многословные имена deployment'ов корректно отделяются
+    assert _deployment_from_pod_name("chat-message-service-7d4fdbb455-l6md8") == "chat-message-service"
+
+
+def test_deployment_from_pod_name_statefulset_pattern():
+    """StatefulSet `pg-cluster-0` — не наш кейс (нет 2 hash-суффиксов)."""
+    from app.knowledge_graph.k8s_events_sync import _deployment_from_pod_name
+    assert _deployment_from_pod_name("pg-cluster-0") is None
+    assert _deployment_from_pod_name("redis-0") is None
+    assert _deployment_from_pod_name("") is None
+
+
+def test_parse_k8s_timestamp():
+    from app.knowledge_graph.k8s_events_sync import _parse_k8s_timestamp
+    dt = _parse_k8s_timestamp("2026-05-16T07:30:03Z")
+    assert dt is not None and dt.year == 2026 and dt.minute == 30
+    assert _parse_k8s_timestamp(None) is None
+    assert _parse_k8s_timestamp("invalid") is None
+
+
+def test_warn_reasons_includes_critical_diagnostic_events():
+    """OOMKilled / FailedScheduling / ImagePullBackOff / Unhealthy — must-have."""
+    from app.knowledge_graph.k8s_events_sync import _WARN_REASONS
+    for r in ("OOMKilled", "FailedScheduling", "ImagePullBackOff",
+              "FailedMount", "BackOff", "CrashLoopBackOff", "Unhealthy",
+              "Evicted", "NodeNotReady"):
+        assert r in _WARN_REASONS, f"missing diagnostic reason: {r}"
+
+
+def test_warn_reasons_excludes_info_events():
+    """Pulled / Created / Scheduled — info noise, не нужны в KG."""
+    from app.knowledge_graph.k8s_events_sync import _WARN_REASONS
+    for r in ("Pulled", "Created", "Scheduled", "Started", "Killing"):
+        assert r not in _WARN_REASONS

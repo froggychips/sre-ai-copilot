@@ -18,8 +18,8 @@ from typing import Any, Dict, Optional
 import structlog
 from sqlalchemy.orm import Session
 
-from app.knowledge_graph.schema import (AlertEvent, Deployment, Service,
-                                        ServiceEdge)
+from app.knowledge_graph.schema import (AlertEvent, Deployment, PodEvent,
+                                        Service, ServiceEdge)
 
 logger = structlog.get_logger()
 
@@ -197,6 +197,53 @@ def record_alert_event(
         fired_at=fired_at,
         incident_id=incident_id,
         raw=raw,
+    )
+    db.add(ev)
+    db.flush()
+    return ev
+
+
+def record_pod_event(
+    db: Session,
+    service: Optional[Service],
+    namespace: str,
+    pod_name: str,
+    reason: str,
+    event_uid: str,
+    first_seen: datetime,
+    last_seen: Optional[datetime] = None,
+    count: Optional[int] = None,
+    message: Optional[str] = None,
+    type_: Optional[str] = None,
+    extras: Optional[Dict[str, Any]] = None,
+) -> PodEvent:
+    """A4: идемпотентно по `event_uid` (k8s Event UID).
+
+    Повторный sync того же события → обновляем `last_seen` и `count`
+    (k8s агрегирует одинаковые события и инкрементит count).
+    """
+    existing = (
+        db.query(PodEvent).filter(PodEvent.event_uid == event_uid).one_or_none()
+    )
+    if existing is not None:
+        if last_seen is not None:
+            existing.last_seen = last_seen
+        if count is not None:
+            existing.count = count
+        return existing
+
+    ev = PodEvent(
+        service_id=service.id if service else None,
+        namespace=namespace,
+        pod_name=pod_name,
+        reason=reason,
+        message=message,
+        type=type_,
+        event_uid=event_uid,
+        first_seen=first_seen,
+        last_seen=last_seen,
+        count=count,
+        extras=extras,
     )
     db.add(ev)
     db.flush()

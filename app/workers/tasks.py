@@ -61,6 +61,13 @@ celery_app.conf.beat_schedule = {
         "task": "chronic_alerts_digest",
         "schedule": crontab(minute=0, hour="*/6"),
     },
+    # A4: k8s pod-events → kg_pod_events. Каждые 10 мин тянем Warning-events
+    # из всех ns с deployments в KG. Idempotent по event_uid. Источник
+    # OOMKilled / FailedScheduling / ImagePullBackOff / Unhealthy / etc.
+    "k8s-pod-events-sync": {
+        "task": "k8s_pod_events_sync",
+        "schedule": crontab(minute="*/10"),
+    },
 }
 
 
@@ -137,6 +144,19 @@ def kg_topology_sync_task():
     except Exception as e:
         logger.error("kg_topology_sync.failed: %s", e)
         raise
+
+
+@celery_app.task(name="k8s_pod_events_sync")
+def k8s_pod_events_sync_task():
+    """A4: pull Warning k8s-events → kg_pod_events. БЕЗ LLM."""
+    from app.knowledge_graph.k8s_events_sync import sync_all_events
+
+    db = SessionLocal()
+    try:
+        result = sync_all_events(db)
+    finally:
+        db.close()
+    return result
 
 
 @celery_app.task(name="tc_deploys_to_kg")
