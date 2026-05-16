@@ -33,12 +33,14 @@ class DriftCleanupSkipped(Exception):
 
 
 def _k8s_live_namespaces() -> Set[str]:
-    """kubectl get ns → set имён. Raises на kubectl-failure."""
+    """kubectl get ns → set имён. Raises на kubectl-failure.
+
+    `-o name` вместо jsonpath: jsonpath с `\\n`-разделителями через
+    python subprocess может фейлиться на shell-escape. `-o name` даёт
+    стабильный формат `namespace/<name>` per line.
+    """
     out = subprocess.run(
-        [
-            "kubectl", "get", "ns",
-            "-o", "jsonpath={range .items[*]}{.metadata.name}{\"\\n\"}{end}",
-        ],
+        ["kubectl", "get", "ns", "-o", "name"],
         capture_output=True, text=True, check=False, timeout=15,
     )
     if out.returncode != 0:
@@ -46,7 +48,11 @@ def _k8s_live_namespaces() -> Set[str]:
             f"kubectl get ns failed (rc={out.returncode}): "
             f"{out.stderr.strip()[:200]}"
         )
-    return {ln.strip() for ln in out.stdout.splitlines() if ln.strip()}
+    return {
+        ln.removeprefix("namespace/").strip()
+        for ln in out.stdout.splitlines()
+        if ln.strip()
+    }
 
 
 def run_drift_cleanup(
@@ -110,10 +116,14 @@ def run_drift_cleanup(
     affected = db.query(Service).filter(Service.namespace.in_(drift)).all()
     marked = 0
     for s in affected:
-        if s.synthetic and (s.metadata_json or {}).get("drift_reason"):
+        # Legacy: metadata_json у некоторых старых services хранится как list
+        # (например, после устаревших ETL-проходов). Защита от
+        # AttributeError: 'list' object has no attribute 'get'.
+        existing_meta = s.metadata_json if isinstance(s.metadata_json, dict) else {}
+        if s.synthetic and existing_meta.get("drift_reason"):
             continue  # уже помечен ранее — пропускаем
         s.synthetic = True
-        meta = dict(s.metadata_json or {})
+        meta = dict(existing_meta)
         meta["drift_marked_at"] = now_iso
         meta["drift_reason"] = "ns_not_in_k8s"
         s.metadata_json = meta
