@@ -40,6 +40,24 @@ def test_is_synthetic_exact_names():
     assert _is_synthetic_service("redis-exporter")
 
 
+def test_is_synthetic_observability_agents():
+    """G1.1: vm-* / prometheus-kube-prometheus-* / legal-pages — observability,
+    никогда не имеют edges. Без флага засчитывались как pure_orphan."""
+    for name in (
+        "vm-node-exporter",
+        "vm-kube-state-metrics",
+        "vmagent-vm-victoria-metrics-k8s-stack",
+        "vm-victoria-metrics-k8s-stack-kube-controller-manager",
+        "vm-victoria-metrics-k8s-stack-kube-etcd",
+        "prometheus-kube-prometheus-kubelet",
+        "prometheus-kube-prometheus-kube-controller-manager",
+        "prometheus-kube-prometheus-kube-etcd",
+        "prometheus-kube-prometheus-kube-scheduler",
+        "legal-pages",
+    ):
+        assert _is_synthetic_service(name), f"{name} должен быть synthetic"
+
+
 def test_is_synthetic_rejects_real_services():
     """Backup-related НЕ-cron сервисы — не synthetic."""
     assert not _is_synthetic_service("backup-service")  # это API, не cron

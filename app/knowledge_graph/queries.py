@@ -11,6 +11,8 @@ from typing import Any, Dict, List, Optional
 
 from sqlalchemy.orm import Session
 
+from app.knowledge_graph.confidence import (confidence_label,
+                                            confidence_score)
 from app.knowledge_graph.schema import (AlertEvent, Deployment, PodEvent,
                                         Service, ServiceEdge)
 
@@ -105,6 +107,7 @@ def upstream_of(
     for edge in q.all():
         if edge.dst is None:
             continue
+        score = confidence_score(edge.extras, edge.last_seen_at)
         out.append({
             "service": edge.dst.name,
             "namespace": edge.dst.namespace,
@@ -112,6 +115,8 @@ def upstream_of(
             "weight": edge.weight,
             "last_seen_at": edge.last_seen_at,
             "discovery_sources": (edge.extras or {}).get("discovery_sources") or [],
+            "confidence_score": score,
+            "confidence_label": confidence_label(score),
         })
     return out
 

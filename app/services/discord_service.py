@@ -365,8 +365,9 @@ class DiscordService:
 
         # Outgoing deps — куда сервис сам ходит. Для leaf-сервисов (как
         # bot-service) это главная диагностика при падении: «упал —
-        # потому что зависит от X». Группируем по kind.
+        # потому что зависит от X». Группируем по kind, badge confidence.
         if head.outgoing_deps:
+            from app.knowledge_graph.confidence import confidence_badge
             by_kind: Dict[str, List[str]] = {}
             for d in head.outgoing_deps:
                 k = d.get("kind", "?")
@@ -374,6 +375,12 @@ class DiscordService:
                 target_ns = d.get("namespace") or ""
                 if target_ns and target_ns != (head.incident.namespace or ""):
                     target = f"{target} @ `{target_ns}`"
+                # G5: confidence-badge. ●●● multi-source+fresh → high.
+                # ●○○ single-source+stale → low. LLM-pipeline (когда включится)
+                # видит «inferred с confidence 0.4», а не «факт».
+                score = d.get("confidence_score") or 0.0
+                badge = confidence_badge(score)
+                target = f"{target} {badge}"
                 by_kind.setdefault(k, []).append(target)
             lines = []
             kind_icons = {"calls": "→", "uses_db": "🗄", "uses_nats": "📡"}
@@ -385,7 +392,7 @@ class DiscordService:
                     value_str += f" (+{len(items)-6})"
                 lines.append(f"{icon_k} **{k}** ({len(items)}): {value_str}")
             fields.append({
-                "name": "🔗 Зависит от (outgoing, KG)",
+                "name": "🔗 Зависит от · ●●●high ●●○med ●○○low",
                 "value": "\n".join(lines)[:1024],
                 "inline": False,
             })

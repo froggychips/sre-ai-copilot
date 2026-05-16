@@ -66,8 +66,25 @@ _SYNTHETIC_EXACT_NAMES = frozenset({
     "nats-exporter-prometheus-nats-exporter",
     "seq",
     "redis-exporter",
+    # G1.1: observability-агенты — никогда не имеют edges (мониторят кластер,
+    # не бизнес-сервисы). Без флага засчитывались как pure_orphan и раздували
+    # orphan-метрику до 10%.
+    "vm-node-exporter",
+    "vm-kube-state-metrics",
+    "vmagent-vm-victoria-metrics-k8s-stack",
+    "vm-victoria-metrics-k8s-stack-kube-controller-manager",
+    "vm-victoria-metrics-k8s-stack-kube-etcd",
+    "prometheus-kube-prometheus-kubelet",
+    "prometheus-kube-prometheus-kube-controller-manager",
+    "prometheus-kube-prometheus-kube-etcd",
+    "prometheus-kube-prometheus-kube-scheduler",
+    # legal-pages — статический сайт без deps (leaf endpoint).
+    "legal-pages",
 })
 _SYNTHETIC_SUFFIXES = ("-db-backup", "-cron")
+# G1.1: префиксные паттерны observability (vm-* / prometheus-kube-prometheus-*
+# с любым suffix). Удобнее точечно — exact_names выше; здесь только generic
+# семейства которые редко имеют edges.
 
 
 def _is_synthetic_service(name: str) -> bool:
