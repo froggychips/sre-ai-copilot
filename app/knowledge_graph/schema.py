@@ -7,8 +7,8 @@ from __future__ import annotations
 
 from datetime import datetime
 
-from sqlalchemy import (JSON, Boolean, Column, DateTime, ForeignKey, Index,
-                        Integer, String, UniqueConstraint)
+from sqlalchemy import (JSON, Boolean, Column, DateTime, Float, ForeignKey,
+                        Index, Integer, String, UniqueConstraint)
 from sqlalchemy.orm import relationship
 
 from app.database import Base
@@ -34,6 +34,14 @@ class Service(Base):
 
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    # Service health score [0, 1] — composite (alerts × severity + crashloop +
+    # recurrence). Recomputed периодически через `kg_health_recompute` beat task.
+    # None = ещё не считалось. 1.0 = perfect health, 0.0 = down/broken.
+    # Используется в kg_fragile_top для «истинного» ранжирования (не только
+    # inbound count). Per ChatGPT review #4.3.
+    health_score = Column(Float, nullable=True, index=True)
+    health_computed_at = Column(DateTime, nullable=True)
 
     __table_args__ = (
         UniqueConstraint("namespace", "name", name="uq_kg_service_ns_name"),

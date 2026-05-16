@@ -25,23 +25,65 @@ from datetime import datetime
 from typing import Any, Dict, Optional
 
 
+# Source precedence (per ChatGPT review #3.1): explicit truth hierarchy.
+# Без неё все inferred-источники одинаковые base=0.5. Теперь сила source-а
+# зависит от того, насколько он близко к runtime-наблюдению:
+#   runtime traces (OTEL spans, VM client metrics) > declared (k8s Ingress) >
+#   strong inferred (DSN из secret-key) > weak inferred (env-vars).
+# При множественных источниках берётся MAX precedence + bonus за corroboration.
+_SOURCE_PRECEDENCE: Dict[str, float] = {
+    # Tier 1: runtime-observed (1.0). Не реализовано пока — placeholder для
+    # будущих OTEL / VM metrics источников.
+    "kg_sync/otel_runtime": 1.0,
+    "kg_sync/vm_runtime": 1.0,
+    "kg_sync/runtime_corr": 0.95,   # PodEvent ↔ ServiceEdge correlation
+    # Tier 2: declarative k8s resources (0.85). Manifest существует физически.
+    "kg_sync/ingress": 0.85,
+    "kg_sync/service": 0.85,
+    "kg_sync/network_policy": 0.85,
+    # Tier 3: strong inference (0.65). Имя secret key явно говорит про DB.
+    "kg_sync/secret_hint": 0.65,
+    "kg_sync/dsn_env": 0.65,
+    # Tier 4: weak inference (0.50). Env-vars с URL/HOST в имени.
+    "kg_sync/env_url_v2": 0.50,
+    "kg_sync/env_vars": 0.50,
+    "kg_sync/nats_env": 0.50,
+}
+_SOURCE_PRECEDENCE_DEFAULT = 0.40  # unknown sources — ниже weakest known
+
+
+def _source_precedence_max(sources: list) -> float:
+    """MAX precedence среди источников. Reflects «what's the strongest
+    discovery method for this edge» — runtime > k8s manifest > inference."""
+    if not sources:
+        return 0.0
+    return max(_SOURCE_PRECEDENCE.get(s, _SOURCE_PRECEDENCE_DEFAULT) for s in sources)
+
+
 def confidence_score(
     extras: Optional[Dict[str, Any]],
     last_seen_at: Optional[datetime],
 ) -> float:
-    """Calculate edge confidence [0, 1] from discovery_sources + freshness."""
+    """Calculate edge confidence [0, 1] from precedence + corroboration + freshness.
+
+    Formula (revised per ChatGPT review #3.1):
+        precedence = max_source_weight  (runtime 1.0 → manifest 0.85 → secret 0.65 → env 0.5)
+        corroboration = +0.10 per additional unique source (capped +0.20)
+        freshness = decay multiplier по last_seen_at
+        score = (precedence + corroboration) × freshness, clamped [0, 1]
+
+    Это даёт явную precedence model вместо равной base=0.5 для всех inferred.
+    Runtime-observed edge получает score ≈ 1.0 (●●●) сразу. Env-only edge
+    остаётся ●●○ medium даже если fresh — потому что precedence низкая.
+    """
     sources = (extras or {}).get("discovery_sources") or []
-    n = len(sources)
-    if n == 0:
+    if not sources:
         # Backfill-эпохальные edges без provenance — нулевая уверенность.
         return 0.0
 
-    if n == 1:
-        src_mul = 1.0
-    elif n == 2:
-        src_mul = 1.3
-    else:
-        src_mul = 1.5
+    precedence = _source_precedence_max(sources)
+    unique_sources = len(set(sources))
+    corroboration = min(0.20, max(0, unique_sources - 1) * 0.10)
 
     if last_seen_at is None:
         fresh_mul = 0.5
@@ -59,8 +101,7 @@ def confidence_score(
         else:                        # > месяца — stale
             fresh_mul = 0.2
 
-    base = 0.5
-    return min(1.0, base * src_mul * fresh_mul)
+    return min(1.0, (precedence + corroboration) * fresh_mul)
 
 
 def confidence_label(score: float) -> str:

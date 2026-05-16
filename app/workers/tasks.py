@@ -91,6 +91,14 @@ celery_app.conf.beat_schedule = {
         "task": "kg_ingress_sync",
         "schedule": crontab(minute=37),  # ежечасно в 37 мин (offset от других)
     },
+    # ChatGPT review #4.3: service health composite (open alerts × severity
+    # + chronic pod events + recurrence). Раз в 20 мин — health моментальный
+    # сигнал, но recompute дорого над всеми ~370 real services. Используется
+    # в kg_fragile_top для «истинного» ранжирования и в digest «🩺 Unhealthy».
+    "kg-health-recompute": {
+        "task": "kg_health_recompute",
+        "schedule": crontab(minute="*/20"),
+    },
 }
 
 
@@ -192,6 +200,21 @@ def kg_ingress_sync_task():
         return sync_all_ingresses(db)
     except Exception as e:
         logger.warning("kg_ingress_sync.failed: %s", e)
+        return {"error": str(e)}
+    finally:
+        db.close()
+
+
+@celery_app.task(name="kg_health_recompute")
+def kg_health_recompute_task():
+    """ChatGPT review #4.3: composite health score per real service."""
+    from app.knowledge_graph.health_score import recompute_all_health
+
+    db = SessionLocal()
+    try:
+        return recompute_all_health(db)
+    except Exception as e:
+        logger.warning("kg_health_recompute.failed: %s", e)
         return {"error": str(e)}
     finally:
         db.close()
