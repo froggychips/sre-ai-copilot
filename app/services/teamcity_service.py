@@ -441,6 +441,7 @@ def _fetch_recent_deploys_direct(
                 "branch": b.get("branchName"),
                 "buildtype_id": b.get("buildTypeId"),
                 "buildtype_name": btype_name,
+                "started_at": _tc_to_iso(b.get("startDate")),
                 "finished_at": _tc_to_iso(b.get("finishDate")),
                 "triggered_by": trig_user.get("username") or trig_user.get("name"),
                 "triggered_type": triggered.get("type"),

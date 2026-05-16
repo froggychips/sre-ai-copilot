@@ -166,7 +166,7 @@ async def _tc_deploys_to_kg_logic() -> dict:
 
     # Берём builds за последние 24h. Cron каждые 15 мин — overkill по
     # window, но dedup защищает и cheaply tolerant к беатам-пропускам.
-    builds = await recent_deploys(lookback_hours=24, limit=50)
+    builds = await recent_deploys(lookback_hours=24, limit=200)
     if not builds:
         return {"builds_fetched": 0, "kg_deployments_added": 0}
 
@@ -192,7 +192,11 @@ async def _tc_deploys_to_kg_logic() -> dict:
                 continue
 
             finished = b.get("finished_at")
-            started = b.get("finished_at")  # TC `recent_deploys` не отдаёт start; используем finish
+            # startDate из TC (A3 fix) — без него RecentDeployRule матчит окно
+            # по finishDate и пропускает alert'ы, прилетевшие пока деплой ещё
+            # идёт. Fallback на finished_at — для совместимости со старыми
+            # builds, где startDate не приехал.
+            started = b.get("started_at") or b.get("finished_at")
             if not started:
                 continue
             try:
@@ -210,38 +214,40 @@ async def _tc_deploys_to_kg_logic() -> dict:
                     pass
 
             for ns in target_namespaces:
-                # «ns-representative» — первый non-synthetic service.
-                rep_svc = (
+                # A3: ns-wide broadcast. Раньше писали только на «ns-representative»
+                # (первый non-synthetic) — из-за этого 98% сервисов в KG не
+                # имели deploy-истории. RecentDeployRule работает per-service,
+                # значит каждый сервис в ns должен видеть тот же deploy event.
+                # Dedup защищён уникальностью (service_id, buildtype_id, build_number).
+                ns_services = (
                     db.query(Service)
                     .filter_by(namespace=ns, synthetic=False)
-                    .order_by(Service.name)
-                    .first()
+                    .all()
                 )
-                if rep_svc is None:
-                    continue
-                try:
-                    record_deployment(
-                        db,
-                        service=rep_svc,
-                        started_at=started_naive,
-                        finished_at=finished_naive,
-                        buildtype_id=b.get("buildtype_id"),
-                        build_number=str(b.get("number") or ""),
-                        status=b.get("status"),
-                        triggered_by=b.get("triggered_by"),
-                        extras={
-                            "branch": branch_full,
-                            "buildtype_name": b.get("buildtype_name"),
-                            "url": b.get("url"),
-                            "namespace_scope": True,  # маркер ns-wide attribution
-                        },
-                    )
-                    added += 1
-                except Exception as e:
-                    logger.warning(
-                        "tc_deploys_to_kg.record_failed ns=%s build=#%s: %s",
-                        ns, b.get("number"), e,
-                    )
+                for svc in ns_services:
+                    try:
+                        record_deployment(
+                            db,
+                            service=svc,
+                            started_at=started_naive,
+                            finished_at=finished_naive,
+                            buildtype_id=b.get("buildtype_id"),
+                            build_number=str(b.get("number") or ""),
+                            status=b.get("status"),
+                            triggered_by=b.get("triggered_by"),
+                            extras={
+                                "branch": branch_full,
+                                "buildtype_name": b.get("buildtype_name"),
+                                "url": b.get("url"),
+                                "namespace_scope": True,  # маркер ns-wide attribution
+                            },
+                        )
+                        added += 1
+                    except Exception as e:
+                        logger.warning(
+                            "tc_deploys_to_kg.record_failed ns=%s svc=%s build=#%s: %s",
+                            ns, svc.name, b.get("number"), e,
+                        )
         db.commit()
     except Exception as e:
         logger.error("tc_deploys_to_kg.failed: %s", e)
