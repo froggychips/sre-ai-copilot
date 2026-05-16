@@ -116,7 +116,44 @@ _DSN_DRIVER_CANON = {
     "rediss": "redis",
     "amqps": "amqp",
     "mariadb": "mysql",
+    "mongo": "mongodb",
+    "rabbit": "amqp",
+    "rabbitmq": "amqp",
 }
+
+# A2-v2: эвристика по имени Secret. Большинство prod DSN сидят в secretKeyRef,
+# не в plain values — RBAC у sre-ai SA на secrets отсутствует (намеренно).
+# Парсим имя secret-а (видно через valueFrom без чтения содержимого).
+_SECRET_DB_DRIVER_RE = re.compile(
+    r"(?<![a-z])(postgres(?:ql)?|mysql|mariadb|mongo(?:db)?|redis|clickhouse|"
+    r"amqp|rabbit(?:mq)?|elasticsearch)(?![a-z])",
+    re.IGNORECASE,
+)
+_SECRET_NAME_NOISE = frozenset({
+    "secret", "secrets", "creds", "credentials", "credential", "config",
+    "url", "dsn", "conn", "connection", "uri", "auth", "password", "passwords",
+    "db", "database", "main", "primary", "rw", "ro",
+})
+
+# A2-v2: эвристика по `secretKeyRef.key`. Реальные prod-секреты в WO
+# называются обобщённо (`database`, `infrastructure`) — driver/host
+# по name не угадать. А ключи говорящие: `MV_POSTGRES_DB_CONNECTION`,
+# `ANALYTICS_DB_CLICKHOUSE_CONNECTION`, `TOWN_DB_CONNECTION`.
+_KEY_DB_DRIVER_TOKEN = re.compile(
+    r"^(POSTGRES|PG|MYSQL|MARIADB|MONGO(?:DB)?|REDIS|CLICKHOUSE|AMQP|RABBIT(?:MQ)?)$",
+    re.IGNORECASE,
+)
+_KEY_DB_GENERIC_TOKEN = re.compile(r"^(DB|DATABASE)$", re.IGNORECASE)
+_KEY_DB_ENDPOINT_TOKEN = frozenset({"CONNECTION", "CONN", "URI", "URL", "DSN"})
+_KEY_DB_NOISE = frozenset({
+    "additional", "primary", "main", "rw", "ro", "client", "server",
+    "user", "username", "password", "passwd", "host", "port", "name", "id",
+    "ssl", "tls", "secret", "key",
+})
+
+# Для DB-host hint ослабляем фильтр имени (min 2 chars): в WO ключах
+# встречаются короткие хосты типа `mv` (Materialized Views) — это валидно.
+_DB_HOST_HINT_RE = re.compile(r"^[a-z][a-z0-9-]+$")
 
 
 def _inferred_extras(kind: str) -> Dict[str, Any]:
@@ -307,68 +344,218 @@ def _extract_upstreams_extended(
     return sorted(found)
 
 
+def _parse_db_hint_from_secret_key(
+    secret_key: str,
+) -> Optional[Tuple[str, str]]:
+    """A2-v2: эвристика по `secretKeyRef.key` (более информативна чем name
+    в WO-инфре, где имена секретов обобщённые: `database`, `infrastructure`).
+
+    Требует endpoint-marker (CONNECTION / CONN / URI / URL / DSN) — иначе
+    это креденшл (PG_USER, ACCESS_TOKEN), не endpoint.
+
+    Driver: первый driver-токен (POSTGRES/PG/MYSQL/MARIADB/MONGO/REDIS/
+    CLICKHOUSE/AMQP/RABBIT). Если нет driver-токена, но есть generic
+    DB-токен — default postgres (WO в основном Postgres, см. PG_USER/PG_PASSWORD
+    в secret/database).
+
+    Host hint — оставшиеся токены key, без noise.
+
+    Examples:
+      MV_POSTGRES_DB_CONNECTION         → ("postgres",   "mv")
+      ANALYTICS_DB_CLICKHOUSE_CONNECTION → ("clickhouse", "analytics")
+      TOWN_DB_CONNECTION                → ("postgres",   "town")   # default driver
+      CHAT_MESSAGE_ADDITIONAL_DB_CONNECTION → ("postgres", "chat-message")
+      PG_USER                           → None  (нет endpoint-marker)
+      ACCESS_TOKEN_SECRET               → None  (нет ни driver, ни DB)
+    """
+    if not secret_key:
+        return None
+    tokens_raw = re.split(r"[_.]", secret_key)
+    tokens = [t for t in tokens_raw if t]
+
+    # Phase 1: endpoint-marker обязателен (отсекаем PG_USER и т.п.).
+    if not any(t.upper() in _KEY_DB_ENDPOINT_TOKEN for t in tokens):
+        return None
+
+    driver: Optional[str] = None
+    is_dsn_like = False
+    host_parts: List[str] = []
+    for tok in tokens:
+        upper = tok.upper()
+        if _KEY_DB_DRIVER_TOKEN.match(upper):
+            low = upper.lower()
+            if low == "pg":
+                driver = "postgres"
+            else:
+                driver = _DSN_DRIVER_CANON.get(low, low)
+            continue
+        if _KEY_DB_GENERIC_TOKEN.match(upper):
+            is_dsn_like = True
+            continue
+        if upper in _KEY_DB_ENDPOINT_TOKEN:
+            continue
+        if tok.lower() in _KEY_DB_NOISE:
+            continue
+        host_parts.append(tok.lower())
+
+    if driver is None:
+        if not is_dsn_like:
+            return None
+        driver = "postgres"  # WO default — большинство DB Postgres
+
+    if not host_parts:
+        return None
+    host_hint = "-".join(host_parts)
+    if not _DB_HOST_HINT_RE.match(host_hint):
+        return None
+    return (driver, host_hint)
+
+
+def _parse_db_hint_from_secret_ref(
+    secret_name: str,
+    secret_key: str,
+) -> Optional[Tuple[str, str]]:
+    """Combined heuristic: сначала key (точнее), fallback на name."""
+    by_key = _parse_db_hint_from_secret_key(secret_key)
+    if by_key is not None:
+        return by_key
+    return _parse_db_hint_from_secret_name(secret_name)
+
+
+def _parse_db_hint_from_secret_name(
+    secret_name: str,
+) -> Optional[Tuple[str, str]]:
+    """A2-v2: эвристика по имени Secret для DB-цели.
+
+    БЕЗ чтения содержимого Secret. Имя содержит driver-токен (postgres /
+    redis / mongo / mysql / clickhouse / amqp / elasticsearch) — extract
+    его + "host hint" из оставшейся части имени (удалив driver и общие
+    noise-токены: secret / creds / config / url / dsn / db / ...).
+
+    Примеры:
+      postgres-finance-secret    → ("postgres", "finance")
+      redis-cache-creds          → ("redis",    "cache")
+      mongo-sessions-config      → ("mongodb",  "sessions")
+      app-db-credentials         → None  (нет driver-токена)
+      finance-postgres-rw-creds  → ("postgres", "finance-rw")
+    """
+    if not secret_name:
+        return None
+    m = _SECRET_DB_DRIVER_RE.search(secret_name)
+    if not m:
+        return None
+    raw_driver = m.group(1).lower()
+    driver = _DSN_DRIVER_CANON.get(raw_driver, raw_driver)
+
+    # Разбиваем имя на токены и убираем driver + noise. Оставшиеся —
+    # host hint (joined обратно через '-' чтобы сохранить порядок).
+    parts = re.split(r"[-_.]", secret_name.lower())
+    host_parts = [
+        p for p in parts
+        if p and p != raw_driver and p != driver and p not in _SECRET_NAME_NOISE
+    ]
+    if not host_parts:
+        return None
+    host_hint = "-".join(host_parts)
+    if not _SVC_NAME_RE.match(host_hint):
+        return None
+    return (driver, host_hint)
+
+
 def _extract_db_targets(
     deploy: Dict[str, Any],
     own_namespace: str,
-) -> List[Tuple[str, str, str]]:
-    """A2: scan env-values на DSN-схему БД.
+) -> List[Tuple[str, str, str, str]]:
+    """A2: возвращает [(db_node, namespace, driver, source)] для DB-edges.
 
-    Возвращает [(db_node_name, namespace, driver)]. Параллельный
-    _extract_upstreams_extended путь — без known_index фильтра, потому что
-    БД-узлы создаются synthetic'ами на лету (реальный deployment у БД может
-    жить в чужом ns или быть managed-сервисом).
+    Два источника (`source`):
 
-    Канонический формат db_node_name: `db:<driver>:<host>` — отделяет узел
-    БД от deployment-сервиса с тем же именем (например, БД-кластер
-    `finance-db` ≠ приложение `finance-db`).
+    1. `dsn_env` — plain `value` с DSN-схемой (postgres:// / redis:// /
+       clickhouse:// / mysql:// / mongodb:// / amqp(s):// / elasticsearch://).
+       Точный host из value.
 
-    External cloud-БД (RDS / CloudSQL / Atlas) исключаются по hostname:
-    содержит `amazonaws|azure|gcp|cloud.google` → skip.
+    2. `secret_hint` — `valueFrom.secretKeyRef.name` распознан как DB-secret
+       по regex (A2-v2). Host выводится эвристически из имени secret-а
+       (без чтения содержимого — RBAC у sre-ai SA на secrets отсутствует
+       намеренно). Менее точно: ns = own_namespace, host = derived от имени.
+
+    Канонический формат `db_node`: `db:<driver>:<host>` — отделяет узел
+    БД от одноимённого application-deployment.
+
+    External cloud-БД (RDS / CloudSQL / Atlas) исключаются по hostname
+    в dsn_env пути; для secret_hint cloud-фильтр не применим (имя
+    secret-а не отражает endpoint).
     """
     envs: List[Dict[str, Any]] = []
     for c in deploy.get("spec", {}).get("template", {}).get("spec", {}).get("containers", []):
         envs += c.get("env") or []
 
-    found: set[Tuple[str, str, str]] = set()
+    found: set[Tuple[str, str, str, str]] = set()
     for e in envs:
+        # === 1. Plain DSN value ===
         v = str(e.get("value") or "").strip()
-        if not v:
-            continue
-        m = _DSN_RE.match(v)
-        if not m:
-            continue
-        driver = m.group("scheme").lower()
-        driver = _DSN_DRIVER_CANON.get(driver, driver)
+        if v:
+            m = _DSN_RE.match(v)
+            if m:
+                driver = m.group("scheme").lower()
+                driver = _DSN_DRIVER_CANON.get(driver, driver)
 
-        # DSN ветка `_parse_host_from_value` уже умеет вырезать user:pass@,
-        # порт, path и .svc.cluster.local. Используем его, но обходим
-        # _SKIP_VALUE_FRAGMENTS-фильтр сами (там 'redis'/'postgres' помечены
-        # как noise — справедливо для HTTP, но не для DSN).
-        host = _parse_host_from_value(v, allow_no_scheme=False)
-        if host is None:
-            # _parse мог отбросить из-за SKIP_FRAGMENTS. Fallback-парсинг
-            # достаточно для bare-host без cloud-markers:
-            rest = v.split("://", 1)[1]
-            if "@" in rest:
-                rest = rest.split("@", 1)[1]
-            rest = rest.split("?", 1)[0].split("/", 1)[0].split(":", 1)[0]
-            rest = re.sub(r"\.svc\.cluster\.local$", "", rest)
-            if not rest:
-                continue
-            lower_host = rest.lower()
-            if any(frag in lower_host for frag in ("amazonaws", "azure", "googleapis", "cloud.google")):
-                continue
-            parts = rest.split(".", 1)
-            svc = parts[0].lower()
-            ns = parts[1].lower() if len(parts) > 1 else None
-            if not _SVC_NAME_RE.match(svc) or svc in _SKIP_SERVICE_NAMES:
-                continue
-        else:
-            svc, ns = host
+                # _parse_host_from_value умеет вырезать user:pass@, порт,
+                # path и .svc.cluster.local. Обходим только
+                # _SKIP_VALUE_FRAGMENTS-фильтр (там 'redis'/'postgres'
+                # помечены как noise для HTTP, но это не наш случай).
+                host = _parse_host_from_value(v, allow_no_scheme=False)
+                if host is None:
+                    rest = v.split("://", 1)[1]
+                    if "@" in rest:
+                        rest = rest.split("@", 1)[1]
+                    rest = rest.split("?", 1)[0].split("/", 1)[0].split(":", 1)[0]
+                    rest = re.sub(r"\.svc\.cluster\.local$", "", rest)
+                    if rest:
+                        lower_host = rest.lower()
+                        if not any(frag in lower_host for frag in (
+                            "amazonaws", "azure", "googleapis", "cloud.google",
+                        )):
+                            parts = rest.split(".", 1)
+                            svc = parts[0].lower()
+                            ns = parts[1].lower() if len(parts) > 1 else None
+                            if _SVC_NAME_RE.match(svc) and svc not in _SKIP_SERVICE_NAMES:
+                                found.add((
+                                    f"db:{driver}:{svc}",
+                                    ns or own_namespace,
+                                    driver,
+                                    "dsn_env",
+                                ))
+                else:
+                    svc, ns = host
+                    found.add((
+                        f"db:{driver}:{svc}",
+                        ns or own_namespace,
+                        driver,
+                        "dsn_env",
+                    ))
+                continue  # plain DSN исключает дальнейший parse этого env
 
-        ns = ns or own_namespace
-        db_node = f"db:{driver}:{svc}"
-        found.add((db_node, ns, driver))
+        # === 2. secretKeyRef heuristic (A2-v2) ===
+        # Сначала key (информативен в WO: MV_POSTGRES_DB_CONNECTION),
+        # fallback на name (для других конвенций именования).
+        vf = e.get("valueFrom") or {}
+        sref = vf.get("secretKeyRef") or {}
+        secret_name = sref.get("name") or ""
+        secret_key = sref.get("key") or ""
+        if not (secret_name or secret_key):
+            continue
+        hint = _parse_db_hint_from_secret_ref(secret_name, secret_key)
+        if hint is None:
+            continue
+        driver, host_hint = hint
+        found.add((
+            f"db:{driver}:{host_hint}",
+            own_namespace,  # secret может ссылаться на DB в любом ns
+            driver,
+            "secret_hint",
+        ))
+
     return sorted(found)
 
 
@@ -490,11 +677,12 @@ def sync_namespace(
             )
             stats["edges"] += 1
 
-        # A2: DB-edges из DSN-схем (postgres/redis/clickhouse/mysql/mongodb).
-        # Synthetic-узел `db:<driver>:<host>` — отделяет узел БД от
-        # одноимённого application-deployment. team_owner="data" — маркер
-        # инфра-узла данных. Driver кладём в extras для embed-вывода.
-        for db_node, db_ns, driver in _extract_db_targets(deploy, namespace):
+        # A2: DB-edges из DSN-схем (plain value) + эвристика по secret-name
+        # (A2-v2, когда DSN в valueFrom.secretKeyRef и RBAC не даёт читать).
+        # Synthetic-узел `db:<driver>:<host>`, team_owner="data".
+        # confidence отражает точность источника: dsn_env — точно (host из
+        # реального значения), secret_hint — нестрого (host угадан из имени).
+        for db_node, db_ns, driver, source in _extract_db_targets(deploy, namespace):
             dst = upsert_service(
                 db,
                 namespace=db_ns,
@@ -502,11 +690,16 @@ def sync_namespace(
                 team_owner="data",
                 synthetic=True,
             )
+            confidence = "inferred_env" if source == "dsn_env" else "inferred_secret_name"
             upsert_edge(
                 db, src=src, dst=dst,
                 kind="uses_db",
-                discovered_by="kg_sync/dsn_env",
-                extras={"driver": driver, **_inferred_extras("uses_db")},
+                discovered_by=f"kg_sync/{source}",
+                extras={
+                    "driver": driver,
+                    "confidence": confidence,
+                    "semantics": _KIND_TO_SEMANTICS["uses_db"],
+                },
             )
             stats["edges"] += 1
 

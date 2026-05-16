@@ -421,7 +421,7 @@ def test_db_targets_postgres_with_explicit_ns():
         _mk_deploy_with_env({"DSN": "postgres://u:p@finance-db.prod-shared:5432/f"}),
         own_namespace="prod-kingdom1",
     )
-    assert out == [("db:postgres:finance-db", "prod-shared", "postgres")]
+    assert out == [("db:postgres:finance-db", "prod-shared", "postgres", "dsn_env")]
 
 
 def test_db_targets_redis_bare_host_uses_own_ns():
@@ -430,7 +430,7 @@ def test_db_targets_redis_bare_host_uses_own_ns():
         _mk_deploy_with_env({"CACHE_URL": "redis://redis-cluster:6379/0"}),
         own_namespace="prod-kingdom1",
     )
-    assert out == [("db:redis:redis-cluster", "prod-kingdom1", "redis")]
+    assert out == [("db:redis:redis-cluster", "prod-kingdom1", "redis", "dsn_env")]
 
 
 def test_db_targets_driver_canonization():
@@ -467,3 +467,129 @@ def test_db_targets_skip_non_dsn():
     ]
     for envs in cases:
         assert _extract_db_targets(_mk_deploy_with_env(envs), "ns") == []
+
+
+# ── A2-v2: secret-name heuristic ────────────────────────────────────────────
+
+def _mk_deploy_with_secret_envs(envs: dict) -> dict:
+    """envs: {env_name: secret_name} → deployment с valueFrom.secretKeyRef."""
+    return {"spec": {"template": {"spec": {"containers": [{"env": [
+        {"name": k, "valueFrom": {"secretKeyRef": {"name": v, "key": "url"}}}
+        for k, v in envs.items()
+    ]}]}}}}
+
+
+def test_secret_hint_postgres():
+    from app.knowledge_graph.kg_sync import _parse_db_hint_from_secret_name
+    assert _parse_db_hint_from_secret_name("postgres-finance-secret") == ("postgres", "finance")
+    # `rw`/`ro` (read-write / read-only) — noise; вырезаются, остаётся бизнес-имя.
+    assert _parse_db_hint_from_secret_name("finance-postgres-rw-creds") == ("postgres", "finance")
+    assert _parse_db_hint_from_secret_name("postgres-orders-ro-secret") == ("postgres", "orders")
+
+
+def test_secret_hint_mongo_canonical():
+    """`mongo` в имени → driver канонизируется в mongodb."""
+    from app.knowledge_graph.kg_sync import _parse_db_hint_from_secret_name
+    assert _parse_db_hint_from_secret_name("mongo-sessions-config") == ("mongodb", "sessions")
+
+
+def test_secret_hint_rabbit_to_amqp():
+    from app.knowledge_graph.kg_sync import _parse_db_hint_from_secret_name
+    assert _parse_db_hint_from_secret_name("rabbit-events-creds") == ("amqp", "events")
+
+
+def test_secret_hint_no_driver_token_returns_none():
+    """Имя без driver-токена не парсится."""
+    from app.knowledge_graph.kg_sync import _parse_db_hint_from_secret_name
+    assert _parse_db_hint_from_secret_name("app-db-credentials") is None
+    assert _parse_db_hint_from_secret_name("api-config") is None
+    assert _parse_db_hint_from_secret_name("") is None
+    assert _parse_db_hint_from_secret_name("random-string") is None
+
+
+def test_secret_hint_all_noise_returns_none():
+    """Только driver + noise-токены → нет host hint."""
+    from app.knowledge_graph.kg_sync import _parse_db_hint_from_secret_name
+    assert _parse_db_hint_from_secret_name("postgres-secret") is None
+    assert _parse_db_hint_from_secret_name("redis-creds") is None
+    assert _parse_db_hint_from_secret_name("mongo-config") is None
+
+
+def test_db_targets_secret_hint_e2e():
+    """A2-v2: valueFrom.secretKeyRef.name → uses_db edge со source=secret_hint."""
+    from app.knowledge_graph.kg_sync import _extract_db_targets
+    out = _extract_db_targets(
+        _mk_deploy_with_secret_envs({
+            "DB_URL": "postgres-finance-secret",
+            "CACHE_URL": "redis-cache-creds",
+        }),
+        own_namespace="prod-kingdom1",
+    )
+    assert ("db:postgres:finance", "prod-kingdom1", "postgres", "secret_hint") in out
+    assert ("db:redis:cache", "prod-kingdom1", "redis", "secret_hint") in out
+
+
+# ── A2-v2: secret-key heuristic (важнее secret-name в WO) ──────────────────
+
+def test_secret_key_postgres_explicit_driver():
+    from app.knowledge_graph.kg_sync import _parse_db_hint_from_secret_key
+    assert _parse_db_hint_from_secret_key("MV_POSTGRES_DB_CONNECTION") == ("postgres", "mv")
+    assert _parse_db_hint_from_secret_key("ANALYTICS_DB_CLICKHOUSE_CONNECTION") == ("clickhouse", "analytics")
+
+
+def test_secret_key_generic_db_defaults_to_postgres():
+    """Generic *_DB_CONNECTION без driver-токена → postgres (WO default)."""
+    from app.knowledge_graph.kg_sync import _parse_db_hint_from_secret_key
+    assert _parse_db_hint_from_secret_key("TOWN_DB_CONNECTION") == ("postgres", "town")
+    assert _parse_db_hint_from_secret_key("CONFIG_DB_CONNECTION") == ("postgres", "config")
+    assert _parse_db_hint_from_secret_key("FINANCE_DB_CONNECTION") == ("postgres", "finance")
+
+
+def test_secret_key_multi_word_host():
+    """CHAT_MESSAGE_ADDITIONAL_DB_CONNECTION → chat-message (additional — noise)."""
+    from app.knowledge_graph.kg_sync import _parse_db_hint_from_secret_key
+    assert _parse_db_hint_from_secret_key("CHAT_MESSAGE_ADDITIONAL_DB_CONNECTION") == ("postgres", "chat-message")
+
+
+def test_secret_key_requires_endpoint_marker():
+    """Без CONNECTION/CONN/URI/URL/DSN — не endpoint, skip (creds, тех значения)."""
+    from app.knowledge_graph.kg_sync import _parse_db_hint_from_secret_key
+    assert _parse_db_hint_from_secret_key("PG_USER") is None
+    assert _parse_db_hint_from_secret_key("PG_PASSWORD") is None
+    assert _parse_db_hint_from_secret_key("ACCESS_TOKEN_SECRET") is None
+    assert _parse_db_hint_from_secret_key("S3_REGION") is None
+
+
+def test_secret_key_no_db_token_returns_none():
+    from app.knowledge_graph.kg_sync import _parse_db_hint_from_secret_key
+    # endpoint-marker есть, но нет ни DB, ни driver-токена → не DB endpoint.
+    assert _parse_db_hint_from_secret_key("CDN_BASE_URI") is None
+    assert _parse_db_hint_from_secret_key("UPDATE_SERVICE_REST_ENDPOINT") is None
+    assert _parse_db_hint_from_secret_key("") is None
+
+
+def test_secret_ref_combined_prefers_key():
+    """secret_name тоже передаётся, но key информативнее → его и используем."""
+    from app.knowledge_graph.kg_sync import _parse_db_hint_from_secret_ref
+    # name='database' (generic), key точный → берём key.
+    assert _parse_db_hint_from_secret_ref("database", "TOWN_DB_CONNECTION") == ("postgres", "town")
+
+
+def test_secret_ref_falls_back_to_name():
+    """Если key не парсится, проверяем name (для других конвенций)."""
+    from app.knowledge_graph.kg_sync import _parse_db_hint_from_secret_ref
+    assert _parse_db_hint_from_secret_ref("postgres-finance-secret", "url") == ("postgres", "finance")
+
+
+def test_db_targets_dsn_env_wins_over_secret_hint():
+    """Если у env есть и value, и valueFrom, priority — plain DSN."""
+    from app.knowledge_graph.kg_sync import _extract_db_targets
+    deploy = {"spec": {"template": {"spec": {"containers": [{"env": [
+        {
+            "name": "DB_URL",
+            "value": "postgres://u@real-host:5432/d",
+            "valueFrom": {"secretKeyRef": {"name": "postgres-fake-secret", "key": "x"}},
+        }
+    ]}]}}}}
+    out = _extract_db_targets(deploy, "ns")
+    assert out == [("db:postgres:real-host", "ns", "postgres", "dsn_env")]
