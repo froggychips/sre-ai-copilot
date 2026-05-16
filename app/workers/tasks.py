@@ -68,6 +68,13 @@ celery_app.conf.beat_schedule = {
         "task": "k8s_pod_events_sync",
         "schedule": crontab(minute="*/10"),
     },
+    # D2-auto: drift cleanup. Раз в час пересинхронизирует kg_services со
+    # списком существующих в k8s ns. Safety threshold 20% — защита от
+    # mass-mark при временной недоступности API server.
+    "kg-drift-cleanup": {
+        "task": "kg_drift_cleanup",
+        "schedule": crontab(minute=17),  # ежечасно в 17 мин
+    },
 }
 
 
@@ -157,6 +164,26 @@ def k8s_pod_events_sync_task():
     finally:
         db.close()
     return result
+
+
+@celery_app.task(name="kg_drift_cleanup")
+def kg_drift_cleanup_task():
+    """D2-auto: пометить services из несуществующих ns как synthetic.
+
+    Safety: max_drift_pct=20% — при kubectl-failure / временной недоступности
+    API server вернётся пустой ns-set, drift станет 100%, threshold заблокирует
+    UPDATE. Manual run для override: `python -m app.scripts.cleanup_drift --apply`.
+    """
+    from app.knowledge_graph.drift_cleanup import run_drift_cleanup
+
+    db = SessionLocal()
+    try:
+        return run_drift_cleanup(db, max_drift_pct=20.0, apply=True)
+    except Exception as e:
+        logger.warning("kg_drift_cleanup.failed: %s", e)
+        return {"error": str(e)}
+    finally:
+        db.close()
 
 
 @celery_app.task(name="tc_deploys_to_kg")

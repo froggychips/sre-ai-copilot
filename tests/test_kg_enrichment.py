@@ -735,3 +735,91 @@ def test_upsert_edge_idempotent_for_same_source():
 
     # Не задублился
     assert existing.extras["discovery_sources"] == ["kg_sync/env_vars"]
+
+
+# ── D2-auto: drift cleanup safety threshold ───────────────────────────────
+
+
+def test_drift_cleanup_skipped_threshold():
+    """Когда drift > max_drift_pct — no-op, защита от false-wipe."""
+    from unittest.mock import patch
+    from app.knowledge_graph.drift_cleanup import run_drift_cleanup
+
+    # Mock: k8s has 1 ns, kg has 5 ns (4 drift = 80% > 20% threshold).
+    with patch("app.knowledge_graph.drift_cleanup._k8s_live_namespaces",
+               return_value={"only-this"}):
+        db = MagicMock()
+        db.query.return_value.distinct.return_value.all.return_value = [
+            ("ns-a",), ("ns-b",), ("ns-c",), ("ns-d",), ("only-this",),
+        ]
+        result = run_drift_cleanup(db, max_drift_pct=20.0, apply=True)
+
+    assert result["skipped_threshold"] is True
+    assert result["drift_pct"] == 80.0
+    assert result["marked_services"] == 0
+    assert result["applied"] is False
+    # UPDATE не должен быть вызван
+    db.commit.assert_not_called()
+
+
+def test_drift_cleanup_within_threshold_apply():
+    """Когда drift ≤ threshold — UPDATE применяется."""
+    from unittest.mock import patch, MagicMock
+    from app.knowledge_graph.drift_cleanup import run_drift_cleanup
+    from app.knowledge_graph.schema import Service
+
+    # Mock: 5 ns в KG, 4 в k8s → drift 1/5 = 20% (на границе, проходит).
+    svc = MagicMock(spec=Service)
+    svc.synthetic = False
+    svc.metadata_json = None
+
+    with patch("app.knowledge_graph.drift_cleanup._k8s_live_namespaces",
+               return_value={"a", "b", "c", "d"}):
+        db = MagicMock()
+        db.query.return_value.distinct.return_value.all.return_value = [
+            ("a",), ("b",), ("c",), ("d",), ("drift-ns",),
+        ]
+        db.query.return_value.filter.return_value.all.return_value = [svc]
+        result = run_drift_cleanup(db, max_drift_pct=25.0, apply=True)
+
+    assert result["skipped_threshold"] is False
+    assert result["drift_pct"] == 20.0
+    assert result["applied"] is True
+    assert result["marked_services"] == 1
+    assert svc.synthetic is True
+    assert svc.metadata_json["drift_reason"] == "ns_not_in_k8s"
+    db.commit.assert_called_once()
+
+
+def test_drift_cleanup_kubectl_failure_raises():
+    """kubectl-failure → RuntimeError. Beat task ловит и логирует."""
+    from unittest.mock import patch
+    from app.knowledge_graph.drift_cleanup import run_drift_cleanup
+    import pytest
+
+    with patch("app.knowledge_graph.drift_cleanup.subprocess.run") as mr:
+        mr.return_value = MagicMock(returncode=1, stderr="connection refused")
+        with pytest.raises(RuntimeError, match="kubectl get ns failed"):
+            run_drift_cleanup(MagicMock(), apply=True)
+
+
+def test_drift_cleanup_already_marked_idempotent():
+    """Services с drift_reason уже помечены — skip повтор."""
+    from unittest.mock import patch, MagicMock
+    from app.knowledge_graph.drift_cleanup import run_drift_cleanup
+    from app.knowledge_graph.schema import Service
+
+    already = MagicMock(spec=Service)
+    already.synthetic = True
+    already.metadata_json = {"drift_reason": "ns_not_in_k8s"}
+
+    with patch("app.knowledge_graph.drift_cleanup._k8s_live_namespaces",
+               return_value={"a", "b", "c", "d"}):
+        db = MagicMock()
+        db.query.return_value.distinct.return_value.all.return_value = [
+            ("a",), ("b",), ("c",), ("d",), ("drift-ns",),
+        ]
+        db.query.return_value.filter.return_value.all.return_value = [already]
+        result = run_drift_cleanup(db, max_drift_pct=25.0, apply=True)
+
+    assert result["marked_services"] == 0  # уже помечен, skip
