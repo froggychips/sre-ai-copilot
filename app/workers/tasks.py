@@ -99,6 +99,16 @@ celery_app.conf.beat_schedule = {
         "task": "kg_health_recompute",
         "schedule": crontab(minute="*/20"),
     },
+    # External probe: DNS+TCP+HTTPS на synthetic `ingress:<host>` узлы. Каждую
+    # минуту проверяет публичные endpoint'ы (источник — k8s Ingress hosts из
+    # kg_ingress_sync). При consecutive_failures ≥ EXTERNAL_PROBE_FAIL_THRESHOLD
+    # шлёт embed в DISCORD_WEBHOOK_URL и пишет AlertEvent в kg_alerts.
+    # Default OFF (EXTERNAL_PROBE_ENABLED=False) — включается осознанно после
+    # подгонки threshold/таргетов.
+    "kg-external-probe": {
+        "task": "kg_external_probe",
+        "schedule": crontab(minute="*"),
+    },
 }
 
 
@@ -200,6 +210,27 @@ def kg_ingress_sync_task():
         return sync_all_ingresses(db)
     except Exception as e:
         logger.warning("kg_ingress_sync.failed: %s", e)
+        return {"error": str(e)}
+    finally:
+        db.close()
+
+
+@celery_app.task(name="kg_external_probe")
+def kg_external_probe_task():
+    """External probe: DNS+TCP+HTTPS на synthetic `ingress:<host>` узлы.
+
+    Идемпотентен: state (consecutive_failures / firing) в metadata_json.
+    Безопасен к беатам-пропускам (один пропуск ≠ false-resolve).
+    Шлёт Discord на FAIL_THRESHOLD-й тик подряд, resolve — при возврате в up.
+    """
+    import asyncio as _aio
+    from app.knowledge_graph.external_probe_sync import run_external_probe
+
+    db = SessionLocal()
+    try:
+        return _aio.run(run_external_probe(db))
+    except Exception as e:
+        logger.warning("kg_external_probe.failed: %s", e)
         return {"error": str(e)}
     finally:
         db.close()

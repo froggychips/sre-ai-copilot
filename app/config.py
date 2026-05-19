@@ -110,6 +110,14 @@ class Settings(BaseSettings):
 
     DISCORD_WEBHOOK_URL: Optional[str] = Field(None, description="Discord webhook — канал #error (инциденты)")
     DISCORD_WEBHOOK_STATS_URL: Optional[str] = Field(None, description="Discord webhook — канал #stats (cluster health, daily report)")
+
+    # External probe: DNS+TCP+HTTPS на synthetic `ingress:<host>` узлы из KG.
+    # Источник hosts — k8s Ingress (см. kg_ingress_sync). Default OFF чтобы
+    # первый запуск с >100 hosts не залил Discord — включается вручную после
+    # того как allowlist/threshold подобран. Алерты идут в DISCORD_WEBHOOK_URL.
+    EXTERNAL_PROBE_ENABLED: bool = Field(False, description="Включить периодический probe внешних ingress-hosts")
+    EXTERNAL_PROBE_TIMEOUT_SECONDS: float = Field(5.0, description="Timeout per-IP TCP и HTTPS HEAD")
+    EXTERNAL_PROBE_FAIL_THRESHOLD: int = Field(3, description="Сколько подряд fail-ов до alert (anti-flap)")
     # Discord Interactions — для обработки нажатий кнопок 👍/👎.
     # Взять из Discord Developer Portal → Application → General Information.
     DISCORD_PUBLIC_KEY: Optional[str] = Field(None, description="Ed25519 публичный ключ приложения Discord")

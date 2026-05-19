@@ -598,6 +598,81 @@ class DiscordService:
                     extra={"status": r.status_code, "body": r.text[:200]},
                 )
 
+    async def send_external_probe_alert(
+        self,
+        host: str,
+        status: str,
+        snapshot: Dict[str, Any],
+        resolved: bool = False,
+    ) -> None:
+        """Compact embed для external probe state-change.
+
+        firing: 🔴 down или 🟡 degraded — color по severity, поле "IPs" с
+        per-IP TCP/HTTP results, поле "HTTPS" с общим HEAD-кодом.
+        resolved: ✅ — green, краткая строка.
+        """
+        if settings.DISCORD_DRY_RUN:
+            _dry_run_log.info(
+                "discord.dry_run.send_external_probe_alert",
+                host=host, status=status, resolved=resolved,
+            )
+            return
+        url = settings.DISCORD_WEBHOOK_URL
+        if not url:
+            logging.warning("DISCORD_WEBHOOK_URL not set, skipping external probe alert")
+            return
+
+        if resolved:
+            title = f"✅ External probe recovered: {host}"
+            color = _COLOR_RESOLVED
+        elif status == "down":
+            title = f"🔴 External probe DOWN: {host}"
+            color = _COLOR_CRITICAL
+        else:
+            title = f"🟡 External probe degraded: {host}"
+            color = _COLOR_WARNING
+
+        ip_lines: List[str] = []
+        for r in (snapshot.get("tcp_results") or []):
+            ok = r.get("tcp_ok")
+            mark = "✓" if ok else "✗"
+            err = (r.get("error") or "")[:60]
+            ms = r.get("latency_ms")
+            ms_s = f"{ms}ms" if ms is not None else "—"
+            ip_lines.append(f"`{mark}` `{r.get('ip','?'):<15}` tcp={ms_s} {err}")
+        if not ip_lines and snapshot.get("dns_error"):
+            ip_lines.append(f"DNS: `{snapshot['dns_error']}`")
+
+        http = snapshot.get("http_result") or {}
+        http_line = f"code=`{http.get('http_code', '—')}` latency=`{http.get('latency_ms', '—')}ms`"
+        if http.get("error"):
+            http_line += f" err=`{http['error'][:80]}`"
+
+        fields = [
+            {"name": "IPs", "value": "\n".join(ip_lines)[:1024] or "—", "inline": False},
+            {"name": "HTTPS HEAD", "value": http_line[:1024], "inline": False},
+        ]
+        cf = snapshot.get("consecutive_failures")
+        if cf and not resolved:
+            fields.append({"name": "Consecutive failures", "value": f"`{cf}`", "inline": True})
+
+        payload = {
+            "embeds": [{
+                "title": title[:256],
+                "color": color,
+                "fields": fields,
+                "footer": {"text": f"external_probe/{host}"},
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+            }]
+        }
+        async with httpx.AsyncClient() as client:
+            r = await client.post(url, json=payload)
+            if r.status_code >= 400:
+                logging.error(
+                    "discord_external_probe_alert_failed",
+                    extra={"status": r.status_code, "body": r.text[:200], "host": host},
+                )
+
     async def send_approval_request(self, approval_id: str, details: dict):
         """Отправляет Rich Embed с информацией об опасной операции и ссылками для подтверждения."""
         payload = {
