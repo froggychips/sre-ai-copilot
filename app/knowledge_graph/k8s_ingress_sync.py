@@ -24,7 +24,6 @@ from __future__ import annotations
 import json
 import logging
 import subprocess
-import sys
 from typing import Any, Dict, List
 
 from sqlalchemy.orm import Session

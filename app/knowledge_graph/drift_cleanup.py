@@ -14,13 +14,11 @@
 """
 from __future__ import annotations
 
-import json
 import logging
 import subprocess
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Set
+from typing import Any, Dict, Set
 
-from sqlalchemy import update
 from sqlalchemy.orm import Session
 
 from app.knowledge_graph.schema import Service

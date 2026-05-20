@@ -9,7 +9,7 @@
   - Builder корректно работает при пустом KG (in_kg=False fallback).
 """
 import uuid
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, patch
 
 import pytest
 
