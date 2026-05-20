@@ -416,13 +416,20 @@ class DiscordService:
                 shorts = []
                 for s in srcs:
                     s_low = (s or "").lower()
-                    if "secret" in s_low: shorts.append("secret")
-                    elif "nats" in s_low: shorts.append("nats")
-                    elif "url" in s_low: shorts.append("url")
-                    elif "env" in s_low: shorts.append("env")
-                    elif "dsn" in s_low: shorts.append("dsn")
-                    elif "runtime" in s_low: shorts.append("runtime")
-                    else: shorts.append("?")
+                    if "secret" in s_low:
+                        shorts.append("secret")
+                    elif "nats" in s_low:
+                        shorts.append("nats")
+                    elif "url" in s_low:
+                        shorts.append("url")
+                    elif "env" in s_low:
+                        shorts.append("env")
+                    elif "dsn" in s_low:
+                        shorts.append("dsn")
+                    elif "runtime" in s_low:
+                        shorts.append("runtime")
+                    else:
+                        shorts.append("?")
                 return "+".join(dict.fromkeys(shorts))  # unique-preserved-order
 
             by_kind: Dict[str, List[str]] = {}

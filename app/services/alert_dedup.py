@@ -16,7 +16,6 @@ Fail-open: при недоступности Redis возвращаем SEND (к
 from __future__ import annotations
 
 import json
-import time
 from datetime import datetime, timedelta, timezone
 from enum import Enum
 from typing import Optional

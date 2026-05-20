@@ -114,7 +114,6 @@ def upsert_edge(
         # C1: каждый upsert — refresh last_seen_at. Edges, не подтверждённые
         # N дней, попадут в decay-task (см. queries.upstream_of(fresh_only=)).
         edge.last_seen_at = now
-        changed = True
         if edge.weight != weight:
             edge.weight = weight
         # C3: merge discovery_sources unique-list, не overwrite одним источником.

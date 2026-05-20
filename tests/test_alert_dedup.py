@@ -18,10 +18,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from app.services.alert_dedup import (CHRONIC_MIN_COUNT,
-                                      CHRONIC_QUIET_RESET_SECONDS,
-                                      ROLLOUT_NOISE_THRESHOLD_SECONDS,
-                                      Decision, decide_send)
+from app.services.alert_dedup import (Decision, decide_send)
 
 
 @pytest.fixture

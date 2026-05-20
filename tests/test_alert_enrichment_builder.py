@@ -9,7 +9,6 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from app.diagnostics.facts import Fact, FactKind
 from app.models.incident import Incident
 from app.services.alert_enrichment import (EnrichedContext,
                                            _detect_rollout_noise,
@@ -214,7 +213,8 @@ async def test_send_enriched_alert_rollout_noise_tagged_and_dimmed():
 
     async def fake_post(self, url, json=None, **_):
         sent["payload"] = json
-        resp = MagicMock(); resp.status_code = 204
+        resp = MagicMock()
+        resp.status_code = 204
         return resp
 
     svc = DiscordService()
@@ -242,7 +242,8 @@ async def test_send_enriched_alert_recurrence_tag():
 
     async def fake_post(self, url, json=None, **_):
         sent["payload"] = json
-        resp = MagicMock(); resp.status_code = 204
+        resp = MagicMock()
+        resp.status_code = 204
         return resp
 
     svc = DiscordService()
