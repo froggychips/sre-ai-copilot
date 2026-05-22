@@ -248,6 +248,25 @@ class Settings(BaseSettings):
     CHRONIC_DIGEST_MIN_FIRES: int = 5
     STATS_DIGEST_STALE_DAYS: int = Field(30, description="Threshold days for stale-deployment detection")
 
+    # Per-team daily digest (см. app/services/team_digest.py).
+    # Шлёт один embed на каждый team_owner из kg_services с top-5 fragile,
+    # deploy success-rate, open alerts, SLO burn. Default OFF — opt-in после
+    # того как kg_signal_aggregates наполнится (минимум 24h работы
+    # `kg_signal_aggregates_compute`).
+    TEAM_DIGEST_ENABLED: bool = Field(False, description="Enable daily team digest beat task")
+    TEAM_DIGEST_HOUR_UTC: int = Field(9, description="UTC hour to run team digest (0-23)")
+    TEAM_DIGEST_WINDOW_HOURS: int = Field(24, description="Aggregation window for team digest")
+    # Единый канал для всех teams на первое время — пока per-team mapping
+    # не вычитан из Discord-серверов. Fallback на DISCORD_WEBHOOK_STATS_URL.
+    DISCORD_WEBHOOK_TEAM_DIGEST_URL: Optional[str] = Field(
+        None,
+        description="Discord webhook для team digests (общий канал)",
+    )
+    # TODO: per-team channel mapping. Когда команды разъедутся по своим
+    # каналам, формат будет JSON через env:
+    #   TEAM_DIGEST_CHANNEL_MAP='{"squad-1":"https://discord.com/api/webhooks/..."}'
+    # А сейчас все летит в DISCORD_WEBHOOK_TEAM_DIGEST_URL.
+
     # Executor approval (PR #3 executor track). Если True — Discord-embed
     # получает кнопку "Apply", которая после двухшагового подтверждения
     # запускает kubectl с dry_run=False. Требует:
@@ -257,6 +276,25 @@ class Settings(BaseSettings):
     #   4. execution_intent.risk in {"low", "medium"} (high — manual only)
     # Default False — нужен явный опт-ин на проде.
     EXECUTOR_APPROVAL_ENABLED: bool = Field(False, description="Show Apply button on Discord embed")
+
+    # Seq — log aggregator. Layout WO: на каждом wo-api{N}-prod `/seq/`
+    # + один в ns `logging`. Используется beat-task'ом `kg_seq_logs_sync`
+    # для агрегации Error/Fatal событий per service per ~10 мин в
+    # `kg_log_observations`. Пусто = task no-op.
+    #
+    # Два способа конфигурации (взаимодополняющие):
+    #   1. SEQ_INSTANCES (JSON) — полный список с namespace-hint:
+    #      `[{"name":"prod","url":"https://wo-api1-prod.../seq",
+    #         "token":"...","namespace":"prod-shared"}, ...]`
+    #   2. Одиночные SEQ_URL_<ENV>/SEQ_TOKEN_<ENV> для prod/preprod/preupdate
+    #      (без namespace-hint — сервис матчится по name только).
+    SEQ_INSTANCES: str = Field("", description="Seq instances (JSON list). Пусто = fallback на SEQ_URL_<ENV>")
+    SEQ_URL_PROD: str = Field("", description="Seq prod base URL (https://wo-api1-prod.lastoasisgame.com/seq)")
+    SEQ_TOKEN_PROD: str = Field("", description="Seq prod API key (X-Seq-ApiKey header)")
+    SEQ_URL_PREPROD: str = Field("", description="Seq preprod base URL")
+    SEQ_TOKEN_PREPROD: str = Field("", description="Seq preprod API key")
+    SEQ_URL_PREUPDATE: str = Field("", description="Seq preupdate base URL")
+    SEQ_TOKEN_PREUPDATE: str = Field("", description="Seq preupdate API key")
 
     # Atlassian Jira — поиск известных инцидентов/задач по сервису.
     # Basic Auth: email + API token (https://id.atlassian.com/manage-profile/security/api-tokens)

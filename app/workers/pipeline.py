@@ -43,7 +43,9 @@ from app.diagnostics import default_engine as diag_engine
 from app.diagnostics.facts import FactStore
 from app.diagnostics.incident_ctx import build_diagnostics_ctx
 from app.knowledge_graph.auto_populator import populate_from_incident
+from app.knowledge_graph.schema import Service
 from app.models.incident import Incident
+from app.rca.deploy_correlator import correlate_deploy_to_incident
 from app.observability.ai_metrics import (
     track_disagreement,
     track_execution_intent,
@@ -200,6 +202,10 @@ class IncidentPipeline:
                 self._enrich_statics(diag_ctx),
                 return_exceptions=True,
             )
+            # Sync best-effort hook: ищем deploy в окне до инцидента и
+            # сравниваем метрики до/после. Результат — отдельный сигнал для
+            # RCA-агентов и финального синтеза (см. diag_ctx["deploy_correlation"]).
+            self._enrich_deploy_correlation(diag_ctx)
             self.fact_store = diag_engine.run(diag_ctx)
         snap = t.snapshot().to_dict()
         self._safe_transition(IncidentState.FACTS_COLLECTED, snap)
@@ -236,6 +242,55 @@ class IncidentPipeline:
                 audit_service.log_event("STATICS_ENRICHED", {"incident_id": self.incident_id})
         except Exception as e:
             audit_service.log_event("STATICS_ENRICH_FAILED", {"incident_id": self.incident_id, "error": str(e)})
+
+    def _enrich_deploy_correlation(self, diag_ctx: dict) -> None:
+        """Связать инцидент с недавним deploy через kg_deployments+kg_service_health.
+
+        Sync, best-effort. При любой ошибке пайплайн не падает: просто пишем
+        событие в audit и идём дальше.
+
+        TODO: глубже интегрировать в hypothesis prompt (app/workers/pipeline.py
+        stage_hypothesize) и в SynthesisAgent — сейчас сигнал доступен через
+        diag_ctx["deploy_correlation"], но не подмешан в текст для LLM.
+        """
+        if not self.incident.namespace:
+            return
+        service_name = (self.incident.labels or {}).get("service")
+        if not service_name:
+            return
+        incident_starts_at = diag_ctx.get("incident_starts_at")
+        if incident_starts_at is None:
+            return
+        try:
+            svc = (
+                self.db.query(Service)
+                .filter(
+                    Service.namespace == self.incident.namespace,
+                    Service.name == service_name,
+                )
+                .one_or_none()
+            )
+            if svc is None:
+                return
+            result = correlate_deploy_to_incident(
+                db=self.db,
+                service_id=svc.id,
+                incident_ts=incident_starts_at,
+            )
+            diag_ctx["deploy_correlation"] = result
+            if result.get("verdict") == "suspect":
+                audit_service.log_event(
+                    "DEPLOY_CORRELATION_SUSPECT",
+                    {
+                        "incident_id": self.incident_id,
+                        "deploy_id": (result.get("deploy") or {}).get("id"),
+                    },
+                )
+        except Exception as e:
+            audit_service.log_event(
+                "DEPLOY_CORRELATION_FAILED",
+                {"incident_id": self.incident_id, "error": type(e).__name__},
+            )
 
     async def _enrich_gitlab(self) -> None:
         try:

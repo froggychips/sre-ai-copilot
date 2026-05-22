@@ -901,9 +901,19 @@ def test_health_perfect_when_no_signals():
     db = MagicMock()
     db.query.return_value.filter.return_value.all.return_value = []
     db.query.return_value.filter.return_value.count.return_value = 0
+    # SignalAggregate lookup — нет свежей записи → skip новых компонентов
+    db.query.return_value.filter.return_value.order_by.return_value.first.return_value = None
     score, signals = compute_health_for_service(db, svc)
     assert score == 1.0
-    assert signals == {"open_critical": 0, "open_warning": 0, "chronic_pod_events": 0, "recurrence_24h": 0}
+    assert signals["open_critical"] == 0
+    assert signals["open_warning"] == 0
+    assert signals["chronic_pod_events"] == 0
+    assert signals["recurrence_24h"] == 0
+    # Новые компоненты — graceful skip → None
+    assert signals["p95_drift_pct"] is None
+    assert signals["http_5xx_rate"] is None
+    assert signals["deploy_failure_pct"] is None
+    assert signals["slo_burn_pct"] is None
 
 
 def test_health_critical_alert_penalty():
@@ -920,6 +930,7 @@ def test_health_critical_alert_penalty():
     counts_returns = iter([0, 0])
     db.query.return_value.filter.return_value.all.return_value = [critical]
     db.query.return_value.filter.return_value.count.side_effect = lambda: next(counts_returns)
+    db.query.return_value.filter.return_value.order_by.return_value.first.return_value = None
     score, signals = compute_health_for_service(db, svc)
     assert score == 0.60
     assert signals["open_critical"] == 1
@@ -935,6 +946,7 @@ def test_health_chronic_pod_event_penalty():
     db.query.return_value.filter.return_value.all.return_value = []
     counts_returns = iter([2, 0])  # 2 chronic events, 0 recurrence
     db.query.return_value.filter.return_value.count.side_effect = lambda: next(counts_returns)
+    db.query.return_value.filter.return_value.order_by.return_value.first.return_value = None
     score, signals = compute_health_for_service(db, svc)
     # 1.0 - 2*0.35 = 0.30
     assert abs(score - 0.30) < 0.01
@@ -951,6 +963,7 @@ def test_health_recurrence_penalty():
     db.query.return_value.filter.return_value.all.return_value = []
     counts_returns = iter([0, 20])  # 0 chronic, 20 recurrences
     db.query.return_value.filter.return_value.count.side_effect = lambda: next(counts_returns)
+    db.query.return_value.filter.return_value.order_by.return_value.first.return_value = None
     score, _ = compute_health_for_service(db, svc)
     # 1.0 - (20 // 5) * 0.10 = 1.0 - 4*0.10 = 0.60
     assert abs(score - 0.60) < 0.01
@@ -968,5 +981,135 @@ def test_health_score_clamped_to_zero():
     db.query.return_value.filter.return_value.all.return_value = alerts
     counts_returns = iter([3, 20])
     db.query.return_value.filter.return_value.count.side_effect = lambda: next(counts_returns)
+    db.query.return_value.filter.return_value.order_by.return_value.first.return_value = None
     score, _ = compute_health_for_service(db, svc)
     assert score == 0.0
+
+
+# ── расширение health_score: p95/5xx/deploy/slo (2026-05-22) ────────────────
+
+
+def _mk_clean_db():
+    """db-mock без alerts/pod_events/recurrence — чистый baseline 1.0."""
+    from unittest.mock import MagicMock
+    db = MagicMock()
+    db.query.return_value.filter.return_value.all.return_value = []
+    db.query.return_value.filter.return_value.count.return_value = 0
+    db.query.return_value.filter.return_value.order_by.return_value.first.return_value = None
+    return db
+
+
+def test_health_penalty_high_5xx_rate():
+    """5xx rate 3% (>1% trigger) — penalty в районе 0.10 (capped 0.25)."""
+    from unittest.mock import patch
+    from app.knowledge_graph.health_score import compute_health_for_service
+    from app.knowledge_graph.schema import Service
+    svc = Service(id=1, namespace="ns", name="svc")
+    db = _mk_clean_db()
+    # p95 None (нет drift), 5xx = 0.03 (3%), 12 точек (>= 6 min)
+    with patch(
+        "app.knowledge_graph.health_score._recent_p95_and_5xx",
+        return_value=(None, 0.03, 12),
+    ), patch(
+        "app.knowledge_graph.health_score._baseline_p95",
+        return_value=None,
+    ), patch(
+        "app.knowledge_graph.health_score._latest_signal_aggregate",
+        return_value=None,
+    ):
+        score, signals = compute_health_for_service(db, svc)
+    # penalty = (0.03 - 0.01) * 5.0 = 0.10
+    assert abs(score - 0.90) < 0.01
+    assert signals["http_5xx_rate"] == 0.03
+
+
+def test_health_penalty_p95_drift():
+    """p95 текущее в 2× от baseline (drift 100%, > 50% trigger) — penalty."""
+    from unittest.mock import patch
+    from app.knowledge_graph.health_score import compute_health_for_service
+    from app.knowledge_graph.schema import Service
+    svc = Service(id=1, namespace="ns", name="svc")
+    db = _mk_clean_db()
+    # current 400ms vs baseline 200ms → drift = +100%
+    with patch(
+        "app.knowledge_graph.health_score._recent_p95_and_5xx",
+        return_value=(400.0, None, 10),
+    ), patch(
+        "app.knowledge_graph.health_score._baseline_p95",
+        return_value=200.0,
+    ), patch(
+        "app.knowledge_graph.health_score._latest_signal_aggregate",
+        return_value=None,
+    ):
+        score, signals = compute_health_for_service(db, svc)
+    # penalty = (100 - 50) * 0.005 = 0.25 (на самой границе cap)
+    assert abs(score - 0.75) < 0.01
+    assert signals["p95_drift_pct"] == 100.0
+    # cap проверка: ещё больший drift не должен увести ниже 0.75
+    with patch(
+        "app.knowledge_graph.health_score._recent_p95_and_5xx",
+        return_value=(2000.0, None, 10),
+    ), patch(
+        "app.knowledge_graph.health_score._baseline_p95",
+        return_value=200.0,
+    ), patch(
+        "app.knowledge_graph.health_score._latest_signal_aggregate",
+        return_value=None,
+    ):
+        score_big, _ = compute_health_for_service(db, svc)
+    assert abs(score_big - 0.75) < 0.01  # capped
+
+
+def test_health_penalty_slo_burn():
+    """slo_burn_pct 30% (> 10% trigger) — penalty из kg_signal_aggregates."""
+    from unittest.mock import MagicMock, patch
+    from app.knowledge_graph.health_score import compute_health_for_service
+    from app.knowledge_graph.schema import Service, SignalAggregate
+    svc = Service(id=1, namespace="ns", name="svc")
+    db = _mk_clean_db()
+    agg = MagicMock(spec=SignalAggregate)
+    agg.deploy_failure_pct = 0.0    # ниже trigger 20% — no penalty
+    agg.slo_burn_pct = 30.0
+    with patch(
+        "app.knowledge_graph.health_score._recent_p95_and_5xx",
+        return_value=(None, None, 0),
+    ), patch(
+        "app.knowledge_graph.health_score._baseline_p95",
+        return_value=None,
+    ), patch(
+        "app.knowledge_graph.health_score._latest_signal_aggregate",
+        return_value=agg,
+    ):
+        score, signals = compute_health_for_service(db, svc)
+    # penalty = (30 - 10) * 0.01 = 0.20 (под cap 0.25)
+    assert abs(score - 0.80) < 0.01
+    assert signals["slo_burn_pct"] == 30.0
+    assert signals["deploy_failure_pct"] == 0.0
+
+
+def test_health_skips_when_no_metric_data():
+    """Меньше 6 точек в kg_service_health за час → graceful skip,
+    нет penalty по p95/5xx; нет свежей SignalAggregate → нет penalty
+    deploy/slo. Score остаётся 1.0."""
+    from unittest.mock import patch
+    from app.knowledge_graph.health_score import compute_health_for_service
+    from app.knowledge_graph.schema import Service
+    svc = Service(id=1, namespace="ns", name="svc")
+    db = _mk_clean_db()
+    # 3 точки (< 6 min) → helper возвращает (None, None, 3)
+    with patch(
+        "app.knowledge_graph.health_score._recent_p95_and_5xx",
+        return_value=(None, None, 3),
+    ), patch(
+        "app.knowledge_graph.health_score._baseline_p95",
+        return_value=None,
+    ), patch(
+        "app.knowledge_graph.health_score._latest_signal_aggregate",
+        return_value=None,
+    ):
+        score, signals = compute_health_for_service(db, svc)
+    assert score == 1.0
+    assert signals["p95_drift_pct"] is None
+    assert signals["http_5xx_rate"] is None
+    assert signals["deploy_failure_pct"] is None
+    assert signals["slo_burn_pct"] is None

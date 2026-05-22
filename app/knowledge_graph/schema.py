@@ -273,6 +273,97 @@ class SignalAggregate(Base):
     )
 
 
+class AnomalyObservation(Base):
+    """Per-service per-metric аномалия по rolling z-score (>3 sigma).
+
+    Beat-task `kg_anomaly_detection_task` каждые ~10 мин пробегает по
+    kg_service_health: текущая точка vs baseline (7d, исключая последний
+    час). |z|>3 → 'warning'; |z|>5 → 'critical'. Идемпотентность по
+    (service_id, ts, metric) — повторный tick тот же snapshot не дубль.
+
+    `notified` — флаг для второй фазы (Discord). Default false, апдейт
+    отдельно когда уведомление успешно отослано.
+    """
+    __tablename__ = "kg_anomaly_observations"
+
+    id = Column(Integer, primary_key=True, index=True)
+    service_id = Column(
+        Integer, ForeignKey("kg_services.id"), nullable=False, index=True,
+    )
+    ts = Column(DateTime, nullable=False)
+    metric = Column(String, nullable=False)
+    value = Column(Float, nullable=True)
+    baseline_mean = Column(Float, nullable=True)
+    baseline_stddev = Column(Float, nullable=True)
+    z_score = Column(Float, nullable=True)
+    severity = Column(String, nullable=True)  # 'warning' | 'critical'
+    notified = Column(
+        Boolean, nullable=False, default=False, server_default="false",
+    )
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    service = relationship("Service")
+
+    __table_args__ = (
+        UniqueConstraint(
+            "service_id", "ts", "metric",
+            name="uq_kg_anomaly_obs_service_ts_metric",
+        ),
+        Index("ix_kg_anomaly_obs_service_ts", "service_id", "ts"),
+        Index("ix_kg_anomaly_obs_severity_ts", "severity", "ts"),
+    )
+
+
+class LogObservation(Base):
+    """Per-service агрегат error/fatal/warning логов из Seq за окно.
+
+    Beat-task `kg_seq_logs_sync` каждые ~10 мин тянет count событий по
+    level=Error/Fatal/Warning из нескольких Seq-инстансов (prod / preprod /
+    preupdate) и пишет одну строку per (service, level, source) в окно.
+
+    `service_id` NULLABLE — если по Application-тэгу из Seq не получилось
+    сматчить запись в `kg_services` (новый сервис ещё не в KG или
+    нестандартный тэг), всё равно сохраняем aggregate с service_id=NULL.
+    Атрибуция остаётся через `namespace` + `source` (имя Seq-инстанса).
+
+    `top_message_hash` — md5 от самого частого MessageTemplate за окно.
+    Стабильный fingerprint для группировки: msg повторяется три тика
+    подряд — значит это chronic-pattern. `sample_message` — текстовый
+    пример топа.
+
+    Идемпотентность: UNIQUE(service_id, ts, level, source); повторный
+    beat-tick в том же окне делает ON CONFLICT DO UPDATE count=excluded.count
+    в `seq_logs_sync.py`.
+    """
+    __tablename__ = "kg_log_observations"
+
+    id = Column(Integer, primary_key=True, index=True)
+    service_id = Column(
+        Integer, ForeignKey("kg_services.id"), nullable=True, index=True,
+    )
+    ts = Column(DateTime, nullable=False)
+    # Error / Fatal / Warning — Seq использует эти строковые уровни.
+    level = Column(String, nullable=False)
+    count = Column(Integer, nullable=False)
+    top_message_hash = Column(String, nullable=True)
+    sample_message = Column(String, nullable=True)
+    # Имя Seq-инстанса: prod / preprod / preupdate / wo-api3-prod / ...
+    source = Column(String, nullable=True)
+    namespace = Column(String, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    service = relationship("Service")
+
+    __table_args__ = (
+        UniqueConstraint(
+            "service_id", "ts", "level", "source",
+            name="uq_kg_log_obs_service_ts_level_source",
+        ),
+        Index("ix_kg_log_obs_service_ts", "service_id", "ts"),
+        Index("ix_kg_log_obs_level_ts", "level", "ts"),
+    )
+
+
 class ServiceEdge(Base):
     """Ребро графа: src сервис вызывает / зависит от dst сервиса.
 

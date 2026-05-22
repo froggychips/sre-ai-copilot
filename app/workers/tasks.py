@@ -139,6 +139,30 @@ celery_app.conf.beat_schedule = {
         "task": "kg_signal_aggregates_compute",
         "schedule": crontab(minute=23),  # ежечасно в 23 мин (offset от drift/ingress)
     },
+    # Anomaly detection (2026-05-22, миграция 20260522_0200):
+    # rolling z-score по kg_service_health для каждой из 5 метрик.
+    # При |z|>3 пишем в kg_anomaly_observations (severity warning/critical).
+    # Идемпотентно по (service_id, ts, metric). Discord-уведомление — фаза 2.
+    "kg-anomaly-detection-task": {
+        "task": "kg_anomaly_detection_task",
+        "schedule": crontab(minute="*/10"),
+    },
+    # Per-team daily digest — один embed per team_owner (squad-N / infra /
+    # monitoring). Зависит от kg_signal_aggregates (slo_burn_pct) и
+    # kg_services.health_score — должен запускаться ПОСЛЕ их compute.
+    # Управляется TEAM_DIGEST_ENABLED.
+    "team-daily-digest": {
+        "task": "team_daily_digest",
+        "schedule": crontab(hour=settings.TEAM_DIGEST_HOUR_UTC, minute=0),
+    },
+    # Error/Fatal логи из Seq → kg_log_observations. Тянет по настроенным
+    # Seq-инстансам (prod/preprod/preupdate) count событий за окно ~10 мин,
+    # агрегирует per service per level и пишет одну строку через
+    # ON CONFLICT DO UPDATE. Если SEQ_* пусто — no-op.
+    "kg-seq-logs-sync-task": {
+        "task": "kg_seq_logs_sync",
+        "schedule": crontab(minute="*/10"),
+    },
 }
 
 
@@ -524,6 +548,25 @@ def kg_signal_aggregates_compute_task():
         db.close()
 
 
+@celery_app.task(name="kg_anomaly_detection_task")
+def kg_anomaly_detection_task():
+    """Rolling z-score аномалии по kg_service_health → kg_anomaly_observations.
+
+    |z|>3 на любой из 5 метрик пишет запись (severity warning/critical).
+    Discord notify — отдельная фаза, эта задача только пишет notified=false.
+    """
+    from app.knowledge_graph.anomaly_detection import detect_anomalies
+
+    db = SessionLocal()
+    try:
+        return detect_anomalies(db)
+    except Exception as e:
+        logger.warning("kg_anomaly_detection_task.failed: %s", e)
+        return {"error": str(e)}
+    finally:
+        db.close()
+
+
 @celery_app.task(name="daily_stats_digest")
 def daily_stats_digest_task():
     """Daily Discord-stats report. Pure data-aggregation, БЕЗ LLM-вызовов.
@@ -543,5 +586,48 @@ def daily_stats_digest_task():
         logger.error("daily_stats_digest.failed: %s", e)
         # Не падаем в Celery (retry бесполезен, это аналитический task).
         return {"status": "error", "error": str(e)}
+    finally:
+        db.close()
+
+
+@celery_app.task(name="team_daily_digest")
+def team_daily_digest_task():
+    """Daily per-team Discord digest. Pure data-aggregation, БЕЗ LLM.
+
+    Итерирует все distinct team_owner из kg_services и шлёт embed per team.
+    Управляется флагом settings.TEAM_DIGEST_ENABLED — если False, выходит
+    сразу. См. app/services/team_digest.py.
+    """
+    from app.services.team_digest import send_all_team_digests
+
+    try:
+        result = asyncio.run(
+            send_all_team_digests(window_hours=settings.TEAM_DIGEST_WINDOW_HOURS)
+        )
+        logger.info("team_daily_digest.done result=%s", result)
+        return result
+    except Exception as e:
+        logger.error("team_daily_digest.failed: %s", e)
+        # Не падаем в Celery: digest аналитический, retry смысла не имеет.
+        return {"status": "error", "error": str(e)}
+
+
+@celery_app.task(name="kg_seq_logs_sync")
+def kg_seq_logs_sync_task():
+    """Error/Fatal логи из Seq → kg_log_observations (per ~10 мин).
+
+    Тянет события из всех настроенных Seq-инстансов (см. SEQ_INSTANCES /
+    SEQ_URL_<ENV>), агрегирует per service per level и upsert'ит в
+    `kg_log_observations` через ON CONFLICT DO UPDATE. Если SEQ_*
+    не сконфигурирован — task no-op.
+    """
+    from app.knowledge_graph.seq_logs_sync import sync_seq_logs
+
+    db = SessionLocal()
+    try:
+        return sync_seq_logs(db, window_minutes=10)
+    except Exception as e:
+        logger.warning("kg_seq_logs_sync.failed: %s", e)
+        return {"error": str(e)}
     finally:
         db.close()
