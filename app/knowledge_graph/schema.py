@@ -135,6 +135,144 @@ class PodEvent(Base):
     )
 
 
+class ServiceHealth(Base):
+    """Per-service snapshot из VictoriaMetrics (cpu/mem/restarts/5xx/p95).
+
+    Записывается beat-task'ом `kg_metrics_sync` каждые ~10 мин. Уникальность
+    по (service_id, ts) — повторный tick того же расписания не плодит дубли.
+    FK без ondelete — случайная чистка services не должна снести историю.
+    `source` различает откуда метрика взята: `vm` / `vm_kube_state` / etc.
+    """
+    __tablename__ = "kg_service_health"
+
+    id = Column(Integer, primary_key=True, index=True)
+    service_id = Column(
+        Integer, ForeignKey("kg_services.id"), nullable=False, index=True,
+    )
+    ts = Column(DateTime, nullable=False)
+    cpu_pct = Column(Float, nullable=True)
+    mem_pct = Column(Float, nullable=True)
+    restarts_rate = Column(Float, nullable=True)
+    http_5xx_rate = Column(Float, nullable=True)
+    p95_latency_ms = Column(Float, nullable=True)
+    source = Column(String, nullable=True)
+
+    service = relationship("Service")
+
+    __table_args__ = (
+        UniqueConstraint(
+            "service_id", "ts", name="uq_kg_service_health_service_ts",
+        ),
+        Index("ix_kg_service_health_service_ts", "service_id", "ts"),
+        Index("ix_kg_service_health_ts", "ts"),
+    )
+
+
+class ClusterObservation(Base):
+    """Global cluster snapshot — те же поля что ClusterHealth.to_dict().
+
+    Single row per ~5 минут (cron `kg_cluster_health_sync`). Используется для
+    «trend last 24h» в digest'ах и как контекст для post-mortem (что было с
+    cluster-ом на момент X). Уникальность по ts.
+    """
+    __tablename__ = "kg_cluster_observations"
+
+    id = Column(Integer, primary_key=True, index=True)
+    ts = Column(DateTime, nullable=False)
+    cpu_pct = Column(Float, nullable=True)
+    mem_pct = Column(Float, nullable=True)
+    disk_peak_pct = Column(Float, nullable=True)
+    pods_running = Column(Integer, nullable=True)
+    pods_pending = Column(Integer, nullable=True)
+    pods_failed = Column(Integer, nullable=True)
+    crashloops = Column(Integer, nullable=True)
+    deploy_mismatch = Column(Integer, nullable=True)
+    alerts_critical = Column(Integer, nullable=True)
+    alerts_warning = Column(Integer, nullable=True)
+    alerts_prod = Column(Integer, nullable=True)
+    # Сырые поля из ClusterHealth — для forward-compat если VMClient добавит
+    # новые сигналы, мы не теряем их даже без миграции.
+    raw = Column(JSON, nullable=True)
+
+    __table_args__ = (
+        UniqueConstraint("ts", name="uq_kg_cluster_obs_ts"),
+        Index("ix_kg_cluster_obs_ts", "ts"),
+    )
+
+
+class IngressObservation(Base):
+    """Per ingress endpoint snapshot: p95/p99/rps/4xx/5xx.
+
+    Источник host/path — synthetic-узлы `ingress:<host>` и edges в
+    kg_service_edges (kind='calls', discovered_by='kg_sync/ingress'),
+    backend service_id берётся из dst edge'а. Запись раз в ~10 мин beat-task'ом
+    `kg_ingress_observations_sync`. Уникальность по (ingress_name, host, path, ts).
+    """
+    __tablename__ = "kg_ingress_observations"
+
+    id = Column(Integer, primary_key=True, index=True)
+    ts = Column(DateTime, nullable=False)
+    ingress_name = Column(String, nullable=False)
+    host = Column(String, nullable=False)
+    path = Column(String, nullable=True)
+    service_id = Column(
+        Integer, ForeignKey("kg_services.id"), nullable=True, index=True,
+    )
+    p95_latency_ms = Column(Float, nullable=True)
+    p99_latency_ms = Column(Float, nullable=True)
+    rps = Column(Float, nullable=True)
+    error_5xx_rate = Column(Float, nullable=True)
+    error_4xx_rate = Column(Float, nullable=True)
+
+    service = relationship("Service")
+
+    __table_args__ = (
+        UniqueConstraint(
+            "ingress_name", "host", "path", "ts",
+            name="uq_kg_ingress_obs_ingress_host_path_ts",
+        ),
+        Index("ix_kg_ingress_obs_ingress_ts", "ingress_name", "ts"),
+    )
+
+
+class SignalAggregate(Base):
+    """Per-service агрегаты сигналов из САМОГО KG за окно window_hours.
+
+    Считается из kg_deployments / kg_alerts / kg_pod_events beat-task'ом
+    `kg_signal_aggregates_compute` (раз в час). Идемпотентно по
+    (service_id, window_end). `slo_burn_pct` — упрощённо
+    `alert_open_count_critical / max(1, deploy_count)`.
+    """
+    __tablename__ = "kg_signal_aggregates"
+
+    id = Column(Integer, primary_key=True, index=True)
+    service_id = Column(
+        Integer, ForeignKey("kg_services.id"), nullable=False, index=True,
+    )
+    window_end = Column(DateTime, nullable=False)
+    window_hours = Column(Integer, nullable=True)
+    deploy_count = Column(Integer, nullable=True)
+    deploy_failure_pct = Column(Float, nullable=True)
+    alert_open_count = Column(Integer, nullable=True)
+    alert_ttr_p50_min = Column(Float, nullable=True)
+    pod_event_count = Column(Integer, nullable=True)
+    top_event_reason = Column(String, nullable=True)
+    slo_burn_pct = Column(Float, nullable=True)
+
+    service = relationship("Service")
+
+    __table_args__ = (
+        UniqueConstraint(
+            "service_id", "window_end",
+            name="uq_kg_signal_aggregates_service_window",
+        ),
+        Index(
+            "ix_kg_signal_aggregates_service_window",
+            "service_id", "window_end",
+        ),
+    )
+
+
 class ServiceEdge(Base):
     """Ребро графа: src сервис вызывает / зависит от dst сервиса.
 

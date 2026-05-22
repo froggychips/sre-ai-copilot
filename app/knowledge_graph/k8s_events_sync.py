@@ -60,6 +60,15 @@ _POD_NAME_DEPLOYMENT_RE = re.compile(
     r"^(?P<dep>.+)-(?P<rs>[a-z0-9]{8,10})-(?P<pod>[a-z0-9]{4,8})$"
 )
 
+# StatefulSet pod-name pattern: `<sts>-<ordinal>` (например, `nats-0`,
+# `town-db-postgresql-0`). Используется как fallback когда Deployment-regex
+# не сматчил (см. _resolve_service_for_pod).
+_POD_NAME_STS_RE = re.compile(r"^(?P<sts>.+)-(?P<ord>\d+)$")
+
+# Bitnami init-container создаёт временный pod `<sts>-tmp` (volumePermissions).
+# Snimaем суффикс перед матчингом.
+_BITNAMI_TMP_SUFFIX = "-tmp"
+
 
 def _kubectl_get_events_warning(namespace: str) -> List[Dict[str, Any]]:
     """`kubectl get events -n NS --field-selector type=Warning -o json`."""
@@ -93,12 +102,167 @@ def _deployment_from_pod_name(pod_name: str) -> Optional[str]:
     """`bot-service-5476d85d74-f626c` → `bot-service`.
 
     None если pod-name не соответствует стандартному pattern Deployment
-    (например, StatefulSet даёт `pg-cluster-0` — не наш кейс для A4).
+    (например, StatefulSet даёт `pg-cluster-0` — для StS см.
+    `_sts_base_candidates`).
     """
     if not pod_name:
         return None
     m = _POD_NAME_DEPLOYMENT_RE.match(pod_name)
     return m.group("dep") if m else None
+
+
+def _sts_base_candidates(pod_name: str) -> List[str]:
+    """Кандидаты на имя сервиса для StatefulSet-пода.
+
+    Порядок приоритета (от точного к широкому):
+      1. Полное pod_name (на случай pod-без-ординала, например job-pod).
+      2. Strip Bitnami `-tmp` суффикса (init-container volumePermissions).
+      3. Strip trailing `-<digits>` (StatefulSet ординал).
+      4. Strip и `-tmp`, и ординал.
+      5. Strip полу-name: `<base>-postgresql-0` → `<base>` (для случая
+         когда kg_services хранит логический сервис типа `town-db`,
+         а pod зовут `town-db-postgresql-0`). Только если после strip
+         ординала имя оканчивается на хорошо известный bitnami-чарт.
+
+    Возвращает список кандидатов (с дедупликацией), сохраняя порядок
+    приоритета. Caller матчит по `svc_map` и берёт первое попадание.
+    """
+    if not pod_name:
+        return []
+    candidates: List[str] = []
+
+    def _push(name: str) -> None:
+        if name and name not in candidates:
+            candidates.append(name)
+
+    _push(pod_name)
+
+    stripped_tmp = pod_name
+    if stripped_tmp.endswith(_BITNAMI_TMP_SUFFIX):
+        stripped_tmp = stripped_tmp[: -len(_BITNAMI_TMP_SUFFIX)]
+        _push(stripped_tmp)
+
+    m = _POD_NAME_STS_RE.match(stripped_tmp)
+    if m:
+        sts_base = m.group("sts")
+        _push(sts_base)
+        # Полу-strip: `town-db-postgresql` → `town-db`. Ограничиваем известными
+        # bitnami/инфра чартами, чтобы не калечить имена типа `wo-api-shared`.
+        for chart in ("-postgresql", "-clickhouse", "-redis", "-mongodb", "-mariadb"):
+            if sts_base.endswith(chart):
+                _push(sts_base[: -len(chart)])
+                break
+
+    return candidates
+
+
+def _kubectl_get_pods_owner_map(namespace: str) -> Dict[str, str]:
+    """`kubectl get pods -n NS -o json` → {pod_name: owner_name}.
+
+    Owner = первый ownerReference (StatefulSet / ReplicaSet / DaemonSet / Job).
+    Для ReplicaSet возвращаем имя ReplicaSet — caller затем сматчит его как
+    Deployment через `_POD_NAME_DEPLOYMENT_RE` или через strip hash-суффикса.
+
+    Используется как поздний fallback, когда ни Deployment-regex, ни
+    StatefulSet-suffix-strip не нашли service. Один kubectl call на ns.
+    Пустой dict при ошибке — не валим sync.
+    """
+    try:
+        out = subprocess.run(
+            ["kubectl", "get", "pods", "-n", namespace, "-o", "json"],
+            capture_output=True, text=True, timeout=30, check=False,
+        )
+    except subprocess.TimeoutExpired:
+        logger.warning("k8s_events.pods_timeout namespace=%s", namespace)
+        return {}
+    if out.returncode != 0:
+        logger.warning(
+            "k8s_events.pods_kubectl_failed namespace=%s rc=%d stderr=%s",
+            namespace, out.returncode, out.stderr.strip()[:200],
+        )
+        return {}
+    try:
+        data = json.loads(out.stdout)
+    except json.JSONDecodeError as e:
+        logger.warning("k8s_events.pods_json_decode_failed namespace=%s err=%s", namespace, e)
+        return {}
+
+    result: Dict[str, str] = {}
+    for pod in data.get("items") or []:
+        md = pod.get("metadata") or {}
+        name = md.get("name")
+        owners = md.get("ownerReferences") or []
+        if not name or not owners:
+            continue
+        # Первый owner — основной (k8s гарантирует controller=true только один).
+        owner = owners[0]
+        owner_name = owner.get("name")
+        owner_kind = owner.get("kind")
+        if not owner_name:
+            continue
+        # ReplicaSet → strip hash-суффикс до Deployment-имени.
+        if owner_kind == "ReplicaSet":
+            # `bot-service-5476d85d74` → `bot-service`.
+            m = re.match(r"^(?P<dep>.+)-[a-z0-9]{8,10}$", owner_name)
+            if m:
+                result[name] = m.group("dep")
+                continue
+        result[name] = owner_name
+    return result
+
+
+def _resolve_service_for_pod(
+    pod_name: str,
+    svc_map: Dict[str, "Service"],
+    owner_map_loader,
+) -> tuple:
+    """pod_name → (service|None, resolver_tag).
+
+    Порядок:
+      1. `_deployment_from_pod_name` (старый strict regex) — для Deployment-подов.
+      2. `_sts_base_candidates` — для StatefulSet'ов и Bitnami `-tmp` init-подов.
+      3. `owner_map_loader()` — lazy kubectl batch lookup ownerReferences.
+
+    `owner_map_loader` — callable () → Dict[pod_name, owner_name], кэшируется
+    на уровне sync_namespace_events (один вызов на ns).
+    """
+    if not pod_name:
+        return None, "none"
+
+    # 1. Deployment hash strip (старое поведение, не ломаем).
+    dep_name = _deployment_from_pod_name(pod_name)
+    if dep_name:
+        svc = svc_map.get(dep_name)
+        if svc is not None:
+            return svc, "pod_hash"
+
+    # 2. StatefulSet / Bitnami-tmp fallback.
+    for cand in _sts_base_candidates(pod_name):
+        svc = svc_map.get(cand)
+        if svc is not None:
+            if cand == pod_name:
+                tag = "pod_name_exact"
+            elif pod_name.endswith(_BITNAMI_TMP_SUFFIX) and cand == pod_name[: -len(_BITNAMI_TMP_SUFFIX)]:
+                tag = "sts_suffix_strip_tmp"
+            else:
+                tag = "sts_suffix_strip"
+            return svc, tag
+
+    # 3. Owner-ref lookup (lazy, один kubectl call на ns).
+    owner_map = owner_map_loader()
+    owner_name = owner_map.get(pod_name)
+    if owner_name:
+        svc = svc_map.get(owner_name)
+        if svc is not None:
+            return svc, "owner_ref"
+        # Owner может быть, например, `town-db-postgresql` (StS) —
+        # пробуем те же strip-кандидаты на owner_name.
+        for cand in _sts_base_candidates(owner_name):
+            svc = svc_map.get(cand)
+            if svc is not None:
+                return svc, "owner_ref_strip"
+
+    return None, "none"
 
 
 def _parse_k8s_timestamp(ts: Optional[str]) -> Optional[datetime]:
@@ -132,6 +296,16 @@ def sync_namespace_events(
         s.name: s for s in db.query(Service).filter_by(namespace=namespace).all()
     }
 
+    # Lazy owner-ref map: дёргаем `kubectl get pods` только если standard +
+    # sts-suffix fallback не нашли service хоть для одного pod'а. Кэшируется
+    # внутри замыкания, чтобы не делать N вызовов на ns.
+    _owner_map_cache: Dict[str, Dict[str, str]] = {}
+
+    def _owner_map_loader() -> Dict[str, str]:
+        if "v" not in _owner_map_cache:
+            _owner_map_cache["v"] = _kubectl_get_pods_owner_map(namespace)
+        return _owner_map_cache["v"]
+
     for ev in raw_events:
         try:
             reason = ev.get("reason")
@@ -154,8 +328,9 @@ def sync_namespace_events(
                 stats["skipped"] += 1
                 continue
 
-            dep_name = _deployment_from_pod_name(obj_name)
-            svc = svc_map.get(dep_name) if dep_name else None
+            svc, resolver_tag = _resolve_service_for_pod(
+                obj_name, svc_map, _owner_map_loader,
+            )
 
             first_seen = (
                 _parse_k8s_timestamp(ev.get("firstTimestamp"))
@@ -184,6 +359,7 @@ def sync_namespace_events(
                     "field_path": involved.get("fieldPath"),
                     "source_component": (ev.get("source") or {}).get("component"),
                     "source_host": (ev.get("source") or {}).get("host"),
+                    "resolver": resolver_tag,
                 },
             )
             stats["added"] += 1

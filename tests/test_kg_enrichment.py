@@ -322,7 +322,7 @@ def test_sync_namespace_calls_upsert_with_team_owner_and_nats_edges():
     }
 
     with patch("app.knowledge_graph.kg_sync._kubectl_get_deployments", return_value=[fake_deploy]), \
-         patch("app.knowledge_graph.kg_sync.upsert_service") as mock_upsert_svc, \
+         patch("app.knowledge_graph.kg_sync._upsert_service_pg") as mock_upsert_svc, \
          patch("app.knowledge_graph.kg_sync.upsert_edge") as mock_upsert_edge:
         mock_upsert_svc.return_value = MagicMock()  # каждая call возвращает разный obj
         stats = sync_namespace(db=MagicMock(), namespace="prod-kingdom1")

@@ -109,6 +109,36 @@ celery_app.conf.beat_schedule = {
         "task": "kg_external_probe",
         "schedule": crontab(minute="*"),
     },
+    # Метрические сигналы (2026-05-22, миграция 20260522_0100):
+    # 4 новых таски материализуют time-series из VictoriaMetrics в KG.
+    # До них VM-клиент использовался on-demand в pipeline/stats_digest и
+    # ничего исторического не сохранялось.
+    #
+    # per-service snapshot cpu/mem/restarts/5xx/p95. UNIQUE(service_id, ts) →
+    # idempotent. Если VICTORIA_METRICS_URL пустой — task no-op.
+    "kg-metrics-sync": {
+        "task": "kg_metrics_sync",
+        "schedule": crontab(minute="*/10"),
+    },
+    # Global cluster snapshot — те же поля что в #stats daily report,
+    # но раз в 5 мин и материализованно. Используется для trend-аналитики
+    # и post-mortem контекста.
+    "kg-cluster-health-sync": {
+        "task": "kg_cluster_health_sync",
+        "schedule": crontab(minute="*/5"),
+    },
+    # Per ingress endpoint observations (p95/p99/rps/4xx/5xx) из nginx-ingress
+    # exporter. host/path берутся из k8s Ingress resources (kubectl get -A).
+    "kg-ingress-observations-sync": {
+        "task": "kg_ingress_observations_sync",
+        "schedule": crontab(minute="*/10"),
+    },
+    # Pre-compute per-service агрегаты сигналов из САМОГО KG (deploys/alerts/
+    # pod_events) за 24h окно. Hourly. Не ходит в VM — pure SQL.
+    "kg-signal-aggregates-compute": {
+        "task": "kg_signal_aggregates_compute",
+        "schedule": crontab(minute=23),  # ежечасно в 23 мин (offset от drift/ingress)
+    },
 }
 
 
@@ -429,6 +459,67 @@ def chronic_alerts_digest_task():
     except Exception as e:
         logger.error("chronic_alerts_digest.failed: %s", e)
         return {"status": "error", "error": str(e)}
+    finally:
+        db.close()
+
+
+@celery_app.task(name="kg_metrics_sync")
+def kg_metrics_sync_task():
+    """Per-service метрики из VM → kg_service_health (snapshot per ~10 мин)."""
+    from app.knowledge_graph.metrics_sync import sync_service_health
+
+    db = SessionLocal()
+    try:
+        return sync_service_health(db)
+    except Exception as e:
+        logger.warning("kg_metrics_sync.failed: %s", e)
+        return {"error": str(e)}
+    finally:
+        db.close()
+
+
+@celery_app.task(name="kg_cluster_health_sync")
+def kg_cluster_health_sync_task():
+    """Global cluster snapshot из VM → kg_cluster_observations (per ~5 мин)."""
+    from app.knowledge_graph.cluster_health_sync import sync_cluster_health
+
+    db = SessionLocal()
+    try:
+        return sync_cluster_health(db)
+    except Exception as e:
+        logger.warning("kg_cluster_health_sync.failed: %s", e)
+        return {"error": str(e)}
+    finally:
+        db.close()
+
+
+@celery_app.task(name="kg_ingress_observations_sync")
+def kg_ingress_observations_sync_task():
+    """Per ingress endpoint metrics → kg_ingress_observations (per ~10 мин)."""
+    from app.knowledge_graph.ingress_observations_sync import \
+        sync_ingress_observations
+
+    db = SessionLocal()
+    try:
+        return sync_ingress_observations(db)
+    except Exception as e:
+        logger.warning("kg_ingress_observations_sync.failed: %s", e)
+        return {"error": str(e)}
+    finally:
+        db.close()
+
+
+@celery_app.task(name="kg_signal_aggregates_compute")
+def kg_signal_aggregates_compute_task():
+    """Pre-compute per-service агрегатов сигналов из KG (24h окно, hourly)."""
+    from app.knowledge_graph.signal_aggregates import compute_signal_aggregates
+
+    db = SessionLocal()
+    try:
+        return compute_signal_aggregates(db, window_hours=24)
+    except Exception as e:
+        logger.warning("kg_signal_aggregates_compute.failed: %s", e)
+        return {"error": str(e)}
     finally:
         db.close()
 
