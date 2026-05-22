@@ -64,22 +64,36 @@ def _q_restarts_rate(namespace: str, deployment: str) -> str:
 
 
 def _q_http_5xx_rate(namespace: str, deployment: str) -> str:
-    # http_requests_total{status=~"5.."} — стандартный naming в WO. Если
-    # сервис не экспортит — VM вернёт 0, мы пропустим (NULL-only сейчас).
+    # ВАЖНО (recon 2026-05-22): prod WO API сервисы (60 namespace) НЕ
+    # скрейпятся центральной VictoriaMetrics — `microsoft_aspnetcore_*` и
+    # `gr_wo_*` существуют только в namespace=monitoring. serviceMonitor
+    # / scrape config не покрывает prod-WO. Этот PromQL гарантированно
+    # вернёт 0 в текущей конфигурации.
+    # Когда scrape config поправят — раскомментировать ASP.NET Core
+    # вариант ниже. До тех пор оставлен legacy http_requests_total для
+    # cross-cluster совместимости.
     return (
         f'sum(rate(http_requests_total'
         f'{{namespace="{namespace}",service=~"{deployment}.*",status=~"5.."}}[5m]))'
     )
+    # TODO когда WO API получит scrape config:
+    # return (f'sum(rate(microsoft_aspnetcore_hosting_failed_requests'
+    #         f'{{namespace="{namespace}",pod=~"{deployment}-.*"}}[5m]))')
 
 
 def _q_p95_latency_ms(namespace: str, deployment: str) -> str:
-    # histogram_quantile → ms. В WO histogram стандартное `http_request_duration_seconds`.
+    # См. комментарий выше — prod WO не скрейпится. Запрос валидный,
+    # но в текущем кластере вернёт 0.
     return (
         f'1000 * histogram_quantile(0.95, sum by(le)('
         f'rate(http_request_duration_seconds_bucket'
         f'{{namespace="{namespace}",service=~"{deployment}.*"}}[5m])'
         f'))'
     )
+    # TODO когда WO API получит scrape config:
+    # return (f'1000 * histogram_quantile(0.95, sum by(le)('
+    #         f'rate(microsoft_aspnetcore_hosting_http_server_request_duration_bucket'
+    #         f'{{namespace="{namespace}",pod=~"{deployment}-.*"}}[5m])))')
 
 
 async def _fetch_service_metrics(
