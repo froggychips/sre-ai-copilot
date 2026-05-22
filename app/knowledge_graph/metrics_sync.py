@@ -43,15 +43,24 @@ def _q_cpu_pct(namespace: str, deployment: str) -> str:
 
 
 def _q_mem_pct(namespace: str, deployment: str) -> str:
-    # working_set / limit. Если limit=0 — fallback на 0.
+    # working_set / (limit OR request). У большинства WO-pods limit отсутствует
+    # → раньше division by NULL давала 0% покрытие. Fallback на request через
+    # `or on(...) group_left()`. Если и request пустой — точка NULL (skip).
+    base = (
+        f'container_memory_working_set_bytes'
+        f'{{namespace="{namespace}",pod=~"{deployment}-.*",container!=""}}'
+    )
+    limit = (
+        f'kube_pod_container_resource_limits'
+        f'{{namespace="{namespace}",pod=~"{deployment}-.*",resource="memory"}}'
+    )
+    request = (
+        f'kube_pod_container_resource_requests'
+        f'{{namespace="{namespace}",pod=~"{deployment}-.*",resource="memory"}}'
+    )
     return (
-        f'avg('
-        f'  container_memory_working_set_bytes'
-        f'  {{namespace="{namespace}",pod=~"{deployment}-.*",container!=""}}'
-        f'  / on(namespace, pod, container)'
-        f'  kube_pod_container_resource_limits'
-        f'  {{namespace="{namespace}",pod=~"{deployment}-.*",resource="memory"}}'
-        f') * 100'
+        f'avg({base} / on(namespace, pod, container) '
+        f'(({limit}) or on(namespace, pod, container) ({request}))) * 100'
     )
 
 

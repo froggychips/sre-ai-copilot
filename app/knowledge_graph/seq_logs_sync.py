@@ -42,7 +42,7 @@ log = logging.getLogger(__name__)
 
 # Уровни Seq, которые льём в KG. Warning тоже учитываем (см. WO signal-m33302),
 # но при необходимости можно отрезать через env позже.
-_LEVELS = ("Error", "Fatal")
+_LEVELS = ("Error", "Fatal", "Warning")
 
 
 def _load_instances() -> List[Dict[str, Optional[str]]]:
