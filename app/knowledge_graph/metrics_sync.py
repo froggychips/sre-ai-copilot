@@ -43,12 +43,16 @@ def _q_cpu_pct(namespace: str, deployment: str) -> str:
 
 
 def _q_mem_pct(namespace: str, deployment: str) -> str:
-    # working_set / (limit OR request). У большинства WO-pods limit отсутствует
-    # → раньше division by NULL давала 0% покрытие. Fallback на request через
-    # `or on(...) group_left()`. Если и request пустой — точка NULL (skip).
+    # working_set / (limit OR request).
+    # Тонкости (recon 2026-05-22):
+    #  1. cAdvisor отдаёт несколько ts с одинаковыми (namespace,pod,container)
+    #     labels (per-image, per-sandbox) → many-to-one join даёт 0 rows
+    #     без агрегата. Решение: `avg by(namespace,pod,container)` слева.
+    #  2. У большинства WO pods отсутствует memory limit → division by NULL.
+    #     Fallback на request через `or on(...) (request)`.
     base = (
-        f'container_memory_working_set_bytes'
-        f'{{namespace="{namespace}",pod=~"{deployment}-.*",container!=""}}'
+        f'avg by(namespace,pod,container) (container_memory_working_set_bytes'
+        f'{{namespace="{namespace}",pod=~"{deployment}-.*",container!=""}})'
     )
     limit = (
         f'kube_pod_container_resource_limits'
