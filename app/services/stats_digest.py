@@ -5,12 +5,19 @@
 символы и завалится при попытке импорта reasoning-агентов.
 
 Секции (в порядке вывода):
-  1. cluster_health — VMClient.get_cluster_health() + count firing series
+  1. cluster_health — VMClient.get_cluster_health() + trend vs yesterday
+     из kg_cluster_observations + count firing series
   2. firing_alerts_by_squad — группировка firing-series по namespace→team_owner из KG
   3. top_alert_types — top-5 по alertname
-  4. fragile_services — top-5 services с самым высоким inbound-degree в KG
-  5. stale_deployments — kubectl-обход WO-namespaces, idle ≥ STATS_DIGEST_STALE_DAYS
-  6. kg_quality — services/edges/orphan%/team_owner coverage
+  4. anomaly_summary — total/severity/by-metric breakdown за 24h из
+     kg_anomaly_observations (Wave 2)
+  5. anomaly_top — persistent (service, metric) пары за 7d (Wave 2)
+  6. log_errors — top-3 service по error/fatal count за 24h из
+     kg_log_observations (Wave 2; пусто пока Seq env-vars не заданы)
+  7. recent_deploys — TC deployer activity за окно
+  8. fragile_services — top-3 services по composite health_score из KG
+  9. stale_deployments — kubectl-обход WO-namespaces, idle ≥ STATS_DIGEST_STALE_DAYS
+  10. kg_quality — services/edges/orphan%/team_owner coverage
 
 Запускается через Celery beat task `daily_stats_digest`
 (см. app/workers/tasks.py).
@@ -49,8 +56,89 @@ def _get_ns_to_team_map(db: Session) -> Dict[str, str]:
     return {ns: team for ns, team in rows}
 
 
-async def cluster_health_section(vm: VMClient, fired_series: List[dict]) -> str:
-    """1. Cluster health snapshot."""
+def _fmt_delta_pp(today: Optional[float], yesterday: Optional[float]) -> str:
+    """Δ в percentage-points: '+3pp' / '-1pp' / '±0pp'. None → пусто."""
+    if today is None or yesterday is None:
+        return ""
+    delta = today - yesterday
+    if abs(delta) < 0.5:
+        return "±0pp"
+    sign = "+" if delta >= 0 else ""
+    return f"{sign}{delta:.0f}pp"
+
+
+def _fmt_delta_int(today: Optional[float], yesterday: Optional[float]) -> str:
+    """Δ для integer-метрик (crashloops): '+2' / '-1' / '±0'."""
+    if today is None or yesterday is None:
+        return ""
+    delta = today - yesterday
+    if abs(delta) < 0.5:
+        return "±0"
+    sign = "+" if delta >= 0 else ""
+    return f"{sign}{delta:.0f}"
+
+
+def _cluster_trend_24h(db: Session) -> Optional[Dict[str, Any]]:
+    """Trend по kg_cluster_observations: today (24h) vs yesterday (24-48h).
+
+    Возвращает None если:
+      - таблица не существует (на dev без миграции);
+      - в окне «вчера» < 1 sample (свежий rollout < 48h истории).
+    Иначе dict с avg cpu/mem/crashloops и max disk_peak — сегодня + дельты.
+    """
+    try:
+        today = db.execute(text("""
+            SELECT avg(cpu_pct), avg(mem_pct), max(disk_peak_pct),
+                   avg(crashloops), count(*)
+            FROM kg_cluster_observations
+            WHERE ts > NOW() - INTERVAL '24 hours'
+        """)).fetchone()
+        yesterday = db.execute(text("""
+            SELECT avg(cpu_pct), avg(mem_pct), max(disk_peak_pct),
+                   avg(crashloops), count(*)
+            FROM kg_cluster_observations
+            WHERE ts BETWEEN NOW() - INTERVAL '48 hours' AND NOW() - INTERVAL '24 hours'
+        """)).fetchone()
+    except Exception as e:
+        log.warning("stats_digest.cluster_trend_missing_table", error=str(e))
+        return None
+
+    today_count = (today[4] if today else 0) or 0
+    yesterday_count = (yesterday[4] if yesterday else 0) or 0
+    if today_count == 0 or yesterday_count == 0:
+        return None
+
+    def _val(row, idx) -> Optional[float]:
+        v = row[idx] if row else None
+        return float(v) if v is not None else None
+
+    return {
+        "today_cpu": _val(today, 0),
+        "today_mem": _val(today, 1),
+        "today_disk": _val(today, 2),
+        "today_crash": _val(today, 3),
+        "yest_cpu": _val(yesterday, 0),
+        "yest_mem": _val(yesterday, 1),
+        "yest_disk": _val(yesterday, 2),
+        "yest_crash": _val(yesterday, 3),
+    }
+
+
+async def cluster_health_section(
+    vm: VMClient,
+    fired_series: List[dict],
+    db: Optional[Session] = None,
+) -> str:
+    """1. Cluster health snapshot + trend vs yesterday.
+
+    Snapshot — текущее состояние из VM (nodes_ready / crashloops).
+    Trend — avg/max по kg_cluster_observations за сегодня (24h) vs вчера
+    (24-48h). Если истории < 48h или таблицы нет — рисуем только snapshot
+    с пометкой `_недостаточно данных для trend_`.
+
+    `db` опционален для backwards-compat в тестах: если не передан, trend
+    не считается.
+    """
     try:
         ch = await vm.get_cluster_health()
         d = ch.to_dict() if hasattr(ch, "to_dict") else {}
@@ -59,10 +147,45 @@ async def cluster_health_section(vm: VMClient, fired_series: List[dict]) -> str:
     except Exception as e:
         log.warning("stats_digest.cluster_health_failed", error=str(e))
         nodes, crash = "?", "?"
-    return (
-        "**🛡️ Cluster Health**\n"
+
+    snapshot_line = (
         f"  Nodes ready: `{nodes}` · Crashloops: `{crash}` · Firing series: `{len(fired_series)}`"
     )
+
+    trend = _cluster_trend_24h(db) if db is not None else None
+    if trend is None:
+        return "\n".join([
+            "**🛡️ Cluster Health**",
+            snapshot_line,
+            "  _недостаточно данных для trend (нужно ≥48h истории)_",
+        ])
+
+    def _fmt_pct(today: Optional[float], yest: Optional[float], delta_str: str) -> str:
+        t = f"{today:.0f}" if today is not None else "?"
+        y = f"{yest:.0f}" if yest is not None else "?"
+        suffix = f" ({delta_str})" if delta_str else ""
+        return f"{y}→{t}%{suffix}"
+
+    cpu_str = _fmt_pct(trend["today_cpu"], trend["yest_cpu"],
+                       _fmt_delta_pp(trend["today_cpu"], trend["yest_cpu"]))
+    mem_str = _fmt_pct(trend["today_mem"], trend["yest_mem"],
+                       _fmt_delta_pp(trend["today_mem"], trend["yest_mem"]))
+    disk_str = _fmt_pct(trend["today_disk"], trend["yest_disk"],
+                        _fmt_delta_pp(trend["today_disk"], trend["yest_disk"]))
+    crash_delta = _fmt_delta_int(trend["today_crash"], trend["yest_crash"])
+    crash_y = f"{trend['yest_crash']:.0f}" if trend["yest_crash"] is not None else "?"
+    crash_t = f"{trend['today_crash']:.0f}" if trend["today_crash"] is not None else "?"
+    crash_suffix = f" ({crash_delta})" if crash_delta else ""
+
+    trend_line = (
+        f"  Trend (vs yesterday): cpu {cpu_str}, mem {mem_str}, "
+        f"crashloops avg {crash_y}→{crash_t}{crash_suffix}, disk peak {disk_str}"
+    )
+    return "\n".join([
+        "**🛡️ Cluster Health**",
+        snapshot_line,
+        trend_line,
+    ])
 
 
 def firing_alerts_section(
@@ -132,9 +255,47 @@ def top_alert_types_section(unique_alerts: Counter) -> str:
     return "\n".join(lines)
 
 
+def _health_marker(score: float) -> str:
+    """Цветовой маркер для health_score: 🟢 ≥0.7, 🟡 0.4-0.7, 🔴 <0.4."""
+    if score >= 0.7:
+        return "🟢"
+    if score >= 0.4:
+        return "🟡"
+    return "🔴"
+
+
 def fragile_services_section(db: Session, ns_to_team: Dict[str, str]) -> str:
-    """4. Top inbound-degree services (кто страдает при падении больше всех)."""
+    """4. Top fragile services по health_score (low = bad).
+
+    Раньше сортировали по inbound-degree, что давало bias на NATS-узлы
+    (которых много кто использует, но они синтетика и реальное состояние
+    нерелевантно). Теперь — composite health_score из beat-task'а
+    `kg_health_recompute`, который учитывает alerts × severity + crashloop +
+    recurrence. Synthetic и неизмеренные сервисы исключаем.
+
+    Если health_score ни у кого не посчитан (beat ещё не прошёл на dev) —
+    fallback на старый inbound-запрос с явной пометкой.
+    """
     rows = db.execute(text("""
+        SELECT name, namespace, health_score
+        FROM kg_services
+        WHERE NOT synthetic AND health_score IS NOT NULL
+        ORDER BY health_score ASC NULLS LAST
+        LIMIT 3
+    """)).fetchall()
+    if rows:
+        lines = ["**🔗 Top fragile services** (composite health_score из KG)"]
+        for name, ns, score in rows:
+            score_f = float(score)
+            team = ns_to_team.get(ns, "(unowned)")
+            marker = _health_marker(score_f)
+            lines.append(
+                f"  {marker} `{name}` _{ns}_ — health `{score_f:.2f}` · @{team}"
+            )
+        return "\n".join(lines)
+
+    # Fallback на старый inbound-degree запрос с пометкой о незаполненности.
+    fallback_rows = db.execute(text("""
         SELECT s.name, s.namespace, count(e.id) AS callers
         FROM kg_services s
         JOIN kg_service_edges e ON e.dst_id = s.id
@@ -144,10 +305,11 @@ def fragile_services_section(db: Session, ns_to_team: Dict[str, str]) -> str:
         LIMIT 3
     """)).fetchall()
     lines = ["**🔗 Top fragile services** (inbound callers из KG)"]
-    if not rows:
+    lines.append("  _health_score ещё не посчитан — fallback на inbound-degree_")
+    if not fallback_rows:
         lines.append("  _нет edges_")
     else:
-        for name, ns, callers in rows:
+        for name, ns, callers in fallback_rows:
             team = ns_to_team.get(ns, "(unowned)")
             lines.append(f"  `{name}` _{ns}_ — {callers} callers · @{team}")
     return "\n".join(lines)
@@ -315,6 +477,182 @@ async def recent_deploys_section(
     return "\n".join(lines)
 
 
+# ── anomaly_summary / anomaly_top / log_errors (Wave 2) ────────────────────
+
+
+# Маппинг сырых имён метрик в короткие подписи для inline-перечисления.
+# Если метрика новая (нет в маппинге) — показываем как есть.
+_METRIC_LABELS = {
+    "cpu_pct": "cpu",
+    "mem_pct": "mem",
+    "restarts_rate": "restarts",
+    "http_5xx_rate": "5xx",
+    "p95_latency_ms": "p95",
+}
+
+
+def anomaly_summary_section(db: Session) -> str:
+    """5. Summary anomaly за 24h из kg_anomaly_observations.
+
+    Total + breakdown by severity + by metric + top-5 affected services.
+    Если таблицы нет в БД (на dev без миграции) — возвращаем "" (секция
+    не показывается). Если таблица есть но 0 anomaly — рисуем «всё в норме».
+    """
+    try:
+        total_row = db.execute(text("""
+            SELECT count(*), count(DISTINCT service_id)
+            FROM kg_anomaly_observations
+            WHERE ts > NOW() - INTERVAL '24 hours'
+        """)).fetchone()
+    except Exception as e:
+        log.warning("stats_digest.anomaly_summary_missing_table", error=str(e))
+        return ""
+
+    total = (total_row[0] if total_row else 0) or 0
+    distinct_services = (total_row[1] if total_row else 0) or 0
+
+    if total == 0:
+        return (
+            "**📈 Anomalies (last 24h)**\n"
+            "  ✅ ни одной аномалии — поведение в норме"
+        )
+
+    by_severity = {
+        sev: cnt for sev, cnt in db.execute(text("""
+            SELECT severity, count(*)
+            FROM kg_anomaly_observations
+            WHERE ts > NOW() - INTERVAL '24 hours'
+            GROUP BY severity
+        """)).fetchall()
+    }
+    warning_cnt = by_severity.get("warning", 0)
+    critical_cnt = by_severity.get("critical", 0)
+
+    top_services = db.execute(text("""
+        SELECT s.name, count(a.id) AS cnt
+        FROM kg_anomaly_observations a
+        JOIN kg_services s ON s.id = a.service_id
+        WHERE a.ts > NOW() - INTERVAL '24 hours'
+        GROUP BY s.id, s.name
+        ORDER BY cnt DESC
+        LIMIT 5
+    """)).fetchall()
+
+    by_metric = db.execute(text("""
+        SELECT metric, count(*)
+        FROM kg_anomaly_observations
+        WHERE ts > NOW() - INTERVAL '24 hours'
+        GROUP BY metric
+        ORDER BY count(*) DESC
+    """)).fetchall()
+
+    lines = ["**📈 Anomalies (last 24h)**"]
+    lines.append(
+        f"  Total: {total} across {distinct_services} svc "
+        f"(warning: {warning_cnt}, critical: {critical_cnt})"
+    )
+    if top_services:
+        top_parts = ", ".join(f"`{name}` ×{cnt}" for name, cnt in top_services)
+        lines.append(f"  Top affected: {top_parts}")
+    if by_metric:
+        metric_parts = ", ".join(
+            f"{_METRIC_LABELS.get(m, m)}×{c}" for m, c in by_metric
+        )
+        lines.append(f"  By metric: {metric_parts}")
+    return "\n".join(lines)
+
+
+def anomaly_top_section(db: Session, ns_to_team: Dict[str, str]) -> str:
+    """11a. Persistent anomalies за 7d: top-3 (service, metric) пар.
+
+    «Persistent» = метрика на сервисе ловит anomaly ≥3 раз за неделю. Сюда
+    подмешиваем самый свежий z_score чтобы реciever видел не только «было
+    плохо», а текущий «насколько плохо сейчас». Если таблицы нет или 0
+    persistent-кейсов — возвращаем "" (секция скрыта).
+    """
+    try:
+        rows = db.execute(text("""
+            WITH ranked AS (
+                SELECT
+                    a.service_id,
+                    a.metric,
+                    a.z_score,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY a.service_id, a.metric
+                        ORDER BY a.ts DESC
+                    ) AS rn
+                FROM kg_anomaly_observations a
+                WHERE a.ts > NOW() - INTERVAL '7 days'
+            )
+            SELECT s.name, s.namespace, r.metric,
+                   count(*) AS events,
+                   max(CASE WHEN r.rn = 1 THEN r.z_score END) AS latest_z
+            FROM ranked r
+            JOIN kg_services s ON s.id = r.service_id
+            GROUP BY s.id, s.name, s.namespace, r.metric
+            HAVING count(*) > 0
+            ORDER BY events DESC, latest_z DESC NULLS LAST
+            LIMIT 3
+        """)).fetchall()
+    except Exception as e:
+        log.warning("stats_digest.anomaly_top_missing_table", error=str(e))
+        return ""
+
+    if not rows:
+        return ""
+
+    lines = ["**🔬 Persistent anomalies (last 7d)**"]
+    for name, ns, metric, events, latest_z in rows:
+        team = ns_to_team.get(ns, "(unowned)")
+        metric_label = _METRIC_LABELS.get(metric, metric)
+        z_str = f"z={float(latest_z):.1f}" if latest_z is not None else "z=?"
+        lines.append(
+            f"  `{name}` {metric_label} — {events} events, latest {z_str} · @{team}"
+        )
+    return "\n".join(lines)
+
+
+def log_errors_section(db: Session, ns_to_team: Dict[str, str]) -> str:
+    """11b. Top-3 service по error/fatal log-count за 24h.
+
+    Источник — kg_log_observations (Seq-aggregator beat). Если таблицы нет
+    или пуста (SEQ env-vars не сконфигурены) — возвращаем "". Sample-сообщение
+    обрезаем до 60 chars чтобы строка не уехала за ширину embed-а.
+    """
+    try:
+        rows = db.execute(text("""
+            SELECT s.name, s.namespace,
+                   SUM(l.count)::int AS total,
+                   MAX(l.sample_message) AS sample
+            FROM kg_log_observations l
+            JOIN kg_services s ON s.id = l.service_id
+            WHERE l.ts > NOW() - INTERVAL '24 hours'
+              AND l.level IN ('Error', 'Fatal')
+            GROUP BY s.id, s.name, s.namespace
+            HAVING SUM(l.count) > 0
+            ORDER BY total DESC
+            LIMIT 3
+        """)).fetchall()
+    except Exception as e:
+        log.warning("stats_digest.log_errors_missing_table", error=str(e))
+        return ""
+
+    if not rows:
+        return ""
+
+    lines = ["**📜 Log errors (last 24h)**"]
+    for name, ns, total, sample in rows:
+        team = ns_to_team.get(ns, "(unowned)")
+        sample_str = (sample or "").strip().replace("\n", " ")
+        if len(sample_str) > 60:
+            sample_str = sample_str[:57] + "..."
+        sample_suffix = f" (sample: {sample_str})" if sample_str else ""
+        lines.append(
+            f"  `{name}` — {total} errors{sample_suffix} · @{team}"
+        )
+    return "\n".join(lines)
+
+
 def kg_quality_section(db: Session) -> str:
     """6. KG quality: services, orphan%, edges, team_owner coverage."""
     services_total = db.execute(text("SELECT count(*) FROM kg_services")).scalar() or 0
@@ -414,12 +752,16 @@ async def build_digest(db: Session) -> str:
         health_text = await cluster_health_section(
             VMClient(settings.VICTORIA_METRICS_URL, timeout=15.0),
             fired_series,
+            db,
         )
     else:
         health_text = "**🛡️ Cluster Health**\n  _VICTORIA_METRICS_URL не настроен_"
 
     alerts_text, unique_alerts, _ = firing_alerts_section(fired_series, ns_to_team)
     top_types_text = top_alert_types_section(unique_alerts)
+    anomaly_summary_text = anomaly_summary_section(db)
+    anomaly_top_text = anomaly_top_section(db, ns_to_team)
+    log_errors_text = log_errors_section(db, ns_to_team)
     fragile_text = fragile_services_section(db, ns_to_team)
     stale_text = stale_deployments_section(
         db, ns_to_team, threshold_days=settings.STATS_DIGEST_STALE_DAYS
@@ -435,6 +777,9 @@ async def build_digest(db: Session) -> str:
         health_text,
         alerts_text,
         top_types_text,
+        anomaly_summary_text,
+        anomaly_top_text,
+        log_errors_text,
         deploys_text,
         fragile_text,
         stale_text,

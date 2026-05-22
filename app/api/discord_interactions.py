@@ -21,13 +21,17 @@ import json
 import logging
 from typing import Any
 
+from datetime import datetime, timezone
+
 from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 from fastapi import APIRouter, Header, HTTPException, Request
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.config import settings
 from app.database import IncidentRecord, SessionLocal
+from app.services.audit_logger import audit_service
 
 logger = logging.getLogger(__name__)
 
@@ -219,6 +223,121 @@ def _format_apply_refusal(incident_id: str, reason: str) -> str:
     return f"❌ Не могу применить: {reason}"
 
 
+def _record_decision(
+    incident_id: str,
+    intent_signature: str,
+    status: str,
+    approved_by: str,
+) -> dict:
+    """Записать approve/decline в kg_action_approvals.
+
+    Возвращает dict:
+      - {"already_decided": False, "status": ..., "approved_by": ..., "decided_at": ...}
+        при свежем insert'е;
+      - {"already_decided": True, "status": <prev>, "approved_by": <prev>, "decided_at": <prev>}
+        если есть существующая запись (UNIQUE collision).
+    """
+    from app.knowledge_graph.schema import ActionApproval
+
+    db: Session = SessionLocal()
+    try:
+        decided_at = datetime.now(timezone.utc).replace(tzinfo=None)
+        row = ActionApproval(
+            incident_id=incident_id,
+            intent_signature=intent_signature,
+            status=status,
+            approved_by=approved_by,
+            decided_at=decided_at,
+        )
+        db.add(row)
+        try:
+            db.commit()
+        except IntegrityError:
+            db.rollback()
+            existing = (
+                db.query(ActionApproval)
+                .filter(
+                    ActionApproval.incident_id == incident_id,
+                    ActionApproval.intent_signature == intent_signature,
+                )
+                .first()
+            )
+            if existing is None:
+                # Race — кто-то другой удалил после rollback. Не возможно
+                # в обычном flow; вернуть already_decided unknown.
+                return {
+                    "already_decided": True,
+                    "status": "unknown",
+                    "approved_by": "?",
+                    "decided_at": "?",
+                }
+            return {
+                "already_decided": True,
+                "status": existing.status,
+                "approved_by": existing.approved_by or "?",
+                "decided_at": (
+                    existing.decided_at.strftime("%H:%M UTC")
+                    if existing.decided_at else "?"
+                ),
+            }
+        return {
+            "already_decided": False,
+            "status": status,
+            "approved_by": approved_by,
+            "decided_at": decided_at.strftime("%H:%M UTC"),
+        }
+    finally:
+        db.close()
+
+
+async def _edit_message_after_decision(
+    channel_id: str,
+    message_id: str,
+    verdict: str,
+    user_name: str,
+    decided_at: str,
+    original_message: dict,
+) -> None:
+    """PATCH сообщения: убрать buttons + дописать пометку в embed footer.
+
+    Используется bot API (PATCH /channels/{cid}/messages/{mid}). Не падаем
+    наружу — приоритет на ack пользователю; edit best-effort.
+    """
+    token = settings.DISCORD_BOT_TOKEN
+    if not token:
+        logger.warning("discord_edit_skipped reason=no_bot_token")
+        return
+
+    # Сохраняем embeds, добавляем пометку в footer.text. Buttons убираем
+    # передачей пустого components-массива (Discord допускает []).
+    embeds = list(original_message.get("embeds") or [])
+    icon = "✅" if verdict == "approved" else "❌"
+    mark = f"{icon} {verdict.capitalize()} by @{user_name} at {decided_at}"
+    if embeds:
+        first = embeds[0]
+        existing_footer = (first.get("footer") or {}).get("text") or ""
+        new_text = f"{existing_footer} · {mark}" if existing_footer else mark
+        first["footer"] = {"text": new_text[:2048]}
+
+    import httpx
+    url = f"{_DISCORD_API_BASE}/channels/{channel_id}/messages/{message_id}"
+    headers = {
+        "Authorization": f"Bot {token}",
+        "Content-Type": "application/json",
+    }
+    payload = {"embeds": embeds, "components": []}
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            r = await client.patch(url, headers=headers, json=payload)
+            if r.status_code >= 400:
+                logger.error(
+                    "discord_message_edit_failed status=%s body=%s",
+                    r.status_code, r.text[:200],
+                )
+    except Exception as e:
+        logger.error("discord_message_edit_exception error=%s", str(e))
+
+
 @router.post("/interactions")
 async def discord_interactions(
     request: Request,
@@ -321,5 +440,87 @@ async def discord_interactions(
     # ── ⚙️ Apply: отмена ───────────────────────────────────────────────────
     if custom_id.startswith("apply_cancel_"):
         return _ephemeral("Apply отменён.")
+
+    # ── ✅/❌ Approve / Decline proposed action ─────────────────────────────
+    # custom_id формат `approve:{incident_id}:{intent_signature}` /
+    # `decline:{incident_id}:{intent_signature}`. Двоеточие — потому что
+    # incident_id может содержать подчёркивания (см. fingerprint-format).
+    if custom_id.startswith("approve:") or custom_id.startswith("decline:"):
+        verdict = "approved" if custom_id.startswith("approve:") else "declined"
+        try:
+            _, incident_id, intent_sig = custom_id.split(":", 2)
+        except ValueError:
+            return _ephemeral("❌ Неверный формат custom_id.")
+
+        # Кто нажал — для аудита и edit-message
+        member = payload.get("member") or {}
+        user_obj = member.get("user") or payload.get("user") or {}
+        user_name = user_obj.get("username") or user_obj.get("global_name") or user_id or "unknown"
+
+        # Сообщение, на которое прицеплены кнопки — нужно для PATCH'а
+        message = payload.get("message") or {}
+        message_id = message.get("id")
+        channel_id = payload.get("channel_id") or message.get("channel_id")
+
+        decision = _record_decision(
+            incident_id=incident_id,
+            intent_signature=intent_sig,
+            status=verdict,
+            approved_by=user_name,
+        )
+
+        if decision["already_decided"]:
+            prev_status = decision["status"]
+            prev_user = decision["approved_by"] or "?"
+            prev_time = decision["decided_at"] or "?"
+            return _ephemeral(
+                f"ℹ️ Already {prev_status} by @{prev_user} at {prev_time}."
+            )
+
+        # Edit оригинального сообщения: убрать buttons + дописать footer.
+        # Не блокируем основной response — Discord ждёт ≤3s.
+        if message_id and channel_id:
+            import asyncio
+            asyncio.create_task(_edit_message_after_decision(
+                channel_id=channel_id,
+                message_id=message_id,
+                verdict=verdict,
+                user_name=user_name,
+                decided_at=decision["decided_at"],
+                original_message=message,
+            ))
+
+        audit_service.log_event(
+            "INCIDENT_ACTION_APPROVED" if verdict == "approved" else "INCIDENT_ACTION_DECLINED",
+            {
+                "incident_id": incident_id,
+                "intent_signature": intent_sig,
+                "discord_user_id": user_id,
+                "discord_user_name": user_name,
+            },
+        )
+
+        if verdict == "declined":
+            return _ephemeral(f"❌ Declined. Recorded as decided by @{user_name}.")
+
+        # Approved — если EXECUTOR_ENABLED, fire-and-forget executor task.
+        if settings.EXECUTOR_ENABLED:
+            try:
+                from app.services.executor_apply import apply_intent
+                import asyncio
+                asyncio.create_task(asyncio.to_thread(apply_intent, incident_id, user_name))
+                return _ephemeral(
+                    f"✅ Approved by @{user_name}. Executor launched (fire-and-forget). "
+                    "Audit-trail: INCIDENT_ACTION_APPROVED."
+                )
+            except Exception as e:
+                logger.error("approved_executor_dispatch_failed error=%s", str(e))
+                return _ephemeral(
+                    f"✅ Approved by @{user_name}, но launch executor упал: {e}"
+                )
+        return _ephemeral(
+            f"✅ Approved by @{user_name}. Will execute when executor goes live "
+            "(EXECUTOR_ENABLED=false right now)."
+        )
 
     return _ephemeral("Неизвестное действие.")

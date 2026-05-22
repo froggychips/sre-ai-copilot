@@ -110,6 +110,14 @@ class Settings(BaseSettings):
 
     DISCORD_WEBHOOK_URL: Optional[str] = Field(None, description="Discord webhook — канал #error (инциденты)")
     DISCORD_WEBHOOK_STATS_URL: Optional[str] = Field(None, description="Discord webhook — канал #stats (cluster health, daily report)")
+    # Per-team channel routing. JSON `{"squad-1":"https://discord.com/api/webhooks/.../...", ...}`.
+    # Пусто (default) — все инциденты идут в DISCORD_WEBHOOK_URL. При непустом —
+    # инциденты с `team_owner` в этой map шлются на per-team webhook вместо
+    # общего канала. Резолв через DiscordService._pick_webhook_url.
+    DISCORD_TEAM_CHANNEL_MAP: Optional[str] = Field(
+        None,
+        description="JSON map team_owner → webhook url для per-team routing",
+    )
 
     # External probe: DNS+TCP+HTTPS на synthetic `ingress:<host>` узлы из KG.
     # Источник hosts — k8s Ingress (см. kg_ingress_sync). Default OFF чтобы
@@ -125,6 +133,20 @@ class Settings(BaseSettings):
     # PATCH /webhooks/{app_id}/{interaction_token}/messages/@original.
     # Взять там же где DISCORD_PUBLIC_KEY (General Information → Application ID).
     DISCORD_APPLICATION_ID: Optional[str] = Field(None, description="Discord application ID for deferred responses")
+
+    # Bot token нужен для отправки incident-сообщений через bot API
+    # (POST /channels/{channel_id}/messages). Без bot API webhooks НЕ поддерживают
+    # interactive components — buttons не появятся. Если не задан, fallback на
+    # webhook (без approve/decline кнопок). Взять в Discord Developer Portal →
+    # Application → Bot → Reset Token.
+    DISCORD_BOT_TOKEN: Optional[str] = Field(None, description="Discord bot token for sending messages with components")
+    # ID канала #infra-error для отправки incident-embed с approve/decline.
+    # TODO: id канала #infra-error = 1501861363880824943 (см. WO alert routing).
+    # Взять в Discord: правый клик на канал → Copy Channel ID (Developer Mode on).
+    DISCORD_INCIDENT_CHANNEL_ID: Optional[str] = Field(
+        None,
+        description="Discord channel ID для incident-сообщений с buttons (через bot API)",
+    )
 
     # Auth
     JWT_PUBLIC_KEY: str = Field("", description="RSA Public Key for JWT validation")

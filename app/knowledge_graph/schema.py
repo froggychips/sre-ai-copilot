@@ -364,6 +364,46 @@ class LogObservation(Base):
     )
 
 
+class ActionApproval(Base):
+    """Persistent approve/decline решение по proposed action из Discord embed.
+
+    Создаётся при клике Approve/Decline-кнопки в incident-embed. UNIQUE по
+    (incident_id, intent_signature) — повторный клик ловится коллизией и
+    handler отвечает "already approved/declined by @user".
+
+    `intent_signature` — детерминированный хэш ExecutionIntent
+    (action+resource+ns+params), вычисляется через
+    `app.services.intent_signature.compute_signature`. Не sequence-номер:
+    одна команда — одна approval-запись.
+
+    `status` финальное: `approved` | `declined`. PENDING-промежутка нет —
+    кнопка либо нажата (row создаётся), либо нет.
+
+    `approved_by` — Discord username/id того кто нажал. Для audit-трейла.
+    """
+    __tablename__ = "kg_action_approvals"
+
+    id = Column(Integer, primary_key=True, index=True)
+    incident_id = Column(String, nullable=False, index=True)
+    action = Column(String, nullable=True)            # ActionType value, для quick-filter
+    intent_signature = Column(String, nullable=False)
+    status = Column(String, nullable=False)           # "approved" | "declined"
+    approved_by = Column(String, nullable=True)
+    decided_at = Column(DateTime, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    __table_args__ = (
+        UniqueConstraint(
+            "incident_id", "intent_signature",
+            name="uq_kg_action_approvals_incident_intent",
+        ),
+        Index(
+            "ix_kg_action_approvals_status_decided",
+            "status", "decided_at",
+        ),
+    )
+
+
 class ServiceEdge(Base):
     """Ребро графа: src сервис вызывает / зависит от dst сервиса.
 

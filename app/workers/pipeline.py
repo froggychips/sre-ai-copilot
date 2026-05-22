@@ -144,6 +144,15 @@ class IncidentPipeline:
         self.gitlab_context: Optional[Dict[str, Any]] = None
         self.blast_radius_context: Optional[str] = None
         self.statics_check_context: Optional[str] = None
+        # Wave 3 #2: deploy correlation для проброса в Discord embed.
+        # Заполняется в stage_diagnose._enrich_deploy_correlation.
+        self.deploy_correlation: Optional[Dict[str, Any]] = None
+        # Wave 3 #10: team_owner резолвится после KG populate; используется
+        # в send_incident_report для per-team channel routing.
+        self.team_owner: Optional[str] = None
+        # Wave 3 #13: окно для recurrence-label «×N in 24h · M in 7d».
+        self.recurrence_count_24h: int = 0
+        self.recurrence_count_7d: int = 0
 
     # ------------------------------------------------------------------
     # State machine helpers
@@ -278,6 +287,11 @@ class IncidentPipeline:
                 incident_ts=incident_starts_at,
             )
             diag_ctx["deploy_correlation"] = result
+            # Wave 3 #2: пробрасываем в discord embed через _persist.
+            self.deploy_correlation = result
+            # Wave 3 #10: подтягиваем team_owner с сервиса (best-effort).
+            if svc.team_owner:
+                self.team_owner = svc.team_owner
             if result.get("verdict") == "suspect":
                 audit_service.log_event(
                     "DEPLOY_CORRELATION_SUSPECT",
@@ -702,9 +716,28 @@ class IncidentPipeline:
             self.traces.append(synth_snap)
 
         labels = self.incident.labels or {}
+        alertname = labels.get("alertname", "UnknownAlert")
+
+        # Wave 3 #13: recurrence counts 24h/7d (best-effort).
+        self._compute_recurrence_counts(alertname)
+        # Wave 3 #10: если team_owner ещё не определён (например deploy
+        # correlation не сработал), пробуем дорезолвить по сервису.
+        if not self.team_owner:
+            self._resolve_team_owner()
+
+        # incident_ts для #8 log error rate window.
+        incident_ts = None
+        if self.incident.starts_at:
+            try:
+                incident_ts = datetime.fromisoformat(
+                    self.incident.starts_at.replace("Z", "+00:00")
+                )
+            except (ValueError, TypeError):
+                incident_ts = None
+
         await discord_service.send_incident_report(
             incident_id=self.incident_id,
-            alertname=labels.get("alertname", "UnknownAlert"),
+            alertname=alertname,
             namespace=self.incident.namespace or "",
             pod=labels.get("pod"),
             service=labels.get("service") or labels.get("app"),
@@ -718,7 +751,74 @@ class IncidentPipeline:
             flap_count=self.flap_count,
             execution_intent=self.execution_intent,
             executor_result=self.executor_result,
+            deploy_correlation=self.deploy_correlation,
+            team_owner=self.team_owner,
+            recurrence_count_24h=self.recurrence_count_24h,
+            recurrence_count_7d=self.recurrence_count_7d,
+            incident_ts=incident_ts,
         )
+
+    def _compute_recurrence_counts(self, alertname: str) -> None:
+        """Wave 3 #13: посчитать сколько раз alertname сработал за 24h/7d.
+
+        Берём из kg_alerts: fired_at в окне OR resolved_at в окне (alert мог
+        начаться раньше, разрешиться внутри). Best-effort: при любой ошибке
+        оставляем 0.
+        """
+        try:
+            from datetime import datetime as _dt, timedelta as _td
+
+            from sqlalchemy import or_
+
+            from app.knowledge_graph.schema import AlertEvent
+
+            now = _dt.utcnow()
+            cutoff_24h = now - _td(hours=24)
+            cutoff_7d = now - _td(days=7)
+            base = self.db.query(AlertEvent).filter(AlertEvent.alertname == alertname)
+            cnt_24h = base.filter(
+                or_(
+                    AlertEvent.fired_at >= cutoff_24h,
+                    AlertEvent.resolved_at >= cutoff_24h,
+                )
+            ).count()
+            cnt_7d = base.filter(
+                or_(
+                    AlertEvent.fired_at >= cutoff_7d,
+                    AlertEvent.resolved_at >= cutoff_7d,
+                )
+            ).count()
+            # Защита от mock'нутых session (тесты): принимаем только int.
+            self.recurrence_count_24h = int(cnt_24h) if isinstance(cnt_24h, int) else 0
+            self.recurrence_count_7d = int(cnt_7d) if isinstance(cnt_7d, int) else 0
+        except Exception as e:
+            audit_service.log_event(
+                "RECURRENCE_COUNT_FAILED",
+                {"incident_id": self.incident_id, "error": type(e).__name__},
+            )
+
+    def _resolve_team_owner(self) -> None:
+        """Wave 3 #10: подтянуть team_owner по (namespace, service)."""
+        if not self.incident or not self.incident.namespace:
+            return
+        labels = self.incident.labels or {}
+        service_name = labels.get("service") or labels.get("app")
+        if not service_name:
+            return
+        try:
+            svc = (
+                self.db.query(Service)
+                .filter(
+                    Service.namespace == self.incident.namespace,
+                    Service.name == service_name,
+                )
+                .one_or_none()
+            )
+            if svc and svc.team_owner:
+                self.team_owner = svc.team_owner
+        except Exception:
+            # best-effort, без логирования (не критично для embed)
+            return
 
     # ------------------------------------------------------------------
     # Orchestrator
