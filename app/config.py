@@ -98,6 +98,15 @@ class Settings(BaseSettings):
     ENRICH_RECURRENCE_LOOKBACK_MIN: int = 1440  # 24 ч
     ENRICH_UPSTREAM_WINDOW_MIN: int = 15
 
+    # Rollout-noise suppression (root cause #2 alert-quality).
+    # KubeDeployment{Generation,Replicas}Mismatch + KubeContainerWaiting
+    # часто срабатывают во время активного rolling-update'а (median TTR
+    # ~11 мин). Если в окне <N мин назад есть `kg_deployments` для
+    # резолвенного сервиса — демотим severity до "info", чтобы Wave 3
+    # severity-routing погасил эти алёрты в #infra-error.
+    ROLLOUT_SUPPRESS_ENABLED: bool = True
+    ROLLOUT_SUPPRESS_WINDOW_MINUTES: int = 15
+
     # Anti-DoS cap для prompt_guard.detect_injection. Поднимать только
     # осознанно — каждый LLM-вызов биллится по входным токенам.
     PROMPT_INPUT_MAX_CHARS: int = 20000
@@ -151,6 +160,33 @@ class Settings(BaseSettings):
     DISCORD_WEBHOOK_SELF_HEALTH_URL: Optional[str] = Field(
         None,
         description="Discord webhook для self-health fail-уведомлений (dev-канал copilot)",
+    )
+
+    # Stuck-alerts escalation. Источник идеи (2026-05-23): KG-side TTR
+    # analytics показал median 29h / p90 83h для KubeDeploymentReplicasMismatch —
+    # реально сломанное состояние, похороненное под потоком свежих firing-
+    # алёртов. Hourly beat task `kg_stuck_alerts_check` ищет alerts firing
+    # > STUCK_ALERTS_MIN_DURATION_HOURS без resolved_at, группирует по
+    # team_owner и пишет audit-log + опциональный Discord embed.
+    # KG-side severity bump (только в audit/embed, AM не трогаем).
+    STUCK_ALERTS_MIN_DURATION_HOURS: int = Field(
+        24,
+        description="Окно firing-без-resolve для пометки alert как stuck (часы)",
+    )
+    STUCK_ALERTS_DEDUP_WINDOW_HOURS: int = Field(
+        6,
+        description="In-memory dedup window для Discord embed (часы)",
+    )
+    STUCK_ALERTS_DISCORD_ENABLED: bool = Field(
+        True,
+        description="Слать Discord embed на stuck-alerts (audit-log пишется всегда)",
+    )
+    # Webhook dedicated канала «escalations». Пусто → embed skip, audit-log
+    # остаётся. Намеренно отдельный от #infra-error: stuck-сигнал не
+    # действует под on-call rotation, его адресат — owner-команда.
+    DISCORD_WEBHOOK_STUCK_ALERTS_URL: Optional[str] = Field(
+        None,
+        description="Discord webhook для stuck-alerts escalation (пусто → embed skip)",
     )
     # Discord Interactions — для обработки нажатий кнопок 👍/👎.
     # Взять из Discord Developer Portal → Application → General Information.
