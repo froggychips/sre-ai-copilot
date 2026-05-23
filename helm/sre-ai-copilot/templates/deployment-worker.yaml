@@ -61,5 +61,11 @@ spec:
           value: {{ .Values.env.statsDigestHourUtc | default "9" | quote }}
         - name: STATS_DIGEST_STALE_DAYS
           value: {{ .Values.env.statsDigestStaleDays | default "14" | quote }}
+        - name: EXTERNAL_PROBE_ENABLED
+          value: {{ .Values.env.externalProbeEnabled | default "false" | quote }}
+        - name: EXTERNAL_PROBE_FAIL_THRESHOLD
+          value: {{ .Values.env.externalProbeFailThreshold | default "3" | quote }}
+        - name: EXTERNAL_PROBE_TIMEOUT_SECONDS
+          value: {{ .Values.env.externalProbeTimeoutSeconds | default "5" | quote }}
         resources:
           {{- toYaml .Values.resources.worker | nindent 10 }}

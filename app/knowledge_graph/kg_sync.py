@@ -16,13 +16,23 @@ import logging
 import re
 import subprocess
 import json
+from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Tuple
 
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.orm import Session
 
-from app.knowledge_graph.populator import upsert_service, upsert_edge
+from app.knowledge_graph.populator import upsert_edge
+from app.knowledge_graph.schema import Service, ServiceEdge
 
 logger = logging.getLogger(__name__)
+
+# Edge decay config: edges с last_seen_at старше N дней — DELETE.
+# Между 7 и N днями — мягко помечаются `inactive=true` в extras (не удаляем,
+# нужны историчные для корреляций). 7 — порог soft-mark, не настраивается
+# (привязан к классическому SLA-окну инцидентов). N — конфигурируемо.
+EDGE_DECAY_DELETE_AFTER_DAYS = 30
+EDGE_DECAY_INACTIVE_AFTER_DAYS = 7
 
 # URL-паттерн: http(s)://service-name(.namespace)?(.svc.cluster.local)?(:port)?
 _SVC_URL_RE = re.compile(
@@ -632,6 +642,79 @@ def _extract_nats_clusters(
     return sorted(found)
 
 
+def _upsert_service_pg(
+    db: Session,
+    namespace: str,
+    name: str,
+    team_owner: Optional[str] = None,
+    metadata: Optional[Dict[str, Any]] = None,
+    synthetic: Optional[bool] = None,
+) -> Service:
+    """PG-нативный UPSERT для kg_services.
+
+    INSERT IF NOT EXISTS из populator.upsert_service не апдейтил уже
+    существующие строки — labels/team_owner/metadata дрейфили месяцами.
+    Здесь делаем `INSERT ... ON CONFLICT (namespace, name) DO UPDATE` —
+    обновляем team_owner / metadata_json / updated_at при каждом sync.
+
+    Поля:
+      - created_at: только на insert (server default), не апдейтим.
+      - updated_at: всегда now() на update.
+      - synthetic: обновляем ТОЛЬКО если новое значение False (сервис стал
+        реальным — был synthetic, перестал). Обратной деградации не делаем,
+        чтобы случайное упущение в `_is_synthetic_service` не стёрло флаг.
+
+    Требует UNIQUE constraint `uq_kg_service_ns_name` на (namespace, name) —
+    он есть в schema.py (см. Service.__table_args__).
+    TODO: если констрейнта в БД нет (старая инсталляция без миграции) —
+    добавить через:
+        ALTER TABLE kg_services
+        ADD CONSTRAINT uq_kg_service_ns_name UNIQUE (namespace, name);
+    """
+    now = datetime.utcnow()
+    values = {
+        "namespace": namespace,
+        "name": name,
+        "team_owner": team_owner,
+        "metadata_json": metadata,
+        "synthetic": bool(synthetic) if synthetic is not None else False,
+        "created_at": now,
+        "updated_at": now,
+    }
+
+    # Set-клауза: обновляем только то что реально меняется в sync-е.
+    # team_owner — берём новый если задан (COALESCE для случая когда вызов
+    # передал None — оставить существующий).
+    set_clause: Dict[str, Any] = {
+        "updated_at": now,
+    }
+    if team_owner is not None:
+        set_clause["team_owner"] = team_owner
+    if metadata is not None:
+        set_clause["metadata_json"] = metadata
+    # synthetic: апдейтим только если новое значение False (стал реальным).
+    if synthetic is False:
+        set_clause["synthetic"] = False
+
+    stmt = (
+        pg_insert(Service.__table__)
+        .values(**values)
+        .on_conflict_do_update(
+            constraint="uq_kg_service_ns_name",
+            set_=set_clause,
+        )
+        .returning(Service.__table__.c.id)
+    )
+    result = db.execute(stmt)
+    row = result.first()
+    # ORM-объект нужен для downstream upsert_edge (использует svc.id).
+    svc = db.query(Service).filter_by(namespace=namespace, name=name).one()
+    if row is not None:
+        # flush чтобы downstream видели обновления в этой транзакции.
+        db.flush()
+    return svc
+
+
 def sync_namespace(
     db: Session,
     namespace: str,
@@ -653,7 +736,7 @@ def sync_namespace(
         if not name:
             continue
 
-        src = upsert_service(
+        src = _upsert_service_pg(
             db, namespace=namespace, name=name, team_owner=src_team,
             synthetic=_is_synthetic_service(name),
         )
@@ -662,7 +745,7 @@ def sync_namespace(
         # URL-based edges (existing flow)
         upstreams = _extract_upstreams(deploy, namespace)
         for up_svc, up_ns in upstreams:
-            dst = upsert_service(
+            dst = _upsert_service_pg(
                 db,
                 namespace=up_ns,
                 name=up_svc,
@@ -680,7 +763,7 @@ def sync_namespace(
         # либо local-kingdom NATS в текущем namespace. team_owner="platform" —
         # явный маркер что это инфра-узел, а не business-service.
         for nats_name, nats_ns in _extract_nats_clusters(deploy, namespace):
-            dst = upsert_service(
+            dst = _upsert_service_pg(
                 db,
                 namespace=nats_ns,
                 name=nats_name,
@@ -700,7 +783,7 @@ def sync_namespace(
         # confidence отражает точность источника: dsn_env — точно (host из
         # реального значения), secret_hint — нестрого (host угадан из имени).
         for db_node, db_ns, driver, source in _extract_db_targets(deploy, namespace):
-            dst = upsert_service(
+            dst = _upsert_service_pg(
                 db,
                 namespace=db_ns,
                 name=db_node,
@@ -798,6 +881,94 @@ def _enrich_calls_edges_for_ns(
     return edges_count
 
 
+def _decay_stale_edges(
+    db: Session,
+    delete_after_days: int = EDGE_DECAY_DELETE_AFTER_DAYS,
+    inactive_after_days: int = EDGE_DECAY_INACTIVE_AFTER_DAYS,
+) -> Dict[str, int]:
+    """Decay для kg_service_edges по last_seen_at.
+
+    Логика:
+      1. Edges с last_seen_at < now() - delete_after_days → DELETE.
+         Конфигурируется через EDGE_DECAY_DELETE_AFTER_DAYS (default 30).
+      2. Edges с last_seen_at < now() - inactive_after_days → soft-mark:
+         extras['inactive'] = True, extras['inactivated_at'] = now().
+         НЕ удаляем — нужны историчные для корреляций.
+      3. Edges «воскресшие» (последний sync обновил last_seen_at — они
+         уже свежие) — сюда не попадают; флаг `inactive` чистится в
+         основном проходе через `upsert_edge` (см. ниже).
+
+    Возвращает stats: {marked_inactive, deleted, revived}.
+    Revived здесь не считаем — это делает основной проход (см. PR в
+    upsert_edge: unset inactive при апдейте last_seen_at).
+    """
+    now = datetime.utcnow()
+    inactive_cutoff = now - timedelta(days=inactive_after_days)
+    delete_cutoff = now - timedelta(days=delete_after_days)
+
+    stats = {"marked_inactive": 0, "deleted": 0}
+
+    # 1) DELETE старых (>= delete_after_days). Делаем первым чтобы не
+    #    помечать как inactive то, что сейчас удалим.
+    deleted = (
+        db.query(ServiceEdge)
+        .filter(ServiceEdge.last_seen_at < delete_cutoff)
+        .delete(synchronize_session=False)
+    )
+    stats["deleted"] = int(deleted or 0)
+
+    # 2) Soft-mark inactive (между inactive_after_days и delete_after_days).
+    #    Берём edges без `inactive=true` в extras чтобы не перетирать
+    #    inactivated_at при каждом проходе. JSON-merge: сохраняем
+    #    существующие ключи (discovery_sources / confidence / semantics).
+    candidates = (
+        db.query(ServiceEdge)
+        .filter(
+            ServiceEdge.last_seen_at < inactive_cutoff,
+            ServiceEdge.last_seen_at >= delete_cutoff,
+        )
+        .all()
+    )
+    for edge in candidates:
+        ex = dict(edge.extras or {})
+        if ex.get("inactive") is True:
+            continue  # уже помечен в предыдущем decay-проходе
+        ex["inactive"] = True
+        ex["inactivated_at"] = now.isoformat()
+        edge.extras = ex
+        stats["marked_inactive"] += 1
+    if candidates:
+        db.flush()
+    return stats
+
+
+def _revive_active_edges(db: Session) -> int:
+    """Снимает флаг inactive с edges, у которых last_seen_at стал свежим.
+
+    Основной sync-проход (upsert_edge) обновляет last_seen_at = now(),
+    но не трогает extras['inactive']. Делаем это здесь: если edge свежее
+    inactive-cutoff, но в extras висит inactive=true — снимаем флаг.
+    """
+    cutoff = datetime.utcnow() - timedelta(days=EDGE_DECAY_INACTIVE_AFTER_DAYS)
+    edges = (
+        db.query(ServiceEdge)
+        .filter(ServiceEdge.last_seen_at >= cutoff)
+        .all()
+    )
+    revived = 0
+    for edge in edges:
+        ex = edge.extras or {}
+        if ex.get("inactive") is True:
+            new_ex = dict(ex)
+            new_ex.pop("inactive", None)
+            new_ex.pop("inactivated_at", None)
+            edge.extras = new_ex or None
+            revived += 1
+    if revived:
+        db.flush()
+    return revived
+
+
 def sync_topology(
     db: Session,
     namespaces: Optional[List[str]] = None,
@@ -827,6 +998,7 @@ def sync_topology(
     total: Dict[str, Any] = {
         "services": 0, "edges": 0, "edges_extended": 0,
         "namespaces": 0, "errors": 0,
+        "edges_marked_inactive": 0, "edges_deleted": 0, "edges_revived": 0,
     }
     deploys_cache: Dict[str, List[Dict[str, Any]]] = {}
 
@@ -860,6 +1032,28 @@ def sync_topology(
             logger.warning("kg_sync.ns_failed_pass2 ns=%s: %s", ns, e)
             total["errors"] += 1
     db.commit()
+
+    # ── Pass 3: edge decay — soft-mark inactive (>7д) + DELETE (>30д) ──
+    # Сначала revive: снимаем `inactive` с edges, чьи last_seen_at
+    # обновились в Pass 1/2. Затем decay: помечаем/удаляем stale-edges.
+    try:
+        revived = _revive_active_edges(db)
+        decay_stats = _decay_stale_edges(db)
+        total["edges_revived"] = revived
+        total["edges_marked_inactive"] = decay_stats["marked_inactive"]
+        total["edges_deleted"] = decay_stats["deleted"]
+        if revived or decay_stats["marked_inactive"] or decay_stats["deleted"]:
+            logger.info(
+                "kg_sync.edge_decay revived=%d marked_inactive=%d deleted=%d "
+                "(inactive_after=%dd delete_after=%dd)",
+                revived, decay_stats["marked_inactive"], decay_stats["deleted"],
+                EDGE_DECAY_INACTIVE_AFTER_DAYS, EDGE_DECAY_DELETE_AFTER_DAYS,
+            )
+        db.commit()
+    except Exception as e:
+        logger.warning("kg_sync.edge_decay_failed: %s", e)
+        total["errors"] += 1
+        db.rollback()
 
     logger.info("kg_sync.done total=%s", total)
     return total

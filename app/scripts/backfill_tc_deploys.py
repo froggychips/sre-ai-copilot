@@ -68,27 +68,36 @@ async def _backfill(days: int, limit: int) -> dict:
                 except ValueError:
                     pass
 
+            # SHA коммита из TC revisions[0]; multi-root monorepo — полный
+            # список в extras['all_revisions']. NULL ок (manual trigger / no VCS).
+            sha = b.get("sha")
+            all_revisions = b.get("all_revisions") or []
+
             for ns in target_namespaces:
                 ns_services = (
                     db.query(Service).filter_by(namespace=ns, synthetic=False).all()
                 )
                 for svc in ns_services:
+                    extras: dict = {
+                        "branch": branch_full,
+                        "buildtype_name": b.get("buildtype_name"),
+                        "url": b.get("url"),
+                        "namespace_scope": True,
+                        "backfill": True,
+                    }
+                    if len(all_revisions) > 1:
+                        extras["all_revisions"] = all_revisions
                     record_deployment(
                         db,
                         service=svc,
                         started_at=started_naive,
                         finished_at=finished_naive,
+                        sha=sha,
                         buildtype_id=b.get("buildtype_id"),
                         build_number=str(b.get("number") or ""),
                         status=b.get("status"),
                         triggered_by=b.get("triggered_by"),
-                        extras={
-                            "branch": branch_full,
-                            "buildtype_name": b.get("buildtype_name"),
-                            "url": b.get("url"),
-                            "namespace_scope": True,
-                            "backfill": True,
-                        },
+                        extras=extras,
                     )
                     added += 1
         db.commit()

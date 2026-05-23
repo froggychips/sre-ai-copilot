@@ -79,6 +79,14 @@ env:
   statsDigestHourUtc: "9"           # ежедневно в HH:00 UTC
   statsDigestStaleDays: "14"        # threshold для stale-deployment секции
 
+  # External probe: DNS+TCP+HTTPS на synthetic ingress:<host> узлы из KG
+  # (источник — k8s_ingress_sync). Beat task kg-external-probe каждую минуту,
+  # алерты в DISCORD_WEBHOOK_URL. Default off — включается после смоук-прогона
+  # (внутри pod: python -m app.knowledge_graph.external_probe_sync).
+  externalProbeEnabled: "false"
+  externalProbeFailThreshold: "3"   # сколько подряд fail-ов до alert (anti-flap)
+  externalProbeTimeoutSeconds: "5"
+
 # All secret keys — fill in before deploying.
 # In production prefer SealedSecrets or ExternalSecrets (see k8s/base/secrets.*.yaml.example).
 secrets:

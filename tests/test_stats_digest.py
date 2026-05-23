@@ -144,25 +144,56 @@ def test_top_alert_types_empty():
 
 # ── fragile_services_section ───────────────────────────────────────────────
 
-def test_fragile_services_renders_top_callers():
+def test_fragile_services_renders_top_by_health_score():
+    """После Wave 2 fragile сортируется по health_score (asc, low=bad), не
+    inbound-degree. NULL health исключаем, markers 🟢/🟡/🔴 по диапазонам."""
     db = MagicMock()
     db.execute.return_value.fetchall.return_value = [
-        ("auth-service", "prod-shared", 5),
-        ("town-service", "prod-kingdom1", 3),
-        ("dev-service", "prod-kingdom2", 2),
+        ("auth-service", "prod-shared", 0.18),       # 🔴 critical
+        ("town-service", "prod-kingdom1", 0.52),     # 🟡
+        ("dev-service", "prod-kingdom2", 0.81),      # 🟢
     ]
     text = stats_digest.fragile_services_section(
         db, ns_to_team={"prod-shared": "shared", "prod-kingdom1": "kingdom1", "prod-kingdom2": "kingdom2"},
     )
     assert "auth-service" in text
-    assert "5 callers" in text
+    assert "health `0.18`" in text
+    assert "🔴" in text
+    assert "🟡" in text
+    assert "🟢" in text
     assert "@shared" in text
     assert "@kingdom1" in text
+    # Fallback-сообщение НЕ должно появляться — health_score есть
+    assert "fallback" not in text
 
 
-def test_fragile_services_empty_state():
+def test_fragile_services_fallback_when_health_score_not_computed():
+    """Если health_score ни у кого не посчитан (beat ещё не прошёл на dev) —
+    fallback на старый inbound-degree запрос с явной пометкой."""
     db = MagicMock()
-    db.execute.return_value.fetchall.return_value = []
+    health_rows = []
+    inbound_rows = [
+        ("auth-service", "prod-shared", 5),
+        ("town-service", "prod-kingdom1", 3),
+    ]
+    db.execute.side_effect = [
+        MagicMock(fetchall=lambda: health_rows),
+        MagicMock(fetchall=lambda: inbound_rows),
+    ]
+    text = stats_digest.fragile_services_section(
+        db, ns_to_team={"prod-shared": "shared", "prod-kingdom1": "kingdom1"},
+    )
+    assert "fallback" in text or "ещё не посчитан" in text
+    assert "auth-service" in text
+    assert "5 callers" in text
+
+
+def test_fragile_services_empty_state_when_both_queries_empty():
+    db = MagicMock()
+    db.execute.side_effect = [
+        MagicMock(fetchall=lambda: []),  # health_score empty
+        MagicMock(fetchall=lambda: []),  # inbound fallback empty
+    ]
     text = stats_digest.fragile_services_section(db, ns_to_team={})
     assert "нет edges" in text
 
@@ -333,6 +364,190 @@ def test_top_alert_types_excludes_infrastructure_noise():
     assert "Watchdog" not in text
     assert "KubePodCrashLooping" in text
     assert "etcdInsufficientMembers" in text
+
+
+# ── anomaly_summary_section (Wave 2) ───────────────────────────────────────
+
+
+def test_anomaly_summary_empty_zero_anomalies():
+    """Таблица есть, но за 24h ничего не нашлось — показываем «всё в норме»."""
+    db = MagicMock()
+    db.execute.return_value.fetchone.return_value = (0, 0)
+    text = stats_digest.anomaly_summary_section(db)
+    assert "Anomalies" in text
+    assert "ни одной аномалии" in text
+
+
+def test_anomaly_summary_missing_table_returns_empty_string():
+    """На dev без миграции — try/except → секция полностью скрыта."""
+    db = MagicMock()
+    db.execute.side_effect = RuntimeError("relation kg_anomaly_observations does not exist")
+    text = stats_digest.anomaly_summary_section(db)
+    assert text == ""
+
+
+def test_anomaly_summary_renders_total_severity_top_metric():
+    db = MagicMock()
+    # Порядок SQL-вызовов: total → by_severity → top_services → by_metric
+    db.execute.side_effect = [
+        MagicMock(fetchone=lambda: (47, 12)),  # total, distinct_services
+        MagicMock(fetchall=lambda: [("warning", 40), ("critical", 7)]),
+        MagicMock(fetchall=lambda: [
+            ("mv-service", 12),
+            ("town-grainhost", 8),
+            ("auth-service", 5),
+        ]),
+        MagicMock(fetchall=lambda: [
+            ("p95_latency_ms", 20),
+            ("http_5xx_rate", 15),
+            ("restarts_rate", 12),
+        ]),
+    ]
+    text = stats_digest.anomaly_summary_section(db)
+    assert "Total: 47" in text
+    assert "12 svc" in text
+    assert "warning: 40" in text
+    assert "critical: 7" in text
+    assert "`mv-service` ×12" in text
+    assert "p95×20" in text
+    assert "5xx×15" in text
+
+
+# ── anomaly_top_section (Wave 2) ───────────────────────────────────────────
+
+
+def test_anomaly_top_renders_persistent_pairs():
+    db = MagicMock()
+    db.execute.return_value.fetchall.return_value = [
+        ("mv-service", "prod-shared", "p95_latency_ms", 12, 4.2),
+        ("town-grainhost", "prod-kingdom1", "restarts_rate", 8, 3.7),
+    ]
+    text = stats_digest.anomaly_top_section(
+        db, ns_to_team={"prod-shared": "shared", "prod-kingdom1": "kingdom1"},
+    )
+    assert "Persistent anomalies" in text
+    assert "`mv-service`" in text
+    assert "p95" in text
+    assert "12 events" in text
+    assert "z=4.2" in text
+    assert "@shared" in text
+    assert "@kingdom1" in text
+
+
+def test_anomaly_top_hidden_when_empty():
+    db = MagicMock()
+    db.execute.return_value.fetchall.return_value = []
+    text = stats_digest.anomaly_top_section(db, ns_to_team={})
+    assert text == ""
+
+
+def test_anomaly_top_hidden_when_table_missing():
+    db = MagicMock()
+    db.execute.side_effect = RuntimeError("table does not exist")
+    text = stats_digest.anomaly_top_section(db, ns_to_team={})
+    assert text == ""
+
+
+# ── log_errors_section (Wave 2) ────────────────────────────────────────────
+
+
+def test_log_errors_renders_top_3_with_sample():
+    db = MagicMock()
+    db.execute.return_value.fetchall.return_value = [
+        ("mv-service", "prod-shared", 234, "connection refused: 10.0.5.13"),
+        ("town-grainhost", "prod-kingdom1", 87, "NullReferenceException at TownActor.OnTick"),
+    ]
+    text = stats_digest.log_errors_section(
+        db, ns_to_team={"prod-shared": "shared", "prod-kingdom1": "kingdom1"},
+    )
+    assert "Log errors" in text
+    assert "`mv-service`" in text
+    assert "234 errors" in text
+    assert "connection refused" in text
+    assert "@shared" in text
+
+
+def test_log_errors_hidden_when_empty():
+    """Таблица пуста (Seq env-vars не сконфигурены) — секция скрыта."""
+    db = MagicMock()
+    db.execute.return_value.fetchall.return_value = []
+    text = stats_digest.log_errors_section(db, ns_to_team={})
+    assert text == ""
+
+
+def test_log_errors_hidden_when_table_missing():
+    db = MagicMock()
+    db.execute.side_effect = RuntimeError("relation kg_log_observations does not exist")
+    text = stats_digest.log_errors_section(db, ns_to_team={})
+    assert text == ""
+
+
+def test_log_errors_sample_truncated_to_60_chars():
+    db = MagicMock()
+    long_msg = "A" * 200
+    db.execute.return_value.fetchall.return_value = [
+        ("svc", "prod-ns", 10, long_msg),
+    ]
+    text = stats_digest.log_errors_section(db, ns_to_team={"prod-ns": "team"})
+    assert "..." in text
+    # Не должно быть полной 200-char строки
+    assert "A" * 200 not in text
+
+
+# ── cluster_health trend (Wave 2) ──────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_cluster_health_renders_trend_when_history_available():
+    vm = MagicMock()
+    vm.get_cluster_health = AsyncMock(return_value=MagicMock(
+        to_dict=lambda: {"nodes_ready": 16, "crashloops": 5}
+    ))
+    db = MagicMock()
+    # today (24h) — 5 столбцов: cpu, mem, disk, crash, count
+    today = (34.2, 37.1, 47.5, 5.0, 144)
+    yesterday = (31.0, 36.0, 45.0, 3.0, 144)
+    db.execute.side_effect = [
+        MagicMock(fetchone=lambda: today),
+        MagicMock(fetchone=lambda: yesterday),
+    ]
+    text = await stats_digest.cluster_health_section(vm, fired_series=[], db=db)
+    assert "Trend" in text
+    assert "31→34%" in text  # cpu rounded
+    assert "+3pp" in text
+    assert "crashloops avg 3→5" in text
+    assert "+2" in text
+
+
+@pytest.mark.asyncio
+async def test_cluster_health_fallback_when_no_yesterday_data():
+    """< 48h истории — рисуем snapshot + пометку «недостаточно данных»."""
+    vm = MagicMock()
+    vm.get_cluster_health = AsyncMock(return_value=MagicMock(
+        to_dict=lambda: {"nodes_ready": 16, "crashloops": 5}
+    ))
+    db = MagicMock()
+    today = (34.2, 37.1, 47.5, 5.0, 144)
+    yesterday = (None, None, None, None, 0)  # пусто
+    db.execute.side_effect = [
+        MagicMock(fetchone=lambda: today),
+        MagicMock(fetchone=lambda: yesterday),
+    ]
+    text = await stats_digest.cluster_health_section(vm, fired_series=[], db=db)
+    assert "недостаточно данных" in text
+    assert "Trend" not in text
+
+
+@pytest.mark.asyncio
+async def test_cluster_health_no_db_omits_trend_section():
+    """Старая signature без db работает (для unit-тестов без БД)."""
+    vm = MagicMock()
+    vm.get_cluster_health = AsyncMock(return_value=MagicMock(
+        to_dict=lambda: {"nodes_ready": 16, "crashloops": 8}
+    ))
+    text = await stats_digest.cluster_health_section(vm, fired_series=[{}] * 47)
+    assert "недостаточно данных" in text
+    assert "Trend" not in text
 
 
 # ── kg_quality_section ─────────────────────────────────────────────────────
