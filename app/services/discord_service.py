@@ -44,6 +44,39 @@ def _should_route_to_error(severity: Optional[str]) -> bool:
     return (severity or "").strip().lower() in _ROUTEABLE_SEVERITIES
 
 
+def _summarize_self_health_detail(name: str, detail: Dict[str, Any]) -> str:
+    """Сжать detail check'а в одну Discord-строку.
+
+    Не json.dumps — детали бывают вложенные (per_metric/per_task), читать в
+    embed-е невозможно. Здесь делаем «одно предложение» на каждый тип чека.
+    """
+    if name == "materialization_zero_rate":
+        offenders = []
+        for metric, info in (detail.get("per_metric") or {}).items():
+            if info.get("status") in {"warn", "fail"}:
+                offenders.append(f"{metric}={info.get('zero_or_null_pct')}%")
+        return f"zero/null rate too high: {', '.join(offenders) or '—'}"
+    if name == "sync_lag":
+        offenders = []
+        for task, info in (detail.get("per_task") or {}).items():
+            if info.get("status") in {"warn", "fail"}:
+                lag = info.get("lag_minutes")
+                offenders.append(f"{task}: lag={lag}min")
+        return f"stale: {', '.join(offenders) or '—'}"
+    if name == "pod_events_link_rate":
+        return f"linked={detail.get('linked_pct')}% of {detail.get('total')} events"
+    if name == "edges_freshness":
+        return f"stale={detail.get('stale_pct')}% of {detail.get('total')} edges"
+    if name == "anomaly_signal_health":
+        return f"count_24h={detail.get('count_24h')} — {detail.get('reason')}"
+    if name == "alerts_resolve_freshness":
+        return f"stale_open={detail.get('stale_open_alerts')} alerts >7d unresolved"
+    # generic fallback
+    if "error" in detail:
+        return f"error: {detail['error']}"
+    return ", ".join(f"{k}={v}" for k, v in list(detail.items())[:4])
+
+
 # Dedup state cache (#1, #9). In-memory, TTL 30 минут.
 #   _recent_incidents key=(alertname, ns, pod), value={msg_id, msg_url, first_ts,
 #     last_ts, count, webhook_url, embed, alertname}.
@@ -1308,6 +1341,66 @@ class DiscordService:
                 logging.error(
                     "discord_external_probe_alert_failed",
                     extra={"status": r.status_code, "body": r.text[:200], "host": host},
+                )
+
+    async def send_self_health_alert(
+        self,
+        failed_checks: List[Dict[str, Any]],
+        warn_checks: Optional[List[Dict[str, Any]]] = None,
+    ) -> None:
+        """Single embed на отдельный dev-канал команды copilot.
+
+        НЕ шлёт в DISCORD_WEBHOOK_URL (#infra-error) — намеренно, чтобы не
+        смешивать «KG сам поломался» с «production-сервис упал». Адресат —
+        команда разработчиков копилота, читающие свой канал.
+        """
+        url = settings.DISCORD_WEBHOOK_SELF_HEALTH_URL
+        if not url:
+            _log.info(
+                "discord.self_health.skipped_no_url",
+                failed=len(failed_checks),
+            )
+            return
+        if settings.DISCORD_DRY_RUN:
+            _dry_run_log.info(
+                "discord.dry_run.send_self_health_alert",
+                failed=len(failed_checks),
+                warn=len(warn_checks or []),
+            )
+            return
+
+        fields: List[Dict[str, Any]] = []
+        for c in failed_checks[:10]:
+            detail = c.get("detail") or {}
+            summary = _summarize_self_health_detail(c.get("name") or "", detail)
+            fields.append({
+                "name": f"FAIL: {c.get('name', '?')}",
+                "value": summary[:1024] or "—",
+                "inline": False,
+            })
+        if warn_checks:
+            warn_names = ", ".join(c.get("name", "?") for c in warn_checks[:10])
+            fields.append({
+                "name": f"warn ({len(warn_checks)})",
+                "value": warn_names[:1024],
+                "inline": False,
+            })
+
+        payload = {
+            "embeds": [{
+                "title": f"KG self-health: {len(failed_checks)} failed check(s)"[:256],
+                "color": _COLOR_CRITICAL,
+                "fields": fields,
+                "footer": {"text": "kg_self_health_check"},
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+            }]
+        }
+        async with httpx.AsyncClient() as client:
+            r = await client.post(url, json=payload)
+            if r.status_code >= 400:
+                logging.error(
+                    "discord_self_health_alert_failed",
+                    extra={"status": r.status_code, "body": r.text[:200]},
                 )
 
     async def send_approval_request(self, approval_id: str, details: dict):

@@ -126,6 +126,32 @@ class Settings(BaseSettings):
     EXTERNAL_PROBE_ENABLED: bool = Field(False, description="Включить периодический probe внешних ingress-hosts")
     EXTERNAL_PROBE_TIMEOUT_SECONDS: float = Field(5.0, description="Timeout per-IP TCP и HTTPS HEAD")
     EXTERNAL_PROBE_FAIL_THRESHOLD: int = Field(3, description="Сколько подряд fail-ов до alert (anti-flap)")
+
+    # KG self-health: «monitoring of the monitoring». Beat task бегает по
+    # собственным KG-таблицам и ловит ситуации типа «mem_pct=0 неделю и никто
+    # не заметил» (Wave 5 retrospective). Series of canary checks; на FAIL —
+    # audit-log + опциональный Discord embed в отдельный dev-канал (НЕ в
+    # #infra-error чтоб не плодить шум). Default ON — проверки read-only,
+    # дешёвые, ничего не ломают.
+    KG_SELF_HEALTH_ENABLED: bool = Field(True, description="Включить KG self-health canary task")
+    # Метрики, которые легально могут быть = 0 (TODO в metrics_sync до тех пор
+    # пока WO scrape config не подключит nginx_ingress/application-метрики во
+    # всех ns). materialization_zero_rate их игнорирует.
+    KG_SELF_HEALTH_KNOWN_ZERO_METRICS: str = Field(
+        "http_5xx_rate,p95_latency_ms",
+        description="CSV колонок kg_service_health которые могут быть 0 — не алёртить",
+    )
+    KG_SELF_HEALTH_INTERVAL_MINUTES: int = Field(
+        30,
+        description="Период beat-задачи kg_self_health_check (для документации; реальный расписан в tasks.py)",
+    )
+    # Webhook отдельного dev-канала команды copilot. Пусто → Discord-уведомление
+    # отключено, остаётся только audit-log. Намеренно НЕ DISCORD_WEBHOOK_URL —
+    # этот сигнал не для on-call SRE, а для разработчиков KG.
+    DISCORD_WEBHOOK_SELF_HEALTH_URL: Optional[str] = Field(
+        None,
+        description="Discord webhook для self-health fail-уведомлений (dev-канал copilot)",
+    )
     # Discord Interactions — для обработки нажатий кнопок 👍/👎.
     # Взять из Discord Developer Portal → Application → General Information.
     DISCORD_PUBLIC_KEY: Optional[str] = Field(None, description="Ed25519 публичный ключ приложения Discord")

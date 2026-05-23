@@ -163,6 +163,15 @@ celery_app.conf.beat_schedule = {
         "task": "kg_seq_logs_sync",
         "schedule": crontab(minute="*/10"),
     },
+    # KG self-health canary (Wave 5 retrospective): «monitoring of the
+    # monitoring». Ищет тихие деградации в наших же KG-таблицах
+    # (mem_pct=0 за неделю, sync_lag, stale alerts, и т.п.). На FAIL —
+    # audit-log + опциональный Discord embed в DISCORD_WEBHOOK_SELF_HEALTH_URL
+    # (отдельный dev-канал, не #infra-error). Idempotency: 6h dedup window.
+    "kg-self-health-check": {
+        "task": "kg_self_health_check",
+        "schedule": crontab(minute="*/30"),
+    },
 }
 
 
@@ -610,6 +619,105 @@ def team_daily_digest_task():
         logger.error("team_daily_digest.failed: %s", e)
         # Не падаем в Celery: digest аналитический, retry смысла не имеет.
         return {"status": "error", "error": str(e)}
+
+
+@celery_app.task(name="kg_self_health_check")
+def kg_self_health_check_task():
+    """KG self-health canary (Wave 5 retrospective).
+
+    Runs `run_self_health_checks()` каждые 30 мин, агрегирует статус,
+    пишет в audit-log один из:
+        KG_SELF_HEALTH_OK     — все ok
+        KG_SELF_HEALTH_WARN   — есть warn'ы, нет fail'ов
+        KG_SELF_HEALTH_FAIL   — хотя бы один fail
+
+    На FAIL — отправляет single embed в DISCORD_WEBHOOK_SELF_HEALTH_URL
+    (если задан). Намеренно НЕ в #infra-error — этот сигнал для команды
+    разработки copilot, не для on-call SRE.
+
+    Idempotency: 6h dedup-окно по grubby fingerprint (sorted check_names с
+    fail-статусом). In-memory state — переживает только worker-процесс,
+    что и нужно: если worker рестартовал, лучше один лишний embed, чем
+    пропустить регрессию.
+    """
+    if not settings.KG_SELF_HEALTH_ENABLED:
+        return {"status": "disabled"}
+
+    return asyncio.run(_kg_self_health_logic())
+
+
+# In-memory dedup state — переживает только worker-процесс. Worker max
+# tasks per child перезапускается часто, так что fingerprint живёт максимум
+# ~часы. Это сознательный trade-off (см. docstring task'а).
+_SELF_HEALTH_LAST_FIRE: dict[str, float] = {}
+_SELF_HEALTH_DEDUP_SECONDS = 6 * 3600
+
+
+async def _kg_self_health_logic() -> dict:
+    import time
+
+    from app.knowledge_graph.self_health import (aggregate_status,
+                                                 fingerprint,
+                                                 run_self_health_checks)
+    from app.services.audit_logger import audit_service
+
+    db = SessionLocal()
+    try:
+        results = run_self_health_checks(db)
+    finally:
+        db.close()
+
+    overall = aggregate_status(results)
+    payload = {
+        "overall": overall,
+        "results": [r.as_dict() for r in results],
+    }
+    if overall == "ok":
+        audit_service.log_event("KG_SELF_HEALTH_OK", payload)
+        return {"status": "ok", "checks": len(results)}
+    if overall == "warn":
+        audit_service.log_event("KG_SELF_HEALTH_WARN", payload)
+        return {"status": "warn", "checks": len(results)}
+
+    # overall == "fail"
+    audit_service.log_event("KG_SELF_HEALTH_FAIL", payload)
+
+    failed = [r for r in results if r.status == "fail"]
+    warned = [r for r in results if r.status == "warn"]
+    fp = fingerprint(results)
+    now = time.time()
+    last = _SELF_HEALTH_LAST_FIRE.get(fp, 0.0)
+    if now - last < _SELF_HEALTH_DEDUP_SECONDS:
+        logger.info(
+            "kg_self_health.discord_deduped fp=%s age=%.0fs",
+            fp, now - last,
+        )
+        return {
+            "status": "fail",
+            "checks": len(results),
+            "failed": len(failed),
+            "discord": "deduped",
+        }
+
+    try:
+        from app.services.discord_service import DiscordService
+        discord = DiscordService()
+        await discord.send_self_health_alert(
+            failed_checks=[r.as_dict() for r in failed],
+            warn_checks=[r.as_dict() for r in warned],
+        )
+        _SELF_HEALTH_LAST_FIRE[fp] = now
+        sent = True
+    except Exception as e:
+        logger.warning("kg_self_health.discord_failed: %s", e)
+        sent = False
+
+    return {
+        "status": "fail",
+        "checks": len(results),
+        "failed": len(failed),
+        "discord": "sent" if sent else "failed",
+    }
 
 
 @celery_app.task(name="kg_seq_logs_sync")
