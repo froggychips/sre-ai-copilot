@@ -285,7 +285,7 @@ def correlate_deploy_to_incident(
 
     verdict = _verdict_for(confidence)
 
-    extras = deploy.extras if isinstance(deploy.extras, dict) else {}
+    extras: Dict[str, Any] = deploy.extras if isinstance(deploy.extras, dict) else {}
     deploy_dict: Dict[str, Any] = {
         "id": deploy.id,
         "service_id": deploy.service_id,

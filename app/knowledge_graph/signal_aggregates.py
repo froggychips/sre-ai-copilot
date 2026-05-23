@@ -23,7 +23,7 @@ import logging
 import statistics
 from collections import Counter
 from datetime import datetime, timedelta
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, cast
 
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
@@ -104,7 +104,7 @@ def _compute_for_service(
     if pod_events:
         counter: Counter = Counter()
         for e in pod_events:
-            counter[e.reason] += (e.count or 1)
+            counter[e.reason] += int(e.count or 1)
         top_event_reason, _ = counter.most_common(1)[0]
 
     # ── SLO burn (упрощённая модель) ───────────────────────────────────
@@ -165,7 +165,7 @@ def compute_signal_aggregates(
     services: List[Service] = (
         db.query(Service).filter(Service.synthetic.is_(False)).all()
     )
-    stats = {
+    stats: Dict[str, Any] = {
         "real_services": len(services),
         "window_hours": window_hours,
         "window_end": window_end.isoformat(),
@@ -198,7 +198,7 @@ def compute_signal_aggregates(
 
         ok = _insert_idempotent(
             db,
-            service_id=svc.id,
+            service_id=cast(int, svc.id),
             window_end=window_end,
             window_hours=window_hours,
             values=values,
