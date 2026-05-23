@@ -32,7 +32,7 @@ from __future__ import annotations
 
 import logging
 from datetime import datetime, timedelta
-from typing import Any, Dict, List, Optional, Tuple, cast
+from typing import Dict, List, Optional, Tuple, cast
 
 from sqlalchemy.orm import Session
 
