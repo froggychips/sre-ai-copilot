@@ -98,6 +98,15 @@ class Settings(BaseSettings):
     ENRICH_RECURRENCE_LOOKBACK_MIN: int = 1440  # 24 ч
     ENRICH_UPSTREAM_WINDOW_MIN: int = 15
 
+    # Rollout-noise suppression (root cause #2 alert-quality).
+    # KubeDeployment{Generation,Replicas}Mismatch + KubeContainerWaiting
+    # часто срабатывают во время активного rolling-update'а (median TTR
+    # ~11 мин). Если в окне <N мин назад есть `kg_deployments` для
+    # резолвенного сервиса — демотим severity до "info", чтобы Wave 3
+    # severity-routing погасил эти алёрты в #infra-error.
+    ROLLOUT_SUPPRESS_ENABLED: bool = True
+    ROLLOUT_SUPPRESS_WINDOW_MINUTES: int = 15
+
     # Anti-DoS cap для prompt_guard.detect_injection. Поднимать только
     # осознанно — каждый LLM-вызов биллится по входным токенам.
     PROMPT_INPUT_MAX_CHARS: int = 20000

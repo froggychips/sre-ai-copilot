@@ -18,7 +18,7 @@ Stage order:
 from __future__ import annotations
 
 import asyncio
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional
 
 import structlog
@@ -43,7 +43,7 @@ from app.diagnostics import default_engine as diag_engine
 from app.diagnostics.facts import FactStore
 from app.diagnostics.incident_ctx import build_diagnostics_ctx
 from app.knowledge_graph.auto_populator import populate_from_incident
-from app.knowledge_graph.schema import Service
+from app.knowledge_graph.schema import Deployment, Service
 from app.models.incident import Incident
 from app.rca.deploy_correlator import correlate_deploy_to_incident
 from app.observability.ai_metrics import (
@@ -71,6 +71,24 @@ _LEGACY_STATUS_ALIAS: dict[str, IncidentState] = {
     "PENDING": IncidentState.OPEN,
     "COMPLETED": IncidentState.RESOLVED,
 }
+
+# Root cause #2: alerts, которые срабатывают как побочка rolling-deploy'а,
+# а не как реальная проблема. KubeDeploymentGenerationMismatch ловится 131
+# раз/неделю с median TTR ~11 мин — это таймер rollout'а, а не инцидент.
+ROLLOUT_NOISE_ALERTNAMES = frozenset({
+    "KubeDeploymentGenerationMismatch",
+    "KubeDeploymentReplicasMismatch",
+    "KubeContainerWaiting",
+})
+
+# Whitelist: эти алёрты всегда actionable — НЕ подавляем даже если есть
+# active rollout. CrashLooping/JobFailed/TargetDown — реальные сбои.
+ROLLOUT_NOISE_NEVER_SUPPRESS = frozenset({
+    "KubePodCrashLooping",
+    "KubeJobFailed",
+    "TargetDown",
+    "KubePodNotReady",
+})
 
 
 def _current_state(record) -> IncidentState:
@@ -215,6 +233,11 @@ class IncidentPipeline:
             # сравниваем метрики до/после. Результат — отдельный сигнал для
             # RCA-агентов и финального синтеза (см. diag_ctx["deploy_correlation"]).
             self._enrich_deploy_correlation(diag_ctx)
+            # Root cause #2: если в окне ROLLOUT_SUPPRESS_WINDOW_MINUTES
+            # шёл rollout того же сервиса — `KubeDeploymentGenerationMismatch`
+            # и компания являются rollout-noise. Демотим severity → "info",
+            # Wave 3 severity-routing уже умеет пропускать info.
+            self._filter_rollout_noise(diag_ctx)
             self.fact_store = diag_engine.run(diag_ctx)
         snap = t.snapshot().to_dict()
         self._safe_transition(IncidentState.FACTS_COLLECTED, snap)
@@ -305,6 +328,104 @@ class IncidentPipeline:
         except Exception as e:
             audit_service.log_event(
                 "DEPLOY_CORRELATION_FAILED",
+                {"incident_id": self.incident_id, "error": type(e).__name__},
+            )
+
+    def _filter_rollout_noise(self, diag_ctx: dict) -> None:
+        """Подавить rollout-noise алёрты, если идёт активный rollout сервиса.
+
+        Root cause #2 alert-quality: `KubeDeployment{Generation,Replicas}Mismatch`
+        и `KubeContainerWaiting` срабатывают как side-effect rolling-update'а
+        (median TTR ~11 мин). Если в окне `ROLLOUT_SUPPRESS_WINDOW_MINUTES`
+        зафиксирован deploy того же сервиса → демотим severity до "info"
+        (Wave 3 severity-routing уже умеет skip-ать info → канал тихий).
+
+        Whitelist actionable алёртов (`KubePodCrashLooping`, `KubeJobFailed`,
+        `TargetDown`, `KubePodNotReady`) — НЕ подавляются никогда; это
+        реальные сбои, даже если совпадают с rollout-окном.
+
+        Best-effort: при любой ошибке (KG holod, БД сорвалась) ничего не
+        делаем — пайплайн идёт дальше с исходной severity.
+        """
+        if not settings.ROLLOUT_SUPPRESS_ENABLED:
+            return
+        if self.incident is None:
+            return
+        labels = self.incident.labels or {}
+        alertname = labels.get("alertname", "")
+        if alertname not in ROLLOUT_NOISE_ALERTNAMES:
+            return
+        if alertname in ROLLOUT_NOISE_NEVER_SUPPRESS:
+            # Defensive: пересечение пустое (sets разные), но если кто-то
+            # переставит alertname в обе группы — actionable приоритет.
+            return
+
+        # Резолвим target service из labels (тот же helper, что в alert_enrichment).
+        try:
+            from app.services.alert_enrichment import _resolve_target_service_from_labels
+            resolved_ns, resolved_svc = _resolve_target_service_from_labels(labels)
+        except Exception:
+            resolved_ns, resolved_svc = None, None
+        namespace = resolved_ns or self.incident.namespace
+        service_name = resolved_svc or labels.get("service") or labels.get("app")
+        if not namespace or not service_name:
+            return
+
+        window_min = max(1, int(settings.ROLLOUT_SUPPRESS_WINDOW_MINUTES))
+        try:
+            svc = (
+                self.db.query(Service)
+                .filter(Service.namespace == namespace, Service.name == service_name)
+                .one_or_none()
+            )
+            if svc is None:
+                return
+            now = datetime.utcnow()
+            cutoff = now - timedelta(minutes=window_min)
+            # Активный rollout = started_at в окне И (finished_at IS NULL OR
+            # finished_at >= started_at - 5 мин). Второе условие защищает от
+            # rollouts, которые закончились прямо перед alert-ом — generation
+            # mismatch может задержаться на ~1 мин после finish.
+            deploy = (
+                self.db.query(Deployment)
+                .filter(
+                    Deployment.service_id == svc.id,
+                    Deployment.started_at >= cutoff,
+                )
+                .order_by(Deployment.started_at.desc())
+                .first()
+            )
+            if deploy is None:
+                return
+            if deploy.finished_at is not None and deploy.finished_at < (
+                deploy.started_at - timedelta(minutes=5)
+            ):
+                # finished_at сильно раньше started_at — это битая запись, не верим.
+                return
+            # Гасим: severity → info. Wave 3 routing.skip_info_in_error работает.
+            previous_severity = self.incident.severity
+            self.incident.severity = "info"
+            # Подсветить в labels для downstream-render (audit/digest/digital pet).
+            self.incident.labels["suppress_reason"] = "active_rollout"
+            self.incident.labels["original_severity"] = previous_severity or ""
+            diag_ctx["rollout_suppressed"] = True
+            age_seconds = int((now - deploy.started_at).total_seconds())
+            audit_service.log_event(
+                "ALERT_SUPPRESSED_ROLLOUT_NOISE",
+                {
+                    "incident_id": self.incident_id,
+                    "alertname": alertname,
+                    "namespace": namespace,
+                    "service": service_name,
+                    "deploy_id": deploy.id,
+                    "deploy_started_at": deploy.started_at.isoformat(),
+                    "age_seconds": age_seconds,
+                    "previous_severity": previous_severity,
+                },
+            )
+        except Exception as e:
+            audit_service.log_event(
+                "ROLLOUT_NOISE_FILTER_FAILED",
                 {"incident_id": self.incident_id, "error": type(e).__name__},
             )
 
