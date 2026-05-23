@@ -10,9 +10,10 @@ app.diagnostics.rules — БЕЗ LLM-вызовов. Используется в
 """
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import structlog
 from sqlalchemy.orm import Session
@@ -106,6 +107,11 @@ class EnrichedContext:
     rollout_noise: bool = False
 
     kg_data_age_sec: Optional[int] = None
+
+    # Свободное поле для metadata, которая не имеет первого-класса своего слота:
+    # `synthetic_fallback` (resolver hit на synthetic Service), `target_resolve_*` —
+    # debug-сигналы, не для render-а в embed напрямую.
+    extras: Dict[str, Any] = field(default_factory=dict)
 
     def primary_hypothesis(self) -> Optional[str]:
         """Берёт самый сильный observed fact для подсказки в Root Cause."""
@@ -216,6 +222,72 @@ def _kg_data_age(db: Session, namespace: str, service_name: str) -> Optional[int
     return int(age.total_seconds())
 
 
+# Root cause #1: `incident.namespace` для `kube_*` алёртов часто указывает
+# на ns источника метрики (monitoring / kube-system), а не на target deploy.
+# В результате 330 alerts/неделю всем стеком улетают в misattribute на
+# `vm-kube-state-metrics`. Резолвим target из labels в порядке приоритета.
+#
+# Pod-hash strip: kube создаёт pod как `<deployment>-<rs-hash>-<pod-hash>`
+# (rs-hash = 8..10 alnum, pod-hash = 5 alnum). При `Kube*` алёртах из labels
+# берём pod и режем хвост, чтобы получить имя deployment'а.
+_POD_HASH_RE = re.compile(r"^(?P<deploy>.+?)-[a-z0-9]{8,10}-[a-z0-9]{5}$")
+# StatefulSet pod: `<sts>-<ordinal>` (e.g. `town-db-postgresql-0`).
+_STS_POD_RE = re.compile(r"^(?P<sts>.+?)-(?P<ord>\d+)$")
+
+
+def _strip_pod_hash(pod: str) -> Optional[str]:
+    """Извлечь deployment-name из k8s pod-name.
+
+    `auth-service-7f8c4b6cdf-h2x9k` → `auth-service`.
+    `town-db-postgresql-0` → `town-db-postgresql` (StatefulSet ordinal).
+    Не-stripped pod → None.
+    """
+    if not pod:
+        return None
+    m = _POD_HASH_RE.match(pod)
+    if m:
+        return m.group("deploy")
+    m = _STS_POD_RE.match(pod)
+    if m:
+        return m.group("sts")
+    return None
+
+
+def _resolve_target_service_from_labels(
+    labels: Dict[str, str],
+) -> Tuple[Optional[str], Optional[str]]:
+    """Извлечь (namespace, service_name) для target deployment'а.
+
+    Порядок приоритета (root cause #1 fix):
+        1. labels["deployment"]    — KubeDeployment*
+        2. labels["statefulset"]   — KubeStatefulSet*
+        3. labels["daemonset"]     — KubeDaemonSet*
+        4. labels["job_name"]      — KubeJobFailed
+        5. labels["pod"] → strip hash → deployment-derive
+        6. labels["container"]     — last-resort fallback
+
+    namespace ВСЕГДА из labels["namespace"] (если есть). Это namespace
+    target'а, не источника метрики. Если ничего не нашли — (None, None).
+    """
+    if not labels:
+        return (None, None)
+    namespace = labels.get("namespace") or None
+    # Priority chain: первое непустое поле выигрывает.
+    for key in ("deployment", "statefulset", "daemonset", "job_name"):
+        value = labels.get(key)
+        if value:
+            return (namespace, value)
+    pod = labels.get("pod")
+    if pod:
+        derived = _strip_pod_hash(pod)
+        if derived:
+            return (namespace, derived)
+    container = labels.get("container")
+    if container:
+        return (namespace, container)
+    return (namespace, None)
+
+
 def _detect_rollout_noise(incident: Incident, recent_deploys: List[Dict[str, Any]]) -> bool:
     """Heuristic: KubeDeploymentGenerationMismatch + deploy <5 мин назад → noise."""
     alertname = incident.labels.get("alertname", "")
@@ -232,9 +304,24 @@ def enrich_alert(db: Session, incident: Incident) -> EnrichedContext:
 
     Безопасно при пустом KG — каждое поле fallback в пустое значение.
     """
-    namespace = incident.namespace or incident.labels.get("namespace", "")
-    service = incident.labels.get("service") or incident.labels.get("deployment")
-    pod = incident.labels.get("pod")
+    labels = incident.labels or {}
+    pod = labels.get("pod")
+    # Root cause #1: target из labels в priority order. incident.service_name
+    # (если бы он был) сейчас глючит — приоритет за labels-resolved. Старый
+    # код брал `service || deployment` → пропускал KubeStatefulSet/Daemon/Job
+    # alerts и игнорировал pod-hash-strip. Misattribute на vm-kube-state-metrics
+    # =  330 alerts/week просачивались в #infra-error именно из-за этого.
+    resolved_ns, resolved_svc = _resolve_target_service_from_labels(labels)
+    # Если labels пустые/не дали target — fallback на incident.namespace.
+    # Это уже не сервис-namespace, а namespace источника метрики (часто
+    # `monitoring`), но без неё мы вообще ничего не найдём в KG.
+    namespace = resolved_ns or incident.namespace or ""
+    service = resolved_svc
+    # Legacy fallback: старые alerts с `service`/`app` label без структурных
+    # `deployment`/`pod` (например, custom Prometheus rules). Оставляем
+    # last-resort, чтобы не регрессировать на не-Kube alerts.
+    if not service:
+        service = labels.get("service") or labels.get("app")
 
     ctx = EnrichedContext(
         incident=incident,
@@ -351,12 +438,18 @@ def enrich_alert(db: Session, incident: Incident) -> EnrichedContext:
         log.warning("enrich.pod_events_failed", error=str(e))
 
     # 5. Service metadata (team_owner, in_kg flag, data freshness)
+    # Сначала ищем не-synthetic; synthetic-only попадание помечаем в extras —
+    # это полезный сигнал «edge case: cron-job или nats-tool», но точно не
+    # реальный target deployment.
     try:
-        svc = (
-            db.query(Service)
-            .filter(Service.namespace == namespace, Service.name == service)
-            .one_or_none()
+        q = db.query(Service).filter(
+            Service.namespace == namespace, Service.name == service
         )
+        svc = q.filter(Service.synthetic == False).first()  # noqa: E712
+        if svc is None:
+            svc = q.first()
+            if svc is not None:
+                ctx.extras["synthetic_fallback"] = True
         if svc is not None:
             ctx.in_kg = True
             ctx.team_owner = svc.team_owner
