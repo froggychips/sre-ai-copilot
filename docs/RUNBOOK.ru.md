@@ -289,3 +289,190 @@ Audit log events (фильтр по `event`):
 | `EXECUTOR_APPLY_REFUSED` | Apply ineligible |
 | `EXECUTOR_APPLY_EXCEPTION` | Неожиданная exception в apply-service |
 | `EXECUTOR_DRY_RUN_FAILED` | Exception в `stage_executor` |
+
+---
+
+## KG self-health alerts
+
+Beat-задача `kg_self_health_check` запускает шесть canary'ев каждые 30 минут. На любой `fail`/`warn` шлёт single embed в `DISCORD_WEBHOOK_SELF_HEALTH_URL` (отдельный канал от `#infra-error` — намеренно, чтобы операционные алерты и tooling-алерты не конкурировали).
+
+Audit-log event'ы: `KG_SELF_HEALTH_OK` / `KG_SELF_HEALTH_WARN` / `KG_SELF_HEALTH_FAIL`. Фильтр по `check_name` чтобы детализировать.
+
+### `materialization_zero_rate` fail на конкретной метрике (например, `cpu_pct`)
+
+Что значит: больше допустимого % строк `kg_service_health` за 24 ч имеют значение 0 или NULL для этой метрики.
+
+Allowlist: `http_5xx_rate` и `p95_latency_ms` ожидаемо ноль, пока ingress scrape config не настроен — на них этот canary НЕ должен срабатывать. Если срабатывает — allowlist в `self_health.py` устарел.
+
+Диагностика по порядку:
+
+1. Доступна ли VictoriaMetrics? `curl <vm-host>/api/v1/query?query=up`. Если нет — VM лежит; canary справедливо орёт, чинить VM.
+2. PromQL всё ещё валиден? Открыть `metrics_sync.py`, скопировать запрос в VM UI напрямую — он что-то возвращает на заведомо живом сервисе?
+3. Менялась ли форма запроса недавно? См. Wave 5 gotcha: aggregate-then-divide молча отдаёт 0. Корректная форма для ratio-метрик — divide-then-aggregate.
+4. Жив ли celery-worker, который крутит `kg_metrics_sync`? `celery -A app.celery_worker inspect active`.
+
+### `sync_lag` fail на `kg_seq_logs_sync` (или любой другой sync)
+
+Что значит: последний write timestamp для этого источника старше 5× ожидаемого интервала.
+
+Типичные причины по sync'у:
+- `kg_seq_logs_sync` — Seq недоступен, API key протух, egress заблокирован.
+- `kg_metrics_sync` — VM недоступна.
+- `kg_topology_sync` — kubeconfig невалиден или k8s API throttled.
+- `tc_deploys_to_kg` — TC MCP недоступен или token протух.
+
+Generic check: tail логов celery-worker, grep по имени задачи; искать exceptions или repeated retries.
+
+### `anomaly_signal_health: 0 observations`
+
+Что значит: anomaly-детектор написал ноль строк за последние 24 ч.
+
+Две интерпретации:
+- **Flat baseline** — исходная метрика вся нули (например, ingress без scrape). Ожидаемо; не проблема.
+- **Detector regression** — детектор отработал, но output не выдал, хотя в источнике есть variance. Посмотреть variance в `kg_service_health`, потом запустить `anomaly_detection.py` интерактивно на известно-аномальном сервисе, проверить поле `extras.method`.
+
+### `anomaly_signal_health: >500 observations`
+
+Что значит: пороги слишком слабые, либо добавили новую метрику с природным шумом.
+
+Поднять `KG_ANOMALY_ROBUST_Z_WARN` / `_CRIT` вверх или сузить baseline window. Volume guard кэпит на 3/час на (service, metric), так что >500 за 24 ч означает распыление по многим сервисам — скорее всего global threshold issue, а не один горячий сервис.
+
+### `pod_events_link_rate <50%`
+
+Что значит: больше половины `kg_pod_events` за последние 24 ч имеют `service_id IS NULL`.
+
+Это StS-резолвер регрессия. Pod naming для StS использует ordinal suffixes (`-0`, `-1`) вместо deployment hash; проверить, что в `k8s_events_sync.py` живой cascading fallback Deployment regex → StatefulSet regex → DaemonSet regex.
+
+### `edges_freshness >30% stale`
+
+Что значит: слишком много `kg_service_edges` имеют `last_seen_at` старше 24 ч или NULL.
+
+Самая вероятная причина: `kg_topology_sync` не запускается, не refresh'ит `last_seen_at` или upsert'ит под не той identity. Проверить celery beat logs на hourly run, и убедиться в БД что `max(last_seen_at)` сдвигается с каждым прогоном.
+
+---
+
+## Setting up Discord approvers
+
+Approve / Decline на incident-embed'ах гейтятся. Без сконфигурированных approver'ов система fail-closed — кнопки отказывают с audit `DISCORD_APPROVAL_DENIED_NO_APPROVERS_CONFIGURED`.
+
+### Получить Discord user ID
+
+В Discord-клиенте включить Developer Mode (Settings → Advanced → Developer Mode). Дальше right-click по нужному юзеру → "Copy ID". ID — числовая строка 17–19 цифр.
+
+### Конфигурация
+
+```bash
+# Allowlist по юзерам (CSV):
+DISCORD_APPROVERS_USER_IDS="123456789012345678,234567890123456789"
+
+# Либо по ролям (разрешает любого, у кого есть хотя бы одна из этих ролей):
+DISCORD_APPROVERS_ROLE_IDS="345678901234567890"
+
+# Опционально override квоты (default 5/час на юзера):
+DISCORD_APPROVAL_RATE_LIMIT_PER_HOUR="10"
+```
+
+Списки юзеров и ролей объединяются (user-id match OR role match → allowed).
+
+### Fail-closed семантика
+
+Если оба списка `DISCORD_APPROVERS_USER_IDS` и `DISCORD_APPROVERS_ROLE_IDS` пустые, каждый клик отказывает с `DISCORD_APPROVAL_DENIED_NO_APPROVERS_CONFIGURED`. Никакого "default allow" — это by design.
+
+### Тестирование
+
+1. Прописать env-vars, рестартнуть API + worker.
+2. Послать тестовый incident; убедиться что в embed'е есть кнопки Approve / Decline.
+3. Из-под allowlisted юзера: клик Approve → ephemeral "approved" + строка в audit log.
+4. Из-под не-allowlisted юзера: клик Approve → ephemeral deny + audit `DISCORD_APPROVAL_DENIED_UNAUTHORIZED`. Проверить что отказ НЕ потребил rate-limit квоту легитимного approver'а.
+
+---
+
+## Per-team Discord channels
+
+Discord-рендерер умеет роутить incident'ы и дайджесты в разные каналы по `team_owner`. Конфигурируется через `DISCORD_TEAM_CHANNEL_MAP` как JSON-строка:
+
+```json
+{
+  "platform": "https://discord.com/api/webhooks/.../platform-channel",
+  "payments": "https://discord.com/api/webhooks/.../payments-channel",
+  "gameplay": "https://discord.com/api/webhooks/.../gameplay-channel"
+}
+```
+
+- Ключи матчатся с `kg_services.team_owner` (выводится из namespace prefix).
+- Несовпавшие команды откатываются на `DISCORD_WEBHOOK_URL`.
+- Добавить новую команду: дописать запись; код менять не надо. Рестартнуть worker, чтобы подхватил.
+
+---
+
+## Signal quality tuning
+
+Anomaly-пороги тюнятся через env-vars. Robust-z статистически well-defined (3.5 ≈ p99.95 на нормально-подобном распределении), но реальные метрики имеют тяжёлые хвосты.
+
+### Конфигурация
+
+```bash
+KG_ANOMALY_ROBUST_Z_WARN="3.5"   # default — производит "warning" строки
+KG_ANOMALY_ROBUST_Z_CRIT="6.0"   # default — производит "critical" строки
+```
+
+### Симптомы false-positive overload
+
+- Canary `anomaly_signal_health` переходит в `warn` с `>500 obs/24h`.
+- Discord pipeline начинает агрессивно дедупить сам себя (одна и та же аномалия каждые 30 мин).
+- Операторы жалуются на «шум» в embed'ах.
+
+### Как тюнить
+
+1. **Поднять пороги** — `KG_ANOMALY_ROBUST_Z_WARN` до 4.5 или 5.0. Грубый, но быстрый фикс.
+2. **Сузить baseline window** — по умолчанию детектор использует 7 дней. Если у метрики недельные циклы отличаются от дневных, seasonal baseline становится шумным. Сужение окна помогает при коротких циклах.
+3. **Проверить `flat_baseline`** — если у многих аномалий `extras.flat_baseline=true`, метрика реально мёртвая, и детектор срабатывает на переходе "0 → 1". Обычно это корректно, но стоит проверить, что метрика должна быть живой.
+
+### Симптомы false-negative
+
+- Canary `anomaly_signal_health` переходит в `warn` с `0 obs/24h`.
+- Известные инциденты не поднимают deploy correlator signal, хотя метрики явно прыгнули.
+
+Понизить пороги или проверить, что seasonal-стратификация не маскирует сигнал (нужно ≥50 исторических точек — у недавно появившихся сервисов их ещё нет).
+
+---
+
+## Deploy correlator verdict
+
+Каждый инцидент, прошедший enrichment, получает блок `deploy_correlator` в `analysis`. Verdict tier управляет тем, что покажет Discord embed.
+
+### Что значит verdict
+
+| Verdict | Confidence | Действие |
+|---|---|---|
+| `likely` | ≥ 0.7 | Отрисовывается как блок "Suspect deploy" в embed'е с TC-ссылкой + автором. Смотреть деплой первым. |
+| `suspect` | 0.4 – 0.7 | Отрисовывается мягче ("possibly related"). Смотреть после primary hypothesis. |
+| `weak` | 0.2 – 0.4 | Остаётся в `analysis` JSON, в embed не идёт. Полезно для backfill / audit. |
+| `unlikely` | < 0.2 | Пишется для полноты, дальше игнорируется. |
+
+### Посмотреть confidence напрямую
+
+```sql
+SELECT
+  incident_id,
+  analysis -> 'deploy_correlator' -> 'verdict'    AS verdict,
+  analysis -> 'deploy_correlator' -> 'confidence' AS confidence,
+  analysis -> 'deploy_correlator' -> 'factors'    AS factors,
+  analysis -> 'deploy_correlator' -> 'deploy'     AS deploy
+FROM incidents
+WHERE incident_id = '<id>';
+```
+
+`factors` показывает multi-factor разбивку:
+
+- `n_spikes` — anomaly count после деплоя в окне
+- `max_zscore` — пиковый robust-z
+- `time_proximity` — ближе по времени = выше
+- `deploy_status_factor` — FAILED > SUCCESS
+- `flat_baseline_penalty` — снижает confidence на спайках мёртвой метрики
+
+### Когда копать руками
+
+- `likely`, но деплой был docs-only → проверить `deploy_status_factor` и `time_proximity`; деплой мог совпасть по времени с независимым инцидентом. Пометить инцидент `resolution_quality = 'unresolved'`, чтобы не засорять KG.
+- `suspect`, а интуиция оператора говорит "точно он" → посмотреть на `max_zscore`. Если он чуть ниже warning-порога, исходная метрика может быть пограничной по шуму.
+- `weak`, но интуиция говорит "yes" → проверить, не вылез ли деплой за 2-часовое окно (incident lag из-за VM scrape interval может сдвинуть timestamp позже, чем реально).

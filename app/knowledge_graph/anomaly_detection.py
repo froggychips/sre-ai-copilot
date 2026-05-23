@@ -1,4 +1,4 @@
-"""Rolling z-score anomaly detection по kg_service_health.
+"""Robust-z anomaly detection по kg_service_health.
 
 Beat-task `kg_anomaly_detection_task` каждые ~10 мин:
 1. Берём все real (synthetic=False) services из KG.
@@ -7,15 +7,25 @@ Beat-task `kg_anomaly_detection_task` каждые ~10 мин:
      значение метрики = mean этих точек (устойчивее к одной выбросной точке).
    - baseline_window = 7d, исключая последний 1ч (чтобы текущий всплеск не
      подмешивался в baseline).
-   - z = (current - mean_baseline) / stddev_baseline.
-3. Защиты от ложных срабатываний:
+   - robust_z = (current - median(baseline)) / (1.4826 × MAD(baseline)).
+     MAD = median absolute deviation. 1.4826 — gauss-consistency-constant.
+     В отличие от mean/stddev устойчиво к outlier-ам в baseline
+     (deploy spike предыдущего дня не «отравит» порог).
+3. **Опциональный seasonal baseline**: если baseline ≥ 50 точек, бьём
+   точки по hour-of-day и сравниваем current с baseline-точками текущего
+   часа ±1. Иначе fallback на плоский baseline. Снижает false-positive
+   shower при day/night паттернах.
+4. Защиты от ложных срабатываний:
    - baseline_n < 10 → пропускаем метрику (мало данных).
-   - stddev < 1e-6 → пропускаем (flat-line, любой шум даст ∞).
+   - MAD < 1e-6 → пропускаем (flat-line после удаления outlier-ов).
    - NULL в value → пропускаем эту метрику для этой точки.
-4. |z|>3 → INSERT в kg_anomaly_observations. severity:
-     * |z|>5 → 'critical'
-     * иначе → 'warning'
-5. Идемпотентность: UNIQUE(service_id, ts, metric) + per-row savepoint.
+5. **Volume guard**: per-service per-metric не более 3 anomaly
+   observations за последний час. После 3-го — игнорируем (защита от
+   «постоянно деградирующего сервиса» flood-а в digest).
+6. Пороги: |robust_z| > KG_ANOMALY_ROBUST_Z_WARN → warning,
+            |robust_z| > KG_ANOMALY_ROBUST_Z_CRIT → critical.
+   Default 3.5 / 6.0. Trigger >=, не строго >.
+7. Идемпотентность: UNIQUE(service_id, ts, metric) + per-row savepoint.
 
 Discord-уведомление в этой фазе не реализуется — пишем notified=false,
 вторая фаза обработает unsent.
@@ -25,6 +35,7 @@ CLI: `python -m app.knowledge_graph.anomaly_detection`.
 from __future__ import annotations
 
 import logging
+import os
 import statistics
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Tuple
@@ -37,7 +48,7 @@ from app.knowledge_graph.schema import (AnomalyObservation, Service,
 
 log = logging.getLogger(__name__)
 
-# Метрики, по которым считаем z-score. Должны существовать в ServiceHealth.
+# Метрики, по которым считаем robust-z. Должны существовать в ServiceHealth.
 METRICS: Tuple[str, ...] = (
     "cpu_pct",
     "mem_pct",
@@ -46,14 +57,46 @@ METRICS: Tuple[str, ...] = (
     "p95_latency_ms",
 )
 
-# Параметры окон / порогов.
+# Параметры окон.
 CURRENT_POINTS = 6              # последние ≈1ч при 10-мин ритме
 BASELINE_DAYS = 7               # окно baseline
 BASELINE_EXCLUDE_HOURS = 1      # исключить последний час из baseline
 MIN_BASELINE_POINTS = 10        # ниже — слишком мало, пропускаем
-MIN_STDDEV = 1e-6               # защита от division-by-zero / flat-line
-Z_WARNING = 3.0
-Z_CRITICAL = 5.0
+
+# MAD ниже этого считаем «плоской линией» — z не информативен.
+MIN_MAD = 1e-6
+
+# 1.4826 — gauss-consistency-constant: 1 / Φ⁻¹(0.75). При нормальном
+# распределении даёт MAD ≈ stddev, поэтому robust_z сопоставим со стандартным.
+MAD_GAUSS_CONST = 1.4826
+
+# Seasonal baseline активируется только при достаточном объёме.
+SEASONAL_MIN_POINTS = 50
+SEASONAL_HOUR_BAND = 1          # ±1 час от target hour-of-day
+
+# Volume guard: per-service per-metric не более N observations за окно.
+VOLUME_GUARD_MAX_PER_HOUR = 3
+VOLUME_GUARD_WINDOW = timedelta(hours=1)
+
+
+def _threshold_warn() -> float:
+    """Порог warning из env с safe-fallback."""
+    raw = os.environ.get("KG_ANOMALY_ROBUST_Z_WARN", "3.5")
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        log.warning("anomaly.bad_warn_threshold raw=%r → using 3.5", raw)
+        return 3.5
+
+
+def _threshold_crit() -> float:
+    """Порог critical из env с safe-fallback."""
+    raw = os.environ.get("KG_ANOMALY_ROBUST_Z_CRIT", "6.0")
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        log.warning("anomaly.bad_crit_threshold raw=%r → using 6.0", raw)
+        return 6.0
 
 
 def _extract_values(
@@ -72,25 +115,86 @@ def _extract_values(
     return out
 
 
-def _compute_z(
+def _mad(values: List[float]) -> Optional[float]:
+    """Median Absolute Deviation. None если <2 точек."""
+    if len(values) < 2:
+        return None
+    med = statistics.median(values)
+    abs_devs = [abs(v - med) for v in values]
+    return statistics.median(abs_devs)
+
+
+def _compute_robust_z(
     current: float, baseline: List[float],
 ) -> Optional[Tuple[float, float, float]]:
-    """Возвращает (z, mean, stddev) или None если baseline недостаточен."""
+    """Возвращает (robust_z, median, mad) или None если baseline недостаточен.
+
+    robust_z = (current - median) / (1.4826 × MAD).
+    """
     if len(baseline) < MIN_BASELINE_POINTS:
         return None
     try:
-        mean = statistics.fmean(baseline)
-        stddev = statistics.pstdev(baseline)
+        med = statistics.median(baseline)
     except statistics.StatisticsError:
         return None
-    if stddev < MIN_STDDEV:
+    mad = _mad(baseline)
+    if mad is None or mad < MIN_MAD:
         return None
-    z = (current - mean) / stddev
-    return z, mean, stddev
+    scaled_mad = MAD_GAUSS_CONST * mad
+    if scaled_mad < MIN_MAD:
+        return None
+    z = (current - med) / scaled_mad
+    return z, med, mad
 
 
-def _severity(z: float) -> str:
-    return "critical" if abs(z) > Z_CRITICAL else "warning"
+def _seasonal_baseline(
+    rows: List[ServiceHealth], metric: str, target_hour: int,
+) -> List[float]:
+    """Отфильтровать baseline-точки по hour-of-day ±SEASONAL_HOUR_BAND.
+
+    Например target_hour=14 → берём только точки с hour ∈ {13, 14, 15}.
+    Учитываем wrap-around через сутки: hour 23 → {22, 23, 0}.
+    """
+    band = SEASONAL_HOUR_BAND
+    allowed = {(target_hour + i) % 24 for i in range(-band, band + 1)}
+    out: List[float] = []
+    for r in rows:
+        if r.ts is None or r.ts.hour not in allowed:
+            continue
+        v = getattr(r, metric, None)
+        if v is None:
+            continue
+        try:
+            out.append(float(v))
+        except (TypeError, ValueError):
+            continue
+    return out
+
+
+def _severity(z: float, warn: float, crit: float) -> str:
+    return "critical" if abs(z) >= crit else "warning"
+
+
+def _count_recent_observations(
+    db: Session, service_id: int, metric: str, now: datetime,
+) -> int:
+    """Сколько уже было записано аномалий за последний час по
+    (service_id, metric). Volume guard.
+
+    Окно считаем по `ts` (анамалии-таймстамп), не по `created_at`. Это
+    даёт детерминированное окно в тестах (где `now` подменяется) и
+    в обычном проде работает идентично (kg_service_health.ts ≈ now).
+    """
+    cutoff = now - VOLUME_GUARD_WINDOW
+    return (
+        db.query(AnomalyObservation)
+        .filter(
+            AnomalyObservation.service_id == service_id,
+            AnomalyObservation.metric == metric,
+            AnomalyObservation.ts >= cutoff,
+        )
+        .count()
+    )
 
 
 def _insert_idempotent(
@@ -104,12 +208,9 @@ def _insert_idempotent(
     baseline_stddev: float,
     z_score: float,
     severity: str,
+    extras: Optional[Dict[str, Any]] = None,
 ) -> bool:
-    """INSERT с защитой по UNIQUE(service_id, ts, metric).
-
-    Кроссдиалектно: savepoint + IntegrityError. Возвращает True если строка
-    реально вставилась.
-    """
+    """INSERT с защитой по UNIQUE(service_id, ts, metric)."""
     row = AnomalyObservation(
         service_id=service_id,
         ts=ts,
@@ -120,6 +221,7 @@ def _insert_idempotent(
         z_score=z_score,
         severity=severity,
         notified=False,
+        extras=extras,
     )
     try:
         with db.begin_nested():
@@ -133,25 +235,26 @@ def _detect_for_service(
     db: Session,
     service: Service,
     now: datetime,
+    *,
+    warn_thresh: float,
+    crit_thresh: float,
 ) -> Dict[str, int]:
     """Считает аномалии для одного сервиса.
 
     Возвращает счётчики: inserted / skipped_dup / skipped_no_baseline /
-    skipped_no_current.
+    skipped_no_current / skipped_volume_guard.
     """
     counters = {
         "inserted": 0,
         "skipped_dup": 0,
         "skipped_no_baseline": 0,
         "skipped_no_current": 0,
+        "skipped_volume_guard": 0,
     }
 
     current_start = now - timedelta(hours=BASELINE_EXCLUDE_HOURS)
     baseline_start = now - timedelta(days=BASELINE_DAYS)
 
-    # Один SELECT по всему baseline-окну, дальше делим в Python — экономит
-    # роунд-трипы при ~370 сервисах. ORDER BY ts ASC чтобы latest легко
-    # отрезать срезом.
     rows: List[ServiceHealth] = (
         db.query(ServiceHealth)
         .filter(
@@ -165,46 +268,76 @@ def _detect_for_service(
     if not rows:
         return counters
 
-    # Делим на baseline (ts < current_start) и current (последние CURRENT_POINTS
-    # точек). Если current-окно пустое — нечего сравнивать, пропускаем.
     baseline_rows = [r for r in rows if r.ts < current_start]
     current_rows = [r for r in rows if r.ts >= current_start][-CURRENT_POINTS:]
     if not current_rows:
         counters["skipped_no_current"] += len(METRICS)
         return counters
 
-    # `ts` для записи аномалии — самая свежая точка current-окна. Это
-    # стабильный ключ идемпотентности при пере-запуске на тот же snapshot.
     anomaly_ts = current_rows[-1].ts
+    target_hour = anomaly_ts.hour
 
     for metric in METRICS:
         current_vals = _extract_values(current_rows, metric)
-        baseline_vals = _extract_values(baseline_rows, metric)
         if not current_vals:
             counters["skipped_no_current"] += 1
             continue
-        # current = mean current_window → устойчивее к единичной выбросной точке
-        # (одна нестабильная scrape-точка не должна давать ложный alert).
         current_value = statistics.fmean(current_vals)
 
-        res = _compute_z(current_value, baseline_vals)
+        # Сначала пробуем seasonal baseline если данных достаточно.
+        baseline_all = _extract_values(baseline_rows, metric)
+        method = "robust_z_flat"
+        baseline_vals = baseline_all
+
+        if len(baseline_all) >= SEASONAL_MIN_POINTS:
+            seasonal = _seasonal_baseline(baseline_rows, metric, target_hour)
+            # Seasonal-окно тоже должно набрать MIN_BASELINE_POINTS — иначе
+            # fallback на flat.
+            if len(seasonal) >= MIN_BASELINE_POINTS:
+                baseline_vals = seasonal
+                method = "robust_z_seasonal"
+
+        res = _compute_robust_z(current_value, baseline_vals)
         if res is None:
             counters["skipped_no_baseline"] += 1
             continue
-        z, mean, stddev = res
-        if abs(z) <= Z_WARNING:
+        z, median, mad = res
+        if abs(z) < warn_thresh:
             continue
 
+        # Volume guard: не плодим observations того же service/metric.
+        recent_count = _count_recent_observations(
+            db, service.id, metric, now,
+        )
+        if recent_count >= VOLUME_GUARD_MAX_PER_HOUR:
+            counters["skipped_volume_guard"] += 1
+            continue
+
+        sev = _severity(z, warn_thresh, crit_thresh)
+        extras = {
+            "method": method,
+            "median": median,
+            "mad": mad,
+            "baseline_n": len(baseline_vals),
+            "warn_thresh": warn_thresh,
+            "crit_thresh": crit_thresh,
+            "target_hour": target_hour,
+        }
+
+        # baseline_mean/baseline_stddev по схеме — пишем median и
+        # scaled_mad (MAD × 1.4826). Это сохраняет смысл колонок
+        # (центр + разброс) и читаемо для downstream-сервисов.
         ok = _insert_idempotent(
             db,
             service_id=service.id,
             ts=anomaly_ts,
             metric=metric,
             value=current_value,
-            baseline_mean=mean,
-            baseline_stddev=stddev,
+            baseline_mean=median,
+            baseline_stddev=MAD_GAUSS_CONST * mad,
             z_score=z,
-            severity=_severity(z),
+            severity=sev,
+            extras=extras,
         )
         if ok:
             counters["inserted"] += 1
@@ -223,6 +356,8 @@ def detect_anomalies(
     `now` — для тестов (фиксированное время). Default = datetime.utcnow().
     """
     now = now or datetime.utcnow()
+    warn_thresh = _threshold_warn()
+    crit_thresh = _threshold_crit()
 
     services: List[Service] = (
         db.query(Service).filter(Service.synthetic.is_(False)).all()
@@ -230,17 +365,23 @@ def detect_anomalies(
     stats: Dict[str, Any] = {
         "real_services": len(services),
         "now": now.isoformat(),
+        "warn_thresh": warn_thresh,
+        "crit_thresh": crit_thresh,
         "inserted": 0,
         "skipped_dup": 0,
         "skipped_no_baseline": 0,
         "skipped_no_current": 0,
+        "skipped_volume_guard": 0,
         "errors": 0,
         "by_severity": {"warning": 0, "critical": 0},
     }
 
     for svc in services:
         try:
-            counters = _detect_for_service(db, svc, now)
+            counters = _detect_for_service(
+                db, svc, now,
+                warn_thresh=warn_thresh, crit_thresh=crit_thresh,
+            )
         except Exception as e:
             stats["errors"] += 1
             log.warning(
@@ -252,15 +393,11 @@ def detect_anomalies(
         stats["skipped_dup"] += counters["skipped_dup"]
         stats["skipped_no_baseline"] += counters["skipped_no_baseline"]
         stats["skipped_no_current"] += counters["skipped_no_current"]
+        stats["skipped_volume_guard"] += counters["skipped_volume_guard"]
 
-    # Один COMMIT в конце — savepoints внутри уже зафиксировали успешные
-    # INSERT-ы. Если COMMIT упадёт — всё откатится, что приемлемо (следующий
-    # beat-tick повторит).
     db.commit()
 
-    # Подсчёт by_severity по только что вставленным — дополнительный SELECT
-    # дешёвый и даёт быстрый sanity-сигнал в логах. Берём только записи с
-    # created_at >= start of this run (≈ now минус safety-зазор 1 мин).
+    # Подсчёт by_severity по только что вставленным.
     try:
         recent_cutoff = now - timedelta(minutes=1)
         sev_rows = (
@@ -272,16 +409,17 @@ def detect_anomalies(
             if sev in stats["by_severity"]:
                 stats["by_severity"][sev] += 1
     except Exception:
-        # Не критично — лог-deко.
         pass
 
     log.info(
         "anomaly_detection.done real=%d inserted=%d (warn=%d crit=%d) "
-        "skipped_dup=%d skipped_no_baseline=%d skipped_no_current=%d errors=%d",
+        "skipped_dup=%d skipped_no_baseline=%d skipped_no_current=%d "
+        "skipped_volume_guard=%d errors=%d thresh=%.1f/%.1f",
         stats["real_services"], stats["inserted"],
         stats["by_severity"]["warning"], stats["by_severity"]["critical"],
         stats["skipped_dup"], stats["skipped_no_baseline"],
-        stats["skipped_no_current"], stats["errors"],
+        stats["skipped_no_current"], stats["skipped_volume_guard"],
+        stats["errors"], warn_thresh, crit_thresh,
     )
     return stats
 
