@@ -2,16 +2,24 @@
 
 При срабатывании alert ищем ближайший по времени deploy того же сервиса
 (в окне lookback_hours до инцидента) и сравниваем «до vs после» по метрикам
-из kg_service_health. Если хоть одна метрика подскочила более чем на 50% —
-выдаём verdict=suspect.
+из kg_service_health. На основе нескольких факторов (N_spikes, max |z-score|,
+time-proximity, flat-baseline penalty, deploy-status weight) считаем
+confidence в [0..1] и выдаём verdict-градацию:
+
+    confidence >= 0.7        → likely     (сильный сигнал)
+    0.4 <= conf < 0.7        → suspect    (заметный сигнал)
+    0.2 <= conf < 0.4        → weak       (слабый сигнал)
+    conf < 0.2               → unlikely   (фоновое движение)
 
 Используется RCA-пайплайном как дополнительный сигнал «релиз сломал прод».
 Read-only: только select-ы, никаких commit-ов.
 """
 from __future__ import annotations
 
+import math
+import statistics
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 from sqlalchemy.orm import Session
 
@@ -27,7 +35,7 @@ _METRICS = (
     "p95_latency_ms",
 )
 
-# Порог, при превышении которого относим деплой к suspect.
+# Порог, при превышении которого считаем метрику «всплеском» в N_spikes.
 _SUSPECT_DELTA_PCT = 50.0
 
 # Если before_avg близок к нулю — относительная дельта не имеет смысла.
@@ -41,6 +49,25 @@ _ABS_SPIKE_MIN = {
     "p95_latency_ms": 50.0,    # 50ms
 }
 
+# Verdict-пороги по confidence. Если хочется поправить тарировку —
+# трогать здесь, не в коде.
+_VERDICT_LIKELY = 0.7
+_VERDICT_SUSPECT = 0.4
+_VERDICT_WEAK = 0.2
+
+# Time-proximity decay: confidence × exp(-Δt_min / TAU). TAU=30min даёт
+# 0 мин → 1.0, 60 мин → ~0.14, 120 мин → ~0.02.
+_TIME_DECAY_TAU_MIN = 30.0
+
+# Если у всех метрик baseline-stddev ≈ 0 (flat-line, low-traffic dev-сервис),
+# z-score не информативен — рубим confidence до 30% от исходной.
+_FLAT_BASELINE_PENALTY = 0.3
+_FLAT_BASELINE_STDDEV_EPS = 1e-6
+
+# Deploy-status weighting: FAILURE deploy более вероятный suspect.
+_STATUS_FACTOR_FAILURE = 1.2
+_STATUS_FACTOR_SUCCESS = 1.0
+
 
 def _strip_tz(dt: datetime) -> datetime:
     """kg_service_health.ts хранится как naive UTC — приводим к тому же виду."""
@@ -49,9 +76,23 @@ def _strip_tz(dt: datetime) -> datetime:
     return dt
 
 
+def _values(rows, attr: str) -> List[float]:
+    """Список non-NULL числовых значений по атрибуту."""
+    out: List[float] = []
+    for r in rows:
+        v = getattr(r, attr, None)
+        if v is None:
+            continue
+        try:
+            out.append(float(v))
+        except (TypeError, ValueError):
+            continue
+    return out
+
+
 def _avg(rows, attr: str) -> Optional[float]:
-    """Среднее по атрибуту attr, пропуская None. None если нет данных."""
-    values = [getattr(r, attr) for r in rows if getattr(r, attr) is not None]
+    """Среднее по атрибуту, пропуская None. None если нет данных."""
+    values = _values(rows, attr)
     if not values:
         return None
     return sum(values) / len(values)
@@ -59,10 +100,7 @@ def _avg(rows, attr: str) -> Optional[float]:
 
 def _delta_pct(before: Optional[float], after: Optional[float],
                metric: str) -> Optional[float]:
-    """Относительное изменение в процентах с защитой от before≈0.
-
-    Возвращает None, если данных недостаточно для вывода.
-    """
+    """Относительное изменение в процентах с защитой от before≈0."""
     if before is None or after is None:
         return None
     if abs(before) < _NEAR_ZERO_EPS:
@@ -75,6 +113,43 @@ def _delta_pct(before: Optional[float], after: Optional[float],
             return 9999.0
         return 0.0
     return (after - before) / abs(before) * 100.0
+
+
+def _baseline_stddev(values: List[float]) -> Optional[float]:
+    """Population stddev по списку. None если <2 точек."""
+    if len(values) < 2:
+        return None
+    try:
+        return statistics.pstdev(values)
+    except statistics.StatisticsError:
+        return None
+
+
+def _metric_zscore(
+    before_vals: List[float], after_avg: Optional[float],
+) -> Optional[float]:
+    """|z| текущего after_avg относительно before-распределения.
+
+    Возвращает None если baseline слишком мал/плоский для оценки.
+    """
+    if after_avg is None or len(before_vals) < 2:
+        return None
+    mean = statistics.fmean(before_vals)
+    stddev = _baseline_stddev(before_vals)
+    if stddev is None or stddev < _FLAT_BASELINE_STDDEV_EPS:
+        return None
+    return abs((after_avg - mean) / stddev)
+
+
+def _verdict_for(confidence: float) -> str:
+    """Маппинг confidence → verdict-тег."""
+    if confidence >= _VERDICT_LIKELY:
+        return "likely"
+    if confidence >= _VERDICT_SUSPECT:
+        return "suspect"
+    if confidence >= _VERDICT_WEAK:
+        return "weak"
+    return "unlikely"
 
 
 def correlate_deploy_to_incident(
@@ -98,10 +173,16 @@ def correlate_deploy_to_incident(
             {
               "deploy": {id, started_at, sha, buildtype_id, status, ...},
               "metrics_diff": {
-                "cpu_pct": {"before": .., "after": .., "delta_pct": ..},
+                "cpu_pct": {"before": .., "after": .., "delta_pct": ..,
+                            "zscore": ..},
                 ...
               },
-              "verdict": "suspect" | "ok",
+              "verdict": "likely" | "suspect" | "weak" | "unlikely",
+              "confidence": 0..1,
+              "n_spikes": int,
+              "max_zscore": float | None,
+              "time_proximity_minutes": int,
+              "scoring": { factor breakdown for debug },
             }
         Иначе: {"deploy": None, "reason": "no_recent_deploy"}.
     """
@@ -141,21 +222,68 @@ def correlate_deploy_to_incident(
     before_rows = [r for r in rows if r.ts <= deploy_ts]
     after_rows = [r for r in rows if r.ts > deploy_ts]
 
+    # --- Per-metric statistics --------------------------------------------
     metrics_diff: Dict[str, Dict[str, Optional[float]]] = {}
-    verdict = "ok"
+    n_spikes = 0
+    z_scores: List[float] = []
+    stddev_present_count = 0  # сколько метрик дали валидный stddev для z
+
     for metric in _METRICS:
-        before_avg = _avg(before_rows, metric)
+        before_vals = _values(before_rows, metric)
         after_avg = _avg(after_rows, metric)
+        before_avg = sum(before_vals) / len(before_vals) if before_vals else None
         delta = _delta_pct(before_avg, after_avg, metric)
+        z = _metric_zscore(before_vals, after_avg)
+
         metrics_diff[metric] = {
             "before": before_avg,
             "after": after_avg,
             "delta_pct": delta,
+            "zscore": z,
         }
-        # suspect если любая метрика выросла > порога. Падение игнорируем
-        # (для всех 5 метрик «меньше — лучше», падение это нормально).
+
         if delta is not None and delta > _SUSPECT_DELTA_PCT:
-            verdict = "suspect"
+            n_spikes += 1
+        if z is not None:
+            z_scores.append(z)
+            stddev_present_count += 1
+
+    max_zscore = max(z_scores) if z_scores else None
+
+    # --- Time-proximity decay ---------------------------------------------
+    delta_minutes = (incident_naive - deploy_ts).total_seconds() / 60.0
+    # Клипуем отрицательное (deploy после incident — теоретически невозможно
+    # по фильтру, но на всякий случай) и не-числа.
+    delta_minutes = max(0.0, delta_minutes)
+    time_proximity = math.exp(-delta_minutes / _TIME_DECAY_TAU_MIN)
+
+    # --- Deploy-status factor ---------------------------------------------
+    status = (deploy.status or "").upper()
+    if status == "FAILURE":
+        status_factor = _STATUS_FACTOR_FAILURE
+    else:
+        status_factor = _STATUS_FACTOR_SUCCESS
+
+    # --- Flat-baseline penalty --------------------------------------------
+    # Если ни одна метрика не дала валидный stddev — z-score вообще
+    # неинформативен; в этой ситуации сигнал по spike-проценту можно
+    # принять, но с понижающим коэффициентом.
+    flat_penalty = (
+        _FLAT_BASELINE_PENALTY if stddev_present_count == 0 else 1.0
+    )
+
+    # --- Final confidence -------------------------------------------------
+    n_spike_factor = n_spikes / float(len(_METRICS))  # 0..1
+    z_factor = min((max_zscore or 0.0) / 5.0, 1.0)
+    # 50/50 вес между «сколько метрик спайкнули» и «насколько сильно худшая».
+    spike_component = 0.5 * n_spike_factor + 0.5 * z_factor
+
+    raw = time_proximity * status_factor * spike_component
+    confidence = min(1.0, max(0.0, raw)) * flat_penalty
+    # Финальный clip — flat_penalty может только ронять, не растить.
+    confidence = max(0.0, min(1.0, confidence))
+
+    verdict = _verdict_for(confidence)
 
     extras = deploy.extras if isinstance(deploy.extras, dict) else {}
     deploy_dict: Dict[str, Any] = {
@@ -170,13 +298,23 @@ def correlate_deploy_to_incident(
         "status": deploy.status,
         "triggered_by": deploy.triggered_by,
         "url": extras.get("url"),
-        "minutes_before_incident": int(
-            (incident_naive - deploy_ts).total_seconds() // 60
-        ),
+        "minutes_before_incident": int(delta_minutes),
     }
 
     return {
         "deploy": deploy_dict,
         "metrics_diff": metrics_diff,
         "verdict": verdict,
+        "confidence": round(confidence, 4),
+        "n_spikes": n_spikes,
+        "max_zscore": (round(max_zscore, 4) if max_zscore is not None else None),
+        "time_proximity_minutes": int(delta_minutes),
+        "scoring": {
+            "time_proximity": round(time_proximity, 4),
+            "status_factor": status_factor,
+            "n_spike_factor": round(n_spike_factor, 4),
+            "z_factor": round(z_factor, 4),
+            "spike_component": round(spike_component, 4),
+            "flat_baseline_penalty": flat_penalty,
+        },
     }

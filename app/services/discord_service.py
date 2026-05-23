@@ -129,9 +129,15 @@ def _format_sha_link(sha: Optional[str], repo: Optional[str] = None) -> str:
 def _build_deploy_correlation_field(corr: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     """Сформировать embed-field для suspect-deploy (#2).
 
-    Возвращает None, если verdict != "suspect" или deploy отсутствует.
+    Возвращает None если verdict в {None, "ok", "unlikely"} или deploy
+    отсутствует. Показывается для verdict in {"likely", "suspect", "weak"}
+    с указанием confidence-скора.
     """
-    if not corr or corr.get("verdict") != "suspect":
+    if not corr:
+        return None
+    verdict = corr.get("verdict")
+    # "ok" — legacy alias; новые verdict-ы: likely/suspect/weak/unlikely.
+    if verdict not in ("likely", "suspect", "weak"):
         return None
     deploy = corr.get("deploy") or {}
     if not deploy:
@@ -144,10 +150,13 @@ def _build_deploy_correlation_field(corr: Dict[str, Any]) -> Optional[Dict[str, 
     triggered = deploy.get("triggered_by") or ""
     sha = deploy.get("sha")
     repo = deploy.get("repo")
+    confidence = corr.get("confidence")
 
     head_line = f"`{bt_id}` #{build_num} @ {started_at}"
     if mins is not None:
         head_line += f" ({mins}min before)"
+    if confidence is not None:
+        head_line += f" (score {confidence:.2f} · {verdict})"
 
     sha_link = _format_sha_link(sha, repo)
     sha_line = ""
@@ -181,8 +190,12 @@ def _build_deploy_correlation_field(corr: Dict[str, Any]) -> Optional[Dict[str, 
     if metric_line:
         value_lines.append(metric_line)
 
+    # Иконка зависит от тира — выше тир, краснее. Чтобы оператор не путал
+    # «likely» с «weak» по первой строке embed-а.
+    icon = {"likely": "🔴", "suspect": "🟠", "weak": "🟡"}.get(verdict, "🟡")
+    field_name = f"{icon} Suspect Deploy" if verdict != "weak" else f"{icon} Weak Deploy Signal"
     return {
-        "name": "🔴 Suspect Deploy",
+        "name": field_name,
         "value": "\n".join(value_lines)[:1024],
         "inline": False,
     }
@@ -443,7 +456,8 @@ class DiscordService:
 
         Новые kwargs (Wave 3):
           - deploy_correlation: результат `correlate_deploy_to_incident`. Если
-            verdict == "suspect" — добавляем отдельное «🔴 Suspect Deploy» поле.
+            verdict in {likely, suspect, weak} — добавляем отдельный embed-field
+            (🔴/🟠/🟡 Suspect Deploy) с confidence-скором.
           - team_owner: для per-team channel routing через DISCORD_TEAM_CHANNEL_MAP.
           - recurrence_count_24h / _7d: для footer-метки «×N in 24h · M in 7d».
           - incident_ts: момент инцидента — для запроса kg_log_observations
@@ -624,7 +638,7 @@ class DiscordService:
                 title=title, cause=cause, resolution_quality=resolution_quality,
                 via_bot=bool(approve_row),
                 team_owner=team_owner,
-                deploy_suspect=(deploy_correlation or {}).get("verdict") == "suspect",
+                deploy_suspect=(deploy_correlation or {}).get("verdict") in ("likely", "suspect"),
             )
             return
 
