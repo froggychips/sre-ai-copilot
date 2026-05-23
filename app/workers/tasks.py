@@ -172,6 +172,16 @@ celery_app.conf.beat_schedule = {
         "task": "kg_self_health_check",
         "schedule": crontab(minute="*/30"),
     },
+    # Stuck-alerts escalation (KG TTR-analytics, 2026-05-23): alerts firing
+    # >24h без resolved_at теряются в потоке свежих firing-event'ов. Hourly
+    # — длинная firing-window не меняется быстро, чаще нет смысла. Audit-log
+    # + опциональный Discord embed в DISCORD_WEBHOOK_STUCK_ALERTS_URL
+    # (dedicated канал, не #infra-error). Idempotency: 6h dedup window
+    # по set fingerprint stuck-alert-id-ов.
+    "kg-stuck-alerts-check": {
+        "task": "kg_stuck_alerts_check",
+        "schedule": crontab(minute=11),  # ежечасно в 11 мин (offset от drift=17/ingress=37)
+    },
 }
 
 
@@ -716,6 +726,105 @@ async def _kg_self_health_logic() -> dict:
         "status": "fail",
         "checks": len(results),
         "failed": len(failed),
+        "discord": "sent" if sent else "failed",
+    }
+
+
+@celery_app.task(name="kg_stuck_alerts_check")
+def kg_stuck_alerts_check_task():
+    """Stuck-alerts escalation: firing >MIN_DURATION_HOURS без resolved_at.
+
+    Origin: KG-side TTR analytics (2026-05-23) показала median 29h /
+    p90 83h для KubeDeploymentReplicasMismatch — реально сломанное
+    состояние, похороненное под потоком свежих firing-алёртов.
+
+    Hourly schedule, в отличие от self-health/15-мин. Длинная firing-window
+    не меняется быстро, плюс audit-log на каждый tick дороже чем сигнал
+    обещает дать. Idempotency: 6h dedup window по set fingerprint
+    stuck-alert-id-ов (in-memory state, переживает только worker-процесс).
+    """
+    return asyncio.run(_kg_stuck_alerts_logic())
+
+
+# In-memory dedup state — переживает только worker-процесс (как и self-health).
+_STUCK_ALERTS_LAST_FIRE: dict[str, float] = {}
+
+
+async def _kg_stuck_alerts_logic() -> dict:
+    import time
+
+    from app.knowledge_graph.stuck_alerts import (find_stuck_alerts,
+                                                   fingerprint, group_by_team)
+    from app.services.audit_logger import audit_service
+
+    min_hours = settings.STUCK_ALERTS_MIN_DURATION_HOURS
+
+    db = SessionLocal()
+    try:
+        stuck = find_stuck_alerts(db, min_duration_hours=min_hours)
+    finally:
+        db.close()
+
+    if not stuck:
+        audit_service.log_event("STUCK_ALERTS_NONE", {
+            "min_duration_hours": min_hours,
+        })
+        return {"status": "ok", "stuck_count": 0}
+
+    groups = group_by_team(stuck)
+
+    # Per-team audit-log с count + alertnames. Один event на команду:
+    # дешевле читать в дашборде чем event-per-alert.
+    for g in groups:
+        audit_service.log_event("STUCK_ALERTS_FOUND", {
+            "team_owner": g.team_owner,
+            "count": g.count,
+            "alertnames": sorted({a.alertname for a in g.alerts}),
+            "min_duration_hours": min_hours,
+        })
+
+    if not settings.STUCK_ALERTS_DISCORD_ENABLED:
+        return {
+            "status": "found",
+            "stuck_count": len(stuck),
+            "teams": len(groups),
+            "discord": "disabled",
+        }
+
+    fp = fingerprint(stuck)
+    now = time.time()
+    dedup_seconds = settings.STUCK_ALERTS_DEDUP_WINDOW_HOURS * 3600
+    last = _STUCK_ALERTS_LAST_FIRE.get(fp, 0.0)
+    if now - last < dedup_seconds:
+        logger.info(
+            "kg_stuck_alerts.discord_deduped fp=%s age=%.0fs",
+            fp, now - last,
+        )
+        return {
+            "status": "found",
+            "stuck_count": len(stuck),
+            "teams": len(groups),
+            "discord": "deduped",
+        }
+
+    try:
+        from app.services.discord_service import DiscordService
+        discord = DiscordService()
+        await discord.send_stuck_alerts_escalation(
+            team_groups=[g.as_dict() for g in groups],
+            total_count=len(stuck),
+            min_duration_hours=min_hours,
+        )
+        _STUCK_ALERTS_LAST_FIRE[fp] = now
+        sent = True
+    except Exception as e:
+        logger.warning("kg_stuck_alerts.discord_failed: %s", e)
+        sent = False
+
+    return {
+        "status": "found",
+        "stuck_count": len(stuck),
+        "teams": len(groups),
         "discord": "sent" if sent else "failed",
     }
 

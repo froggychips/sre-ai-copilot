@@ -1191,6 +1191,78 @@ class DiscordService:
                     extra={"status": r.status_code, "body": r.text[:200]},
                 )
 
+    async def send_stuck_alerts_escalation(
+        self,
+        team_groups: List[Dict[str, Any]],
+        total_count: int,
+        min_duration_hours: int,
+    ) -> None:
+        """Single embed на dedicated escalation-webhook.
+
+        НЕ шлёт в DISCORD_WEBHOOK_URL (#infra-error) — у stuck-alerts другая
+        аудитория: owner-команды, а не on-call. Если URL не задан — skip
+        (audit-log при этом остаётся, см. tasks.kg_stuck_alerts_check_task).
+        """
+        url = settings.DISCORD_WEBHOOK_STUCK_ALERTS_URL
+        if not url:
+            _log.info(
+                "discord.stuck_alerts.skipped_no_url",
+                total=total_count,
+                teams=len(team_groups),
+            )
+            return
+        if settings.DISCORD_DRY_RUN:
+            _dry_run_log.info(
+                "discord.dry_run.send_stuck_alerts_escalation",
+                total=total_count,
+                teams=len(team_groups),
+            )
+            return
+
+        fields: List[Dict[str, Any]] = []
+        # Не больше 25 полей на embed — лимит Discord. Берём top-15 команд.
+        for tg in team_groups[:15]:
+            team = tg.get("team_owner") or "unknown"
+            alerts = tg.get("alerts") or []
+            lines: List[str] = []
+            for a in alerts[:10]:
+                hours = a.get("hours_firing", 0.0)
+                svc = a.get("service") or "—"
+                name = a.get("alertname") or "?"
+                rec = a.get("recurrence_24h") or 0
+                lines.append(
+                    f"• `{name}` — `{svc}` · firing {hours:.0f}h"
+                    + (f" · 24h fires: {rec}" if rec > 1 else "")
+                )
+            if not lines:
+                continue
+            field_val = "\n".join(lines)
+            fields.append({
+                "name": f"{team} ({len(alerts)})",
+                "value": field_val[:1024],
+                "inline": False,
+            })
+
+        payload = {
+            "embeds": [{
+                "title": (
+                    f"🔴 {total_count} stuck alerts "
+                    f"(>{min_duration_hours}h firing)"
+                )[:256],
+                "color": _COLOR_CRITICAL,
+                "fields": fields,
+                "footer": {"text": "runbook: ..."},
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+            }]
+        }
+        async with httpx.AsyncClient() as client:
+            r = await client.post(url, json=payload)
+            if r.status_code >= 400:
+                logging.error(
+                    "discord_stuck_alerts_escalation_failed",
+                    extra={"status": r.status_code, "body": r.text[:200]},
+                )
+
     async def send_approval_request(self, approval_id: str, details: dict):
         """Отправляет Rich Embed с информацией об опасной операции и ссылками для подтверждения."""
         payload = {
