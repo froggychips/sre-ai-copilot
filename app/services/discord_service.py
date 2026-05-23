@@ -10,6 +10,7 @@ import httpx
 import structlog
 
 from app.config import settings
+from app.services.pii_redaction import redact_pii
 
 # structlog для DRY_RUN-логов — стандартный python `logging` отфильтровывается
 # на корневом WARNING level в production, поэтому [DISCORD_DRY_RUN] раньше
@@ -218,7 +219,12 @@ def _build_log_error_rate_field(
                     parts.append(f"{level}: {counts[level]}")
             value = ", ".join(parts) if parts else f"total: {total}"
             if sample:
-                value += f"\n_sample:_ {sample[:200]}"
+                # Defense-in-depth: seq_logs_sync redacts on write, but if a
+                # future source pushes into kg_log_observations without
+                # scrubbing, we still don't want PII / secrets surfacing
+                # in Discord embeds. redact_pii is idempotent over already-
+                # redacted placeholders, so this is a no-op on the common path.
+                value += f"\n_sample:_ {redact_pii(sample)[:200]}"
             return {
                 "name": "📜 Log error rate (±10min)",
                 "value": value[:1024],

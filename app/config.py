@@ -299,6 +299,35 @@ class Settings(BaseSettings):
     # Default False — нужен явный опт-ин на проде.
     EXECUTOR_APPROVAL_ENABLED: bool = Field(False, description="Show Apply button on Discord embed")
 
+    # Approve/Decline whitelist (PR #12 executor track, security hardening).
+    # CSV строки с Discord IDs. Минимум ОДИН из двух должен быть непуст,
+    # иначе все нажатия approve/decline → deny + audit (fail-closed).
+    #
+    # Resolution в коде:
+    #   - DISCORD_APPROVERS_USER_IDS: разрешаем если interaction.user.id ∈ set.
+    #   - DISCORD_APPROVERS_ROLE_IDS: разрешаем если member.roles ∩ set ≠ ∅.
+    # Любой из двух матчей → разрешено. Оба пусты → deny все.
+    #
+    # Примеры:
+    #   DISCORD_APPROVERS_USER_IDS="123456789012345678,234567890123456789"
+    #   DISCORD_APPROVERS_ROLE_IDS="345678901234567890"
+    DISCORD_APPROVERS_USER_IDS: str = Field(
+        "",
+        description="CSV Discord user IDs allowed to approve/decline actions",
+    )
+    DISCORD_APPROVERS_ROLE_IDS: str = Field(
+        "",
+        description="CSV Discord role IDs allowed to approve/decline actions",
+    )
+
+    # Rate-limit per Discord user on approve clicks: N clicks per hour.
+    # In-memory state per process (Celery + FastAPI run multi-process; this is
+    # a soft guardrail — strict global limit would need Redis).
+    DISCORD_APPROVAL_RATE_LIMIT_PER_HOUR: int = Field(
+        5,
+        description="Per-user approve-click cap per rolling hour",
+    )
+
     # Seq — log aggregator. Layout WO: на каждом wo-api{N}-prod `/seq/`
     # + один в ns `logging`. Используется beat-task'ом `kg_seq_logs_sync`
     # для агрегации Error/Fatal событий per service per ~10 мин в

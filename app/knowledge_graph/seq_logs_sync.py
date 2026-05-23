@@ -36,6 +36,7 @@ from sqlalchemy.orm import Session
 from app.config import settings
 from app.context.seq_client import SeqClient
 from app.knowledge_graph.schema import LogObservation, Service
+from app.services.pii_redaction import redact_pii
 
 log = logging.getLogger(__name__)
 
@@ -227,6 +228,14 @@ async def _sync_instance(
             else:
                 stats["unmatched"] += 1
 
+            # PII scrub at write-time. Raw stack-traces from Seq may
+            # contain emails / IPs / JWTs / bearer tokens / request payloads
+            # — they must NOT land in kg_log_observations.sample_message,
+            # which is later echoed into Discord embeds. Idempotent: the
+            # placeholders we substitute (<email>, <jwt>, ...) don't
+            # match the source patterns, so re-running redact is a no-op.
+            sample_redacted = redact_pii(top_msg) if top_msg else None
+
             try:
                 _upsert_log_obs(
                     db,
@@ -235,7 +244,7 @@ async def _sync_instance(
                     level=level,
                     count=int(total),
                     top_message_hash=top_hash,
-                    sample_message=(top_msg or None),
+                    sample_message=sample_redacted,
                     source=name,
                     namespace=ns_for_row,
                 )

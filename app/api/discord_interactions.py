@@ -19,7 +19,10 @@ from __future__ import annotations
 import binascii
 import json
 import logging
-from typing import Any
+import threading
+import time
+from collections import deque
+from typing import Any, Deque, Dict, Set, Tuple
 
 from datetime import datetime, timezone
 
@@ -61,6 +64,84 @@ _BTN_PRIMARY   = 1  # blurple
 _BTN_SECONDARY = 2  # grey
 _BTN_SUCCESS   = 3  # green
 _BTN_DANGER    = 4  # red
+
+
+# ─── Approve/Decline authorization (security hardening, PR #12) ─────────────
+# Whitelist resolved at request-time from settings (so tests can monkeypatch
+# settings.DISCORD_APPROVERS_USER_IDS without re-importing the module).
+
+def _parse_csv_ids(raw: str) -> Set[str]:
+    """Parse a CSV string of Discord IDs into a set, dropping blanks."""
+    if not raw:
+        return set()
+    return {p.strip() for p in raw.split(",") if p.strip()}
+
+
+def _is_authorized_approver(payload: dict) -> Tuple[bool, str]:
+    """Check whether the user clicking approve/decline is whitelisted.
+
+    Returns (allowed, reason). `reason` is one of:
+      - "ok_user_whitelist"    — user_id matched DISCORD_APPROVERS_USER_IDS
+      - "ok_role_whitelist"    — at least one of member.roles matched DISCORD_APPROVERS_ROLE_IDS
+      - "no_approvers_configured" — both lists empty → fail-closed
+      - "not_in_whitelist"     — neither user_id nor any role matched
+
+    Fail-closed: empty config denies all clicks.
+    """
+    allowed_users = _parse_csv_ids(getattr(settings, "DISCORD_APPROVERS_USER_IDS", "") or "")
+    allowed_roles = _parse_csv_ids(getattr(settings, "DISCORD_APPROVERS_ROLE_IDS", "") or "")
+
+    if not allowed_users and not allowed_roles:
+        return False, "no_approvers_configured"
+
+    user_id = str(
+        (payload.get("member") or {}).get("user", {}).get("id")
+        or payload.get("user", {}).get("id")
+        or ""
+    )
+    if user_id and user_id in allowed_users:
+        return True, "ok_user_whitelist"
+
+    member = payload.get("member") or {}
+    member_roles = {str(r) for r in (member.get("roles") or [])}
+    if member_roles & allowed_roles:
+        return True, "ok_role_whitelist"
+
+    return False, "not_in_whitelist"
+
+
+# In-memory per-user rate-limit on approve/decline clicks. This is a soft
+# guardrail: API + worker run as multiple processes, so the cap is per-process,
+# not global. Strict global rate-limit would need Redis or DB-backed counters.
+_RATE_WINDOW_SEC = 3600
+_rate_state: Dict[str, Deque[float]] = {}
+_rate_lock = threading.Lock()
+
+
+def _check_rate_limit(user_id: str) -> bool:
+    """Return True if user may click, False if over cap. Records the click on True.
+
+    Cap from settings.DISCORD_APPROVAL_RATE_LIMIT_PER_HOUR (default 5/h).
+    """
+    cap = int(getattr(settings, "DISCORD_APPROVAL_RATE_LIMIT_PER_HOUR", 5) or 0)
+    if cap <= 0:
+        # 0 / negative disables the limiter.
+        return True
+    if not user_id:
+        # Anonymous click (no user_id) — let it through; authz already
+        # blocks unauthenticated paths.
+        return True
+    now = time.time()
+    cutoff = now - _RATE_WINDOW_SEC
+    with _rate_lock:
+        clicks = _rate_state.setdefault(user_id, deque())
+        # Evict expired
+        while clicks and clicks[0] < cutoff:
+            clicks.popleft()
+        if len(clicks) >= cap:
+            return False
+        clicks.append(now)
+        return True
 
 
 def _verify_signature(public_key_hex: str, signature_hex: str, timestamp: str, body: bytes) -> bool:
@@ -456,6 +537,51 @@ async def discord_interactions(
         member = payload.get("member") or {}
         user_obj = member.get("user") or payload.get("user") or {}
         user_name = user_obj.get("username") or user_obj.get("global_name") or user_id or "unknown"
+
+        # ── Authorization gate ───────────────────────────────────────────────
+        # Fail-closed: if neither DISCORD_APPROVERS_USER_IDS nor _ROLE_IDS is
+        # set, every click is denied. Otherwise the clicker must appear in
+        # the user-whitelist OR have at least one role in the role-whitelist.
+        # Audit every denial so we can spot abuse / brute-force.
+        allowed, reason = _is_authorized_approver(payload)
+        if not allowed:
+            event_type = (
+                "DISCORD_APPROVAL_DENIED_NO_APPROVERS_CONFIGURED"
+                if reason == "no_approvers_configured"
+                else "DISCORD_APPROVAL_DENIED_UNAUTHORIZED"
+            )
+            audit_service.log_event(
+                event_type,
+                {
+                    "incident_id": incident_id,
+                    "intent_signature": intent_sig,
+                    "discord_user_id": user_id,
+                    "discord_user_name": user_name,
+                    "verdict_attempted": verdict,
+                    "reason": reason,
+                },
+            )
+            return _ephemeral(
+                "You are not authorized to approve actions for this incident."
+            )
+
+        # ── Per-user rate-limit (soft) ──────────────────────────────────────
+        # Cap accidental / malicious click-floods. In-memory per process
+        # (multiple workers → cap multiplies; acceptable for current scale).
+        if not _check_rate_limit(user_id):
+            audit_service.log_event(
+                "DISCORD_APPROVAL_DENIED_RATE_LIMIT",
+                {
+                    "incident_id": incident_id,
+                    "intent_signature": intent_sig,
+                    "discord_user_id": user_id,
+                    "discord_user_name": user_name,
+                    "verdict_attempted": verdict,
+                },
+            )
+            return _ephemeral(
+                "Rate limit exceeded — too many approval clicks in the last hour."
+            )
 
         # Сообщение, на которое прицеплены кнопки — нужно для PATCH'а
         message = payload.get("message") or {}
