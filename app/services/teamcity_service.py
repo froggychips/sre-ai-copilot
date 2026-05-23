@@ -412,10 +412,13 @@ def _fetch_recent_deploys_direct(
     client = _TCClient(url=settings.TC_URL, token=settings.TC_TOKEN,
                        timeout=settings.TC_TIMEOUT_SECONDS * 2)
     try:
+        # revisions(...) даёт commit SHA каждого VCS root в билде. Нужен для
+        # корреляции «новый коммит → новый инцидент» в kg_deployments.sha.
         fields = (
             "build(id,number,status,state,branchName,buildTypeId,"
             "buildType(name),startDate,finishDate,"
-            "triggered(type,date,user(username,name)))"
+            "triggered(type,date,user(username,name)),"
+            "revisions(revision(version,vcs-root-instance(name,vcs-root-id))))"
         )
         # TC sinceDate format: yyyyMMdd'T'HHmmss±HHmm
         since_str = since.astimezone(timezone.utc).strftime("%Y%m%dT%H%M%S+0000")
@@ -434,6 +437,21 @@ def _fetch_recent_deploys_direct(
                 continue
             triggered = b.get("triggered") or {}
             trig_user = triggered.get("user") or {}
+            # revisions: для monorepo может быть несколько VCS root.
+            # Основной SHA — первый, полный список идёт в all_revisions.
+            raw_revs = (b.get("revisions") or {}).get("revision", []) or []
+            all_revs: list[dict[str, Any]] = []
+            for r in raw_revs:
+                ver = r.get("version")
+                if not ver:
+                    continue
+                vri = r.get("vcs-root-instance") or {}
+                all_revs.append({
+                    "sha": ver,
+                    "root": vri.get("name"),
+                    "vcs_root_id": vri.get("vcs-root-id") or vri.get("vcsRootId"),
+                })
+            sha = all_revs[0]["sha"] if all_revs else None
             out.append({
                 "id": b.get("id"),
                 "number": b.get("number"),
@@ -445,6 +463,8 @@ def _fetch_recent_deploys_direct(
                 "finished_at": _tc_to_iso(b.get("finishDate")),
                 "triggered_by": trig_user.get("username") or trig_user.get("name"),
                 "triggered_type": triggered.get("type"),
+                "sha": sha,
+                "all_revisions": all_revs,
                 "url": (
                     f"{settings.TEAMCITY_WEB_URL.rstrip('/')}/viewLog.html?buildId={b.get('id')}"
                     if settings.TEAMCITY_WEB_URL and b.get("id") else None

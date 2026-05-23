@@ -99,6 +99,70 @@ celery_app.conf.beat_schedule = {
         "task": "kg_health_recompute",
         "schedule": crontab(minute="*/20"),
     },
+    # External probe: DNS+TCP+HTTPS на synthetic `ingress:<host>` узлы. Каждую
+    # минуту проверяет публичные endpoint'ы (источник — k8s Ingress hosts из
+    # kg_ingress_sync). При consecutive_failures ≥ EXTERNAL_PROBE_FAIL_THRESHOLD
+    # шлёт embed в DISCORD_WEBHOOK_URL и пишет AlertEvent в kg_alerts.
+    # Default OFF (EXTERNAL_PROBE_ENABLED=False) — включается осознанно после
+    # подгонки threshold/таргетов.
+    "kg-external-probe": {
+        "task": "kg_external_probe",
+        "schedule": crontab(minute="*"),
+    },
+    # Метрические сигналы (2026-05-22, миграция 20260522_0100):
+    # 4 новых таски материализуют time-series из VictoriaMetrics в KG.
+    # До них VM-клиент использовался on-demand в pipeline/stats_digest и
+    # ничего исторического не сохранялось.
+    #
+    # per-service snapshot cpu/mem/restarts/5xx/p95. UNIQUE(service_id, ts) →
+    # idempotent. Если VICTORIA_METRICS_URL пустой — task no-op.
+    "kg-metrics-sync": {
+        "task": "kg_metrics_sync",
+        "schedule": crontab(minute="*/10"),
+    },
+    # Global cluster snapshot — те же поля что в #stats daily report,
+    # но раз в 5 мин и материализованно. Используется для trend-аналитики
+    # и post-mortem контекста.
+    "kg-cluster-health-sync": {
+        "task": "kg_cluster_health_sync",
+        "schedule": crontab(minute="*/5"),
+    },
+    # Per ingress endpoint observations (p95/p99/rps/4xx/5xx) из nginx-ingress
+    # exporter. host/path берутся из k8s Ingress resources (kubectl get -A).
+    "kg-ingress-observations-sync": {
+        "task": "kg_ingress_observations_sync",
+        "schedule": crontab(minute="*/10"),
+    },
+    # Pre-compute per-service агрегаты сигналов из САМОГО KG (deploys/alerts/
+    # pod_events) за 24h окно. Hourly. Не ходит в VM — pure SQL.
+    "kg-signal-aggregates-compute": {
+        "task": "kg_signal_aggregates_compute",
+        "schedule": crontab(minute=23),  # ежечасно в 23 мин (offset от drift/ingress)
+    },
+    # Anomaly detection (2026-05-22, миграция 20260522_0200):
+    # rolling z-score по kg_service_health для каждой из 5 метрик.
+    # При |z|>3 пишем в kg_anomaly_observations (severity warning/critical).
+    # Идемпотентно по (service_id, ts, metric). Discord-уведомление — фаза 2.
+    "kg-anomaly-detection-task": {
+        "task": "kg_anomaly_detection_task",
+        "schedule": crontab(minute="*/10"),
+    },
+    # Per-team daily digest — один embed per team_owner (squad-N / infra /
+    # monitoring). Зависит от kg_signal_aggregates (slo_burn_pct) и
+    # kg_services.health_score — должен запускаться ПОСЛЕ их compute.
+    # Управляется TEAM_DIGEST_ENABLED.
+    "team-daily-digest": {
+        "task": "team_daily_digest",
+        "schedule": crontab(hour=settings.TEAM_DIGEST_HOUR_UTC, minute=0),
+    },
+    # Error/Fatal логи из Seq → kg_log_observations. Тянет по настроенным
+    # Seq-инстансам (prod/preprod/preupdate) count событий за окно ~10 мин,
+    # агрегирует per service per level и пишет одну строку через
+    # ON CONFLICT DO UPDATE. Если SEQ_* пусто — no-op.
+    "kg-seq-logs-sync-task": {
+        "task": "kg_seq_logs_sync",
+        "schedule": crontab(minute="*/10"),
+    },
 }
 
 
@@ -200,6 +264,27 @@ def kg_ingress_sync_task():
         return sync_all_ingresses(db)
     except Exception as e:
         logger.warning("kg_ingress_sync.failed: %s", e)
+        return {"error": str(e)}
+    finally:
+        db.close()
+
+
+@celery_app.task(name="kg_external_probe")
+def kg_external_probe_task():
+    """External probe: DNS+TCP+HTTPS на synthetic `ingress:<host>` узлы.
+
+    Идемпотентен: state (consecutive_failures / firing) в metadata_json.
+    Безопасен к беатам-пропускам (один пропуск ≠ false-resolve).
+    Шлёт Discord на FAIL_THRESHOLD-й тик подряд, resolve — при возврате в up.
+    """
+    import asyncio as _aio
+    from app.knowledge_graph.external_probe_sync import run_external_probe
+
+    db = SessionLocal()
+    try:
+        return _aio.run(run_external_probe(db))
+    except Exception as e:
+        logger.warning("kg_external_probe.failed: %s", e)
         return {"error": str(e)}
     finally:
         db.close()
@@ -402,6 +487,86 @@ def chronic_alerts_digest_task():
         db.close()
 
 
+@celery_app.task(name="kg_metrics_sync")
+def kg_metrics_sync_task():
+    """Per-service метрики из VM → kg_service_health (snapshot per ~10 мин)."""
+    from app.knowledge_graph.metrics_sync import sync_service_health
+
+    db = SessionLocal()
+    try:
+        return sync_service_health(db)
+    except Exception as e:
+        logger.warning("kg_metrics_sync.failed: %s", e)
+        return {"error": str(e)}
+    finally:
+        db.close()
+
+
+@celery_app.task(name="kg_cluster_health_sync")
+def kg_cluster_health_sync_task():
+    """Global cluster snapshot из VM → kg_cluster_observations (per ~5 мин)."""
+    from app.knowledge_graph.cluster_health_sync import sync_cluster_health
+
+    db = SessionLocal()
+    try:
+        return sync_cluster_health(db)
+    except Exception as e:
+        logger.warning("kg_cluster_health_sync.failed: %s", e)
+        return {"error": str(e)}
+    finally:
+        db.close()
+
+
+@celery_app.task(name="kg_ingress_observations_sync")
+def kg_ingress_observations_sync_task():
+    """Per ingress endpoint metrics → kg_ingress_observations (per ~10 мин)."""
+    from app.knowledge_graph.ingress_observations_sync import \
+        sync_ingress_observations
+
+    db = SessionLocal()
+    try:
+        return sync_ingress_observations(db)
+    except Exception as e:
+        logger.warning("kg_ingress_observations_sync.failed: %s", e)
+        return {"error": str(e)}
+    finally:
+        db.close()
+
+
+@celery_app.task(name="kg_signal_aggregates_compute")
+def kg_signal_aggregates_compute_task():
+    """Pre-compute per-service агрегатов сигналов из KG (24h окно, hourly)."""
+    from app.knowledge_graph.signal_aggregates import compute_signal_aggregates
+
+    db = SessionLocal()
+    try:
+        return compute_signal_aggregates(db, window_hours=24)
+    except Exception as e:
+        logger.warning("kg_signal_aggregates_compute.failed: %s", e)
+        return {"error": str(e)}
+    finally:
+        db.close()
+
+
+@celery_app.task(name="kg_anomaly_detection_task")
+def kg_anomaly_detection_task():
+    """Rolling z-score аномалии по kg_service_health → kg_anomaly_observations.
+
+    |z|>3 на любой из 5 метрик пишет запись (severity warning/critical).
+    Discord notify — отдельная фаза, эта задача только пишет notified=false.
+    """
+    from app.knowledge_graph.anomaly_detection import detect_anomalies
+
+    db = SessionLocal()
+    try:
+        return detect_anomalies(db)
+    except Exception as e:
+        logger.warning("kg_anomaly_detection_task.failed: %s", e)
+        return {"error": str(e)}
+    finally:
+        db.close()
+
+
 @celery_app.task(name="daily_stats_digest")
 def daily_stats_digest_task():
     """Daily Discord-stats report. Pure data-aggregation, БЕЗ LLM-вызовов.
@@ -421,5 +586,48 @@ def daily_stats_digest_task():
         logger.error("daily_stats_digest.failed: %s", e)
         # Не падаем в Celery (retry бесполезен, это аналитический task).
         return {"status": "error", "error": str(e)}
+    finally:
+        db.close()
+
+
+@celery_app.task(name="team_daily_digest")
+def team_daily_digest_task():
+    """Daily per-team Discord digest. Pure data-aggregation, БЕЗ LLM.
+
+    Итерирует все distinct team_owner из kg_services и шлёт embed per team.
+    Управляется флагом settings.TEAM_DIGEST_ENABLED — если False, выходит
+    сразу. См. app/services/team_digest.py.
+    """
+    from app.services.team_digest import send_all_team_digests
+
+    try:
+        result = asyncio.run(
+            send_all_team_digests(window_hours=settings.TEAM_DIGEST_WINDOW_HOURS)
+        )
+        logger.info("team_daily_digest.done result=%s", result)
+        return result
+    except Exception as e:
+        logger.error("team_daily_digest.failed: %s", e)
+        # Не падаем в Celery: digest аналитический, retry смысла не имеет.
+        return {"status": "error", "error": str(e)}
+
+
+@celery_app.task(name="kg_seq_logs_sync")
+def kg_seq_logs_sync_task():
+    """Error/Fatal логи из Seq → kg_log_observations (per ~10 мин).
+
+    Тянет события из всех настроенных Seq-инстансов (см. SEQ_INSTANCES /
+    SEQ_URL_<ENV>), агрегирует per service per level и upsert'ит в
+    `kg_log_observations` через ON CONFLICT DO UPDATE. Если SEQ_*
+    не сконфигурирован — task no-op.
+    """
+    from app.knowledge_graph.seq_logs_sync import sync_seq_logs
+
+    db = SessionLocal()
+    try:
+        return sync_seq_logs(db, window_minutes=10)
+    except Exception as e:
+        logger.warning("kg_seq_logs_sync.failed: %s", e)
+        return {"error": str(e)}
     finally:
         db.close()

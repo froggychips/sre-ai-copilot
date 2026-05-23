@@ -43,7 +43,9 @@ from app.diagnostics import default_engine as diag_engine
 from app.diagnostics.facts import FactStore
 from app.diagnostics.incident_ctx import build_diagnostics_ctx
 from app.knowledge_graph.auto_populator import populate_from_incident
+from app.knowledge_graph.schema import Service
 from app.models.incident import Incident
+from app.rca.deploy_correlator import correlate_deploy_to_incident
 from app.observability.ai_metrics import (
     track_disagreement,
     track_execution_intent,
@@ -142,6 +144,15 @@ class IncidentPipeline:
         self.gitlab_context: Optional[Dict[str, Any]] = None
         self.blast_radius_context: Optional[str] = None
         self.statics_check_context: Optional[str] = None
+        # Wave 3 #2: deploy correlation для проброса в Discord embed.
+        # Заполняется в stage_diagnose._enrich_deploy_correlation.
+        self.deploy_correlation: Optional[Dict[str, Any]] = None
+        # Wave 3 #10: team_owner резолвится после KG populate; используется
+        # в send_incident_report для per-team channel routing.
+        self.team_owner: Optional[str] = None
+        # Wave 3 #13: окно для recurrence-label «×N in 24h · M in 7d».
+        self.recurrence_count_24h: int = 0
+        self.recurrence_count_7d: int = 0
 
     # ------------------------------------------------------------------
     # State machine helpers
@@ -200,6 +211,10 @@ class IncidentPipeline:
                 self._enrich_statics(diag_ctx),
                 return_exceptions=True,
             )
+            # Sync best-effort hook: ищем deploy в окне до инцидента и
+            # сравниваем метрики до/после. Результат — отдельный сигнал для
+            # RCA-агентов и финального синтеза (см. diag_ctx["deploy_correlation"]).
+            self._enrich_deploy_correlation(diag_ctx)
             self.fact_store = diag_engine.run(diag_ctx)
         snap = t.snapshot().to_dict()
         self._safe_transition(IncidentState.FACTS_COLLECTED, snap)
@@ -236,6 +251,60 @@ class IncidentPipeline:
                 audit_service.log_event("STATICS_ENRICHED", {"incident_id": self.incident_id})
         except Exception as e:
             audit_service.log_event("STATICS_ENRICH_FAILED", {"incident_id": self.incident_id, "error": str(e)})
+
+    def _enrich_deploy_correlation(self, diag_ctx: dict) -> None:
+        """Связать инцидент с недавним deploy через kg_deployments+kg_service_health.
+
+        Sync, best-effort. При любой ошибке пайплайн не падает: просто пишем
+        событие в audit и идём дальше.
+
+        TODO: глубже интегрировать в hypothesis prompt (app/workers/pipeline.py
+        stage_hypothesize) и в SynthesisAgent — сейчас сигнал доступен через
+        diag_ctx["deploy_correlation"], но не подмешан в текст для LLM.
+        """
+        if not self.incident.namespace:
+            return
+        service_name = (self.incident.labels or {}).get("service")
+        if not service_name:
+            return
+        incident_starts_at = diag_ctx.get("incident_starts_at")
+        if incident_starts_at is None:
+            return
+        try:
+            svc = (
+                self.db.query(Service)
+                .filter(
+                    Service.namespace == self.incident.namespace,
+                    Service.name == service_name,
+                )
+                .one_or_none()
+            )
+            if svc is None:
+                return
+            result = correlate_deploy_to_incident(
+                db=self.db,
+                service_id=svc.id,
+                incident_ts=incident_starts_at,
+            )
+            diag_ctx["deploy_correlation"] = result
+            # Wave 3 #2: пробрасываем в discord embed через _persist.
+            self.deploy_correlation = result
+            # Wave 3 #10: подтягиваем team_owner с сервиса (best-effort).
+            if svc.team_owner:
+                self.team_owner = svc.team_owner
+            if result.get("verdict") == "suspect":
+                audit_service.log_event(
+                    "DEPLOY_CORRELATION_SUSPECT",
+                    {
+                        "incident_id": self.incident_id,
+                        "deploy_id": (result.get("deploy") or {}).get("id"),
+                    },
+                )
+        except Exception as e:
+            audit_service.log_event(
+                "DEPLOY_CORRELATION_FAILED",
+                {"incident_id": self.incident_id, "error": type(e).__name__},
+            )
 
     async def _enrich_gitlab(self) -> None:
         try:
@@ -647,9 +716,28 @@ class IncidentPipeline:
             self.traces.append(synth_snap)
 
         labels = self.incident.labels or {}
+        alertname = labels.get("alertname", "UnknownAlert")
+
+        # Wave 3 #13: recurrence counts 24h/7d (best-effort).
+        self._compute_recurrence_counts(alertname)
+        # Wave 3 #10: если team_owner ещё не определён (например deploy
+        # correlation не сработал), пробуем дорезолвить по сервису.
+        if not self.team_owner:
+            self._resolve_team_owner()
+
+        # incident_ts для #8 log error rate window.
+        incident_ts = None
+        if self.incident.starts_at:
+            try:
+                incident_ts = datetime.fromisoformat(
+                    self.incident.starts_at.replace("Z", "+00:00")
+                )
+            except (ValueError, TypeError):
+                incident_ts = None
+
         await discord_service.send_incident_report(
             incident_id=self.incident_id,
-            alertname=labels.get("alertname", "UnknownAlert"),
+            alertname=alertname,
             namespace=self.incident.namespace or "",
             pod=labels.get("pod"),
             service=labels.get("service") or labels.get("app"),
@@ -663,7 +751,74 @@ class IncidentPipeline:
             flap_count=self.flap_count,
             execution_intent=self.execution_intent,
             executor_result=self.executor_result,
+            deploy_correlation=self.deploy_correlation,
+            team_owner=self.team_owner,
+            recurrence_count_24h=self.recurrence_count_24h,
+            recurrence_count_7d=self.recurrence_count_7d,
+            incident_ts=incident_ts,
         )
+
+    def _compute_recurrence_counts(self, alertname: str) -> None:
+        """Wave 3 #13: посчитать сколько раз alertname сработал за 24h/7d.
+
+        Берём из kg_alerts: fired_at в окне OR resolved_at в окне (alert мог
+        начаться раньше, разрешиться внутри). Best-effort: при любой ошибке
+        оставляем 0.
+        """
+        try:
+            from datetime import datetime as _dt, timedelta as _td
+
+            from sqlalchemy import or_
+
+            from app.knowledge_graph.schema import AlertEvent
+
+            now = _dt.utcnow()
+            cutoff_24h = now - _td(hours=24)
+            cutoff_7d = now - _td(days=7)
+            base = self.db.query(AlertEvent).filter(AlertEvent.alertname == alertname)
+            cnt_24h = base.filter(
+                or_(
+                    AlertEvent.fired_at >= cutoff_24h,
+                    AlertEvent.resolved_at >= cutoff_24h,
+                )
+            ).count()
+            cnt_7d = base.filter(
+                or_(
+                    AlertEvent.fired_at >= cutoff_7d,
+                    AlertEvent.resolved_at >= cutoff_7d,
+                )
+            ).count()
+            # Защита от mock'нутых session (тесты): принимаем только int.
+            self.recurrence_count_24h = int(cnt_24h) if isinstance(cnt_24h, int) else 0
+            self.recurrence_count_7d = int(cnt_7d) if isinstance(cnt_7d, int) else 0
+        except Exception as e:
+            audit_service.log_event(
+                "RECURRENCE_COUNT_FAILED",
+                {"incident_id": self.incident_id, "error": type(e).__name__},
+            )
+
+    def _resolve_team_owner(self) -> None:
+        """Wave 3 #10: подтянуть team_owner по (namespace, service)."""
+        if not self.incident or not self.incident.namespace:
+            return
+        labels = self.incident.labels or {}
+        service_name = labels.get("service") or labels.get("app")
+        if not service_name:
+            return
+        try:
+            svc = (
+                self.db.query(Service)
+                .filter(
+                    Service.namespace == self.incident.namespace,
+                    Service.name == service_name,
+                )
+                .one_or_none()
+            )
+            if svc and svc.team_owner:
+                self.team_owner = svc.team_owner
+        except Exception:
+            # best-effort, без логирования (не критично для embed)
+            return
 
     # ------------------------------------------------------------------
     # Orchestrator

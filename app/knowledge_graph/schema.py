@@ -135,6 +135,275 @@ class PodEvent(Base):
     )
 
 
+class ServiceHealth(Base):
+    """Per-service snapshot из VictoriaMetrics (cpu/mem/restarts/5xx/p95).
+
+    Записывается beat-task'ом `kg_metrics_sync` каждые ~10 мин. Уникальность
+    по (service_id, ts) — повторный tick того же расписания не плодит дубли.
+    FK без ondelete — случайная чистка services не должна снести историю.
+    `source` различает откуда метрика взята: `vm` / `vm_kube_state` / etc.
+    """
+    __tablename__ = "kg_service_health"
+
+    id = Column(Integer, primary_key=True, index=True)
+    service_id = Column(
+        Integer, ForeignKey("kg_services.id"), nullable=False, index=True,
+    )
+    ts = Column(DateTime, nullable=False)
+    cpu_pct = Column(Float, nullable=True)
+    mem_pct = Column(Float, nullable=True)
+    restarts_rate = Column(Float, nullable=True)
+    http_5xx_rate = Column(Float, nullable=True)
+    p95_latency_ms = Column(Float, nullable=True)
+    source = Column(String, nullable=True)
+
+    service = relationship("Service")
+
+    __table_args__ = (
+        UniqueConstraint(
+            "service_id", "ts", name="uq_kg_service_health_service_ts",
+        ),
+        Index("ix_kg_service_health_service_ts", "service_id", "ts"),
+        Index("ix_kg_service_health_ts", "ts"),
+    )
+
+
+class ClusterObservation(Base):
+    """Global cluster snapshot — те же поля что ClusterHealth.to_dict().
+
+    Single row per ~5 минут (cron `kg_cluster_health_sync`). Используется для
+    «trend last 24h» в digest'ах и как контекст для post-mortem (что было с
+    cluster-ом на момент X). Уникальность по ts.
+    """
+    __tablename__ = "kg_cluster_observations"
+
+    id = Column(Integer, primary_key=True, index=True)
+    ts = Column(DateTime, nullable=False)
+    cpu_pct = Column(Float, nullable=True)
+    mem_pct = Column(Float, nullable=True)
+    disk_peak_pct = Column(Float, nullable=True)
+    pods_running = Column(Integer, nullable=True)
+    pods_pending = Column(Integer, nullable=True)
+    pods_failed = Column(Integer, nullable=True)
+    crashloops = Column(Integer, nullable=True)
+    deploy_mismatch = Column(Integer, nullable=True)
+    alerts_critical = Column(Integer, nullable=True)
+    alerts_warning = Column(Integer, nullable=True)
+    alerts_prod = Column(Integer, nullable=True)
+    # Сырые поля из ClusterHealth — для forward-compat если VMClient добавит
+    # новые сигналы, мы не теряем их даже без миграции.
+    raw = Column(JSON, nullable=True)
+
+    __table_args__ = (
+        UniqueConstraint("ts", name="uq_kg_cluster_obs_ts"),
+        Index("ix_kg_cluster_obs_ts", "ts"),
+    )
+
+
+class IngressObservation(Base):
+    """Per ingress endpoint snapshot: p95/p99/rps/4xx/5xx.
+
+    Источник host/path — synthetic-узлы `ingress:<host>` и edges в
+    kg_service_edges (kind='calls', discovered_by='kg_sync/ingress'),
+    backend service_id берётся из dst edge'а. Запись раз в ~10 мин beat-task'ом
+    `kg_ingress_observations_sync`. Уникальность по (ingress_name, host, path, ts).
+    """
+    __tablename__ = "kg_ingress_observations"
+
+    id = Column(Integer, primary_key=True, index=True)
+    ts = Column(DateTime, nullable=False)
+    ingress_name = Column(String, nullable=False)
+    host = Column(String, nullable=False)
+    path = Column(String, nullable=True)
+    service_id = Column(
+        Integer, ForeignKey("kg_services.id"), nullable=True, index=True,
+    )
+    p95_latency_ms = Column(Float, nullable=True)
+    p99_latency_ms = Column(Float, nullable=True)
+    rps = Column(Float, nullable=True)
+    error_5xx_rate = Column(Float, nullable=True)
+    error_4xx_rate = Column(Float, nullable=True)
+
+    service = relationship("Service")
+
+    __table_args__ = (
+        UniqueConstraint(
+            "ingress_name", "host", "path", "ts",
+            name="uq_kg_ingress_obs_ingress_host_path_ts",
+        ),
+        Index("ix_kg_ingress_obs_ingress_ts", "ingress_name", "ts"),
+    )
+
+
+class SignalAggregate(Base):
+    """Per-service агрегаты сигналов из САМОГО KG за окно window_hours.
+
+    Считается из kg_deployments / kg_alerts / kg_pod_events beat-task'ом
+    `kg_signal_aggregates_compute` (раз в час). Идемпотентно по
+    (service_id, window_end). `slo_burn_pct` — упрощённо
+    `alert_open_count_critical / max(1, deploy_count)`.
+    """
+    __tablename__ = "kg_signal_aggregates"
+
+    id = Column(Integer, primary_key=True, index=True)
+    service_id = Column(
+        Integer, ForeignKey("kg_services.id"), nullable=False, index=True,
+    )
+    window_end = Column(DateTime, nullable=False)
+    window_hours = Column(Integer, nullable=True)
+    deploy_count = Column(Integer, nullable=True)
+    deploy_failure_pct = Column(Float, nullable=True)
+    alert_open_count = Column(Integer, nullable=True)
+    alert_ttr_p50_min = Column(Float, nullable=True)
+    pod_event_count = Column(Integer, nullable=True)
+    top_event_reason = Column(String, nullable=True)
+    slo_burn_pct = Column(Float, nullable=True)
+
+    service = relationship("Service")
+
+    __table_args__ = (
+        UniqueConstraint(
+            "service_id", "window_end",
+            name="uq_kg_signal_aggregates_service_window",
+        ),
+        Index(
+            "ix_kg_signal_aggregates_service_window",
+            "service_id", "window_end",
+        ),
+    )
+
+
+class AnomalyObservation(Base):
+    """Per-service per-metric аномалия по rolling z-score (>3 sigma).
+
+    Beat-task `kg_anomaly_detection_task` каждые ~10 мин пробегает по
+    kg_service_health: текущая точка vs baseline (7d, исключая последний
+    час). |z|>3 → 'warning'; |z|>5 → 'critical'. Идемпотентность по
+    (service_id, ts, metric) — повторный tick тот же snapshot не дубль.
+
+    `notified` — флаг для второй фазы (Discord). Default false, апдейт
+    отдельно когда уведомление успешно отослано.
+    """
+    __tablename__ = "kg_anomaly_observations"
+
+    id = Column(Integer, primary_key=True, index=True)
+    service_id = Column(
+        Integer, ForeignKey("kg_services.id"), nullable=False, index=True,
+    )
+    ts = Column(DateTime, nullable=False)
+    metric = Column(String, nullable=False)
+    value = Column(Float, nullable=True)
+    baseline_mean = Column(Float, nullable=True)
+    baseline_stddev = Column(Float, nullable=True)
+    z_score = Column(Float, nullable=True)
+    severity = Column(String, nullable=True)  # 'warning' | 'critical'
+    notified = Column(
+        Boolean, nullable=False, default=False, server_default="false",
+    )
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    service = relationship("Service")
+
+    __table_args__ = (
+        UniqueConstraint(
+            "service_id", "ts", "metric",
+            name="uq_kg_anomaly_obs_service_ts_metric",
+        ),
+        Index("ix_kg_anomaly_obs_service_ts", "service_id", "ts"),
+        Index("ix_kg_anomaly_obs_severity_ts", "severity", "ts"),
+    )
+
+
+class LogObservation(Base):
+    """Per-service агрегат error/fatal/warning логов из Seq за окно.
+
+    Beat-task `kg_seq_logs_sync` каждые ~10 мин тянет count событий по
+    level=Error/Fatal/Warning из нескольких Seq-инстансов (prod / preprod /
+    preupdate) и пишет одну строку per (service, level, source) в окно.
+
+    `service_id` NULLABLE — если по Application-тэгу из Seq не получилось
+    сматчить запись в `kg_services` (новый сервис ещё не в KG или
+    нестандартный тэг), всё равно сохраняем aggregate с service_id=NULL.
+    Атрибуция остаётся через `namespace` + `source` (имя Seq-инстанса).
+
+    `top_message_hash` — md5 от самого частого MessageTemplate за окно.
+    Стабильный fingerprint для группировки: msg повторяется три тика
+    подряд — значит это chronic-pattern. `sample_message` — текстовый
+    пример топа.
+
+    Идемпотентность: UNIQUE(service_id, ts, level, source); повторный
+    beat-tick в том же окне делает ON CONFLICT DO UPDATE count=excluded.count
+    в `seq_logs_sync.py`.
+    """
+    __tablename__ = "kg_log_observations"
+
+    id = Column(Integer, primary_key=True, index=True)
+    service_id = Column(
+        Integer, ForeignKey("kg_services.id"), nullable=True, index=True,
+    )
+    ts = Column(DateTime, nullable=False)
+    # Error / Fatal / Warning — Seq использует эти строковые уровни.
+    level = Column(String, nullable=False)
+    count = Column(Integer, nullable=False)
+    top_message_hash = Column(String, nullable=True)
+    sample_message = Column(String, nullable=True)
+    # Имя Seq-инстанса: prod / preprod / preupdate / wo-api3-prod / ...
+    source = Column(String, nullable=True)
+    namespace = Column(String, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    service = relationship("Service")
+
+    __table_args__ = (
+        UniqueConstraint(
+            "service_id", "ts", "level", "source",
+            name="uq_kg_log_obs_service_ts_level_source",
+        ),
+        Index("ix_kg_log_obs_service_ts", "service_id", "ts"),
+        Index("ix_kg_log_obs_level_ts", "level", "ts"),
+    )
+
+
+class ActionApproval(Base):
+    """Persistent approve/decline решение по proposed action из Discord embed.
+
+    Создаётся при клике Approve/Decline-кнопки в incident-embed. UNIQUE по
+    (incident_id, intent_signature) — повторный клик ловится коллизией и
+    handler отвечает "already approved/declined by @user".
+
+    `intent_signature` — детерминированный хэш ExecutionIntent
+    (action+resource+ns+params), вычисляется через
+    `app.services.intent_signature.compute_signature`. Не sequence-номер:
+    одна команда — одна approval-запись.
+
+    `status` финальное: `approved` | `declined`. PENDING-промежутка нет —
+    кнопка либо нажата (row создаётся), либо нет.
+
+    `approved_by` — Discord username/id того кто нажал. Для audit-трейла.
+    """
+    __tablename__ = "kg_action_approvals"
+
+    id = Column(Integer, primary_key=True, index=True)
+    incident_id = Column(String, nullable=False, index=True)
+    action = Column(String, nullable=True)            # ActionType value, для quick-filter
+    intent_signature = Column(String, nullable=False)
+    status = Column(String, nullable=False)           # "approved" | "declined"
+    approved_by = Column(String, nullable=True)
+    decided_at = Column(DateTime, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    __table_args__ = (
+        UniqueConstraint(
+            "incident_id", "intent_signature",
+            name="uq_kg_action_approvals_incident_intent",
+        ),
+        Index(
+            "ix_kg_action_approvals_status_decided",
+            "status", "decided_at",
+        ),
+    )
+
+
 class ServiceEdge(Base):
     """Ребро графа: src сервис вызывает / зависит от dst сервиса.
 
