@@ -122,6 +122,7 @@ async def test_approve_records_decision_and_acks(isolated_db):
     with patch.object(discord_interactions, "_verify_signature", return_value=True), \
          patch.object(discord_interactions.settings, "DISCORD_PUBLIC_KEY", "deadbeef"), \
          patch.object(discord_interactions.settings, "EXECUTOR_ENABLED", False), \
+         patch.object(discord_interactions.settings, "DISCORD_APPROVERS_USER_IDS", "u-1"), \
          patch.object(discord_interactions.audit_service, "log_event",
                       side_effect=lambda et, d: audit_calls.append((et, d))), \
          patch("asyncio.create_task"):
@@ -157,6 +158,7 @@ async def test_decline_records_decision_and_acks(isolated_db):
 
     with patch.object(discord_interactions, "_verify_signature", return_value=True), \
          patch.object(discord_interactions.settings, "DISCORD_PUBLIC_KEY", "deadbeef"), \
+         patch.object(discord_interactions.settings, "DISCORD_APPROVERS_USER_IDS", "u-1"), \
          patch.object(discord_interactions.audit_service, "log_event",
                       side_effect=lambda et, d: audit_calls.append((et, d))), \
          patch("asyncio.create_task"):
@@ -188,6 +190,7 @@ async def test_double_click_returns_already_decided(isolated_db):
     with patch.object(discord_interactions, "_verify_signature", return_value=True), \
          patch.object(discord_interactions.settings, "DISCORD_PUBLIC_KEY", "deadbeef"), \
          patch.object(discord_interactions.settings, "EXECUTOR_ENABLED", False), \
+         patch.object(discord_interactions.settings, "DISCORD_APPROVERS_USER_IDS", "u-1"), \
          patch.object(discord_interactions.audit_service, "log_event",
                       side_effect=lambda et, d: audit_calls.append((et, d))), \
          patch("asyncio.create_task"):
@@ -233,6 +236,7 @@ async def test_approve_executor_enabled_dispatches_task(isolated_db):
     with patch.object(discord_interactions, "_verify_signature", return_value=True), \
          patch.object(discord_interactions.settings, "DISCORD_PUBLIC_KEY", "deadbeef"), \
          patch.object(discord_interactions.settings, "EXECUTOR_ENABLED", True), \
+         patch.object(discord_interactions.settings, "DISCORD_APPROVERS_USER_IDS", "u-1"), \
          patch.object(discord_interactions.audit_service, "log_event"), \
          patch("asyncio.create_task", side_effect=spy):
         request = MagicMock()
@@ -373,3 +377,266 @@ async def test_send_incident_report_uses_bot_api_when_configured(monkeypatch):
     expected_sig = compute_signature(_intent())
     assert f"approve:inc-1:{expected_sig}" in custom_ids
     assert f"decline:inc-1:{expected_sig}" in custom_ids
+
+
+# ---------------------------------------------------------------------------
+# Authorization (PR #12 security hardening)
+# ---------------------------------------------------------------------------
+
+@pytest.fixture(autouse=True)
+def _reset_rate_state():
+    """Clear in-memory per-user rate-limit state between tests."""
+    from app.api import discord_interactions as di_mod
+    di_mod._rate_state.clear()
+    yield
+    di_mod._rate_state.clear()
+
+
+@pytest.mark.asyncio
+async def test_authorized_user_id_can_approve(isolated_db):
+    """interaction.user.id in DISCORD_APPROVERS_USER_IDS → approve passes."""
+    intent_sig = compute_signature(_intent())
+    payload = _make_payload(f"approve:inc-auth1:{intent_sig}",
+                            user_id="approver-1", user_name="alice")
+    audit_calls = []
+
+    with patch.object(discord_interactions, "_verify_signature", return_value=True), \
+         patch.object(discord_interactions.settings, "DISCORD_PUBLIC_KEY", "deadbeef"), \
+         patch.object(discord_interactions.settings, "EXECUTOR_ENABLED", False), \
+         patch.object(discord_interactions.settings,
+                      "DISCORD_APPROVERS_USER_IDS", "approver-1,approver-2"), \
+         patch.object(discord_interactions.settings, "DISCORD_APPROVERS_ROLE_IDS", ""), \
+         patch.object(discord_interactions.audit_service, "log_event",
+                      side_effect=lambda et, d: audit_calls.append((et, d))), \
+         patch("asyncio.create_task"):
+        request = MagicMock()
+        request.body = AsyncMock(return_value=json.dumps(payload).encode())
+        resp = await discord_interactions.discord_interactions(
+            request, x_signature_ed25519="00" * 64, x_signature_timestamp="0",
+        )
+
+    assert resp["type"] == 4
+    assert "Approved" in resp["data"]["content"]
+    # Exactly one audit event — INCIDENT_ACTION_APPROVED, no denial.
+    assert len(audit_calls) == 1
+    assert audit_calls[0][0] == "INCIDENT_ACTION_APPROVED"
+
+
+@pytest.mark.asyncio
+async def test_authorized_via_role_id_can_approve(isolated_db):
+    """member.roles ∩ DISCORD_APPROVERS_ROLE_IDS != ∅ → approve passes."""
+    intent_sig = compute_signature(_intent())
+    payload = _make_payload(f"approve:inc-role:{intent_sig}",
+                            user_id="rando", user_name="bob")
+    # Attach roles to member
+    payload["member"]["roles"] = ["123456789", "sre-approver-role"]
+    audit_calls = []
+
+    with patch.object(discord_interactions, "_verify_signature", return_value=True), \
+         patch.object(discord_interactions.settings, "DISCORD_PUBLIC_KEY", "deadbeef"), \
+         patch.object(discord_interactions.settings, "EXECUTOR_ENABLED", False), \
+         patch.object(discord_interactions.settings, "DISCORD_APPROVERS_USER_IDS", ""), \
+         patch.object(discord_interactions.settings,
+                      "DISCORD_APPROVERS_ROLE_IDS", "sre-approver-role,other-role"), \
+         patch.object(discord_interactions.audit_service, "log_event",
+                      side_effect=lambda et, d: audit_calls.append((et, d))), \
+         patch("asyncio.create_task"):
+        request = MagicMock()
+        request.body = AsyncMock(return_value=json.dumps(payload).encode())
+        resp = await discord_interactions.discord_interactions(
+            request, x_signature_ed25519="00" * 64, x_signature_timestamp="0",
+        )
+
+    assert resp["type"] == 4
+    assert "Approved" in resp["data"]["content"]
+    assert len(audit_calls) == 1
+    assert audit_calls[0][0] == "INCIDENT_ACTION_APPROVED"
+
+
+@pytest.mark.asyncio
+async def test_unauthorized_user_is_denied_and_audited(isolated_db):
+    """Configured whitelists but clicker not in either → deny + DISCORD_APPROVAL_DENIED_UNAUTHORIZED."""
+    intent_sig = compute_signature(_intent())
+    payload = _make_payload(f"approve:inc-deny:{intent_sig}",
+                            user_id="random-user", user_name="mallory")
+    payload["member"]["roles"] = ["unrelated-role"]
+    audit_calls = []
+
+    with patch.object(discord_interactions, "_verify_signature", return_value=True), \
+         patch.object(discord_interactions.settings, "DISCORD_PUBLIC_KEY", "deadbeef"), \
+         patch.object(discord_interactions.settings,
+                      "DISCORD_APPROVERS_USER_IDS", "approver-1"), \
+         patch.object(discord_interactions.settings,
+                      "DISCORD_APPROVERS_ROLE_IDS", "sre-approver-role"), \
+         patch.object(discord_interactions.audit_service, "log_event",
+                      side_effect=lambda et, d: audit_calls.append((et, d))), \
+         patch("asyncio.create_task"):
+        request = MagicMock()
+        request.body = AsyncMock(return_value=json.dumps(payload).encode())
+        resp = await discord_interactions.discord_interactions(
+            request, x_signature_ed25519="00" * 64, x_signature_timestamp="0",
+        )
+
+    assert resp["type"] == 4
+    assert resp["data"]["flags"] == 64  # ephemeral
+    assert "not authorized" in resp["data"]["content"].lower()
+    # Exactly one audit event — the denial.
+    assert len(audit_calls) == 1
+    assert audit_calls[0][0] == "DISCORD_APPROVAL_DENIED_UNAUTHORIZED"
+    assert audit_calls[0][1]["discord_user_id"] == "random-user"
+    assert audit_calls[0][1]["verdict_attempted"] == "approved"
+
+    # No row inserted in DB
+    from app.knowledge_graph.schema import ActionApproval
+    with isolated_db() as session:
+        assert session.query(ActionApproval).count() == 0
+
+
+@pytest.mark.asyncio
+async def test_empty_config_denies_all(isolated_db):
+    """Both DISCORD_APPROVERS_* empty → fail-closed, every click denied."""
+    intent_sig = compute_signature(_intent())
+    payload = _make_payload(f"approve:inc-failclosed:{intent_sig}",
+                            user_id="some-admin", user_name="root")
+    payload["member"]["roles"] = ["any-role", "another-role"]
+    audit_calls = []
+
+    with patch.object(discord_interactions, "_verify_signature", return_value=True), \
+         patch.object(discord_interactions.settings, "DISCORD_PUBLIC_KEY", "deadbeef"), \
+         patch.object(discord_interactions.settings, "DISCORD_APPROVERS_USER_IDS", ""), \
+         patch.object(discord_interactions.settings, "DISCORD_APPROVERS_ROLE_IDS", ""), \
+         patch.object(discord_interactions.audit_service, "log_event",
+                      side_effect=lambda et, d: audit_calls.append((et, d))), \
+         patch("asyncio.create_task"):
+        request = MagicMock()
+        request.body = AsyncMock(return_value=json.dumps(payload).encode())
+        resp = await discord_interactions.discord_interactions(
+            request, x_signature_ed25519="00" * 64, x_signature_timestamp="0",
+        )
+
+    assert "not authorized" in resp["data"]["content"].lower()
+    assert resp["data"]["flags"] == 64  # ephemeral
+    assert len(audit_calls) == 1
+    assert audit_calls[0][0] == "DISCORD_APPROVAL_DENIED_NO_APPROVERS_CONFIGURED"
+
+    from app.knowledge_graph.schema import ActionApproval
+    with isolated_db() as session:
+        assert session.query(ActionApproval).count() == 0
+
+
+@pytest.mark.asyncio
+async def test_decline_also_requires_authorization(isolated_db):
+    """The gate covers decline equally, not just approve."""
+    intent_sig = compute_signature(_intent())
+    payload = _make_payload(f"decline:inc-decline:{intent_sig}",
+                            user_id="random-user", user_name="mallory")
+    audit_calls = []
+
+    with patch.object(discord_interactions, "_verify_signature", return_value=True), \
+         patch.object(discord_interactions.settings, "DISCORD_PUBLIC_KEY", "deadbeef"), \
+         patch.object(discord_interactions.settings,
+                      "DISCORD_APPROVERS_USER_IDS", "only-this-user"), \
+         patch.object(discord_interactions.settings, "DISCORD_APPROVERS_ROLE_IDS", ""), \
+         patch.object(discord_interactions.audit_service, "log_event",
+                      side_effect=lambda et, d: audit_calls.append((et, d))), \
+         patch("asyncio.create_task"):
+        request = MagicMock()
+        request.body = AsyncMock(return_value=json.dumps(payload).encode())
+        resp = await discord_interactions.discord_interactions(
+            request, x_signature_ed25519="00" * 64, x_signature_timestamp="0",
+        )
+
+    assert "not authorized" in resp["data"]["content"].lower()
+    assert audit_calls[0][0] == "DISCORD_APPROVAL_DENIED_UNAUTHORIZED"
+    assert audit_calls[0][1]["verdict_attempted"] == "declined"
+
+
+@pytest.mark.asyncio
+async def test_rate_limit_blocks_excess_clicks(isolated_db):
+    """Authorized user exceeding DISCORD_APPROVAL_RATE_LIMIT_PER_HOUR gets blocked.
+
+    Uses a unique intent_signature per click to avoid the already_decided path.
+    """
+    audit_calls = []
+
+    with patch.object(discord_interactions, "_verify_signature", return_value=True), \
+         patch.object(discord_interactions.settings, "DISCORD_PUBLIC_KEY", "deadbeef"), \
+         patch.object(discord_interactions.settings, "EXECUTOR_ENABLED", False), \
+         patch.object(discord_interactions.settings, "DISCORD_APPROVERS_USER_IDS", "u-1"), \
+         patch.object(discord_interactions.settings, "DISCORD_APPROVERS_ROLE_IDS", ""), \
+         patch.object(discord_interactions.settings,
+                      "DISCORD_APPROVAL_RATE_LIMIT_PER_HOUR", 2), \
+         patch.object(discord_interactions.audit_service, "log_event",
+                      side_effect=lambda et, d: audit_calls.append((et, d))), \
+         patch("asyncio.create_task"):
+        # 3 clicks; cap is 2. 1st + 2nd succeed, 3rd blocked.
+        responses = []
+        for i in range(3):
+            p = _make_payload(f"approve:inc-rl-{i}:sig-{i}")
+            req = MagicMock()
+            req.body = AsyncMock(return_value=json.dumps(p).encode())
+            responses.append(await discord_interactions.discord_interactions(
+                req, x_signature_ed25519="00" * 64, x_signature_timestamp="0",
+            ))
+
+    assert "Approved" in responses[0]["data"]["content"]
+    assert "Approved" in responses[1]["data"]["content"]
+    assert "Rate limit" in responses[2]["data"]["content"]
+    # 2 INCIDENT_ACTION_APPROVED + 1 DISCORD_APPROVAL_DENIED_RATE_LIMIT
+    types = [c[0] for c in audit_calls]
+    assert types.count("INCIDENT_ACTION_APPROVED") == 2
+    assert types.count("DISCORD_APPROVAL_DENIED_RATE_LIMIT") == 1
+
+
+@pytest.mark.asyncio
+async def test_unauthorized_does_not_consume_rate_limit_quota(isolated_db):
+    """Rate-limit accounting is AFTER authz; failed authz must not eat quota.
+
+    This is an implementation detail check — the deny path returns early
+    without recording a click.
+    """
+    audit_calls = []
+
+    # Step 1: 5 unauthorized clicks (whitelist excludes this user).
+    payload_deny = _make_payload(
+        "approve:inc-foo:sig-foo", user_id="random-user", user_name="m"
+    )
+
+    # Step 2: now switch settings to allow same user, ensure they aren't already
+    # banned by rate-limit (would prove authz happened before rl-record).
+    payload_allow = _make_payload(
+        "approve:inc-bar:sig-bar", user_id="random-user", user_name="m"
+    )
+
+    with patch.object(discord_interactions, "_verify_signature", return_value=True), \
+         patch.object(discord_interactions.settings, "DISCORD_PUBLIC_KEY", "deadbeef"), \
+         patch.object(discord_interactions.settings, "EXECUTOR_ENABLED", False), \
+         patch.object(discord_interactions.settings,
+                      "DISCORD_APPROVAL_RATE_LIMIT_PER_HOUR", 2), \
+         patch.object(discord_interactions.audit_service, "log_event",
+                      side_effect=lambda et, d: audit_calls.append((et, d))), \
+         patch("asyncio.create_task"):
+        # 5 unauthorized clicks
+        with patch.object(discord_interactions.settings,
+                          "DISCORD_APPROVERS_USER_IDS", "someone-else"), \
+             patch.object(discord_interactions.settings,
+                          "DISCORD_APPROVERS_ROLE_IDS", ""):
+            for _ in range(5):
+                req = MagicMock()
+                req.body = AsyncMock(return_value=json.dumps(payload_deny).encode())
+                await discord_interactions.discord_interactions(
+                    req, x_signature_ed25519="00" * 64, x_signature_timestamp="0",
+                )
+        # Now authorize the same user; their first authorized click should
+        # succeed (quota not consumed by deny path).
+        with patch.object(discord_interactions.settings,
+                          "DISCORD_APPROVERS_USER_IDS", "random-user"), \
+             patch.object(discord_interactions.settings,
+                          "DISCORD_APPROVERS_ROLE_IDS", ""):
+            req = MagicMock()
+            req.body = AsyncMock(return_value=json.dumps(payload_allow).encode())
+            resp = await discord_interactions.discord_interactions(
+                req, x_signature_ed25519="00" * 64, x_signature_timestamp="0",
+            )
+
+    assert "Approved" in resp["data"]["content"]

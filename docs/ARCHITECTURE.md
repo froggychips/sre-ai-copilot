@@ -34,6 +34,15 @@ The application consists of: an HTTP API (FastAPI), background tasks (Celery), a
 | `kg_drift_cleanup` | hourly @ :17 | services from missing namespaces → `synthetic=true` |
 | `daily_stats_digest` | daily | KG-summary digest to Discord #stats |
 | `chronic_alerts_digest` | every 6h | chronic-suppressed alerts visibility digest |
+| `kg_metrics_sync` | every 5 min | VictoriaMetrics PromQL → `kg_service_health` (cpu_pct, mem_pct, restarts_rate, http_5xx_rate, p95_latency_ms) |
+| `kg_cluster_health_sync` | every 5 min | k8s node-level snapshot → `kg_cluster_observations` |
+| `kg_ingress_observations_sync` | every 5 min | ingress-controller PromQL → `kg_ingress_observations` (schema present; scrape config for WO ns not in place, so http_5xx/p95 are currently 0) |
+| `kg_anomaly_detect` | every 5 min | rolling robust-z scan → `kg_anomaly_observations` |
+| `kg_signal_aggregates` | every 10 min | 24h roll-up of anomalies/alerts/deploys/pod_events → `kg_signal_aggregates` |
+| `kg_seq_logs_sync` | every 10 min | Seq REST API → `kg_log_observations` (per service × level) |
+| `kg_deploy_correlator` | every 15 min | recent incidents × deploys → multi-factor confidence + verdict |
+| `team_digest` | daily @ 09:00 UTC | per-team fragile services digest |
+| `kg_self_health_check` | every 30 min | 6 canaries against KG data quality |
 
 ## 3. Data Flow (Webhook Incident Pipeline)
 
@@ -101,6 +110,135 @@ AlertManager webhook
 
 Latency budget: <500ms p95 synchronous in HTTP handler. No LLM tokens. Total cost: 0 per alert.
 
+## 3b. Active Observability Layer (Wave 1–5)
+
+Beyond the discrete event tables (deployments / alerts / pod_events), the KG also materialises a continuous time-series view of every service, used by the digest, the anomaly detector, the deploy correlator, and the Discord pipeline.
+
+### Time-series materialization (Wave 1)
+
+| Table | Source | Granularity |
+|---|---|---|
+| `kg_service_health` | VictoriaMetrics PromQL via `metrics_sync.py` | 5-min, per service |
+| `kg_cluster_observations` | k8s node API via `cluster_health_sync.py` | 5-min, per node |
+| `kg_ingress_observations` | ingress-controller PromQL via `ingress_observations_sync.py` | 5-min, per host |
+| `kg_signal_aggregates` | 24-h roll-up via `signal_aggregates.py` | hourly refresh, per service |
+
+Every PromQL fetch is wrapped in a Postgres `SAVEPOINT` per row insert; an `IntegrityError` on the unique key (e.g. duplicate `(service_id, ts)`) rolls back to the savepoint and continues. This makes the sync naturally idempotent on overlapping windows.
+
+Wave 5 PromQL gotcha (documented for future authors): `mem_pct` must be computed as `avg(rate(container_memory_working_set_bytes) / on(pod) kube_pod_container_resource_limits)` — i.e. divide first, aggregate second. The aggregate-then-divide form ran for several days returning silent 0s because the many-to-one join collapsed before the division. The kg_self_health canary (see below) was added specifically to detect this class of silent failure.
+
+Honest limitation: ingress observations are materialised into the schema, but the scrape config that would expose `nginx_ingress_controller_*` for WO namespaces is not in place, so `http_5xx_rate` and `p95_latency_ms` are currently 0 for all services. The pipeline degrades gracefully — anomaly detection on a flat-zero metric simply produces no observations.
+
+### Anomaly detection (Wave 2 + Wave 6 update)
+
+`app/knowledge_graph/anomaly_detection.py` scans the materialised time series and writes `kg_anomaly_observations`.
+
+- **Robust-z statistic.** `robust_z = (current − median(baseline)) / (1.4826 × MAD(baseline))`. Uses median + MAD instead of mean + stddev, so a single spike in the baseline doesn't poison the threshold.
+- **Seasonal baseline.** When ≥50 historical points are available, baseline is stratified by hour-of-day to absorb daily traffic patterns. `extras.method = robust_z_seasonal`. Below that threshold the detector falls back to a flat baseline (`robust_z_flat`).
+- **Configurable thresholds** via `KG_ANOMALY_ROBUST_Z_WARN` (default `3.5`) and `KG_ANOMALY_ROBUST_Z_CRIT` (default `6.0`).
+- **Volume guard.** No more than 3 observations per (service, metric) per hour, to avoid flooding when a metric is genuinely sustained-anomalous.
+- **Baseline window:** rolling 7 days.
+
+### Deploy ↔ Incident correlator (Wave 2 + Wave 6 update)
+
+`app/rca/deploy_correlator.py` is invoked inline by `IncidentPipeline._enrich_deploy_correlation` for every incident that reaches enrichment.
+
+- **Window:** `[incident − 2h, incident]`. Every deployment of the affected service inside the window is a candidate.
+- **Confidence formula.** Multi-factor score, each component clamped to `[0, 1]`:
+  - `N_spikes`: number of anomaly observations of the service after the deploy
+  - `max_zscore`: peak robust-z observed in the window
+  - `time_proximity`: how close the deploy is to the incident start
+  - `deploy_status_factor`: FAILED deploys score higher than SUCCESS
+  - `flat_baseline_penalty`: if baseline was all-zeros (i.e. metric was dead anyway), confidence is dampened
+- **Verdict tiers:**
+  - `likely` if confidence ≥ 0.7 — surfaced as a "Suspect deploy" block in the Discord embed
+  - `suspect` if 0.4 ≤ conf < 0.7 — surfaced with weaker language
+  - `weak` if 0.2 ≤ conf < 0.4 — kept in the analysis JSON, not in the embed
+  - `unlikely` if conf < 0.2 — recorded for audit but not shown
+- Available downstream via `analysis["deploy_correlator"]` for the Discord renderer and any future RCA consumers.
+
+### Seq logs integration (Wave 2)
+
+`app/knowledge_graph/seq_logs_sync.py` polls the Seq REST API every 10 minutes and writes `kg_log_observations`, one row per `(service, level)` per 10-min window.
+
+- Match algorithm: Seq event `Application`/`Service` property → `kg_services.name`, falling back to namespace prefix.
+- Used by the Discord pipeline to render a "log error rate" block when anomalies coincide.
+- Known limitation: at the moment the pipeline writes everything as `Information` because the available realms expose only a single combined stream — per-realm Seq instances or access-log routing would be needed to populate `Error`/`Warning` independently. The schema and downstream consumers are level-aware; only the source data is degraded.
+
+### Daily team digest (Wave 2)
+
+`app/services/team_digest.py` runs daily at 09:00 UTC and produces a per-team Discord embed with:
+
+- Fragile top-5 services by `health_score` (the lowest scores)
+- Deploy success-rate over the last 24h
+- Open alerts breakdown (firing / chronic-suppressed / resolved)
+- Top alertnames over the last 24h
+- SLO burn rate where available
+
+### Discord pipeline overhaul (Wave 3)
+
+The Discord renderer (`app/services/discord_service.py`) was reshaped from "send and forget" into a stateful publisher:
+
+- **Dedup window**: 30 min. Repeat of the same logical alert PATCHes the existing message via `webhook?wait=true` instead of re-posting.
+- **Severity routing**: `critical` / `warning` → channel post; `info` / `none` → silent (audit only). Configurable per env.
+- **Per-team channel routing** via `DISCORD_TEAM_CHANNEL_MAP` (JSON: `{team_owner: webhook_url}`); fallback to the default webhook.
+- **Suspect deploy block** rendered when `deploy_correlator.verdict ∈ {likely, suspect}`.
+- **Log error rate block** rendered when `kg_log_observations` shows an anomaly in the same window.
+- **Anomaly block** rendered from `kg_anomaly_observations`.
+- **Recurrence block** — "×N in 24h · M in 7d" — driven by KG history.
+- **Linked alerts aggregation** — alerts whose upstream/downstream services are also firing are folded into one embed.
+- **Persistent approval** — `ActionApproval` ORM table with UNIQUE `(incident_id, intent_signature)`; Approve / Decline buttons hit the Discord interactions endpoint and record the decision.
+
+## 3c. Security & Operational Hardening (Wave 6)
+
+### PII redaction
+
+`app/services/pii_redaction.py` provides a regex-based redactor with patterns for:
+
+- email addresses
+- IPv4 and IPv6 literals
+- JWT tokens (3-segment base64)
+- `Bearer …` authorisation headers
+- UUIDs
+- long hex strings (likely fingerprints / keys)
+- `key=value` style secrets where key matches `password|token|secret|api_key`
+
+Applied at two layers:
+
+1. **Write-time** in `seq_logs_sync.py` — log lines are redacted before being persisted into `kg_log_observations.message_sample`, with a 500-character truncation. This keeps the database itself clean.
+2. **Defense-in-depth** at embed-render time in `discord_service.py` — every string heading to a Discord webhook is run through the redactor a second time, on the assumption that any future data source might bypass write-time scrubbing.
+
+The redactor is idempotent: running it twice produces the same output.
+
+### Approve / Decline authorization
+
+The Discord interactions endpoint (`app/api/discord_interactions.py`) now gates Approve / Decline button presses:
+
+- `DISCORD_APPROVERS_USER_IDS` — comma-separated allowlist of Discord user IDs
+- `DISCORD_APPROVERS_ROLE_IDS` — comma-separated allowlist of Discord role IDs (the interaction member must hold at least one)
+- `DISCORD_APPROVAL_RATE_LIMIT_PER_HOUR` — per-user quota, default 5
+
+Semantics:
+
+- **Fail-closed** when both lists are empty — the button is denied and audit-logged as `DISCORD_APPROVAL_DENIED_NO_APPROVERS_CONFIGURED`.
+- Unauthorized presses get an ephemeral deny reply and audit log `DISCORD_APPROVAL_DENIED_UNAUTHORIZED`.
+- Rate-limit is in-memory. An authz failure does NOT consume quota — a denied user can't be used to exhaust the limit for a legitimate approver.
+
+### KG self-health canary
+
+`app/knowledge_graph/self_health.py` is a "monitoring of the monitoring" beat task, triggered after the Wave 5 mem_pct silent-failure to make sure that class of regression is detected automatically.
+
+Runs every 30 minutes. Six checks, each returning `ok` / `warn` / `fail`:
+
+1. **`materialization_zero_rate`** — % of rows in `kg_service_health` where a metric is 0 or NULL over 24h. Allowlist for known-zero metrics (`http_5xx_rate`, `p95_latency_ms` while WO scrape config is missing).
+2. **`sync_lag`** — `max(ts)` per beat task vs expected interval; >2× → warn, >5× → fail.
+3. **`anomaly_signal_health`** — count of `kg_anomaly_observations` over 24h. 0 → warn (flat baseline or detector broken). >500 → warn (threshold too loose, overload).
+4. **`alerts_resolve_freshness`** — count of `kg_alerts` with `fired_at < 7d ago` and `resolved_at IS NULL`. >20 → warn.
+5. **`pod_events_link_rate`** — % of `kg_pod_events` over 24h with `service_id NOT NULL`. <80% warn, <50% fail (StatefulSet resolver regression).
+6. **`edges_freshness`** — % of `kg_service_edges` with `last_seen_at < 24h` or `NULL`. >30% stale → warn (kg_topology_sync regression).
+
+Output: audit-log line per run; on any `fail`/`warn`, a single Discord embed is posted to `DISCORD_WEBHOOK_SELF_HEALTH_URL` — kept separate from `#infra-error` to avoid drowning operational alerts. A 6-hour dedup window prevents the same canary fail from spamming the channel.
+
 ## 4. Fact-Anchored Reasoning
 
 The diagnostic engine runs before any LLM agent. It evaluates deterministic rules against structured k8s data (`k8s_pod_state`, pod events) and emits a `FactStore` — a typed collection of `Fact` objects, each with:
@@ -151,6 +289,9 @@ If a match is found, `recurrence=True` is set in the pipeline output. `FixAgent`
 - Approval API for human-in-the-loop before any write action.
 - `SAFE_MODE=true` is enforced in production (config validator raises on `SAFE_MODE=false` + `ENV=production`).
 - Prompt injection guard (`prompt_guard.detect_injection`) with input length cap (`PROMPT_INPUT_MAX_CHARS`).
+- **PII redaction** (`app/services/pii_redaction.py`) — write-time scrubbing of Seq log samples and defense-in-depth scrubbing of Discord embed strings. Patterns: emails, IPv4/IPv6, JWT, bearer tokens, UUIDs, long hex, `password|token|secret|api_key` key/value pairs.
+- **Approve / Decline authz** on Discord buttons — `DISCORD_APPROVERS_USER_IDS` / `DISCORD_APPROVERS_ROLE_IDS` allowlists, `DISCORD_APPROVAL_RATE_LIMIT_PER_HOUR` quota. Fail-closed when both allowlists are empty.
+- **Dedicated read-only Postgres role** (`kg_reader`) for any external KG access — separate user, `SELECT` on `kg_*` and `alembic_version` only, no default privileges (future tables must be granted explicitly).
 
 ## 9. External Integrations
 
@@ -161,4 +302,9 @@ If a match is found, `recurrence=True` is set in the pipeline output. `FixAgent`
 | TeamCity (MCP) | Recent deploy context | `TEAMCITY_MCP_URL`, `TEAMCITY_MCP_TOKEN` |
 | Atlassian Jira | Known open/resolved tickets for the service | `JIRA_BASE_URL`, `JIRA_EMAIL`, `JIRA_API_TOKEN` |
 | Discord | Approval flow + incident report | `DISCORD_WEBHOOK_URL` |
+| Discord (per-team) | Per-team channel routing for digests/incidents | `DISCORD_TEAM_CHANNEL_MAP` (JSON) |
+| Discord (self-health) | KG canary alerts, separate from `#infra-error` | `DISCORD_WEBHOOK_SELF_HEALTH_URL` |
+| Discord (authz) | Allowlist for Approve/Decline buttons | `DISCORD_APPROVERS_USER_IDS`, `DISCORD_APPROVERS_ROLE_IDS`, `DISCORD_APPROVAL_RATE_LIMIT_PER_HOUR` |
+| Seq | Application log stream → `kg_log_observations` | `SEQ_URL`, `SEQ_API_KEY` |
 | OpenTelemetry | Distributed tracing | `OTLP_EXPORTER_ENDPOINT` |
+| Anomaly tuning | Robust-z thresholds | `KG_ANOMALY_ROBUST_Z_WARN`, `KG_ANOMALY_ROBUST_Z_CRIT` |

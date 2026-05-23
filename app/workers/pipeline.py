@@ -292,12 +292,14 @@ class IncidentPipeline:
             # Wave 3 #10: подтягиваем team_owner с сервиса (best-effort).
             if svc.team_owner:
                 self.team_owner = svc.team_owner
-            if result.get("verdict") == "suspect":
+            if result.get("verdict") in ("likely", "suspect"):
                 audit_service.log_event(
                     "DEPLOY_CORRELATION_SUSPECT",
                     {
                         "incident_id": self.incident_id,
                         "deploy_id": (result.get("deploy") or {}).get("id"),
+                        "verdict": result.get("verdict"),
+                        "confidence": result.get("confidence"),
                     },
                 )
         except Exception as e:

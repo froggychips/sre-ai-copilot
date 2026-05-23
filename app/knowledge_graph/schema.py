@@ -301,6 +301,10 @@ class AnomalyObservation(Base):
         Boolean, nullable=False, default=False, server_default="false",
     )
     created_at = Column(DateTime, default=datetime.utcnow)
+    # JSON-debug: какой method использован (robust_z_flat/robust_z_seasonal),
+    # сколько baseline-точек, MAD, threshold-config. Не используется для
+    # фильтрации — только для post-mortem'ов и tuning'а.
+    extras = Column(JSON, nullable=True)
 
     service = relationship("Service")
 
