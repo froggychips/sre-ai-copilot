@@ -25,7 +25,7 @@ import logging
 import socket
 import time
 from datetime import datetime
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 
 import httpx
 import structlog
@@ -237,7 +237,6 @@ async def run_external_probe(db: Session) -> Dict[str, Any]:
 
 
 if __name__ == "__main__":
-    import sys
     from app.database import SessionLocal
     logging.basicConfig(level=logging.INFO)
     db = SessionLocal()

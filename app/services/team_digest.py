@@ -20,7 +20,6 @@ embed-структура — как `send_stats_report` (title + description + f
 """
 from __future__ import annotations
 
-import logging
 from collections import Counter
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple

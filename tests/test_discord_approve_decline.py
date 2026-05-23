@@ -281,11 +281,17 @@ async def test_send_incident_report_skips_approve_row_when_bot_not_configured(mo
     captured = []
 
     class FakeClient:
-        async def __aenter__(self): return self
-        async def __aexit__(self, *a): return False
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
         async def post(self, url, json=None, headers=None):
             captured.append({"url": url, "json": json, "headers": headers})
-            r = MagicMock(); r.status_code = 200; return r
+            r = MagicMock()
+            r.status_code = 200
+            return r
 
     svc = DiscordService()
     with patch("httpx.AsyncClient", return_value=FakeClient()):
@@ -325,12 +331,20 @@ async def test_send_incident_report_uses_bot_api_when_configured(monkeypatch):
     captured = []
 
     class FakeClient:
-        def __init__(self, **kw): pass
-        async def __aenter__(self): return self
-        async def __aexit__(self, *a): return False
+        def __init__(self, **kw):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
         async def post(self, url, json=None, headers=None):
             captured.append({"url": url, "json": json, "headers": headers})
-            r = MagicMock(); r.status_code = 200; return r
+            r = MagicMock()
+            r.status_code = 200
+            return r
 
     svc = DiscordService()
     with patch("httpx.AsyncClient", FakeClient):
