@@ -33,6 +33,8 @@ from app.config import settings
 from app.database import SessionLocal
 from app.knowledge_graph.schema import (AlertEvent, Deployment, Service,
                                         SignalAggregate)
+from app.knowledge_graph.stuck_alerts import (find_stuck_alerts,
+                                              severity_emoji)
 
 log = structlog.get_logger("team_digest")
 
@@ -46,6 +48,7 @@ _COLOR_NEUTRAL  = 0x607D8B   # blue-grey — данных нет / новый te
 # Максимальная глубина списков в embed-полях.
 _TOP_FRAGILE = 5
 _TOP_ALERTS = 5
+_TOP_STUCK = 5
 
 
 # ────────────────────────────────────────────────────────────────────────────
@@ -166,6 +169,23 @@ def _slo_burn_summary(
     }
 
 
+def _top_stuck_alerts(
+    db: Session, team_owner: str, limit: int = _TOP_STUCK,
+) -> List[Dict[str, Any]]:
+    """Top-N stuck alerts (firing >MIN_DURATION_HOURS) для команды.
+
+    Использует общий `find_stuck_alerts` из knowledge_graph.stuck_alerts —
+    тот же источник что hourly beat task, никакого double-source-of-truth.
+    Сортировка — по hours_firing desc (свежий API из stuck_alerts
+    возвращает поле напрямую).
+    """
+    min_hours = settings.STUCK_ALERTS_MIN_DURATION_HOURS
+    stuck = find_stuck_alerts(db, min_duration_hours=min_hours)
+    filtered = [s for s in stuck if (s.get("team_owner") == team_owner)]
+    filtered.sort(key=lambda s: s.get("hours_firing", 0.0), reverse=True)
+    return filtered[:limit]
+
+
 def _real_service_count(db: Session, team_owner: str) -> int:
     return (
         db.query(func.count(Service.id))
@@ -200,6 +220,7 @@ def build_team_digest(
     alerts = _alerts_breakdown(db, team_owner, since_naive)
     slo = _slo_burn_summary(db, team_owner, since_naive)
     svc_count = _real_service_count(db, team_owner)
+    stuck = _top_stuck_alerts(db, team_owner)
 
     return {
         "team_owner": team_owner,
@@ -210,6 +231,7 @@ def build_team_digest(
         "deploys": deploys,
         "alerts": alerts,
         "slo": slo,
+        "stuck": stuck,
     }
 
 
@@ -229,6 +251,10 @@ def _pick_color(digest: Dict[str, Any]) -> int:
         return _COLOR_NEUTRAL
     by_sev = digest["alerts"]["by_severity"]
     if by_sev.get("critical", 0) > 0:
+        return _COLOR_CRITICAL
+    # Любой stuck alert → red. Это эскалационный сигнал: alert тлеет >24h,
+    # фактически такое же критично как «есть открытый critical».
+    if digest.get("stuck"):
         return _COLOR_CRITICAL
     has_warnings = by_sev.get("warning", 0) > 0
     has_unhealthy = any(
@@ -293,6 +319,27 @@ def _fmt_alerts_field(alerts: Dict[str, Any]) -> str:
     return "\n".join(lines)[:1024]
 
 
+def _fmt_stuck_field(stuck: List[Dict[str, Any]]) -> Optional[str]:
+    """Top-5 stuck alerts с severity emoji + hours_firing.
+
+    Если список пуст — возвращаем None, чтобы render_embed скрыл секцию.
+    """
+    if not stuck:
+        return None
+    lines: List[str] = []
+    for s in stuck:
+        hours = s.get("hours_firing", 0.0)
+        emoji = severity_emoji(s.get("severity_current"), hours_firing=hours)
+        svc = s.get("service") or "—"
+        name = s.get("alertname") or "?"
+        rec = s.get("recurrence_24h") or 0
+        rec_tag = f" · 24h fires: `{rec}`" if rec > 1 else ""
+        lines.append(
+            f"{emoji} `{name}` _{svc}_ — **{hours:.0f}h**{rec_tag}"
+        )
+    return "\n".join(lines)[:1024]
+
+
 def _fmt_slo_field(slo: Optional[Dict[str, Any]]) -> Optional[str]:
     if not slo:
         return None
@@ -330,6 +377,15 @@ def render_embed(digest: Dict[str, Any]) -> Dict[str, Any]:
         "value": _fmt_fragile_field(digest["fragile"]),
         "inline": False,
     })
+    stuck_value = _fmt_stuck_field(digest.get("stuck") or [])
+    if stuck_value:
+        fields.append({
+            "name": (
+                f"🔴 Stuck alerts (>{settings.STUCK_ALERTS_MIN_DURATION_HOURS}h)"
+            ),
+            "value": stuck_value,
+            "inline": False,
+        })
     slo_value = _fmt_slo_field(digest["slo"])
     if slo_value:
         fields.append({

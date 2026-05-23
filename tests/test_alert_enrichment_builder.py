@@ -116,8 +116,13 @@ def test_enrich_alert_builds_full_context(
     db = MagicMock()
     svc_row = MagicMock()
     svc_row.team_owner = "gameplay-team"
+    svc_row.synthetic = False
     svc_row.updated_at = datetime(2026, 5, 15, 12, 50, tzinfo=timezone.utc)
+    # Backwards-compat: legacy mock уровень для _downstream_count_by_kind
+    # и т.п., если будут.
     db.query.return_value.filter.return_value.one_or_none.return_value = svc_row
+    # New resolver path: filter(ns, name).filter(synthetic==False).first()
+    db.query.return_value.filter.return_value.filter.return_value.first.return_value = svc_row
 
     ctx = enrich_alert(db, inc)
     assert ctx.in_kg is True
