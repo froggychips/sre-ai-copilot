@@ -117,7 +117,7 @@ def run_drift_cleanup(
         # Legacy: metadata_json у некоторых старых services хранится как list
         # (например, после устаревших ETL-проходов). Защита от
         # AttributeError: 'list' object has no attribute 'get'.
-        existing_meta = s.metadata_json if isinstance(s.metadata_json, dict) else {}
+        existing_meta: Dict[str, Any] = s.metadata_json if isinstance(s.metadata_json, dict) else {}
         if s.synthetic and existing_meta.get("drift_reason"):
             continue  # уже помечен ранее — пропускаем
         s.synthetic = True

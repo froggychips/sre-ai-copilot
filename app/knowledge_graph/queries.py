@@ -64,7 +64,7 @@ def recent_deploys_for(
         delta_min = int(
             (before_aware - d.started_at.replace(tzinfo=timezone.utc)).total_seconds() // 60
         )
-        extras = d.extras if isinstance(d.extras, dict) else {}
+        extras: Dict[str, Any] = d.extras if isinstance(d.extras, dict) else {}
         out.append({
             "name": service_name,
             "ts": d.started_at,
