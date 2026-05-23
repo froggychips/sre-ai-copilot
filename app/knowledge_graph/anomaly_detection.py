@@ -38,7 +38,7 @@ import logging
 import os
 import statistics
 from datetime import datetime, timedelta
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, cast
 
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
@@ -307,7 +307,7 @@ def _detect_for_service(
 
         # Volume guard: не плодим observations того же service/metric.
         recent_count = _count_recent_observations(
-            db, service.id, metric, now,
+            db, cast(int, service.id), metric, now,
         )
         if recent_count >= VOLUME_GUARD_MAX_PER_HOUR:
             counters["skipped_volume_guard"] += 1
@@ -329,8 +329,8 @@ def _detect_for_service(
         # (центр + разброс) и читаемо для downstream-сервисов.
         ok = _insert_idempotent(
             db,
-            service_id=service.id,
-            ts=anomaly_ts,
+            service_id=cast(int, service.id),
+            ts=cast(datetime, anomaly_ts),
             metric=metric,
             value=current_value,
             baseline_mean=median,

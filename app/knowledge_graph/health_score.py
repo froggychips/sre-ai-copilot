@@ -32,7 +32,7 @@ from __future__ import annotations
 
 import logging
 from datetime import datetime, timedelta
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, cast
 
 from sqlalchemy.orm import Session
 
@@ -101,8 +101,12 @@ def _recent_p95_and_5xx(
     )
     if len(rows) < _MIN_POINTS_FOR_METRICS:
         return None, None, len(rows)
-    p95_vals = [r.p95_latency_ms for r in rows if r.p95_latency_ms is not None]
-    err_vals = [r.http_5xx_rate for r in rows if r.http_5xx_rate is not None]
+    p95_vals: List[float] = [
+        float(r.p95_latency_ms) for r in rows if r.p95_latency_ms is not None
+    ]
+    err_vals: List[float] = [
+        float(r.http_5xx_rate) for r in rows if r.http_5xx_rate is not None
+    ]
     p95 = sum(p95_vals) / len(p95_vals) if p95_vals else None
     err = sum(err_vals) / len(err_vals) if err_vals else None
     return p95, err, len(rows)
@@ -125,7 +129,9 @@ def _baseline_p95(
         )
         .all()
     )
-    vals = [r.p95_latency_ms for r in rows if r.p95_latency_ms is not None]
+    vals: List[float] = [
+        float(r.p95_latency_ms) for r in rows if r.p95_latency_ms is not None
+    ]
     if not vals:
         return None
     return sum(vals) / len(vals)
@@ -161,7 +167,7 @@ def compute_health_for_service(
     db: Session,
     service: Service,
     now: Optional[datetime] = None,
-) -> Tuple[float, Dict[str, int]]:
+) -> Tuple[float, Dict[str, Optional[float]]]:
     """Compute health [0, 1] для одного service. Returns (score, signal_counts)
     для logging / digest. Signals содержит {open_critical, open_warning,
     chronic_pod_events, recurrence_24h, p95_drift_pct, http_5xx_rate,
@@ -220,13 +226,15 @@ def compute_health_for_service(
     )
 
     # ── новые компоненты ────────────────────────────────────────────────
-    p95_recent, err_recent, n_points = _recent_p95_and_5xx(db, service.id, now)
+    p95_recent, err_recent, n_points = _recent_p95_and_5xx(
+        db, cast(int, service.id), now
+    )
 
     # p95 drift: текущий vs baseline, penalty при > +50%
     p95_drift_pct: Optional[float] = None
     p95_drift_penalty = 0.0
     if p95_recent is not None:
-        baseline = _baseline_p95(db, service.id, now)
+        baseline = _baseline_p95(db, cast(int, service.id), now)
         if baseline and baseline > 0:
             drift = (p95_recent - baseline) / baseline * 100.0
             p95_drift_pct = drift
@@ -241,7 +249,7 @@ def compute_health_for_service(
         http_5xx_penalty = _capped(over * _HTTP_5XX_WEIGHT)
 
     # deploy_failure_pct / slo_burn_pct — из свежей записи kg_signal_aggregates
-    agg = _latest_signal_aggregate(db, service.id, now)
+    agg = _latest_signal_aggregate(db, cast(int, service.id), now)
     deploy_failure_pct: Optional[float] = None
     slo_burn_pct: Optional[float] = None
     deploy_failure_penalty = 0.0

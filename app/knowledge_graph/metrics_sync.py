@@ -17,7 +17,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from datetime import datetime
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, cast
 
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
@@ -185,7 +185,7 @@ async def _sync_service_health_async(db: Session) -> Dict[str, Any]:
     )
     ts = datetime.utcnow()
 
-    stats = {
+    stats: Dict[str, Any] = {
         "real_services": len(services),
         "fetched": 0,
         "with_signal": 0,
@@ -197,7 +197,9 @@ async def _sync_service_health_async(db: Session) -> Dict[str, Any]:
 
     for svc in services:
         try:
-            metrics = await _fetch_service_metrics(vm, svc.namespace, svc.name)
+            metrics = await _fetch_service_metrics(
+                vm, cast(str, svc.namespace), cast(str, svc.name)
+            )
             stats["fetched"] += 1
         except Exception as e:
             stats["errors"] += 1
@@ -213,7 +215,7 @@ async def _sync_service_health_async(db: Session) -> Dict[str, Any]:
 
         stats["with_signal"] += 1
         inserted = _insert_idempotent(
-            db, service_id=svc.id, ts=ts, metrics=metrics, source="vm",
+            db, service_id=cast(int, svc.id), ts=ts, metrics=metrics, source="vm",
         )
         if inserted:
             stats["inserted"] += 1

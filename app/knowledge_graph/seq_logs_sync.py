@@ -28,7 +28,7 @@ import hashlib
 import json
 import logging
 from datetime import datetime, timedelta
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, cast
 
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.orm import Session
@@ -220,8 +220,8 @@ async def _sync_instance(
             if app_name:
                 svc = _match_service(db, app_name, ns_hint)
                 if svc is not None:
-                    svc_id = svc.id
-                    ns_for_row = svc.namespace
+                    svc_id = cast(int, svc.id)
+                    ns_for_row = cast(str, svc.namespace)
                     stats["matched"] += 1
                 else:
                     stats["unmatched"] += 1
