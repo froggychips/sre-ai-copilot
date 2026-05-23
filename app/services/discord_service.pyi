@@ -12,6 +12,7 @@ from app.services.discord.dedup import (
     _DEDUP_TTL_SEC as _DEDUP_TTL_SEC,
     _LINKED_MIN_COUNT as _LINKED_MIN_COUNT,
     _LINKED_WINDOW_SEC as _LINKED_WINDOW_SEC,
+    _compute_content_key as _compute_content_key,
     _dedup_lock as _dedup_lock,
     _purge_dedup_state as _purge_dedup_state,
     _recent_by_alertname as _recent_by_alertname,

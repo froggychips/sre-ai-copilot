@@ -24,6 +24,7 @@ from . import dedup as _dedup_state
 from .dedup import (
     _LINKED_MIN_COUNT,
     _LINKED_WINDOW_SEC,
+    _compute_content_key,
     _dedup_lock,
     _purge_dedup_state,
     _webhook_edit_endpoint,
@@ -138,6 +139,8 @@ class DiscordService:
         recurrence_count_24h: int = 0,
         recurrence_count_7d: int = 0,
         incident_ts: Optional[datetime] = None,
+        pod_event_reason: Optional[str] = None,
+        metric_source: Optional[str] = None,
     ) -> None:
         """Единый embed-отчёт, заменяющий сырой алерт от Spidey Bot.
 
@@ -152,6 +155,12 @@ class DiscordService:
           - recurrence_count_24h / _7d: для footer-метки «×N in 24h · M in 7d».
           - incident_ts: момент инцидента — для запроса kg_log_observations
             и dedup-cache TTL.
+          - pod_event_reason: нормализованный k8s reason (OOMKilled, BackOff…)
+            для content-based dedup. Если None — fallback на lowercase
+            alertname.
+          - metric_source: имя metric_source когда service_name не резолвится
+            (синтетический алерт). Используется для content-key чтобы
+            разные «безымянные» алерты не схлопывались.
         """
         # #3 severity-routing: info/none/empty → НЕ шлём в #infra-error.
         # kg_alerts всё равно содержит запись (alertmanager_sync), digest
@@ -354,7 +363,10 @@ class DiscordService:
             return
 
         # #1 + #9 dedup. Ключи кэша:
-        #   - per (alertname, ns, pod) — точечный дедуп (#1).
+        #   - content-key (alertname, ns, service, reason) — точечный дедуп
+        #     (#1). Раньше был AM fingerprint через (alertname, ns, pod),
+        #     но AM минтит свежий fingerprint при каждой ре-mission →
+        #     dedup не срабатывал. Content-key решает.
         #   - per (alertname,) — burst-агрегация (#9), если ≥3 за 5 мин.
         # Берём решение под локом.
         await self._post_or_edit_incident(
@@ -364,7 +376,10 @@ class DiscordService:
             alertname=alertname,
             namespace=namespace or "",
             pod=pod or "",
+            service=service,
             severity=severity,
+            pod_event_reason=pod_event_reason,
+            metric_source=metric_source,
         )
 
     async def _post_or_edit_incident(
@@ -375,13 +390,19 @@ class DiscordService:
         alertname: str,
         namespace: str,
         pod: str,
+        service: Optional[str],
         severity: str,
+        pod_event_reason: Optional[str] = None,
+        metric_source: Optional[str] = None,
     ) -> None:
         """Решает: новый POST или PATCH существующего сообщения.
 
         Логика:
-          1. Если (alertname, ns, pod) уже в кэше <30 мин — PATCH embed
-             (увеличиваем count, обновляем footer last_seen).
+          1. Если content-key (alertname, ns, service, reason) уже в кэше
+             <30 мин — PATCH embed (увеличиваем count, обновляем footer
+             last_seen). Это основной dedup-путь.
+             Если content-key resolve фейлит (нет service) — fallback на
+             старый AM-style key (alertname, ns, pod).
           2. Иначе если (alertname,) видели ≥_LINKED_MIN_COUNT раз за
              _LINKED_WINDOW_SEC — PATCH первое сообщение этого alertname,
              добавляем pod/ns в виде fields/footer.
@@ -391,7 +412,27 @@ class DiscordService:
         без записи в кэш.
         """
         now = time.time()
-        key_full = (alertname, namespace, pod)
+        # Content-based key (новый). Fallback на (alertname,ns,pod) если
+        # service не резолвится.
+        content_key = _compute_content_key(
+            alertname=alertname,
+            namespace=namespace,
+            service_name=service,
+            reason=pod_event_reason,
+            metric_source=metric_source,
+        )
+        if content_key is not None:
+            key_full = content_key
+            dedup_mode = "content"
+        else:
+            # Fallback: legacy key для случаев когда service не резолвится
+            # (hard-to-route alerts). Тоже строка для единого типа.
+            key_full = f"fingerprint:{alertname}:{namespace}:{pod}"
+            dedup_mode = "fingerprint"
+            logging.debug(
+                "fallback to fingerprint dedup: alertname=%s ns=%s pod=%s",
+                alertname, namespace, pod,
+            )
         key_alert = (alertname,)
 
         with _dedup_lock:
@@ -399,13 +440,26 @@ class DiscordService:
             existing_full = _dedup_state._recent_incidents.get(key_full)
             existing_alert = _dedup_state._recent_by_alertname.get(key_alert)
 
-        # #1: PATCH сообщения для того же (alertname, ns, pod).
+        # #1: PATCH сообщения если content-key (или fallback) уже в кэше.
         if existing_full is not None:
+            self._audit_dedup_event(
+                "DEDUP_HIT_CONTENT" if dedup_mode == "content"
+                else "DEDUP_HIT_FINGERPRINT",
+                alertname=alertname, namespace=namespace,
+                service=service, key=key_full,
+            )
             await self._patch_recurrence(
                 url, embed, key_full, key_alert, namespace, pod,
                 mode="exact", now=now,
             )
             return
+
+        # Свежий — записываем DEDUP_MISS_FRESH ниже после успешного POST.
+        self._audit_dedup_event(
+            "DEDUP_MISS_FRESH",
+            alertname=alertname, namespace=namespace,
+            service=service, key=key_full, dedup_mode=dedup_mode,
+        )
 
         # #9: burst-aggregation. Видели ≥3 за 5 мин по alertname → агрегируем
         # вместо нового сообщения.
@@ -478,7 +532,7 @@ class DiscordService:
         self,
         url: str,
         embed: Dict[str, Any],
-        key_full: Tuple[str, str, str],
+        key_full: str,
         key_alert: Tuple[str],
         namespace: str,
         pod: str,
@@ -565,6 +619,36 @@ class DiscordService:
                 _dedup_state._recent_incidents[key_full]["embed"] = patched_embed
             if mode == "linked" and key_alert in _dedup_state._recent_by_alertname:
                 _dedup_state._recent_by_alertname[key_alert]["embed"] = patched_embed
+
+    def _audit_dedup_event(
+        self,
+        event_type: str,
+        *,
+        alertname: str,
+        namespace: str,
+        service: Optional[str],
+        key: str,
+        dedup_mode: Optional[str] = None,
+    ) -> None:
+        """Структурированная audit-запись dedup-решения.
+
+        Без числовых counter'ов — обычные log lines в audit_logger, чтобы
+        в Loki/ELK можно было `count by event_type` и быстро увидеть
+        долю HIT_CONTENT vs HIT_FINGERPRINT vs MISS_FRESH.
+        """
+        try:
+            from app.services.audit_logger import audit_logger
+            audit_logger.info(
+                event_type,
+                event_type=event_type,
+                alertname=alertname,
+                namespace=namespace,
+                service=service,
+                dedup_key=key,
+                dedup_mode=dedup_mode,
+            )
+        except Exception as e:  # never let telemetry break the send-path
+            logging.debug("audit_dedup_event_failed: %s", e)
 
     def _can_send_via_bot(self) -> bool:
         """Bot API доступен, когда есть token + channel_id. Без них fallback на webhook."""
