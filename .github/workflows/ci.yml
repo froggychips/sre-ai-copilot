@@ -123,7 +123,7 @@ jobs:
             ghcr.io/${{ github.repository }}@${{ steps.build.outputs.digest }}
 
       - name: Upload SBOM artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: sbom-${{ github.sha }}
           path: sbom.spdx.json
