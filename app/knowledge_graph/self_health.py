@@ -44,7 +44,7 @@ from sqlalchemy.orm import Session
 from app.config import settings
 from app.knowledge_graph.schema import (AlertEvent, AnomalyObservation,
                                         ClusterObservation,
-                                        IngressObservation, LogObservation,
+                                        LogObservation,
                                         PodEvent, Service, ServiceEdge,
                                         ServiceHealth, SignalAggregate)
 
