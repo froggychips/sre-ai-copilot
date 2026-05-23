@@ -17,7 +17,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from datetime import datetime
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, cast
 
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
@@ -168,7 +168,7 @@ async def _sync_ingress_observations_async(db: Session) -> Dict[str, Any]:
                 .filter_by(namespace=ns, name=backend_name)
                 .one_or_none()
             )
-            service_id = backend.id if backend else None
+            service_id: Optional[int] = cast(int, backend.id) if backend else None
 
             try:
                 metrics = await _fetch_ingress_metrics(vm, host, path)
