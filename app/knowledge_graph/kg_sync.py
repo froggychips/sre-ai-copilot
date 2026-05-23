@@ -17,7 +17,7 @@ import re
 import subprocess
 import json
 from datetime import datetime, timedelta
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, cast
 
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.orm import Session
@@ -930,12 +930,12 @@ def _decay_stale_edges(
         .all()
     )
     for edge in candidates:
-        ex = dict(edge.extras or {})
+        ex: Dict[str, Any] = dict(edge.extras or {})
         if ex.get("inactive") is True:
             continue  # уже помечен в предыдущем decay-проходе
         ex["inactive"] = True
         ex["inactivated_at"] = now.isoformat()
-        edge.extras = ex
+        edge.extras = cast(Any, ex)
         stats["marked_inactive"] += 1
     if candidates:
         db.flush()
@@ -957,12 +957,12 @@ def _revive_active_edges(db: Session) -> int:
     )
     revived = 0
     for edge in edges:
-        ex = edge.extras or {}
+        ex: Dict[str, Any] = cast(Dict[str, Any], edge.extras) or {}
         if ex.get("inactive") is True:
             new_ex = dict(ex)
             new_ex.pop("inactive", None)
             new_ex.pop("inactivated_at", None)
-            edge.extras = new_ex or None
+            edge.extras = cast(Any, new_ex or None)
             revived += 1
     if revived:
         db.flush()

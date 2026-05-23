@@ -4,7 +4,7 @@ import re
 import threading
 import time
 from datetime import datetime, timedelta, timezone
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, cast
 
 import httpx
 import structlog
@@ -101,9 +101,9 @@ def _purge_dedup_state(now: Optional[float] = None) -> None:
     for k in list(_recent_incidents.keys()):
         if _recent_incidents[k].get("first_ts", 0) < cutoff:
             del _recent_incidents[k]
-    for k in list(_recent_by_alertname.keys()):
-        if _recent_by_alertname[k].get("first_ts", 0) < cutoff:
-            del _recent_by_alertname[k]
+    for ka in list(_recent_by_alertname.keys()):
+        if _recent_by_alertname[ka].get("first_ts", 0) < cutoff:
+            del _recent_by_alertname[ka]
 
 
 def _format_sha_link(sha: Optional[str], repo: Optional[str] = None) -> str:
@@ -252,10 +252,12 @@ def _build_log_error_rate_field(
             sample = ""
             sample_count = -1
             for r in rows:
-                counts[r.level] = counts.get(r.level, 0) + (r.count or 0)
-                if (r.count or 0) > sample_count and r.sample_message:
-                    sample_count = r.count or 0
-                    sample = r.sample_message
+                level = cast(str, r.level)
+                row_count = int(r.count or 0)
+                counts[level] = counts.get(level, 0) + row_count
+                if row_count > sample_count and r.sample_message:
+                    sample_count = row_count
+                    sample = cast(str, r.sample_message)
             total = sum(counts.values())
             if total <= 0:
                 return None
