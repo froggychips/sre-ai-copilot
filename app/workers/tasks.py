@@ -201,6 +201,15 @@ celery_app.conf.beat_schedule = {
         "task": "kg_topology_resources_sync",
         "schedule": crontab(minute="*/15"),
     },
+    # Wave 7-Z: парсер NATS subjects из исходников WO monorepo. Раз в 6h
+    # делает git fetch shallow clone + grep `.cs` файлы на consumers/publish
+    # call-site → upsert subject-узлы + edges kind=`uses_nats`. Идемпотентен.
+    # Off by default (NATS_SUBJECTS_PARSER_ENABLED=false): требует ssh-доступ
+    # к wo-gitlab и каталога `WO_MONOREPO_PATH` — включается осознанно.
+    "kg-nats-subjects-sync": {
+        "task": "kg_nats_subjects_sync",
+        "schedule": crontab(minute=43, hour="*/6"),  # 6h, offset от drift/ingress/stuck
+    },
 }
 
 
@@ -918,6 +927,36 @@ def kg_seq_logs_sync_task():
         return sync_seq_logs(db, window_minutes=10)
     except Exception as e:
         logger.warning("kg_seq_logs_sync.failed: %s", e)
+        return {"error": str(e)}
+    finally:
+        db.close()
+
+
+@celery_app.task(name="kg_nats_subjects_sync")
+def kg_nats_subjects_sync_task():
+    """Wave 7-Z: парсер NATS subjects из исходников WO monorepo.
+
+    Раз в 6h:
+      1. git clone/fetch shallow + sparse (`GR.Platform`, `GR.WO.*`)
+      2. grep `.cs` на consumer-overrides + `SendToJetStreamAsync(...)`
+      3. upsert synthetic subject-узлы `subject:<x>` в namespace
+         `nats-subjects` + edges `uses_nats` с `extras.direction = pub|sub`
+
+    Off by default через `NATS_SUBJECTS_PARSER_ENABLED=false` — требует
+    ssh-доступа к wo-gitlab и каталога `WO_MONOREPO_PATH`. Включается
+    осознанно после ручного дры-ран на тестовой инсталляции.
+    """
+    if not getattr(settings, "NATS_SUBJECTS_PARSER_ENABLED", False):
+        logger.info("kg_nats_subjects_sync.skipped reason=disabled")
+        return {"skipped": True, "reason": "NATS_SUBJECTS_PARSER_ENABLED=false"}
+
+    from app.knowledge_graph.nats_subjects_sync import sync_nats_subjects
+
+    db = SessionLocal()
+    try:
+        return sync_nats_subjects(db)
+    except Exception as e:
+        logger.warning("kg_nats_subjects_sync.failed: %s", e)
         return {"error": str(e)}
     finally:
         db.close()
