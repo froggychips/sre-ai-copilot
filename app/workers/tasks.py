@@ -227,6 +227,16 @@ celery_app.conf.beat_schedule = {
         "task": "kg_nats_subjects_sync",
         "schedule": crontab(minute=43, hour="*/6"),  # 6h, offset от drift/ingress/stuck
     },
+    # Periodic ownership backfill (2026-05-24): закрывает gap multi-signal
+    # owner inference, который интегрирован только в digest. Каждые 6 часов
+    # проходит по сервисам без owner и применяет high-confidence-кандидатов
+    # (порог = OWNERSHIP_BACKFILL_THRESHOLD). Default OFF — включается через
+    # OWNERSHIP_BACKFILL_ENABLED. Offset minute=17 чтобы не наложиться на
+    # drift-cleanup (тот же 17 min, но schedule отличается).
+    "kg-ownership-backfill": {
+        "task": "kg_ownership_backfill",
+        "schedule": crontab(minute=17, hour="*/6"),
+    },
 }
 
 
@@ -1017,6 +1027,55 @@ def kg_nats_subjects_sync_task():
         return sync_nats_subjects(db)
     except Exception as e:
         logger.warning("kg_nats_subjects_sync.failed: %s", e)
+        return {"error": str(e)}
+    finally:
+        db.close()
+
+
+@celery_app.task(name="kg_ownership_backfill")
+def kg_ownership_backfill_task():
+    """Periodic backfill team_owner через multi-signal inference.
+
+    Раз в 6h проходит по `kg_services` где team_owner NULL/'', прогоняет
+    `suggest_owner_multi_signal` и UPDATE-ит owner при confidence >=
+    OWNERSHIP_BACKFILL_THRESHOLD (default 0.7 — high-confidence only,
+    чтобы не записывать спорные эвристики автоматом без review).
+
+    Default OFF (OWNERSHIP_BACKFILL_ENABLED=false). Включается осознанно
+    после dry-run прогона CLI: `python -m app.scripts.backfill_ownership`.
+    Manual override (OWNERSHIP_MANIFEST_PATH=ownership.yaml) применяется
+    всегда — manifest-confidence = 1.0.
+    """
+    if not getattr(settings, "OWNERSHIP_BACKFILL_ENABLED", False):
+        logger.info("kg_ownership_backfill.skipped reason=disabled")
+        return {"skipped": True, "reason": "OWNERSHIP_BACKFILL_ENABLED=false"}
+
+    from app.scripts.backfill_ownership import run_backfill
+
+    threshold = float(getattr(settings, "OWNERSHIP_BACKFILL_THRESHOLD", 0.7))
+    db = SessionLocal()
+    try:
+        result = run_backfill(
+            db,
+            apply=True,
+            threshold=threshold,
+            do_ownership=True,
+            do_stale=False,
+        )
+        logger.info(
+            "kg_ownership_backfill.done updated=%d skipped_low_conf=%d kept=%d",
+            result.actually_updated_owner,
+            result.skipped_low_confidence,
+            result.kept_existing,
+        )
+        return {
+            "updated_owner": result.actually_updated_owner,
+            "skipped_low_confidence": result.skipped_low_confidence,
+            "kept_existing": result.kept_existing,
+            "threshold": threshold,
+        }
+    except Exception as e:
+        logger.warning("kg_ownership_backfill.failed: %s", e)
         return {"error": str(e)}
     finally:
         db.close()
