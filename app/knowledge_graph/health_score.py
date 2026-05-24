@@ -27,6 +27,10 @@ Score [0, 1], 1.0 = perfect health, 0.0 = down/broken. Деривируется
 
 Refresh периодический (beat task `kg_health_recompute`), хранится в
 kg_services.health_score + health_computed_at.
+
+См. также `app.knowledge_graph.contract` — `is_synthetic` (этот модуль
+skip-ает synthetic-узлы), `QUALITY_THRESHOLDS` (общие пороги). Формальный
+контракт — `docs/KG_SCHEMA_CONTRACT.md`.
 """
 from __future__ import annotations
 

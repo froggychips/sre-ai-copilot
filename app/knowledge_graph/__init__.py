@@ -15,6 +15,13 @@
 после интеграции в pipeline (см. C/D).
 """
 
+from app.knowledge_graph.contract import (
+    EDGE_KINDS,
+    KG_SCHEMA_VERSION,
+    QUALITY_THRESHOLDS,
+    is_orphan,
+    is_synthetic,
+)
 from app.knowledge_graph.queries import (
     incidents_on,
     nearby_alerts,
@@ -37,4 +44,9 @@ __all__ = [
     "upstream_of",
     "incidents_on",
     "nearby_alerts",
+    "KG_SCHEMA_VERSION",
+    "EDGE_KINDS",
+    "QUALITY_THRESHOLDS",
+    "is_orphan",
+    "is_synthetic",
 ]
