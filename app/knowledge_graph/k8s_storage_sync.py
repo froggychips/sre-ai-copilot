@@ -41,7 +41,7 @@ import logging
 import re
 import subprocess
 from datetime import datetime
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, cast
 
 from sqlalchemy.orm import Session
 
@@ -321,14 +321,14 @@ def _upsert_volume(
     # Update mutable fields. Не трогаем disk_pct если на этом тике нет
     # данных (None) — чтобы предыдущее значение не стиралось при
     # STORAGE_METRICS_ENABLED=False.
-    vol.capacity_bytes = fields.get("capacity_bytes")
-    vol.storage_class = fields.get("storage_class")
-    vol.phase = fields.get("phase")
-    vol.access_modes = fields.get("access_modes")
-    vol.volume_name = fields.get("volume_name")
-    vol.metadata_json = fields.get("metadata_json")
+    vol.capacity_bytes = cast(Any, fields.get("capacity_bytes"))
+    vol.storage_class = cast(Any, fields.get("storage_class"))
+    vol.phase = cast(Any, fields.get("phase"))
+    vol.access_modes = cast(Any, fields.get("access_modes"))
+    vol.volume_name = cast(Any, fields.get("volume_name"))
+    vol.metadata_json = cast(Any, fields.get("metadata_json"))
     if disk_pct is not None:
-        vol.disk_pct = disk_pct
+        vol.disk_pct = cast(Any, disk_pct)
     db.flush()
     return vol
 
@@ -370,12 +370,12 @@ def _upsert_volume_edge(
         db.add(edge)
         db.flush()
     else:
-        edge.last_seen_at = now
+        edge.last_seen_at = cast(Any, now)
         if extras:
             merged = dict(edge.extras or {})
             merged.update(extras)
             if merged != (edge.extras or {}):
-                edge.extras = merged
+                edge.extras = cast(Any, merged)
         db.flush()
     return edge
 
@@ -517,8 +517,8 @@ def sync_pvcs(
                 continue
             _upsert_volume_edge(
                 db,
-                src_kind=NODE_PVC, src_id=pvc_node.id,
-                dst_kind=NODE_PV, dst_id=pv_node.id,
+                src_kind=NODE_PVC, src_id=cast(int, pvc_node.id),
+                dst_kind=NODE_PV, dst_id=cast(int, pv_node.id),
                 kind=EDGE_BOUND_TO,
                 discovered_by=DISCOVERED_BY_PVC_SPEC,
                 extras={"phase": fields.get("phase")},
@@ -599,8 +599,8 @@ def sync_pod_pvc_edges(db: Session) -> Dict[str, int]:
                 continue
             _upsert_volume_edge(
                 db,
-                src_kind=NODE_SERVICE, src_id=svc.id,
-                dst_kind=NODE_PVC, dst_id=pvc_node.id,
+                src_kind=NODE_SERVICE, src_id=cast(int, svc.id),
+                dst_kind=NODE_PVC, dst_id=cast(int, pvc_node.id),
                 kind=EDGE_USES_VOLUME,
                 discovered_by=DISCOVERED_BY_PODS,
             )
