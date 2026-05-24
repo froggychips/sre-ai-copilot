@@ -147,6 +147,14 @@ celery_app.conf.beat_schedule = {
         "task": "kg_anomaly_detection_task",
         "schedule": crontab(minute="*/10"),
     },
+    # Runtime correlation: подтверждает existing edges через co-occurrence
+    # warning-событий (BackOff/Unhealthy/OOMKilled/...) у src+dst в окне 15 мин.
+    # Sliding window 7 дней — дорогой запрос, /30 мин достаточно.
+    # Управляется RUNTIME_CORRELATION_ENABLED.
+    "kg-runtime-correlation-sync": {
+        "task": "kg_runtime_correlation_sync",
+        "schedule": crontab(minute="*/30"),
+    },
     # Per-team daily digest — один embed per team_owner (squad-N / infra /
     # monitoring). Зависит от kg_signal_aggregates (slo_burn_pct) и
     # kg_services.health_score — должен запускаться ПОСЛЕ их compute.
@@ -581,6 +589,37 @@ def kg_anomaly_detection_task():
         return detect_anomalies(db)
     except Exception as e:
         logger.warning("kg_anomaly_detection_task.failed: %s", e)
+
+
+@celery_app.task(name="kg_runtime_correlation_sync")
+def kg_runtime_correlation_sync_task():
+    """Подтверждение existing edges через co-occurrence warning-событий.
+
+    Для каждой edge ищем pairs (src.event, dst.event) с |Δt| ≤ window_minutes
+    за lookback_days. Если набралось min_correlation_count+ за окно — добавляем
+    "runtime_correlation" в discovery_sources (high-priority в C3 formula).
+
+    Идемпотентно через discovery_sources merge — повторный run не дублирует.
+    """
+    if not settings.RUNTIME_CORRELATION_ENABLED:
+        logger.info("kg_runtime_correlation_sync.skipped: disabled by config")
+        return {"skipped": "disabled"}
+
+    import asyncio
+    from app.knowledge_graph.runtime_correlation import run_runtime_correlation_sync
+
+    db = SessionLocal()
+    try:
+        return asyncio.run(
+            run_runtime_correlation_sync(
+                db,
+                window_minutes=settings.RUNTIME_CORRELATION_WINDOW_MINUTES,
+                min_correlation_count=settings.RUNTIME_CORRELATION_MIN_COUNT,
+                lookback_days=settings.RUNTIME_CORRELATION_LOOKBACK_DAYS,
+            )
+        )
+    except Exception as e:
+        logger.warning("kg_runtime_correlation_sync.failed: %s", e)
         return {"error": str(e)}
     finally:
         db.close()

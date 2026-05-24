@@ -409,6 +409,32 @@ class Settings(BaseSettings):
     SEQ_URL_PREUPDATE: str = Field("", description="Seq preupdate base URL")
     SEQ_TOKEN_PREUPDATE: str = Field("", description="Seq preupdate API key")
 
+    # PodEvent runtime correlation — cheap OTEL-substitute. Beat task
+    # `kg_runtime_correlation_sync` каждые 30 мин ищет пары (src, dst) для
+    # которых warning-события сваливались в одном окне N+ раз за неделю,
+    # и помечает их edges как runtime-correlation-confirmed (новый
+    # discovery_source с tier-1 precedence 0.95).
+    #
+    # ВАЖНО: только подтверждает существующие edges; новые edges из ничего
+    # не создаёт (симметричный сигнал не определяет direction). Sliding
+    # window 7d — это дорогой запрос, чаще 30мин нет смысла.
+    RUNTIME_CORRELATION_ENABLED: bool = Field(
+        True,
+        description="Включить kg_runtime_correlation_sync beat task",
+    )
+    RUNTIME_CORRELATION_WINDOW_MINUTES: int = Field(
+        15,
+        description="Окно для co-occurrence матчинга warning-событий (минуты)",
+    )
+    RUNTIME_CORRELATION_MIN_COUNT: int = Field(
+        2,
+        description="Минимум co-occurrences для подтверждения edge",
+    )
+    RUNTIME_CORRELATION_LOOKBACK_DAYS: int = Field(
+        7,
+        description="Глубина истории pod_events для корреляции (дни)",
+    )
+
     # Atlassian Jira — поиск известных инцидентов/задач по сервису.
     # Basic Auth: email + API token (https://id.atlassian.com/manage-profile/security/api-tokens)
     # Пусто = Jira отключена (graceful degrade).
