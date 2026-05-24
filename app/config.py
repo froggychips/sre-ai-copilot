@@ -177,6 +177,18 @@ class Settings(BaseSettings):
         6,
         description="In-memory dedup window для Discord embed (часы)",
     )
+    # Stage 2 (PATCH-dedup для send_enriched_alert).
+    # AM preprod: group_interval=10m, repeat=4h → одна (alertname,ns,service,
+    # severity) даёт ~18 embed/сутки в #infra-error без dedup. С 30-мин окном
+    # → ~3 embed/сутки (1 POST + N PATCH), остальное patches counter в
+    # footer'е. Окно совпадает с _DEDUP_TTL_SEC incident-кэша для единообразия.
+    ENRICHED_DEDUP_WINDOW_SECONDS: int = Field(
+        1800,
+        description=(
+            "TTL окна PATCH-dedup для send_enriched_alert (sec). "
+            "Default 30 мин — same as incident-cache."
+        ),
+    )
     STUCK_ALERTS_DISCORD_ENABLED: bool = Field(
         True,
         description="Слать Discord embed на stuck-alerts (audit-log пишется всегда)",

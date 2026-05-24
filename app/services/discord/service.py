@@ -25,8 +25,10 @@ from .dedup import (
     _LINKED_MIN_COUNT,
     _LINKED_WINDOW_SEC,
     _compute_content_key,
+    _compute_enriched_key,
     _dedup_lock,
     _purge_dedup_state,
+    _purge_enriched_state,
     _webhook_edit_endpoint,
 )
 from .embed_builder import (
@@ -1048,6 +1050,111 @@ class DiscordService:
         if not url:
             logging.warning("DISCORD_WEBHOOK_URL not set, skipping enriched alert")
             return
+        # Stage 2: PATCH-dedup. Раньше send_enriched_alert POSTил на каждую
+        # (alertname, severity)-группу AM batch'а — без content-dedup,
+        # 18 embed/сутки в preprod (group_interval=10m, repeat=4h).
+        # Теперь — content-key (alertname,ns,service,severity)+30-мин окно
+        # → 1 POST + N PATCH (counter в footer'е).
+        await self._post_or_patch_enriched(
+            url=url,
+            payload=payload,
+            embed=payload["embeds"][0],
+            alertname=alertname,
+            namespace=(namespaces[0] if namespaces else None),
+            service=head.service,
+            severity=severity,
+        )
+
+    async def _post_or_patch_enriched(
+        self,
+        url: str,
+        payload: Dict[str, Any],
+        embed: Dict[str, Any],
+        alertname: str,
+        namespace: Optional[str],
+        service: Optional[str],
+        severity: str,
+    ) -> None:
+        """PATCH-dedup для enriched-канала. Аналог `_post_or_edit_incident`,
+        но с собственным кэшем `_recent_enriched` и без burst-агрегации
+        (#9 здесь не нужна — enriched уже схлопывает AM batch в один embed).
+
+        Логика:
+          1. Если ключ (alertname,ns,service,severity) уже в кэше <TTL —
+             PATCH сообщения (count++, обновляем footer).
+          2. Иначе POST с ?wait=true, сохраняем msg_id+embed+ts.
+          3. Без msg_id (legacy webhook без wait) — не пополняем кэш,
+             следующий incident пойдёт как новый POST. Это OK.
+
+        TTL берётся из `settings.ENRICHED_DEDUP_WINDOW_SECONDS` (default 30 мин).
+        """
+        now = time.time()
+        ttl = int(getattr(settings, "ENRICHED_DEDUP_WINDOW_SECONDS", 1800) or 1800)
+        key = _compute_enriched_key(
+            alertname=alertname,
+            namespace=namespace,
+            service_name=service,
+            severity=severity,
+        )
+        if key is None:
+            # Без alertname или невалидный вход — POST без dedup.
+            await self._post_enriched_raw(url, payload)
+            return
+
+        with _dedup_lock:
+            _purge_enriched_state(now, ttl_sec=ttl)
+            existing = _dedup_state._recent_enriched.get(key)
+
+        if existing is not None and (now - existing.get("first_ts", 0)) <= ttl:
+            await self._patch_enriched_recurrence(
+                url=url, embed=embed, key=key,
+                ttl_sec=ttl, now=now,
+            )
+            return
+
+        # Новый POST. wait=true чтобы получить msg_id.
+        post_url = _ensure_wait_param(url)
+        msg_id: Optional[str] = None
+        try:
+            async with httpx.AsyncClient() as client:
+                r = await client.post(post_url, json=payload)
+                if r.status_code >= 400:
+                    logging.error(
+                        "discord_enriched_alert_failed",
+                        extra={"status": r.status_code, "body": r.text[:200]},
+                    )
+                    return
+                if r.status_code == 200:
+                    try:
+                        msg_id = str(r.json().get("id") or "") or None
+                    except (ValueError, TypeError):
+                        msg_id = None
+        except Exception as e:
+            logging.error("discord_enriched_alert_exception", extra={"error": str(e)})
+            return
+
+        if not msg_id:
+            # Legacy webhook без wait=true → нечего PATCH-ить, dedup-кэш
+            # не пополняем. Это симметрично с `_post_or_edit_incident`.
+            return
+
+        with _dedup_lock:
+            _dedup_state._recent_enriched[key] = {
+                "msg_id": msg_id,
+                "first_ts": now,
+                "last_ts": now,
+                "count": 1,
+                "webhook_url": url,
+                "embed": embed,
+                "alertname": alertname,
+                "namespace": namespace,
+                "service": service,
+                "severity": severity,
+            }
+
+    async def _post_enriched_raw(self, url: str, payload: Dict[str, Any]) -> None:
+        """Fallback-POST когда _compute_enriched_key вернул None.
+        Без dedup — просто шлём embed."""
         async with httpx.AsyncClient() as client:
             r = await client.post(url, json=payload)
             if r.status_code >= 400:
@@ -1055,6 +1162,83 @@ class DiscordService:
                     "discord_enriched_alert_failed",
                     extra={"status": r.status_code, "body": r.text[:200]},
                 )
+
+    async def _patch_enriched_recurrence(
+        self,
+        url: str,
+        embed: Dict[str, Any],
+        key: str,
+        ttl_sec: int,
+        now: float,
+    ) -> None:
+        """PATCH ранее отправленного enriched embed: count++, footer update.
+
+        В отличие от `_patch_recurrence` (incident-канал) — нет mode=linked
+        (enriched уже агрегирует AM batch). Footer формата
+        `<base> · ×N в <TTL>мин · first HH:MM · last HH:MM` для consistency
+        с incident-каналом.
+        """
+        with _dedup_lock:
+            rec = _dedup_state._recent_enriched.get(key)
+            if rec is None:
+                return
+            rec["count"] = rec.get("count", 1) + 1
+            rec["last_ts"] = now
+            msg_id = rec["msg_id"]
+            cached_embed = rec.get("embed") or embed
+            count = rec["count"]
+            first_ts = rec["first_ts"]
+            webhook_url = rec.get("webhook_url") or url
+
+        # Берём новый embed (с актуальными KG-данными — KG mог обновиться
+        # за окно дедупа), но обновляем footer counter'ом.
+        patched_embed = dict(embed)
+        first_seen = datetime.fromtimestamp(first_ts, tz=timezone.utc).strftime("%H:%M")
+        last_seen = datetime.fromtimestamp(now, tz=timezone.utc).strftime("%H:%M")
+        original_footer = (patched_embed.get("footer") or {}).get("text") or ""
+        # Если footer уже PATCH-ев (содержит «×N в»), берём префикс до « · ×».
+        base_footer = original_footer.split(" · ×", 1)[0] if original_footer else ""
+        ttl_min = max(1, ttl_sec // 60)
+        patched_embed["footer"] = {
+            "text": (
+                f"{base_footer} · ×{count} в {ttl_min}мин · "
+                f"first {first_seen} · last {last_seen}"
+            )[:2048]
+        }
+        patch_payload = {"embeds": [patched_embed]}
+
+        endpoint = _webhook_edit_endpoint(webhook_url, msg_id)
+        if not endpoint:
+            logging.warning(
+                "discord_enriched_patch_no_endpoint",
+                extra={"webhook": webhook_url[:40]},
+            )
+            return
+        try:
+            async with httpx.AsyncClient() as client:
+                r = await client.patch(endpoint, json=patch_payload)
+                if r.status_code >= 400:
+                    logging.warning(
+                        "discord_enriched_patch_failed",
+                        extra={"status": r.status_code, "body": r.text[:200]},
+                    )
+                    return
+        except Exception as e:
+            logging.warning("discord_enriched_patch_exception", extra={"error": str(e)})
+            return
+        # Кэшируем patched_embed чтобы следующий patch не терял footer'ной
+        # истории, если KG-данные между ре-mission'ами одинаковы.
+        with _dedup_lock:
+            if key in _dedup_state._recent_enriched:
+                _dedup_state._recent_enriched[key]["embed"] = patched_embed
+        # Audit-log в structlog (симметрично с incident-каналом).
+        try:
+            _log.info(
+                "enriched.dedup_hit",
+                key=key[:12], count=count, alertname=cached_embed.get("title", "?")[:40],
+            )
+        except Exception:
+            pass
 
     async def send_external_probe_alert(
         self,

@@ -31,8 +31,10 @@ sys.modules[__name__] = _service_module
 # `discord_service._foo` тоже работало. Только после module-alias.
 _REEXPORT_FROM_DEDUP = (
     "_DEDUP_TTL_SEC", "_LINKED_MIN_COUNT", "_LINKED_WINDOW_SEC",
-    "_compute_content_key", "_dedup_lock", "_purge_dedup_state",
-    "_recent_by_alertname", "_recent_incidents", "_webhook_edit_endpoint",
+    "_compute_content_key", "_compute_enriched_key",
+    "_dedup_lock", "_purge_dedup_state", "_purge_enriched_state",
+    "_recent_by_alertname", "_recent_enriched", "_recent_incidents",
+    "_webhook_edit_endpoint",
 )
 _REEXPORT_FROM_EMBED_BUILDER = (
     "_build_deploy_correlation_field", "_build_log_error_rate_field",
