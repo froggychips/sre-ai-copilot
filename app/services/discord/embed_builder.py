@@ -229,6 +229,116 @@ def _build_log_error_rate_field(
         return None
 
 
+def _build_blast_radius_field(
+    blast: Optional[Dict[str, Any]],
+) -> Optional[Dict[str, Any]]:
+    """Wave 7 (X, PR #71) — 🎯 Blast radius field для critical embed.
+
+    Принимает результат `queries.blast_radius_for(...)`. Считает:
+        * сколько Service'ов маршрутят трафик на упавший Deployment
+          (`serves_traffic` IN-edges) — это «кто вызовет проблему»;
+        * сколько Ingress hosts (внешние URL) затронуты (`routes_to`).
+
+    Возвращает None если оба counts == 0 (skip-if-empty). Embed-секция
+    добавляется только когда есть нечего показать кроме нулей.
+    """
+    if not blast:
+        return None
+    services = blast.get("services") or []
+    urls = blast.get("urls") or []
+    services_total = blast.get("services_total") or 0
+    urls_total = blast.get("urls_total") or 0
+    if services_total == 0 and urls_total == 0:
+        return None
+
+    parts: List[str] = []
+    if services_total > 0:
+        names = ", ".join(f"`{s}`" for s in services[:3])
+        suffix = f" (+{services_total - len(services)})" if services_total > len(services) else ""
+        parts.append(f"{services_total} svc → {names}{suffix}")
+    if urls_total > 0:
+        url_names = ", ".join(f"`{u}`" for u in urls[:3])
+        suffix = f" (+{urls_total - len(urls)})" if urls_total > len(urls) else ""
+        parts.append(f"{urls_total} URL → {url_names}{suffix}")
+
+    return {
+        "name": "🎯 Blast radius (Wave 7)",
+        "value": "\n".join(parts)[:1024],
+        "inline": False,
+    }
+
+
+def _build_nats_impact_field(
+    impact: Optional[List[Dict[str, Any]]],
+) -> Optional[Dict[str, Any]]:
+    """Wave 7 (Z, PR #72) — 📨 NATS impact field для critical embed.
+
+    Принимает результат `queries.nats_impact_for(...)`. Для каждого
+    subject показывает direction (pub→/sub←), subject-имя и количество
+    других сервисов на этом subject'е.
+
+    Возвращает None если list пуст (большинство сервисов без NATS).
+    Caching impact_count происходит внутри `nats_impact_for` (один batch
+    SQL-запрос на все subjects), здесь — чисто рендеринг.
+    """
+    if not impact:
+        return None
+    lines: List[str] = []
+    for entry in impact[:3]:
+        subject = entry.get("subject") or "?"
+        direction = (entry.get("direction") or "?").lower()
+        impact_count = entry.get("impact_count") or 0
+        # Чистим префикс `nats-subject:` если synthetic-узел так назван;
+        # populator может использовать любой prefix, но render оставляет
+        # имя как есть, если префикса нет.
+        subject_clean = subject.split(":", 1)[1] if subject.startswith("nats-subject:") else subject
+        arrow = "pub→" if direction == "pub" else ("sub←" if direction == "sub" else "?·")
+        # Семантика impact_count: pub → сколько подписчиков получат событие;
+        # sub → сколько других продюсеров (общий subject = «обмен»).
+        if direction == "pub":
+            count_label = f"{impact_count} sub-консьюмер{'ов' if impact_count != 1 else ''}"
+        elif direction == "sub":
+            count_label = f"{impact_count} co-consumer{'s' if impact_count != 1 else ''}"
+        else:
+            count_label = f"{impact_count} other"
+        lines.append(f"• {arrow}`{subject_clean}` ({count_label})")
+
+    return {
+        "name": "📨 NATS impact (Wave 7)",
+        "value": "\n".join(lines)[:1024],
+        "inline": False,
+    }
+
+
+def _build_pod_trail_field(
+    trail: Optional[Dict[str, Any]],
+) -> Optional[Dict[str, Any]]:
+    """Wave 7 (Y, PR #70) — 🕒 Pod trail field для critical embed.
+
+    Принимает результат `queries.pod_event_summary_for(...)`. Агрегирует
+    PodEvent по reason за последний час: `5 evts: 3 OOMKilled,
+    2 CrashLoopBackOff`. Это короткая сводка над уже-существующей
+    секцией «Recent pod events» (top-5 individual events), но фокус
+    на counts а не на messages.
+
+    Возвращает None если total == 0 (skip-if-empty).
+    """
+    if not trail:
+        return None
+    total = trail.get("total") or 0
+    by_reason = trail.get("by_reason") or []
+    if total == 0 or not by_reason:
+        return None
+    # Top-5 reasons максимум — больше в embed-line не вмещается читаемо.
+    by_reason = by_reason[:5]
+    reasons_str = ", ".join(f"{cnt} {reason}" for reason, cnt in by_reason)
+    return {
+        "name": "🕒 Pod trail (Wave 7, 1h)",
+        "value": f"{total} evts: {reasons_str}"[:1024],
+        "inline": False,
+    }
+
+
 def _format_recurrence_tag(
     is_recurrence: bool,
     count_24h: int = 0,
