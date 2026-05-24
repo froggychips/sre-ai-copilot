@@ -49,11 +49,22 @@
 ## Knowledge Graph
 
 ### Schema (`app/knowledge_graph/schema.py`)
-- `Service` — узлы (`kg_services`, unique `(namespace, name)`); флаг `synthetic` скрывает инфра/observability/drift-узлы из KG-запросов; `team_owner` выводится из namespace prefix.
-- `ServiceEdge` — направленные рёбра (`kg_service_edges`); `kind` ∈ `calls` / `uses_nats` / `uses_db`; `last_seen_at` для TTL/decay; `extras.discovery_sources` (list) копит все источники (multi-source = выше confidence).
+- `Service` — узлы (`kg_services`, unique `(namespace, name)`); флаг `synthetic` скрывает инфра/observability/drift-узлы из KG-запросов; `team_owner` выводится из namespace prefix; `stale_class` (PR #86): `active` / `expected_stale` / `suspicious_stale` (см. `stale_classifier`).
+- `ServiceEdge` — направленные рёбра (`kg_service_edges`); `kind` ∈ `calls` / `uses_nats` / `uses_db` / `serves_traffic` / `routes_to`; `last_seen_at` для TTL/decay; `extras.discovery_sources` (list) копит все источники (multi-source = выше confidence).
 - `Deployment` — история TC builds (`kg_deployments`); `started_at` из TC API (не `finishDate`), `triggered_by`, статус `SUCCESS`/`FAILURE`/etc.
 - `AlertEvent` — алерты от AM (`kg_alerts`); идемпотентно по `fingerprint`; `resolved_at` обновляется через `kg_alerts_resolve_sync`.
 - `PodEvent` — k8s Warning-события (`kg_pod_events`); идемпотентно по `event_uid`; `count` копит kubelet-retries.
+- `K8sJob` (PR #82, `kg_k8s_jobs`) — Job/CronJob узлы вне `kg_services`; `kind` ∈ `job` / `cronjob`; `owner_service_id` метаколонка реализует semantic edge `runs_as_job` без отдельного edge-row.
+- `StorageVolume` (PR #84, `kg_storage_volumes`) — PVC/PV узлы; `kind` ∈ `pvc` / `pv` (PVC — namespace-scoped, PV — cluster-scoped с `namespace=''`); атрибуты: phase, capacity_bytes, storage_class.
+- `VolumeEdge` (PR #84, `kg_volume_edges`) — heterogeneous edges (`uses_volume` Service→PVC, `bound_to` PVC→PV); tagged `src_kind`/`dst_kind` без FK constraint.
+
+### Schema / quality contract (`app/knowledge_graph/contract.py`)
+- `KG_SCHEMA_VERSION` — текущая версия (`2.2`, после PR #82/#84/#86). Bump rules — `docs/KG_SCHEMA_CONTRACT.md` §8.
+- `EDGE_KINDS` — реестр всех edge kinds + spec (`semantic` / `src_kinds` / `dst_kinds` / `source` / `status` / `table`). `table` = где edge живёт: `kg_service_edges` / `kg_volume_edges` / `fk_only` (через FK) / `metadata_only` (через owner_service_id).
+- `OWNER_SOURCES` / `OWNER_SOURCE_ALIASES` — canonical источники owner-а + маппинг коротких имён из `ownership_suggester`.
+- `STALE_CLASS_VALUES` — enum значений `kg_services.stale_class`.
+- `STARTUP_CONTRACT_CHECK(db)` — boot-time диагностика drift-а.
+- Test: `tests/test_contract_drift.py` (Gate #22) — auto-validation что код и контракт не разъезжаются.
 
 ### Sync (auto-populating beat tasks)
 - `app/knowledge_graph/kg_sync.py`: `sync_topology()` — раз в час `kubectl get deployments -A` → `kg_services` + рёбра из env-vars (HTTP URLs, NATS-кластеры) и `secretKeyRef.key` heuristic (DB-DSN без чтения значений secret).
@@ -61,6 +72,12 @@
 - `app/knowledge_graph/k8s_ingress_sync.py`: `sync_all_ingresses()` — раз в час `kubectl get ingresses -A` → synthetic-узлы `ingress:<host>` + рёбра `calls` к backend-сервисам.
 - `app/knowledge_graph/alerts_resolve_sync.py`: `run_alerts_resolve_sync()` — каждые 15 мин сравнивает `kg_alerts.fingerprint` с `GET AM /api/v2/alerts` → не-firing → `resolved_at=NOW`. Safety: min 1 active fingerprint.
 - `app/knowledge_graph/drift_cleanup.py`: `run_drift_cleanup()` — раз в час; services из несуществующих ns → `synthetic=true` + `metadata.drift_reason`. Safety threshold 20% drift_pct.
+- `app/knowledge_graph/k8s_topology_resources_sync.py` (Wave 7-X): каждые 15 минут `kubectl get services/ingresses -A -o json` → edges `serves_traffic` (Service → backing Deployment по selector-match) и `routes_to` (Ingress-как-ресурс → backend Service). Параллельный slice к `k8s_ingress_sync` (Ingress-as-host). RBAC: cluster-role требует `services`, `ingresses` на verbs `get`/`list`/`watch`.
+- `app/knowledge_graph/runtime_correlation.py` (Wave 7-Y): каждые 30 минут sliding-window по `kg_pod_events`. Для каждой пары `(src, dst)` где edge уже существует, считает co-occurrences warning-событий в окне (default 15 мин). При count ≥ MIN_COUNT — подтверждает edge новым `discovery_source = "kg_sync/runtime_corr"` (tier-1 precedence 0.95). Не создаёт новые edges (симметричный сигнал не определяет direction). Feature flag `RUNTIME_CORRELATION_ENABLED=true`.
+- `app/knowledge_graph/nats_subjects_sync.py` (Wave 7-Z): каждые 6 часов shallow clone + sparse-checkout WO monorepo, regex-парсер C# исходников на consumers (`NatsJetStreamConsumer<T>`) и publish call-sites (`SendToJetStreamAsync`). Subject = synthetic-Service в `nats-subjects` namespace, `name=subject:<value>`. Edge `uses_nats` с `extras.direction ∈ {pub, sub}`, `weight = count(call-sites)`. Feature flag `NATS_SUBJECTS_PARSER_ENABLED=false` (требует ssh-доступ к gitlab-monorepo).
+- `app/knowledge_graph/k8s_jobs_sync.py` (Wave 8-A, PR #82): `sync_k8s_jobs()` — каждые 15 минут `kubectl get jobs,cronjobs -A -o json` → `kg_k8s_jobs`. Поля Jobs: `succeeded_count`/`failed_count`/`active_count`/`completion_time`/`last_pod_exit_code`. Поля CronJobs: `schedule`/`last_schedule_time`/`last_successful_time`/`suspended`. Owner Service резолвится через label `app.kubernetes.io/part-of` (fallback `app`) → semantic `runs_as_job` через `owner_service_id` metadata-column (а не отдельный edge-row).
+- `app/knowledge_graph/k8s_storage_sync.py` (Wave 8-B, PR #84): `sync_storage()` — каждые 30 мин, отдельные проходы для PV (cluster-scoped), PVC (namespace-scoped) + scan `pod.spec.volumes` для `uses_volume` edges. Все edges идут в `kg_volume_edges` (heterogeneous, tagged src/dst). Опциональный disk_pct enrichment через `kubelet_volume_stats_*` PromQL под флагом `STORAGE_METRICS_ENABLED=false` (default OFF — scrape config может быть не настроен).
+- `app/knowledge_graph/stale_classifier.py` (Wave 8-D, PR #86): `classify_stale_with_deploys(name, ns, last_deploy_at, team_owner)` → `active` / `expected_stale` / `suspicious_stale`. Используется `kg_sync.sync_namespace` для апдейта `kg_services.stale_class` идемпотентно. Re-exports canonical values из `contract.STALE_CLASS_VALUES`.
 
 ### Population (`app/knowledge_graph/populator.py`)
 Идемпотентные upsert'ы, используются всеми sync'ами:
@@ -136,6 +153,36 @@
   - pod event count
   - log error rate
 - Питает daily team digest (fragile top-5 ranking) и `health_score.py` (per-service composite).
+
+### Multi-signal owner inference (`app/services/ownership_suggester.py`)
+- Эвристика предложения owner-а для unowned-namespace. Используется в `stats_digest` для секции `Unowned namespaces`.
+- **Архитектура multi-signal** — взвешенный fusion трёх независимых сигналов + manual override:
+  - **A. Prefix** (weight 0.4) — regex-таблица по ns-имени (`squad-N-*` → `@squad-N`, `<env>-kingdom<N>` → `@kingdom-N`, bare `monitoring`/`kube-system` → `@platform`).
+  - **B. Deploy history** (weight 0.4) — most-frequent `triggered_by` из `kg_deployments` за 30 дней. Username транслируется через `owner_aliases.resolve_username`. Покрывает кейс «ns без префикса, но один человек туда стабильно деплоит».
+  - **C. Labels** (weight 0.2) — k8s labels `team` / `owner` / `squad` / `app.kubernetes.io/part-of` из `kg_services.metadata_json`.
+  - **Manual override** через `OWNERSHIP_MANIFEST_PATH=ownership.yaml` со списком `[{ns_pattern, owner, reason}]`. Match по pattern (glob) → confidence=1.0, эвристики игнорируются.
+- API: `suggest_owner_multi_signal(db, ns) → OwnerSuggestion(owner, confidence, sources, reasoning)`. Top-1 по сумме `weight × signal_strength`. Confidence clamp `[0, 1]`.
+- **Backward compat**: старая `suggest_owner_for_ns(ns)` оставлена как deprecated wrapper.
+
+### Owner aliases (`app/services/owner_aliases.py`)
+- TC username → team mapping для owner inference (сигнал B).
+- **Источники маппинга** в порядке приоритета:
+  1. YAML-файл из ENV `OWNER_ALIASES_PATH` (deployment-specific override).
+  2. Pre-baked `_DEFAULT_ALIASES` в коде (подтверждено по recent_deploys digest-у).
+  3. Fallback `@?-{username}` — caller возвращает для неизвестных.
+- API: `resolve_username(username: str) → str` (lowercase'ит вход).
+
+### Quality report (`app/scripts/quality_report.py`)
+- Идемпотентный read-only CLI: 5 групп метрик из Postgres KG-БД (`kg_services`, `kg_service_edges`, `kg_volume_edges`, `kg_alerts`, `kg_deployments`, `kg_k8s_jobs`, `kg_storage_volumes`, `kg_pod_events`).
+- **Use case**: точка отсчёта для Phase A (remediation), чтобы demonstrably улучшать метрики, а не угадывать. После 17 PR Wave 7 + Wave 8 нужен baseline-снимок перед Phase A.
+- **Без записи в БД** — никаких INSERT/UPDATE/DELETE. Использует production `SessionLocal`; для unit-тестов `build_report(db)` принимает session-объект напрямую.
+- **CLI**:
+  ```bash
+  python -m app.scripts.quality_report                    # markdown в stdout
+  python -m app.scripts.quality_report --json             # JSON в stdout
+  python -m app.scripts.quality_report --markdown --output baseline.md
+  ```
+- Baseline snapshot: `docs/quality_report_baseline_2026_05_24.md`.
 
 ### Self-health (`app/knowledge_graph/self_health.py`)
 «Monitoring of the monitoring». Шесть canary'ев по KG data quality, запускаются каждые 30 минут beat-задачей `kg_self_health_check`.

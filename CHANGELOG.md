@@ -2,6 +2,223 @@
 
 All notable changes to this project are documented in this file.
 
+## [0.12.0] — 2026-05-24 — Wave 8 (KG Metadata + UX Polish)
+
+Метаданные KG и Discord-UX доведены до состояния, в котором можно строить
+поверх них Phase A (remediation pipeline). Wave 8 — это 17 PR одной
+сессией: четыре расширения KG (Jobs/Storage/Owner-multi-signal/stale_class)
++ формализованный schema/quality contract v2.2 + пять UX-итераций по
+Discord embed и daily stats digest + автономный quality_report-скрипт +
+snapshot-фикстуры для UX regression-guard + два hotfix-а зависимостей.
+
+### KG Coverage — новые источники и атрибуты
+
+#### Wave 8-A: k8s Jobs/CronJobs coverage (PR #82, `0630c7d`)
+
+- **`app/knowledge_graph/k8s_jobs_sync.py`** (531 LoC, +422 LoC тестов) +
+  миграция `alembic/versions/20260524_0000_add_kg_k8s_jobs.py`. Beat task
+  `kg_jobs_sync` каждые 15 минут делает `kubectl get jobs,cronjobs -A -o json`
+  и upsert'ит в новую таблицу `kg_k8s_jobs`.
+- **Closes blind spot**: до Wave 8 KG видел только Deployments/StatefulSets;
+  alembic migration jobs, backup CronJob-ы (etcd snapshot, postgres dumps,
+  push-s3), ad-hoc cleanup/reindex/cdn-prewarm — оставались невидимыми.
+- **Поля Jobs**: `succeeded_count` / `failed_count` / `active_count` /
+  `completion_time` / `last_pod_exit_code` (из podStatus последнего pod-а
+  по label-selector `job-name=<name>`).
+- **Поля CronJobs**: `schedule` / `last_schedule_time` /
+  `last_successful_time` / `suspended`.
+- **Semantic edge `runs_as_job`**: CronJob → owner Service реализован
+  через `K8sJob.owner_service_id` metadata-column (а не отдельный edge-row
+  в `kg_service_edges`). Match через label `app.kubernetes.io/part-of` или
+  `app` совпадающий с `kg_services.name` в том же namespace.
+- CLI: `python -m app.knowledge_graph.k8s_jobs_sync [namespace]`.
+
+#### Wave 8-B: PVC/PV storage coverage (PR #84, `b165dbc`)
+
+- **`app/knowledge_graph/k8s_storage_sync.py`** (660 LoC, +581 LoC тестов)
+  + миграция `alembic/versions/20260524_0100_add_kg_storage_volumes.py`.
+  Beat task `kg_storage_sync` каждые 30 минут.
+- **Closes blind spot**: ClickHouse / Postgres «упал» = в 95% случаев
+  диск кончился; до Wave 8 KG не имел никакого storage-слоя.
+- **Новые таблицы**: `kg_storage_volumes` (PVC/PV; `kind ∈ {pvc, pv}`;
+  PVC namespace-scoped, PV cluster-scoped с `namespace=''`) +
+  `kg_volume_edges` (heterogeneous edges с tagged `src_kind`/`dst_kind`).
+- **Атрибуты**: storage_class, access_modes, phase (Bound/Pending/Lost/
+  Released/Available/Failed), capacity_bytes.
+- **Новые edges** (в `kg_volume_edges`):
+  - `uses_volume` (Service → PVC) — scan всех pod'ов, для каждого
+    `pod.spec.volumes[].persistentVolumeClaim.claimName` → edge от
+    owning Service (через ownerReference Deployment/StatefulSet/RS).
+  - `bound_to` (PVC → PV) через `pvc.spec.volumeName`.
+- **disk_pct enrichment** под флагом `STORAGE_METRICS_ENABLED=false`
+  (default OFF — kubelet_volume_stats_* scrape config может быть не
+  настроен; без него запрос вернёт 0 для всех PVC и замаскирует реальные NULL).
+- CLI: `python -m app.knowledge_graph.k8s_storage_sync`.
+
+#### Wave 8-C: multi-signal owner inference (PR #85, `9c8809c`)
+
+- **`app/services/ownership_suggester.py`** (529 LoC, +507 LoC тестов) +
+  **`app/services/owner_aliases.py`** (119 LoC). Расширяет prefix-only
+  логику до взвешенного fusion-а трёх независимых сигналов + manual
+  override:
+  - **A. Prefix** (weight 0.4) — regex по ns-имени (`squad-N-*`,
+    `<env>-kingdom<N>`, bare `monitoring`/`kube-system` → `platform`).
+  - **B. Deploy history** (weight 0.4) — most-frequent `triggered_by`
+    из `kg_deployments` за 30 дней. Username транслируется через
+    `owner_aliases.resolve_username` → `@squad-N`/`@platform`.
+  - **C. Labels** (weight 0.2) — k8s labels `team` / `owner` / `squad` /
+    `app.kubernetes.io/part-of` из `kg_services.metadata_json`.
+  - **Manual override** — `OWNERSHIP_MANIFEST_PATH=ownership.yaml` со
+    списком `[{ns_pattern, owner, reason}]`. Match по glob → confidence=1.0,
+    все эвристики игнорируются.
+- `OWNER_ALIASES_PATH=aliases.yaml` для TC-username → team mapping
+  (deployment-specific override на pre-baked defaults в коде).
+- Backward compat: старая `suggest_owner_for_ns(ns)` оставлена как
+  deprecated wrapper.
+
+#### Wave 8-D: stale_class column в kg_services (PR #86, `1f829fd`)
+
+- **`app/knowledge_graph/stale_classifier.py`** (141 LoC, +467 LoC
+  тестов) + миграция `alembic/versions/20260524_0200_add_kg_services_stale_class.py`.
+- Три значения `kg_services.stale_class`:
+  - `active` — deploy за последние `ACTIVE_WINDOW_DAYS` (default 30d).
+  - `expected_stale` — давно не катился, но это норма: backup/cron/system
+    (`*-backup`, `*-cron`, ns `kube-system`, `monitoring`, …) либо
+    infra/platform owner.
+  - `suspicious_stale` — нет deploys 30d, не expected_stale.
+- Используется `kg_sync.sync_namespace` (переписывает column идемпотентно)
+  и `stats_digest.stale_deployments_section` (читает column как primary,
+  fallback на legacy `_classify_stale` если column пуст).
+
+#### Wave 8-E: KG schema/quality contract v2.1 → v2.2 (PRs #83 + #89, `75066fa`/`c704244`)
+
+- **`app/knowledge_graph/contract.py`** (506 LoC, +298 LoC тестов в
+  `test_kg_contract.py` + `test_contract_drift.py` 247 LoC) +
+  **`docs/KG_SCHEMA_CONTRACT.md`** (349 LoC). Формальный реестр
+  инвариантов графа: `KG_SCHEMA_VERSION`, `EDGE_KINDS` (semantic /
+  src_kinds / dst_kinds / source / status / table), `SERVICE_KINDS` /
+  `SYNTHETIC_KINDS`, `OWNER_SOURCES` / `OWNER_SOURCE_ALIASES`,
+  `STALE_CLASS_VALUES`.
+- Bump v2.1 (Wave 7) → **v2.2** после PR #82/#84/#86: добавлены
+  `runs_as_job`, `uses_volume`, `bound_to` edges; promoted `pod_event_of`,
+  `serves_traffic`, `routes_to` из `planned` в `active`; новый
+  owner source `deploy_history`.
+- `STARTUP_CONTRACT_CHECK(db)` — boot-time диагностика: сверяет
+  реальные kinds в БД с реестром, логирует drift.
+- **Gate #22**: `tests/test_contract_drift.py` auto-validation что
+  код и контракт не разъезжаются.
+
+### Discord UX — пять итераций
+
+#### PR #76 — Wave 7 content в enriched embed (`9f82b00`)
+
+- Blast radius (X / Service-Ingress topology), NATS impact (Z / subject
+  pub-sub), pod trail (Y / runtime correlation) теперь рендерятся в
+  enriched embed как отдельные поля. До этого Wave 7 наполнял KG, но
+  embed его не показывал.
+
+#### PR #77 — PATCH-dedup для send_enriched_alert (`da1214e`)
+
+- 30-минутное content-key окно: если тот же логический алерт (по
+  hash content) приходит повторно, PATCH-им существующее сообщение
+  через `webhook?wait=true`, не репостим. Параллельно к существующему
+  fingerprint-dedup для legacy LLM пайплайна.
+
+#### PR #79 — Enriched embed UX polish (`d676057`)
+
+- Human-time («2 hours ago» вместо ISO), pod name, ready/desired
+  replicas, kubelet reason — все человекочитаемые сигналы в одном поле.
+- Новый модуль `app/utils/time_human.py` (62 LoC).
+
+#### PR #81 — Stats digest UX — 6 пунктов (`d4c339e`)
+
+- `series → series` (один сервис с burst-pattern не разрывает digest на
+  отдельные сериес-entries).
+- `unowned action block` (видит unowned ns → suggest owner через
+  ownership_suggester).
+- `trend Δ24h` для всех метрик (vs yesterday-state).
+- `alert-types Δ24h`, `chronic`, `resurfaced` — отдельные секции.
+- `stale classification` (active/expected/suspicious) с pill «expected:
+  скрыто N» при `STATS_HIDE_EXPECTED_STALE=true` (default).
+- `fragile → blast-radius` rename — точнее по семантике.
+
+#### PR #90 — Stats digest preview fixes (`bea2d22`)
+
+- Cascade deploys aggregation для multi-squad shared override (one
+  push to `prod-shared` → cascades on N kingdom realms; считаем как
+  один деплой, не N).
+- New-baseline placeholder: `(new baseline)` плейсхолдер вместо
+  пустой Δ24h когда yesterday-state не существует.
+- Multi-squad shared override для secret-key heuristic.
+
+### Pre-Phase A — quality baseline + snapshot regression-guard
+
+#### PR #87 — quality_report скрипт + baseline snapshot (`bf4dd97`)
+
+- **`app/scripts/quality_report.py`** (785 LoC, +427 LoC тестов).
+  Идемпотентный read-only скрипт: 5 групп метрик из Postgres KG
+  (services / edges / events / deploys / coverage). Markdown (default)
+  или JSON output. Use case — точка отсчёта для Phase A (remediation),
+  чтобы demonstrably улучшать metrics, а не угадывать.
+- CLI: `python -m app.scripts.quality_report [--json] [--output file]`.
+- `docs/quality_report_baseline_2026_05_24.md` (200 LoC) —
+  baseline-снимок на момент мерджа Wave 8.
+
+#### PR #88 — Snapshot fixtures gallery (`3b1b8fe`)
+
+- **`tests/fixtures/discord_snapshots/`** — 7 known-good embed cases
+  (critical_fresh / critical_resurfaced / warning_compact /
+  burst_aggregation / daily_digest / chronic_digest / team_digest) с
+  input.json + expected.json. **UX regression-guard**: любое изменение
+  в discord/embed_builder валит diff.
+- `tests/test_discord_alert_gallery.py` (375 LoC) — раннер.
+  Update workflow: `UPDATE_SNAPSHOTS=1 pytest tests/test_discord_alert_gallery.py`.
+
+### Hotfixes / chores
+
+#### PR #74 — PyJWT 2.9 → 2.12 (`9a535c9`)
+
+- CVE-2026-32597 / GHSA-752w-5fwx-jx9f, severity high (Algorithm
+  confusion in PyJWT verify when `algorithms` is not explicitly set).
+
+#### PR #75 — gc legacy Discord send_report / send_approval_request (`8a91361`)
+
+- Убраны deprecated `send_report` (celery_worker) и
+  `send_approval_request` (service.py) — функциональность мигрировала
+  в `send_enriched_alert` ещё в Wave 4, dead code 2 недели.
+
+#### PR #78 / #80 — ruff F841 / F401 fixes (`ff30095` / `9199b6f`)
+
+- Удалены неиспользуемые `svc` локалс и `datetime/timezone` импорты
+  в test-файлах Wave 7.
+
+### Schema impact (v2.2)
+
+| Объект | Где живёт | Wave 8 PR |
+|---|---|---|
+| `kg_k8s_jobs` (table) | новая таблица | #82 |
+| `kg_storage_volumes` (table) | новая таблица | #84 |
+| `kg_volume_edges` (table) | новая таблица | #84 |
+| `kg_services.stale_class` (column) | существующая | #86 |
+| Edge `runs_as_job` | `K8sJob.owner_service_id` (metadata-only) | #82 |
+| Edge `uses_volume` | `kg_volume_edges` | #84 |
+| Edge `bound_to` | `kg_volume_edges` | #84 |
+
+### Beat schedule additions
+
+| Task | Schedule | Module |
+|---|---|---|
+| `kg_jobs_sync` | every 15 min | `k8s_jobs_sync.py` |
+| `kg_storage_sync` | every 30 min | `k8s_storage_sync.py` |
+
+### Documentation
+
+- `docs/KG_SCHEMA_CONTRACT.md` — новый формальный документ контракта.
+- `docs/quality_report_baseline_2026_05_24.md` — baseline снимок.
+- `docs/ARCHITECTURE.md` / `MODULE_DOCS.md` (EN + RU) обновлены до v2.2 / Wave 8.
+- `docs/RUNBOOK.md` / `FAQ.md` (EN + RU) — добавлены секции по
+  `quality_report`, ownership manifest, stale_class, snapshot update.
+
 ## [0.11.0] — 2026-05-24 — Wave 7 (Topology Expansion)
 
 Расширение источников топологии KG: к env-var heuristic-у (Wave 0) и

@@ -166,6 +166,110 @@ Replay перезапускает пайплайн агентов на сохр�
 
 ---
 
+## Как KG узнаёт владельца сервиса?
+
+Multi-signal owner inference (`app/services/ownership_suggester.py`),
+добавлен в Wave 8 (PR #85). Четыре сигнала пробуются параллельно:
+
+1. **Prefix** (weight 0.4) — regex по ns-имени (`squad-N-*` → `@squad-N`,
+   `monitoring` / `kube-system` → `@platform`).
+2. **Deploy history** (weight 0.4) — most-frequent `triggered_by` за 30
+   дней по `kg_deployments`. Username → team handle через
+   `owner_aliases.py`.
+3. **Labels** (weight 0.2) — k8s labels `team` / `owner` / `squad` /
+   `app.kubernetes.io/part-of` из `kg_services.metadata_json`.
+4. **Manual override** — `OWNERSHIP_MANIFEST_PATH=ownership.yaml`, match
+   по glob → confidence=1.0, оверрайдит всё.
+
+Победитель — top-1 по сумме `weight × signal_strength`. См.
+[Ownership manifest в RUNBOOK](RUNBOOK.ru.md#ownership-manifest) — как
+добавлять override-ы.
+
+---
+
+## Почему в daily digest пишет «(new baseline)»?
+
+Daily stats digest показывает trend Δ24h для каждой метрики (alert
+count, deploy success rate, fragile services count, …). Trend требует
+yesterday-state-строку для сравнения.
+
+Когда digest запускается впервые или yesterday-state была purg-нута —
+сравнения нет, и мы пишем `(new baseline)` вместо фейкового `Δ +0`.
+Wave 8-F (PR #90) добавил этот explicit placeholder; до него trend
+молча показывал 0, что вводило в заблуждение.
+
+Placeholder исчезнет на следующем digest-run-е (через 24 часа), когда
+появится yesterday-state. Если видишь `(new baseline)` больше одного
+раза подряд — state-persistence сломалась, проверить строки
+`kg_stats_digest_state`.
+
+---
+
+## Что значит `stale_class` у сервиса?
+
+Wave 8 (PR #86) добавил column `kg_services.stale_class` с тремя
+значениями:
+
+- **`active`** — deploy за последние 30 дней. Нормальное operating
+  state.
+- **`expected_stale`** — не катился 30d, но это норма: backup/cron/
+  system паттерны (`*-backup`, `*-cron`, `kube-system`, `monitoring`)
+  либо `infra`/`platform`-owned namespaces.
+- **`suspicious_stale`** — нет deploys 30d, не подходит под expected-
+  паттерны. Кандидат на retire/handoff investigation.
+
+Column переписывается идемпотентно через `kg_sync.sync_namespace` на
+каждом hourly sync. Stats digest скрывает `expected_stale` по умолчанию
+через `STATS_HIDE_EXPECTED_STALE=true`, чтобы убрать шум. См.
+[stale_class в RUNBOOK](RUNBOOK.ru.md#stale_class-на-kg_services) — как
+реклассифицировать misclassified сервис.
+
+---
+
+## Как добавить новый playbook (Phase A remediation)?
+
+**Короткий ответ: Phase A в плане, не в коде.** На момент v0.12.0
+copilot работает в **advisory-режиме по умолчанию**
+(`EXECUTOR_ENABLED=false`) с opt-in стадией `executor`, которая делает
+только `kubectl --dry-run=server` валидацию. Wave 8 — это «metadata +
+UX polish» фундамент перед тем как строить Phase A (remediation pipeline).
+
+Phase A добавит:
+
+- Playbook registry — типизированный `RemediationPlaybook` с
+  preconditions, actions и rollback steps.
+- Confidence gating — только playbook-и с `confidence ≥ 0.8` и
+  KG-quality сигналами выше порога будут пытаться запускаться.
+- Human-in-the-loop — Approve/Decline кнопки на каждом playbook-
+  предложении (HIGH risk auto-apply никогда, by design).
+
+План лежит в user-memory `project_remediation_pipeline_plan.md` (пока
+не в репо). Когда Phase A приедет, эта запись FAQ будет обновлена с
+реальными инструкциями по авторству playbook-ов.
+
+Пока что см. [Roadmap → Execution](../README.md#roadmap--execution-1) в
+README — executor-трек построен (PR #23/#26/#27) и закрыт за
+`EXECUTOR_APPROVAL_ENABLED=true` для ad-hoc human-approved действий на
+отдельных инцидентах.
+
+---
+
+## Как снять snapshot KG quality?
+
+```bash
+python -m app.scripts.quality_report --markdown --output baseline.md
+```
+
+CLI `quality_report` (PR #87) read-only — безопасно гонять на production.
+Считает 5 секций (services, edges, events, coverage, quality flags),
+output — markdown или JSON.
+
+Использовать до/после крупных remediation-волн, чтобы видеть
+измеряемый change. Baseline на v0.12.0:
+`docs/quality_report_baseline_2026_05_24.md`.
+
+---
+
 ## Куда сообщать об ошибках?
 
 [GitHub Issues](https://github.com/froggychips/sre-ai-copilot/issues) или Telegram [@froggychips](https://t.me/froggychips).
