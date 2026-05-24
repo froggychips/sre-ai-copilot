@@ -106,6 +106,13 @@ rules:
 - apiGroups: ["apps"]
   resources: ["deployments"]
   verbs: ["get", "list", "watch"]
+# `namespaces` cluster-wide list — auto-discovery non-system ns в
+# kg_sync.discover_namespaces() и drift_cleanup.fetch_live_namespaces().
+# Regression от 2026-05-24: при apply нового ClusterRole было утрачено это
+# правило (старая версия имела `["deployments","namespaces"]`).
+- apiGroups: [""]
+  resources: ["namespaces"]
+  verbs: ["get", "list", "watch"]
 # Wave 7 / G1.3: declarative Service + Ingress parser.
 # Services: spec.selector → match на Deployment pod-template labels.
 # Ingresses: spec.rules[].http.paths[].backend.service.name → backend match.
