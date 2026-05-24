@@ -190,6 +190,17 @@ celery_app.conf.beat_schedule = {
         "task": "kg_stuck_alerts_check",
         "schedule": crontab(minute=11),  # ежечасно в 11 мин (offset от drift=17/ingress=37)
     },
+    # Wave 7 / G1.3: declarative parser k8s Service + Ingress resources.
+    # Каждые 15 мин получает все Services и Ingresses cluster-wide,
+    # upsert kg_services (с k8s_service/k8s_ingress metadata) + edges
+    # `serves_traffic` (Service → backing Deployment по selector) и
+    # `routes_to` (Ingress → backend Service). Это самый дешёвый
+    # declarative источник топологии — снимает с env-scan'а часть
+    # нагрузки. См. k8s_topology_resources_sync.py.
+    "kg-topology-resources-sync": {
+        "task": "kg_topology_resources_sync",
+        "schedule": crontab(minute="*/15"),
+    },
 }
 
 
@@ -291,6 +302,29 @@ def kg_ingress_sync_task():
         return sync_all_ingresses(db)
     except Exception as e:
         logger.warning("kg_ingress_sync.failed: %s", e)
+        return {"error": str(e)}
+    finally:
+        db.close()
+
+
+@celery_app.task(name="kg_topology_resources_sync")
+def kg_topology_resources_sync_task():
+    """Wave 7 / G1.3: declarative k8s Service + Ingress resources → KG.
+
+    Создаёт edges `serves_traffic` (Service → backing Deployment по selector)
+    и `routes_to` (Ingress → backend Service). Не raise — failure внутри
+    одного tick'а не должна валить beat-worker.
+    """
+    from app.knowledge_graph.k8s_topology_resources_sync import \
+        sync_topology_resources
+
+    db = SessionLocal()
+    try:
+        result = sync_topology_resources(db)
+        logger.info("kg_topology_resources_sync.done result=%s", result)
+        return result
+    except Exception as e:
+        logger.warning("kg_topology_resources_sync.failed: %s", e)
         return {"error": str(e)}
     finally:
         db.close()
