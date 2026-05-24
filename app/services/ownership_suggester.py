@@ -74,6 +74,19 @@ _PREFIX_PATTERNS = [
 ]
 
 
+# Bare `<env>-shared` namespaces — это «общая» зона, содержат сервисы разных
+# squad-ов. Live PREVIEW 2026-05-24 показал false-positive: `@infra` подхватился
+# через какой-то частичный match — мы переопределяем такие ns как `multi-squad`
+# с средним confidence (0.6), чтобы:
+#   - high-confidence сигналы (deploy_history / labels / manual) могли перекрыть;
+#   - но baseline без сигналов чётко сообщал «нужен manual», а не врал.
+# squad-N-shared под это правило НЕ попадает — там shared = realm конкретного
+# squad, и `squad-N-` prefix даёт правильный owner.
+_BARE_SHARED_RE = re.compile(r"^(?:prod|preprod|dev|staging|qa)-shared$")
+_BARE_SHARED_STRENGTH = 0.6
+_BARE_SHARED_OWNER = "multi-squad"
+
+
 # Веса сигналов. Сумма не нормализована к 1.0 намеренно — мы не делаем soft-max,
 # а просто складываем; calibration в тестах подтверждает что 0.4/0.4/0.2 даёт
 # адекватные confidence axes (см. test_owner_inference_multi.py).
@@ -374,10 +387,21 @@ def suggest_owner_multi_signal(
     sources_used: List[str] = []
 
     # A: prefix (strength всегда 1.0 — либо matched, либо нет).
-    a = _try_prefix_match(ns)
-    if a is not None:
-        candidates[a] = candidates.get(a, 0.0) + _W_PREFIX * 1.0
+    # Спец-кейс: bare `<env>-shared` ns мультитенантный — prefix-only suggest
+    # `shared`/`@infra` врёт. Заменяем на `multi-squad` с **medium strength**
+    # (0.6 вместо 1.0), чтобы любой реальный сигнал (deploy_history, labels,
+    # manual override) мог перевесить. См. live preview регрессию 2026-05-24.
+    if _BARE_SHARED_RE.match(ns):
+        candidates[_BARE_SHARED_OWNER] = (
+            candidates.get(_BARE_SHARED_OWNER, 0.0)
+            + _W_PREFIX * _BARE_SHARED_STRENGTH
+        )
         sources_used.append("prefix")
+    else:
+        a = _try_prefix_match(ns)
+        if a is not None:
+            candidates[a] = candidates.get(a, 0.0) + _W_PREFIX * 1.0
+            sources_used.append("prefix")
 
     # B: deploy history. Требует db.
     if db is not None:
