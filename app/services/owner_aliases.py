@@ -7,8 +7,11 @@
 Источники маппинга (в порядке приоритета):
   1. YAML-файл из ENV `OWNER_ALIASES_PATH` (если задан и существует) —
      deployment-specific override.
-  2. Дефолты в `_DEFAULT_ALIASES` ниже — то что мы стабильно знаем по WO.
-  3. Fallback `@?-{username}` — caller вернёт это для неизвестных юзеров.
+  2. Bundled YAML `app/services/owner_aliases.yaml` рядом с модулем —
+     версионируется в репо, расширяется через PR.
+  3. Дефолты в `_DEFAULT_ALIASES` ниже — minimal hardcode (можно удалить
+     когда bundled YAML стабилизируется).
+  4. Fallback `@?-{username}` — caller вернёт это для неизвестных юзеров.
 
 Формат YAML:
     kemyashev: "@squad-1"
@@ -29,10 +32,9 @@ import yaml
 log = logging.getLogger(__name__)
 
 
-# Дефолтный pre-baked маппинг — то что подтверждено по recent_deploys digest-у
-# и наблюдениям в TC (см. ref_wo_addnode_prepare_ssh_pre_step / project_zakhar*).
-# Расширять по мере обнаружения. Юнит — без @ префикса в values, добавляется в
-# caller-е чтобы строка не зависела от YAML-парсинга.
+# Дефолтный pre-baked маппинг — to-be-deprecated после полного перехода на
+# bundled YAML. Оставлено как safety-net на случай отсутствия yaml-файла.
+# Каноничный source-of-truth — `owner_aliases.yaml` рядом с модулем.
 _DEFAULT_ALIASES: Dict[str, str] = {
     "kemyashev": "@squad-1",
     "apleshkov": "@squad-2",
@@ -40,8 +42,14 @@ _DEFAULT_ALIASES: Dict[str, str] = {
 }
 
 
+# Путь к bundled YAML рядом с модулем. Читается без ENV-флага если файл есть.
+# ENV `OWNER_ALIASES_PATH` имеет приоритет (deployment-specific override).
+_BUNDLED_YAML_PATH = Path(__file__).parent / "owner_aliases.yaml"
+
+
 _FILE_CACHE: Optional[Dict[str, str]] = None
 _FILE_CACHE_PATH: Optional[str] = None
+_BUNDLED_CACHE: Optional[Dict[str, str]] = None
 
 
 def _load_yaml_aliases(path: str) -> Dict[str, str]:
@@ -70,11 +78,29 @@ def _load_yaml_aliases(path: str) -> Dict[str, str]:
         return {}
 
 
+def _get_bundled_aliases() -> Dict[str, str]:
+    """Прочитать bundled YAML рядом с модулем. Кэшируется in-process.
+
+    Файл отсутствует → пустой dict (test environments / minimal install)."""
+    global _BUNDLED_CACHE
+    if _BUNDLED_CACHE is not None:
+        return _BUNDLED_CACHE
+    if _BUNDLED_YAML_PATH.exists():
+        _BUNDLED_CACHE = _load_yaml_aliases(str(_BUNDLED_YAML_PATH))
+    else:
+        _BUNDLED_CACHE = {}
+    return _BUNDLED_CACHE
+
+
 def get_aliases() -> Dict[str, str]:
     """Вернуть объединённый маппинг username (lower) → team string (с @).
 
-    File overrides defaults. Кэшируем по пути файла — повторные вызовы не
-    читают diskdrive каждый раз.
+    Приоритет (более поздние оверрайдят ранние):
+      1. `_DEFAULT_ALIASES` — hardcoded safety net.
+      2. Bundled `owner_aliases.yaml` рядом с модулем.
+      3. ENV `OWNER_ALIASES_PATH` — deployment override.
+
+    Кэшируем по пути файла — повторные вызовы не читают disk каждый раз.
     """
     global _FILE_CACHE, _FILE_CACHE_PATH
 
@@ -90,12 +116,28 @@ def get_aliases() -> Dict[str, str]:
             _FILE_CACHE_PATH = path
 
     merged: Dict[str, str] = {}
-    # сначала дефолты — file overrides
+    # 1. hardcoded defaults
     for k, v in _DEFAULT_ALIASES.items():
         merged[k.lower()] = v
+    # 2. bundled YAML (overrides defaults)
+    for k, v in _get_bundled_aliases().items():
+        merged[k] = v
+    # 3. ENV-pointed YAML (overrides bundled)
     for k, v in file_aliases.items():
         merged[k] = v
     return merged
+
+
+def is_known_username(username: str) -> bool:
+    """True если username имеет alias-маппинг (в YAML или дефолтах).
+
+    Используется в `ownership_suggester._deploy_history_top` чтобы отличить
+    «реальный owner» (squad-N/platform) от fallback-а `@?-{username}`. Только
+    known users контрибутят strength=N/total в сигнал B; unknown — strength=0.0.
+    """
+    if not username:
+        return False
+    return username.lower().strip() in get_aliases()
 
 
 def resolve_username(username: str) -> str:
@@ -113,7 +155,11 @@ def resolve_username(username: str) -> str:
 
 
 def reset_cache() -> None:
-    """Тестовый хелпер — сбросить in-process кэш файла."""
-    global _FILE_CACHE, _FILE_CACHE_PATH
+    """Тестовый хелпер — сбросить in-process кэш файла.
+
+    Сбрасывает оба кэша: ENV-overrides и bundled YAML.
+    """
+    global _FILE_CACHE, _FILE_CACHE_PATH, _BUNDLED_CACHE
     _FILE_CACHE = None
     _FILE_CACHE_PATH = None
+    _BUNDLED_CACHE = None

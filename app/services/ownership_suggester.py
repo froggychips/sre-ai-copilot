@@ -4,24 +4,31 @@
 если namespace упомянут в digest но не имеет team_owner в kg_services,
 пытаемся подсказать вероятного owner-а.
 
-Архитектура multi-signal (KG Coverage #3, 2026-05-24):
+Архитектура multi-signal (KG Coverage #3, 2026-05-24; revised 2026-05-24):
 
 Старая prefix-only логика (PR #81) расширена до взвешенного fusion-а трёх
 независимых сигналов + manual override:
 
-  A. **Prefix** (weight 0.4) — regex-таблица по ns-имени (`squad-N-*`,
+  A. **Prefix** (weight 0.5) — regex-таблица по ns-имени (`squad-N-*`,
      `<env>-kingdom<N>`, bare `monitoring`/`kube-system` → `platform` и т.п.).
-     Стабильный, но не покрывает «странные» ns без явного prefix-а.
+     Стабильный, но не покрывает «странные» ns без явного prefix-а. Bump
+     0.4→0.5 чтобы prefix-only сигналы достигали default backfill threshold.
 
-  B. **Deploy history** (weight 0.4) — most-frequent `triggered_by` из
+  B. **Deploy history** (weight 0.3) — most-frequent `triggered_by` из
      `kg_deployments` за последние 30 дней для сервисов в этом ns. Username
      транслируется через `owner_aliases.resolve_username` → `@squad-N`.
      Покрывает кейс «ns без префикса, но один человек туда стабильно деплоит».
+     **Unknown usernames (без alias-маппинга) дают strength=0.0** — не врём
+     `?-username` как ownership.
 
   C. **Labels** (weight 0.2) — k8s labels `team` / `owner` / `squad` /
      `app.kubernetes.io/part-of` из `kg_services.metadata_json` для любого
-     сервиса в ns. Самый слабый сигнал (часто labels отсутствуют), но если
-     есть — explicit declaration.
+     сервиса в ns. Реальный extract из 3 мест: `metadata.labels.<key>`,
+     `metadata.k8s_labels.<key>`, плоский `metadata.<key>`. Если есть —
+     explicit declaration, ценный сигнал даже при small strength.
+
+  Веса нормированы: prefix 0.5 + deploy 0.3 + labels 0.2 = 1.0. Любой
+  prefix-only + второй сигнал ≥ default threshold 0.5.
 
   **Manual override** — `OWNERSHIP_MANIFEST_PATH=ownership.yaml` со списком
   `[{ns_pattern, owner, reason}]`. Match по pattern (glob) → confidence=1.0,
@@ -82,16 +89,29 @@ _PREFIX_PATTERNS = [
 #   - но baseline без сигналов чётко сообщал «нужен manual», а не врал.
 # squad-N-shared под это правило НЕ попадает — там shared = realm конкретного
 # squad, и `squad-N-` prefix даёт правильный owner.
+# strength 0.4 (после bump _W_PREFIX 0.4→0.5) → multi-squad баллов 0.5*0.4=0.20,
+# что ниже full deploy-history (0.3*1.0=0.3) и full labels (0.2*1.0=0.2 — tie,
+# но labels не самостоятельно перевешивает, так что multi-squad всё ещё
+# дефолт без других сигналов). Любой реальный сигнал ≥ medium strength —
+# побеждает placeholder, как и задумано в живом preview 2026-05-24.
 _BARE_SHARED_RE = re.compile(r"^(?:prod|preprod|dev|staging|qa)-shared$")
-_BARE_SHARED_STRENGTH = 0.6
+_BARE_SHARED_STRENGTH = 0.4
 _BARE_SHARED_OWNER = "multi-squad"
 
 
-# Веса сигналов. Сумма не нормализована к 1.0 намеренно — мы не делаем soft-max,
-# а просто складываем; calibration в тестах подтверждает что 0.4/0.4/0.2 даёт
-# адекватные confidence axes (см. test_owner_inference_multi.py).
-_W_PREFIX = 0.4
-_W_DEPLOY = 0.4
+# Веса сигналов. Sum = 1.0 (prefix 0.5 + deploy 0.3 + labels 0.2). Калибровка
+# подбиралась так, чтобы prefix-only хитал default backfill threshold 0.5 и
+# любой дополнительный сигнал поднимал confidence выше (см. live preview
+# 2026-05-24: prefix-only @ 0.4 давал 0 candidates с threshold 0.5).
+#
+# Калибровка по axis:
+#   - prefix only:                       0.50  (≥ threshold 0.5, eligible)
+#   - prefix + label-match (squad-N):    0.70  (high but не bold)
+#   - prefix + deploy known user:        0.50–0.80 (зависит от strength)
+#   - all 3 max strength:                1.00  (max, без manual)
+#   - manual override:                   1.00  (cap)
+_W_PREFIX = 0.5
+_W_DEPLOY = 0.3
 _W_LABELS = 0.2
 
 # Окно для deploy-history сигнала. 30 дней — достаточно чтобы поймать
@@ -140,15 +160,23 @@ def _deploy_history_top(
     *,
     lookback_days: int = _DEPLOY_LOOKBACK_DAYS,
 ) -> Optional[Tuple[str, float]]:
-    """Самый частый triggered_by в kg_deployments по сервисам ns за окно.
+    """Самый частый KNOWN triggered_by в kg_deployments по сервисам ns за окно.
 
     Возвращает (team, strength) или None если данных нет.
-      - team: `squad-N` / `platform` / `?-{username}` — без `@`.
+      - team: `squad-N` / `platform` — без `@`. **Только resolved users**.
       - strength: доля most-frequent от общего числа deploys в окне, [0, 1].
                   Например 5 деплоев у kemyashev из 6 общих → 0.83.
 
-    Низкая strength (один deploy за месяц от незнакомого юзера) даст низкий
-    итоговый confidence — что и хочется: «может это и не owner, а just commit».
+    Алгоритм:
+      1. Считаем COUNT(*) per triggered_by за окно (top-10).
+      2. Берём top-1 username который имеет alias-маппинг
+         (`owner_aliases.is_known_username`).
+      3. Если в top-10 нет ни одного known user — возвращаем None
+         (сигнал B не контрибутит). Раньше возвращали `?-username` —
+         это давало ложно-высокий confidence для случайного коммитера.
+
+    Strength = top_known_cnt / total_deploys (включая unknown). Это
+    штрафует ns где основной деплоер не в alias-таблице.
     """
     cutoff = datetime.utcnow() - timedelta(days=lookback_days)
     try:
@@ -161,7 +189,7 @@ def _deploy_history_top(
               AND d.started_at >= :cutoff
             GROUP BY d.triggered_by
             ORDER BY cnt DESC
-            LIMIT 5
+            LIMIT 10
         """), {"ns": ns, "cutoff": cutoff}).fetchall()
     except Exception as e:
         log.debug("deploy_history_top(%s): db error: %s", ns, e)
@@ -174,46 +202,82 @@ def _deploy_history_top(
     if total == 0:
         return None
 
-    top_user, top_cnt = rows[0][0], int(rows[0][1])
-    strength = top_cnt / total
+    # Найти top KNOWN user. Если все unknown — сигнал не контрибутит.
+    for user, cnt in rows:
+        if owner_aliases.is_known_username(str(user)):
+            strength = int(cnt) / total
+            resolved = owner_aliases.resolve_username(str(user))
+            # Strip leading `@` — caller добавляет.
+            team = resolved.lstrip("@")
+            return team, strength
 
-    resolved = owner_aliases.resolve_username(top_user)
-    # Strip leading `@` — caller добавляет.
-    team = resolved.lstrip("@")
-    return team, strength
+    return None
 
 
 # ── Сигнал C helper: labels ──────────────────────────────────────────────
 
 
-# Ключи которые ищем в metadata_json (плоско и в "labels" sub-key).
-# Порядок специфичности: более специфичные выше.
-_LABEL_KEYS = ("team", "owner", "squad", "app.kubernetes.io/part-of")
+# Ключи которые ищем в metadata_json. Порядок specificity (более узкие выше),
+# первый matched побеждает на этом уровне.
+_LABEL_KEYS = (
+    "team",
+    "owner",
+    "squad",
+    "app.kubernetes.io/part-of",
+    "app.kubernetes.io/managed-by",  # fallback для платформенных компонентов
+)
+
+# Где в metadata_json могут лежать labels. Порядок sub-key sources.
+_LABEL_SUBKEYS = ("labels", "k8s_labels")
+
+
+def _normalize_label_value(v: str) -> str:
+    """Нормализовать label-value в owner-токен (без `@` префикса).
+
+    - Strip whitespace + leading `@`.
+    - Squad shorthand: `squad7` → `squad-7` (если number следует за `squad`).
+
+    Никаких изменений если value уже в каноничном формате (`squad-N`,
+    `platform`, `kingdom2`, etc.)
+    """
+    s = v.strip().lstrip("@").strip()
+    # squad7 → squad-7 (некоторые манифесты пишут без дефиса).
+    m = re.match(r"^squad(\d+)$", s)
+    if m:
+        return f"squad-{m.group(1)}"
+    return s
 
 
 def _extract_label_owner(metadata: Any) -> Optional[str]:
     """Из metadata_json (dict/JSON) попытаться достать owner-токен из labels.
 
-    Смотрим:
-      1. `metadata["labels"][key]` для key in _LABEL_KEYS — стандартное место.
-      2. `metadata[key]` напрямую — на случай если sync положил labels плоско.
+    Смотрим в порядке specificity:
+      1. `metadata["labels"][key]` — стандартное k8s место.
+      2. `metadata["k8s_labels"][key]` — альтернативное (некоторые sync-еры).
+      3. `metadata[key]` напрямую — flat fallback.
 
-    None если ничего не нашли.
+    Все `_LABEL_KEYS` проверяются в каждом source. Первый non-empty value
+    нормализуется через `_normalize_label_value` и возвращается.
+
+    None если ничего не нашли или metadata невалидно.
     """
     if not isinstance(metadata, dict):
         return None
 
-    labels = metadata.get("labels")
-    if isinstance(labels, dict):
-        for k in _LABEL_KEYS:
-            v = labels.get(k)
-            if isinstance(v, str) and v.strip():
-                return v.strip()
+    # 1+2: nested label dicts (labels / k8s_labels)
+    for sub in _LABEL_SUBKEYS:
+        sub_dict = metadata.get(sub)
+        if isinstance(sub_dict, dict):
+            for k in _LABEL_KEYS:
+                v = sub_dict.get(k)
+                if isinstance(v, str) and v.strip():
+                    return _normalize_label_value(v)
 
+    # 3: flat fallback
     for k in _LABEL_KEYS:
         v = metadata.get(k)
         if isinstance(v, str) and v.strip():
-            return v.strip()
+            return _normalize_label_value(v)
 
     return None
 

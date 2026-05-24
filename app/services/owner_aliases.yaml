@@ -1,0 +1,50 @@
+# TeamCity / GitLab username → team alias mapping.
+#
+# Используется в `app/services/owner_aliases.resolve_username` (через
+# ENV `OWNER_ALIASES_PATH=app/services/owner_aliases.yaml`) для resolve
+# `triggered_by` в kg_deployments → owner-токен сигнала B (deploy_history)
+# multi-signal ownership inference.
+#
+# Формат: `<lower-case-username>: "@<team>"`.
+#  - значения с `@` сохраняются как есть (caller strip-ает `@` при сложении).
+#  - все ключи lower-case (TC usernames исторически lower-case).
+#
+# Расширять по мере обнаружения новых регулярных deploy-юзеров через
+# `SELECT triggered_by, COUNT(*) FROM kg_deployments
+#   WHERE started_at > now() - interval '30 days'
+#   GROUP BY triggered_by ORDER BY 2 DESC`.
+#
+# Неизвестные usernames резолвятся в `@?-<username>` (strength=0.0 при
+# фолбэке — НЕ контрибутят к confidence сигнала B, см. ownership_suggester).
+
+# ── Platform / infra ──
+wizaryx: "@platform"
+yshulgin: "@platform"
+yar.shulgin: "@platform"
+zbushuev: "@platform"
+sgrozov: "@platform"
+pryzhikov: "@platform"
+
+# ── Squad-1 (town / core gameplay) ──
+kemyashev: "@squad-1"
+
+# ── Squad-2 ──
+apleshkov: "@squad-2"
+
+# ── Squad-gd (game design / live ops) ──
+igoncharov: "@squad-gd"
+
+# ── Backend / shared services ──
+egecer: "@backend"
+ddosta: "@backend"
+ashulgin: "@backend"
+mlopatin: "@backend"
+
+# ── QA / release ──
+qauser: "@qa"
+release-bot: "@platform"
+teamcity: "@platform"
+
+# ── Data / analytics ──
+analytics: "@data"
+data-bot: "@data"
