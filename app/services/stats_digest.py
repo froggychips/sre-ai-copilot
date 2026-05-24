@@ -301,34 +301,51 @@ def unowned_namespaces_section(
     *,
     top_n: int = 5,
 ) -> str:
-    """3. Unowned-namespaces — отдельной секцией с suggested-owner эвристикой.
+    """3. Unowned-namespaces — отдельной секцией с multi-signal suggest.
 
     Раньше unowned рисовался inline в firing_alerts (`monitoring=44, ...`),
-    что не actionable: непонятно, кому стыдить. Теперь:
+    что не actionable. С 2026-05-24 переехало на
+    `ownership_suggester.suggest_owner_multi_signal` (prefix + deploy-history +
+    labels + manual manifest). Confidence отображается в формате `?` / `bold`:
 
       🔎 Unowned namespaces — нужны owner
-        • monitoring         — 44 series · suggest: `@platform`
-        • squad-7-shared     — 36 series · suggest: `@squad-7`
+        • monitoring         — 44 series · suggest: **`@platform`** (manual)
+        • squad-7-kingdom2   — 36 series · suggest: **`@squad-7`**
         • prod-cdn           — 12 series · suggest: `@cdn`
-        • lo-tools           — 8 series  · suggest: `?`
+        • weird-ns           — 8 series  · suggest: `@?-kemyashev` ?
 
-    Источник suggest: `ownership_suggester.suggest_owners_bulk`.
+    Правила рендера:
+      - confidence ≥ 0.8 → **bold** suggestion (высокая уверенность).
+      - confidence <  0.5 → суффикс ` ?` (слабая догадка).
+      - sources содержит 'manual' → суффикс ` (manual)`.
+      - owner is None → `?`.
 
     Если unowned пуст — секцию скрываем ("").
     """
     if not unowned:
         return ""
 
-    from app.services.ownership_suggester import suggest_owners_bulk
+    from app.services.ownership_suggester import suggest_owner_multi_signal
 
     top = sorted(unowned.items(), key=lambda x: -x[1])[:top_n]
-    ns_list = [ns for ns, _ in top]
-    suggestions = suggest_owners_bulk(ns_list, db)
 
     lines = ["**🔎 Unowned namespaces** — нужны owner"]
     for ns, count in top:
-        owner = suggestions.get(ns)
-        owner_str = f"`@{owner}`" if owner else "`?`"
+        sug = suggest_owner_multi_signal(ns, db)
+        if sug.owner is None:
+            owner_str = "`?`"
+        else:
+            base = f"`@{sug.owner}`"
+            # Bold для high-confidence suggestion.
+            if sug.confidence >= 0.8:
+                base = f"**{base}**"
+            owner_str = base
+            # Manual marker — append.
+            if sug.manual:
+                owner_str = f"{owner_str} (manual)"
+            # Low-confidence marker — append `?`.
+            elif sug.confidence < 0.5:
+                owner_str = f"{owner_str} ?"
         lines.append(f"  • `{ns}` — {count} series · suggest: {owner_str}")
     return "\n".join(lines)
 
