@@ -209,6 +209,15 @@ celery_app.conf.beat_schedule = {
         "task": "kg_jobs_sync",
         "schedule": crontab(minute="*/15"),
     },
+    # KG Coverage #2: PVC/PV/storage signals → kg_storage_volumes + uses_volume/
+    # bound_to edges. Каждые 30 мин: storage редко меняется (claim ~раз в неделю,
+    # capacity статична), но мы хотим ловить phase-переходы Bound→Released в
+    # течение получаса. disk_pct enrichment под флагом STORAGE_METRICS_ENABLED
+    # (default OFF — kubelet_volume_stats_* может быть не настроен).
+    "kg-storage-sync": {
+        "task": "kg_storage_sync",
+        "schedule": crontab(minute="*/30"),
+    },
     # Wave 7-Z: парсер NATS subjects из исходников WO monorepo. Раз в 6h
     # делает git fetch shallow clone + grep `.cs` файлы на consumers/publish
     # call-site → upsert subject-узлы + edges kind=`uses_nats`. Идемпотентен.
@@ -364,6 +373,27 @@ def kg_jobs_sync_task():
         return result
     except Exception as e:
         logger.warning("kg_jobs_sync.failed: %s", e)
+        return {"error": str(e)}
+    finally:
+        db.close()
+
+
+@celery_app.task(name="kg_storage_sync")
+def kg_storage_sync_task():
+    """KG Coverage #2: sync PVC + PV + uses_volume/bound_to edges.
+
+    Включает опциональный disk_pct enrichment если STORAGE_METRICS_ENABLED.
+    Не raise — failure внутри одного tick'а не должна валить beat-worker.
+    """
+    from app.knowledge_graph.k8s_storage_sync import sync_storage
+
+    db = SessionLocal()
+    try:
+        result = sync_storage(db)
+        logger.info("kg_storage_sync.done result=%s", result)
+        return result
+    except Exception as e:
+        logger.warning("kg_storage_sync.failed: %s", e)
         return {"error": str(e)}
     finally:
         db.close()

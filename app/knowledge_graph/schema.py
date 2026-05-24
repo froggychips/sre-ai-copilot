@@ -7,8 +7,8 @@ from __future__ import annotations
 
 from datetime import datetime
 
-from sqlalchemy import (JSON, Boolean, Column, DateTime, Float, ForeignKey,
-                        Index, Integer, String, UniqueConstraint)
+from sqlalchemy import (JSON, BigInteger, Boolean, Column, DateTime, Float,
+                        ForeignKey, Index, Integer, String, UniqueConstraint)
 from sqlalchemy.orm import relationship
 
 from app.database import Base
@@ -514,4 +514,101 @@ class ServiceEdge(Base):
 
     __table_args__ = (
         UniqueConstraint("src_id", "dst_id", "kind", name="uq_kg_edge_src_dst_kind"),
+    )
+
+
+class StorageVolume(Base):
+    """Узел графа для k8s PVC и PV (KG Coverage #2).
+
+    `kind`:
+        * 'pvc' — PersistentVolumeClaim, namespace-scoped. `namespace` =
+          реальный ns; `volume_name` указывает на bound PV (если Bound).
+        * 'pv' — PersistentVolume, cluster-scoped. `namespace` = ''
+          (пустая строка, не NULL — упрощает JOIN/UNIQUE).
+
+    Не reuse `kg_services` потому что:
+      * жизненный цикл другой (claim/release/bound vs deployment rollout);
+      * drift_cleanup logically scoped на deployments — мы не хотим чтобы
+        Pending PVC были помечены synthetic;
+      * атрибуты другие (capacity, storage_class, phase).
+
+    `disk_pct` — последний known % использования из kubelet_volume_stats_*
+    (PromQL `100 * used_bytes / capacity_bytes`). NULL когда:
+      * STORAGE_METRICS_ENABLED=False (default);
+      * scrape config не покрывает kubelet stats (см. WO VM scrape gap recon);
+      * volume только что создан и метрика ещё не пришла.
+
+    `volume_name` дублирует bound_to edge для быстрых выборок «какой PV у
+    этого PVC» без JOIN-а. Edge остаётся source of truth — колонка
+    обновляется в том же transaction.
+    """
+    __tablename__ = "kg_storage_volumes"
+
+    id = Column(Integer, primary_key=True, index=True)
+    kind = Column(String, nullable=False, index=True)
+    namespace = Column(
+        String, nullable=False, server_default="", index=True,
+    )
+    name = Column(String, nullable=False, index=True)
+    capacity_bytes = Column(BigInteger, nullable=True)
+    storage_class = Column(String, nullable=True, index=True)
+    phase = Column(String, nullable=True, index=True)
+    access_modes = Column(JSON, nullable=True)
+    volume_name = Column(String, nullable=True)
+    disk_pct = Column(Float, nullable=True)
+    metadata_json = Column(JSON, nullable=True)
+
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(
+        DateTime, default=datetime.utcnow, onupdate=datetime.utcnow,
+    )
+
+    __table_args__ = (
+        UniqueConstraint(
+            "kind", "namespace", "name",
+            name="uq_kg_storage_volumes_kind_ns_name",
+        ),
+        Index("ix_kg_storage_volumes_kind_ns", "kind", "namespace"),
+    )
+
+
+class VolumeEdge(Base):
+    """Гетерогенное ребро для storage-графа.
+
+    Не reuse `kg_service_edges`: у src/dst могут быть разные node-типы
+    (`Service` ↔ `StorageVolume`), а ServiceEdge FK жёстко на kg_services.id.
+    Поэтому tagged ID: `src_kind` + `src_id` (без FK constraint — kind
+    указывает на таблицу).
+
+    Поддерживаемые kinds:
+        * `uses_volume` — Service → PVC. Источник: scan pod.spec.volumes
+          по всем pod'ам, attribuiton к owning Deployment/StatefulSet.
+        * `bound_to`    — PVC → PV. Источник: pvc.spec.volumeName.
+
+    `last_seen_at` обновляется на каждом upsert — основа для будущего
+    decay-task'а (edges не подтверждённые N дней соответствуют удалённым
+    PVC/Pod'ам).
+    """
+    __tablename__ = "kg_volume_edges"
+
+    id = Column(Integer, primary_key=True, index=True)
+    # `src_kind` ∈ {'service', 'pvc', 'pv'}. Без FK — это namespacing,
+    # не reference. Проверка валидности — на app-уровне (populator).
+    src_kind = Column(String, nullable=False, index=True)
+    src_id = Column(Integer, nullable=False, index=True)
+    dst_kind = Column(String, nullable=False, index=True)
+    dst_id = Column(Integer, nullable=False, index=True)
+    kind = Column(String, nullable=False, index=True)
+    discovered_by = Column(String, nullable=True)
+    extras = Column(JSON, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    last_seen_at = Column(DateTime, nullable=True, index=True)
+
+    __table_args__ = (
+        UniqueConstraint(
+            "src_kind", "src_id", "dst_kind", "dst_id", "kind",
+            name="uq_kg_volume_edge_src_dst_kind",
+        ),
+        Index("ix_kg_volume_edges_src", "src_kind", "src_id"),
+        Index("ix_kg_volume_edges_dst", "dst_kind", "dst_id"),
     )
