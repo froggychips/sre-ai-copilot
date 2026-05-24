@@ -181,9 +181,10 @@ class K8sService:
             return {"success": False, "error": str(e), "dry_run": dry_run}
 
     # ── Backward compat: старая run_command-обёртка ────────────────────────
-    # Используется в discord_service.send_approval_request URL-генерации; ничего
-    # критичного в коде её больше не вызывает. Оставляем заглушкой на случай
-    # если внешние интеграции дёрнут.
+    # Legacy: исторически использовалась в discord_service.send_approval_request
+    # (удалён в chore/gc-legacy-discord-senders). Оставляем заглушкой на случай,
+    # если внешние интеграции дёрнут — approve-flow теперь через
+    # api/discord_interactions.py (PR #12, button-based).
     def run_command(
         self,
         command: str,
