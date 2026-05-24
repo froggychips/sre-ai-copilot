@@ -15,7 +15,6 @@
 - идемпотентность сквозная: повторный sync_storage не плодит дубли
 - kubectl failure: пустой результат, sync не raise
 """
-from datetime import datetime
 from unittest.mock import patch
 
 import pytest
