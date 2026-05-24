@@ -408,6 +408,80 @@ class ActionApproval(Base):
     )
 
 
+class K8sJob(Base):
+    """KG Coverage #1: узел графа для k8s Job или CronJob.
+
+    Один Service может иметь несколько связанных CronJob-ов (backup +
+    cleanup + reindex), плюс ad-hoc Job-ы (migration на каждый rollout).
+    Хранить их в `kg_services` смешало бы health-метрики (Job завершается —
+    Service остаётся). Поэтому отдельная table.
+
+    `kind` различает Job / CronJob.
+
+    Для CronJob: `schedule` (cron-выражение) + `last_schedule_time` +
+    `last_successful_time` + `suspended`. Эти поля позволяют детектить:
+        * cron не запускался N дней
+        * `last_successful_time` далеко позади `last_schedule_time`
+          (последний запуск свалился)
+        * suspended=true (намеренно остановлен — это feature, не алёрт)
+
+    Для Job: `succeeded_count` / `failed_count` / `active_count` +
+    `last_pod_exit_code` (из последнего pod-а). Failed alembic-migration с
+    exit_code=1 — это критичный сигнал для backfill RecentDeployRule.
+
+    `owner_service_name` — label-attribution на Service в kg_services
+    (тот же namespace). Если match сработал, в metadata_json также
+    кладётся `owner_service_id` для O(1) join'а. Для Job, созданного
+    CronJob-ом, дополнительно проставляется через ownerReferences
+    transitive resolve в `k8s_jobs_sync._link_jobs_to_cronjob_owners`.
+    """
+    __tablename__ = "kg_k8s_jobs"
+
+    id = Column(Integer, primary_key=True, index=True)
+    namespace = Column(String, nullable=False, index=True)
+    name = Column(String, nullable=False, index=True)
+    # 'job' | 'cronjob'. Hard-coded enum как и в discovery_sources —
+    # валидация на app-уровне, сейчас плоская string.
+    kind = Column(String, nullable=False, index=True)
+
+    # Owner-label attribution. `owner_service_name` — name из k8s label
+    # (`app.kubernetes.io/part-of` или `app`); `owner_service_id` живёт в
+    # metadata_json — это сматченный id из kg_services. Опционально.
+    owner_service_name = Column(String, nullable=True, index=True)
+
+    # CronJob-only поля. На Job-узлах остаются None.
+    schedule = Column(String, nullable=True)              # cron expression
+    suspended = Column(Boolean, nullable=False, default=False, server_default="false")
+    last_schedule_time = Column(DateTime, nullable=True)
+    last_successful_time = Column(DateTime, nullable=True)
+
+    # Job-counters. На CronJob: active_count = len(status.active), succeeded/
+    # failed остаются 0 (это для одного Job-а). UX-ясности это не вредит:
+    # фильтрация по kind отделяет одно от другого.
+    succeeded_count = Column(Integer, nullable=True)
+    failed_count = Column(Integer, nullable=True)
+    active_count = Column(Integer, nullable=True)
+    start_time = Column(DateTime, nullable=True)
+    completion_time = Column(DateTime, nullable=True)
+
+    # Job-only: exit-code из последнего terminated container первого pod-а.
+    # NULL если pod ещё running или failed_count=0 (мы не дёргаем exit-code
+    # на success — implied 0). Используется для post-mortem: «alembic
+    # migration упала с exit 1 за час до alert KubeDeploymentReplicasMismatch».
+    last_pod_exit_code = Column(Integer, nullable=True)
+
+    metadata_json = Column(JSON, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    # Refresh timestamp на каждом upsert. Stale rows (не sync N часов) —
+    # кандидаты на drift_cleanup. Не индексируем — выборка raredата-аналитики.
+    last_seen_at = Column(DateTime, nullable=True)
+
+    __table_args__ = (
+        UniqueConstraint("namespace", "name", "kind", name="uq_kg_k8s_job_ns_name_kind"),
+        Index("ix_kg_k8s_job_kind_ns", "kind", "namespace"),
+    )
+
+
 class ServiceEdge(Base):
     """Ребро графа: src сервис вызывает / зависит от dst сервиса.
 
