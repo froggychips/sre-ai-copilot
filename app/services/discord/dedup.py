@@ -1,6 +1,6 @@
 """In-memory dedup state for Discord incident embeds.
 
-Кэш per-process, TTL 30 минут. Используется DiscordService для двух стратегий:
+Кэш per-process, TTL 30 минут. Используется DiscordService для трёх стратегий:
   * (#1) точечный дедуп по content-key (alertname, ns, service, reason) —
     PATCH embed-а вместо нового POST, когда логически тот же инцидент
     срабатывает повторно. Раньше ключом была AM fingerprint через
@@ -9,6 +9,10 @@
     Content-key решает: один alertname+service+reason → один embed.
   * (#9) burst-агрегация по alertname — если ≥_LINKED_MIN_COUNT срабатываний
     за _LINKED_WINDOW_SEC, сворачиваем в одно сообщение с группой ns/pod.
+  * (Stage 2) PATCH-dedup для `send_enriched_alert` — параллельный кэш
+    `_recent_enriched`, ключ sha1(alertname, ns, service, severity). Был
+    основной источник тройных постов в #infra-error: preprod AM,
+    group_interval=10m, repeat=4h → 18 embed/сутки на одну и ту же группу.
 
 State хранится на module-level — DiscordService может вызываться из разных
 asyncio-тасков (FastAPI handlers + Celery workers держат свой state в каждом
@@ -18,6 +22,7 @@ asyncio-тасков (FastAPI handlers + Celery workers держат свой st
 это работает благодаря re-export'у в shim'е верхнего уровня.
 """
 
+import hashlib
 import re
 import threading
 import time
@@ -32,6 +37,11 @@ _LINKED_MIN_COUNT = 3
 # та же (dict lookup в кэше per-process, никаких persistence).
 _recent_incidents: Dict[str, Dict[str, Any]] = {}
 _recent_by_alertname: Dict[Tuple[str], Dict[str, Any]] = {}
+# Stage 2: отдельный кэш для send_enriched_alert. Параллельный — чтобы
+# enriched-канал (KG-deterministic) и incident-канал (suspect deploy /
+# self-health) дедупились независимо. Семантика та же — sha1-ключ,
+# entry хранит msg_id+first_ts+last_ts+count+webhook_url+embed.
+_recent_enriched: Dict[str, Dict[str, Any]] = {}
 _dedup_lock = threading.Lock()
 
 
@@ -80,6 +90,48 @@ def _purge_dedup_state(now: Optional[float] = None) -> None:
     for ka in list(_recent_by_alertname.keys()):
         if _recent_by_alertname[ka].get("first_ts", 0) < cutoff:
             del _recent_by_alertname[ka]
+
+
+def _compute_enriched_key(
+    alertname: str,
+    namespace: Optional[str],
+    service_name: Optional[str],
+    severity: Optional[str],
+) -> Optional[str]:
+    """Sha1-ключ для PATCH-dedup в send_enriched_alert.
+
+    Состав ключа: (alertname, namespace, service, severity). Раздельно от
+    incident-кэша (`_compute_content_key`), потому что:
+      * enriched-batch не имеет pod_event_reason и шлёт один embed на
+        AM-batch (≥1 алерт того же типа в группе ns/service);
+      * severity критичен — preprod-warning и preprod-critical не должны
+        схлопываться в один embed.
+
+    None-компоненты заменяются на `<none>` (как и в content-key) чтобы
+    избежать pythonовского None в hash-input. Возвращает hex sha1 (40 chars)
+    для компактности и стабильности (vs ad-hoc f-string).
+    """
+    if not alertname:
+        return None
+    ns = namespace or "<none>"
+    svc = service_name or "<none>"
+    sev = (severity or "<none>").lower()
+    raw = f"{alertname}|{ns}|{svc}|{sev}".encode("utf-8")
+    return hashlib.sha1(raw).hexdigest()
+
+
+def _purge_enriched_state(now: Optional[float] = None, ttl_sec: Optional[int] = None) -> None:
+    """Удалить из `_recent_enriched` записи старше ttl_sec.
+
+    ttl_sec может быть config-driven (`ENRICHED_DEDUP_WINDOW_SECONDS`) и
+    отличается от `_DEDUP_TTL_SEC` (incident-кэш). По умолчанию 30 мин,
+    т.к. AM preprod group_interval=10m → за 30 мин укладывается 3 ре-mission.
+    """
+    now = now or time.time()
+    cutoff = now - (ttl_sec if ttl_sec is not None else _DEDUP_TTL_SEC)
+    for k in list(_recent_enriched.keys()):
+        if _recent_enriched[k].get("first_ts", 0) < cutoff:
+            del _recent_enriched[k]
 
 
 def _webhook_edit_endpoint(url: str, message_id: str) -> Optional[str]:
