@@ -22,7 +22,9 @@ from app.config import settings
 from app.diagnostics.facts import Fact
 from app.diagnostics.rules.recent_deploy import RecentDeployRule
 from app.diagnostics.rules.upstream_degraded import UpstreamDegradedRule
-from app.knowledge_graph.queries import (incidents_on, nearby_alerts,
+from app.knowledge_graph.queries import (blast_radius_for, incidents_on,
+                                         nats_impact_for, nearby_alerts,
+                                         pod_event_summary_for,
                                          recent_deploys_for,
                                          recent_pod_events_for, upstream_of)
 from app.knowledge_graph.schema import Service, ServiceEdge
@@ -107,6 +109,19 @@ class EnrichedContext:
     rollout_noise: bool = False
 
     kg_data_age_sec: Optional[int] = None
+
+    # Wave 7 секции (только для critical-render, skip-if-empty внутри builders).
+    # blast_radius — `{services, urls, services_total, urls_total}` для
+    # «кто маршрутит трафик на меня» (serves_traffic IN) и «какие URL
+    # затронуты» (routes_to). См. queries.blast_radius_for.
+    blast_radius: Dict[str, Any] = field(default_factory=dict)
+    # nats_impact — list[{subject, direction, impact_count, impact_others}],
+    # отсортирован по impact_count desc. См. queries.nats_impact_for.
+    nats_impact: List[Dict[str, Any]] = field(default_factory=list)
+    # pod_trail — `{total, by_reason: [(reason, count), ...]}` агрегация
+    # PodEvent за окно ±60м. Параллельна `pod_events` (top-5 individual),
+    # фокус на counts. См. queries.pod_event_summary_for.
+    pod_trail: Dict[str, Any] = field(default_factory=dict)
 
     # Свободное поле для metadata, которая не имеет первого-класса своего слота:
     # `synthetic_fallback` (resolver hit на synthetic Service), `target_resolve_*` —
@@ -436,6 +451,27 @@ def enrich_alert(db: Session, incident: Incident) -> EnrichedContext:
             )
     except Exception as e:
         log.warning("enrich.pod_events_failed", error=str(e))
+
+    # 4e. Wave 7 enrichment: blast radius / NATS impact / pod trail.
+    # Все три — best-effort, silent fail. Render в embed только при
+    # severity=critical (gate в send_enriched_alert), плюс skip-if-empty
+    # внутри builders. Здесь просто заполняем структуру.
+    is_critical = (incident.severity or "").lower() == "critical"
+    if is_critical:
+        try:
+            ctx.blast_radius = blast_radius_for(db, namespace, service, top_n=3)
+        except Exception as e:
+            log.warning("enrich.blast_radius_failed", error=str(e))
+        try:
+            ctx.nats_impact = nats_impact_for(db, namespace, service, top_n=3)
+        except Exception as e:
+            log.warning("enrich.nats_impact_failed", error=str(e))
+        try:
+            ctx.pod_trail = pod_event_summary_for(
+                db, namespace, service, around=effective_at, window_minutes=60,
+            )
+        except Exception as e:
+            log.warning("enrich.pod_trail_failed", error=str(e))
 
     # 5. Service metadata (team_owner, in_kg flag, data freshness)
     # Сначала ищем не-synthetic; synthetic-only попадание помечаем в extras —

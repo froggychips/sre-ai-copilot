@@ -196,6 +196,211 @@ def nearby_alerts(
     return out
 
 
+def blast_radius_for(
+    db: Session,
+    namespace: str,
+    service_name: str,
+    top_n: int = 3,
+) -> Dict[str, Any]:
+    """Wave 7 (X, PR #71): blast radius для упавшего сервиса.
+
+    Считает:
+        * `serves_traffic` IN-edges (kind='serves_traffic', dst=svc):
+          какие k8s-Service'ы маршрутят трафик на этот Deployment.
+          Это «сервисные точки входа» — клиенты ходят через них.
+        * `routes_to` IN-edges (kind='routes_to', dst=svc): какие
+          Ingress-ресурсы натравлены на этот backend. extras.host даёт
+          внешний URL.
+
+    Возвращает `{services: [name, ...top_n], urls: [host, ...top_n],
+                  services_total: int, urls_total: int}`.
+
+    Используется в Discord embed-секции «🎯 Blast radius» (только critical).
+    """
+    svc = _service_by_namespace_name(db, namespace, service_name)
+    if svc is None:
+        return {"services": [], "urls": [], "services_total": 0, "urls_total": 0}
+
+    # serves_traffic — `kg_services` ноды (k8s Service), маршрутизирующие
+    # трафик на этот Deployment. Имя ноды k8s-Service'а лежит как есть.
+    serves_rows = (
+        db.query(ServiceEdge)
+        .filter(
+            ServiceEdge.dst_id == svc.id,
+            ServiceEdge.kind == "serves_traffic",
+        )
+        .all()
+    )
+    services_seen: List[str] = []
+    for edge in serves_rows:
+        if edge.src is None:
+            continue
+        if edge.src.name in services_seen:
+            continue
+        services_seen.append(edge.src.name)
+
+    # routes_to — Ingress synthetic nodes (`ingress:<name>`). Хост-имя
+    # лежит в `extras.host`. Если host='*' (wildcard) — пропускаем,
+    # для оператора оно не информативно как URL.
+    routes_rows = (
+        db.query(ServiceEdge)
+        .filter(
+            ServiceEdge.dst_id == svc.id,
+            ServiceEdge.kind == "routes_to",
+        )
+        .all()
+    )
+    urls_seen: List[str] = []
+    for edge in routes_rows:
+        extras = edge.extras if isinstance(edge.extras, dict) else {}
+        host = extras.get("host")
+        if not host or host == "*":
+            continue
+        if host in urls_seen:
+            continue
+        urls_seen.append(host)
+
+    return {
+        "services": services_seen[:top_n],
+        "urls": urls_seen[:top_n],
+        "services_total": len(services_seen),
+        "urls_total": len(urls_seen),
+    }
+
+
+def nats_impact_for(
+    db: Session,
+    namespace: str,
+    service_name: str,
+    top_n: int = 3,
+) -> List[Dict[str, Any]]:
+    """Wave 7 (Z, PR #72): NATS impact — subjects + co-consumers.
+
+    Для каждого `uses_nats` OUT-edge (src=svc, dst=NATS subject synthetic
+    node) считает сколько ДРУГИХ сервисов используют этот subject
+    (в любом direction). Это «impact count» — оценка broadcast-радиуса.
+
+    `extras.direction` (pub|sub) берётся из edge на текущий сервис.
+
+    Возвращает list[dict] (sorted by impact_count desc, max `top_n`):
+        [{subject, direction, impact_count, impact_others: [(name, dir)...]}]
+
+    Пустой если у сервиса нет NATS-edges (skip-if-empty в embed).
+    Один query на subjects + один batch query на impact_others — не N
+    запросов на subject.
+    """
+    svc = _service_by_namespace_name(db, namespace, service_name)
+    if svc is None:
+        return []
+
+    out_edges = (
+        db.query(ServiceEdge)
+        .filter(
+            ServiceEdge.src_id == svc.id,
+            ServiceEdge.kind == "uses_nats",
+        )
+        .all()
+    )
+    if not out_edges:
+        return []
+
+    # Собираем subject-node IDs за один батч, чтобы посчитать ко-консьюмеров
+    # одним SQL-запросом, а не N.
+    subject_ids: List[int] = []
+    by_subject_id: Dict[int, Dict[str, Any]] = {}
+    for edge in out_edges:
+        if edge.dst is None:
+            continue
+        sid = edge.dst_id
+        extras = edge.extras if isinstance(edge.extras, dict) else {}
+        direction = (extras.get("direction") or "?").lower()
+        subject_ids.append(sid)
+        by_subject_id[sid] = {
+            "subject": edge.dst.name,
+            "direction": direction,
+            "impact_count": 0,
+            "impact_others": [],
+        }
+
+    if subject_ids:
+        co_rows = (
+            db.query(ServiceEdge)
+            .filter(
+                ServiceEdge.dst_id.in_(subject_ids),
+                ServiceEdge.kind == "uses_nats",
+                ServiceEdge.src_id != svc.id,
+            )
+            .all()
+        )
+        for r in co_rows:
+            if r.src is None:
+                continue
+            entry = by_subject_id.get(r.dst_id)
+            if entry is None:
+                continue
+            entry["impact_count"] += 1
+            if len(entry["impact_others"]) < 3:
+                r_extras = r.extras if isinstance(r.extras, dict) else {}
+                entry["impact_others"].append((
+                    r.src.name,
+                    (r_extras.get("direction") or "?").lower(),
+                ))
+
+    result = list(by_subject_id.values())
+    result.sort(key=lambda x: x["impact_count"], reverse=True)
+    return result[:top_n]
+
+
+def pod_event_summary_for(
+    db: Session,
+    namespace: str,
+    service_name: str,
+    around: datetime,
+    window_minutes: int = 60,
+) -> Dict[str, Any]:
+    """Wave 7 (Y, PR #70): агрегированная сводка PodEvent для второй секции.
+
+    Берёт `kg_pod_events` в окне ±window_minutes от `around` для сервиса
+    (через runtime_correlation linkage), группирует по `reason`, отдаёт
+    counts. Используется в Discord embed-секции «🕒 Pod trail» (только
+    critical) — даёт быстрый сигнал «5 evts: 3 OOMKilled, 2 CrashLoopBackOff».
+
+    Возвращает `{total: int, by_reason: [(reason, count), ...desc]}`.
+    Пустой dict если нет событий (skip-if-empty в embed).
+    """
+    svc = _service_by_namespace_name(db, namespace, service_name)
+    if svc is None:
+        return {"total": 0, "by_reason": []}
+    around_aware = _ensure_aware(around)
+    since = around_aware - timedelta(minutes=window_minutes)
+    until = around_aware + timedelta(minutes=window_minutes)
+
+    rows = (
+        db.query(PodEvent)
+        .filter(
+            PodEvent.service_id == svc.id,
+            PodEvent.first_seen >= since.replace(tzinfo=None),
+            PodEvent.first_seen <= until.replace(tzinfo=None),
+        )
+        .all()
+    )
+    if not rows:
+        return {"total": 0, "by_reason": []}
+
+    by_reason: Dict[str, int] = {}
+    total = 0
+    for r in rows:
+        # PodEvent.count = сколько раз k8s видел этот event (агрегация
+        # за весь lifetime). Для «сколько падений было» используем count;
+        # `max(1, count)` чтобы NULL/0 не схлопывали row.
+        c = max(1, int(r.count or 1))
+        by_reason[r.reason] = by_reason.get(r.reason, 0) + c
+        total += c
+
+    pairs = sorted(by_reason.items(), key=lambda kv: kv[1], reverse=True)
+    return {"total": total, "by_reason": pairs}
+
+
 def recent_pod_events_for(
     db: Session,
     namespace: str,
