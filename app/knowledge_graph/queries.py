@@ -31,6 +31,30 @@ def _service_by_namespace_name(
     )
 
 
+def services_by_stale_class(
+    db: Session,
+    stale_class: str,
+    *,
+    namespace: Optional[str] = None,
+    limit: Optional[int] = None,
+) -> List[Service]:
+    """Сервисы с заданным ``kg_services.stale_class``.
+
+    Значения: ``active`` | ``expected_stale`` | ``suspicious_stale``.
+    Заполняется в ``kg_sync.sync_namespace`` (KG Coverage #4).
+
+    Используется stats-digest, dashboards и owner-routing'ом alert-ов
+    (suspicious_stale деплоймент роняет alert → assignee = team_owner kg_svc).
+    """
+    q = db.query(Service).filter(Service.stale_class == stale_class)
+    if namespace is not None:
+        q = q.filter(Service.namespace == namespace)
+    q = q.order_by(Service.namespace, Service.name)
+    if limit is not None:
+        q = q.limit(limit)
+    return q.all()
+
+
 def recent_deploys_for(
     db: Session,
     namespace: str,

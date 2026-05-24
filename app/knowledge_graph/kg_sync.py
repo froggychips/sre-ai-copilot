@@ -23,7 +23,10 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.orm import Session
 
 from app.knowledge_graph.populator import upsert_edge
-from app.knowledge_graph.schema import Service, ServiceEdge
+from app.knowledge_graph.schema import Deployment, Service, ServiceEdge
+from app.knowledge_graph.stale_classifier import (
+    classify_stale_with_deploys,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -649,6 +652,7 @@ def _upsert_service_pg(
     team_owner: Optional[str] = None,
     metadata: Optional[Dict[str, Any]] = None,
     synthetic: Optional[bool] = None,
+    stale_class: Optional[str] = None,
 ) -> Service:
     """PG-нативный UPSERT для kg_services.
 
@@ -678,6 +682,7 @@ def _upsert_service_pg(
         "team_owner": team_owner,
         "metadata_json": metadata,
         "synthetic": bool(synthetic) if synthetic is not None else False,
+        "stale_class": stale_class,
         "created_at": now,
         "updated_at": now,
     }
@@ -695,6 +700,8 @@ def _upsert_service_pg(
     # synthetic: апдейтим только если новое значение False (стал реальным).
     if synthetic is False:
         set_clause["synthetic"] = False
+    if stale_class is not None:
+        set_clause["stale_class"] = stale_class
 
     stmt = (
         pg_insert(Service.__table__)
@@ -803,7 +810,53 @@ def sync_namespace(
             )
             stats["edges"] += 1
 
+    # KG Coverage #4: пересчитать stale_class для всех сервисов в этом ns.
+    # Делаем здесь (а не в _upsert_service_pg), чтобы один SQL-проход по
+    # kg_deployments вместо N×запросов.
+    _refresh_stale_class_for_namespace(db, namespace)
+
     return stats
+
+
+def _refresh_stale_class_for_namespace(db: Session, namespace: str) -> int:
+    """Пересчитать ``kg_services.stale_class`` для всех сервисов в namespace.
+
+    Используем max(``kg_deployments.started_at``) per service как «последний
+    deploy». Сервисы без deploy → ``last_deploy_at = None``.
+
+    Возвращает количество обновлённых строк.
+    """
+    from sqlalchemy import func
+
+    services = db.query(Service).filter(Service.namespace == namespace).all()
+    if not services:
+        return 0
+
+    svc_ids = [s.id for s in services]
+    rows = (
+        db.query(Deployment.service_id, func.max(Deployment.started_at))
+        .filter(Deployment.service_id.in_(svc_ids))
+        .group_by(Deployment.service_id)
+        .all()
+    )
+    last_deploy_by_svc: Dict[int, datetime] = {sid: ts for sid, ts in rows}
+
+    updated = 0
+    for svc in services:
+        svc_id_int: int = cast(int, svc.id)
+        last = last_deploy_by_svc.get(svc_id_int)
+        new_class = classify_stale_with_deploys(
+            name=cast(str, svc.name),
+            namespace=cast(str, svc.namespace),
+            last_deploy_at=last,
+            team_owner=cast(Optional[str], svc.team_owner),
+        )
+        if svc.stale_class != new_class:
+            svc.stale_class = new_class  # type: ignore[assignment]
+            updated += 1
+    if updated:
+        db.flush()
+    return updated
 
 
 _SYSTEM_NAMESPACE_PREFIXES = ("kube-", "openshift-", "cattle-")
