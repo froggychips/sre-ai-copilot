@@ -21,7 +21,7 @@ from app.database import Base
 from app.knowledge_graph.k8s_jobs_sync import (
     _extract_cronjob_status, _extract_job_status,
     _extract_pod_template_labels, _kubectl_get_all, _parse_k8s_time,
-    _resolve_owner_service_name, _upsert_k8s_job, _link_jobs_to_cronjob_owners,
+    _resolve_owner_service_name, _upsert_k8s_job,
     sync_all_cronjobs, sync_all_jobs, sync_k8s_jobs,
 )
 from app.knowledge_graph.populator import upsert_service
