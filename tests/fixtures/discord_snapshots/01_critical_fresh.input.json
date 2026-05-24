@@ -1,0 +1,90 @@
+{
+  "_doc": "Case 1: KubePodCrashLooping critical · clickhouse-shard0-0. Все Wave 7 секции (blast/NATS/pod_trail), все UX-поля (pod/replicas/reason), primary_hypothesis из PodEventsRule и why_this_matters из shared-dep signal.",
+  "incident": {
+    "incident_id": "fp-snap-01",
+    "severity": "critical",
+    "status": "firing",
+    "summary": "Pod is crash looping.",
+    "description": "Pod prod-shared/clickhouse-shard0-0 is in waiting state (reason: \"CrashLoopBackOff\").",
+    "namespace": "prod-shared",
+    "labels": {
+      "alertname": "KubePodCrashLooping",
+      "severity": "critical",
+      "namespace": "prod-shared",
+      "statefulset": "clickhouse-shard0",
+      "pod": "clickhouse-shard0-0",
+      "container": "clickhouse"
+    },
+    "annotations": {
+      "description": "Pod prod-shared/clickhouse-shard0-0 is in waiting state."
+    },
+    "starts_at": "2026-05-24T10:38:00Z",
+    "generator_url": "https://prom.example.com/alerts?expr=ALERTS"
+  },
+  "service": "clickhouse-shard0",
+  "pod": "clickhouse-shard0-0",
+  "team_owner": "platform",
+  "in_kg": true,
+  "pod_name": "clickhouse-shard0-0",
+  "container_reason": "CrashLoopBackOff",
+  "replicas_ready_desired": "0/2",
+  "recent_deploys": [],
+  "upstream_alerts": [],
+  "recurrence_24h": [],
+  "inbound_count_by_kind": {
+    "calls": 18,
+    "uses_db": 7
+  },
+  "outgoing_deps": [
+    {
+      "kind": "uses_db",
+      "service": "ch-keeper",
+      "namespace": "prod-shared",
+      "confidence_score": 0.9,
+      "discovery_sources": ["kg_sync/env_vars"]
+    }
+  ],
+  "pod_events": [
+    {
+      "reason": "BackOff",
+      "pod_name": "clickhouse-shard0-0",
+      "count": 1342,
+      "minutes_before": 35,
+      "message": "Back-off restarting failed container"
+    }
+  ],
+  "rule_facts": [
+    {
+      "kind": "crashloop",
+      "observed": true,
+      "confidence": 0.95,
+      "source_rule": "PodEventsRule",
+      "evidence": {
+        "reason": "BackOff",
+        "count": 1342,
+        "message": "Back-off restarting failed container"
+      }
+    }
+  ],
+  "jira_issues": [],
+  "rollout_noise": false,
+  "kg_data_age_sec": 600,
+  "blast_radius": {
+    "services": ["bot-service", "stats-aggregator", "town-api"],
+    "urls": ["api.lastoasisgame.com"],
+    "services_total": 5,
+    "urls_total": 1
+  },
+  "nats_impact": [
+    {
+      "subject": "leaderboard.flush",
+      "direction": "pub",
+      "impact_count": 4,
+      "impact_others": []
+    }
+  ],
+  "pod_trail": {
+    "total": 12,
+    "by_reason": [["BackOff", 9], ["Unhealthy", 3]]
+  }
+}
