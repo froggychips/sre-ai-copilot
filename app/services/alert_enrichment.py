@@ -22,7 +22,9 @@ from app.config import settings
 from app.diagnostics.facts import Fact
 from app.diagnostics.rules.recent_deploy import RecentDeployRule
 from app.diagnostics.rules.upstream_degraded import UpstreamDegradedRule
-from app.knowledge_graph.queries import (blast_radius_for, incidents_on,
+from app.knowledge_graph.queries import (blast_radius_for,
+                                         current_replicas_from_kg,
+                                         incidents_on, latest_pod_event_for,
                                          nats_impact_for, nearby_alerts,
                                          pod_event_summary_for,
                                          recent_deploys_for,
@@ -98,6 +100,12 @@ class EnrichedContext:
     outgoing_deps: List[Dict[str, Any]] = field(default_factory=list)
     # Pod-events (kg_pod_events) — k8s diagnostic signal в окне инцидента.
     pod_events: List[Dict[str, Any]] = field(default_factory=list)
+    # UX polish (on-call feedback 10:38): конкретный pod-name, последний
+    # containerStatus.reason, current ready/desired — чтобы on-call видел
+    # «какой pod, что с ним, сколько реплик жилых».
+    pod_name: Optional[str] = None
+    container_reason: Optional[str] = None
+    replicas_ready_desired: Optional[str] = None  # "1/3" — sentinel для render-а
     # A6 (Phase 2): Jira-issues linkback. Тикеты с label=backend и service
     # в summary за последние JIRA_SEARCH_DAYS дней. Embed-секция «Ticketsy»
     # с прямыми URL на issue.
@@ -153,12 +161,14 @@ def _fact_to_short_text(fact: Fact) -> str:
         deploys = ev.get("deploys") or []
         if deploys:
             d = deploys[0]
-            mins = d.get("minutes_before_incident", "?")
+            mins = d.get("minutes_before_incident")
             sha = (d.get("sha") or "")[:7]
             build = d.get("number") or d.get("buildtype_id") or "?"
             triggered = d.get("triggered_by") or ""
             by = f" by {triggered}" if triggered else ""
-            return f"Deploy #{build}{by} ({sha}) {mins} мин назад — возможный регресс"
+            from app.utils.time_human import humanize_minutes_ago
+            when = humanize_minutes_ago(mins)
+            return f"Deploy #{build}{by} ({sha}) {when} — возможный регресс"
     if fact.source_rule == "UpstreamDegradedRule":
         cnt = ev.get("count", 0)
         alerts = ev.get("alerts") or []
@@ -472,6 +482,61 @@ def enrich_alert(db: Session, incident: Incident) -> EnrichedContext:
             )
         except Exception as e:
             log.warning("enrich.pod_trail_failed", error=str(e))
+
+    # 4c-bis (on-call UX): конкретный pod_name + containerStatus.reason
+    # из последнего kg_pod_events. Если оконные fallback пусты — берём
+    # вообще latest event (latest_pod_event_for). Заполняем
+    # ctx.pod_name / ctx.container_reason — embed-render их рисует
+    # отдельными полями.
+    try:
+        latest_ev: Optional[Dict[str, Any]] = None
+        if ctx.pod_events:
+            # head(pod_events) уже отсортирован по first_seen DESC
+            latest_ev = ctx.pod_events[0]
+        else:
+            latest_ev = latest_pod_event_for(db, namespace, service)
+        if latest_ev:
+            ctx.pod_name = latest_ev.get("pod_name") or None
+            ctx.container_reason = latest_ev.get("reason") or None
+    except Exception as e:
+        log.warning("enrich.latest_pod_event_failed", error=str(e))
+
+    # 4c-ter (on-call UX): replicas ready/desired. Сначала KG metadata_json
+    # (дёшево), при отсутствии — live k8s API под флагом
+    # INCLUDE_LIVE_K8S_STATE с hard timeout. На один embed — один лук-ап.
+    try:
+        rep = current_replicas_from_kg(db, namespace, service)
+        if rep is None and getattr(settings, "INCLUDE_LIVE_K8S_STATE", True):
+            kind_hint = None
+            if labels.get("statefulset"):
+                kind_hint = "statefulset"
+            elif labels.get("deployment"):
+                kind_hint = "deployment"
+            # Локальный импорт — модуль тянет kubernetes-client, не хотим
+            # утаскивать его в чистые dry-run пути (тесты с mock-db).
+            try:
+                from app.context.deployments import fetch_live_replicas
+                rep = fetch_live_replicas(
+                    namespace, service,
+                    kind_hint=kind_hint,
+                    timeout_sec=getattr(settings, "LIVE_K8S_TIMEOUT_SEC", 3.0),
+                )
+            except Exception as e:
+                log.warning("enrich.live_replicas_import_failed", error=type(e).__name__)
+        if rep:
+            ready = rep.get("ready")
+            desired = rep.get("desired")
+            if ready is not None and desired is not None:
+                ctx.replicas_ready_desired = f"{ready}/{desired}"
+            elif desired is not None:
+                ctx.replicas_ready_desired = f"?/{desired}"
+    except Exception as e:
+        log.warning("enrich.replicas_lookup_failed", error=str(e))
+
+    # TODO INCLUDE_LAST_LOG_LINE: при settings.INCLUDE_LAST_LOG_LINE
+    # подтянуть последнюю строку pod-логов + exit_code через
+    # fetch_last_log_line(namespace, ctx.pod_name). Сейчас отключено —
+    # read_namespaced_pod_log дорогой и flaky, см. on-call note item 5.
 
     # 5. Service metadata (team_owner, in_kg flag, data freshness)
     # Сначала ищем не-synthetic; synthetic-only попадание помечаем в extras —
