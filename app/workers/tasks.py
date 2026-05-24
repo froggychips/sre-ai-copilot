@@ -201,6 +201,14 @@ celery_app.conf.beat_schedule = {
         "task": "kg_topology_resources_sync",
         "schedule": crontab(minute="*/15"),
     },
+    # KG Coverage #1: k8s Job + CronJob → kg_k8s_jobs. Каждые 15 мин
+    # `kubectl get jobs,cronjobs -A` + upsert. Сигналы: last_successful_time
+    # / last_schedule_time / failed_count / last_pod_exit_code. Закрывает
+    # blind-spot на backup CronJob'ах и failed alembic-миграциях.
+    "kg-jobs-sync": {
+        "task": "kg_jobs_sync",
+        "schedule": crontab(minute="*/15"),
+    },
     # Wave 7-Z: парсер NATS subjects из исходников WO monorepo. Раз в 6h
     # делает git fetch shallow clone + grep `.cs` файлы на consumers/publish
     # call-site → upsert subject-узлы + edges kind=`uses_nats`. Идемпотентен.
@@ -334,6 +342,28 @@ def kg_topology_resources_sync_task():
         return result
     except Exception as e:
         logger.warning("kg_topology_resources_sync.failed: %s", e)
+        return {"error": str(e)}
+    finally:
+        db.close()
+
+
+@celery_app.task(name="kg_jobs_sync")
+def kg_jobs_sync_task():
+    """KG Coverage #1: k8s Job + CronJob → kg_k8s_jobs (per 15 мин).
+
+    Не raise — failure внутри tick'а не должна валить beat-loop. См.
+    `app.knowledge_graph.k8s_jobs_sync` для деталей и owner-label
+    атрибуции.
+    """
+    from app.knowledge_graph.k8s_jobs_sync import sync_k8s_jobs
+
+    db = SessionLocal()
+    try:
+        result = sync_k8s_jobs(db)
+        logger.info("kg_jobs_sync.done result=%s", result)
+        return result
+    except Exception as e:
+        logger.warning("kg_jobs_sync.failed: %s", e)
         return {"error": str(e)}
     finally:
         db.close()
