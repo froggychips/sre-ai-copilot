@@ -654,7 +654,14 @@ def log_errors_section(db: Session, ns_to_team: Dict[str, str]) -> str:
 
 
 def kg_quality_section(db: Session) -> str:
-    """6. KG quality: services, orphan%, edges, team_owner coverage."""
+    """6. KG quality: services, orphan%, edges, team_owner coverage.
+
+    Формальное определение orphan / synthetic / threshold-ов — см.
+    `app.knowledge_graph.contract` (KG_SCHEMA_VERSION, QUALITY_THRESHOLDS,
+    is_orphan, is_synthetic) и `docs/KG_SCHEMA_CONTRACT.md`. Логика
+    ниже — оптимизированная SQL-агрегация, эквивалентная сумме per-service
+    `is_orphan(s, edges)` из contract.py.
+    """
     services_total = db.execute(text("SELECT count(*) FROM kg_services")).scalar() or 0
     if services_total == 0:
         return "**🧬 KG quality**\n  _KG пустой — kg_topology_sync ещё не выполнялся_"
