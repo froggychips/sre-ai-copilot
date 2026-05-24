@@ -53,15 +53,19 @@ _INFRA_OWNER_TOKENS = frozenset({"platform", "infra", "infrastructure", "data"})
 ACTIVE_WINDOW_DAYS = 30
 INFRA_EXPECTED_DAYS = 60
 
-STALE_CLASS_ACTIVE = "active"
-STALE_CLASS_EXPECTED = "expected_stale"
-STALE_CLASS_SUSPICIOUS = "suspicious_stale"
-
-STALE_CLASS_VALUES = (
+# Канонические значения хранятся в `contract.py` (источник истины для
+# enum). Здесь ре-экспортируем под старыми именами ради backward-compat
+# с импортёрами (`stats_digest`, тесты), которые жили до выноса в contract.
+from app.knowledge_graph.contract import (
     STALE_CLASS_ACTIVE,
-    STALE_CLASS_EXPECTED,
-    STALE_CLASS_SUSPICIOUS,
+    STALE_CLASS_EXPECTED_STALE as STALE_CLASS_EXPECTED,
+    STALE_CLASS_SUSPICIOUS_STALE as STALE_CLASS_SUSPICIOUS,
 )
+from app.knowledge_graph.contract import STALE_CLASS_VALUES as _CONTRACT_STALE_CLASS_VALUES
+
+# Для backward-compat сохраняем tuple-форму (старый API). В новых местах
+# использовать `contract.STALE_CLASS_VALUES` (set).
+STALE_CLASS_VALUES = tuple(sorted(_CONTRACT_STALE_CLASS_VALUES))
 
 
 def _classify_stale(name: str, namespace: str) -> str:

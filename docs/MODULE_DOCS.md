@@ -49,11 +49,22 @@
 ## Knowledge Graph
 
 ### Schema (`app/knowledge_graph/schema.py`)
-- `Service` — nodes (`kg_services`, unique `(namespace, name)`); `synthetic` flag hides infra/observability/drift nodes from KG queries; `team_owner` derived from namespace prefix.
-- `ServiceEdge` — directed edges (`kg_service_edges`); `kind` ∈ `calls` / `uses_nats` / `uses_db`; `last_seen_at` for TTL/decay; `extras.discovery_sources` (list) tracks all source flows (multi-source = higher confidence).
+- `Service` — nodes (`kg_services`, unique `(namespace, name)`); `synthetic` flag hides infra/observability/drift nodes from KG queries; `team_owner` derived from namespace prefix; `stale_class` (PR #86): `active` / `expected_stale` / `suspicious_stale` (см. `stale_classifier`).
+- `ServiceEdge` — directed edges (`kg_service_edges`); `kind` ∈ `calls` / `uses_nats` / `uses_db` / `serves_traffic` / `routes_to`; `last_seen_at` for TTL/decay; `extras.discovery_sources` (list) tracks all source flows (multi-source = higher confidence).
 - `Deployment` — TC build history (`kg_deployments`); records `started_at` from TC API (not `finishDate`), `triggered_by`, status `SUCCESS`/`FAILURE`/etc.
 - `AlertEvent` — alerts from AM (`kg_alerts`); idempotent by `fingerprint`; `resolved_at` refreshed by `kg_alerts_resolve_sync`.
 - `PodEvent` — k8s Warning events (`kg_pod_events`); idempotent by `event_uid`; `count` accumulates across kubelet retries.
+- `K8sJob` (PR #82, `kg_k8s_jobs`) — Job/CronJob узлы вне `kg_services`; `kind` ∈ `job` / `cronjob`; `owner_service_id` метаколонка реализует semantic edge `runs_as_job` без отдельного edge-row.
+- `StorageVolume` (PR #84, `kg_storage_volumes`) — PVC/PV узлы; `kind` ∈ `pvc` / `pv` (PVC — namespace-scoped, PV — cluster-scoped с `namespace=''`); атрибуты: phase, capacity_bytes, storage_class.
+- `VolumeEdge` (PR #84, `kg_volume_edges`) — heterogeneous edges (`uses_volume` Service→PVC, `bound_to` PVC→PV); tagged `src_kind`/`dst_kind` без FK constraint.
+
+### Schema / quality contract (`app/knowledge_graph/contract.py`)
+- `KG_SCHEMA_VERSION` — текущая версия (`2.2`, после PR #82/#84/#86). Bump rules — `docs/KG_SCHEMA_CONTRACT.md` §8.
+- `EDGE_KINDS` — реестр всех edge kinds + spec (`semantic` / `src_kinds` / `dst_kinds` / `source` / `status` / `table`). `table` = где edge живёт: `kg_service_edges` / `kg_volume_edges` / `fk_only` (через FK) / `metadata_only` (через owner_service_id).
+- `OWNER_SOURCES` / `OWNER_SOURCE_ALIASES` — canonical источники owner-а + маппинг коротких имён из `ownership_suggester` (`prefix`→`namespace_prefix`, `labels`→`k8s_labels` и т.д.).
+- `STALE_CLASS_VALUES` — enum значений `kg_services.stale_class`. Re-export'ится в `stale_classifier` для backward-compat.
+- `STARTUP_CONTRACT_CHECK(db)` — boot-time диагностика: сверяет реальные kinds в БД с реестром, логирует drift.
+- Test: `tests/test_contract_drift.py` (Gate #22) — auto-validation что код и контракт не разъезжаются.
 
 ### Sync (auto-populating beat tasks)
 - `app/knowledge_graph/kg_sync.py`: `sync_topology()` — hourly `kubectl get deployments -A` → `kg_services` + edges from env-vars (HTTP URLs, NATS clusters) and `secretKeyRef.key` heuristic (DB DSNs without reading secret values).
@@ -61,6 +72,9 @@
 - `app/knowledge_graph/k8s_ingress_sync.py`: `sync_all_ingresses()` — hourly, `kubectl get ingresses -A` → synthetic `ingress:<host>` nodes + `calls` edges to backend services.
 - `app/knowledge_graph/alerts_resolve_sync.py`: `run_alerts_resolve_sync()` — every 15 min, compares `kg_alerts.fingerprint` with `GET AM /api/v2/alerts` → marks non-firing as `resolved_at=NOW`. Safety: min 1 active fingerprint (skip on AM-down).
 - `app/knowledge_graph/drift_cleanup.py`: `run_drift_cleanup()` — hourly, marks services from namespaces missing in `kubectl get ns` as `synthetic=true` + `metadata.drift_reason`. Safety threshold 20% drift_pct (skip on kubectl failure → empty ns set).
+- `app/knowledge_graph/k8s_jobs_sync.py` (PR #82): `sync_jobs_and_cronjobs()` — hourly, `kubectl get jobs,cronjobs -A -o json` → `kg_k8s_jobs` rows. Owner Service резолвится через label `app.kubernetes.io/part-of` (fallback `app`) → semantic `runs_as_job` edge через `owner_service_id` metadata-column (а не отдельный edge-row в `kg_service_edges`).
+- `app/knowledge_graph/k8s_storage_sync.py` (PR #84): `sync_storage()` — every 30 min, отдельные проходы для PV (cluster-scoped), PVC (namespace-scoped) + scan pod.spec.volumes для `uses_volume` edges. Все edges идут в `kg_volume_edges` (heterogeneous, tagged src/dst). Опциональный disk_pct enrichment через `kubelet_volume_stats_*` PromQL (default OFF — scrape config redirect нужен).
+- `app/knowledge_graph/stale_classifier.py` (PR #86): `classify_stale_with_deploys(name, ns, last_deploy_at, team_owner)` → `active` / `expected_stale` / `suspicious_stale`. Используется `kg_sync.sync_namespace` для апдейта `kg_services.stale_class` идемпотентно. Re-exports canonical values из `contract.STALE_CLASS_VALUES`.
 
 ### Population (`app/knowledge_graph/populator.py`)
 Idempotent upserts used by all syncs:
