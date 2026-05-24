@@ -53,6 +53,7 @@ _KUBECTL_TIMEOUT_S = 30
 
 # Edge kinds, которые этот модуль использует. ServiceEdge.kind — свободная
 # строка, валидация на app-уровне. Эти константы — единственная sсемантика.
+# Источник истины — `app.knowledge_graph.contract.EDGE_KINDS` (status='active').
 EDGE_SERVES_TRAFFIC = "serves_traffic"   # Service → backing Deployment
 EDGE_ROUTES_TO = "routes_to"             # Ingress → Service
 

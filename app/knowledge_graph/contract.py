@@ -37,7 +37,9 @@ log = logging.getLogger(__name__)
 
 #: KG schema contract version. Bump rules — см. docs/KG_SCHEMA_CONTRACT.md.
 #: 2.1 = после Wave 7 (PodEvent corr / Service+Ingress topology / NATS subjects).
-KG_SCHEMA_VERSION: str = "2.1"
+#: 2.2 = после PR #82 (k8s_jobs_sync), #84 (k8s_storage_sync) и #86
+#: (kg_services.stale_class column + multi-signal owner inference).
+KG_SCHEMA_VERSION: str = "2.2"
 
 
 # ---------------------------------------------------------------------------
@@ -66,6 +68,13 @@ SYNTHETIC_KINDS: Set[str] = {
 #: контрактом для валидации новых типов.
 SERVICE_KINDS: Set[str] = REAL_SERVICE_KINDS | SYNTHETIC_KINDS
 
+#: Node kinds для `kg_volume_edges` (PR #84, k8s_storage_sync). Это
+#: heterogeneous-граф: src/dst могут быть из `kg_services` ИЛИ из
+#: `kg_storage_volumes`. Поэтому отдельный namespacing от SERVICE_KINDS.
+#:   * `service` — обычный сервис из kg_services (любой REAL_SERVICE_KIND);
+#:   * `pvc`/`pv` — узлы из kg_storage_volumes.
+STORAGE_NODE_KINDS: Set[str] = {"service", "pvc", "pv"}
+
 
 # ---------------------------------------------------------------------------
 # Owner sources
@@ -74,12 +83,32 @@ SERVICE_KINDS: Set[str] = REAL_SERVICE_KINDS | SYNTHETIC_KINDS
 #: Откуда мог быть взят `kg_services.team_owner`. Сейчас в схеме поле
 #: одно (без `owner_source`), но мы фиксируем семантику чтобы дальнейшие
 #: волны могли начать прокидывать `owner_source` как metadata-key.
+#:
+#: Naming convention: контракт фиксирует «slug» источника (snake_case,
+#: длинная форма). `ownership_suggester` использует короткие алиасы в поле
+#: `OwnerSuggestion.sources` ради компактности; они должны мапиться сюда:
+#:   suggester    ↔ contract
+#:   prefix       ↔ namespace_prefix
+#:   labels       ↔ k8s_labels
+#:   deploy_history ↔ deploy_history
+#:   manual       ↔ manual
 OWNER_SOURCES: Set[str] = {
-    "manual",            # ручная правка через admin endpoint (планируется PR #19)
-    "k8s_labels",        # лейбл `team-owner` / `owner` на Deployment/StS
-    "namespace_prefix",  # эвристика по namespace (`squad-N` → owner=`squad-N`)
+    "manual",            # ручная правка через admin endpoint / OWNERSHIP_MANIFEST_PATH
+    "k8s_labels",        # лейбл `team-owner` / `owner` / `squad` / part-of (alias: `labels`)
+    "namespace_prefix",  # эвристика по namespace (`squad-N` → owner=`squad-N`) (alias: `prefix`)
+    "deploy_history",    # PR #85: most-frequent `triggered_by` за 30d в kg_deployments
     "platform_static",   # synthetic-узлы platform/data/external — захардкожено
-    "suggested",         # AI/heuristic suggestion (планируется PR #18, нужно approve)
+    "suggested",         # AI/heuristic suggestion (требует approve, planned)
+}
+
+#: Маппинг коротких алиасов из `OwnerSuggestion.sources` в канонические
+#: ключи `OWNER_SOURCES`. Используется тестами `tests/test_contract_drift.py`
+#: и (optionally) дашбордами которые хотят показывать длинные имена.
+OWNER_SOURCE_ALIASES: Dict[str, str] = {
+    "prefix": "namespace_prefix",
+    "labels": "k8s_labels",
+    "deploy_history": "deploy_history",
+    "manual": "manual",
 }
 
 
@@ -90,11 +119,15 @@ OWNER_SOURCES: Set[str] = {
 class EdgeKindSpec(TypedDict):
     """Описание одного edge kind."""
     semantic: str          # что edge значит человеческими словами
-    src_kinds: Set[str]    # допустимые kinds у src service
-    dst_kinds: Set[str]    # допустимые kinds у dst service
+    src_kinds: Set[str]    # допустимые kinds у src
+    dst_kinds: Set[str]    # допустимые kinds у dst
     source: str            # какой sync/parser создаёт edge
     example: str           # пример (для документации)
     status: str            # "active" | "planned"
+    table: str             # где edge живёт: 'kg_service_edges' |
+                           #   'kg_volume_edges' | 'fk_only' (через FK,
+                           #   а не отдельный edge-row) | 'metadata_only'
+                           #   (через owner_service_id metadata column).
 
 
 #: Реестр edge kinds. Любой новый kind должен:
@@ -109,6 +142,7 @@ EDGE_KINDS: Dict[str, EdgeKindSpec] = {
         "source": "kg_sync (env_url_v2 / env_vars / ingress)",
         "example": "town-service --calls--> world-service",
         "status": "active",
+        "table": "kg_service_edges",
     },
     "uses_db": {
         "semantic": "src читает/пишет в БД (synthetic db-узел)",
@@ -117,6 +151,7 @@ EDGE_KINDS: Dict[str, EdgeKindSpec] = {
         "source": "kg_sync (env_vars: *_CONN / *_DSN)",
         "example": "town-service --uses_db--> db:postgres:postgres-squad-1",
         "status": "active",
+        "table": "kg_service_edges",
     },
     "uses_nats": {
         "semantic": "src подключается к NATS-кластеру",
@@ -125,6 +160,7 @@ EDGE_KINDS: Dict[str, EdgeKindSpec] = {
         "source": "kg_sync (nats_env) + nats_subjects_sync (Wave 7-Z)",
         "example": "town-service --uses_nats--> subject:march-export",
         "status": "active",
+        "table": "kg_service_edges",
     },
     "serves_traffic": {
         "semantic": "src получает HTTP-трафик через ingress dst",
@@ -133,6 +169,7 @@ EDGE_KINDS: Dict[str, EdgeKindSpec] = {
         "source": "k8s_topology_resources_sync (Wave 7 / G1.3)",
         "example": "wo-api-squad-1 --serves_traffic--> ingress:wo-api-squad-1.lastoasisgame.com",
         "status": "active",
+        "table": "kg_service_edges",
     },
     "routes_to": {
         "semantic": "ingress правило роутит на backend service",
@@ -141,6 +178,7 @@ EDGE_KINDS: Dict[str, EdgeKindSpec] = {
         "source": "k8s_topology_resources_sync (Wave 7 / G1.3)",
         "example": "ingress:wo-api-squad-1.* --routes_to--> wo-api-squad-1",
         "status": "active",
+        "table": "kg_service_edges",
     },
     "pod_event_of": {
         "semantic": "Pod event (OOMKilled/CrashLoop) принадлежит сервису",
@@ -149,31 +187,45 @@ EDGE_KINDS: Dict[str, EdgeKindSpec] = {
         "source": "runtime_correlation (Wave 7-Y)",
         "example": "kg_pod_events row linked → kg_services row (через service_id FK)",
         "status": "active",
+        # Не отдельный edge-row в kg_service_edges. Связь — через
+        # `kg_pod_events.service_id` FK на kg_services.id. Запись здесь
+        # ради semantic-инвентаризации (graph queries должны понимать,
+        # что pod events ↔ services связаны).
+        "table": "fk_only",
     },
-    # ---- Planned ----
+    # ---- Promoted from planned → active (PR #82, #84) ----
     "runs_as_job": {
         "semantic": "Service запускается как k8s Job/CronJob (не Deployment)",
         "src_kinds": REAL_SERVICE_KINDS,
         "dst_kinds": REAL_SERVICE_KINDS,
-        "source": "k8s_jobs_sync (planned in PR #16)",
-        "example": "backup-cron-town --runs_as_job--> (self, schedule='0 */6 * * *')",
-        "status": "planned",
+        "source": "k8s_jobs_sync (PR #82)",
+        "example": "backup-cron-town --runs_as_job--> owner Service (через K8sJob.owner_service_id)",
+        "status": "active",
+        # Реализовано без отдельного edge-row: `K8sJob.owner_service_id`
+        # metadata-column в `kg_k8s_jobs`. Compromise: ради одного
+        # edge-типа отдельный poly-graph не оправдан.
+        "table": "metadata_only",
     },
     "uses_volume": {
-        "semantic": "Service монтирует PV/PVC (storage dependency)",
-        "src_kinds": REAL_SERVICE_KINDS,
-        "dst_kinds": REAL_SERVICE_KINDS,  # synthetic volume kind может появиться позже
-        "source": "k8s_storage_sync (planned in PR #17)",
+        "semantic": "Service монтирует PVC (storage dependency)",
+        # NB: src/dst живут в STORAGE_NODE_KINDS namespace (`service`/`pvc`),
+        # не в SERVICE_KINDS — потому что dst — узел из kg_storage_volumes,
+        # не из kg_services. validation утилиты должны это учитывать.
+        "src_kinds": {"service"},
+        "dst_kinds": {"pvc"},
+        "source": "k8s_storage_sync.sync_pod_pvc_edges (PR #84)",
         "example": "postgres-squad-1 --uses_volume--> pvc:data-postgres-squad-1-0",
-        "status": "planned",
+        "status": "active",
+        "table": "kg_volume_edges",
     },
     "bound_to": {
         "semantic": "PVC связан с конкретным PV (для cluster-PV резерва)",
-        "src_kinds": REAL_SERVICE_KINDS,
-        "dst_kinds": REAL_SERVICE_KINDS,
-        "source": "k8s_storage_sync (planned in PR #17)",
+        "src_kinds": {"pvc"},
+        "dst_kinds": {"pv"},
+        "source": "k8s_storage_sync.sync_pvcs (PR #84)",
         "example": "pvc:data-postgres-squad-1-0 --bound_to--> pv:pvc-abc123",
-        "status": "planned",
+        "status": "active",
+        "table": "kg_volume_edges",
     },
 }
 
@@ -280,6 +332,30 @@ def owner_known(service: "Service") -> bool:
     if owner.strip().lower() in {"unknown", "n/a", "-", "none"}:
         return False
     return True
+
+
+#: Все известные node-kinds (service + storage). Используется
+#: тестами drift-check для валидации src/dst у edge-specs.
+ALL_NODE_KINDS: Set[str] = SERVICE_KINDS | STORAGE_NODE_KINDS
+
+
+# ---------------------------------------------------------------------------
+# Stale class enum (kg_services.stale_class column, добавлен PR #86)
+# ---------------------------------------------------------------------------
+
+#: Допустимые значения колонки `kg_services.stale_class`. Источник
+#: реализации классификатора — `app.knowledge_graph.stale_classifier`.
+#: Контракт фиксирует именно строковые значения (миграция хранит как
+#: `String`, не PG enum, ради sqlite-compat тестов).
+STALE_CLASS_ACTIVE: str = "active"
+STALE_CLASS_EXPECTED_STALE: str = "expected_stale"
+STALE_CLASS_SUSPICIOUS_STALE: str = "suspicious_stale"
+
+STALE_CLASS_VALUES: Set[str] = {
+    STALE_CLASS_ACTIVE,
+    STALE_CLASS_EXPECTED_STALE,
+    STALE_CLASS_SUSPICIOUS_STALE,
+}
 
 
 def is_edge_kind_known(kind: str) -> bool:
@@ -406,12 +482,19 @@ __all__ = [
     "REAL_SERVICE_KINDS",
     "SYNTHETIC_KINDS",
     "SERVICE_KINDS",
+    "STORAGE_NODE_KINDS",
+    "ALL_NODE_KINDS",
     "OWNER_SOURCES",
+    "OWNER_SOURCE_ALIASES",
     "EDGE_KINDS",
     "EdgeKindSpec",
     "QUALITY_THRESHOLDS",
     "DEPLOY_ATTRIBUTION_WINDOW_DAYS",
     "EDGE_STALE_WINDOW_DAYS",
+    "STALE_CLASS_ACTIVE",
+    "STALE_CLASS_EXPECTED_STALE",
+    "STALE_CLASS_SUSPICIOUS_STALE",
+    "STALE_CLASS_VALUES",
     "is_synthetic",
     "is_orphan",
     "owner_known",

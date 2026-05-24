@@ -16,7 +16,7 @@ The application consists of: an HTTP API (FastAPI), background tasks (Celery), a
 - **FixAgent (`app.agents.fix`)**: generates a structured `ExecutionIntent`; recurrence-aware and Jira-enriched.
 - **SimilarIncidentEngine (`app.core.intelligence.similar_incidents`)**: KG-based recurrence detection (7-day window).
 - **JiraClient (`app.context.jira_client`)**: Atlassian REST API enrichment for FixAgent context.
-- **Knowledge Graph (`app.knowledge_graph.*`)**: auto-populating directed graph in Postgres (5 tables: `kg_services`, `kg_service_edges`, `kg_deployments`, `kg_alerts`, `kg_pod_events`); 8 sync sources (env-vars, NATS env, DSN-from-secret-key, k8s events, k8s ingresses-as-host, **k8s Services + Ingresses as resources (Wave 7-X)**, **NATS subjects from monorepo source (Wave 7-Z)**, **runtime PodEvent co-occurrence (Wave 7-Y)**); confidence scoring with multi-source provenance.
+- **Knowledge Graph (`app.knowledge_graph.*`)**: auto-populating directed graph in Postgres. Core tables: `kg_services`, `kg_service_edges`, `kg_deployments`, `kg_alerts`, `kg_pod_events`. Storage subgraph (PR #84): `kg_storage_volumes` (PVC/PV) + `kg_volume_edges` (heterogeneous). Jobs (PR #82): `kg_k8s_jobs` (Job/CronJob с `owner_service_id`). 10+ sync sources (env-vars, NATS env, DSN-from-secret-key, k8s events, k8s ingresses-as-host, **k8s Services + Ingresses (Wave 7-X)**, **NATS subjects from monorepo source (Wave 7-Z)**, **runtime PodEvent co-occurrence (Wave 7-Y)**, **k8s Jobs/CronJobs (PR #82)**, **PVC/PV storage (PR #84)**). Schema/quality contract — `app/knowledge_graph/contract.py` (KG_SCHEMA_VERSION=2.2); confidence scoring with multi-source provenance.
 - **Alert enrichment (`app.services.alert_enrichment`)**: deterministic KG-based enrichment for `/webhooks/alertmanager/enrich-and-forward` — runs without LLM, ~5 SQL queries, builds `EnrichedContext` (recent_deploys, upstream_alerts, outgoing_deps, pod_events, jira_issues, primary_hypothesis, why_this_matters).
 - **Data layer (`app.database`, `app.repository`)**: SQLAlchemy models and CRUD operations.
 - **Integration layer (`app.services.mcp_client`)**: MCP client for k8s, TeamCity, and other external tools.
@@ -47,6 +47,8 @@ The application consists of: an HTTP API (FastAPI), background tasks (Celery), a
 | `kg_topology_resources_sync` | every 15 min | **Wave 7-X**: k8s Service+Ingress declarative → edges `serves_traffic` + `routes_to` |
 | `kg_runtime_correlation_sync` | every 30 min | **Wave 7-Y**: pod_event co-occurrence (7d window) подтверждает existing edges |
 | `kg_nats_subjects_sync` | every 6h @ :43 | **Wave 7-Z**: parse C# monorepo → subject nodes + `uses_nats` edges с direction (off by default) |
+| `kg_k8s_jobs_sync` | hourly | **PR #82**: k8s Job/CronJob → `kg_k8s_jobs` + `runs_as_job` linkage (через `owner_service_id` metadata column) |
+| `kg_storage_sync` | every 30 min | **PR #84**: PVC/PV + `uses_volume` / `bound_to` edges в `kg_volume_edges` (heterogeneous Service↔PVC↔PV graph) |
 
 ## 3. Data Flow (Webhook Incident Pipeline)
 
