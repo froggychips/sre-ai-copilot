@@ -219,6 +219,22 @@ class Settings(BaseSettings):
         False,
         description="Включить периодический парсер NATS subjects (см. WO-Z, KG Wave 7)",
     )
+    # Periodic ownership backfill (2026-05-24): закрывает gap где
+    # `kg_topology_sync` не пересчитывает team_owner для уже существующих
+    # сервисов (только `_derive_team_owner` prefix-only при первом upsert-е).
+    # Beat task `kg_ownership_backfill` каждые 6h прогоняет multi-signal
+    # inference на сервисах с NULL/'' owner и применяет UPDATE-ы только
+    # при confidence >= OWNERSHIP_BACKFILL_THRESHOLD (default 0.7 —
+    # высокий, чтобы не записать спорные эвристики автоматом).
+    # Default OFF — включается осознанно после dry-run прогона CLI.
+    OWNERSHIP_BACKFILL_ENABLED: bool = Field(
+        False,
+        description="Включить периодический backfill team_owner через multi-signal inference",
+    )
+    OWNERSHIP_BACKFILL_THRESHOLD: float = Field(
+        0.7,
+        description="Минимальный confidence для авто-применения owner-а (default 0.7 — high-confidence)",
+    )
     # Discord Interactions — для обработки нажатий кнопок 👍/👎.
     # Взять из Discord Developer Portal → Application → General Information.
     DISCORD_PUBLIC_KEY: Optional[str] = Field(None, description="Ed25519 публичный ключ приложения Discord")
