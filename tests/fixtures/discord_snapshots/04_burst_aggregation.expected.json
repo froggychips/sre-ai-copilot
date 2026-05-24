@@ -1,0 +1,65 @@
+{
+  "title": "🔴 PREPROD · KubePodCrashLooping · cart-worker",
+  "color": 15022389,
+  "fields": [
+    {
+      "name": "Namespaces",
+      "value": "`prod-kingdom1`",
+      "inline": true
+    },
+    {
+      "name": "Owner",
+      "value": "`squad-1`",
+      "inline": true
+    },
+    {
+      "name": "Replicas",
+      "value": "`0/8`",
+      "inline": true
+    },
+    {
+      "name": "Pod",
+      "value": "`cart-worker-7f8c4b6cdf-a1b2c`",
+      "inline": true
+    },
+    {
+      "name": "Reason",
+      "value": "`CrashLoopBackOff`",
+      "inline": true
+    },
+    {
+      "name": "🎯 Скорее всего",
+      "value": "Deploy #2231 by apleshkov (abc1234) 7 min ago — возможный регресс",
+      "inline": false
+    },
+    {
+      "name": "⭐ Почему важно",
+      "value": "📍 **6 inbound callers** зависят от этого сервиса",
+      "inline": false
+    },
+    {
+      "name": "Recent deploys (~7м)",
+      "value": "• [RebuildCartWorker #2231](https://teamcity.example.com/build/2231) by `apleshkov` [`abc12345`](https://wo-gitlab.lastoasisgame.com/wo/backend/-/commit/abc1234567890def) — 7 min ago — SUCCESS",
+      "inline": false
+    },
+    {
+      "name": "Inbound callers (KG)",
+      "value": "6 через `calls`",
+      "inline": false
+    },
+    {
+      "name": "Recent pod events (k8s)",
+      "value": "• 🩺 `BackOff` ×23 — 5 min ago: Back-off restarting failed container",
+      "inline": false
+    },
+    {
+      "name": "🕒 Pod trail (Wave 7, 1h)",
+      "value": "8 evts: 8 BackOff",
+      "inline": false
+    }
+  ],
+  "description": "Pod prod-kingdom1/cart-worker-7f8c4b6cdf-a1b2c is in CrashLoopBackOff.",
+  "footer": {
+    "text": "copilot/enrich · groupKey=KubePodCrashLooping"
+  }
+}

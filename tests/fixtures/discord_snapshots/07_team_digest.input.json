@@ -1,0 +1,50 @@
+{
+  "_doc": "Case 7: Per-team daily digest (squad-7). render_embed(digest) — Discord embed dict. Покрываем все 6 fields: Services count, Deploys success rate, Alerts breakdown (open + severity + top), Fragile top-5 с bar-шкалой, Stuck alerts (>24h) с severity-emoji, SLO burn aggregates.",
+  "digest": {
+    "team_owner": "squad-7",
+    "window_hours": 24,
+    "generated_at": "2026-05-24T12:00:00+00:00",
+    "service_count": 14,
+    "fragile": [
+      {"name": "auth-service", "namespace": "squad-7-shared", "health_score": 0.22},
+      {"name": "session-store", "namespace": "squad-7-shared", "health_score": 0.41},
+      {"name": "town-api", "namespace": "squad-7-kingdom2", "health_score": 0.65}
+    ],
+    "deploys": {
+      "total": 12,
+      "success": 9,
+      "failed": 3,
+      "success_pct": 75.0
+    },
+    "alerts": {
+      "open_total": 7,
+      "by_severity": {"critical": 1, "warning": 6},
+      "top_alertnames": [
+        ["KubeStatefulSetReplicasMismatch", 4],
+        ["KubePodCrashLooping", 2],
+        ["KubeDeploymentRolloutStuck", 1]
+      ]
+    },
+    "slo": {
+      "samples": 28,
+      "avg_burn_pct": 12.4,
+      "worst_burn_pct": 41.2
+    },
+    "stuck": [
+      {
+        "service": "auth-service",
+        "alertname": "KubePodCrashLooping",
+        "severity_current": "critical",
+        "hours_firing": 36.5,
+        "recurrence_24h": 18
+      },
+      {
+        "service": "session-store",
+        "alertname": "KubeStatefulSetReplicasMismatch",
+        "severity_current": "warning",
+        "hours_firing": 28.0,
+        "recurrence_24h": 3
+      }
+    ]
+  }
+}

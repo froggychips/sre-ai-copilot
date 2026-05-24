@@ -1,0 +1,31 @@
+{
+  "_doc": "Case 6: Chronic alerts digest (4×/день beat task). _format(rows, window_hours) — markdown. Tests detrministic now() (else firing_hours/quiet_min зависят от wallclock).",
+  "now": "2026-05-24T12:00:00+00:00",
+  "window_hours": 24,
+  "rows": [
+    {
+      "namespace": "preprod-kingdom1",
+      "service": "bot-service",
+      "alertname": "KubePodCrashLooping",
+      "fires": 42,
+      "first_fired": "2026-05-23T12:00:00",
+      "last_fired": "2026-05-24T11:45:00"
+    },
+    {
+      "namespace": "prod-shared",
+      "service": "clickhouse-shard0",
+      "alertname": "KubePodCrashLooping",
+      "fires": 18,
+      "first_fired": "2026-05-23T14:30:00",
+      "last_fired": "2026-05-24T11:50:00"
+    },
+    {
+      "namespace": "prod-kingdom2",
+      "service": "push-db",
+      "alertname": "KubeStatefulSetReplicasMismatch",
+      "fires": 9,
+      "first_fired": "2026-05-23T18:15:00",
+      "last_fired": "2026-05-24T10:00:00"
+    }
+  ]
+}

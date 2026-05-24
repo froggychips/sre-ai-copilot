@@ -1,0 +1,60 @@
+{
+  "_doc": "Case 3: KubeStatefulSetReplicasMismatch warning · clickhouse-keeper. Жёлтый цвет, БЕЗ Wave 7 секций (critical-only), outgoing_deps только counts inline, без primary_hypothesis (нет rule_facts), pod_events top-1 без message.",
+  "incident": {
+    "incident_id": "fp-snap-03",
+    "severity": "warning",
+    "status": "firing",
+    "summary": "StatefulSet replicas mismatch.",
+    "description": "StatefulSet preprod-shared/clickhouse-keeper has not matched the expected number of replicas for longer than 15 minutes.",
+    "namespace": "preprod-shared",
+    "labels": {
+      "alertname": "KubeStatefulSetReplicasMismatch",
+      "severity": "warning",
+      "namespace": "preprod-shared",
+      "statefulset": "clickhouse-keeper"
+    },
+    "annotations": {},
+    "starts_at": "2026-05-24T11:15:00Z"
+  },
+  "service": "clickhouse-keeper",
+  "team_owner": "platform",
+  "in_kg": true,
+  "pod_name": "clickhouse-keeper-1",
+  "container_reason": "PodInitializing",
+  "replicas_ready_desired": "2/3",
+  "recent_deploys": [],
+  "upstream_alerts": [],
+  "recurrence_24h": [],
+  "inbound_count_by_kind": {
+    "calls": 3
+  },
+  "outgoing_deps": [
+    {
+      "kind": "uses_db",
+      "service": "etcd",
+      "namespace": "kube-system",
+      "confidence_score": 0.7,
+      "discovery_sources": ["kg_sync/env_vars"]
+    },
+    {
+      "kind": "calls",
+      "service": "vault-agent",
+      "namespace": "preprod-shared",
+      "confidence_score": 0.5,
+      "discovery_sources": ["kg_sync/url"]
+    }
+  ],
+  "pod_events": [
+    {
+      "reason": "Unhealthy",
+      "pod_name": "clickhouse-keeper-1",
+      "count": 4,
+      "minutes_before": 8,
+      "message": "Readiness probe failed: connection refused"
+    }
+  ],
+  "rule_facts": [],
+  "jira_issues": [],
+  "rollout_noise": false,
+  "kg_data_age_sec": 900
+}
