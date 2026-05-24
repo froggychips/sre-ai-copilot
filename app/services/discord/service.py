@@ -32,8 +32,11 @@ from .dedup import (
     _webhook_edit_endpoint,
 )
 from .embed_builder import (
+    _build_blast_radius_field,
     _build_deploy_correlation_field,
     _build_log_error_rate_field,
+    _build_nats_impact_field,
+    _build_pod_trail_field,
     _format_recurrence_tag,
     _format_sha_link,
     _summarize_self_health_detail,
@@ -995,6 +998,21 @@ class DiscordService:
 
         # Phase 3-A: "Гипотеза" (legacy field) удалена — теперь
         # «🎯 Скорее всего» выше по полю primary_hypothesis(). Дубликат не нужен.
+
+        # Wave 7 (PRs #70 #71 #72): blast radius / NATS impact / pod trail.
+        # Только для critical (warning compact-mode не трогаем). Каждый
+        # builder сам skip-if-empty — embed не раздувается на сервисах
+        # без NATS/Ingress/PodEvent данных.
+        if is_critical:
+            blast_field = _build_blast_radius_field(head.blast_radius)
+            if blast_field:
+                fields.append(blast_field)
+            nats_field = _build_nats_impact_field(head.nats_impact)
+            if nats_field:
+                fields.append(nats_field)
+            trail_field = _build_pod_trail_field(head.pod_trail)
+            if trail_field:
+                fields.append(trail_field)
 
         # Generator link (Grafana) — если есть
         if incident.generator_url:
