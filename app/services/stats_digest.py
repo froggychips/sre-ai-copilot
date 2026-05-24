@@ -334,6 +334,11 @@ def unowned_namespaces_section(
         sug = suggest_owner_multi_signal(ns, db)
         if sug.owner is None:
             owner_str = "`?`"
+        elif sug.owner == "multi-squad":
+            # Bare `<env>-shared` намеренно подсвечивает «нужен manual», не врёт
+            # конкретным squad-ом. Без bold (не high-confidence) и без `?`-суффикса
+            # (это явный actionable маркер, а не догадка).
+            owner_str = "`multi-squad` (shared, manual nudge)"
         else:
             base = f"`@{sug.owner}`"
             # Bold для high-confidence suggestion.
@@ -360,16 +365,19 @@ _NOISE_ALERTNAMES = frozenset({"InfoInhibitor", "Watchdog", "CPUThrottlingHigh"}
 def _alert_type_metadata(
     db: Optional[Session],
     alertnames: List[str],
-) -> Dict[str, Dict[str, int]]:
+) -> Dict[str, Dict[str, Optional[int]]]:
     """Для каждого alertname посчитать (yesterday_cnt, chronic, resurfaced)
     из kg_alerts.
 
     Definitions:
-      - `yesterday_cnt`: distinct (service_id) с этим alertname за 24-48h назад.
+      - `yesterday_cnt`: count series с этим alertname за 24-48h назад.
+        **None** если за окно 24-48h в `kg_alerts` нет данных вообще
+        (например, alert_state ещё не отслеживался ⇒ new baseline);
+        **0** если данные есть, но не для этого alertname (legit «не fired»).
       - `chronic`: число сервисов где (service_id, alertname) имел ≥3 fires
-        за последние 24h.
+        за последние 24h. None если 24h-окно пусто (нет tracking-а).
       - `resurfaced`: число сервисов где есть resolved_at И позже него ещё один
-        fired_at в последних 24h (alert ушёл и вернулся).
+        fired_at в последних 24h. None если 24h-окно пусто.
 
     Если таблицы нет / db is None / запрос упал — возвращаем пустой dict.
     Caller рендерит без этих полей.
@@ -377,9 +385,27 @@ def _alert_type_metadata(
     if db is None or not alertnames:
         return {}
     try:
+        # Сначала проверяем наличие данных в окнах — нужно различать
+        # «alert не fired вчера» (legit 0) и «вообще нет истории» (None /
+        # new baseline). Если в kg_alerts за окно вообще 0 rows, отмечаем
+        # `*_has_history=False`.
+        yest_has_rows = db.execute(text("""
+            SELECT EXISTS(
+                SELECT 1 FROM kg_alerts
+                WHERE fired_at BETWEEN NOW() - INTERVAL '48 hours'
+                                   AND NOW() - INTERVAL '24 hours'
+                LIMIT 1
+            )
+        """)).scalar()
+        today_has_rows = db.execute(text("""
+            SELECT EXISTS(
+                SELECT 1 FROM kg_alerts
+                WHERE fired_at > NOW() - INTERVAL '24 hours'
+                LIMIT 1
+            )
+        """)).scalar()
+
         # 1) yesterday: за окно 24-48h назад, count(*) по alertname.
-        # Group on alertname only; sample per series (не distinct), чтобы
-        # сравниваться с today-count из VM firing-series.
         yest_rows = db.execute(text("""
             SELECT alertname, count(*) AS cnt
             FROM kg_alerts
@@ -431,14 +457,14 @@ def _alert_type_metadata(
         log.warning("stats_digest.alert_type_metadata_failed", error=str(e))
         return {}
 
-    return {
-        name: {
-            "yesterday": yesterday.get(name, 0),
-            "chronic": chronic.get(name, 0),
-            "resurfaced": resurfaced.get(name, 0),
+    out: Dict[str, Dict[str, Optional[int]]] = {}
+    for name in alertnames:
+        out[name] = {
+            "yesterday": yesterday.get(name, 0) if yest_has_rows else None,
+            "chronic": chronic.get(name, 0) if today_has_rows else None,
+            "resurfaced": resurfaced.get(name, 0) if today_has_rows else None,
         }
-        for name in alertnames
-    }
+    return out
 
 
 def top_alert_types_section(
@@ -475,14 +501,26 @@ def top_alert_types_section(
 
         parts: List[str] = []
         yesterday = meta["yesterday"]
-        if yesterday > 0 or metadata:
-            delta = cnt - yesterday
-            sign = "+" if delta >= 0 else ""
-            parts.append(f"Δ24h {sign}{delta}")
-        if meta["chronic"]:
-            parts.append(f"{meta['chronic']} chronic")
-        if meta["resurfaced"]:
-            parts.append(f"{meta['resurfaced']} resurfaced")
+        chronic = meta["chronic"]
+        resurfaced = meta["resurfaced"]
+
+        # None у yesterday/chronic/resurfaced = «нет истории за окно». Раньше
+        # мы превращали это в 0 и тихо рендерили `Δ24h +cnt` — что вводит в
+        # заблуждение. Теперь явно проставляем `(new baseline)` маркер и не
+        # показываем нулевые Δ-поля.
+        if yesterday is None and chronic is None and resurfaced is None:
+            parts.append("new baseline")
+        else:
+            if yesterday is None:
+                parts.append("Δ24h ?")
+            else:
+                delta = cnt - yesterday
+                sign = "+" if delta >= 0 else ""
+                parts.append(f"Δ24h {sign}{delta}")
+            if chronic:
+                parts.append(f"{chronic} chronic")
+            if resurfaced:
+                parts.append(f"{resurfaced} resurfaced")
 
         suffix = f" ({', '.join(parts)})" if parts else ""
         lines.append(f"  `{name}` × {cnt}{suffix}")
@@ -776,6 +814,39 @@ def _humanize_ago(iso_str: Optional[str], now: Optional[datetime] = None) -> str
     return f"{secs // 86400}d ago"
 
 
+def _cascade_fingerprint(build: dict) -> Tuple[Any, ...]:
+    """Fingerprint для агрегации cascade-deploys.
+
+    Один TC build (build chain triggered одним `Build and update` action)
+    может выкатить 3+ сервиса в одном kingdom — TC создаёт N отдельных
+    билдов с **одинаковым** `(number, branch, triggered_by, status)`. Без
+    группировки они засоряют embed по 3 строки на одно событие.
+
+    Намеренно НЕ включаем `id` (он у каждого билда свой) и НЕ финализуем
+    по `finished_at` (cascade-builds стартуют параллельно и финишируют в
+    разное время — sub-минутные расхождения).
+    """
+    return (
+        build.get("number"),
+        (build.get("branch") or "").replace("refs/heads/", ""),
+        build.get("triggered_by") or build.get("triggered_type"),
+        build.get("status"),
+    )
+
+
+def _format_services_list(names: List[str], cap: int = 3) -> str:
+    """`['town-service', 'chat-tasks-service', 'map-service', 'a', 'b']`
+    → `'town-service/chat-tasks-service/map-service +2 more'`."""
+    if not names:
+        return "?"
+    shown = names[:cap]
+    rest = len(names) - cap
+    base = "/".join(shown)
+    if rest > 0:
+        base += f" +{rest} more"
+    return base
+
+
 async def recent_deploys_section(
     *,
     lookback_hours: int = 24,
@@ -788,37 +859,81 @@ async def recent_deploys_section(
     «кто что катил» — рабочий запрос: top-N finished deploy-builds, sorted
     by finished_at. Показывает trigger-user (или type для auto-triggered).
 
+    2026-05-24 preview-fix: cascade-deploys (один TC «Build and update»
+    разваливает на N parallel deploy-builds для разных сервисов в одном ns)
+    агрегируются по fingerprint `(number, branch, triggered_by, status)`.
+    Один build = одна логическая запись с `svc1/svc2/svc3 +N more`.
+
+    Header:
+      - есть результаты за 24h → `(24h)`;
+      - 24h пусто → fallback на 7d, header → `(last 7d, 24h тихо)`;
+      - 7d тоже пусто → секция скрыта.
+
     `fetch_fn` — для DI в тестах. По умолчанию `teamcity_service.recent_deploys`.
     """
     if fetch_fn is None:
         from app.services.teamcity_service import recent_deploys as _rd
         fetch_fn = _rd
     try:
-        builds = await fetch_fn(lookback_hours=lookback_hours, limit=limit)
+        builds = await fetch_fn(lookback_hours=lookback_hours, limit=limit * 4)
     except Exception as e:
         log.warning("stats_digest.recent_deploys_failed", error=str(e))
         return ""
 
-    # Если TC не сконфигурирован или за окно нет deploy-билдов — секцию вообще
-    # не показываем, чтобы не шуметь в digest. Header без данных бесполезен.
+    header_suffix = f"({lookback_hours}h)"
+    # Fallback: если за 24h пусто (тихий день), попробуем 7d-окно и пометим
+    # header чтобы зритель понимал «секция не баг — просто 24h спокойно».
+    if not builds and lookback_hours <= 24:
+        try:
+            builds = await fetch_fn(lookback_hours=24 * 7, limit=limit * 4)
+        except Exception as e:
+            log.warning("stats_digest.recent_deploys_fallback_failed", error=str(e))
+            return ""
+        if builds:
+            header_suffix = "(last 7d, 24h тихо)"
+
     if not builds:
         return ""
-    lines = [f"**🔧 Recent deploys** (последние {lookback_hours}h)"]
+
+    # Aggregate cascade-deploys по fingerprint, сохраняя порядок (newest first).
+    groups: Dict[Tuple[Any, ...], Dict[str, Any]] = {}
+    for b in builds:
+        fp = _cascade_fingerprint(b)
+        if fp in groups:
+            groups[fp]["builds"].append(b)
+        else:
+            groups[fp] = {"first": b, "builds": [b]}
+
+    lines = [f"**🔧 Recent deploys** {header_suffix}"]
 
     now = datetime.now(timezone.utc)
-    for b in builds:
-        user = b.get("triggered_by")
-        trig_type = b.get("triggered_type") or "?"
+    for fp, grp in list(groups.items())[:limit]:
+        first = grp["first"]
+        group_builds = grp["builds"]
+
+        user = first.get("triggered_by")
+        trig_type = first.get("triggered_type") or "?"
         actor = f"`{user}`" if user else f"_{trig_type}_"
-        btype = b.get("buildtype_name") or "?"
-        branch = (b.get("branch") or "?").replace("refs/heads/", "")
-        num = b.get("number") or "?"
-        status = b.get("status") or "?"
-        ago = _humanize_ago(b.get("finished_at"), now)
+        branch = (first.get("branch") or "?").replace("refs/heads/", "")
+        num = first.get("number") or "?"
+        status = first.get("status") or "?"
+        ago = _humanize_ago(first.get("finished_at"), now)
         status_marker = "" if status == "SUCCESS" else f" · ⚠️ {status}"
-        lines.append(
-            f"  • by {actor} · `{btype}` ({branch} #{num}) · {ago}{status_marker}"
-        )
+
+        if len(group_builds) == 1:
+            # Single-build (нет cascade) — старый формат, чтобы не ломать
+            # backwards-compat с existing snapshot-тестами.
+            btype = first.get("buildtype_name") or "?"
+            lines.append(
+                f"  • by {actor} · `{btype}` ({branch} #{num}) · {ago}{status_marker}"
+            )
+        else:
+            # Cascade aggregation: список service-имён сжимается до svc1/svc2/svc3 +N.
+            service_names = [b.get("buildtype_name") or "?" for b in group_builds]
+            services_str = _format_services_list(service_names)
+            lines.append(
+                f"  • #{num} by {actor} · {ago} · `{services_str}` @ {branch}{status_marker}"
+            )
     return "\n".join(lines)
 
 
