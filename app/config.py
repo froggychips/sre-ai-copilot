@@ -188,6 +188,13 @@ class Settings(BaseSettings):
         None,
         description="Discord webhook для stuck-alerts escalation (пусто → embed skip)",
     )
+    # Wave 7-Z: парсер NATS subjects из WO monorepo (см. nats_subjects_sync.py).
+    # OFF by default — task ходит на ssh wo-gitlab + клонирует репо локально,
+    # включается осознанно после ручного --dry-run прогона.
+    NATS_SUBJECTS_PARSER_ENABLED: bool = Field(
+        False,
+        description="Включить периодический парсер NATS subjects (см. WO-Z, KG Wave 7)",
+    )
     # Discord Interactions — для обработки нажатий кнопок 👍/👎.
     # Взять из Discord Developer Portal → Application → General Information.
     DISCORD_PUBLIC_KEY: Optional[str] = Field(None, description="Ed25519 публичный ключ приложения Discord")
