@@ -144,6 +144,103 @@ Read-side API used by enrichment + MCP tools:
   - log error rate
 - Consumed by the daily team digest (fragile top-5 ranking) and by `health_score.py` (per-service composite).
 
+### Wave 7-X: declarative k8s topology resources (`app/knowledge_graph/k8s_topology_resources_sync.py`)
+- `sync_topology_resources(db)` — главная функция. Каждые 15 минут beat task
+  `kg_topology_resources_sync` делает `kubectl get services -A -o json` и
+  `kubectl get ingresses -A -o json`, upsert-ит `kg_services` с
+  `metadata_json` (service_type, ports, selector), и пишет два новых вида edges.
+- **Edge `serves_traffic`** (`EDGE_SERVES_TRAFFIC`): Service → backing
+  Deployment. Алгоритм — selector-match Service.spec.selector на pod
+  template labels всех known Deployments в том же namespace. Если матч
+  есть — edge upsert с `discovered_by="k8s_topology_resources/service"`.
+  Если Service-резерв не имеет match'а на Deployment, он всё равно
+  регистрируется как node (downstream Ingress может на него routes-ить).
+- **Edge `routes_to`** (`EDGE_ROUTES_TO`): Ingress (как ресурс) → backend
+  Service. Synthetic-узел `ingress:<name>` создаётся, если в KG ещё нет.
+  Параллельный slice к `k8s_ingress_sync` (который строит `ingress:<host>` →
+  backend как `calls`) — Ingress-as-resource vs Ingress-as-host. Merge
+  через `populator.upsert_edge` (`extras.discovery_sources`).
+- **Cluster-wide RBAC**: требует `services`, `ingresses` на verbs
+  `get`/`list`/`watch` в ClusterRole (см. `k8s/base/rbac.yaml`,
+  `helm/sre-ai-copilot/templates/rbac.yaml`).
+- **Без feature flag** — declarative, idempotent, нет внешних зависимостей
+  кроме `kubectl` в окружении worker-pod-а.
+- **Failure mode**: `subprocess.TimeoutExpired` или non-zero exit kubectl —
+  logs.warning, beat tick'а возвращает пустой result, следующий tick попробует
+  снова.
+- CLI: `python -m app.knowledge_graph.k8s_topology_resources_sync [namespace]`
+  (один ns или все).
+
+### Wave 7-Y: PodEvent runtime correlation (`app/knowledge_graph/runtime_correlation.py`)
+- `run_runtime_correlation_sync(db)` — главная async-функция. Beat task
+  `kg_runtime_correlation_sync` каждые 30 минут.
+- **Метод.** Sliding window `RUNTIME_CORRELATION_LOOKBACK_DAYS` (default 7d)
+  по `kg_pod_events`. Для каждой пары (src, dst), где edge уже существует,
+  считаем co-occurrences в окне `RUNTIME_CORRELATION_WINDOW_MINUTES` (default
+  15 мин). Если count ≥ `RUNTIME_CORRELATION_MIN_COUNT` (default 2) —
+  подтверждаем edge: вызываем `populator.upsert_edge` с `discovered_by =
+  "kg_sync/runtime_corr"`. `populator` добавит источник в
+  `extras.discovery_sources`-merge и обновит `last_seen_at`.
+- **Confidence integration.** `kg_sync/runtime_corr` зарегистрирован в
+  `confidence._SOURCE_PRECEDENCE` как tier-1 источник (precedence 0.95).
+  Multi-source provenance (env + runtime_corr) → высший confidence
+  badge в Discord embed.
+- **Не создаёт новые edges.** По дизайну — симметричный сигнал co-fail
+  не определяет direction. Если в KG нет edge (src, dst, kind), runtime
+  correlation его не добавит. Direction discovery остаётся за declarative
+  источниками (env, Service-selector, Ingress, NATS-monorepo).
+- **Reasons whitelist** (`DEFAULT_CORRELATION_REASONS`): BackOff, Unhealthy,
+  OOMKilled, FailedScheduling, CrashLoopBackOff, FailedMount,
+  ImagePullBackOff. Узкая diagnostic-subset — NodeNotReady и подобные
+  cluster-wide reasons исключены: они дают false-positive каждой паре
+  сервисов на ноде.
+- **Synthetic-исключение.** `_is_synthetic()` фильтрует synthetic-узлы
+  (NATS-cluster, ingress:host, subject:* и т.п.) — их pod_events идут
+  через cluster-wide kubelet.
+- **Feature flag:** `RUNTIME_CORRELATION_ENABLED=true` (включён по
+  умолчанию). При `False` task пропускается с info-логом.
+- CLI: `python -m app.knowledge_graph.runtime_correlation`.
+
+### Wave 7-Z: NATS subjects parser (`app/knowledge_graph/nats_subjects_sync.py`)
+- `sync_nats_subjects(db, monorepo_path=...)` — главная функция. Beat
+  task `kg_nats_subjects_sync` каждые 6 часов @ minute=43 (offset от drift/ingress/stuck).
+- **Stage 1 — git sync** (`_ensure_monorepo`): shallow clone
+  (`--depth=1`) + sparse-checkout (`GR.Platform`, `GR.Platform.Features`,
+  `GR.WO.*`) в `WO_MONOREPO_PATH` (default `/var/lib/sre-ai/wo-monorepo`).
+  При повторном run — `git fetch origin master + reset --hard`.
+- **Stage 2 — parse** (`parse_monorepo` → `parse_csharp_text`):
+  - **Subject constants resolver** (`_load_subject_constants`) — один
+    проход по `GR.Platform/DataBus/Nats/NatsConst.cs`,
+    собирает `NatsSubjectConst.<NAME>` → литеральная строка.
+  - **Subscribers** — regex на классы, унаследованные от
+    `NatsJetStreamConsumer<T>` / `NatsJetStreamBatchConsumer<T>` /
+    `MapNatsJetStreamConsumer<T>` / `MapNatsJetStreamBatchConsumer<T>`.
+    Subject из `Subject => NatsSubjectConst.<NAME>` или `Subject => "literal"`.
+  - **Publishers** — regex на `SendToJetStreamAsync(...)` /
+    `PublishAsync(...)`, первый аргумент или named `subject:` =
+    `NatsSubjectConst.<NAME>` или литерал.
+  - **Service name** (`_service_name_from_path`): путь
+    `GR.WO.<X.Y.Z>/...` → `<x>-<y>-<z>` (lowercase, dots-to-dash).
+    Примеры: `GR.WO.Map.Service/...` → `map-service`,
+    `GR.WO.MapCoordinator.Service/...` → `mapcoordinator-service`,
+    `GR.WO.City.Workers/...` → `city-workers`. Эти имена матчатся с
+    Deployment-именами в k8s.
+- **Stage 3 — persist** (`persist_to_kg`):
+  - Subject = synthetic-Service в `nats-subjects` namespace, `name =
+    subject:<value>`. Hidden by `synthetic=True`.
+  - Edge `uses_nats`, src=service, dst=subject. `extras.direction ∈
+    {pub, sub}`, `weight = count(call-sites)`. Идемпотентно по
+    `(src_id, dst_id, kind, extras.direction)`.
+- **Failure mode.** Git/ssh failure → logger.warning + skip; tests via
+  `tests/kg/fixtures/nats_csharp/` без сетевых вызовов.
+- **Feature flag:** `NATS_SUBJECTS_PARSER_ENABLED=false` (выключен по
+  умолчанию — требует ssh-доступ к gitlab-monorepo). Включается осознанно
+  после ручного `--dry-run` прогона.
+- **Env vars**: `WO_MONOREPO_PATH`, `WO_MONOREPO_SSH_URL`,
+  `WO_MONOREPO_SPARSE_DIRS`.
+- CLI: `python -m app.knowledge_graph.nats_subjects_sync [--dry-run]
+  [--path PATH]`.
+
 ### Self-health (`app/knowledge_graph/self_health.py`)
 "Monitoring of the monitoring." Six canaries against KG data quality, run every 30 minutes by the `kg_self_health_check` beat task.
 
