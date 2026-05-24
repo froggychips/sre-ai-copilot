@@ -1,0 +1,84 @@
+{
+  "_doc": "Case 2: Тот же KubePodCrashLooping через 4 часа — resurfaced=True + PATCH-dedup footer. Симулируем эффект _patch_enriched_recurrence (count=3 за 30мин окно).",
+  "_simulated_dedup_count": 3,
+  "_simulated_dedup_ttl_min": 30,
+  "incident": {
+    "incident_id": "fp-snap-02",
+    "severity": "critical",
+    "status": "firing",
+    "summary": "Pod is crash looping.",
+    "description": "Pod prod-shared/clickhouse-shard0-0 is in waiting state (reason: \"CrashLoopBackOff\").",
+    "namespace": "prod-shared",
+    "labels": {
+      "alertname": "KubePodCrashLooping",
+      "severity": "critical",
+      "namespace": "prod-shared",
+      "statefulset": "clickhouse-shard0",
+      "pod": "clickhouse-shard0-0",
+      "container": "clickhouse"
+    },
+    "annotations": {},
+    "starts_at": "2026-05-24T14:42:00Z"
+  },
+  "service": "clickhouse-shard0",
+  "pod": "clickhouse-shard0-0",
+  "team_owner": "platform",
+  "in_kg": true,
+  "pod_name": "clickhouse-shard0-0",
+  "container_reason": "CrashLoopBackOff",
+  "replicas_ready_desired": "0/2",
+  "recent_deploys": [],
+  "upstream_alerts": [],
+  "recurrence_24h": [
+    {"id": 1},
+    {"id": 2}
+  ],
+  "inbound_count_by_kind": {
+    "calls": 18,
+    "uses_db": 7
+  },
+  "outgoing_deps": [],
+  "pod_events": [
+    {
+      "reason": "BackOff",
+      "pod_name": "clickhouse-shard0-0",
+      "count": 1389,
+      "minutes_before": 12,
+      "message": "Back-off restarting failed container"
+    }
+  ],
+  "rule_facts": [
+    {
+      "kind": "crashloop",
+      "observed": true,
+      "confidence": 0.95,
+      "source_rule": "PodEventsRule",
+      "evidence": {
+        "reason": "BackOff",
+        "count": 1389,
+        "message": "Back-off restarting failed container"
+      }
+    }
+  ],
+  "jira_issues": [],
+  "rollout_noise": false,
+  "kg_data_age_sec": 600,
+  "blast_radius": {
+    "services": ["bot-service", "stats-aggregator", "town-api"],
+    "urls": ["api.lastoasisgame.com"],
+    "services_total": 5,
+    "urls_total": 1
+  },
+  "nats_impact": [
+    {
+      "subject": "leaderboard.flush",
+      "direction": "pub",
+      "impact_count": 4,
+      "impact_others": []
+    }
+  ],
+  "pod_trail": {
+    "total": 18,
+    "by_reason": [["BackOff", 13], ["Unhealthy", 5]]
+  }
+}

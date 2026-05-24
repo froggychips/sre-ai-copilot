@@ -1,0 +1,70 @@
+{
+  "title": "🔴 PREPROD · KubePodCrashLooping · clickhouse-shard0 · 🔁 ×2 за 24h · 🌀 RESURFACED",
+  "color": 15022389,
+  "fields": [
+    {
+      "name": "Namespaces",
+      "value": "`prod-shared`",
+      "inline": true
+    },
+    {
+      "name": "Owner",
+      "value": "`platform`",
+      "inline": true
+    },
+    {
+      "name": "Replicas",
+      "value": "`0/2`",
+      "inline": true
+    },
+    {
+      "name": "Pod",
+      "value": "`clickhouse-shard0-0`",
+      "inline": true
+    },
+    {
+      "name": "Reason",
+      "value": "`CrashLoopBackOff`",
+      "inline": true
+    },
+    {
+      "name": "🎯 Скорее всего",
+      "value": "k8s `BackOff` ×1389 (хроник 1000+ retries) — pod не запускается",
+      "inline": false
+    },
+    {
+      "name": "⭐ Почему важно",
+      "value": "🌐 **Shared dep**: 25 inbound callers — blast radius широкий\n⚙️ **Infra-critical**: team_owner=`platform` — обычно shared/foundational\n🔥 **Хроник**: pod_event `BackOff` × 1389 retries — несколько суток крашится, нужен owner",
+      "inline": false
+    },
+    {
+      "name": "Inbound callers (KG)",
+      "value": "18 через `calls`, 7 через `uses_db`",
+      "inline": false
+    },
+    {
+      "name": "Recent pod events (k8s)",
+      "value": "• 🩺 `BackOff` ×1389 — 12 min ago: Back-off restarting failed container",
+      "inline": false
+    },
+    {
+      "name": "🎯 Blast radius (Wave 7)",
+      "value": "5 svc → `bot-service`, `stats-aggregator`, `town-api` (+2)\n1 URL → `api.lastoasisgame.com`",
+      "inline": false
+    },
+    {
+      "name": "📨 NATS impact (Wave 7)",
+      "value": "• pub→`leaderboard.flush` (4 sub-консьюмеров)",
+      "inline": false
+    },
+    {
+      "name": "🕒 Pod trail (Wave 7, 1h)",
+      "value": "18 evts: 13 BackOff, 5 Unhealthy",
+      "inline": false
+    }
+  ],
+  "description": "Pod prod-shared/clickhouse-shard0-0 is in waiting state (reason: \"CrashLoopBackOff\").",
+  "footer": {
+    "text": "copilot/enrich · groupKey=KubePodCrashLooping · ×3 в 30мин · first <TS> · last <TS>"
+  }
+}
