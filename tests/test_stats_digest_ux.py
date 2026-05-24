@@ -10,7 +10,7 @@
 """
 from collections import Counter, defaultdict
 from datetime import datetime, timedelta, timezone
-from unittest.mock import MagicMock, AsyncMock, patch
+from unittest.mock import MagicMock, AsyncMock
 
 import pytest
 
