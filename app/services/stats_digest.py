@@ -594,6 +594,9 @@ def fragile_services_section(db: Session, ns_to_team: Dict[str, str]) -> str:
 # (`tests/test_stats_digest_ux.py` импортирует `stats_digest._classify_stale`
 # по имени), плюс константы оставлены чтобы старые тесты на содержимое
 # `_EXPECTED_STALE_NAMESPACES` не падали.
+from app.knowledge_graph.contract import (  # noqa: E402
+    STALE_CLASS_EXPECTED_STALE,
+)
 from app.knowledge_graph.schema import Service  # noqa: E402
 # Re-exports для legacy-import паттерна (stats_digest._EXPECTED_STALE_*) —
 # тесты и внешний код могут импортировать константы через stats_digest module.
@@ -666,7 +669,7 @@ def stale_deployments_section(
         """primary: kg_services.stale_class; fallback: legacy эвристика."""
         col = stale_class_map.get((ns, name))
         if col is not None:
-            return col == "expected_stale"
+            return col == STALE_CLASS_EXPECTED_STALE
         return _classify_stale(name, ns) == "expected"
 
     now = datetime.now(timezone.utc)

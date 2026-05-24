@@ -1,7 +1,7 @@
 # KG Schema / Quality Contract
 
-> **Версия контракта:** `kg_schema: 2.1`
-> **Дата:** 2026-05-24 (после merge PR #74-77 — Wave 7 / discord dedup)
+> **Версия контракта:** `kg_schema: 2.2`
+> **Дата:** 2026-05-24 (после merge PR #82/#84/#86 — k8s_jobs / k8s_storage / stale_class)
 > **Источник истины кода:** [`app/knowledge_graph/contract.py`](../app/knowledge_graph/contract.py)
 
 Документ описывает что в Knowledge Graph считается **service**,
@@ -20,7 +20,7 @@
 ## 1. Версия
 
 ```
-KG_SCHEMA_VERSION = "2.1"
+KG_SCHEMA_VERSION = "2.2"
 ```
 
 `major.minor`:
@@ -36,8 +36,8 @@ KG_SCHEMA_VERSION = "2.1"
 | Версия | Дата | Что добавлено |
 |---|---|---|
 | 2.0 | Wave 6 (2026-05-16) | Базовый contract: `calls` / `uses_db` / `uses_nats`, synthetic flag, health_score |
-| **2.1** | Wave 7 (2026-05-22) | + `serves_traffic`, `routes_to`, `pod_event_of`; `subject:` synthetic |
-| 2.2 (planned) | PR #16 / #17 | + `runs_as_job`, `uses_volume`, `bound_to` |
+| 2.1 | Wave 7 (2026-05-22) | + `serves_traffic`, `routes_to`, `pod_event_of`; `subject:` synthetic |
+| **2.2** | 2026-05-24 (PR #82/#84/#86) | + `runs_as_job` (через `K8sJob.owner_service_id`), `uses_volume`/`bound_to` (в `kg_volume_edges`), `kg_services.stale_class` column (active/expected_stale/suspicious_stale), `deploy_history` owner source |
 
 ---
 
@@ -78,6 +78,20 @@ target'ом).
 быть без inbound edges (если никто их не использует — это валидное
 состояние), либо без outbound (они terminal). Считать их orphan'ами
 загрязняет показатель.
+
+### 2.3. Storage node kinds (`STORAGE_NODE_KINDS`)
+
+Введены в 2.2 для гетерогенных edges (`uses_volume` / `bound_to`,
+живут в `kg_volume_edges`):
+
+| Kind | Таблица | Описание |
+|---|---|---|
+| `service` | `kg_services` | Любой REAL_SERVICE_KIND (deployment/statefulset/daemonset) |
+| `pvc` | `kg_storage_volumes` | PersistentVolumeClaim |
+| `pv` | `kg_storage_volumes` | PersistentVolume (cluster-scoped) |
+
+NB: `pvc`/`pv` — это `kg_storage_volumes.kind`, не `kg_services.kind`. Они
+не учитываются в orphan-метрике (которая считается по `kg_services`).
 
 ---
 
@@ -129,16 +143,24 @@ AND lower(team_owner) NOT IN {'unknown', 'n/a', '-', 'none'}`.
 
 ### 5.1. Источники owner-а (`OWNER_SOURCES`)
 
-| Source | Кто проставляет | Приоритет |
-|---|---|---|
-| `manual` | admin endpoint (PR #19, pending) | 1 (override) |
-| `k8s_labels` | `kg_sync` через `team-owner`/`owner` label | 2 |
-| `namespace_prefix` | `_derive_team_owner()` — squad-N → squad-N | 3 (fallback) |
-| `platform_static` | synthetic-узлы (ingress=external, db=data, nats=platform) | при создании |
-| `suggested` | PR #18 (pending) — AI/heuristic suggestion, требует approve | 4 (только если ничего выше) |
+| Source (canonical) | Alias в `ownership_suggester` | Кто проставляет | Приоритет |
+|---|---|---|---|
+| `manual` | `manual` | admin endpoint / `OWNERSHIP_MANIFEST_PATH` (yaml) | 1 (override, confidence=1.0) |
+| `k8s_labels` | `labels` | `kg_sync` через `team-owner`/`owner`/`squad`/`part-of` label | 2 (weight 0.2 в multi-signal fusion) |
+| `namespace_prefix` | `prefix` | `_derive_team_owner()` / `_try_prefix_match` — `squad-N-*` → squad-N | 3 (weight 0.4) |
+| `deploy_history` | `deploy_history` | PR #85 multi-signal — most-frequent `triggered_by` за 30d из `kg_deployments` | 4 (weight 0.4) |
+| `platform_static` | (hardcoded в kg_sync) | synthetic-узлы (ingress=external, db=data, nats=platform) | при создании |
+| `suggested` | (placeholder) | AI/heuristic suggestion, требует approve | 5 (только если ничего выше) |
+
+Multi-signal fusion (PR #85, `app/services/ownership_suggester.py`):
+суммирует weighted scores prefix/deploy_history/labels, top-1 побеждает;
+manual override полностью обходит fusion. См. `OwnerSuggestion.sources`
+для прозрачности — какие сигналы сработали.
+
+Mapping коротких алиасов в canonical — `contract.OWNER_SOURCE_ALIASES`.
 
 Сейчас в схеме `kg_services` нет колонки `owner_source` — это backlog
-на 2.2/3.0. Логика выбора уже в кодовых путях; константы зафиксированы
+на 3.0. Логика выбора уже в кодовых путях; константы зафиксированы
 в `OWNER_SOURCES`.
 
 ### 5.2. Quality threshold
@@ -150,25 +172,69 @@ AND lower(team_owner) NOT IN {'unknown', 'n/a', '-', 'none'}`.
 ## 6. Edge kinds inventory
 
 Полный реестр — `app/knowledge_graph/contract.py` константой
-`EDGE_KINDS`. Все active + planned:
+`EDGE_KINDS`. Колонка `table` указывает, где edge физически живёт:
 
-| kind | src kinds | dst kinds | semantic | source (sync/parser) | example | status |
+* `kg_service_edges` — стандартная таблица для homogeneous edges (Service→Service);
+* `kg_volume_edges` — heterogeneous storage-граф (Service↔PVC↔PV);
+* `fk_only` — semantic-edge без отдельного row (через FK другой таблицы);
+* `metadata_only` — связь через metadata-column на ноде (`K8sJob.owner_service_id`).
+
+Все active (planned пока нет):
+
+| kind | src kinds | dst kinds | semantic | source (sync/parser) | table | status |
 |---|---|---|---|---|---|---|
-| `calls` | real | real ∪ ingress | Синхронный HTTP/gRPC | `kg_sync` (env_url_v2, env_vars, ingress) | town-service → world-service | active |
-| `uses_db` | real | `db` | Read/write в БД | `kg_sync` (env_vars `*_CONN`/`*_DSN`) | town-service → db:postgres:postgres-squad-1 | active |
-| `uses_nats` | real | `nats` ∪ `subject` | NATS pub/sub | `kg_sync` (nats_env) + `nats_subjects_sync` | town-service → subject:march-export | active |
-| `serves_traffic` | real | `ingress` | Принимает HTTP-трафик через ingress | `k8s_topology_resources_sync` (Wave 7-X) | wo-api-squad-1 → ingress:wo-api-squad-1.lastoasisgame.com | active |
-| `routes_to` | `ingress` | real | Ingress правило роутит на backend | `k8s_topology_resources_sync` (Wave 7-X) | ingress:wo-api.* → wo-api-squad-1 | active |
-| `pod_event_of` | real | real | Pod event linked к сервису (через FK, не отдельный edge — для документации) | `runtime_correlation` (Wave 7-Y) | kg_pod_events.service_id → kg_services.id | active |
-| `runs_as_job` | real | real | Service запускается как k8s Job/CronJob | `k8s_jobs_sync` | backup-cron-town → (self, schedule) | **planned (PR #16)** |
-| `uses_volume` | real | real | Service монтирует PV/PVC | `k8s_storage_sync` | postgres-squad-1 → pvc:data-postgres-squad-1-0 | **planned (PR #17)** |
-| `bound_to` | real | real | PVC bound к PV (cluster-PV резерв) | `k8s_storage_sync` | pvc:data-postgres-squad-1-0 → pv:pvc-abc123 | **planned (PR #17)** |
+| `calls` | real | real ∪ ingress | Синхронный HTTP/gRPC | `kg_sync` (env_url_v2, env_vars, ingress) | `kg_service_edges` | active |
+| `uses_db` | real | `db` | Read/write в БД | `kg_sync` (env_vars `*_CONN`/`*_DSN`) | `kg_service_edges` | active |
+| `uses_nats` | real | `nats` ∪ `subject` | NATS pub/sub | `kg_sync` (nats_env) + `nats_subjects_sync` | `kg_service_edges` | active |
+| `serves_traffic` | real | `ingress` | Принимает HTTP-трафик через ingress | `k8s_topology_resources_sync` (Wave 7-X) | `kg_service_edges` | active |
+| `routes_to` | `ingress` | real | Ingress правило роутит на backend | `k8s_topology_resources_sync` (Wave 7-X) | `kg_service_edges` | active |
+| `pod_event_of` | real | real | Pod event linked к сервису | `runtime_correlation` (Wave 7-Y) | `fk_only` (`kg_pod_events.service_id`) | active |
+| `runs_as_job` | real | real | Service запускается как k8s Job/CronJob | `k8s_jobs_sync` (PR #82) | `metadata_only` (`K8sJob.owner_service_id`) | active |
+| `uses_volume` | `service` | `pvc` | Service монтирует PVC | `k8s_storage_sync` (PR #84) | `kg_volume_edges` | active |
+| `bound_to` | `pvc` | `pv` | PVC bound к PV (cluster-PV резерв) | `k8s_storage_sync` (PR #84) | `kg_volume_edges` | active |
 
 Каждый kind должен:
 
 1. Появиться в `EDGE_KINDS` с `status='planned'` **до** merge wave-а.
 2. Переключиться в `'active'` одновременно с merge.
 3. Бампнуть `KG_SCHEMA_VERSION` (см. §8).
+
+### 6.1. Не-edge-row реализации (важно)
+
+Три из 9 active kinds не пишутся как rows в `kg_service_edges`:
+
+* **`pod_event_of`** (`fk_only`): связь — через `kg_pod_events.service_id`
+  FK. Это сделано чтобы PodEvent оставался first-class узлом со своими
+  timestamps, а не «edge с extras».
+* **`runs_as_job`** (`metadata_only`): связь — через `K8sJob.owner_service_id`
+  в `kg_k8s_jobs`. Compromise: один edge-тип не оправдывает отдельный
+  poly-graph.
+* **`uses_volume`** / **`bound_to`** (`kg_volume_edges`): отдельная таблица
+  с `src_kind`/`src_id`/`dst_kind`/`dst_id` (без FK constraint) ради
+  heterogeneous src/dst (Service↔PVC↔PV).
+
+Drift-test `tests/test_contract_drift.py` исключает эти kinds из «должен
+быть kind="..." литерал в коде»-проверки.
+
+---
+
+## 6.5. Stale class (`kg_services.stale_class`, добавлено в 2.2)
+
+PR #86 — first-class column на `kg_services` со значением классификации
+«насколько свежий сервис». Источник истины enum-значений —
+`contract.STALE_CLASS_VALUES`:
+
+| Value | Условие | Где обрабатывается |
+|---|---|---|
+| `active` | `last_deploy_at` < 30 дней назад | `kg_sync.sync_namespace` → `kg_services.stale_class` |
+| `expected_stale` | backup/cron/system ns или infra-owner + deploy за 60d | `stats_digest.stale_deployments_section` (скрывает или compact-pill) |
+| `suspicious_stale` | нет deploy за 30d, не expected | dashboards / SQL `WHERE stale_class = 'suspicious_stale'` |
+
+Реализация классификатора — `app/knowledge_graph/stale_classifier.py`
+(re-export из contract для backward-compat).
+
+Storage: `String`, не PG enum (sqlite-compat тестов; см. миграцию
+`20260524_0200_add_kg_services_stale_class.py`).
 
 ---
 
@@ -246,20 +312,33 @@ worker startup). Сверяет:
 Файлы, которые **должны** импортировать константы отсюда:
 
 * `app/services/stats_digest.py` — `is_orphan`, `is_synthetic`,
-  `QUALITY_THRESHOLDS` для orphan/owner pct.
+  `QUALITY_THRESHOLDS` для orphan/owner pct; `STALE_CLASS_EXPECTED_STALE`
+  для фильтрации stale_deployments.
 * `app/knowledge_graph/health_score.py` — `is_synthetic` (чтобы
   скипать synthetic из health-compute).
 * `app/knowledge_graph/drift_cleanup.py` — `EDGE_STALE_WINDOW_DAYS`,
   `EDGE_KINDS` для валидации.
+* `app/knowledge_graph/stale_classifier.py` — re-export
+  `STALE_CLASS_VALUES` из contract (canonical source).
+* `app/services/ownership_suggester.py` — `OWNER_SOURCE_ALIASES` для
+  маппинга коротких имён сигналов в canonical.
 * Новые wave'ы (sync/parser) — `EDGE_KINDS` для писательного контракта
   (kind должен быть в реестре до того как уйдёт в БД).
 
 Категорически **нельзя** хардкодить:
 
 * Литералы edge kinds (`"calls"`, `"uses_db"`...) — импортируем ключи
-  из `EDGE_KINDS`.
+  из `EDGE_KINDS` или используем local-constants, которые точно
+  совпадают с реестром (drift-test это валидирует).
 * Synthetic-префиксы — импортируем `SYNTHETIC_KINDS`.
 * Threshold-числа orphan / owner — `QUALITY_THRESHOLDS[...]`.
+* Stale-class strings (`"expected_stale"` и т.п.) — используем
+  `STALE_CLASS_ACTIVE` / `STALE_CLASS_EXPECTED_STALE` /
+  `STALE_CLASS_SUSPICIOUS_STALE`.
+
+Auto-validation — `tests/test_contract_drift.py` (Gate #22). Падение
+при добавлении нового kind = либо забыли занести в `EDGE_KINDS`, либо
+naming drift.
 
 ---
 

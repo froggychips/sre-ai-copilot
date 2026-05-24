@@ -11,6 +11,7 @@ from sqlalchemy.orm import sessionmaker
 
 from app.database import Base
 from app.knowledge_graph.contract import (
+    ALL_NODE_KINDS,
     EDGE_KINDS,
     KG_SCHEMA_VERSION,
     OWNER_SOURCES,
@@ -45,9 +46,15 @@ def test_schema_version_non_empty_and_semver_like():
 
 def test_edge_kinds_contains_all_active_known_in_master():
     """Все edge kinds, которые сейчас реально пишутся sync-ами в master,
-    должны присутствовать в EDGE_KINDS со status='active'."""
+    должны присутствовать в EDGE_KINDS со status='active'.
+
+    После PR #82/#84/#86 (k8s_jobs / k8s_storage / stale_class) три
+    ранее planned kind-а промоутнуты в active.
+    """
     must_have_active = {
-        "calls", "uses_db", "uses_nats", "serves_traffic", "routes_to",
+        "calls", "uses_db", "uses_nats",
+        "serves_traffic", "routes_to",
+        "runs_as_job", "uses_volume", "bound_to",
     }
     for kind in must_have_active:
         assert kind in EDGE_KINDS, f"edge kind {kind!r} отсутствует в EDGE_KINDS"
@@ -56,33 +63,44 @@ def test_edge_kinds_contains_all_active_known_in_master():
         )
 
 
-def test_edge_kinds_includes_planned_for_next_waves():
-    """Wave PR #16/#17 — runs_as_job, uses_volume, bound_to должны быть
-    в реестре с пометкой planned, чтобы при их merge сразу подсветить."""
+def test_no_stale_planned_kinds_after_merges():
+    """После merge PR #82/#84/#86 ни один из этих kinds не должен оставаться
+    в `planned` — иначе drift между контрактом и реальностью.
+    """
     planned = planned_edge_kinds()
-    assert "runs_as_job" in planned
-    assert "uses_volume" in planned
-    assert "bound_to" in planned
+    for kind in ("runs_as_job", "uses_volume", "bound_to"):
+        assert kind not in planned, (
+            f"{kind!r} реализован в master, но остался planned — это drift"
+        )
 
 
 def test_edge_kind_spec_shape():
-    """Каждая запись EDGE_KINDS имеет полный набор полей."""
-    required_keys = {"semantic", "src_kinds", "dst_kinds", "source", "example", "status"}
+    """Каждая запись EDGE_KINDS имеет полный набор полей, включая `table`
+    (где edge физически живёт: kg_service_edges / kg_volume_edges /
+    fk_only / metadata_only).
+    """
+    required_keys = {"semantic", "src_kinds", "dst_kinds", "source", "example", "status", "table"}
+    valid_tables = {"kg_service_edges", "kg_volume_edges", "fk_only", "metadata_only"}
     for kind, spec in EDGE_KINDS.items():
         assert required_keys.issubset(spec.keys()), (
-            f"edge kind {kind!r} спека неполная: {set(spec.keys())}"
+            f"edge kind {kind!r} спека неполная: missing={required_keys - set(spec.keys())}"
         )
         assert spec["status"] in {"active", "planned"}, (
             f"unknown status {spec['status']!r} for {kind!r}"
         )
-        # src/dst kinds — подмножество SERVICE_KINDS
-        assert spec["src_kinds"].issubset(SERVICE_KINDS), (
-            f"{kind}.src_kinds содержит неизвестный kind: "
-            f"{spec['src_kinds'] - SERVICE_KINDS}"
+        assert spec["table"] in valid_tables, (
+            f"{kind!r}: unknown table {spec['table']!r}"
         )
-        assert spec["dst_kinds"].issubset(SERVICE_KINDS), (
+        # src/dst kinds — подмножество ALL_NODE_KINDS (service-kinds ∪
+        # storage-node-kinds). uses_volume/bound_to живут в namespace
+        # `service`/`pvc`/`pv`, остальные — в SERVICE_KINDS.
+        assert spec["src_kinds"].issubset(ALL_NODE_KINDS), (
+            f"{kind}.src_kinds содержит неизвестный kind: "
+            f"{spec['src_kinds'] - ALL_NODE_KINDS}"
+        )
+        assert spec["dst_kinds"].issubset(ALL_NODE_KINDS), (
             f"{kind}.dst_kinds содержит неизвестный kind: "
-            f"{spec['dst_kinds'] - SERVICE_KINDS}"
+            f"{spec['dst_kinds'] - ALL_NODE_KINDS}"
         )
 
 
@@ -224,8 +242,26 @@ def test_startup_contract_check_flags_unknown_kind(db):
     assert "bogus_kind_xyz" in report["unknown_edge_kinds"]
 
 
-def test_startup_contract_check_flags_planned_present(db):
-    """Если planned kind уже встречается в БД — должен попасть в planned_in_db."""
+def test_startup_contract_check_flags_planned_present(db, monkeypatch):
+    """Если planned kind уже встречается в БД — должен попасть в planned_in_db.
+
+    После promotion `runs_as_job`/`uses_volume`/`bound_to` в active никаких
+    planned kinds в EDGE_KINDS сейчас нет, поэтому инжектим временный
+    planned-маркер через monkeypatch, чтобы проверить механизм.
+    """
+    import app.knowledge_graph.contract as contract_mod
+    fake_planned: contract_mod.EdgeKindSpec = {
+        "semantic": "test-only planned kind",
+        "src_kinds": contract_mod.REAL_SERVICE_KINDS,
+        "dst_kinds": contract_mod.REAL_SERVICE_KINDS,
+        "source": "test",
+        "example": "x → y",
+        "status": "planned",
+        "table": "kg_service_edges",
+    }
+    patched_kinds = {**contract_mod.EDGE_KINDS, "__test_planned__": fake_planned}
+    monkeypatch.setattr(contract_mod, "EDGE_KINDS", patched_kinds)
+
     a = Service(name="a", namespace="ns", team_owner="t")
     a.synthetic = False
     b = Service(name="b", namespace="ns", team_owner="t")
@@ -233,14 +269,14 @@ def test_startup_contract_check_flags_planned_present(db):
     db.add_all([a, b])
     db.flush()
     edge = ServiceEdge(
-        src_id=a.id, dst_id=b.id, kind="runs_as_job", weight=1,
+        src_id=a.id, dst_id=b.id, kind="__test_planned__", weight=1,
     )
     db.add(edge)
     db.commit()
 
     report = STARTUP_CONTRACT_CHECK(db)
-    assert "runs_as_job" in report["planned_in_db"]
-    assert "runs_as_job" not in report["unknown_edge_kinds"]
+    assert "__test_planned__" in report["planned_in_db"]
+    assert "__test_planned__" not in report["unknown_edge_kinds"]
 
 
 def test_startup_contract_check_orphan_pct_calculated(db):

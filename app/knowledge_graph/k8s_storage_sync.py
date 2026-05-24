@@ -52,9 +52,14 @@ logger = logging.getLogger(__name__)
 
 _KUBECTL_TIMEOUT_S = 30
 
-# Edge kinds
-EDGE_USES_VOLUME = "uses_volume"  # Service → PVC
-EDGE_BOUND_TO = "bound_to"        # PVC → PV
+# Edge kinds — источник истины `app.knowledge_graph.contract.EDGE_KINDS`.
+# Локальные алиасы — лишь сахар для read-сайта, чтобы при grep'е по
+# модулю их сразу видеть.
+EDGE_USES_VOLUME = "uses_volume"  # Service → PVC (kg_volume_edges)
+EDGE_BOUND_TO = "bound_to"        # PVC → PV (kg_volume_edges)
+# NB: при добавлении нового kind — сначала добавить в contract.EDGE_KINDS
+# с status='planned', потом писать sync; только после merge переключать
+# на 'active' и бампать KG_SCHEMA_VERSION.
 
 # Node kinds (для VolumeEdge.src_kind / dst_kind)
 NODE_SERVICE = "service"
