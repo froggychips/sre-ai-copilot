@@ -6,18 +6,21 @@
 
 Секции (в порядке вывода):
   1. cluster_health — VMClient.get_cluster_health() + trend vs yesterday
-     из kg_cluster_observations + count firing series
+     из kg_cluster_observations + count firing series + Δ к Redis-snapshot
   2. firing_alerts_by_squad — группировка firing-series по namespace→team_owner из KG
-  3. top_alert_types — top-5 по alertname
-  4. anomaly_summary — total/severity/by-metric breakdown за 24h из
+  3. unowned_namespaces — top-5 unowned ns + suggested owner heuristic
+  4. top_alert_types — top-3 alertname + Δ24h + chronic/resurfaced count
+  5. anomaly_summary — total/severity/by-metric breakdown за 24h из
      kg_anomaly_observations (Wave 2)
-  5. anomaly_top — persistent (service, metric) пары за 7d (Wave 2)
-  6. log_errors — top-3 service по error/fatal count за 24h из
+  6. anomaly_top — persistent (service, metric) пары за 7d (Wave 2)
+  7. log_errors — top-3 service по error/fatal count за 24h из
      kg_log_observations (Wave 2; пусто пока Seq env-vars не заданы)
-  7. recent_deploys — TC deployer activity за окно
-  8. fragile_services — top-3 services по composite health_score из KG
-  9. stale_deployments — kubectl-обход WO-namespaces, idle ≥ STATS_DIGEST_STALE_DAYS
-  10. kg_quality — services/edges/orphan%/team_owner coverage
+  8. recent_deploys — TC deployer activity за окно
+  9. blast_radius / fragile_services — split: fragile (health_score<0.7 + ≥3 callers)
+     vs blast-radius (просто много callers)
+  10. stale_deployments — kubectl-обход WO-namespaces, idle ≥ STATS_DIGEST_STALE_DAYS.
+      Backup/system-deployments фильтруются (expected stale).
+  11. kg_quality — services/edges/orphan%/team_owner coverage
 
 Запускается через Celery beat task `daily_stats_digest`
 (см. app/workers/tasks.py).
@@ -54,6 +57,57 @@ def _get_ns_to_team_map(db: Session) -> Dict[str, str]:
         GROUP BY namespace
     """)).fetchall()
     return {ns: team for ns, team in rows}
+
+
+# Redis key для firing-series day-over-day trend (item #3 stats-UX).
+# TTL 25h — чтобы переписывалось каждым daily-run, но не дольше суток без
+# обновления (если digest упал — следующий run покажет «(new baseline)» при
+# expired ключе).
+_FIRING_SERIES_REDIS_KEY = "stats:firing_series:last_day"
+_FIRING_SERIES_REDIS_TTL = 25 * 3600
+
+
+async def _read_last_firing_series() -> Optional[int]:
+    """Прочитать вчерашний firing-count из Redis. None если ключа нет."""
+    try:
+        from app.services.alert_dedup import _get_client
+        client = _get_client()
+        raw = await client.get(_FIRING_SERIES_REDIS_KEY)
+        if raw is None:
+            return None
+        return int(raw)
+    except Exception as e:
+        log.warning("stats_digest.firing_series_redis_read_failed", error=str(e))
+        return None
+
+
+async def _write_last_firing_series(value: int) -> None:
+    """Сохранить сегодняшний count для завтрашнего сравнения."""
+    try:
+        from app.services.alert_dedup import _get_client
+        client = _get_client()
+        await client.set(_FIRING_SERIES_REDIS_KEY, str(value), ex=_FIRING_SERIES_REDIS_TTL)
+    except Exception as e:
+        log.warning("stats_digest.firing_series_redis_write_failed", error=str(e))
+
+
+def _fmt_firing_series_trend(today: int, yesterday: Optional[int]) -> str:
+    """Формат trend-суффикса для `Firing series: 673 (+47 vs вчера, +7.5%)`.
+
+    Если yesterday is None — это первый запуск, метим `(new baseline)`.
+    Если разница 0 — `(=0 vs вчера)`.
+    """
+    if yesterday is None:
+        return " (new baseline)"
+    delta = today - yesterday
+    if delta == 0:
+        return " (=0 vs вчера)"
+    sign = "+" if delta > 0 else ""
+    if yesterday > 0:
+        pct = (delta / yesterday) * 100
+        return f" ({sign}{delta} vs вчера, {sign}{pct:.1f}%)"
+    # yesterday=0, today>0 → не делим на ноль, просто +N
+    return f" ({sign}{delta} vs вчера)"
 
 
 def _fmt_delta_pp(today: Optional[float], yesterday: Optional[float]) -> str:
@@ -128,6 +182,8 @@ async def cluster_health_section(
     vm: VMClient,
     fired_series: List[dict],
     db: Optional[Session] = None,
+    *,
+    firing_series_yesterday: Optional[int] = None,
 ) -> str:
     """1. Cluster health snapshot + trend vs yesterday.
 
@@ -138,6 +194,10 @@ async def cluster_health_section(
 
     `db` опционален для backwards-compat в тестах: если не передан, trend
     не считается.
+
+    `firing_series_yesterday` — count из Redis-snapshot прошлого digest-run.
+    Используется для дельты `Firing series: 673 (+47 vs вчера, +7.5%)`.
+    None → метим `(new baseline)`.
     """
     try:
         ch = await vm.get_cluster_health()
@@ -148,8 +208,11 @@ async def cluster_health_section(
         log.warning("stats_digest.cluster_health_failed", error=str(e))
         nodes, crash = "?", "?"
 
+    firing_today = len(fired_series)
+    firing_trend = _fmt_firing_series_trend(firing_today, firing_series_yesterday)
     snapshot_line = (
-        f"  Nodes ready: `{nodes}` · Crashloops: `{crash}` · Firing series: `{len(fired_series)}`"
+        f"  Nodes ready: `{nodes}` · Crashloops: `{crash}` · "
+        f"Firing series: `{firing_today}`{firing_trend}"
     )
 
     trend = _cluster_trend_24h(db) if db is not None else None
@@ -191,11 +254,15 @@ async def cluster_health_section(
 def firing_alerts_section(
     fired_series: List[dict],
     ns_to_team: Dict[str, str],
-) -> Tuple[str, Counter, defaultdict]:
+) -> Tuple[str, Counter, defaultdict, defaultdict]:
     """2. Firing-series, grouped by squad (через KG namespace→team).
 
-    Возвращает (rendered_text, unique_alertnames, team_alerts) — второе и
-    третье для использования в top_alert_types_section и для DI.
+    Возвращает (rendered_text, unique_alertnames, team_alerts, unowned_ns_counts).
+    `unowned_ns_counts` теперь возвращается отдельно — рендерится в собственной
+    секции `unowned_namespaces_section` с suggested-owner эвристикой, а не
+    inline-перечислением `monitoring=44, squad-7-shared=36, ...`.
+
+    Юнит «series» (не русское «с», которое глаз читает как секунды).
     """
     ns_alerts: defaultdict = defaultdict(Counter)
     unique_alerts: Counter = Counter()
@@ -220,17 +287,50 @@ def firing_alerts_section(
     if not team_alerts and not unowned:
         lines.append("  ✅ ни одной серии — кластер здоров")
     else:
-        # Inline-формат «@team Nс, ...» — раньше каждая team была отдельной
-        # строкой (6-7 строк), теперь одна.
+        # Inline-формат «@team N series, ...» — single body line per teams.
         sorted_teams = sorted(team_alerts, key=lambda t: -team_alerts[t])
         if sorted_teams:
-            parts = ", ".join(f"`@{t}` {team_alerts[t]}с" for t in sorted_teams)
+            parts = ", ".join(f"`@{t}` {team_alerts[t]} series" for t in sorted_teams)
             lines.append(f"  {parts}")
-        if unowned:
-            top = sorted(unowned.items(), key=lambda x: -x[1])[:3]
-            parts = ", ".join(f"{n}={c}" for n, c in top)
-            lines.append(f"  _unowned_: {parts}")
-    return "\n".join(lines), unique_alerts, team_alerts
+    return "\n".join(lines), unique_alerts, team_alerts, unowned
+
+
+def unowned_namespaces_section(
+    unowned: defaultdict,
+    db: Optional[Session] = None,
+    *,
+    top_n: int = 5,
+) -> str:
+    """3. Unowned-namespaces — отдельной секцией с suggested-owner эвристикой.
+
+    Раньше unowned рисовался inline в firing_alerts (`monitoring=44, ...`),
+    что не actionable: непонятно, кому стыдить. Теперь:
+
+      🔎 Unowned namespaces — нужны owner
+        • monitoring         — 44 series · suggest: `@platform`
+        • squad-7-shared     — 36 series · suggest: `@squad-7`
+        • prod-cdn           — 12 series · suggest: `@cdn`
+        • lo-tools           — 8 series  · suggest: `?`
+
+    Источник suggest: `ownership_suggester.suggest_owners_bulk`.
+
+    Если unowned пуст — секцию скрываем ("").
+    """
+    if not unowned:
+        return ""
+
+    from app.services.ownership_suggester import suggest_owners_bulk
+
+    top = sorted(unowned.items(), key=lambda x: -x[1])[:top_n]
+    ns_list = [ns for ns, _ in top]
+    suggestions = suggest_owners_bulk(ns_list, db)
+
+    lines = ["**🔎 Unowned namespaces** — нужны owner"]
+    for ns, count in top:
+        owner = suggestions.get(ns)
+        owner_str = f"`@{owner}`" if owner else "`?`"
+        lines.append(f"  • `{ns}` — {count} series · suggest: {owner_str}")
+    return "\n".join(lines)
 
 
 # Noise-алерты Prometheus stack-а — не реальные проблемы, фильтруем
@@ -240,8 +340,102 @@ def firing_alerts_section(
 _NOISE_ALERTNAMES = frozenset({"InfoInhibitor", "Watchdog", "CPUThrottlingHigh"})
 
 
-def top_alert_types_section(unique_alerts: Counter) -> str:
-    """3. Top-3 alertname по числу series, без infrastructure-noise."""
+def _alert_type_metadata(
+    db: Optional[Session],
+    alertnames: List[str],
+) -> Dict[str, Dict[str, int]]:
+    """Для каждого alertname посчитать (yesterday_cnt, chronic, resurfaced)
+    из kg_alerts.
+
+    Definitions:
+      - `yesterday_cnt`: distinct (service_id) с этим alertname за 24-48h назад.
+      - `chronic`: число сервисов где (service_id, alertname) имел ≥3 fires
+        за последние 24h.
+      - `resurfaced`: число сервисов где есть resolved_at И позже него ещё один
+        fired_at в последних 24h (alert ушёл и вернулся).
+
+    Если таблицы нет / db is None / запрос упал — возвращаем пустой dict.
+    Caller рендерит без этих полей.
+    """
+    if db is None or not alertnames:
+        return {}
+    try:
+        # 1) yesterday: за окно 24-48h назад, count(*) по alertname.
+        # Group on alertname only; sample per series (не distinct), чтобы
+        # сравниваться с today-count из VM firing-series.
+        yest_rows = db.execute(text("""
+            SELECT alertname, count(*) AS cnt
+            FROM kg_alerts
+            WHERE alertname = ANY(:names)
+              AND fired_at BETWEEN NOW() - INTERVAL '48 hours' AND NOW() - INTERVAL '24 hours'
+            GROUP BY alertname
+        """), {"names": alertnames}).fetchall()
+        yesterday: Dict[str, int] = {name: cnt for name, cnt in yest_rows}
+
+        # 2) chronic — service где (service_id, alertname) имеет ≥3 fires за 24h.
+        chronic_rows = db.execute(text("""
+            SELECT alertname, count(*) AS chronic_svc
+            FROM (
+                SELECT alertname, service_id, count(*) AS fires
+                FROM kg_alerts
+                WHERE alertname = ANY(:names)
+                  AND fired_at > NOW() - INTERVAL '24 hours'
+                  AND service_id IS NOT NULL
+                GROUP BY alertname, service_id
+                HAVING count(*) >= 3
+            ) t
+            GROUP BY alertname
+        """), {"names": alertnames}).fetchall()
+        chronic: Dict[str, int] = {name: cnt for name, cnt in chronic_rows}
+
+        # 3) resurfaced — service-alertname пары где есть resolved + позднее fired.
+        # Heuristic: max(resolved_at) < max(fired_at) при ≥2 fires.
+        resurf_rows = db.execute(text("""
+            SELECT alertname, count(*) AS resurf_svc
+            FROM (
+                SELECT alertname, service_id,
+                       max(resolved_at) AS last_resolved,
+                       max(fired_at) AS last_fired,
+                       count(*) AS fires
+                FROM kg_alerts
+                WHERE alertname = ANY(:names)
+                  AND fired_at > NOW() - INTERVAL '24 hours'
+                  AND service_id IS NOT NULL
+                GROUP BY alertname, service_id
+                HAVING count(*) >= 2
+                   AND max(resolved_at) IS NOT NULL
+                   AND max(resolved_at) < max(fired_at)
+            ) t
+            GROUP BY alertname
+        """), {"names": alertnames}).fetchall()
+        resurfaced: Dict[str, int] = {name: cnt for name, cnt in resurf_rows}
+
+    except Exception as e:
+        log.warning("stats_digest.alert_type_metadata_failed", error=str(e))
+        return {}
+
+    return {
+        name: {
+            "yesterday": yesterday.get(name, 0),
+            "chronic": chronic.get(name, 0),
+            "resurfaced": resurfaced.get(name, 0),
+        }
+        for name in alertnames
+    }
+
+
+def top_alert_types_section(
+    unique_alerts: Counter,
+    db: Optional[Session] = None,
+) -> str:
+    """4. Top-3 alertname по числу series, без infrastructure-noise.
+
+    Каждая строка обогащается метаданными из kg_alerts:
+      `KubeDeploymentReplicasMismatch × 75 (Δ24h +12, 23 chronic, 8 resurfaced)`
+
+    Если db is None или таблицы нет — рендерим базовый формат без
+    дополнительных полей (backwards-compat с тестами).
+    """
     filtered = Counter({
         name: cnt for name, cnt in unique_alerts.items()
         if name not in _NOISE_ALERTNAMES
@@ -249,9 +443,32 @@ def top_alert_types_section(unique_alerts: Counter) -> str:
     lines = ["**📋 Top alert types** (без infra-noise)"]
     if not filtered:
         lines.append("  _нет активных алертов_")
-    else:
-        for name, cnt in filtered.most_common(3):
+        return "\n".join(lines)
+
+    top = filtered.most_common(3)
+    top_names = [name for name, _ in top]
+    metadata = _alert_type_metadata(db, top_names)
+
+    for name, cnt in top:
+        meta = metadata.get(name)
+        if meta is None:
+            # без db / запрос упал → базовый формат
             lines.append(f"  `{name}` × {cnt}")
+            continue
+
+        parts: List[str] = []
+        yesterday = meta["yesterday"]
+        if yesterday > 0 or metadata:
+            delta = cnt - yesterday
+            sign = "+" if delta >= 0 else ""
+            parts.append(f"Δ24h {sign}{delta}")
+        if meta["chronic"]:
+            parts.append(f"{meta['chronic']} chronic")
+        if meta["resurfaced"]:
+            parts.append(f"{meta['resurfaced']} resurfaced")
+
+        suffix = f" ({', '.join(parts)})" if parts else ""
+        lines.append(f"  `{name}` × {cnt}{suffix}")
     return "\n".join(lines)
 
 
@@ -264,55 +481,126 @@ def _health_marker(score: float) -> str:
     return "🔴"
 
 
+# Item #6 stats-UX: fragile vs blast-radius. «Fragile» — это активный сигнал
+# деградации (health_score < threshold + ≥3 callers). «Blast-radius» — просто
+# много inbound callers (риск, если что-то сломается, но сейчас всё ОК).
+# Старая секция «Top fragile services» по inbound-callers без health_score —
+# неправильно называла «fragile» то, что было просто «много callers».
+_FRAGILE_HEALTH_THRESHOLD = 0.7
+_FRAGILE_MIN_CALLERS = 3
+
+
 def fragile_services_section(db: Session, ns_to_team: Dict[str, str]) -> str:
-    """4. Top fragile services по health_score (low = bad).
+    """4. Top fragile / blast-radius services.
 
-    Раньше сортировали по inbound-degree, что давало bias на NATS-узлы
-    (которых много кто использует, но они синтетика и реальное состояние
-    нерелевантно). Теперь — composite health_score из beat-task'а
-    `kg_health_recompute`, который учитывает alerts × severity + crashloop +
-    recurrence. Synthetic и неизмеренные сервисы исключаем.
+    Two paths:
+      A) Если есть health_score для сервисов:
+         - fragile = health_score < 0.7 AND inbound_callers ≥ 3 → секция
+           «Top fragile services» (composite health_score из KG).
+         - остальные (health либо хороший, либо нет, но callers ≥ 3) →
+           «Top blast-radius services» (по inbound callers).
+      B) Если health_score ни у кого не посчитан → только blast-radius
+         (никаких inferred-fragile, чтобы не врать терминологией).
 
-    Если health_score ни у кого не посчитан (beat ещё не прошёл на dev) —
-    fallback на старый inbound-запрос с явной пометкой.
+    Sort и cap = 3 на каждую секцию. Если обе пусты — рендерим plain blast-radius
+    fallback с пометкой `нет edges`.
     """
-    rows = db.execute(text("""
-        SELECT name, namespace, health_score
-        FROM kg_services
-        WHERE NOT synthetic AND health_score IS NOT NULL
-        ORDER BY health_score ASC NULLS LAST
-        LIMIT 3
-    """)).fetchall()
-    if rows:
-        lines = ["**🔗 Top fragile services** (composite health_score из KG)"]
-        for name, ns, score in rows:
+    # Pull all candidate services с inbound-callers count + health_score.
+    # SELECT в один проход; дальше классифицируем в Python.
+    try:
+        rows = db.execute(text("""
+            SELECT s.name, s.namespace, s.health_score,
+                   count(e.id) AS callers
+            FROM kg_services s
+            LEFT JOIN kg_service_edges e ON e.dst_id = s.id
+            WHERE NOT s.synthetic
+              AND (s.team_owner IS NULL OR s.team_owner != 'platform')
+            GROUP BY s.id, s.name, s.namespace, s.health_score
+            HAVING count(e.id) > 0
+            ORDER BY callers DESC
+        """)).fetchall()
+    except Exception as e:
+        log.warning("stats_digest.fragile_query_failed", error=str(e))
+        rows = []
+
+    fragile: List[Tuple[str, str, float, int]] = []
+    blast: List[Tuple[str, str, Optional[float], int]] = []
+    any_health = False
+    for name, ns, score, callers in rows:
+        if score is not None:
+            any_health = True
             score_f = float(score)
+            if score_f < _FRAGILE_HEALTH_THRESHOLD and callers >= _FRAGILE_MIN_CALLERS:
+                fragile.append((name, ns, score_f, callers))
+                continue
+        blast.append((name, ns, float(score) if score is not None else None, callers))
+
+    sections: List[str] = []
+
+    if fragile:
+        fragile.sort(key=lambda x: x[2])  # health_score asc (low=bad)
+        lines = ["**⚠️ Top fragile services** (health_score < 0.7 + ≥3 callers)"]
+        for name, ns, score_f, callers in fragile[:3]:
             team = ns_to_team.get(ns, "(unowned)")
             marker = _health_marker(score_f)
             lines.append(
-                f"  {marker} `{name}` _{ns}_ — health `{score_f:.2f}` · @{team}"
+                f"  {marker} `{name}` _{ns}_ — health `{score_f:.2f}` · "
+                f"{callers} callers · @{team}"
             )
-        return "\n".join(lines)
+        sections.append("\n".join(lines))
 
-    # Fallback на старый inbound-degree запрос с пометкой о незаполненности.
-    fallback_rows = db.execute(text("""
-        SELECT s.name, s.namespace, count(e.id) AS callers
-        FROM kg_services s
-        JOIN kg_service_edges e ON e.dst_id = s.id
-        WHERE s.team_owner IS NULL OR s.team_owner != 'platform'
-        GROUP BY s.id
-        ORDER BY callers DESC
-        LIMIT 3
-    """)).fetchall()
-    lines = ["**🔗 Top fragile services** (inbound callers из KG)"]
-    lines.append("  _health_score ещё не посчитан — fallback на inbound-degree_")
-    if not fallback_rows:
-        lines.append("  _нет edges_")
-    else:
-        for name, ns, callers in fallback_rows:
+    if blast:
+        blast.sort(key=lambda x: -x[3])  # callers desc
+        if any_health:
+            header = "**🔗 Top blast-radius services** (по inbound callers)"
+        else:
+            header = "**🔗 Top blast-radius services** (inbound callers · health_score ещё не посчитан)"
+        lines = [header]
+        for name, ns, score_opt, callers in blast[:3]:
             team = ns_to_team.get(ns, "(unowned)")
-            lines.append(f"  `{name}` _{ns}_ — {callers} callers · @{team}")
-    return "\n".join(lines)
+            health_suffix = f" · health `{score_opt:.2f}`" if score_opt is not None else ""
+            lines.append(f"  `{name}` _{ns}_ — {callers} callers{health_suffix} · @{team}")
+        sections.append("\n".join(lines))
+
+    if not sections:
+        return "**🔗 Top blast-radius services** (по inbound callers)\n  _нет edges_"
+
+    return "\n\n".join(sections)
+
+
+# Expected-stale классификация (item #5 stats-UX). Backup/cron/system —
+# нормально что они «не катились 60d»: это batch-инфраструктура, deploy редко.
+# Их перенос в свёрнутую категорию убирает 80% шума из секции.
+_EXPECTED_STALE_NAME_SUFFIXES = ("-backup", "-cron", "-cronjob", "-job")
+_EXPECTED_STALE_NAME_INFIXES = ("backup-", "-backup-", "-cron-")
+_EXPECTED_STALE_NAMESPACES = frozenset({
+    "kube-system",
+    "cattle-system",
+    "monitoring",
+    "logging",
+    "cert-manager",
+    "ingress-nginx",
+    "metallb-system",
+    "local-path-storage",
+})
+
+
+def _classify_stale(name: str, namespace: str) -> str:
+    """Эвристика: 'expected' (backup/cron/system) vs 'suspicious' (application).
+
+    'expected' рендерится скрытой секцией / не рендерится вовсе (control via
+    `STATS_HIDE_EXPECTED_STALE`). 'suspicious' идёт основным списком.
+    """
+    if namespace in _EXPECTED_STALE_NAMESPACES:
+        return "expected"
+    if namespace.startswith("cattle-"):
+        return "expected"
+    name_lower = name.lower()
+    if any(name_lower.endswith(suf) for suf in _EXPECTED_STALE_NAME_SUFFIXES):
+        return "expected"
+    if any(inf in name_lower for inf in _EXPECTED_STALE_NAME_INFIXES):
+        return "expected"
+    return "suspicious"
 
 
 def stale_deployments_section(
@@ -321,6 +609,7 @@ def stale_deployments_section(
     threshold_days: int,
     *,
     kubectl_fn=None,
+    hide_expected: Optional[bool] = None,
 ) -> str:
     """5. Deployments живые (replicas>0) но spec не апдейтился ≥ threshold_days.
 
@@ -328,13 +617,21 @@ def stale_deployments_section(
     встречающиеся в 3+ namespace-ах рендерятся одной строкой
     (`town-db-backup × 5 kingdoms · 62d`).
 
+    Backup/cron/system-deployments классифицируются как `expected` и
+    скрываются (или показываются compact-pill-ом) — настраивается флагом
+    `STATS_HIDE_EXPECTED_STALE` (default True). 80% шума в секции — это
+    backup-deployments по 5 ns × 60d.
+
     Per-release deployer name через TC недостижим (TC устроен «buildtype per
     pipeline action», не «buildtype per helm-release»), поэтому not shown.
     Кто что катил отображается в `recent_deploys_section` отдельно.
 
     `kubectl_fn` — для DI в тестах.
+    `hide_expected` — override settings.STATS_HIDE_EXPECTED_STALE для тестов.
     """
     fn = kubectl_fn or _kubectl_get_deployments_json
+    if hide_expected is None:
+        hide_expected = getattr(settings, "STATS_HIDE_EXPECTED_STALE", True)
 
     wo_namespaces = sorted({
         ns for (ns,) in db.execute(text("SELECT DISTINCT namespace FROM kg_services")).fetchall()
@@ -343,6 +640,7 @@ def stale_deployments_section(
     now = datetime.now(timezone.utc)
     # entries: (idle, ns, name, team, replicas, last_update_dt)
     entries: List[Tuple[int, str, str, str, int, datetime]] = []
+    expected_count = 0
     for ns in wo_namespaces:
         items = fn(ns)
         for dep in items:
@@ -356,12 +654,19 @@ def stale_deployments_section(
             idle = (now - last).days
             if idle < threshold_days:
                 continue
+            # Item #5: expected stale (backup/system) → не в основной список.
+            if hide_expected and _classify_stale(name, ns) == "expected":
+                expected_count += 1
+                continue
             team = ns_to_team.get(ns, "(unowned)")
             entries.append((idle, ns, name, team, replicas, last))
 
     lines = [f"**⏳ Stale deployments** (alive, не катились ≥{threshold_days}d)"]
     if not entries:
-        lines.append("  ✅ ничего не stale")
+        if expected_count:
+            lines.append(f"  ✅ ничего suspicious · скрыто `{expected_count}` expected (backup/system)")
+        else:
+            lines.append("  ✅ ничего не stale")
         return "\n".join(lines)
 
     # Group by (name, idle_days) — деплоится по всем kingdom-ам синхронно,
@@ -405,6 +710,11 @@ def stale_deployments_section(
     # Строка «… и ещё N (скрыто)» убрана: счётчик не actionable, занимает
     # место, провоцирует FOMO. Если хвост важен — в digest всё равно влезает
     # с cap_total=6 + threshold ≥30d.
+    #
+    # Expected stale (backup/cron/system) показываем как итоговую pill —
+    # «всё ок, не application-deploys» — на одну строку.
+    if expected_count:
+        lines.append(f"  _expected (backup/system): скрыто `{expected_count}`_")
     return "\n".join(lines)
 
 
@@ -654,7 +964,14 @@ def log_errors_section(db: Session, ns_to_team: Dict[str, str]) -> str:
 
 
 def kg_quality_section(db: Session) -> str:
-    """6. KG quality: services, orphan%, edges, team_owner coverage."""
+    """6. KG quality: services, orphan%, edges, team_owner coverage.
+
+    Формальное определение orphan / synthetic / threshold-ов — см.
+    `app.knowledge_graph.contract` (KG_SCHEMA_VERSION, QUALITY_THRESHOLDS,
+    is_orphan, is_synthetic) и `docs/KG_SCHEMA_CONTRACT.md`. Логика
+    ниже — оптимизированная SQL-агрегация, эквивалентная сумме per-service
+    `is_orphan(s, edges)` из contract.py.
+    """
     services_total = db.execute(text("SELECT count(*) FROM kg_services")).scalar() or 0
     if services_total == 0:
         return "**🧬 KG quality**\n  _KG пустой — kg_topology_sync ещё не выполнялся_"
@@ -748,17 +1065,24 @@ async def build_digest(db: Session) -> str:
         except Exception as e:
             log.warning("stats_digest.vm_query_failed", error=str(e))
 
+    # Item #3: trend для Firing series vs последнего daily snapshot.
+    firing_yesterday = await _read_last_firing_series()
+
     if settings.VICTORIA_METRICS_URL:
         health_text = await cluster_health_section(
             VMClient(settings.VICTORIA_METRICS_URL, timeout=15.0),
             fired_series,
             db,
+            firing_series_yesterday=firing_yesterday,
         )
     else:
         health_text = "**🛡️ Cluster Health**\n  _VICTORIA_METRICS_URL не настроен_"
 
-    alerts_text, unique_alerts, _ = firing_alerts_section(fired_series, ns_to_team)
-    top_types_text = top_alert_types_section(unique_alerts)
+    alerts_text, unique_alerts, _, unowned_ns = firing_alerts_section(
+        fired_series, ns_to_team
+    )
+    unowned_text = unowned_namespaces_section(unowned_ns, db)
+    top_types_text = top_alert_types_section(unique_alerts, db)
     anomaly_summary_text = anomaly_summary_section(db)
     anomaly_top_text = anomaly_top_section(db, ns_to_team)
     log_errors_text = log_errors_section(db, ns_to_team)
@@ -769,6 +1093,11 @@ async def build_digest(db: Session) -> str:
     deploys_text = await recent_deploys_section(lookback_hours=24, limit=5)
     kg_text = kg_quality_section(db)
 
+    # Item #3: записать сегодняшний firing count для завтрашнего trend.
+    # Делаем ПОСЛЕ всех queries — чтобы не аффектить today-сравнение если бы
+    # кто-то перечитал ключ.
+    await _write_last_firing_series(len(fired_series))
+
     now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     # Пустые секции (вернувшие "") пропускаем — иначе \n\n.join создаст
     # двойной перевод строки и в Discord будет пустая дыра.
@@ -776,6 +1105,7 @@ async def build_digest(db: Session) -> str:
         f"📊 **Cluster Daily Digest** · {now}",
         health_text,
         alerts_text,
+        unowned_text,
         top_types_text,
         anomaly_summary_text,
         anomaly_top_text,

@@ -362,6 +362,12 @@ class Settings(BaseSettings):
     CHRONIC_DIGEST_WINDOW_HOURS: int = 24
     CHRONIC_DIGEST_MIN_FIRES: int = 5
     STATS_DIGEST_STALE_DAYS: int = Field(30, description="Threshold days for stale-deployment detection")
+    # Item #5 stats-UX: backup/cron/system deployments — 80% «stale» entries по
+    # своей природе (deploy редко). Скрываем их по умолчанию, оставляем
+    # compact-pill «expected: скрыто N».
+    STATS_HIDE_EXPECTED_STALE: bool = Field(
+        True, description="Hide backup/cron/system deployments from stale-section"
+    )
 
     # Per-team daily digest (см. app/services/team_digest.py).
     # Шлёт один embed на каждый team_owner из kg_services с top-5 fragile,
