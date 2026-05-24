@@ -102,6 +102,11 @@ rules:
 - apiGroups: ["apps"]
   resources: ["deployments"]
   verbs: ["get", "list", "watch"]
+# `namespaces` cluster-wide list — auto-discovery non-system ns в
+# kg_sync.discover_namespaces() и drift_cleanup.fetch_live_namespaces().
+- apiGroups: [""]
+  resources: ["namespaces"]
+  verbs: ["get", "list", "watch"]
 - apiGroups: [""]
   resources: ["services"]
   verbs: ["get", "list", "watch"]
