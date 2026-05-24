@@ -282,6 +282,17 @@ class Settings(BaseSettings):
     VICTORIA_METRICS_URL: str = Field("", description="VMSingle base URL")
     VICTORIA_METRICS_WINDOW_MINUTES: int = 15
 
+    # KG Coverage #2 (storage signals): включить disk_pct enrichment для PVC
+    # через VM query `100 * kubelet_volume_stats_used_bytes /
+    # kubelet_volume_stats_capacity_bytes`. Default OFF — kubelet stats
+    # экспортёр может быть не настроен (см. WO VM scrape gap recon), а
+    # без него запрос вернёт 0 для всех PVC, замаскировав реальные NULL.
+    # Когда scrape config подтверждён — включается осознанно.
+    STORAGE_METRICS_ENABLED: bool = Field(
+        False,
+        description="Включить disk_pct enrichment в kg_storage_sync (требует kubelet_volume_stats_*)",
+    )
+
     # TeamCity integration — обогащение incident-а recent-deploys.
     # Режимы (в порядке приоритета):
     #   1. Прямой TC REST API: TC_URL + TC_TOKEN (те же что у локального teamcity-mcp).

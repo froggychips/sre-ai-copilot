@@ -124,9 +124,16 @@ rules:
 - apiGroups: ["batch"]
   resources: ["jobs", "cronjobs"]
   verbs: ["get", "list", "watch"]
+# KG Coverage #2 (storage signals): k8s_storage_sync читает PVC + PV
+# cluster-wide + scan pods для uses_volume edges. ReplicaSets нужны для
+# resolution Pod → Deployment owner-chain. Только get/list/watch.
+# pods объединены с #1 ниже одним правилом.
 - apiGroups: [""]
-  resources: ["pods"]
-  verbs: ["get", "list"]
+  resources: ["persistentvolumeclaims", "persistentvolumes", "pods"]
+  verbs: ["get", "list", "watch"]
+- apiGroups: ["apps"]
+  resources: ["replicasets"]
+  verbs: ["get", "list", "watch"]
 
 ---
 apiVersion: rbac.authorization.k8s.io/v1
