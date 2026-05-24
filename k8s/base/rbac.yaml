@@ -117,6 +117,16 @@ rules:
 - apiGroups: ["networking.k8s.io"]
   resources: ["ingresses"]
   verbs: ["get", "list", "watch"]
+# KG Coverage #1: k8s Job + CronJob → kg_k8s_jobs. Cluster-wide read
+# нужен для backup-CronJob'ов в `*-shared` ns + alembic-Job'ов в ns
+# деплоя. pods (cluster-wide) — для resolve last_pod_exit_code у Failed
+# Job'ов (label-selector job-name=<name>).
+- apiGroups: ["batch"]
+  resources: ["jobs", "cronjobs"]
+  verbs: ["get", "list", "watch"]
+- apiGroups: [""]
+  resources: ["pods"]
+  verbs: ["get", "list"]
 
 ---
 apiVersion: rbac.authorization.k8s.io/v1
