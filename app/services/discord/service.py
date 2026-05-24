@@ -1281,46 +1281,8 @@ class DiscordService:
                     extra={"status": r.status_code, "body": r.text[:200]},
                 )
 
-    async def send_approval_request(self, approval_id: str, details: dict):
-        """Отправляет Rich Embed с информацией об опасной операции и ссылками для подтверждения."""
-        payload = {
-            "embeds": [
-                {
-                    "title": "⚠️ ACTION APPROVAL REQUIRED",
-                    "description": "AI Agent requested a high-risk operation on Kubernetes.",
-                    "color": 16711680,
-                    "fields": [
-                        {
-                            "name": "Command",
-                            "value": f"`{details.get('command')}`",
-                            "inline": False,
-                        },
-                        {
-                            "name": "Risk Level",
-                            "value": details.get("risk", "HIGH"),
-                            "inline": True,
-                        },
-                        {"name": "Approval ID", "value": approval_id, "inline": True},
-                        {
-                            "name": "Action",
-                            "value": f"[APPROVE](https://your-api.com/approvals/{approval_id}/approve) | [REJECT](https://your-api.com/approvals/{approval_id}/reject)",
-                            "inline": False,
-                        },
-                    ],
-                }
-            ]
-        }
-        url = settings.DISCORD_WEBHOOK_URL
-        if not url:
-            logging.warning("DISCORD_WEBHOOK_URL not set, skipping approval request")
-            return
-        async with httpx.AsyncClient() as client:
-            response = await client.post(url, json=payload)
-            if response.status_code >= 400:
-                logging.error(
-                    "discord_approval_request_failed",
-                    extra={"status_code": response.status_code},
-                )
+    # send_approval_request удалён (legacy approve-URL flow).
+    # Новый button-based flow: api/discord_interactions.py (PR #12).
 
 
 discord_service = DiscordService()
