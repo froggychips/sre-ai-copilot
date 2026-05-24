@@ -86,4 +86,43 @@ rules:
 #   name: {{ include "sre-ai-copilot.fullname" . }}-remediate
 #   apiGroup: rbac.authorization.k8s.io
 
+---
+# ClusterRole: read-only на deployments / services / ingresses cluster-wide.
+# Нужен kg_topology_sync (env-scan, hourly) + Wave 7 / G1.3
+# kg_topology_resources_sync (declarative Service.spec.selector +
+# Ingress.spec.rules → ServiceEdge graph, каждые 15 мин).
+# Только get/list/watch — write не затронут.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ include "sre-ai-copilot.fullname" . }}-cluster-reader
+  labels:
+    {{- include "sre-ai-copilot.labels" . | nindent 4 }}
+rules:
+- apiGroups: ["apps"]
+  resources: ["deployments"]
+  verbs: ["get", "list", "watch"]
+- apiGroups: [""]
+  resources: ["services"]
+  verbs: ["get", "list", "watch"]
+- apiGroups: ["networking.k8s.io"]
+  resources: ["ingresses"]
+  verbs: ["get", "list", "watch"]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ include "sre-ai-copilot.fullname" . }}-cluster-reader
+  labels:
+    {{- include "sre-ai-copilot.labels" . | nindent 4 }}
+subjects:
+- kind: ServiceAccount
+  name: {{ include "sre-ai-copilot.serviceAccountName" . }}
+  namespace: {{ .Release.Namespace }}
+roleRef:
+  kind: ClusterRole
+  name: {{ include "sre-ai-copilot.fullname" . }}-cluster-reader
+  apiGroup: rbac.authorization.k8s.io
+
 {{- end }}

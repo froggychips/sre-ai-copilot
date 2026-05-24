@@ -90,8 +90,11 @@ rules:
 #   apiGroup: rbac.authorization.k8s.io
 
 ---
-# ClusterRole: read-only на deployments во всех namespace-ах.
-# Нужен kg_sync (hourly Celery beat) для построения ServiceEdge-графа.
+# ClusterRole: read-only на deployments / services / ingresses cluster-wide.
+# Нужен kg_sync (hourly Celery beat) для построения ServiceEdge-графа +
+# Wave 7 / G1.3 declarative parser kg_topology_resources_sync (каждые 15 мин),
+# который читает Service.spec.selector и Ingress.spec.rules cluster-wide
+# и строит edges `serves_traffic` / `routes_to`.
 # Только get/list/watch — write не затронут (write-Role остаётся namespace-scoped).
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
@@ -102,6 +105,17 @@ metadata:
 rules:
 - apiGroups: ["apps"]
   resources: ["deployments"]
+  verbs: ["get", "list", "watch"]
+# Wave 7 / G1.3: declarative Service + Ingress parser.
+# Services: spec.selector → match на Deployment pod-template labels.
+# Ingresses: spec.rules[].http.paths[].backend.service.name → backend match.
+# Без cluster-wide прав парсер пришлось бы скакать per-namespace, что
+# создаёт N kubectl-вызовов и не покрывает ns без RoleBinding.
+- apiGroups: [""]
+  resources: ["services"]
+  verbs: ["get", "list", "watch"]
+- apiGroups: ["networking.k8s.io"]
+  resources: ["ingresses"]
   verbs: ["get", "list", "watch"]
 
 ---
