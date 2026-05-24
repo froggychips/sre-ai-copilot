@@ -556,9 +556,9 @@ def fragile_services_section(db: Session, ns_to_team: Dict[str, str]) -> str:
         else:
             header = "**🔗 Top blast-radius services** (inbound callers · health_score ещё не посчитан)"
         lines = [header]
-        for name, ns, score_f, callers in blast[:3]:
+        for name, ns, score_opt, callers in blast[:3]:
             team = ns_to_team.get(ns, "(unowned)")
-            health_suffix = f" · health `{score_f:.2f}`" if score_f is not None else ""
+            health_suffix = f" · health `{score_opt:.2f}`" if score_opt is not None else ""
             lines.append(f"  `{name}` _{ns}_ — {callers} callers{health_suffix} · @{team}")
         sections.append("\n".join(lines))
 
