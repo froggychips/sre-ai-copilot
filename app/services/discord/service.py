@@ -42,6 +42,7 @@ from .embed_builder import (
     _summarize_self_health_detail,
 )
 from .routing import _ensure_wait_param, _pick_webhook_url, _should_route_to_error
+from app.utils.time_human import humanize_minutes_ago
 
 # structlog для DRY_RUN-логов — стандартный python `logging` отфильтровывается
 # на корневом WARNING level в production, поэтому [DISCORD_DRY_RUN] раньше
@@ -779,6 +780,28 @@ class DiscordService:
                 "inline": True,
             })
 
+        # On-call UX polish (10:38 feedback). Три inline-поля компактным
+        # рядком: какая реплика жива, какой именно pod, и почему container
+        # упал. `skip-if-empty` — поля append-аются только если данные есть.
+        if head.replicas_ready_desired:
+            fields.append({
+                "name": "Replicas",
+                "value": f"`{head.replicas_ready_desired}`",
+                "inline": True,
+            })
+        if head.pod_name:
+            fields.append({
+                "name": "Pod",
+                "value": f"`{head.pod_name}`",
+                "inline": True,
+            })
+        if head.container_reason:
+            fields.append({
+                "name": "Reason",
+                "value": f"`{head.container_reason}`",
+                "inline": True,
+            })
+
         # Phase 3-A: Most likely cause — deterministic, top-1 rule fact.
         # Это превращает embed из «вот данные» в «вот ответ». Главная
         # ценность для скорости triage.
@@ -831,8 +854,9 @@ class DiscordService:
                 sha_link = _format_sha_link(sha_full, repo) if sha_full else ""
                 sha_part = f" {sha_link}" if sha_link else ""
                 status_part = f" — {status}" if status else ""
+                when = humanize_minutes_ago(mins)
                 lines.append(
-                    f"• {build_label}{by_part}{sha_part} — {mins} мин назад{status_part}"
+                    f"• {build_label}{by_part}{sha_part} — {when}{status_part}"
                 )
             # Человекочитаемая шкала окна: «60м» / «24ч» / «3д».
             if max_min < 120:
@@ -856,7 +880,8 @@ class DiscordService:
                 an = a.get("alertname") or "?"
                 mins = a.get("minutes_before", "?")
                 ek = a.get("edge_kind") or ""
-                lines.append(f"• ✗ `{svc}` @ `{ns}` — `{an}` ({mins}m назад, edge={ek})")
+                when = humanize_minutes_ago(mins) if mins != "?" else "?"
+                lines.append(f"• ✗ `{svc}` @ `{ns}` — `{an}` ({when}, edge={ek})")
             fields.append({
                 "name": "Upstream сейчас (KG)",
                 "value": "\n".join(lines)[:1024],
@@ -985,11 +1010,12 @@ class DiscordService:
                 count = ev.get("count")
                 mins = ev.get("minutes_before", "?")
                 cnt_part = f" ×{count}" if count and count > 1 else ""
+                when = humanize_minutes_ago(mins) if mins != "?" else "?"
                 if is_critical:
                     msg = (ev.get("message") or "").replace("\n", " ")[:80]
-                    lines.append(f"• 🩺 `{reason}`{cnt_part} — {mins} мин назад: {msg}")
+                    lines.append(f"• 🩺 `{reason}`{cnt_part} — {when}: {msg}")
                 else:
-                    lines.append(f"• 🩺 `{reason}`{cnt_part} — {mins} мин назад")
+                    lines.append(f"• 🩺 `{reason}`{cnt_part} — {when}")
             fields.append({
                 "name": "Recent pod events (k8s)",
                 "value": "\n".join(lines)[:1024],
@@ -1031,7 +1057,7 @@ class DiscordService:
             )
         if head.kg_data_age_sec is not None and head.kg_data_age_sec > 2 * 3600:
             description_lines.append(
-                f"_KG topology snapshot {head.kg_data_age_sec // 60} мин назад — может быть stale._"
+                f"_KG topology snapshot {humanize_minutes_ago(head.kg_data_age_sec // 60)} — может быть stale._"
             )
         description = "\n".join(description_lines)[:1200]
 
