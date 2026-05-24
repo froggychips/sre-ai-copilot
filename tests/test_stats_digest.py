@@ -69,10 +69,12 @@ def test_firing_alerts_groups_by_team_via_kg():
         "prod-shared": "shared",
         # monitoring → нет
     }
-    text, unique, team_alerts = stats_digest.firing_alerts_section(fired, ns_to_team)
+    text, unique, team_alerts, unowned = stats_digest.firing_alerts_section(fired, ns_to_team)
     assert "@kingdom1" in text
     assert "@shared" in text
-    assert "monitoring=1" in text  # unowned секция
+    # Item #2: unowned теперь в отдельной секции, не inline.
+    assert "monitoring=1" not in text
+    assert unowned["monitoring"] == 1
     assert unique["KubePodCrashLooping"] == 1
     assert unique["CPUThrottlingHigh"] == 1
     assert team_alerts["kingdom1"] == 2
@@ -80,8 +82,23 @@ def test_firing_alerts_groups_by_team_via_kg():
 
 
 def test_firing_alerts_empty_state_message():
-    text, unique, team_alerts = stats_digest.firing_alerts_section([], {})
+    text, unique, team_alerts, unowned = stats_digest.firing_alerts_section([], {})
     assert "кластер здоров" in text
+
+
+def test_firing_alerts_uses_english_series_unit_not_cyrillic_s():
+    """Item #1 stats-UX: «@team 226с» читается как «секунды». Должно быть
+    «series» (полное слово)."""
+    fired = [
+        {"metric": {"namespace": "prod-kingdom1", "alertname": "X"}}
+        for _ in range(5)
+    ]
+    ns_to_team = {"prod-kingdom1": "kingdom1"}
+    text, _, _, _ = stats_digest.firing_alerts_section(fired, ns_to_team)
+    # Не должно быть «5с» (cyrillic с)
+    assert "5с" not in text
+    assert "series" in text
+    assert "5 series" in text
 
 
 def test_firing_alerts_squads_render_inline_single_line():
@@ -93,7 +110,7 @@ def test_firing_alerts_squads_render_inline_single_line():
         for _ in range(3)
     ]
     ns_to_team = {f"prod-kingdom{i}": f"kingdom{i}" for i in range(1, 6)}
-    text, _, _ = stats_digest.firing_alerts_section(fired, ns_to_team)
+    text, _, _, _ = stats_digest.firing_alerts_section(fired, ns_to_team)
     body_lines = [ln for ln in text.split("\n") if ln.strip().startswith("`@")]
     # Должна быть ОДНА body-строка с inline-перечислением teams,
     # не 5 отдельных.
@@ -122,10 +139,11 @@ def test_stale_deployments_no_hidden_teaser():
 
 # ── top_alert_types ────────────────────────────────────────────────────────
 
-def test_top_alert_types_top_5():
+def test_top_alert_types_top_3():
+    """Cap at top-3 (раньше было 5; уплотнили после Wave 2)."""
     counter = Counter({
         "KubePodCrashLooping": 30,
-        "CPUThrottlingHigh": 25,
+        "CPUThrottlingHigh": 25,  # noise — отфильтруется
         "KubeJobFailed": 8,
         "ScrapePoolHasNoTargets": 3,
         "FifthOne": 2,
@@ -134,7 +152,7 @@ def test_top_alert_types_top_5():
     text = stats_digest.top_alert_types_section(counter)
     assert "KubePodCrashLooping" in text
     assert "× 30" in text
-    assert "SixthShouldBeHidden" not in text  # лимит 5
+    assert "SixthShouldBeHidden" not in text  # лимит 3
 
 
 def test_top_alert_types_empty():
@@ -144,56 +162,64 @@ def test_top_alert_types_empty():
 
 # ── fragile_services_section ───────────────────────────────────────────────
 
-def test_fragile_services_renders_top_by_health_score():
-    """После Wave 2 fragile сортируется по health_score (asc, low=bad), не
-    inbound-degree. NULL health исключаем, markers 🟢/🟡/🔴 по диапазонам."""
+def test_fragile_services_renders_fragile_when_health_low_and_callers_high():
+    """Item #6 stats-UX: «fragile» = health_score < 0.7 AND ≥3 callers.
+    SQL row shape: (name, namespace, health_score, callers)."""
     db = MagicMock()
     db.execute.return_value.fetchall.return_value = [
-        ("auth-service", "prod-shared", 0.18),       # 🔴 critical
-        ("town-service", "prod-kingdom1", 0.52),     # 🟡
-        ("dev-service", "prod-kingdom2", 0.81),      # 🟢
+        ("auth-service", "prod-shared", 0.18, 12),       # 🔴 fragile (low+high callers)
+        ("town-service", "prod-kingdom1", 0.52, 5),      # 🟡 fragile
+        ("dev-service", "prod-kingdom2", 0.81, 8),       # 🟢 healthy → blast-radius
     ]
     text = stats_digest.fragile_services_section(
         db, ns_to_team={"prod-shared": "shared", "prod-kingdom1": "kingdom1", "prod-kingdom2": "kingdom2"},
     )
+    assert "Top fragile services" in text
     assert "auth-service" in text
     assert "health `0.18`" in text
-    assert "🔴" in text
-    assert "🟡" in text
-    assert "🟢" in text
-    assert "@shared" in text
-    assert "@kingdom1" in text
-    # Fallback-сообщение НЕ должно появляться — health_score есть
-    assert "fallback" not in text
+    # healthy высокого-callers сервис идёт в blast-radius, не fragile
+    assert "Top blast-radius services" in text
+    assert "dev-service" in text
 
 
-def test_fragile_services_fallback_when_health_score_not_computed():
-    """Если health_score ни у кого не посчитан (beat ещё не прошёл на dev) —
-    fallback на старый inbound-degree запрос с явной пометкой."""
+def test_fragile_services_health_ok_only_renders_blast_radius():
+    """Если все сервисы здоровые (health ≥ 0.7) — только blast-radius секция,
+    без «Top fragile»."""
     db = MagicMock()
-    health_rows = []
-    inbound_rows = [
-        ("auth-service", "prod-shared", 5),
-        ("town-service", "prod-kingdom1", 3),
-    ]
-    db.execute.side_effect = [
-        MagicMock(fetchall=lambda: health_rows),
-        MagicMock(fetchall=lambda: inbound_rows),
+    db.execute.return_value.fetchall.return_value = [
+        ("payment-service", "prod-shared", 0.92, 25),
+        ("town-service", "prod-kingdom1", 0.85, 12),
     ]
     text = stats_digest.fragile_services_section(
         db, ns_to_team={"prod-shared": "shared", "prod-kingdom1": "kingdom1"},
     )
-    assert "fallback" in text or "ещё не посчитан" in text
+    assert "Top fragile services" not in text
+    assert "Top blast-radius services" in text
+    assert "25 callers" in text
+
+
+def test_fragile_services_blast_radius_only_when_health_not_computed():
+    """Item #6: если health_score ни у кого не посчитан — только blast-radius
+    с пометкой «health_score ещё не посчитан». Никаких «fragile» по
+    inbound-degree (это была ошибка терминологии)."""
+    db = MagicMock()
+    db.execute.return_value.fetchall.return_value = [
+        ("auth-service", "prod-shared", None, 5),
+        ("town-service", "prod-kingdom1", None, 3),
+    ]
+    text = stats_digest.fragile_services_section(
+        db, ns_to_team={"prod-shared": "shared", "prod-kingdom1": "kingdom1"},
+    )
+    assert "Top fragile services" not in text  # никаких inferred-fragile
+    assert "Top blast-radius services" in text
+    assert "health_score ещё не посчитан" in text
     assert "auth-service" in text
     assert "5 callers" in text
 
 
-def test_fragile_services_empty_state_when_both_queries_empty():
+def test_fragile_services_empty_state_when_no_edges():
     db = MagicMock()
-    db.execute.side_effect = [
-        MagicMock(fetchall=lambda: []),  # health_score empty
-        MagicMock(fetchall=lambda: []),  # inbound fallback empty
-    ]
+    db.execute.return_value.fetchall.return_value = []
     text = stats_digest.fragile_services_section(db, ns_to_team={})
     assert "нет edges" in text
 
@@ -225,7 +251,7 @@ def test_stale_deployments_groups_by_team_and_excludes_fresh():
             _make_deployment("fresh-deploy", (now - timedelta(days=1)).isoformat()),
         ],
         "prod-kingdom2": [
-            _make_deployment("legacy-cron", (now - timedelta(days=90)).isoformat()),
+            _make_deployment("legacy-app", (now - timedelta(days=90)).isoformat()),
         ],
     }
     text = stats_digest.stale_deployments_section(
@@ -235,7 +261,7 @@ def test_stale_deployments_groups_by_team_and_excludes_fresh():
         kubectl_fn=lambda ns: fake_deploys.get(ns, []),
     )
     assert "town-service" in text
-    assert "legacy-cron" in text
+    assert "legacy-app" in text  # application — попадает в suspicious
     assert "fresh-deploy" not in text  # под 14d threshold
     assert "@kingdom1" in text
     assert "@kingdom2" in text
@@ -254,11 +280,14 @@ def test_stale_deployments_squashes_cross_namespace_groups():
         f"prod-kingdom{i}": [_make_deployment("db-backup", last_iso)]
         for i in range(1, 6)
     }
+    # Тест squash-логики: name содержит «backup» (expected), но мы явно
+    # отключаем hide_expected чтобы протестировать сам group-by-name механизм.
     text = stats_digest.stale_deployments_section(
         db,
         ns_to_team={f"prod-kingdom{i}": f"kingdom{i}" for i in range(1, 6)},
         threshold_days=14,
         kubectl_fn=lambda ns: fake_deploys.get(ns, []),
+        hide_expected=False,
     )
     # Один squash вместо 5 отдельных строк
     assert "× 5 ns" in text
