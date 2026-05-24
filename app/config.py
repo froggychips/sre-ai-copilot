@@ -98,6 +98,18 @@ class Settings(BaseSettings):
     ENRICH_RECURRENCE_LOOKBACK_MIN: int = 1440  # 24 ч
     ENRICH_UPSTREAM_WINDOW_MIN: int = 15
 
+    # UX polish: если KG не дал ready/desired через metadata_json,
+    # делать прямой read_namespaced_stateful_set/deployment (3s timeout).
+    # Per-embed lookup — один call на один build (кэш в alert_enrichment).
+    INCLUDE_LIVE_K8S_STATE: bool = True
+    # Скелет: подтянуть last log line + exit code для упавшего пода.
+    # По умолчанию OFF — read_namespaced_pod_log самый дорогой и flaky
+    # API, оставлено за флагом. См. TODO в alert_enrichment.
+    INCLUDE_LAST_LOG_LINE: bool = False
+    # Hard timeout для live-k8s lookups в enrichment-пути. <500ms budget
+    # на embed — три секунды макс на один pod, иначе skip.
+    LIVE_K8S_TIMEOUT_SEC: float = 3.0
+
     # Rollout-noise suppression (root cause #2 alert-quality).
     # KubeDeployment{Generation,Replicas}Mismatch + KubeContainerWaiting
     # часто срабатывают во время активного rolling-update'а (median TTR
