@@ -9,7 +9,6 @@
 напрямую подаётся EnrichedContext с заполненными полями (для builder-level
 тестов). Critical/warning gate проверяется отдельно.
 """
-from datetime import datetime, timezone
 from unittest.mock import MagicMock, patch
 
 import pytest
