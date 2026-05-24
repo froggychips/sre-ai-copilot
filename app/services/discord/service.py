@@ -1061,7 +1061,7 @@ class DiscordService:
             )
         description = "\n".join(description_lines)[:1200]
 
-        payload = {
+        payload: Dict[str, Any] = {
             "embeds": [{
                 "title": title[:256],
                 "color": color,

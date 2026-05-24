@@ -252,7 +252,9 @@ def blast_radius_for(
     )
     urls_seen: List[str] = []
     for edge in routes_rows:
-        extras = edge.extras if isinstance(edge.extras, dict) else {}
+        extras: Dict[str, Any] = (
+            edge.extras if isinstance(edge.extras, dict) else {}
+        )
         host = extras.get("host")
         if not host or host == "*":
             continue
@@ -311,8 +313,10 @@ def nats_impact_for(
     for edge in out_edges:
         if edge.dst is None:
             continue
-        sid = edge.dst_id
-        extras = edge.extras if isinstance(edge.extras, dict) else {}
+        sid = int(edge.dst_id)
+        extras: Dict[str, Any] = (
+            edge.extras if isinstance(edge.extras, dict) else {}
+        )
         direction = (extras.get("direction") or "?").lower()
         subject_ids.append(sid)
         by_subject_id[sid] = {
@@ -340,7 +344,9 @@ def nats_impact_for(
                 continue
             entry["impact_count"] += 1
             if len(entry["impact_others"]) < 3:
-                r_extras = r.extras if isinstance(r.extras, dict) else {}
+                r_extras: Dict[str, Any] = (
+                    r.extras if isinstance(r.extras, dict) else {}
+                )
                 entry["impact_others"].append((
                     r.src.name,
                     (r_extras.get("direction") or "?").lower(),
@@ -394,7 +400,8 @@ def pod_event_summary_for(
         # за весь lifetime). Для «сколько падений было» используем count;
         # `max(1, count)` чтобы NULL/0 не схлопывали row.
         c = max(1, int(r.count or 1))
-        by_reason[r.reason] = by_reason.get(r.reason, 0) + c
+        reason_key = str(r.reason)
+        by_reason[reason_key] = by_reason.get(reason_key, 0) + c
         total += c
 
     pairs = sorted(by_reason.items(), key=lambda kv: kv[1], reverse=True)
