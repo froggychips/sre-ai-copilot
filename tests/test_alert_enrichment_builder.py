@@ -137,7 +137,8 @@ def test_enrich_alert_builds_full_context(
     # Hypothesis из RecentDeployRule должен быть top-1
     hyp = ctx.primary_hypothesis()
     assert hyp is not None
-    assert "Deploy" in hyp and "4 мин назад" in hyp
+    # human-time formatter заменил «N мин назад» на `4 min ago`
+    assert "Deploy" in hyp and "4 min ago" in hyp
 
 
 # ── builder: send_enriched_alert payload ─────────────────────────────────
