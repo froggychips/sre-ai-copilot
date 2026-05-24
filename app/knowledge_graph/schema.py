@@ -43,6 +43,13 @@ class Service(Base):
     health_score = Column(Float, nullable=True, index=True)
     health_computed_at = Column(DateTime, nullable=True)
 
+    # KG Coverage #4 (2026-05-24): first-class stale классификация.
+    # Значения: 'active' | 'expected_stale' | 'suspicious_stale'.
+    # Заполняется в `kg_sync.sync_namespace` на каждом ран-е (idempotent) и
+    # читается из `stats_digest.stale_deployments_section` / dashboards.
+    # Реализация эвристики — `app/knowledge_graph/stale_classifier.py`.
+    stale_class = Column(String, nullable=True, index=True)
+
     __table_args__ = (
         UniqueConstraint("namespace", "name", name="uq_kg_service_ns_name"),
     )

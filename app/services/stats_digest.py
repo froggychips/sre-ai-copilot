@@ -588,36 +588,21 @@ def fragile_services_section(db: Session, ns_to_team: Dict[str, str]) -> str:
 # Expected-stale классификация (item #5 stats-UX). Backup/cron/system —
 # нормально что они «не катились 60d»: это batch-инфраструктура, deploy редко.
 # Их перенос в свёрнутую категорию убирает 80% шума из секции.
-_EXPECTED_STALE_NAME_SUFFIXES = ("-backup", "-cron", "-cronjob", "-job")
-_EXPECTED_STALE_NAME_INFIXES = ("backup-", "-backup-", "-cron-")
-_EXPECTED_STALE_NAMESPACES = frozenset({
-    "kube-system",
-    "cattle-system",
-    "monitoring",
-    "logging",
-    "cert-manager",
-    "ingress-nginx",
-    "metallb-system",
-    "local-path-storage",
-})
-
-
-def _classify_stale(name: str, namespace: str) -> str:
-    """Эвристика: 'expected' (backup/cron/system) vs 'suspicious' (application).
-
-    'expected' рендерится скрытой секцией / не рендерится вовсе (control via
-    `STATS_HIDE_EXPECTED_STALE`). 'suspicious' идёт основным списком.
-    """
-    if namespace in _EXPECTED_STALE_NAMESPACES:
-        return "expected"
-    if namespace.startswith("cattle-"):
-        return "expected"
-    name_lower = name.lower()
-    if any(name_lower.endswith(suf) for suf in _EXPECTED_STALE_NAME_SUFFIXES):
-        return "expected"
-    if any(inf in name_lower for inf in _EXPECTED_STALE_NAME_INFIXES):
-        return "expected"
-    return "suspicious"
+#
+# Эвристика вынесена в `app/knowledge_graph/stale_classifier.py` (KG Coverage
+# #4, 2026-05-24). Здесь re-export для legacy-импортов
+# (`tests/test_stats_digest_ux.py` импортирует `stats_digest._classify_stale`
+# по имени), плюс константы оставлены чтобы старые тесты на содержимое
+# `_EXPECTED_STALE_NAMESPACES` не падали.
+from app.knowledge_graph.schema import Service  # noqa: E402
+# Re-exports для legacy-import паттерна (stats_digest._EXPECTED_STALE_*) —
+# тесты и внешний код могут импортировать константы через stats_digest module.
+from app.knowledge_graph.stale_classifier import (  # noqa: E402, F401
+    _EXPECTED_STALE_NAME_INFIXES,
+    _EXPECTED_STALE_NAME_SUFFIXES,
+    _EXPECTED_STALE_NAMESPACES,
+    _classify_stale,
+)
 
 
 def stale_deployments_section(
@@ -654,6 +639,36 @@ def stale_deployments_section(
         ns for (ns,) in db.execute(text("SELECT DISTINCT namespace FROM kg_services")).fetchall()
     })
 
+    # KG Coverage #4: primary source of truth — `kg_services.stale_class`.
+    # Если column заполнен (kg_sync уже прошёл) — фильтр expected через DB
+    # вместо runtime `_classify_stale(name, ns)`. Legacy fallback нужен для
+    # rows без column (старая инсталляция, ещё не было ни одного kg_sync) —
+    # в этом случае возвращаемся к name/ns эвристике.
+    #
+    # Используем ORM query (не raw text) — это (а) тип-сейф через Service.*
+    # колонки, (б) не ломает legacy MagicMock-тесты, где `db.execute(...)`
+    # мокается для одного-единственного SELECT DISTINCT namespace.
+    stale_class_map: Dict[Tuple[str, str], Optional[str]] = {}
+    try:
+        rows = (
+            db.query(Service.namespace, Service.name, Service.stale_class)
+            .filter(Service.stale_class.isnot(None))
+            .all()
+        )
+        for ns_, name_, cls_ in rows:
+            stale_class_map[(ns_, name_)] = cls_
+    except Exception:  # pragma: no cover - defensive: MagicMock-тесты / стенды без миграции
+        # Если column ещё нет (migration не накатана) или тесты передали
+        # MagicMock — silently fallback на legacy `_classify_stale`.
+        stale_class_map = {}
+
+    def _is_expected(name: str, ns: str) -> bool:
+        """primary: kg_services.stale_class; fallback: legacy эвристика."""
+        col = stale_class_map.get((ns, name))
+        if col is not None:
+            return col == "expected_stale"
+        return _classify_stale(name, ns) == "expected"
+
     now = datetime.now(timezone.utc)
     # entries: (idle, ns, name, team, replicas, last_update_dt)
     entries: List[Tuple[int, str, str, str, int, datetime]] = []
@@ -672,7 +687,7 @@ def stale_deployments_section(
             if idle < threshold_days:
                 continue
             # Item #5: expected stale (backup/system) → не в основной список.
-            if hide_expected and _classify_stale(name, ns) == "expected":
+            if hide_expected and _is_expected(name, ns):
                 expected_count += 1
                 continue
             team = ns_to_team.get(ns, "(unowned)")
