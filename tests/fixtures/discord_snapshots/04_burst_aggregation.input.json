@@ -1,0 +1,114 @@
+{
+  "_doc": "Case 4: KubePodCrashLooping critical, 8 pods affected → один agg-embed. AM batch'ит 8 алертов в один webhook-payload, send_enriched_alert collapses в один embed (head=contexts[0]). Title содержит head.pod/service; ns одинаковый.",
+  "contexts": [
+    {
+      "incident": {
+        "incident_id": "fp-burst-1",
+        "severity": "critical",
+        "status": "firing",
+        "summary": "Pod is crash looping.",
+        "description": "Pod prod-kingdom1/cart-worker-7f8c4b6cdf-a1b2c is in CrashLoopBackOff.",
+        "namespace": "prod-kingdom1",
+        "labels": {
+          "alertname": "KubePodCrashLooping",
+          "severity": "critical",
+          "namespace": "prod-kingdom1",
+          "deployment": "cart-worker",
+          "pod": "cart-worker-7f8c4b6cdf-a1b2c"
+        },
+        "annotations": {},
+        "starts_at": "2026-05-24T09:30:00Z"
+      },
+      "service": "cart-worker",
+      "pod": "cart-worker-7f8c4b6cdf-a1b2c",
+      "team_owner": "squad-1",
+      "in_kg": true,
+      "pod_name": "cart-worker-7f8c4b6cdf-a1b2c",
+      "container_reason": "CrashLoopBackOff",
+      "replicas_ready_desired": "0/8",
+      "recent_deploys": [
+        {
+          "minutes_before_incident": 7,
+          "sha": "abc1234567890def",
+          "repo": "wo/backend",
+          "number": "2231",
+          "buildtype_name": "RebuildCartWorker",
+          "status": "SUCCESS",
+          "triggered_by": "apleshkov",
+          "url": "https://teamcity.example.com/build/2231"
+        }
+      ],
+      "upstream_alerts": [],
+      "recurrence_24h": [],
+      "inbound_count_by_kind": {"calls": 6},
+      "outgoing_deps": [],
+      "pod_events": [
+        {
+          "reason": "BackOff",
+          "pod_name": "cart-worker-7f8c4b6cdf-a1b2c",
+          "count": 23,
+          "minutes_before": 5,
+          "message": "Back-off restarting failed container"
+        }
+      ],
+      "rule_facts": [
+        {
+          "kind": "recent_deploy",
+          "observed": true,
+          "confidence": 0.85,
+          "source_rule": "RecentDeployRule",
+          "evidence": {
+            "deploys": [
+              {
+                "minutes_before_incident": 7,
+                "sha": "abc1234567890def",
+                "number": "2231",
+                "triggered_by": "apleshkov"
+              }
+            ]
+          }
+        }
+      ],
+      "jira_issues": [],
+      "rollout_noise": false,
+      "kg_data_age_sec": 300,
+      "blast_radius": {},
+      "nats_impact": [],
+      "pod_trail": {
+        "total": 8,
+        "by_reason": [["BackOff", 8]]
+      }
+    },
+    {
+      "incident": {
+        "incident_id": "fp-burst-2",
+        "severity": "critical",
+        "status": "firing",
+        "summary": "Pod is crash looping.",
+        "description": "Pod prod-kingdom1/cart-worker-7f8c4b6cdf-d3e4f is in CrashLoopBackOff.",
+        "namespace": "prod-kingdom1",
+        "labels": {
+          "alertname": "KubePodCrashLooping",
+          "severity": "critical",
+          "namespace": "prod-kingdom1",
+          "deployment": "cart-worker",
+          "pod": "cart-worker-7f8c4b6cdf-d3e4f"
+        },
+        "annotations": {},
+        "starts_at": "2026-05-24T09:30:00Z"
+      },
+      "service": "cart-worker",
+      "team_owner": "squad-1",
+      "in_kg": true,
+      "recent_deploys": [],
+      "upstream_alerts": [],
+      "recurrence_24h": [],
+      "inbound_count_by_kind": {},
+      "outgoing_deps": [],
+      "pod_events": [],
+      "rule_facts": [],
+      "jira_issues": [],
+      "rollout_noise": false
+    }
+  ]
+}

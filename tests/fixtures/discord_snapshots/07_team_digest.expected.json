@@ -1,0 +1,39 @@
+{
+  "title": "Daily Digest — squad-7 (last 24h)",
+  "color": 15022389,
+  "fields": [
+    {
+      "name": "Services",
+      "value": "`14`",
+      "inline": true
+    },
+    {
+      "name": "Deploys",
+      "value": "Success rate: **75%** (9/12) · failed: `3`",
+      "inline": true
+    },
+    {
+      "name": "Alerts",
+      "value": "Open: **7** · `critical` 1, `warning` 6\nTop: `KubeStatefulSetReplicasMismatch`×4, `KubePodCrashLooping`×2, `KubeDeploymentRolloutStuck`×1",
+      "inline": false
+    },
+    {
+      "name": "🩺 Fragile top-5",
+      "value": "• `auth-service` _squad-7-shared_ — ●○○ `0.22`\n• `session-store` _squad-7-shared_ — ●●○ `0.41`\n• `town-api` _squad-7-kingdom2_ — ●●○ `0.65`",
+      "inline": false
+    },
+    {
+      "name": "🔴 Stuck alerts (>24h)",
+      "value": "🟠 `KubePodCrashLooping` _auth-service_ — **36h** · 24h fires: `18`\n🟠 `KubeStatefulSetReplicasMismatch` _session-store_ — **28h** · 24h fires: `3`",
+      "inline": false
+    },
+    {
+      "name": "SLO burn (24h aggregates)",
+      "value": "Avg burn: **12.4%** · worst: `41.2%` (samples: 28)",
+      "inline": false
+    }
+  ],
+  "footer": {
+    "text": "team/squad-7 · window=24h"
+  }
+}

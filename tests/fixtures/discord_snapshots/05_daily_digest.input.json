@@ -1,0 +1,21 @@
+{
+  "_doc": "Case 5: Daily digest UX-секций. Покрываем firing_alerts_section + unowned_namespaces_section с suggest. Полный build_digest требует VM+DB, эти две функции отвечают за самую заметную часть UX (item #1 series unit, item #2 unowned+suggest).",
+  "ns_to_team": {
+    "prod-kingdom1": "kingdom1",
+    "prod-shared": "shared",
+    "preprod-kingdom2": "kingdom2",
+    "squad-7-shared": "squad-7"
+  },
+  "fired_series_metrics": [
+    {"namespace": "prod-kingdom1", "alertname": "KubePodCrashLooping"},
+    {"namespace": "prod-kingdom1", "alertname": "KubePodCrashLooping"},
+    {"namespace": "prod-kingdom1", "alertname": "KubeDeploymentReplicasMismatch"},
+    {"namespace": "prod-shared", "alertname": "KubeStatefulSetReplicasMismatch"},
+    {"namespace": "prod-shared", "alertname": "KubeStatefulSetReplicasMismatch"},
+    {"namespace": "preprod-kingdom2", "alertname": "KubePodNotReady"},
+    {"namespace": "monitoring", "alertname": "TargetDown"},
+    {"namespace": "monitoring", "alertname": "TargetDown"},
+    {"namespace": "monitoring", "alertname": "TargetDown"},
+    {"namespace": "ingress-nginx", "alertname": "NginxReload"}
+  ]
+}
