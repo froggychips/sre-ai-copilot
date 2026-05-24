@@ -247,8 +247,13 @@ def test_top_alert_types_renders_delta_and_chronic_resurfaced():
         "KubePodCrashLooping": 30,
     })
     db = MagicMock()
-    # yest_rows → chronic_rows → resurf_rows
+    # preview-fix 2026-05-24: добавлены 2 preflight EXISTS-запроса (есть ли
+    # история в yest-window и today-window) — для различения «alert не fired»
+    # vs «новый baseline». Порядок: yest_exists → today_exists → yest_rows →
+    # chronic_rows → resurf_rows.
     db.execute.side_effect = [
+        MagicMock(scalar=lambda: True),  # yest history exists
+        MagicMock(scalar=lambda: True),  # today history exists
         MagicMock(fetchall=lambda: [
             ("KubeDeploymentReplicasMismatch", 63),
             ("KubePodCrashLooping", 25),
