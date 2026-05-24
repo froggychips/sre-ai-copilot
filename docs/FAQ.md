@@ -166,6 +166,107 @@ Replay reruns the full agent pipeline on the stored incident data without postin
 
 ---
 
+## How does the KG figure out who owns a service?
+
+Multi-signal owner inference (`app/services/ownership_suggester.py`), added
+in Wave 8 (PR #85). Four signals are tried in parallel:
+
+1. **Prefix** (weight 0.4) — namespace name regex (`squad-N-*` → `@squad-N`,
+   `monitoring` / `kube-system` → `@platform`).
+2. **Deploy history** (weight 0.4) — most-frequent `triggered_by` over the
+   last 30 days of `kg_deployments`. Username → team handle via
+   `owner_aliases.py`.
+3. **Labels** (weight 0.2) — k8s labels `team` / `owner` / `squad` /
+   `app.kubernetes.io/part-of` in `kg_services.metadata_json`.
+4. **Manual override** — `OWNERSHIP_MANIFEST_PATH=ownership.yaml` glob
+   match → confidence=1.0, overrides everything.
+
+Top-1 candidate by summed `weight × signal_strength` wins. See
+[Ownership manifest in RUNBOOK](RUNBOOK.md#ownership-manifest) for how
+to add overrides.
+
+---
+
+## Why does the daily digest say "(new baseline)"?
+
+The daily stats digest shows trend Δ24h for every metric (alert count,
+deploy success rate, fragile services count, …). The trend needs a
+yesterday-state row to compare against.
+
+When the digest runs for the first time, or the yesterday-state row was
+purged, there's no comparison anchor — so we print `(new baseline)`
+instead of a fake `Δ +0`. Wave 8-F (PR #90) added this explicit
+placeholder; before it, the trend silently showed 0 which was misleading.
+
+The placeholder will disappear after the next digest run (24h later)
+once a yesterday-state exists. If you see `(new baseline)` more than
+once in a row, the state-persistence is broken — check
+`kg_stats_digest_state` rows.
+
+---
+
+## What does `stale_class` on a service mean?
+
+Wave 8 (PR #86) added `kg_services.stale_class` with three values:
+
+- **`active`** — deploy within the last 30 days. Normal operating state.
+- **`expected_stale`** — hasn't deployed in 30d, but it's expected:
+  backup/cron/system patterns (`*-backup`, `*-cron`, `kube-system`,
+  `monitoring`) or `infra`/`platform`-owned namespaces.
+- **`suspicious_stale`** — no deploys in 30d, doesn't match expected
+  patterns. Candidate for retire/handoff investigation.
+
+The column is rewritten idempotently by `kg_sync.sync_namespace` on
+every hourly sync. Stats digest hides `expected_stale` by default via
+`STATS_HIDE_EXPECTED_STALE=true` to keep the noise down. See
+[stale_class in RUNBOOK](RUNBOOK.md#stale_class-on-kg_services) for
+how to reclassify a misclassified service.
+
+---
+
+## How do I add a new playbook (Phase A remediation)?
+
+**Short answer: Phase A is planned, not implemented.** As of v0.12.0
+the copilot is in **advisory mode by default** (`EXECUTOR_ENABLED=false`)
+with an opt-in `executor` stage that does `kubectl --dry-run=server`
+validation only. Wave 8 is the "metadata + UX polish" foundation before
+Phase A (remediation pipeline) is built.
+
+Phase A will introduce:
+
+- Playbook registry — typed `RemediationPlaybook` with preconditions,
+  actions, and rollback steps.
+- Confidence gating — only playbooks with `confidence ≥ 0.8` and
+  KG-quality signals above threshold get attempted.
+- Human-in-the-loop — Approve/Decline buttons on every playbook
+  proposal (no auto-apply for HIGH risk, ever).
+
+The plan lives in user-memory `project_remediation_pipeline_plan.md`
+(not in this repo yet). When Phase A lands, this FAQ entry will be
+updated with the actual playbook authoring instructions.
+
+For now, see [Roadmap → Execution](../README.md#roadmap--execution) in
+the README — the executor track is built (PR #23/#26/#27) and gated
+behind `EXECUTOR_APPROVAL_ENABLED=true` for ad-hoc human-approved actions
+on individual incidents.
+
+---
+
+## How do I take a KG quality snapshot?
+
+```bash
+python -m app.scripts.quality_report --markdown --output baseline.md
+```
+
+The `quality_report` CLI (PR #87) is read-only — safe to run against
+production. It computes 5 sections (services, edges, events, coverage,
+quality flags) and outputs markdown or JSON.
+
+Use it before/after large remediation waves to demonstrate measurable
+change. Baseline at v0.12.0: `docs/quality_report_baseline_2026_05_24.md`.
+
+---
+
 ## Where do I report a bug?
 
 [GitHub Issues](https://github.com/froggychips/sre-ai-copilot/issues) or Telegram [@froggychips](https://t.me/froggychips).

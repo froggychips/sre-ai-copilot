@@ -476,3 +476,225 @@ WHERE incident_id = '<id>';
 - `likely`, но деплой был docs-only → проверить `deploy_status_factor` и `time_proximity`; деплой мог совпасть по времени с независимым инцидентом. Пометить инцидент `resolution_quality = 'unresolved'`, чтобы не засорять KG.
 - `suspect`, а интуиция оператора говорит "точно он" → посмотреть на `max_zscore`. Если он чуть ниже warning-порога, исходная метрика может быть пограничной по шуму.
 - `weak`, но интуиция говорит "yes" → проверить, не вылез ли деплой за 2-часовое окно (incident lag из-за VM scrape interval может сдвинуть timestamp позже, чем реально).
+
+---
+
+## KG quality_report — baseline snapshot
+
+CLI `quality_report` — канонический способ снять baseline KG-quality
+перед/после крупной remediation-волны, чтобы видеть delta, а не угадывать.
+
+### Запуск
+
+```bash
+# Markdown в stdout (default):
+python -m app.scripts.quality_report
+
+# JSON в stdout (для diff / dashboard ingestion):
+python -m app.scripts.quality_report --json
+
+# Сохранить snapshot в файл:
+python -m app.scripts.quality_report --markdown --output baseline.md
+```
+
+Скрипт **read-only** — никаких INSERT/UPDATE/DELETE. Безопасно гонять
+на production. Использует ту же `SessionLocal` что и production-copilot,
+поэтому credentials БД подхватываются автоматически.
+
+### Что считает
+
+Пять секций:
+
+1. **Services** — total / real / synthetic / orphans / by `stale_class` /
+   owner coverage.
+2. **Edges** — по `kind` (calls / uses_nats / uses_db / serves_traffic /
+   routes_to / uses_volume / bound_to) / freshness / multi-source ratio.
+3. **Events** — deploys по статусу / pod_events linkage rate (с
+   `service_id`) / alerts open vs resolved.
+4. **Coverage** — Jobs/CronJobs / Storage Volumes / NATS subjects.
+5. **Quality flags** — известные data-quality проблемы с anchor-ами
+   (например, "12 unowned ns с deploys за 30d — suspect owner_inference gap").
+
+### Baseline на v0.12.0
+
+`docs/quality_report_baseline_2026_05_24.md` — снимок сразу после
+мерджа Wave 8. Использовать как anchor для Phase A remediation.
+
+---
+
+## Ownership manifest
+
+Multi-signal owner inference (`ownership_suggester.suggest_owner_multi_signal`)
+пробует три эвристики параллельно (prefix / deploy-history / labels).
+Когда ни одна не подходит или ответ неверный — override через YAML manifest.
+
+### Setup
+
+```bash
+# Путь к YAML (должен быть читаем worker-pod-у):
+OWNERSHIP_MANIFEST_PATH=/etc/sre-ai/ownership.yaml
+```
+
+### YAML формат
+
+```yaml
+# Каждая запись: ns_pattern (glob), owner (строка как есть в digest),
+# reason (свободная форма, идёт в audit log).
+- ns_pattern: "ml-*"
+  owner: "@ml-platform"
+  reason: "ML infra пока без labels — owner подтверждён в Slack 2026-05-23"
+
+- ns_pattern: "vendor-acme"
+  owner: "@vendor-acme"
+  reason: "Third-party namespace без internal owner — эскалация через partnership"
+
+- ns_pattern: "*-backup"
+  owner: "@platform"
+  reason: "Все backup CronJob-ы platform-owned по policy"
+```
+
+- `ns_pattern` — Python `fnmatch` (glob, не regex).
+- Первый match побеждает — порядок важен; специфичные паттерны выше generic-ов.
+- Match в manifest даёт `confidence=1.0` и оверрайдит все три эвристики.
+
+### Reload
+
+Manifest перечитывается на каждом `suggest_owner_multi_signal`-вызове,
+но путь файла кэшируется по environment. Чтобы сменить manifest — поменять
+env-var и рестартнуть worker.
+
+### Audit
+
+Каждый match emit-ит audit-log line `KG_OWNER_MANUAL_OVERRIDE` с
+`ns_pattern`, `owner`, `reason`. Используется для верификации, что
+manifest реально читается в production.
+
+### Alias map для deploy-history сигнала
+
+Для эвристики deploy-history (сигнал B) TC usernames транслируются в
+team-handles через `app/services/owner_aliases.py`. Override:
+
+```bash
+OWNER_ALIASES_PATH=/etc/sre-ai/owner-aliases.yaml
+```
+
+YAML формат:
+
+```yaml
+kemyashev: "@squad-1"
+apleshkov: "@squad-2"
+wizaryx:   "@platform"
+new-engineer: "@squad-N"
+```
+
+Pre-baked defaults в коде; YAML расширяет/оверрайдит. Ключи lowercase.
+
+---
+
+## stale_class на kg_services
+
+Wave 8 вводит `kg_services.stale_class` (PR #86). Три значения:
+
+| Значение | Смысл |
+|---|---|
+| `active` | Deploy за последние `ACTIVE_WINDOW_DAYS` (default 30d). |
+| `expected_stale` | Не катился 30d, но это норма: backup/cron/system имена, infra/platform-owned ns. |
+| `suspicious_stale` | Нет deploys 30d, не подходит под expected-паттерны. |
+
+Column переписывается **идемпотентно** через `kg_sync.sync_namespace` на
+каждом sync (hourly). Stats_digest читает column как primary с fallback
+на legacy in-memory classifier для инсталляций без свежего sync.
+
+### Реклассифицировать сервис
+
+Если сервис misclassified (например, `expected_stale` который реально
+должен катиться чаще), есть три рычага:
+
+1. **Переименовать**: убрать suffix `-backup` / `-cron` / `-job`, который
+   pattern-match'ит в `expected_stale`. Следующий sync переклассифицирует.
+2. **Сменить namespace**: переехать в не-`expected_stale` namespace
+   (`kube-system`, `monitoring` в system-списке).
+3. **Сменить owner**: `team_owner = platform` триггерит `expected_stale`
+   при отсутствии recent deploys. Поставить squad-owner.
+
+Manual override через SQL **не рекомендуется** — column перепишется на
+следующем sync. Это derived-поле, не authoritative.
+
+### Запросы
+
+```sql
+-- Все suspicious_stale сервисы с последним деплоем:
+SELECT
+  s.namespace, s.name, s.team_owner,
+  s.stale_class,
+  MAX(d.started_at) AS last_deploy
+FROM kg_services s
+LEFT JOIN kg_deployments d ON d.service_id = s.id
+WHERE s.stale_class = 'suspicious_stale'
+  AND NOT s.synthetic
+GROUP BY s.id
+ORDER BY last_deploy NULLS FIRST;
+```
+
+Запрос в production для поиска кандидатов на retire/handoff.
+
+---
+
+## Discord snapshot fixtures (UX regression-guard)
+
+Wave 8-G (PR #88) добавляет gallery из 7 snapshot-cases для Discord
+embed-ов — любое UX-изменение в `app/services/discord/embed_builder.py`
+или связанных модулях должно обновить snapshot-ы, иначе CI ляжет.
+
+### Cases
+
+`tests/fixtures/discord_snapshots/`:
+
+1. `01_critical_fresh` — first-fire critical alert с полным enrichment.
+2. `02_critical_resurfaced` — тот же alert, возвращающийся после resolve.
+3. `03_warning_compact` — warning severity, без enrichment.
+4. `04_burst_aggregation` — тот же alert N раз в dedup-окне.
+5. `05_daily_digest` — daily stats digest (KG-summary).
+6. `06_chronic_digest` — chronic-suppressed alerts visibility digest.
+7. `07_team_digest` — per-team fragile services digest.
+
+Каждый case имеет `input.json` (payload алерта/инцидента) и `expected.json`
+(отрисованный embed). Раннер — `tests/test_discord_alert_gallery.py`.
+
+### Update workflow
+
+При намеренном изменении embed-UX:
+
+```bash
+# Перерисовать и перезаписать все expected.json:
+UPDATE_SNAPSHOTS=1 pytest tests/test_discord_alert_gallery.py
+
+# Просмотреть diff:
+git diff tests/fixtures/discord_snapshots/
+
+# Закоммитить если изменения корректные:
+git add tests/fixtures/discord_snapshots/
+git commit -m "UX: обновить snapshot-фикстуры после <change>"
+```
+
+### Просмотр snapshot-diff-ов
+
+Раннер pretty-print-ит diff в pytest output при провале фикстур. Смотрим:
+
+- **Title / description text** — самая user-visible регрессия.
+- **Field order** — изменения здесь меняют scanability embed-а.
+- **Color / severity badge** — visual регрессия с одного взгляда.
+- **Footer / timestamp** — обычно шум; игнорировать если ts-логика не менялась.
+
+Если diff слишком большой для глазного review — гонять с `-vv` для full
+side-by-side, или открыть `input.json` и перерисовать в изоляции.
+
+### Добавить новый case
+
+1. Создать `XX_new_case.input.json` с минимальным payload alert/incident.
+2. `UPDATE_SNAPSHOTS=1 pytest tests/test_discord_alert_gallery.py -k new_case`.
+3. Проверить сгенерированный `XX_new_case.expected.json` — выглядит корректно?
+4. Закоммитить оба файла вместе.
+
+Цель: каждая embed-форма (severity × enrichment-state × digest-type)
+должна иметь хотя бы один case, чтобы ловить регрессии.

@@ -16,7 +16,7 @@
 - **FixAgent (`app.agents.fix`)**: генерирует структурированный `ExecutionIntent`; учитывает рецидивы и Jira-контекст.
 - **SimilarIncidentEngine (`app.core.intelligence.similar_incidents`)**: KG-детекция рецидивов (окно 7 дней).
 - **JiraClient (`app.context.jira_client`)**: обогащение через Atlassian REST API для контекста FixAgent.
-- **Knowledge Graph (`app.knowledge_graph.*`)**: автоматически наполняемый направленный граф в Postgres (5 таблиц: `kg_services`, `kg_service_edges`, `kg_deployments`, `kg_alerts`, `kg_pod_events`); 5 источников sync (env-vars, NATS env, DSN из secret-key, k8s events, k8s ingresses); confidence scoring с multi-source provenance.
+- **Knowledge Graph (`app.knowledge_graph.*`)**: автоматически наполняемый направленный граф в Postgres. Ядро: `kg_services`, `kg_service_edges`, `kg_deployments`, `kg_alerts`, `kg_pod_events`. Storage-подграф (PR #84): `kg_storage_volumes` (PVC/PV) + `kg_volume_edges` (heterogeneous). Jobs (PR #82): `kg_k8s_jobs` (Job/CronJob с `owner_service_id`). 10+ источников sync (env-vars, NATS env, DSN из secret-key, k8s events, k8s ingresses-as-host, **k8s Services + Ingresses (Wave 7-X)**, **NATS subjects из monorepo (Wave 7-Z)**, **runtime PodEvent co-occurrence (Wave 7-Y)**, **k8s Jobs/CronJobs (PR #82)**, **PVC/PV storage (PR #84)**). Schema/quality contract — `app/knowledge_graph/contract.py` (`KG_SCHEMA_VERSION=2.2`); confidence scoring с multi-source provenance.
 - **Alert enrichment (`app.services.alert_enrichment`)**: deterministic KG-обогащение для `/webhooks/alertmanager/enrich-and-forward` — работает без LLM, ~5 SQL-запросов, собирает `EnrichedContext` (recent_deploys, upstream_alerts, outgoing_deps, pod_events, jira_issues, primary_hypothesis, why_this_matters).
 - **Data layer (`app.database`, `app.repository`)**: SQLAlchemy-модели и CRUD-операции.
 - **Integration layer (`app.services.mcp_client`)**: MCP-клиент для k8s, TeamCity и других внешних инструментов.
@@ -43,6 +43,12 @@
 | `kg_deploy_correlator` | каждые 15 мин | recent incidents × deploys → multi-factor confidence + verdict |
 | `team_digest` | ежедневно @ 09:00 UTC | per-team дайджест fragile-сервисов |
 | `kg_self_health_check` | каждые 30 мин | 6 canary'ев по KG data quality |
+| `kg_stuck_alerts_check` | каждый час @ :11 | alerts firing >24h без resolved_at → escalation digest |
+| `kg_topology_resources_sync` | каждые 15 мин | **Wave 7-X**: k8s Service+Ingress declarative → edges `serves_traffic` + `routes_to` |
+| `kg_runtime_correlation_sync` | каждые 30 мин | **Wave 7-Y**: pod_event co-occurrence (7d окно) подтверждает existing edges |
+| `kg_nats_subjects_sync` | каждые 6h @ :43 | **Wave 7-Z**: парсит C# monorepo → subject-узлы + edges `uses_nats` с direction (off by default) |
+| `kg_jobs_sync` | каждые 15 мин | **Wave 8-A (PR #82)**: k8s Job/CronJob → `kg_k8s_jobs` + `runs_as_job` (через `owner_service_id` metadata column) |
+| `kg_storage_sync` | каждые 30 мин | **Wave 8-B (PR #84)**: PVC/PV + edges `uses_volume` / `bound_to` в `kg_volume_edges` (heterogeneous Service↔PVC↔PV граф) |
 
 ## 3. Поток данных (Webhook-инцидент)
 
@@ -238,6 +244,177 @@ Discord interactions endpoint (`app/api/discord_interactions.py`) теперь �
 6. **`edges_freshness`** — % `kg_service_edges` с `last_seen_at < 24h` или NULL. >30% stale → warn (kg_topology_sync regression).
 
 Вывод: строка в audit-log за прогон; на любой `fail`/`warn` — single Discord embed в `DISCORD_WEBHOOK_SELF_HEALTH_URL` (отделено от `#infra-error`, чтобы не топить операционные алерты). 6-часовое dedup-окно не даёт одному и тому же failing-canary заспамить канал.
+
+## 3d. Topology Expansion (Wave 7)
+
+Wave 7 расширяет источники топологии KG с двух (env-var heuristic +
+Ingress-host externalisation) до пяти, плюс runtime confirmation channel.
+Цель — дать confidence-фреймворку (`kg_service_edges.extras.discovery_sources`)
+независимые tier-1 источники, чтобы провенанс edges не зависел от
+единственного heuristic-парсинга env-переменных.
+
+### Wave 7-X: declarative Service + Ingress parser
+
+`app/knowledge_graph/k8s_topology_resources_sync.py` каждые 15 минут читает
+`kubectl get services/ingresses -A -o json` и строит:
+
+- **`serves_traffic`** edge: Service → backing Deployment, по selector-match
+  на pod template labels. Declarative замена runtime Endpoint resolution —
+  не зависит от живых pods, поэтому работает и для свёрнутых деплоев.
+- **`routes_to`** edge: Ingress (как ресурс) → backend Service. Параллельный
+  slice к существующему `k8s_ingress_sync.py`, который строит
+  `ingress:<host>` → backend как `calls` (host-уровень).
+
+RBAC: cluster-role требует `services` + `ingresses` на `get`/`list`/`watch`
+(см. `k8s/base/rbac.yaml`). Включён по умолчанию.
+
+### Wave 7-Y: PodEvent runtime correlation
+
+`app/knowledge_graph/runtime_correlation.py` каждые 30 минут ищет пары
+сервисов, у которых warning-события (BackOff/Unhealthy/OOMKilled/
+FailedScheduling/CrashLoopBackOff/FailedMount/ImagePullBackOff) сваливаются
+в одном окне (default 15 мин) N+ раз за окно (default 7 дней).
+
+**Что делает.** Подтверждает уже существующие edges новым
+`discovery_source = "kg_sync/runtime_corr"` (tier-1 precedence 0.95).
+Дешёвый OTEL-substitute: вместо distributed tracing смотрим на
+наблюдаемую корреляцию failure-сигналов.
+
+**Что НЕ делает.** Новые edges не создаёт. Симметричный co-fail сигнал
+не определяет направление зависимости. Direction discovery остаётся за
+declarative-источниками.
+
+Feature flag: `RUNTIME_CORRELATION_ENABLED=true` (включён по умолчанию).
+
+### Wave 7-Z: NATS subjects parser
+
+`app/knowledge_graph/nats_subjects_sync.py` каждые 6 часов клонирует
+(shallow + sparse-checkout) WO monorepo, regex-парсит C# исходники на
+NATS-consumers и publish call-sites. Subject регистрируется как
+synthetic-Service в namespace `nats-subjects`,
+`name = subject:<value>`. Edge `uses_nats` с `extras.direction ∈ {pub, sub}`,
+`weight = count(call-sites)`.
+
+Feature flag: `NATS_SUBJECTS_PARSER_ENABLED=false` (выключен по умолчанию —
+требует ssh-доступ к gitlab-monorepo и каталог `WO_MONOREPO_PATH`).
+
+### Edge kinds (полный реестр после Wave 7)
+
+| Edge kind | Producer | Direction semantics |
+|---|---|---|
+| `calls` | `kg_sync` (env-var URL), `k8s_ingress_sync` (host) | A делает HTTP-вызов к B |
+| `uses_nats` (cluster-level) | `kg_sync._extract_nats_clusters` | Service использует NATS-кластер (shared/kingdom) |
+| `uses_nats` (subject-level) | `nats_subjects_sync` | Service публикует/читает subject; `extras.direction ∈ {pub, sub}` |
+| `uses_db` | `kg_sync` (secretKeyRef heuristic) | Service использует БД (без чтения значений secret) |
+| `serves_traffic` (Wave 7-X) | `k8s_topology_resources_sync` | Service → backing Deployment (по selector) |
+| `routes_to` (Wave 7-X) | `k8s_topology_resources_sync` | Ingress (ресурс) → backend Service |
+| `runs_as_job` (Wave 8-A) | `k8s_jobs_sync` | CronJob/Job → owner Service (через `K8sJob.owner_service_id`, metadata-only) |
+| `uses_volume` (Wave 8-B) | `k8s_storage_sync` | Service → PVC (в `kg_volume_edges`) |
+| `bound_to` (Wave 8-B) | `k8s_storage_sync` | PVC → PV (в `kg_volume_edges`) |
+
+## 3e. KG Metadata + UX Polish (Wave 8)
+
+Wave 8 — пакет из 17 PR, который доводит KG-метаданные и Discord UX до
+состояния «можно строить Phase A remediation поверх». Контракт становится
+формальным, добавляются два больших coverage-блока (Jobs/Storage), owner
+inference перестаёт быть prefix-only, появляется `quality_report` для
+baseline-снимков перед remediation-волной.
+
+### Wave 8-A: k8s Jobs/CronJobs coverage (PR #82)
+
+`app/knowledge_graph/k8s_jobs_sync.py` каждые 15 минут читает
+`kubectl get jobs,cronjobs -A -o json` и upsert'ит в новую таблицу
+`kg_k8s_jobs` (отдельная от `kg_services` — Job/CronJob не «service»).
+
+- **Закрывает blind spot**: alembic migration jobs, backup CronJob-ы
+  (etcd snapshot, push-s3), ad-hoc cleanup — невидимы для KG до Wave 8.
+- **Поля Jobs**: `succeeded_count` / `failed_count` / `active_count` /
+  `completion_time` / `last_pod_exit_code`.
+- **Поля CronJobs**: `schedule` / `last_schedule_time` /
+  `last_successful_time` / `suspended`.
+- **Semantic edge `runs_as_job`**: CronJob → owner Service через
+  `K8sJob.owner_service_id` metadata-column (не отдельный edge-row).
+  Match по label `app.kubernetes.io/part-of` / `app` совпадающий с
+  `kg_services.name` в том же namespace.
+
+### Wave 8-B: PVC/PV storage coverage (PR #84)
+
+`app/knowledge_graph/k8s_storage_sync.py` каждые 30 минут.
+
+- **Закрывает blind spot**: ClickHouse / Postgres «упал» = в 95% случаев
+  диск кончился; до Wave 8 KG не имел storage-слоя.
+- **Новые таблицы**: `kg_storage_volumes` (PVC/PV; `kind ∈ {pvc, pv}`;
+  PV cluster-scoped с `namespace=''`) + `kg_volume_edges` (heterogeneous
+  edges с tagged `src_kind`/`dst_kind`, без FK constraint).
+- **Атрибуты**: storage_class, access_modes, phase, capacity_bytes.
+- **Edges**: `uses_volume` (Service → PVC, через scan
+  `pod.spec.volumes[]`), `bound_to` (PVC → PV через `pvc.spec.volumeName`).
+- **disk_pct enrichment** опционален через `STORAGE_METRICS_ENABLED=false`
+  (default OFF — kubelet_volume_stats_* scrape config может быть не настроен).
+
+### Wave 8-C: multi-signal owner inference (PR #85)
+
+`app/services/ownership_suggester.py` + `app/services/owner_aliases.py`.
+Старая prefix-only логика расширена до взвешенного fusion-а трёх сигналов
++ manual override:
+
+- **A. Prefix** (weight 0.4) — regex по ns-имени.
+- **B. Deploy history** (weight 0.4) — most-frequent `triggered_by` из
+  `kg_deployments` за 30 дней; username транслируется через
+  `owner_aliases.resolve_username`.
+- **C. Labels** (weight 0.2) — k8s labels из `kg_services.metadata_json`.
+- **Manual override** через `OWNERSHIP_MANIFEST_PATH=ownership.yaml`
+  (match по glob → confidence=1.0, эвристики игнорируются).
+
+### Wave 8-D: stale_class column (PR #86)
+
+`kg_services.stale_class` + `app/knowledge_graph/stale_classifier.py`:
+
+- `active` — deploy за последние `ACTIVE_WINDOW_DAYS` (default 30d).
+- `expected_stale` — давно не катился, но это норма (backup/cron/system
+  ns, infra/platform owner).
+- `suspicious_stale` — нет deploys 30d, не expected_stale.
+
+`kg_sync.sync_namespace` переписывает column идемпотентно; stats_digest
+читает column как primary, fallback на legacy `_classify_stale`.
+
+### Wave 8-E: schema/quality contract v2.2 (PRs #83 + #89)
+
+`app/knowledge_graph/contract.py` — единственный источник истины:
+
+- `KG_SCHEMA_VERSION = "2.2"`.
+- `EDGE_KINDS` — реестр всех edge kinds (semantic / src_kinds / dst_kinds /
+  source / status / table); поле `table` различает где edge живёт
+  (`kg_service_edges` / `kg_volume_edges` / `fk_only` / `metadata_only`).
+- `OWNER_SOURCES`, `STALE_CLASS_VALUES`, `SYNTHETIC_KINDS`.
+- `STARTUP_CONTRACT_CHECK(db)` — boot-time диагностика drift-а.
+- **Gate #22** (`tests/test_contract_drift.py`) — CI-блокирующий тест на
+  расхождение кода и контракта.
+
+Человекочитаемая версия — `docs/KG_SCHEMA_CONTRACT.md`.
+
+### Wave 8-F: Discord UX polish (PRs #76, #77, #79, #81, #90)
+
+- **#76**: blast radius (X) / NATS impact (Z) / pod trail (Y) теперь
+  рендерятся в enriched embed как отдельные поля.
+- **#77**: PATCH-dedup для `send_enriched_alert` — 30-минутное content-key
+  окно.
+- **#79**: human-time, pod name, ready/desired replicas, kubelet reason.
+  Новый модуль `app/utils/time_human.py`.
+- **#81**: stats digest UX — series→series collapse, unowned action
+  block, `trend Δ24h`, секции `chronic`/`resurfaced`, stale pill,
+  `fragile → blast-radius` rename.
+- **#90**: cascade deploys aggregation, new-baseline placeholder.
+
+### Wave 8-G: quality_report + snapshot fixtures (PRs #87, #88)
+
+- **`app/scripts/quality_report.py`** — идемпотентный read-only CLI:
+  5 групп метрик KG. Markdown (default) или JSON. Baseline-снимок —
+  `docs/quality_report_baseline_2026_05_24.md`.
+- **`tests/fixtures/discord_snapshots/`** — 7 known-good embed cases
+  + раннер `tests/test_discord_alert_gallery.py`. UX regression-guard:
+  любое изменение в discord/embed_builder валит diff. Update workflow:
+  `UPDATE_SNAPSHOTS=1 pytest tests/test_discord_alert_gallery.py`.
 
 ## 4. Fact-Anchored Reasoning (рассуждение на основе фактов)
 

@@ -4,7 +4,7 @@
 [![Python](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/)
 [![FastAPI](https://img.shields.io/badge/FastAPI-0.104-009688)](https://fastapi.tiangolo.com/)
 [![Celery](https://img.shields.io/badge/Celery-5.3-37814A)](https://docs.celeryq.dev/)
-[![Release](https://img.shields.io/badge/release-v0.7.3-blue)](CHANGELOG.md)
+[![Release](https://img.shields.io/badge/release-v0.12.0-blue)](CHANGELOG.md)
 
 > **[English](#english) · [Русский](#русский)**
 
@@ -18,6 +18,30 @@
 > **Default = advisory mode.** With out-of-the-box settings (`EXECUTOR_ENABLED=false`, `EXECUTOR_APPROVAL_ENABLED=false`) the copilot does **not** call `kubectl` — it analyzes, posts to Discord, and stops. Engineer acts manually.
 >
 > **Opt-in = auto-remediator with approval.** Setting `EXECUTOR_ENABLED=true` adds a 9th pipeline stage that validates the proposed action against `kube-apiserver` via `kubectl ... --dry-run=server`. Setting `EXECUTOR_APPROVAL_ENABLED=true` additionally shows an «⚙️ Apply» button on the Discord embed (only when dry-run passed and risk ≤ medium); two-click confirmation → real `kubectl` under `K8sSecurityGuard` with full OTEL audit. See [Roadmap → Execution](#roadmap--execution) below for the ramp-up plan.
+
+### What's new
+
+- **v0.12.0 — Wave 8 (KG Metadata + UX Polish)**: k8s Jobs/CronJobs coverage
+  (`kg_k8s_jobs`, `runs_as_job` edge), PVC/PV storage subgraph (`kg_storage_volumes`,
+  `uses_volume` + `bound_to` edges in `kg_volume_edges`), multi-signal owner
+  inference (prefix + deploy-history + labels + manual override), `stale_class`
+  column on `kg_services` (active/expected_stale/suspicious_stale), formal
+  KG schema/quality contract v2.2 (`app/knowledge_graph/contract.py` +
+  `docs/KG_SCHEMA_CONTRACT.md`), Discord embed UX polish (PATCH-dedup,
+  human-time, pod trail), stats digest UX overhaul (trends, unowned action
+  block, blast-radius rename), `quality_report` CLI + 7-case snapshot fixtures
+  gallery for UX regression-guard.
+- **v0.11.0 — Wave 7 (Topology Expansion)**: PodEvent ↔ ServiceEdge runtime
+  correlation (cheap OTEL-substitute, confirms existing edges), declarative
+  k8s Service + Ingress parser (new `serves_traffic` + `routes_to` edges),
+  NATS subjects parser from monorepo source (subject-level pub/sub direction
+  on `uses_nats` edges).
+- **v0.9.0–v0.10.0 — Active observability layer (Wave 1–6)**: VictoriaMetrics
+  time-series materialization (`kg_service_health`), anomaly detection
+  (robust-z + seasonal baseline), deploy ↔ incident correlator, Seq logs
+  integration, daily team digest, Discord pipeline overhaul (dedup, severity
+  routing, per-team channels), PII redaction, Approve/Decline authz, KG
+  self-health canary.
 
 ### What it does
 
@@ -221,6 +245,30 @@ See [docs/RUNBOOK.md → Executor incidents](docs/RUNBOOK.md#executor-incidents)
 > **Default = advisory-режим.** Со стандартными настройками (`EXECUTOR_ENABLED=false`, `EXECUTOR_APPROVAL_ENABLED=false`) copilot **не** вызывает `kubectl` — анализирует, постит в Discord, останавливается. Инженер действует руками.
 >
 > **Opt-in = auto-remediator с approval.** При `EXECUTOR_ENABLED=true` добавляется 9-я стадия пайплайна: предложенное действие валидируется через `kube-apiserver` командой `kubectl ... --dry-run=server`. При `EXECUTOR_APPROVAL_ENABLED=true` на embed дополнительно появляется кнопка «⚙️ Apply» (только если dry-run прошёл и risk ≤ medium); двухшаговое подтверждение → реальный `kubectl` под `K8sSecurityGuard` + полный OTEL audit. См. [Roadmap — Execution](#roadmap--execution-1) ниже для плана выкатки.
+
+### Что нового
+
+- **v0.12.0 — Wave 8 (KG Metadata + UX Polish)**: покрытие k8s Jobs/CronJobs
+  (`kg_k8s_jobs`, edge `runs_as_job`), storage-подграф PVC/PV
+  (`kg_storage_volumes`, edges `uses_volume` + `bound_to` в `kg_volume_edges`),
+  multi-signal owner inference (prefix + deploy-history + labels + manual
+  override), column `stale_class` в `kg_services` (active/expected_stale/
+  suspicious_stale), формализованный KG schema/quality contract v2.2
+  (`app/knowledge_graph/contract.py` + `docs/KG_SCHEMA_CONTRACT.md`), polish
+  Discord embed (PATCH-dedup, human-time, pod trail), переработка stats
+  digest UX (trends, unowned action block, blast-radius rename), CLI
+  `quality_report` + 7 snapshot-фикстур для UX regression-guard.
+- **v0.11.0 — Wave 7 (Topology Expansion)**: runtime correlation
+  PodEvent ↔ ServiceEdge (дешёвый OTEL-substitute, подтверждает существующие
+  edges), declarative-парсер k8s Service + Ingress (новые edges
+  `serves_traffic` + `routes_to`), парсер NATS subjects из monorepo
+  (subject-level direction pub/sub на edges `uses_nats`).
+- **v0.9.0–v0.10.0 — Active observability layer (Wave 1–6)**: time-series
+  материализация VictoriaMetrics (`kg_service_health`), детекция аномалий
+  (robust-z + seasonal baseline), deploy ↔ incident correlator, интеграция
+  Seq, daily team digest, переработка Discord-пайплайна (dedup, severity
+  routing, per-team каналы), PII redaction, authz на Approve/Decline,
+  self-health canary KG.
 
 ### Что умеет
 

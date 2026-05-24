@@ -477,3 +477,229 @@ WHERE incident_id = '<id>';
 - `likely` but the deploy was a docs-only change → check `deploy_status_factor` and `time_proximity`; the deploy might have coincided in time with an unrelated incident. Mark the incident `resolution_quality = 'unresolved'` so it doesn't poison KG.
 - `suspect` and you suspect it's actually likely → look at `max_zscore`. If it's just below the warning threshold, the source metric may be borderline noisy.
 - `weak` but operator intuition says yes → check whether the deploy was outside the 2h window (incident lag from VM scrape interval can push the timestamp later than reality).
+
+---
+
+## KG quality_report — baseline snapshot
+
+The `quality_report` CLI is the canonical way to take a KG-quality
+baseline snapshot — used before/after large remediation waves to
+demonstrate change.
+
+### Run it
+
+```bash
+# Markdown to stdout (default):
+python -m app.scripts.quality_report
+
+# JSON to stdout (for diff / dashboard ingestion):
+python -m app.scripts.quality_report --json
+
+# Save snapshot to a file:
+python -m app.scripts.quality_report --markdown --output baseline.md
+```
+
+The script is **read-only** — no INSERT/UPDATE/DELETE. Safe to run
+against production. It uses the same `SessionLocal` as the production
+copilot, so it picks up the same DB credentials.
+
+### What it computes
+
+Five sections:
+
+1. **Services** — total / real / synthetic / orphans / by `stale_class`
+   (active / expected_stale / suspicious_stale) / owner coverage.
+2. **Edges** — by `kind` (calls / uses_nats / uses_db / serves_traffic /
+   routes_to / uses_volume / bound_to) / freshness / multi-source ratio.
+3. **Events** — deploys by status / pod_events linkage rate (with
+   `service_id` resolved) / alerts open vs resolved.
+4. **Coverage** — Jobs/CronJobs / Storage Volumes / NATS subjects.
+5. **Quality flags** — known data-quality issues with line-number anchors
+   (e.g. "12 unowned ns with deploys in last 30d — suspect owner_inference
+   gap").
+
+### Baseline at v0.12.0
+
+`docs/quality_report_baseline_2026_05_24.md` — taken right after Wave 8
+merge. Use as the comparison anchor for Phase A remediation.
+
+---
+
+## Ownership manifest
+
+The multi-signal owner inference (`ownership_suggester.suggest_owner_multi_signal`)
+tries three heuristics in parallel (prefix / deploy-history / labels).
+When none fit, or the answer is wrong, override with a YAML manifest.
+
+### Setup
+
+```bash
+# Point at a YAML file (must be readable by the worker pod):
+OWNERSHIP_MANIFEST_PATH=/etc/sre-ai/ownership.yaml
+```
+
+### YAML format
+
+```yaml
+# Each entry: ns_pattern (glob), owner (string used as-is in digest),
+# reason (free-form, surfaces in audit log).
+- ns_pattern: "ml-*"
+  owner: "@ml-platform"
+  reason: "ML infra not yet labeled — owner confirmed via Slack 2026-05-23"
+
+- ns_pattern: "vendor-acme"
+  owner: "@vendor-acme"
+  reason: "Third-party namespace, no internal owner — escalate via partnership"
+
+- ns_pattern: "*-backup"
+  owner: "@platform"
+  reason: "All backup CronJobs are platform-owned by policy"
+```
+
+- `ns_pattern` matches with Python `fnmatch` (glob, not regex).
+- First match wins — order matters; specific patterns above generic ones.
+- A manifest match sets `confidence=1.0` and overrides all three heuristics.
+
+### Reload
+
+The manifest is re-read on every `suggest_owner_multi_signal` call, but
+the file path is cached by environment. To switch manifests, change the
+env var and restart the worker.
+
+### Audit
+
+Every manifest match emits a `KG_OWNER_MANUAL_OVERRIDE` audit log line
+with `ns_pattern`, `owner`, `reason`. Use to verify manifest is being
+read in production.
+
+### Alias map for deploy-history signal
+
+For the deploy-history heuristic (signal B), TC usernames are translated
+to team-handles via `app/services/owner_aliases.py`. Override with:
+
+```bash
+OWNER_ALIASES_PATH=/etc/sre-ai/owner-aliases.yaml
+```
+
+YAML format:
+
+```yaml
+kemyashev: "@squad-1"
+apleshkov: "@squad-2"
+wizaryx:   "@platform"
+new-engineer: "@squad-N"
+```
+
+Pre-baked defaults in code; YAML extends/overrides. Keys must be lowercase.
+
+---
+
+## stale_class on kg_services
+
+Wave 8 introduces `kg_services.stale_class` (PR #86). Three values:
+
+| Value | Meaning |
+|---|---|
+| `active` | Deploy within the last `ACTIVE_WINDOW_DAYS` (default 30d). |
+| `expected_stale` | Hasn't deployed in 30d, but it's expected: backup/cron/system names, infra/platform-owned namespaces. |
+| `suspicious_stale` | No deploys in 30d, doesn't match expected patterns. |
+
+The column is rewritten **idempotently** by `kg_sync.sync_namespace` on
+every sync (hourly). The stats_digest reads it as the primary source
+with a fallback to the legacy in-memory classifier for installations
+that haven't synced yet.
+
+### Reclassifying a service
+
+If a service is misclassified (e.g. an `expected_stale` that actually
+needs to deploy more frequently), there are three levers:
+
+1. **Rename**: drop the `-backup` / `-cron` / `-job` suffix that pattern-matches
+   into `expected_stale`. The next sync will reclassify it.
+2. **Move namespace**: re-deploy into a non-`expected_stale` namespace
+   (`kube-system`, `monitoring` are in the system list).
+3. **Change owner**: `team_owner = platform` triggers `expected_stale`
+   when there are no recent deploys. Set to a squad owner instead.
+
+Manual override via SQL is **not recommended** — the column will be
+overwritten on the next sync. Treat it as derived, not authoritative.
+
+### Querying
+
+```sql
+-- All suspicious_stale services with their last deploy:
+SELECT
+  s.namespace, s.name, s.team_owner,
+  s.stale_class,
+  MAX(d.started_at) AS last_deploy
+FROM kg_services s
+LEFT JOIN kg_deployments d ON d.service_id = s.id
+WHERE s.stale_class = 'suspicious_stale'
+  AND NOT s.synthetic
+GROUP BY s.id
+ORDER BY last_deploy NULLS FIRST;
+```
+
+Use this query in production to find candidates for retire/handoff.
+
+---
+
+## Discord snapshot fixtures (UX regression-guard)
+
+Wave 8-G (PR #88) introduces a 7-case snapshot gallery for Discord
+embeds — any UX change in `app/services/discord/embed_builder.py` or
+related modules has to update these snapshots, or CI fails.
+
+### Cases
+
+`tests/fixtures/discord_snapshots/`:
+
+1. `01_critical_fresh` — first-fire critical alert with full enrichment.
+2. `02_critical_resurfaced` — same alert returning after a resolve.
+3. `03_warning_compact` — warning severity, no enrichment.
+4. `04_burst_aggregation` — same alert firing N times in dedup window.
+5. `05_daily_digest` — daily stats digest (KG-summary).
+6. `06_chronic_digest` — chronic-suppressed alerts visibility digest.
+7. `07_team_digest` — per-team fragile services digest.
+
+Each case has `input.json` (alert/incident payload) and `expected.json`
+(rendered embed). The runner is `tests/test_discord_alert_gallery.py`.
+
+### Update workflow
+
+When you intentionally change embed UX:
+
+```bash
+# Re-render and overwrite all expected.json files:
+UPDATE_SNAPSHOTS=1 pytest tests/test_discord_alert_gallery.py
+
+# Review the diff:
+git diff tests/fixtures/discord_snapshots/
+
+# Commit if the changes look correct:
+git add tests/fixtures/discord_snapshots/
+git commit -m "UX: update snapshot fixtures after <change>"
+```
+
+### Reviewing snapshot diffs
+
+The runner pretty-prints diffs in pytest output when fixtures fail. Look
+for:
+
+- **Title/description text** — the most user-visible regression.
+- **Field order** — changes here change scanability of the embed.
+- **Color / severity badge** — visual regression at glance.
+- **Footer/timestamp** — usually noise; ignore unless ts logic changed.
+
+If a diff is too large to review by eye, run with `-vv` for full
+side-by-side, or open `input.json` and re-render in isolation.
+
+### Adding a new case
+
+1. Create `XX_new_case.input.json` with a minimal alert/incident payload.
+2. Run `UPDATE_SNAPSHOTS=1 pytest tests/test_discord_alert_gallery.py -k new_case`.
+3. Inspect the generated `XX_new_case.expected.json` — does it look correct?
+4. Commit both files together.
+
+Goal: every embed shape (severity × enrichment-state × digest-type)
+should have at least one case to detect regression.
