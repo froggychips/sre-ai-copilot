@@ -111,14 +111,20 @@ rules:
 # KG Coverage #1: k8s Job + CronJob → kg_k8s_jobs. Cluster-wide read
 # нужен для backup-CronJob'ов в `*-shared` ns + alembic-Job'ов в ns
 # деплоя. pods нужны для resolve last_pod_exit_code у Failed Job'ов
-# (label-selector job-name=<name>) — уже покрыты core/pods, но
-# kg-cluster-reader исторически не имел pod'ов, поэтому добавляем.
+# (label-selector job-name=<name>) — уже покрыты ниже общим правилом
+# для storage scan.
 - apiGroups: ["batch"]
   resources: ["jobs", "cronjobs"]
   verbs: ["get", "list", "watch"]
+# KG Coverage #2 (storage signals): k8s_storage_sync (PVC/PV cluster-wide
+# + pod scan для uses_volume edges; ReplicaSets — Pod→Deployment chain).
+# pods cluster-wide объединены с #1.
 - apiGroups: [""]
-  resources: ["pods"]
-  verbs: ["get", "list"]
+  resources: ["persistentvolumeclaims", "persistentvolumes", "pods"]
+  verbs: ["get", "list", "watch"]
+- apiGroups: ["apps"]
+  resources: ["replicasets"]
+  verbs: ["get", "list", "watch"]
 
 ---
 apiVersion: rbac.authorization.k8s.io/v1
