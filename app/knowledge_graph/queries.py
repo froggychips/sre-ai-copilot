@@ -252,7 +252,9 @@ def blast_radius_for(
     )
     urls_seen: List[str] = []
     for edge in routes_rows:
-        extras = edge.extras if isinstance(edge.extras, dict) else {}
+        extras: Dict[str, Any] = (
+            edge.extras if isinstance(edge.extras, dict) else {}
+        )
         host = extras.get("host")
         if not host or host == "*":
             continue
@@ -311,8 +313,10 @@ def nats_impact_for(
     for edge in out_edges:
         if edge.dst is None:
             continue
-        sid = edge.dst_id
-        extras = edge.extras if isinstance(edge.extras, dict) else {}
+        sid = int(edge.dst_id)
+        extras: Dict[str, Any] = (
+            edge.extras if isinstance(edge.extras, dict) else {}
+        )
         direction = (extras.get("direction") or "?").lower()
         subject_ids.append(sid)
         by_subject_id[sid] = {
@@ -340,7 +344,9 @@ def nats_impact_for(
                 continue
             entry["impact_count"] += 1
             if len(entry["impact_others"]) < 3:
-                r_extras = r.extras if isinstance(r.extras, dict) else {}
+                r_extras: Dict[str, Any] = (
+                    r.extras if isinstance(r.extras, dict) else {}
+                )
                 entry["impact_others"].append((
                     r.src.name,
                     (r_extras.get("direction") or "?").lower(),
@@ -394,11 +400,90 @@ def pod_event_summary_for(
         # за весь lifetime). Для «сколько падений было» используем count;
         # `max(1, count)` чтобы NULL/0 не схлопывали row.
         c = max(1, int(r.count or 1))
-        by_reason[r.reason] = by_reason.get(r.reason, 0) + c
+        reason_key = str(r.reason)
+        by_reason[reason_key] = by_reason.get(reason_key, 0) + c
         total += c
 
     pairs = sorted(by_reason.items(), key=lambda kv: kv[1], reverse=True)
     return {"total": total, "by_reason": pairs}
+
+
+def latest_pod_event_for(
+    db: Session,
+    namespace: str,
+    service_name: str,
+) -> Optional[Dict[str, Any]]:
+    """Самое свежее `kg_pod_events`-событие для сервиса.
+
+    Используется enrichment-ом, чтобы вытащить `pod_name` + `reason` для
+    embed-полей «Pod» / «Reason». В `recent_pod_events_for` уже есть
+    window-фильтр, тут нужен просто «последнее что было» без окна — для
+    кейса когда window-fallback (7д) тоже пуст и хочется хоть что-то
+    показать.
+
+    Возвращает dict с {pod_name, reason, last_seen, first_seen, count,
+    message, minutes_ago}. None если событий вообще нет.
+    """
+    svc = _service_by_namespace_name(db, namespace, service_name)
+    if svc is None:
+        return None
+    row = (
+        db.query(PodEvent)
+        .filter(PodEvent.service_id == svc.id)
+        .order_by(PodEvent.first_seen.desc())
+        .first()
+    )
+    if row is None:
+        return None
+    now = datetime.now(timezone.utc)
+    first_aware = _ensure_aware(row.first_seen)
+    minutes_ago = int((now - first_aware).total_seconds() // 60)
+    return {
+        "pod_name": row.pod_name,
+        "reason": row.reason,
+        "first_seen": row.first_seen,
+        "last_seen": row.last_seen,
+        "count": row.count,
+        "message": (row.message or "")[:200],
+        "minutes_ago": minutes_ago,
+    }
+
+
+def current_replicas_from_kg(
+    db: Session,
+    namespace: str,
+    service_name: str,
+) -> Optional[Dict[str, Any]]:
+    """Прочитать ready/desired из `kg_services.metadata_json` (если есть).
+
+    Дешёвая попытка — read-only Service row. Если populator не пишет
+    `replicas`/`ready_replicas` в metadata_json — вернёт None и caller
+    может пойти в live k8s API.
+
+    Ожидаемые ключи в metadata_json (по согласованию с populator):
+        * `replicas` или `replicas_desired` — int
+        * `ready_replicas` или `replicas_ready` — int
+
+    Возвращает {ready, desired} или None.
+    """
+    svc = _service_by_namespace_name(db, namespace, service_name)
+    if svc is None:
+        return None
+    meta: Dict[str, Any] = svc.metadata_json or {}
+    if not isinstance(meta, dict):
+        return None
+    desired = meta.get("replicas_desired")
+    if desired is None:
+        desired = meta.get("replicas")
+    ready = meta.get("replicas_ready")
+    if ready is None:
+        ready = meta.get("ready_replicas")
+    if desired is None and ready is None:
+        return None
+    return {
+        "ready": int(ready) if ready is not None else None,
+        "desired": int(desired) if desired is not None else None,
+    }
 
 
 def recent_pod_events_for(
