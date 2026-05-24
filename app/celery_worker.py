@@ -105,13 +105,9 @@ async def _generate_reply_logic(
 
         transition(IncidentState.FIX_PROPOSED)
 
-        # В режиме REPLAY пропускаем отправку в Discord
-        if not replay_mode:
-            from app.services.discord_service import discord_service
-
-            await discord_service.send_report(
-                f"Analysis for incident {conversation_id} completed."
-            )
+        # Legacy Discord notification удалён: основной отчёт идёт через
+        # app/workers/pipeline.py::send_incident_report (severity-gated embed).
+        # См. PR chore/gc-legacy-discord-senders.
 
         if replay_mode and environment_fingerprint:
             return json.dumps(
