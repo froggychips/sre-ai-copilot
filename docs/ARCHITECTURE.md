@@ -16,7 +16,7 @@ The application consists of: an HTTP API (FastAPI), background tasks (Celery), a
 - **FixAgent (`app.agents.fix`)**: generates a structured `ExecutionIntent`; recurrence-aware and Jira-enriched.
 - **SimilarIncidentEngine (`app.core.intelligence.similar_incidents`)**: KG-based recurrence detection (7-day window).
 - **JiraClient (`app.context.jira_client`)**: Atlassian REST API enrichment for FixAgent context.
-- **Knowledge Graph (`app.knowledge_graph.*`)**: auto-populating directed graph in Postgres (5 tables: `kg_services`, `kg_service_edges`, `kg_deployments`, `kg_alerts`, `kg_pod_events`); 5 sync sources (env-vars, NATS env, DSN-from-secret-key, k8s events, k8s ingresses); confidence scoring with multi-source provenance.
+- **Knowledge Graph (`app.knowledge_graph.*`)**: auto-populating directed graph in Postgres (5 tables: `kg_services`, `kg_service_edges`, `kg_deployments`, `kg_alerts`, `kg_pod_events`); 8 sync sources (env-vars, NATS env, DSN-from-secret-key, k8s events, k8s ingresses-as-host, **k8s Services + Ingresses as resources (Wave 7-X)**, **NATS subjects from monorepo source (Wave 7-Z)**, **runtime PodEvent co-occurrence (Wave 7-Y)**); confidence scoring with multi-source provenance.
 - **Alert enrichment (`app.services.alert_enrichment`)**: deterministic KG-based enrichment for `/webhooks/alertmanager/enrich-and-forward` — runs without LLM, ~5 SQL queries, builds `EnrichedContext` (recent_deploys, upstream_alerts, outgoing_deps, pod_events, jira_issues, primary_hypothesis, why_this_matters).
 - **Data layer (`app.database`, `app.repository`)**: SQLAlchemy models and CRUD operations.
 - **Integration layer (`app.services.mcp_client`)**: MCP client for k8s, TeamCity, and other external tools.
@@ -43,6 +43,10 @@ The application consists of: an HTTP API (FastAPI), background tasks (Celery), a
 | `kg_deploy_correlator` | every 15 min | recent incidents × deploys → multi-factor confidence + verdict |
 | `team_digest` | daily @ 09:00 UTC | per-team fragile services digest |
 | `kg_self_health_check` | every 30 min | 6 canaries against KG data quality |
+| `kg_stuck_alerts_check` | hourly @ :11 | alerts firing >24h без resolved_at → escalation digest |
+| `kg_topology_resources_sync` | every 15 min | **Wave 7-X**: k8s Service+Ingress declarative → edges `serves_traffic` + `routes_to` |
+| `kg_runtime_correlation_sync` | every 30 min | **Wave 7-Y**: pod_event co-occurrence (7d window) подтверждает existing edges |
+| `kg_nats_subjects_sync` | every 6h @ :43 | **Wave 7-Z**: parse C# monorepo → subject nodes + `uses_nats` edges с direction (off by default) |
 
 ## 3. Data Flow (Webhook Incident Pipeline)
 
@@ -238,6 +242,98 @@ Runs every 30 minutes. Six checks, each returning `ok` / `warn` / `fail`:
 6. **`edges_freshness`** — % of `kg_service_edges` with `last_seen_at < 24h` or `NULL`. >30% stale → warn (kg_topology_sync regression).
 
 Output: audit-log line per run; on any `fail`/`warn`, a single Discord embed is posted to `DISCORD_WEBHOOK_SELF_HEALTH_URL` — kept separate from `#infra-error` to avoid drowning operational alerts. A 6-hour dedup window prevents the same canary fail from spamming the channel.
+
+## 3d. Topology Expansion (Wave 7)
+
+Wave 7 расширяет источники топологии KG с двух (env-var heuristic +
+Ingress-host externalisation) до пяти, плюс runtime confirmation channel.
+Цель — дать confidence-фреймворку (`kg_service_edges.extras.discovery_sources`)
+независимые tier-1 источники, чтобы провенанс edges не зависел от единственного
+heuristic-парсинга env-переменных.
+
+### Wave 7-X: declarative Service + Ingress parser
+
+`app/knowledge_graph/k8s_topology_resources_sync.py` каждые 15 минут читает
+`kubectl get services/ingresses -A -o json` и строит:
+
+- **`serves_traffic`** edge: Service → backing Deployment, по selector-match
+  на pod template labels. Declarative замена runtime Endpoint resolution —
+  не зависит от живых pods, поэтому работает и для свёрнутых деплоев.
+- **`routes_to`** edge: Ingress (как ресурс) → backend Service. Параллельный
+  slice к существующему `k8s_ingress_sync.py`, который строит
+  `ingress:<host>` → backend как `calls` (host-уровень). Один Ingress
+  ресурс часто имеет N hosts/paths — этот модуль покрывает Ingress-as-resource,
+  старый — Ingress-as-host. Оба пишутся в `extras.discovery_sources`
+  через merge в `populator.upsert_edge`.
+
+RBAC: cluster-role требует `services` + `ingresses` на `get`/`list`/`watch`
+(см. `k8s/base/rbac.yaml`).
+
+Включён по умолчанию (нет feature flag) — declarative-источник идемпотентен
+и не требует внешних зависимостей кроме `kubectl`.
+
+### Wave 7-Y: PodEvent runtime correlation
+
+`app/knowledge_graph/runtime_correlation.py` каждые 30 минут ищет пары
+сервисов, у которых warning-события (BackOff/Unhealthy/OOMKilled/
+FailedScheduling/CrashLoopBackOff/FailedMount/ImagePullBackOff) сваливаются
+в одном окне `RUNTIME_CORRELATION_WINDOW_MINUTES` (default 15 мин) N+ раз
+за `RUNTIME_CORRELATION_LOOKBACK_DAYS` (default 7 дней).
+
+**Что делает.** Подтверждает уже существующие edges новым
+`discovery_source = "kg_sync/runtime_corr"` (tier-1 precedence 0.95). Это
+дешёвый OTEL-substitute: вместо распределённого трейсинга смотрим на
+наблюдаемую кореляцию failure-сигналов.
+
+**Что НЕ делает.** Новые edges из ничего не создаёт. Симметричный сигнал
+co-occurrence не определяет направление зависимости — поэтому это
+confirmation channel, а не discovery channel. Топология строится
+declarative-источниками (env, Service-selector, Ingress, NATS-monorepo).
+
+**Synthetic-исключение.** Synthetic-узлы (NATS-cluster, ingress:host)
+исключаются: их pod_events идут через cluster-wide kubelet и дадут
+false-positive каждому сервису в namespace. См. `_is_synthetic()`.
+
+Feature flag: `RUNTIME_CORRELATION_ENABLED=true` (включён по умолчанию).
+
+### Wave 7-Z: NATS subjects parser
+
+`app/knowledge_graph/nats_subjects_sync.py` каждые 6 часов клонирует
+(shallow + sparse-checkout) WO monorepo, regex-парсит C# исходники на
+NATS-consumers (`NatsJetStreamConsumer<T>.Subject => NatsSubjectConst.<NAME>`)
+и publish call-sites (`SendToJetStreamAsync(subject: ...)`).
+
+Subject регистрируется как synthetic-Service в namespace `nats-subjects`,
+`name = subject:<value>` (например `subject:march-export`). Это
+переиспользует существующую схему `kg_services`/`kg_service_edges` без
+новых таблиц или миграций.
+
+Для каждого call-site пишется edge `uses_nats` с `extras.direction ∈ {pub, sub}`,
+`weight = count(call-sites)`. Это дополняет существующие `uses_nats` к
+synthetic NATS-cluster-узлам (env-var-derived) — теперь видно не только
+что сервис подключён к кластеру, но и какие именно subjects он публикует
+или читает.
+
+Service-name резолвинг: путь `GR.WO.Map.Service/...` → `map-service`
+(lowercase, dots→dash) — matches Deployment-имена в k8s.
+`NatsSubjectConst.<NAME>` → литеральная строка через один проход по
+`GR.Platform/DataBus/Nats/NatsConst.cs`.
+
+Feature flag: `NATS_SUBJECTS_PARSER_ENABLED=false` (выключен по умолчанию —
+требует ssh-доступ к gitlab-monorepo и каталог `WO_MONOREPO_PATH`).
+Переменные окружения: `WO_MONOREPO_PATH`, `WO_MONOREPO_SSH_URL`,
+`WO_MONOREPO_SPARSE_DIRS`.
+
+### Edge kinds (full inventory after Wave 7)
+
+| Edge kind | Producer | Direction semantics |
+|---|---|---|
+| `calls` | `kg_sync` (env-var URL), `k8s_ingress_sync` (host) | A makes HTTP call to B |
+| `uses_nats` (cluster-level) | `kg_sync._extract_nats_clusters` | Service uses NATS-cluster (shared/kingdom) |
+| `uses_nats` (subject-level) | `nats_subjects_sync` | Service publishes/subscribes to a subject; `extras.direction ∈ {pub, sub}` |
+| `uses_db` | `kg_sync` (secretKeyRef heuristic) | Service uses DB (without reading secret values) |
+| `serves_traffic` (NEW Wave 7-X) | `k8s_topology_resources_sync` | Service → backing Deployment (by selector) |
+| `routes_to` (NEW Wave 7-X) | `k8s_topology_resources_sync` | Ingress (resource) → backend Service |
 
 ## 4. Fact-Anchored Reasoning
 

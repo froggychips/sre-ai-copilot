@@ -2,6 +2,138 @@
 
 All notable changes to this project are documented in this file.
 
+## [0.11.0] — 2026-05-24 — Wave 7 (Topology Expansion)
+
+Расширение источников топологии KG: к env-var heuristic-у (Wave 0) и
+Ingress-host externalisation (Phase 1) добавлены три новых declarative и
+runtime источника. Цель — снять с env-scan'а монополию на провенанс edges и
+дать confidence-фреймворку независимые tier-1 источники для merge.
+
+### Added — Wave 7-Y: PodEvent ↔ ServiceEdge runtime correlation (PR #70, `e9a093c`)
+
+- **`app/knowledge_graph/runtime_correlation.py`** (338 LoC, +215 LoC тестов):
+  cheap OTEL-substitute. Beat task `kg_runtime_correlation_sync` каждые 30
+  минут ищет пары `(src, dst)` для которых warning-события
+  (BackOff/Unhealthy/OOMKilled/FailedScheduling/CrashLoopBackOff/
+  FailedMount/ImagePullBackOff) сваливаются в окне `RUNTIME_CORRELATION_WINDOW_MINUTES`
+  (default 15 мин) N+ раз за `RUNTIME_CORRELATION_LOOKBACK_DAYS` (default 7d),
+  и подтверждает уже существующие edges новым `discovery_source =
+  "kg_sync/runtime_corr"` (tier-1 precedence 0.95 в `confidence._SOURCE_PRECEDENCE`).
+- **Принципиально не создаёт новые edges из ничего** — симметричный co-fail
+  сигнал не определяет direction; полагаемся на declarative-источники для
+  топологии, runtime — только confirmation channel.
+- **Исключение `_is_synthetic`** — synthetic-узлы (nats-shared, ingress:*)
+  игнорируются: их pod_events идут через cluster-wide kubelet и дадут
+  false-positive каждому сервису в ns.
+- **Feature flag:** `RUNTIME_CORRELATION_ENABLED=true` (включён по умолчанию).
+  Конфиг: `RUNTIME_CORRELATION_MIN_COUNT=2`, `RUNTIME_CORRELATION_WINDOW_MINUTES=15`.
+- CLI: `python -m app.knowledge_graph.runtime_correlation`.
+
+### Added — Wave 7-X: declarative k8s Service + Ingress topology parser (PR #71, `ba6720e`)
+
+- **`app/knowledge_graph/k8s_topology_resources_sync.py`** (428 LoC, +542 LoC
+  тестов): новый declarative источник топологии — golden middle между
+  env-var heuristic и runtime-evidence. Beat task
+  `kg_topology_resources_sync` каждые 15 минут делает
+  `kubectl get services/ingresses -A -o json`, upsert-ит kg_services с
+  `metadata_json` (service_type, ports, selector), и строит:
+  - **Edge `serves_traffic`** (Service → backing Deployment): declarative
+    замена runtime Endpoint-resolve. Selector-match на pod template labels —
+    статичный, без зависимости от живых pods.
+  - **Edge `routes_to`** (Ingress → backend Service): параллельный slice
+    к существующему `k8s_ingress_sync` (`ingress:<host>` → `calls`). Один
+    Ingress ресурс может иметь N hosts/paths; новый источник покрывает
+    Ingress-as-resource, старый — Ingress-as-host. Оба пишутся в `extras.discovery_sources`
+    через `populator.upsert_edge`-merge.
+- **ClusterRole RBAC patch** в `k8s/base/rbac.yaml` и
+  `helm/sre-ai-copilot/templates/rbac.yaml`: `services`, `ingresses` на verbs
+  `get`/`list`/`watch` для cluster-wide read.
+- **Включён по умолчанию** — нет feature flag, declarative и idempotent.
+- CLI: `python -m app.knowledge_graph.k8s_topology_resources_sync [namespace]`.
+
+### Added — Wave 7-Z: NATS subjects parser из WO monorepo (PR #72, `56155fc`)
+
+- **`app/knowledge_graph/nats_subjects_sync.py`** (639 LoC, +357 LoC тестов
+  + C# fixtures): локальный shallow clone WO monorepo + sparse-checkout
+  `GR.Platform*` / `GR.WO.*`, regex-парсер C# исходников на consumers
+  (`NatsJetStreamConsumer<T>.Subject => NatsSubjectConst.<NAME>`) и
+  publish call-sites (`SendToJetStreamAsync(subject: ...)`).
+- **Subject как synthetic-Service**: регистрируется в namespace
+  `nats-subjects`, `name=subject:<value>` (например `subject:march-export`).
+  Переиспользует существующую схему `kg_services`/`kg_service_edges` — без
+  новых таблиц и миграций.
+- **Edge `uses_nats`** с `extras.direction ∈ {pub, sub}`, `weight = count(call-sites)`.
+  Дополняет существующий `uses_nats` к synthetic NATS-cluster-узлам из
+  `kg_sync._extract_nats_clusters` (env-vars) — теперь видно не только что
+  сервис подключён к кластеру, но и какие subjects он публикует/читает.
+- **Service-name резолвинг**: путь `GR.WO.Map.Service/...` → `map-service`
+  (lowercase, dots→dash) — матчится с именами Deployment-ов в k8s.
+- **NatsSubjectConst-resolver**: один проход по
+  `GR.Platform/DataBus/Nats/NatsConst.cs` для `<NAME>` → литерал.
+- **Beat task `kg_nats_subjects_sync`** каждые 6 часов, offset minute=43.
+- **Feature flag:** `NATS_SUBJECTS_PARSER_ENABLED=false` (выключен по
+  умолчанию — требует ssh-доступ к wo-gitlab и каталога `WO_MONOREPO_PATH`,
+  включается осознанно после `--dry-run` прогона).
+- CLI: `python -m app.knowledge_graph.nats_subjects_sync [--dry-run] [--path PATH]`.
+
+### Fixed — runtime crash dep gap (PR #73, `2a5d9ab`)
+
+- `requirements.txt`: добавлены `PyJWT` и `kubernetes` — обе использовались
+  кодом (`app/auth.py`, k8s client-modules), но отсутствовали в lock-е,
+  что давало `ModuleNotFoundError` при холодном старте в новом окружении.
+
+### Schema impact
+
+Новые edge `kind`-ы в `kg_service_edges` (`ServiceEdge.kind` — свободная
+строка, валидация на app-уровне, миграция не требуется):
+
+| Edge kind | Source module | Direction |
+|---|---|---|
+| `serves_traffic` | `k8s_topology_resources_sync` | Service → Deployment |
+| `routes_to` | `k8s_topology_resources_sync` | Ingress → Service |
+| `uses_nats` (subject-level) | `nats_subjects_sync` | Service → `subject:<value>` |
+
+Новый `discovery_source` для existing edges (через merge в `populator.upsert_edge`):
+
+| Source key | Tier | Module |
+|---|---|---|
+| `kg_sync/runtime_corr` | 1 (0.95) | `runtime_correlation` |
+| `k8s_topology_resources/service` | 1 | `k8s_topology_resources_sync` |
+| `k8s_topology_resources/ingress` | 1 | `k8s_topology_resources_sync` |
+| `nats_subjects_sync` | 1 | `nats_subjects_sync` |
+
+### Beat schedule additions
+
+| Task | Schedule | Module |
+|---|---|---|
+| `kg_runtime_correlation_sync` | every 30 min | `runtime_correlation.py` |
+| `kg_topology_resources_sync` | every 15 min | `k8s_topology_resources_sync.py` |
+| `kg_nats_subjects_sync` | every 6h @ :43 | `nats_subjects_sync.py` |
+
+## [0.10.0] — 2026-05-23 — Alert quality batch (Wave 9-style)
+
+Tag-only release. Содержание описано в release notes
+([v0.10.0](https://github.com/froggychips/sre-ai-copilot/releases/tag/v0.10.0)):
+resolver + rollout suppress + content-dedup + stuck-alerts escalation (PR #69).
+
+## [0.9.0] — 2026-05-23 — Active Observability Layer (Wave 1-6)
+
+Tag-only release. Содержание описано в release notes
+([v0.9.0](https://github.com/froggychips/sre-ai-copilot/releases/tag/v0.9.0)):
+time-series materialization (kg_service_health/cluster_observations/
+ingress_observations/signal_aggregates), anomaly detection (robust-z),
+deploy↔incident correlator, Seq logs integration, daily team digest,
+Discord pipeline overhaul (dedup/severity/per-team routing/suspect-deploy/
+log-error/anomaly/recurrence blocks), security hardening (PII redaction,
+Approve/Decline authz allowlist, `kg_reader` RO-роль), self-health canary
+(materialization_zero_rate/sync_lag/anomaly_signal_health/...).
+
+## [0.8.0] — 2026-05-16 — KG Phase 1+2+3
+
+Tag-only release. KG content/quality/embed UX:
+precedence-model + service health score (PR #51-#53). См.
+[v0.8.0 release notes](https://github.com/froggychips/sre-ai-copilot/releases/tag/v0.8.0).
+
 ## [0.7.3] — 2026-05-14
 
 ### Changed — Light scrub of internal infrastructure references
