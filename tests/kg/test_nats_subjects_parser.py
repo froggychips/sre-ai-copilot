@@ -342,7 +342,7 @@ def test_persist_separate_edges_for_pub_and_sub(db):
     Этот тест документирует поведение, чтобы будущие изменения были
     осознанными.
     """
-    svc = upsert_service(db, "squad-1", "echo-service")
+    upsert_service(db, "squad-1", "echo-service")
     db.commit()
 
     persist_to_kg(db, [
