@@ -41,7 +41,7 @@ import logging
 import subprocess
 import sys
 from datetime import datetime
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, cast
 
 from sqlalchemy.orm import Session
 
@@ -290,8 +290,8 @@ def _upsert_k8s_job(
         if hasattr(existing, k):
             setattr(existing, k, v)
     if metadata is not None:
-        existing.metadata_json = metadata
-    existing.last_seen_at = now
+        existing.metadata_json = cast(Any, metadata)
+    existing.last_seen_at = cast(Any, now)
     db.flush()
     return existing
 
@@ -439,9 +439,9 @@ def sync_all_cronjobs(db: Session) -> Dict[str, int]:
         # Связь от owner Service → CronJob node храним в metadata_json
         # CronJob-а (owner_service_id). Это semantic «runs_as_job»: owner
         # Service _имеет_ CronJob как побочный workflow.
-        meta_with_link = dict(cj_node.metadata_json or {})
+        meta_with_link: Dict[str, Any] = dict(cj_node.metadata_json or {})
         meta_with_link["owner_service_id"] = owner_svc.id
-        cj_node.metadata_json = meta_with_link
+        cj_node.metadata_json = cast(Any, meta_with_link)
         db.flush()
         stats["edges_runs_as_job"] += 1
 
@@ -472,7 +472,7 @@ def _link_jobs_to_cronjob_owners(db: Session) -> int:
         .all()
     )
     for j in jobs:
-        meta = j.metadata_json or {}
+        meta: Dict[str, Any] = cast(Dict[str, Any], j.metadata_json or {})
         owner_refs = meta.get("owner_references") or []
         cj_name = None
         for r in owner_refs:
@@ -488,7 +488,7 @@ def _link_jobs_to_cronjob_owners(db: Session) -> int:
         )
         if parent is None:
             continue
-        parent_meta = parent.metadata_json or {}
+        parent_meta: Dict[str, Any] = cast(Dict[str, Any], parent.metadata_json or {})
         owner_id = parent_meta.get("owner_service_id")
         if not owner_id:
             continue
@@ -496,7 +496,7 @@ def _link_jobs_to_cronjob_owners(db: Session) -> int:
         if meta_updated.get("owner_service_id") == owner_id:
             continue
         meta_updated["owner_service_id"] = owner_id
-        j.metadata_json = meta_updated
+        j.metadata_json = cast(Any, meta_updated)
         linked += 1
     if linked:
         db.commit()
