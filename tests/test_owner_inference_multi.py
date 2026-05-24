@@ -71,11 +71,11 @@ def _mock_db_with_responses(*, deploys=None, labels=None, team_owner=None):
 
 
 def test_signal_a_prefix_only_squad():
-    """prefix `squad-7-shared` → squad-7 с confidence = 0.4 (только weight A)."""
+    """prefix `squad-7-shared` → squad-7 с confidence = 0.5 (weight A bump)."""
     sug = suggest_owner_multi_signal("squad-7-shared", db=None)
     assert sug.owner == "squad-7"
     assert sug.sources == ["prefix"]
-    assert pytest.approx(sug.confidence, abs=1e-6) == 0.4
+    assert pytest.approx(sug.confidence, abs=1e-6) == 0.5
     assert sug.manual is False
 
 
@@ -111,16 +111,32 @@ def test_signal_b_deploy_history_only():
     sug = suggest_owner_multi_signal("weird-backend", db)
     assert sug.owner == "squad-1"
     assert sug.sources == ["deploy_history"]
-    # strength = 8/10 = 0.8, weight 0.4 → 0.32
-    assert pytest.approx(sug.confidence, abs=1e-6) == 0.4 * 0.8
+    # strength = 8/10 = 0.8, weight 0.3 → 0.24
+    assert pytest.approx(sug.confidence, abs=1e-6) == 0.3 * 0.8
 
 
-def test_signal_b_unknown_username_falls_back():
-    """Неизвестный username → `?-someuser` fallback."""
+def test_signal_b_unknown_username_no_signal():
+    """Неизвестный username не контрибутит — сигнал B молчит.
+
+    Раньше возвращали `?-someuser` с confidence weight*strength — это
+    было ложно-высокое доверие. Теперь only known aliases вносят strength.
+    """
     db = _mock_db_with_responses(deploys=[("someuser", 5)], labels=[])
     sug = suggest_owner_multi_signal("weird-ns", db)
-    assert sug.owner == "?-someuser"
-    assert sug.sources == ["deploy_history"]
+    assert sug.owner is None
+    assert "deploy_history" not in sug.sources
+
+
+def test_signal_b_known_user_amid_unknown():
+    """Top-1 unknown, top-2 known → берём top-2, strength = top2 / total."""
+    db = _mock_db_with_responses(
+        deploys=[("unknown-bot", 7), ("kemyashev", 3)],
+        labels=[],
+    )
+    sug = suggest_owner_multi_signal("weird-ns", db)
+    assert sug.owner == "squad-1"
+    # strength = 3/10 = 0.3, weight 0.3 → 0.09
+    assert pytest.approx(sug.confidence, abs=1e-6) == 0.3 * 0.3
 
 
 def test_signal_b_empty_deploys_no_suggest():
@@ -178,49 +194,113 @@ def test_signal_c_labels_empty_metadata_no_suggest():
     assert sug.owner is None
 
 
+# ── Signal C: labels extract — расширенные кейсы (2026-05-24) ────────────
+
+
+def test_signal_c_labels_k8s_labels_subkey():
+    """metadata.k8s_labels.team — альтернативное nested место."""
+    db = _mock_db_with_responses(
+        deploys=[],
+        labels=[
+            ({"k8s_labels": {"team": "squad-12"}},),
+            ({"k8s_labels": {"team": "squad-12"}},),
+        ],
+    )
+    sug = suggest_owner_multi_signal("weird-ns", db)
+    assert sug.owner == "squad-12"
+    assert "labels" in sug.sources
+
+
+def test_signal_c_labels_managed_by_fallback():
+    """managed-by label как fallback для платформенных компонентов."""
+    db = _mock_db_with_responses(
+        deploys=[],
+        labels=[({"labels": {"app.kubernetes.io/managed-by": "Helm"}},)],
+    )
+    sug = suggest_owner_multi_signal("weird-ns", db)
+    # managed-by="Helm" — это owner-токен (нормализован).
+    assert sug.owner == "Helm"
+
+
+def test_signal_c_labels_normalize_squad_shorthand():
+    """`squad7` (без дефиса) нормализуется в `squad-7`."""
+    db = _mock_db_with_responses(
+        deploys=[],
+        labels=[({"labels": {"team": "squad7"}},)],
+    )
+    sug = suggest_owner_multi_signal("weird-ns", db)
+    assert sug.owner == "squad-7"
+
+
+def test_signal_c_labels_strip_at_prefix():
+    """`@squad-3` в label-value нормализуется в `squad-3` (без `@`).
+
+    Это важно — caller добавляет `@` сам; иначе на выходе будет `@@squad-3`.
+    """
+    db = _mock_db_with_responses(
+        deploys=[],
+        labels=[({"labels": {"owner": "@squad-3"}},)],
+    )
+    sug = suggest_owner_multi_signal("weird-ns", db)
+    assert sug.owner == "squad-3"
+
+
+def test_signal_c_labels_priority_nested_over_flat():
+    """`labels.team` имеет приоритет над flat `team` (в одной metadata).
+
+    Раньше flat ключи проверялись после labels — оставляем то же поведение,
+    но тестируем явно после расширения sub-keys.
+    """
+    db = _mock_db_with_responses(
+        deploys=[],
+        labels=[
+            ({"labels": {"team": "from-nested"}, "team": "from-flat"},),
+        ],
+    )
+    sug = suggest_owner_multi_signal("weird-ns", db)
+    assert sug.owner == "from-nested"
+
+
 # ── Multi-signal fusion ──────────────────────────────────────────────────
 
 
 def test_fusion_three_signals_agree():
-    """Все 3 сигнала указывают на squad-7 → confidence = sum(weights) = 1.0."""
+    """A + C голосуют за squad-7; B unknown → не контрибутит. Confidence=0.7."""
     db = _mock_db_with_responses(
-        deploys=[("kemyashev_unmapped", 10)],  # без alias → ?-kemyashev_unmapped
+        deploys=[("kemyashev_unmapped", 10)],  # unknown → B молчит
         labels=[({"labels": {"team": "squad-7"}},)],
     )
-    # prefix squad-7-x → squad-7
-    # labels → squad-7
-    # deploy → ?-kemyashev_unmapped (другое)
+    # prefix squad-7-x → squad-7  (weight 0.5)
+    # labels → squad-7             (weight 0.2 * 1.0)
+    # deploy → unknown            (signal silent)
     sug = suggest_owner_multi_signal("squad-7-shared", db)
-    assert sug.owner == "squad-7"  # A+C голосуют за squad-7, B — другое
-    # A=0.4, C=0.2*1.0=0.2 → 0.6
-    assert pytest.approx(sug.confidence, abs=1e-6) == 0.6
+    assert sug.owner == "squad-7"
+    # A=0.5, C=0.2 → 0.7
+    assert pytest.approx(sug.confidence, abs=1e-6) == 0.7
     assert "prefix" in sug.sources
     assert "labels" in sug.sources
-    assert "deploy_history" in sug.sources
+    # B silent — не в sources.
+    assert "deploy_history" not in sug.sources
 
 
 def test_fusion_all_three_signals_same_owner():
     """Все 3 указывают на squad-1 → confidence ≈ 1.0 (max)."""
     db = _mock_db_with_responses(
-        deploys=[("kemyashev", 10)],  # → squad-1
+        deploys=[("kemyashev", 10)],  # → squad-1, strength 1.0
         labels=[({"labels": {"team": "squad-1"}},)],
     )
     sug = suggest_owner_multi_signal("squad-1-shared", db)
     assert sug.owner == "squad-1"
-    # A=0.4 + B=0.4*1.0=0.4 + C=0.2*1.0=0.2 = 1.0
+    # A=0.5 + B=0.3*1.0=0.3 + C=0.2*1.0=0.2 = 1.0
     assert pytest.approx(sug.confidence, abs=1e-6) == 1.0
 
 
 def test_fusion_signals_disagree_highest_wins():
-    """A=squad-7 (0.4), B=apleshkov→squad-2 (0.4*1.0=0.4) → tie → A wins by order.
-
-    Это валидный test для tie-breaking: dict-сохранение insertion order
-    плюс max(...) с key — Python берёт первый.
-    """
+    """A=squad-7 (0.5), B=apleshkov→squad-2 (0.3*1.0=0.3) → A wins by score."""
     db = _mock_db_with_responses(deploys=[("apleshkov", 10)], labels=[])
     sug = suggest_owner_multi_signal("squad-7-shared", db)
-    # Score одинаковый (0.4 vs 0.4), max берёт первый встретившийся (prefix).
-    assert sug.owner in {"squad-7", "squad-2"}
+    # Prefix (0.5) > deploy (0.3) → squad-7 побеждает однозначно.
+    assert sug.owner == "squad-7"
     # Оба сигнала использованы.
     assert set(sug.sources) == {"prefix", "deploy_history"}
 
@@ -233,8 +313,8 @@ def test_fusion_b_dominates_when_a_absent():
     )
     sug = suggest_owner_multi_signal("legacy-ns", db)
     assert sug.owner == "squad-1"
-    # B=0.4 + C=0.2 = 0.6
-    assert pytest.approx(sug.confidence, abs=1e-6) == 0.6
+    # B=0.3 + C=0.2 = 0.5
+    assert pytest.approx(sug.confidence, abs=1e-6) == 0.5
 
 
 # ── Manual override ─────────────────────────────────────────────────────
@@ -352,17 +432,18 @@ def test_confidence_calibration_axes():
     s_weak = suggest_owner_multi_signal("ns-x", db_weak)
     assert 0 < s_weak.confidence < 0.5
 
-    # partial — только prefix
+    # partial — только prefix → 0.5 (bumped из 0.4)
     s_partial = suggest_owner_multi_signal("monitoring", db=None)
-    assert pytest.approx(s_partial.confidence, abs=1e-6) == 0.4
+    assert pytest.approx(s_partial.confidence, abs=1e-6) == 0.5
 
-    # strong — два согласованных сигнала
+    # strong — два согласованных сигнала (prefix + deploy)
     db_strong = _mock_db_with_responses(
         deploys=[("kemyashev", 10)],
         labels=[],
     )
     s_strong = suggest_owner_multi_signal("squad-1-shared", db_strong)
-    assert s_strong.confidence >= 0.5
+    # 0.5 + 0.3*1.0 = 0.8
+    assert pytest.approx(s_strong.confidence, abs=1e-6) == 0.8
 
     # max — все три
     db_max = _mock_db_with_responses(
@@ -395,6 +476,50 @@ def test_owner_aliases_case_insensitive():
     """username нормализуется в lower-case."""
     assert owner_aliases.resolve_username("KEMYASHEV") == "@squad-1"
     assert owner_aliases.resolve_username("Kemyashev") == "@squad-1"
+
+
+def test_owner_aliases_bundled_yaml_resolves():
+    """Bundled `owner_aliases.yaml` рядом с модулем подгружается без ENV.
+
+    Проверяем что расширенные aliases (squad-gd / backend / platform reviewers)
+    резолвятся из YAML по умолчанию.
+    """
+    # Расширения из bundled YAML (см. app/services/owner_aliases.yaml).
+    # `igoncharov` → @squad-gd (раньше был fallback @?-igoncharov).
+    assert owner_aliases.resolve_username("igoncharov") == "@squad-gd"
+
+
+def test_owner_aliases_bundled_yaml_platform_reviewers():
+    """Несколько platform-reviewers резолвятся в @platform."""
+    # Из bundled YAML.
+    assert owner_aliases.resolve_username("zbushuev") == "@platform"
+    assert owner_aliases.resolve_username("sgrozov") == "@platform"
+    assert owner_aliases.resolve_username("pryzhikov") == "@platform"
+
+
+def test_owner_aliases_is_known_helper():
+    """`is_known_username` различает aliased / fallback users.
+
+    Используется сигналом B (deploy_history) чтобы не выдавать
+    `?-username` с положительным weight.
+    """
+    assert owner_aliases.is_known_username("kemyashev") is True
+    assert owner_aliases.is_known_username("igoncharov") is True  # bundled
+    assert owner_aliases.is_known_username("totally-random-bot") is False
+    assert owner_aliases.is_known_username("") is False
+    # Case-insensitive.
+    assert owner_aliases.is_known_username("KEMYASHEV") is True
+
+
+def test_owner_aliases_bundled_size_at_least_15():
+    """Sanity-check на размер bundled YAML.
+
+    Если кто-то случайно удалит aliases — рантайм-фолбэк на дефолты резко
+    урежет покрытие deploy_history сигнала. 15 — нижняя граница, актуальный
+    список ожидаемо больше.
+    """
+    all_aliases = owner_aliases.get_aliases()
+    assert len(all_aliases) >= 15
 
 
 def test_owner_aliases_file_override(monkeypatch, tmp_path):
@@ -459,16 +584,20 @@ def test_unowned_section_bold_for_high_confidence(monkeypatch, tmp_path):
     assert "(manual)" in text
 
 
-def test_unowned_section_question_for_low_confidence():
-    """Только prefix-match для bare 'monitoring' → confidence=0.4 → суффикс ` ?`."""
+def test_unowned_section_medium_confidence_prefix_only():
+    """Prefix-only для bare 'monitoring' → confidence=0.5 → medium (без `?`, без bold).
+
+    После bump _W_PREFIX 0.4 → 0.5 prefix-only достигает default backfill
+    threshold. UI убирает `?`-суффикс, но не bolds (< 0.8).
+    """
     unowned: defaultdict = defaultdict(int)
     unowned["monitoring"] = 44
     text = stats_digest.unowned_namespaces_section(unowned, db=None)
-    # confidence = 0.4 < 0.5 → low → суффикс «?»
     assert "@platform" in text
-    assert "?" in text
     # Не bold (confidence < 0.8).
     assert "**`@platform`**" not in text
+    # И не `?`-suffixed (confidence == 0.5, не < 0.5).
+    assert "@platform` ?" not in text
 
 
 def test_unowned_section_no_suggest_for_unknown_ns():
@@ -492,7 +621,7 @@ def test_unowned_section_caps_top_n():
 
 
 def test_unowned_section_high_confidence_two_signals(monkeypatch, tmp_path):
-    """squad-1-shared + deploy от kemyashev → confidence 0.72 → bold."""
+    """squad-1-shared + deploy от kemyashev → confidence 0.74 → не bold."""
     unowned: defaultdict = defaultdict(int)
     unowned["squad-1-shared"] = 10
 
@@ -501,7 +630,6 @@ def test_unowned_section_high_confidence_two_signals(monkeypatch, tmp_path):
         labels=[],
     )
     text = stats_digest.unowned_namespaces_section(unowned, db=db)
-    # A=0.4 + B=0.4*0.8=0.32 = 0.72 → bold (≥0.5 ? нет, для bold нужно ≥0.8)
-    # Меняем ожидание: 0.72 < 0.8 → не bold, но > 0.5 → нет `?`-суффикса.
+    # A=0.5 + B=0.3*0.8=0.24 = 0.74 → не bold (< 0.8), но > 0.5 → нет `?`.
     assert "@squad-1" in text
     assert "**`@squad-1`**" not in text  # not bold (< 0.8)

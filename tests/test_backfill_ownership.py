@@ -87,20 +87,25 @@ def _make_svc(
 
 
 def test_dry_run_picks_squad_prefix_at_default_threshold(db):
-    """squad-N prefix даёт confidence=0.4 при weight 0.4 — НЕ проходит
-    default threshold 0.5. Dry-run должен показать что они skipped."""
+    """После bump _W_PREFIX 0.4→0.5: prefix-only daёт confidence=0.5 →
+    проходит default threshold 0.5 (≥, не >). Это и есть основной use-case
+    backfill-а — раньше с 0.4 ВСЕ prefix-only кандидаты skipped.
+    """
     _make_svc(db, "town-service", "squad-3-shared")  # owner=None
     _make_svc(db, "auth", "squad-7-kingdom1")
     db.commit()
 
     plans, skipped = plan_ownership(db, threshold=0.5)
-    # Только prefix → confidence 0.4 < 0.5 → оба skipped.
-    assert plans == []
-    assert skipped == 2
+    # Prefix=0.5 ≥ threshold 0.5 → оба candidate.
+    assert len(plans) == 2
+    assert skipped == 0
+    by_ns = {p.namespace: p for p in plans}
+    assert by_ns["squad-3-shared"].suggested_owner == "squad-3"
+    assert by_ns["squad-7-kingdom1"].suggested_owner == "squad-7"
 
 
 def test_dry_run_picks_squad_prefix_at_lower_threshold(db):
-    """С threshold 0.3 prefix-only сигналы проходят."""
+    """С threshold 0.3 prefix-only сигналы проходят (с запасом)."""
     _make_svc(db, "town-service", "squad-3-shared")
     _make_svc(db, "auth", "squad-7-kingdom1")
     db.commit()
@@ -155,11 +160,11 @@ def test_apply_is_idempotent(db):
 
 
 def test_threshold_filters_low_confidence(db):
-    """confidence prefix-only = 0.4. С threshold 0.5 — skipped."""
+    """С threshold 0.6 prefix-only (0.5) уже не проходит — skipped."""
     _make_svc(db, "svc", "squad-3-shared")
     db.commit()
 
-    result = run_backfill(db, apply=True, threshold=0.5)
+    result = run_backfill(db, apply=True, threshold=0.6)
     assert result.actually_updated_owner == 0
     assert result.skipped_low_confidence == 1
 
