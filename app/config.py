@@ -470,13 +470,8 @@ class Settings(BaseSettings):
     STATS_PIPELINE_STALE_MINUTES: int = Field(
         60, description="Minutes threshold for pipeline section to mark stale"
     )
-    # TC URL prefix для clickable Markdown link в Recent deploys. Если задан
-    # TEAMCITY_WEB_URL — его используем приоритетнее. Этот fallback нужен для
-    # тестов и для случая когда TEAMCITY_WEB_URL не сконфигурирован.
-    TC_URL_PREFIX: str = Field(
-        "https://wo-teamcity.lastoasisgame.com",
-        description="TC web URL prefix for build links",
-    )
+    # NB: TC_URL_PREFIX уже определён выше (line ~249) для clickable Build URL в
+    # Recent deploys. Не дублировать здесь.
 
     # Per-team daily digest (см. app/services/team_digest.py).
     # Шлёт один embed на каждый team_owner из kg_services с top-5 fragile,
