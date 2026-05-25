@@ -117,7 +117,7 @@ def _compute_enriched_key(
     svc = service_name or "<none>"
     sev = (severity or "<none>").lower()
     raw = f"{alertname}|{ns}|{svc}|{sev}".encode("utf-8")
-    return hashlib.sha1(raw).hexdigest()
+    return hashlib.sha1(raw, usedforsecurity=False).hexdigest()  # nosec B324 — content-key dedup, не security
 
 
 def _purge_enriched_state(now: Optional[float] = None, ttl_sec: Optional[int] = None) -> None:
