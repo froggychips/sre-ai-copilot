@@ -594,6 +594,163 @@ Pre-baked defaults in code; YAML extends/overrides. Keys must be lowercase.
 
 ---
 
+## Ownership backfill (`app.scripts.backfill_ownership`)
+
+`suggest_owner_multi_signal` is wired into the `unowned_namespaces` digest
+section, but **periodic `kg_topology_sync` doesn't call it** — services
+that don't get an owner on initial discovery stay `owner=NULL` forever
+unless something nudges them. The `backfill_ownership` script closes
+that gap: it sweeps every `kg_services` row with `team_owner IS NULL`,
+runs multi-signal inference, and writes the result at or above a
+configurable confidence threshold.
+
+It also backfills `stale_class` for `stale_class IS NULL` rows via the
+same classifier `kg_sync` uses (see `--stale` / `--all`).
+
+### When to run
+
+- **After initial deploy / a fresh restore.** Topology sync only knows
+  what k8s labels say; backfill pulls in deploy-history + prefix signals
+  that need historical data.
+- **When `owner_known < 80%`** in the daily digest or `kg_quality_report`
+  (see "KG quality_report" section above). Stagnation usually means
+  many services were created before the inference signal existed.
+- **Weekly.** Once enabled as a beat task (next section), the periodic
+  loop does this automatically; the manual run only matters for the
+  first rollout or when you want to lower the threshold for one-off
+  catch-up.
+
+### Dry-run preview (default — safe, no writes)
+
+```bash
+kubectl -n sre-ai exec deployment/sre-ai-api -- \
+  python -m app.scripts.backfill_ownership --dry-run --threshold 0.5
+```
+
+Prints `total_candidates_owner`, `would_update_owner`,
+`skipped_low_confidence`, and `kept_existing` — without touching the
+DB. Use this number to decide whether the apply is worth it.
+
+### Lower threshold to understand the gap
+
+```bash
+kubectl -n sre-ai exec deployment/sre-ai-api -- \
+  python -m app.scripts.backfill_ownership --dry-run --threshold 0.3
+```
+
+Threshold `0.3` surfaces prefix-only suggestions (confidence ≈ 0.4) that
+`0.5` rejects. Useful for diagnosing **why** the gap is still there:
+if `would_update_owner` jumps from ~50 at `0.5` to ~2000 at `0.3`, the
+fix isn't "raise threshold for beat" — it's "configure
+`OWNERSHIP_MANIFEST_PATH` so prefix isn't your only signal".
+
+### Apply (production write)
+
+```bash
+kubectl -n sre-ai exec deployment/sre-ai-api -- \
+  python -m app.scripts.backfill_ownership --apply --threshold 0.4
+```
+
+Threshold `0.4` is the recommended initial-rollout setting: includes
+prefix matches but not pure single-source `0.3` guesses. Idempotent —
+re-running on the same data is a no-op (filtered by
+`team_owner IS NULL`).
+
+**Real-world example (2026-05-24):** prod cluster sat at
+`owner_known = 12.40%` (335 / 2702 services). One run with
+`--apply --threshold 0.4` brought it to `owner_known = 86.68%`
+(+74 pp, 1994 services backfilled with `namespace_prefix` as primary
+source). The remaining ~13% is genuinely unowned — third-party
+namespaces, ad-hoc CronJobs — and is best closed via
+`OWNERSHIP_MANIFEST_PATH`.
+
+### Backfill `stale_class` too
+
+```bash
+# Only stale_class:
+kubectl -n sre-ai exec deployment/sre-ai-api -- \
+  python -m app.scripts.backfill_ownership --stale --apply
+
+# Both ownership + stale_class in one run:
+kubectl -n sre-ai exec deployment/sre-ai-api -- \
+  python -m app.scripts.backfill_ownership --all --apply --threshold 0.4
+```
+
+### Rollback
+
+The script only ever writes rows where `team_owner WAS NULL` (filter is
+in `plan_ownership`). It also stamps `metadata_json.owner_source` with
+the signal that won: one of `namespace_prefix`, `k8s_labels`,
+`deploy_history` (and `manual` for `OWNERSHIP_MANIFEST_PATH` matches).
+To undo a backfill run without touching pre-existing or manually-set
+owners:
+
+```sql
+UPDATE kg_services
+   SET team_owner = NULL
+ WHERE metadata_json->>'owner_source'
+       IN ('namespace_prefix','deploy_history','k8s_labels');
+```
+
+This leaves `owner_source = 'manual'` and the rows where backfill
+never wrote (`owner_source IS NULL`, pre-existing owners) untouched.
+After the SQL, the next sync will leave services `owner=NULL` until
+the next backfill run.
+
+---
+
+## Periodic ownership backfill (beat task `kg-ownership-backfill`)
+
+After the initial manual `--apply` rollout looks healthy, switch the
+process from "ops runs it" to "Celery beat runs it" — same `run_backfill`
+entry-point, runs every 6 hours, scoped to high-confidence signals only.
+
+### Configuration
+
+| Env var | Default | Notes |
+|---|---|---|
+| `OWNERSHIP_BACKFILL_ENABLED` | `false` | Master switch. Beat task no-ops when off. |
+| `OWNERSHIP_BACKFILL_THRESHOLD` | `0.7` | Confidence floor for periodic writes. |
+
+In Helm, set via `values.yaml`:
+
+```yaml
+env:
+  ownershipBackfillEnabled: "true"
+  ownershipBackfillThreshold: "0.7"
+```
+
+Both are wired into the worker Deployment (see
+`helm/sre-ai-copilot/templates/deployment-worker.yaml`).
+
+### Threshold rationale: `0.4` initial vs `0.7` periodic
+
+- **Initial rollout (manual, `0.4`):** ops is watching the result, so
+  it's fine to include prefix-only matches that need human plausibility
+  check. Big one-time win (the +74 pp jump above).
+- **Periodic beat (`0.7`):** runs unattended every 6 h. High threshold
+  means it only commits multi-signal agreement (e.g. prefix + labels,
+  or deploy_history matching prefix). New services that don't clear
+  the bar stay `owner=NULL` and surface in the daily `unowned_namespaces`
+  digest, where a human can either add `OWNERSHIP_MANIFEST_PATH` entry
+  or let the next sync provide enough signal.
+
+Don't lower beat to `0.5` and below "to close the gap" — that defeats
+the human-review layer and will repaint owners every 6 h when a
+single-signal guess flips. Use a one-off manual `--apply --threshold 0.5`
+instead, or extend the ownership manifest.
+
+### Beat schedule + observability
+
+- Schedule: `crontab(minute=17, hour="*/6")` — every 6 h, offset from
+  drift/ingress/stuck syncs to avoid DB contention.
+- Task name: `kg_ownership_backfill` (Celery flower / logs).
+- Log line on each run: `kg_ownership_backfill.done updated=N
+  skipped_low_conf=M kept=K`. `updated=0` for many consecutive runs is
+  the expected steady state; non-zero only when new services arrive.
+
+---
+
 ## stale_class on kg_services
 
 Wave 8 introduces `kg_services.stale_class` (PR #86). Three values:
