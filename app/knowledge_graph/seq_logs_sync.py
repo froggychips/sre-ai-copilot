@@ -128,7 +128,7 @@ def _match_service(
 
 
 def _msg_hash(msg: str) -> str:
-    return hashlib.md5(msg.encode("utf-8", errors="replace")).hexdigest()
+    return hashlib.md5(msg.encode("utf-8", errors="replace"), usedforsecurity=False).hexdigest()  # nosec B324 — content fingerprint, не security
 
 
 def _upsert_log_obs(
