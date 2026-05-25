@@ -1,7 +1,12 @@
 {
-  "title": "🔴 PREPROD · KubePodCrashLooping · cart-worker",
-  "color": 15022389,
+  "title": "🚨 PREPROD · KubePodCrashLooping · cart-worker",
+  "color": 15548997,
   "fields": [
+    {
+      "name": "🎯 TL;DR",
+      "value": "🚨 deploy #2231 (abc1234) 7 min ago · regression suspected",
+      "inline": false
+    },
     {
       "name": "Namespaces",
       "value": "`prod-kingdom1`",
@@ -38,8 +43,13 @@
       "inline": false
     },
     {
+      "name": "📖 Runbook",
+      "value": "[KubePodCrashLooping](https://github.com/froggychips/sre-ai-copilot/blob/master/docs/RUNBOOK.md#kube-pod-crashlooping)",
+      "inline": false
+    },
+    {
       "name": "Recent deploys (~7м)",
-      "value": "• [RebuildCartWorker #2231](https://teamcity.example.com/build/2231) by `apleshkov` [`abc12345`](https://wo-gitlab.lastoasisgame.com/wo/backend/-/commit/abc1234567890def) — 7 min ago — SUCCESS",
+      "value": "• [RebuildCartWorker #2231 by apleshkov](https://teamcity.example.com/build/2231) [`abc12345`](https://wo-gitlab.lastoasisgame.com/wo/backend/-/commit/abc1234567890def) — 7 min ago — SUCCESS",
       "inline": false
     },
     {

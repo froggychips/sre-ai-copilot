@@ -233,6 +233,38 @@ class Settings(BaseSettings):
             "Default 30 мин — same as incident-cache."
         ),
     )
+    # Error-UX overhaul (2026-05-25). TL;DR header, runbook link, severity
+    # visual codes, compact mode, clickable TC build URLs.
+    #
+    # RUNBOOK_URL_PREFIX — base URL для runbook anchor-ссылок. Default
+    # указывает на публичный GitHub репозиторий sre-ai-copilot. Self-hosted
+    # деплои могут переопределить на свой gitlab/internal-wiki.
+    RUNBOOK_URL_PREFIX: str = Field(
+        "https://github.com/froggychips/sre-ai-copilot/blob/master/docs/RUNBOOK.md",
+        description="Base URL префикс для runbook ссылок в embed (без trailing #anchor).",
+    )
+    # TC_URL_PREFIX — base TeamCity URL для кликабельных Build-ссылок в
+    # секции Recent deploys. Если settings.TC_URL уже задан, используется он.
+    # Этот флаг — независимый override для render-слоя.
+    TC_URL_PREFIX: str = Field(
+        "https://wo-teamcity.lastoasisgame.com",
+        description="Префикс TeamCity URL для viewLog ссылок в Discord embed.",
+    )
+    # Compact mode. Значения:
+    #   - "off" (default) — рендерим как сейчас.
+    #   - "warning_only" — warning embeds сворачиваем в одну строку
+    #     (без полей). Critical остаётся full.
+    #   - "all" — все embeds compact (отладочный режим).
+    DISCORD_COMPACT_MODE: str = Field(
+        "off",
+        description="Compact-mode для error-embed. Values: off, warning_only, all.",
+    )
+    # Версия билда копилота — печатается в self-mon footer. Helm подставляет
+    # из image tag. Если пусто — footer не печатает версию.
+    BUILD_VERSION: str = Field(
+        "",
+        description="Версия копилота (image tag) для self-mon footer.",
+    )
     STUCK_ALERTS_DISCORD_ENABLED: bool = Field(
         True,
         description="Слать Discord embed на stuck-alerts (audit-log пишется всегда)",

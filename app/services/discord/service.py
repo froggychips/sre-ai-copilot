@@ -38,12 +38,18 @@ from .embed_builder import (
     _build_log_error_rate_field,
     _build_nats_impact_field,
     _build_pod_trail_field,
+    _build_runbook_field,
     _build_similar_past_field,
+    _build_tldr_field,
     _decay_color,
     _format_recurrence_tag,
     _format_sha_link,
     _lookup_similar_past_incident_cached,
+    _mention_block,
+    _self_health_footer,
+    _severity_to_color,
     _summarize_self_health_detail,
+    _tc_build_url,
 )
 from .routing import _ensure_wait_param, _pick_webhook_url, _should_route_to_error
 from app.utils.time_human import humanize_minutes_ago
@@ -73,6 +79,91 @@ _SEVERITY_COLORS = {
     "warning":  _COLOR_WARNING,
     "info":     _COLOR_UNKNOWN,
 }
+
+
+def _collect_self_health_summary() -> Optional[Dict[str, Any]]:
+    """Best-effort: собрать сжатый snapshot self-health для footer (B6).
+
+    Возвращает dict с ключами `kg_sync_lag_min`, `alerts_resolve_status`,
+    `owner_coverage_pct`. None если что-то fail-нулось (footer тогда
+    рендерится без self-mon суффиксов — embed уходит без задержки).
+
+    Без I/O в hot-path enriched alert: одна short PG-сессия с LIMIT-чтениями.
+    """
+    try:
+        from app.database import SessionLocal
+        from app.knowledge_graph.self_health import (
+            check_alerts_resolve_freshness,
+            check_sync_lag,
+        )
+        from app.knowledge_graph.schema import Service
+        from sqlalchemy import func
+
+        db = SessionLocal()
+        try:
+            summary: Dict[str, Any] = {}
+            # KG sync lag — берём freshest task; считаем lag минимальный
+            # (главное — есть ли хоть один свежий sync, а не максимум).
+            sync_res = check_sync_lag(db)
+            per_task = (sync_res.detail or {}).get("per_task") or {}
+            min_lag: Optional[float] = None
+            for task_info in per_task.values():
+                lag = task_info.get("lag_minutes")
+                if lag is None:
+                    continue
+                try:
+                    lag_f = float(lag)
+                except (ValueError, TypeError):
+                    continue
+                if min_lag is None or lag_f < min_lag:
+                    min_lag = lag_f
+            if min_lag is not None:
+                summary["kg_sync_lag_min"] = min_lag
+
+            # alerts_resolve freshness — ok/warn/fail.
+            ar_res = check_alerts_resolve_freshness(db)
+            summary["alerts_resolve_status"] = ar_res.status
+
+            # Owner coverage — share of services с non-null team_owner.
+            total = db.query(func.count(Service.id)).scalar() or 0
+            if total > 0:
+                owned = (
+                    db.query(func.count(Service.id))
+                    .filter(Service.team_owner.isnot(None))
+                    .filter(Service.team_owner != "")
+                    .scalar()
+                    or 0
+                )
+                summary["owner_coverage_pct"] = round(100.0 * owned / total, 2)
+
+            return summary
+        finally:
+            db.close()
+    except Exception as e:
+        _log.warning("self_health_footer_summary_failed", error=type(e).__name__)
+        return None
+
+
+def _render_compact_warning_line(
+    *,
+    severity: str,
+    alertname: str,
+    service_or_pod: str,
+    duration_label: Optional[str],
+    team_owner: Optional[str],
+) -> str:
+    """B12 — однострочный warning embed для compact_mode=warning_only.
+
+    Формат:
+        🟡 KubeStatefulSetReplicasMismatch · clickhouse-keeper · 46.3h · @infra
+    """
+    icon = {"warning": "🟡", "critical": "🔴", "resolved": "✅"}.get(severity.lower(), "⚪")
+    parts = [f"{icon} {alertname}", service_or_pod]
+    if duration_label:
+        parts.append(duration_label)
+    if team_owner:
+        parts.append(f"@{team_owner}")
+    return " · ".join(parts)
 
 
 class DiscordService:
@@ -783,8 +874,11 @@ class DiscordService:
             )
             return
 
-        # Цвет + emoji
-        color = _SEVERITY_COLORS.get(severity, _COLOR_UNKNOWN)
+        # Цвет + emoji. B-блок #11 — severity-tier visual codes
+        # (red/yellow/green/orange, title prefix 🚨/⚠️/✅/🔁).
+        # Старая `_SEVERITY_COLORS` map оставлена для обратной совместимости
+        # incident-path; enriched alert использует новые tier-цвета.
+        color = _severity_to_color(severity, resurfaced=resurfaced)
         if head.rollout_noise:
             color = _COLOR_UNKNOWN
         # A1: suppressed (silenced/inhibited) — orange override, чтобы on-call
@@ -792,7 +886,14 @@ class DiscordService:
         # severity-color, но не над rollout-noise (rollout = grey).
         if head.inhibition_state and not head.rollout_noise:
             color = _COLOR_SUPPRESSED
-        icon = {"critical": "🔴", "warning": "🟡"}.get(severity, "⚪")
+        # Title prefix: новые severity-aware emoji (🚨/⚠️/✅/🔁). Fallback на
+        # старый `🔴/🟡/⚪` для unknown. Suppressed состояние имеет свой icon (🟠).
+        if head.inhibition_state and not head.rollout_noise:
+            icon = "🟠"
+        elif resurfaced:
+            icon = "🔁"
+        else:
+            icon = {"critical": "🚨", "warning": "⚠️"}.get(severity, "⚪")
         env_part = f"{env.upper()} · " if env else ""
 
         # namespace список (если несколько алертов одного типа в разных ns)
@@ -827,6 +928,21 @@ class DiscordService:
         is_critical = severity == "critical"
 
         fields: List[Dict[str, Any]] = []
+
+        # B1 — TL;DR first-line (heuristic-driven). Сразу после header,
+        # до всех остальных полей. Если ни одна heuristic не сработала и
+        # incident.description пустой — поле пропускается.
+        tldr_field = _build_tldr_field(
+            summary=incident.description or incident.summary,
+            pod_events=head.pod_events,
+            recent_deploys=head.recent_deploys,
+            replicas_ready_desired=head.replicas_ready_desired,
+            recurrence_24h=head.recurrence_24h,
+            chronic_count=rec_max,
+        )
+        if tldr_field:
+            fields.append(tldr_field)
+
         fields.append({
             "name": "Namespaces",
             "value": f"`{ns_str}`",
@@ -899,6 +1015,16 @@ class DiscordService:
                 "inline": False,
             })
 
+        # B3 — Runbook link. Pure-dict map alertname → anchor. URL prefix —
+        # env override `RUNBOOK_URL_PREFIX`. Если для alertname нет matched
+        # anchor — field не добавляется (skip-if-empty).
+        runbook_field = _build_runbook_field(
+            alertname=alertname,
+            url_prefix=getattr(settings, "RUNBOOK_URL_PREFIX", "") or "",
+        )
+        if runbook_field:
+            fields.append(runbook_field)
+
         # Recent deploys. Окно вычисляется из самого дальнего deploy —
         # alert_enrichment может использовать fallback 7д если узкое окно
         # пусто; заголовок честно показывает фактический диапазон.
@@ -919,11 +1045,25 @@ class DiscordService:
                 bt_name = d.get("buildtype_name") or d.get("buildtype_id") or "?"
                 status = d.get("status") or ""
                 triggered = d.get("triggered_by") or ""
-                url = d.get("url")
+                # Sub-task: clickable TC build URLs.
+                # _tc_build_url пробует extras.url → build_id+TC_URL_PREFIX.
+                # Если ни того ни другого — fallback на plain ID label.
+                tc_prefix = getattr(settings, "TC_URL_PREFIX", "") or getattr(settings, "TEAMCITY_WEB_URL", "") or ""
+                url = _tc_build_url(
+                    build_url=d.get("url"),
+                    build_id=d.get("build_id") or d.get("id"),
+                    tc_url_prefix=tc_prefix,
+                )
                 by_part = f" by `{triggered}`" if triggered else ""
                 # Build label — кликабельный если есть TC URL.
                 if url:
-                    build_label = f"[{bt_name} #{num}]({url})"
+                    # «Build and update #2138 by wizaryx» — full человекочитаемый
+                    # лейбл. by_part интегрирован в линк, не как отдельный suffix.
+                    if triggered:
+                        build_label = f"[{bt_name} #{num} by {triggered}]({url})"
+                        by_part = ""  # уже в линке
+                    else:
+                        build_label = f"[{bt_name} #{num}]({url})"
                 else:
                     build_label = f"`#{num}` ({bt_name})"
                 # #7 sha-link: markdown-ссылка на gitlab если репо известно.
@@ -1137,19 +1277,79 @@ class DiscordService:
             )
         description = "\n".join(description_lines)[:1200]
 
-        payload: Dict[str, Any] = {
-            "embeds": [{
-                "title": title[:256],
-                "color": color,
-                "fields": fields,
-                "description": description,
-                "footer": {"text": f"copilot/enrich · groupKey={(labels.get('alertname') or '?')}"},
-                "timestamp": datetime.now(timezone.utc).isoformat(),
-            }],
-            # Mention-payload пуст: даже если в будущем добавим <@&role> в title,
-            # пользователей не пинговать пока owner-mapping не проверен на проде.
-            "allowed_mentions": {"parse": []},
-        }
+        # B6 — self-mon footer. Best-effort: один short SessionLocal-вызов,
+        # exception → footer без self-mon суффиксов (embed уходит без задержки).
+        base_footer = f"copilot/enrich · groupKey={(labels.get('alertname') or '?')}"
+        self_health_summary = _collect_self_health_summary()
+        footer_text = _self_health_footer(
+            base=base_footer,
+            self_health_summary=self_health_summary,
+            build_version=getattr(settings, "BUILD_VERSION", "") or "",
+        )
+
+        # B12 — compact_mode. Если `warning_only` И severity=warning → одна
+        # строка вместо full embed. `all` → ВСЕ embeds (включая critical) compact.
+        compact_mode = (getattr(settings, "DISCORD_COMPACT_MODE", "off") or "off").lower()
+        is_compact = (
+            compact_mode == "all"
+            or (compact_mode == "warning_only" and severity == "warning")
+        )
+
+        # B11 — `@here` mention для critical (только critical, и только когда
+        # не compact-mode, чтобы compact warning не пинговал).
+        mention_prefix = "" if is_compact else _mention_block(severity, env)
+
+        if is_compact:
+            # Один line — без полей, без description.
+            # Длительность считаем грубо: starts_at → now, если есть.
+            duration_label: Optional[str] = None
+            try:
+                if incident.starts_at:
+                    started = datetime.fromisoformat(incident.starts_at.replace("Z", "+00:00"))
+                    if started.tzinfo is None:
+                        started = started.replace(tzinfo=timezone.utc)
+                    mins = int((datetime.now(timezone.utc) - started).total_seconds() // 60)
+                    if mins > 0:
+                        duration_label = humanize_minutes_ago(mins).replace(" ago", "")
+            except (ValueError, TypeError):
+                pass
+            one_line = _render_compact_warning_line(
+                severity=severity,
+                alertname=alertname,
+                service_or_pod=svc_or_pod,
+                duration_label=duration_label,
+                team_owner=head.team_owner,
+            )
+            payload: Dict[str, Any] = {
+                "content": (mention_prefix + one_line)[:2000],
+                "allowed_mentions": (
+                    {"parse": ["everyone"]}
+                    if mention_prefix
+                    else {"parse": []}
+                ),
+            }
+        else:
+            payload = {
+                "embeds": [{
+                    "title": title[:256],
+                    "color": color,
+                    "fields": fields,
+                    "description": description,
+                    "footer": {"text": footer_text},
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                }],
+                # Mention-payload: для critical-severity сами пингуем `@here`
+                # через `content`; allowed_mentions сужаем до `everyone`
+                # (Discord трактует @here как ["everyone"] в allowed_mentions
+                # parse-list). Для остальных severity — empty.
+                "allowed_mentions": (
+                    {"parse": ["everyone"]}
+                    if mention_prefix
+                    else {"parse": []}
+                ),
+            }
+            if mention_prefix:
+                payload["content"] = mention_prefix.strip()
 
         if settings.DISCORD_DRY_RUN:
             # Главный путь — это то место где видно фактический embed-output
@@ -1170,6 +1370,24 @@ class DiscordService:
         if not url:
             logging.warning("DISCORD_WEBHOOK_URL not set, skipping enriched alert")
             return
+        # Compact-mode payload не содержит embeds — PATCH-dedup-канал не
+        # применим (нет structured fields для merge). Просто POST один раз.
+        if is_compact:
+            try:
+                async with httpx.AsyncClient() as client:
+                    r = await client.post(url, json=payload)
+                    if r.status_code >= 400:
+                        logging.error(
+                            "discord_enriched_alert_compact_failed",
+                            extra={"status": r.status_code, "body": r.text[:200]},
+                        )
+            except Exception as e:
+                logging.error(
+                    "discord_enriched_alert_compact_exception",
+                    extra={"error": str(e)},
+                )
+            return
+
         # Stage 2: PATCH-dedup. Раньше send_enriched_alert POSTил на каждую
         # (alertname, severity)-группу AM batch'а — без content-dedup,
         # 18 embed/сутки в preprod (group_interval=10m, repeat=4h).

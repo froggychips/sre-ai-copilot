@@ -13,6 +13,7 @@ import structlog
 
 from app.config import settings
 from app.services.pii_redaction import redact_pii
+from app.utils.time_human import humanize_minutes_ago
 
 _log = structlog.get_logger("discord.embed_builder")
 
@@ -664,6 +665,117 @@ def _build_similar_past_field(
     }
 
 
+# ── Error-UX overhaul (2026-05-25) ────────────────────────────────────────
+#
+# Эти helpers — для overhaul'а #infra-error embed. Все они чистые функции,
+# без I/O, кроме `_self_health_footer` который читает kg_self_health (через
+# SessionLocal, как `_build_log_error_rate_field`).
+#
+# Цвета severity (B-блок tier-codes):
+#   critical  → red    0xed4245
+#   warning   → yellow 0xfaa61a
+#   resolved  → green  0x3ba55d
+#   resurfaced→ orange 0xf57c00
+SEVERITY_COLOR_CRITICAL   = 0xED4245
+SEVERITY_COLOR_WARNING    = 0xFAA61A
+SEVERITY_COLOR_RESOLVED   = 0x3BA55D
+SEVERITY_COLOR_RESURFACED = 0xF57C00
+SEVERITY_COLOR_UNKNOWN    = 0x9E9E9E
+
+SEVERITY_TITLE_PREFIX = {
+    "critical":   "🚨",
+    "warning":    "⚠️",
+    "resolved":   "✅",
+    "resurfaced": "🔁",
+}
+
+
+def _severity_to_color(severity: str, *, resurfaced: bool = False, resolved: bool = False) -> int:
+    """Map severity tier → embed color (B-блок #11).
+
+    Приоритет: resurfaced > resolved > severity. Это потому что resurfaced
+    важнее самой по себе severity (повторный инцидент после resolved — отдельный
+    сигнал), а resolved-флаг приходит как состояние тикета а не severity-label.
+    """
+    if resurfaced:
+        return SEVERITY_COLOR_RESURFACED
+    if resolved:
+        return SEVERITY_COLOR_RESOLVED
+    sev = (severity or "").lower()
+    if sev == "critical":
+        return SEVERITY_COLOR_CRITICAL
+    if sev == "warning":
+        return SEVERITY_COLOR_WARNING
+    return SEVERITY_COLOR_UNKNOWN
+
+
+def _mention_block(severity: str, env: Optional[str] = None) -> str:
+    """B-блок #11 — `@here` префикс для critical (только critical).
+
+    Возвращает строку с trailing newline или пустую строку. Используется
+    как content-префикс embed-payload (не внутри embed-text — Discord не
+    рендерит mentions в embed.title/description).
+
+    env пока не используется (на будущее — `prod` mention, `dev` skip).
+    """
+    if (severity or "").lower() == "critical":
+        return "@here\n"
+    return ""
+
+
+# Runbook anchor map. Ключ — alertname (точное совпадение), значение —
+# anchor в RUNBOOK.md. URL формируется как `{RUNBOOK_URL_PREFIX}#{anchor}`.
+# Список — самые частые alertnames в WO; defaults — без internal-ссылок.
+_RUNBOOK_ANCHORS: Dict[str, str] = {
+    "KubePodCrashLooping":              "kube-pod-crashlooping",
+    "KubePodNotReady":                  "kube-pod-not-ready",
+    "KubeContainerWaiting":             "kube-container-waiting",
+    "KubeDeploymentReplicasMismatch":   "kube-deployment-replicas-mismatch",
+    "KubeStatefulSetReplicasMismatch":  "kube-statefulset-replicas-mismatch",
+    "KubeDeploymentGenerationMismatch": "kube-deployment-generation-mismatch",
+    "KubePersistentVolumeFillingUp":    "kube-pv-filling-up",
+    "KubeNodeNotReady":                 "kube-node-not-ready",
+    "KubeMemoryOvercommit":             "kube-memory-overcommit",
+    "HostOutOfMemory":                  "host-out-of-memory",
+    "HostHighCpuLoad":                  "host-high-cpu-load",
+    "PostgresqlDown":                   "postgresql-down",
+    "ClickHouseRestarted":              "clickhouse-restarted",
+    "TargetDown":                       "target-down",
+    "Watchdog":                         "watchdog",
+}
+
+
+def _runbook_link(alertname: Optional[str], url_prefix: str) -> Optional[str]:
+    """B3 — вернуть URL на runbook entry для alertname.
+
+    None если нет matched anchor. URL = `{url_prefix}#{anchor}`.
+    `url_prefix` берётся из settings.RUNBOOK_URL_PREFIX (env-override).
+    """
+    if not alertname:
+        return None
+    anchor = _RUNBOOK_ANCHORS.get(alertname)
+    if not anchor:
+        return None
+    if not url_prefix:
+        return None
+    return f"{url_prefix}#{anchor}"
+
+
+def _build_runbook_field(
+    alertname: Optional[str],
+    url_prefix: str,
+) -> Optional[Dict[str, Any]]:
+    """B3 — runbook embed-field. None если unknown alertname."""
+    url = _runbook_link(alertname, url_prefix)
+    if not url:
+        return None
+    return {
+        "name": "📖 Runbook",
+        "value": f"[{alertname}]({url})",
+        "inline": False,
+    }
+
+
 def _humanize_ago(seconds: int) -> str:
     """`X seconds → "3 weeks ago" / "5 days ago" / "12 hours ago" /
     "47 minutes ago" / "just now"`. Простая русско-неюзверная локализация
@@ -686,6 +798,192 @@ def _humanize_ago(seconds: int) -> str:
         return f"{weeks} week{'s' if weeks != 1 else ''} ago"
     months = days // 30
     return f"{months} month{'s' if months != 1 else ''} ago"
+
+
+def _build_tldr_field(
+    *,
+    summary: Optional[str],
+    pod_events: Optional[List[Dict[str, Any]]],
+    recent_deploys: Optional[List[Dict[str, Any]]],
+    replicas_ready_desired: Optional[str],
+    recurrence_24h: Optional[List[Dict[str, Any]]],
+    chronic_count: int = 0,
+) -> Optional[Dict[str, Any]]:
+    """B1 — `🎯 TL;DR` одна строка-приоритетная подсказка.
+
+    Логика выбора текста (порядок важен):
+      1. Если есть deploy <30m AND affected_replicas > 50% → «regression suspected»
+      2. chronic_count > 10 → «chronic (Xh)»
+      3. >=3 pod_events с reason='OOMKilled' → «OOMKilled pattern»
+      4. иначе первые 80 chars summary
+
+    `chronic_count` приходит из recurrence_24h len или externally. Если
+    summary пуст и ни одна heuristic не сработала — возвращаем None.
+    """
+    # 1. Regression suspected: свежий deploy + большинство реплик упало
+    deploy_part: Optional[str] = None
+    if recent_deploys:
+        d0 = recent_deploys[0]
+        mins = d0.get("minutes_before_incident")
+        try:
+            mins_int = int(mins) if mins is not None else 999
+        except (ValueError, TypeError):
+            mins_int = 999
+        num = d0.get("number") or "?"
+        sha = (d0.get("sha") or "")[:7]
+        ago = humanize_minutes_ago(mins) if mins is not None else "?"
+        if mins_int < 30 and _is_majority_replicas_down(replicas_ready_desired):
+            sha_part = f" ({sha})" if sha else ""
+            return {
+                "name": "🎯 TL;DR",
+                "value": (
+                    f"🚨 deploy #{num}{sha_part} {ago} · regression suspected"
+                )[:1024],
+                "inline": False,
+            }
+        # Для других веток сохраним краткий deploy-postfix.
+        sha_part = f" ({sha})" if sha else ""
+        deploy_part = f"deploy #{num}{sha_part} {ago}"
+
+    # 2. Chronic
+    if chronic_count > 10:
+        # Грубая оценка «возраста» — count*N часов; берём count как мин.
+        # окно. Это не астрономия, главное передать «это уже долго».
+        suffix = f" · {deploy_part}" if deploy_part else ""
+        return {
+            "name": "🎯 TL;DR",
+            "value": (f"🔁 chronic (×{chronic_count} in 24h){suffix}")[:1024],
+            "inline": False,
+        }
+
+    # 3. OOMKilled pattern (≥3 events с reason OOMKilled)
+    oom_count = 0
+    for ev in (pod_events or []):
+        if (ev.get("reason") or "").lower() == "oomkilled":
+            oom_count += int(ev.get("count") or 1)
+    if oom_count >= 3:
+        suffix = f" · {deploy_part}" if deploy_part else ""
+        return {
+            "name": "🎯 TL;DR",
+            "value": (f"💀 OOMKilled pattern (×{oom_count}){suffix}")[:1024],
+            "inline": False,
+        }
+
+    # 4. Fallback — первые 80 chars summary
+    if summary:
+        line = summary.strip().splitlines()[0] if summary.strip() else ""
+        if line:
+            short = line[:80]
+            if len(line) > 80:
+                short += "…"
+            return {
+                "name": "🎯 TL;DR",
+                "value": short[:1024],
+                "inline": False,
+            }
+    return None
+
+
+def _is_majority_replicas_down(ready_desired: Optional[str]) -> bool:
+    """Helper: проверить что упало > 50% реплик. Формат строки `ready/desired`.
+
+    `1/3` → 2 из 3 = 66% upfall → True. `2/3` → 1 of 3 = 33% → False.
+    Пустая/нечитаемая строка → False (consensus: «не знаем не алёрь»).
+    """
+    if not ready_desired or "/" not in ready_desired:
+        return False
+    try:
+        ready_str, desired_str = ready_desired.split("/", 1)
+        ready = int(ready_str.strip())
+        desired = int(desired_str.strip())
+        if desired <= 0:
+            return False
+        affected = desired - ready
+        return (affected / desired) > 0.5
+    except (ValueError, TypeError, ZeroDivisionError):
+        return False
+
+
+def _tc_build_url(
+    build_url: Optional[str],
+    build_id: Optional[Any],
+    tc_url_prefix: str,
+) -> Optional[str]:
+    """Sub-task: clickable TC build URL.
+
+    Приоритет:
+      1. `build_url` из extras (kg_deployments сохраняет full URL) — берём как есть.
+      2. `build_id` + tc_url_prefix → `{prefix}/viewLog.html?buildId={id}`.
+      3. None если ни того ни другого.
+
+    `tc_url_prefix` без trailing slash.
+    """
+    if build_url:
+        # Дополнительная защита: URL может быть протоколом без host (редкий
+        # invalid сохранитель); проверяем что начинается с http(s).
+        if isinstance(build_url, str) and build_url.startswith(("http://", "https://")):
+            return build_url
+    if build_id is None or build_id == "":
+        return None
+    if not tc_url_prefix:
+        return None
+    prefix = tc_url_prefix.rstrip("/")
+    return f"{prefix}/viewLog.html?buildId={build_id}"
+
+
+def _self_health_footer(
+    base: str,
+    *,
+    self_health_summary: Optional[Dict[str, Any]] = None,
+    build_version: str = "",
+) -> str:
+    """B6 — self-mon footer для enriched embed.
+
+    Формат:
+        `copilot · KG sync 5m ago · alerts_resolve OK · owner 86.68% · build wave-9-uxr`
+
+    Stale KG sync (> 30m) превращается в `KG sync ⚠ 32m ago`.
+
+    `base` — старый footer-текст (`copilot/enrich · groupKey=...`). Возвращаем
+    «base + новые суффиксы» одной строкой; Discord footer limit 2048.
+
+    `self_health_summary` — словарь, который вызывающий формирует сам через
+    `run_self_health_checks(db)` (или передаёт None — тогда суффиксы skip).
+    Ожидаемые ключи:
+      * `kg_sync_lag_min`: float | None — lag самой свежей beat-задачи.
+      * `alerts_resolve_status`: 'ok'|'warn'|'fail'|None.
+      * `owner_coverage_pct`: float | None — `team_owner != ''` пропорция.
+    """
+    parts: List[str] = []
+    if base:
+        parts.append(base)
+
+    if self_health_summary:
+        lag = self_health_summary.get("kg_sync_lag_min")
+        if lag is not None:
+            try:
+                lag_f = float(lag)
+                if lag_f > 30:
+                    parts.append(f"KG sync ⚠ {int(lag_f)}m ago")
+                else:
+                    parts.append(f"KG sync {int(lag_f)}m ago")
+            except (ValueError, TypeError):
+                pass
+        ar_status = self_health_summary.get("alerts_resolve_status")
+        if ar_status:
+            label = "OK" if ar_status == "ok" else ("WARN" if ar_status == "warn" else "FAIL")
+            parts.append(f"alerts_resolve {label}")
+        owner = self_health_summary.get("owner_coverage_pct")
+        if owner is not None:
+            try:
+                parts.append(f"owner {float(owner):.2f}%")
+            except (ValueError, TypeError):
+                pass
+
+    if build_version:
+        parts.append(f"build {build_version}")
+
+    return " · ".join(parts)[:2048]
 
 
 def _format_recurrence_tag(
