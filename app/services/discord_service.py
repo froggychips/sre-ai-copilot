@@ -37,8 +37,14 @@ _REEXPORT_FROM_DEDUP = (
     "_webhook_edit_endpoint",
 )
 _REEXPORT_FROM_EMBED_BUILDER = (
+    "_age_decay_severity",
     "_build_deploy_correlation_field", "_build_log_error_rate_field",
+    "_build_similar_past_field",
+    "_decay_color",
     "_format_recurrence_tag", "_format_sha_link",
+    "_humanize_ago", "_humanize_duration_seconds",
+    "_lookup_similar_past_incident",
+    "_lookup_similar_past_incident_cached",
     "_summarize_self_health_detail",
 )
 _REEXPORT_FROM_ROUTING = (
