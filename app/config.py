@@ -427,6 +427,24 @@ class Settings(BaseSettings):
     STATS_HIDE_EXPECTED_STALE: bool = Field(
         True, description="Hide backup/cron/system deployments from stale-section"
     )
+    # Stats digest overhaul (item A2): skip-if-noop — если все actionable
+    # секции пусты и нет ни одного нового алерта / firing series, не постим
+    # digest вообще. Снижает шум в спокойные дни.
+    STATS_DIGEST_SKIP_NOOP: bool = Field(
+        True, description="Skip posting digest if all sections empty"
+    )
+    # Stats digest overhaul (item C9): pipeline health gauge stale-threshold.
+    # Если sync_lag.lag_minutes > этого порога — на header показываем `⚠️ Xh gap`.
+    STATS_PIPELINE_STALE_MINUTES: int = Field(
+        60, description="Minutes threshold for pipeline section to mark stale"
+    )
+    # TC URL prefix для clickable Markdown link в Recent deploys. Если задан
+    # TEAMCITY_WEB_URL — его используем приоритетнее. Этот fallback нужен для
+    # тестов и для случая когда TEAMCITY_WEB_URL не сконфигурирован.
+    TC_URL_PREFIX: str = Field(
+        "https://wo-teamcity.lastoasisgame.com",
+        description="TC web URL prefix for build links",
+    )
 
     # Per-team daily digest (см. app/services/team_digest.py).
     # Шлёт один embed на каждый team_owner из kg_services с top-5 fragile,

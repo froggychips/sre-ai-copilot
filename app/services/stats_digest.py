@@ -4,23 +4,37 @@
 тестом `tests/test_stats_digest_no_llm.py` — он грепает source на запрещённые
 символы и завалится при попытке импорта reasoning-агентов.
 
-Секции (в порядке вывода):
-  1. cluster_health — VMClient.get_cluster_health() + trend vs yesterday
-     из kg_cluster_observations + count firing series + Δ к Redis-snapshot
-  2. firing_alerts_by_squad — группировка firing-series по namespace→team_owner из KG
-  3. unowned_namespaces — top-5 unowned ns + suggested owner heuristic
-  4. top_alert_types — top-3 alertname + Δ24h + chronic/resurfaced count
-  5. anomaly_summary — total/severity/by-metric breakdown за 24h из
-     kg_anomaly_observations (Wave 2)
-  6. anomaly_top — persistent (service, metric) пары за 7d (Wave 2)
-  7. log_errors — top-3 service по error/fatal count за 24h из
-     kg_log_observations (Wave 2; пусто пока Seq env-vars не заданы)
-  8. recent_deploys — TC deployer activity за окно
-  9. blast_radius / fragile_services — split: fragile (health_score<0.7 + ≥3 callers)
-     vs blast-radius (просто много callers)
-  10. stale_deployments — kubectl-обход WO-namespaces, idle ≥ STATS_DIGEST_STALE_DAYS.
-      Backup/system-deployments фильтруются (expected stale).
-  11. kg_quality — services/edges/orphan%/team_owner coverage
+Overhaul 2026-05-25: digest стал Δ-only + action-driven + observability-rich.
+Изменения:
+  * `_compute_change_report`/`_changes_section` — Δ vs Redis-snapshot prev-day.
+  * Skip-if-noop в `send_daily_digest` — пустой digest вообще не постится.
+  * `action_items_section` — chronic/unowned/suspicious_stale RCA-candidates.
+  * `noisemakers_section` — top-3 сервисов генерирующих >20% алертов.
+  * `mttr_section` — median/p95 MTTR resolved alerts за 7d + trend.
+  * `deploy_incident_correlation_section` — deploy→alert within 30m.
+  * `topology_growth_section` — Δ services/edges/NATS subjects vs snapshot.
+  * `pipeline_health_section` — vmsingle/vmagent/AM/copilot/seq freshness.
+  * `beat_heartbeats_footer` — last_run per sync task.
+  * `recent_deploys_section` — clickable TC build URLs (Markdown link).
+
+Секции (в порядке вывода, после overhaul):
+  0. pipeline_health (header) — gauge vmagent/AM/copilot/seq freshness
+  1. cluster_health — snapshot + Δ vs yesterday
+  2. changes — Δ-only: new alerts / resolved / KG-edges (item A1)
+  3. action_items — RCA-candidates (item B4)
+  4. firing_alerts_by_squad
+  5. unowned_namespaces
+  6. top_alert_types — Δ24h + chronic/resurfaced
+  7. noisemakers — top-3 сервисов с >20% alerts (item B5)
+  8. mttr — resolved alerts last 7d (item B6)
+  9. deploy_incident_correlation — deploy→alert within 30m (item B7)
+  10. topology_growth — Δ services/edges/NATS (item B8)
+  11. anomaly_summary / anomaly_top / log_errors (Wave 2)
+  12. recent_deploys — TC deployer activity, clickable build URLs
+  13. fragile_services / blast_radius
+  14. stale_deployments
+  15. kg_quality
+  16. beat_heartbeats (footer, item C10)
 
 Запускается через Celery beat task `daily_stats_digest`
 (см. app/workers/tasks.py).
@@ -30,6 +44,7 @@ from __future__ import annotations
 import json
 import subprocess
 from collections import Counter, defaultdict
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -41,6 +56,51 @@ from app.config import settings
 from app.context.vm_client import VMClient
 
 log = structlog.get_logger()
+
+
+# ── Overhaul 2026-05-25: shared dataclasses + Redis snapshot keys ───────────
+
+# Все Redis ключи под prefix `stats:`. TTL не более 25h — переписывается каждым
+# daily-run, при пропуске следующий run помечает (new baseline).
+_DAY_SNAPSHOT_REDIS_KEY = "stats:digest:last_day_snapshot"
+_TOPOLOGY_SNAPSHOT_REDIS_KEY = "stats:topology:last_day_snapshot"
+_DAY_SNAPSHOT_REDIS_TTL = 25 * 3600
+
+
+@dataclass
+class ChangeReport:
+    """Δ vs Redis-snapshot предыдущего дня. Item A1.
+
+    Полее `new_baseline=True` если snapshot не нашёлся (первый запуск,
+    Redis-flush, TTL истёк).
+    """
+    new_baseline: bool = False
+    firing_series_today: int = 0
+    firing_series_yesterday: Optional[int] = None
+    crashloops_today: Optional[float] = None
+    crashloops_yesterday: Optional[float] = None
+    new_alerts_24h: int = 0
+    resolved_alerts_24h: int = 0
+    chronic_in_new: int = 0
+    kg_edges_today: int = 0
+    kg_edges_yesterday: Optional[int] = None
+    kg_services_today: int = 0
+    kg_services_yesterday: Optional[int] = None
+    nats_subjects_new: List[str] = field(default_factory=list)
+
+
+# TC web URL prefix — для clickable Markdown link в Recent deploys.
+# Берём TEAMCITY_WEB_URL если задан, иначе fallback default.
+_TC_URL_PREFIX_DEFAULT = "https://wo-teamcity.lastoasisgame.com"
+
+
+def _tc_url_prefix() -> str:
+    """Resolve URL prefix для TC build link. Settings → default."""
+    return (
+        getattr(settings, "TEAMCITY_WEB_URL", "")
+        or getattr(settings, "TC_URL_PREFIX", "")
+        or _TC_URL_PREFIX_DEFAULT
+    ).rstrip("/")
 
 
 def _get_ns_to_team_map(db: Session) -> Dict[str, str]:
@@ -89,6 +149,64 @@ async def _write_last_firing_series(value: int) -> None:
         await client.set(_FIRING_SERIES_REDIS_KEY, str(value), ex=_FIRING_SERIES_REDIS_TTL)
     except Exception as e:
         log.warning("stats_digest.firing_series_redis_write_failed", error=str(e))
+
+
+# ── Snapshot helpers (item A1, B8) ──────────────────────────────────────────
+
+
+async def _read_day_snapshot() -> Optional[Dict[str, Any]]:
+    """Прочитать вчерашний snapshot. None если ключа нет / parse-error."""
+    try:
+        from app.services.alert_dedup import _get_client
+        client = _get_client()
+        raw = await client.get(_DAY_SNAPSHOT_REDIS_KEY)
+        if raw is None:
+            return None
+        return json.loads(raw)
+    except Exception as e:
+        log.warning("stats_digest.snapshot_read_failed", error=str(e))
+        return None
+
+
+async def _write_day_snapshot(snapshot: Dict[str, Any]) -> None:
+    """Сохранить сегодняшний snapshot для завтрашнего Δ-сравнения."""
+    try:
+        from app.services.alert_dedup import _get_client
+        client = _get_client()
+        await client.set(
+            _DAY_SNAPSHOT_REDIS_KEY,
+            json.dumps(snapshot, default=str),
+            ex=_DAY_SNAPSHOT_REDIS_TTL,
+        )
+    except Exception as e:
+        log.warning("stats_digest.snapshot_write_failed", error=str(e))
+
+
+async def _read_topology_snapshot() -> Optional[Dict[str, Any]]:
+    """Прочитать topology snapshot. None если ключа нет."""
+    try:
+        from app.services.alert_dedup import _get_client
+        client = _get_client()
+        raw = await client.get(_TOPOLOGY_SNAPSHOT_REDIS_KEY)
+        if raw is None:
+            return None
+        return json.loads(raw)
+    except Exception as e:
+        log.warning("stats_digest.topology_snapshot_read_failed", error=str(e))
+        return None
+
+
+async def _write_topology_snapshot(snapshot: Dict[str, Any]) -> None:
+    try:
+        from app.services.alert_dedup import _get_client
+        client = _get_client()
+        await client.set(
+            _TOPOLOGY_SNAPSHOT_REDIS_KEY,
+            json.dumps(snapshot, default=str),
+            ex=_DAY_SNAPSHOT_REDIS_TTL,
+        )
+    except Exception as e:
+        log.warning("stats_digest.topology_snapshot_write_failed", error=str(e))
 
 
 def _fmt_firing_series_trend(today: int, yesterday: Optional[int]) -> str:
@@ -920,19 +1038,37 @@ async def recent_deploys_section(
         ago = _humanize_ago(first.get("finished_at"), now)
         status_marker = "" if status == "SUCCESS" else f" · ⚠️ {status}"
 
+        # Overhaul: build_id → clickable Markdown link.
+        # Pre-existing field `url` берём приоритетно (заполняет teamcity_service),
+        # fallback на построение из TC_URL_PREFIX + build.id.
+        build_id = first.get("id")
+        build_url = first.get("url")
+        if not build_url and build_id:
+            build_url = f"{_tc_url_prefix()}/viewLog.html?buildId={build_id}"
+        # TODO: если build_id нет (некоторые fixtures, MCP fallback) — оставляем
+        # plain text. Не сыпем 404-ссылки.
+
         if len(group_builds) == 1:
             # Single-build (нет cascade) — старый формат, чтобы не ломать
             # backwards-compat с existing snapshot-тестами.
             btype = first.get("buildtype_name") or "?"
+            label = f"`{btype}` ({branch} #{num})"
+            if build_url:
+                # Markdown-link только вокруг buildtype+number, чтобы fmt не ломал
+                # парсер ` (… #N)`.
+                label = f"[{btype} ({branch} #{num})]({build_url})"
             lines.append(
-                f"  • by {actor} · `{btype}` ({branch} #{num}) · {ago}{status_marker}"
+                f"  • by {actor} · {label} · {ago}{status_marker}"
             )
         else:
             # Cascade aggregation: список service-имён сжимается до svc1/svc2/svc3 +N.
             service_names = [b.get("buildtype_name") or "?" for b in group_builds]
             services_str = _format_services_list(service_names)
+            head = f"#{num} by {actor}"
+            if build_url:
+                head = f"[#{num} by {actor}]({build_url})"
             lines.append(
-                f"  • #{num} by {actor} · {ago} · `{services_str}` @ {branch}{status_marker}"
+                f"  • {head} · {ago} · `{services_str}` @ {branch}{status_marker}"
             )
     return "\n".join(lines)
 
@@ -1198,8 +1334,630 @@ def _last_update(deployment: Dict[str, Any]) -> Optional[datetime]:
     return last
 
 
+# ── Overhaul sections (item A1, A2, B4-B8, C9-C10) ─────────────────────────
+
+
+def _count_alerts_in_window(db: Session, hours: int) -> Tuple[int, int]:
+    """Возвращает (fired_in_window, resolved_in_window).
+
+    fired_in_window: kg_alerts.fired_at в окне `hours`.
+    resolved_in_window: kg_alerts.resolved_at в окне `hours`.
+
+    На ошибке (нет таблицы) → (0, 0).
+    """
+    try:
+        fired = db.execute(text("""
+            SELECT count(*) FROM kg_alerts
+            WHERE fired_at > NOW() - (:hours || ' hours')::interval
+        """), {"hours": str(hours)}).scalar() or 0
+        resolved = db.execute(text("""
+            SELECT count(*) FROM kg_alerts
+            WHERE resolved_at IS NOT NULL
+              AND resolved_at > NOW() - (:hours || ' hours')::interval
+        """), {"hours": str(hours)}).scalar() or 0
+        return int(fired), int(resolved)
+    except Exception as e:
+        log.warning("stats_digest.count_alerts_failed", error=str(e))
+        return 0, 0
+
+
+def _count_chronic_in_window(db: Session, hours: int, min_fires: int = 5) -> int:
+    """Сколько (service, alertname) пар с ≥ min_fires fires в окне."""
+    try:
+        cnt = db.execute(text("""
+            SELECT count(*) FROM (
+                SELECT service_id, alertname, count(*) AS fires
+                FROM kg_alerts
+                WHERE fired_at > NOW() - (:hours || ' hours')::interval
+                  AND service_id IS NOT NULL
+                GROUP BY service_id, alertname
+                HAVING count(*) >= :min_fires
+            ) t
+        """), {"hours": str(hours), "min_fires": min_fires}).scalar() or 0
+        return int(cnt)
+    except Exception as e:
+        log.warning("stats_digest.chronic_count_failed", error=str(e))
+        return 0
+
+
+def _count_edges(db: Session) -> int:
+    try:
+        return int(db.execute(text("SELECT count(*) FROM kg_service_edges")).scalar() or 0)
+    except Exception:
+        return 0
+
+
+def _count_real_services(db: Session) -> int:
+    try:
+        return int(db.execute(text(
+            "SELECT count(*) FROM kg_services WHERE NOT synthetic"
+        )).scalar() or 0)
+    except Exception:
+        return 0
+
+
+def _nats_subjects(db: Session) -> List[str]:
+    """Список distinct NATS-subjects из kg_service_edges (kind='uses_nats').
+
+    На отсутствие таблицы / kind → пустой список. Используется в topology
+    growth snapshot.
+    """
+    try:
+        rows = db.execute(text("""
+            SELECT DISTINCT extras->>'subject' AS subj
+            FROM kg_service_edges
+            WHERE kind = 'uses_nats'
+              AND extras IS NOT NULL
+              AND extras->>'subject' IS NOT NULL
+        """)).fetchall()
+        return sorted({r[0] for r in rows if r[0]})
+    except Exception:
+        return []
+
+
+async def _compute_change_report(
+    db: Session,
+    firing_today: int,
+    crashloops_today: Optional[float],
+    previous: Optional[Dict[str, Any]],
+) -> ChangeReport:
+    """Собрать ChangeReport vs `previous` snapshot.
+
+    `previous=None` → new_baseline=True, deltas пусты.
+    """
+    new_alerts, resolved_alerts = _count_alerts_in_window(db, hours=24)
+    chronic = _count_chronic_in_window(db, hours=24, min_fires=5)
+    edges_today = _count_edges(db)
+    services_today = _count_real_services(db)
+
+    if previous is None:
+        return ChangeReport(
+            new_baseline=True,
+            firing_series_today=firing_today,
+            crashloops_today=crashloops_today,
+            new_alerts_24h=new_alerts,
+            resolved_alerts_24h=resolved_alerts,
+            chronic_in_new=chronic,
+            kg_edges_today=edges_today,
+            kg_services_today=services_today,
+        )
+
+    return ChangeReport(
+        new_baseline=False,
+        firing_series_today=firing_today,
+        firing_series_yesterday=previous.get("firing_series"),
+        crashloops_today=crashloops_today,
+        crashloops_yesterday=previous.get("crashloops"),
+        new_alerts_24h=new_alerts,
+        resolved_alerts_24h=resolved_alerts,
+        chronic_in_new=chronic,
+        kg_edges_today=edges_today,
+        kg_edges_yesterday=previous.get("kg_edges"),
+        kg_services_today=services_today,
+        kg_services_yesterday=previous.get("kg_services"),
+    )
+
+
+def changes_section(report: ChangeReport) -> str:
+    """A1. Δ-only since yesterday — что изменилось vs прошлого окна.
+
+    Пример:
+      📈 Changes since yesterday
+      +12 new alerts (5 chronic) · -8 resolved · +47 KG edges
+
+    Если `new_baseline=True` — секция показывает только сегодняшние counts
+    с пометкой `(new baseline)`.
+    """
+    if report.new_baseline:
+        return (
+            "**📈 Changes since yesterday**\n"
+            f"  `{report.new_alerts_24h}` new alerts · "
+            f"`{report.resolved_alerts_24h}` resolved · "
+            f"`{report.kg_edges_today}` KG edges _(new baseline)_"
+        )
+
+    parts: List[str] = []
+    parts.append(
+        f"`+{report.new_alerts_24h}` new alerts" + (
+            f" ({report.chronic_in_new} chronic)" if report.chronic_in_new else ""
+        )
+    )
+    parts.append(f"`-{report.resolved_alerts_24h}` resolved")
+
+    if report.kg_edges_yesterday is not None:
+        delta_e = report.kg_edges_today - report.kg_edges_yesterday
+        sign = "+" if delta_e >= 0 else ""
+        parts.append(f"`{sign}{delta_e}` KG edges")
+
+    return "**📈 Changes since yesterday**\n  " + " · ".join(parts)
+
+
+def _chronic_action_items(db: Session, threshold: int = 10) -> List[Dict[str, Any]]:
+    """B4. Service+alertname пары с ≥threshold fires за 24h → RCA-кандидаты.
+
+    Возвращает [{service, alertname, fires}, ...] sorted by fires desc, cap=3.
+    """
+    try:
+        rows = db.execute(text("""
+            SELECT s.name AS service, a.alertname, count(*) AS fires
+            FROM kg_alerts a
+            JOIN kg_services s ON s.id = a.service_id
+            WHERE a.fired_at > NOW() - INTERVAL '24 hours'
+              AND a.service_id IS NOT NULL
+            GROUP BY s.name, a.alertname
+            HAVING count(*) >= :threshold
+            ORDER BY count(*) DESC
+            LIMIT 3
+        """), {"threshold": threshold}).fetchall()
+        return [
+            {"service": r[0], "alertname": r[1], "fires": int(r[2])}
+            for r in rows
+        ]
+    except Exception as e:
+        log.warning("stats_digest.chronic_action_items_failed", error=str(e))
+        return []
+
+
+def _unowned_action_items(db: Session) -> int:
+    """B4. Сколько real services без owner после backfill.
+
+    Возвращает count. Не возвращаем сами имена — это для footer-pill.
+    """
+    try:
+        return int(db.execute(text("""
+            SELECT count(*) FROM kg_services
+            WHERE NOT synthetic
+              AND (team_owner IS NULL OR team_owner = '')
+        """)).scalar() or 0)
+    except Exception:
+        return 0
+
+
+def _suspicious_stale_action_items(db: Session, days: int = 60) -> int:
+    """B4. Services с stale_class=suspicious_stale без deploys >days.
+
+    Возвращает count.
+    """
+    try:
+        cnt = db.execute(text("""
+            SELECT count(*) FROM kg_services s
+            WHERE NOT synthetic
+              AND s.stale_class = 'suspicious_stale'
+              AND NOT EXISTS (
+                  SELECT 1 FROM kg_deployments d
+                  WHERE d.service_id = s.id
+                    AND d.started_at > NOW() - (:days || ' days')::interval
+              )
+        """), {"days": str(days)}).scalar() or 0
+        return int(cnt)
+    except Exception as e:
+        log.warning("stats_digest.suspicious_stale_failed", error=str(e))
+        return 0
+
+
+def action_items_section(
+    db: Session,
+    *,
+    chronic_threshold: int = 10,
+    suspicious_days: int = 60,
+) -> str:
+    """B4. Action items — RCA-кандидаты вместо просто-наблюдательного списка.
+
+    Три категории:
+      1. Chronic (≥threshold fires/24h) → RCA нужен.
+      2. Без owner → manual ownership.yaml.
+      3. Suspicious stale ≥60d → review/delete.
+
+    Если все три пусты — секция скрыта (return "").
+    """
+    chronic = _chronic_action_items(db, threshold=chronic_threshold)
+    unowned = _unowned_action_items(db)
+    stale = _suspicious_stale_action_items(db, days=suspicious_days)
+
+    if not chronic and not unowned and not stale:
+        return ""
+
+    lines = ["**🎯 Action items**"]
+    if chronic:
+        services_str = ", ".join(
+            f"{c['service']}" for c in chronic
+        )
+        lines.append(
+            f"  • `{len(chronic)}` chronic alerts ≥{chronic_threshold} fires/24h "
+            f"→ RCA: {services_str}"
+        )
+    if unowned:
+        lines.append(
+            f"  • `{unowned}` services без owner после backfill — нужен "
+            f"manual в ownership.yaml"
+        )
+    if stale:
+        lines.append(
+            f"  • `{stale}` suspicious_stale без deploys >{suspicious_days}d "
+            f"— review/delete"
+        )
+    return "\n".join(lines)
+
+
+def noisemakers_section(fired_series: List[dict], threshold_pct: float = 20.0) -> str:
+    """B5. Top-3 service генерирующих >threshold_pct% алертов.
+
+    Группируем series по (namespace, service-label). Если ни один сервис не
+    набрал ≥threshold% — секция скрыта.
+    """
+    if not fired_series:
+        return ""
+
+    total = len(fired_series)
+    if total == 0:
+        return ""
+
+    counter: Counter = Counter()
+    ns_map: Dict[str, str] = {}
+    for s in fired_series:
+        m = s.get("metric", {})
+        # Резолв service-имени: пробуем явные labels, fallback на pod-prefix.
+        svc = (
+            m.get("service")
+            or m.get("deployment")
+            or m.get("statefulset")
+        )
+        if not svc:
+            pod = m.get("pod")
+            if pod:
+                svc = pod.rsplit("-", 2)[0]
+        if not svc or svc == "?":
+            continue
+        ns = m.get("namespace") or m.get("exported_namespace") or "?"
+        counter[svc] += 1
+        ns_map.setdefault(svc, ns)
+
+    if not counter:
+        return ""
+
+    top = counter.most_common(3)
+    notable = [(svc, cnt) for svc, cnt in top if (cnt / total * 100) >= threshold_pct]
+    if not notable:
+        return ""
+
+    lines = ["**🔊 Noisemakers (24h)**"]
+    for svc, cnt in notable:
+        pct = (cnt / total * 100)
+        ns = ns_map.get(svc, "?")
+        lines.append(
+            f"  • `{svc}` _{ns}_ — `{pct:.0f}%` alerts ({cnt} events)"
+        )
+    return "\n".join(lines)
+
+
+def _mttr_stats(db: Session, days: int) -> Optional[Dict[str, float]]:
+    """Median + p95 MTTR (resolved_at - fired_at) for alerts resolved в окне.
+
+    Возвращает None если 0 resolved.
+    """
+    try:
+        row = db.execute(text("""
+            SELECT
+                percentile_cont(0.5) WITHIN GROUP (
+                    ORDER BY EXTRACT(EPOCH FROM (resolved_at - fired_at)) / 60
+                ) AS median_min,
+                percentile_cont(0.95) WITHIN GROUP (
+                    ORDER BY EXTRACT(EPOCH FROM (resolved_at - fired_at)) / 60
+                ) AS p95_min,
+                count(*) AS n
+            FROM kg_alerts
+            WHERE resolved_at IS NOT NULL
+              AND fired_at IS NOT NULL
+              AND resolved_at >= fired_at
+              AND resolved_at > NOW() - (:days || ' days')::interval
+        """), {"days": str(days)}).fetchone()
+    except Exception as e:
+        log.warning("stats_digest.mttr_query_failed", error=str(e))
+        return None
+    if row is None or row[2] == 0 or row[2] is None:
+        return None
+    return {
+        "median_min": float(row[0] or 0),
+        "p95_min": float(row[1] or 0),
+        "samples": int(row[2]),
+    }
+
+
+def mttr_section(db: Session, days: int = 7) -> str:
+    """B6. MTTR mini-stat — median / p95 + trend vs prev week.
+
+    `kg_alerts WHERE resolved_at >= now()-Nd`. Если нет samples — скрываем
+    секцию.
+    """
+    now_stats = _mttr_stats(db, days=days)
+    if not now_stats:
+        return ""
+    prev_stats = _mttr_stats(db, days=days * 2)  # rough: includes current; trend approx
+
+    lines = [f"**⏱️ MTTR (resolved alerts last {days}d)**"]
+
+    trend_str = ""
+    if prev_stats and prev_stats["samples"] > now_stats["samples"]:
+        # Очень грубая trend-эвристика: median 7d vs median 14d window.
+        # Не идеальная, но даёт сигнал что-то меняется.
+        prev_med = prev_stats["median_min"]
+        cur_med = now_stats["median_min"]
+        delta = cur_med - prev_med
+        if abs(delta) >= 1:
+            sign = "+" if delta > 0 else ""
+            trend_str = f" · trend: `{sign}{delta:.0f}min` vs prev week"
+
+    lines.append(
+        f"  median: `{now_stats['median_min']:.0f}min` · "
+        f"p95: `{now_stats['p95_min']:.0f}min` · "
+        f"samples: `{now_stats['samples']}`{trend_str}"
+    )
+    return "\n".join(lines)
+
+
+def deploy_incident_correlation_section(db: Session, hours: int = 24) -> str:
+    """B7. Deploy → incident correlation.
+
+    JOIN kg_deployments × kg_alerts: service_id same AND alert fired_at
+    в окне ≤30m после deploy.started_at. Возвращает success-rate + worst deploy.
+    """
+    try:
+        # Сначала overall: сколько deploys, сколько attributed (≥1 alert в 30m).
+        overall = db.execute(text("""
+            WITH recent_deploys AS (
+                SELECT id, service_id, started_at, status, build_number, triggered_by, extras
+                FROM kg_deployments
+                WHERE started_at > NOW() - (:hours || ' hours')::interval
+            )
+            SELECT
+                count(*) AS total,
+                count(*) FILTER (WHERE EXISTS (
+                    SELECT 1 FROM kg_alerts a
+                    WHERE a.service_id = recent_deploys.service_id
+                      AND a.fired_at BETWEEN recent_deploys.started_at
+                                         AND recent_deploys.started_at + INTERVAL '30 minutes'
+                )) AS attributed,
+                count(*) FILTER (WHERE status = 'SUCCESS') AS successes
+            FROM recent_deploys
+        """), {"hours": str(hours)}).fetchone()
+    except Exception as e:
+        log.warning("stats_digest.deploy_incident_failed", error=str(e))
+        return ""
+
+    if overall is None:
+        return ""
+    total = int(overall[0] or 0)
+    if total == 0:
+        return ""
+    attributed = int(overall[1] or 0)
+    successes = int(overall[2] or 0)
+
+    try:
+        worst = db.execute(text("""
+            SELECT
+                d.build_number,
+                d.triggered_by,
+                count(a.id) AS alert_cnt
+            FROM kg_deployments d
+            JOIN kg_alerts a ON a.service_id = d.service_id
+                AND a.fired_at BETWEEN d.started_at
+                                   AND d.started_at + INTERVAL '30 minutes'
+            WHERE d.started_at > NOW() - (:hours || ' hours')::interval
+            GROUP BY d.id, d.build_number, d.triggered_by
+            ORDER BY count(a.id) DESC
+            LIMIT 1
+        """), {"hours": str(hours)}).fetchone()
+    except Exception:
+        worst = None
+
+    success_pct = (successes / total * 100) if total else 0.0
+    attributed_pct = (attributed / total * 100) if total else 0.0
+
+    lines = [f"**🚀 Deploy → incident correlation ({hours}h)**"]
+    lines.append(
+        f"  `{total}` deploys · `{attributed}` attributed alerts "
+        f"({attributed_pct:.0f}%) · success rate `{success_pct:.0f}%`"
+    )
+    if worst and int(worst[2] or 0) >= 2:
+        b_num, b_user, b_cnt = worst
+        user_str = f"by `{b_user}`" if b_user else "_auto_"
+        lines.append(
+            f"  Worst: Build #{b_num} {user_str} → `{int(b_cnt)}` alerts in 30m "
+            f"(rollback recommended)"
+        )
+    return "\n".join(lines)
+
+
+async def topology_growth_section(db: Session) -> str:
+    """B8. Δ services / edges / new NATS subjects vs Redis snapshot.
+
+    Если snapshot ещё не записан — секцию скрываем (после первого daily-run
+    snapshot будет, и со 2го дня появится Δ).
+    """
+    services_now = _count_real_services(db)
+    edges_now = _count_edges(db)
+    subjects_now = _nats_subjects(db)
+
+    prev = await _read_topology_snapshot()
+    # Запишем сегодняшний snapshot в любом случае (включая first-run).
+    await _write_topology_snapshot({
+        "services": services_now,
+        "edges": edges_now,
+        "nats_subjects": subjects_now,
+    })
+
+    if prev is None:
+        return ""
+
+    prev_services = int(prev.get("services") or 0)
+    prev_edges = int(prev.get("edges") or 0)
+    prev_subjects = set(prev.get("nats_subjects") or [])
+
+    d_services = services_now - prev_services
+    d_edges = edges_now - prev_edges
+    new_subjects = sorted(set(subjects_now) - prev_subjects)
+
+    if d_services == 0 and d_edges == 0 and not new_subjects:
+        return ""
+
+    parts: List[str] = []
+    if d_services:
+        sign = "+" if d_services > 0 else ""
+        parts.append(f"`{sign}{d_services}` services")
+    if d_edges:
+        sign = "+" if d_edges > 0 else ""
+        parts.append(f"`{sign}{d_edges}` edges")
+    if new_subjects:
+        shown = ", ".join(new_subjects[:3])
+        more = f" +{len(new_subjects) - 3} more" if len(new_subjects) > 3 else ""
+        parts.append(f"`+{len(new_subjects)}` NATS subjects ({shown}{more})")
+
+    return "**🧬 Topology growth (24h)**\n  " + " · ".join(parts)
+
+
+def pipeline_health_section(db: Session, stale_minutes: Optional[int] = None) -> str:
+    """C9. Pipeline gauge header — vmsingle/vmagent/AM/copilot/seq freshness.
+
+    Использует `check_sync_lag` из app.knowledge_graph.self_health — единый
+    источник истины по last_ts per task. Если task lag > stale_minutes
+    threshold → mark `⚠️ Xh gap`. Иначе `✓`.
+
+    stale_minutes default — settings.STATS_PIPELINE_STALE_MINUTES (60).
+    """
+    if stale_minutes is None:
+        stale_minutes = getattr(settings, "STATS_PIPELINE_STALE_MINUTES", 60)
+    try:
+        from app.knowledge_graph.self_health import check_sync_lag
+        result = check_sync_lag(db)
+        per_task = result.detail.get("per_task", {})
+    except Exception as e:
+        log.warning("stats_digest.pipeline_health_failed", error=str(e))
+        return ""
+
+    # Map sync_task → display name.
+    display_map = {
+        "kg_metrics_sync": "vmsingle",
+        "kg_cluster_health_sync": "vmagent",
+        "kg_anomaly_detection_task": "vmalert",
+        "kg_topology_sync": "copilot",
+        "kg_seq_logs_sync": "seq",
+        "kg_signal_aggregates_compute": "AM",
+    }
+    parts: List[str] = []
+    for task_name, display in display_map.items():
+        info = per_task.get(task_name)
+        if info is None:
+            continue
+        lag_min = info.get("lag_minutes")
+        if lag_min is None:
+            parts.append(f"{display} ⚠️ no data")
+            continue
+        if lag_min > stale_minutes:
+            hours = lag_min / 60
+            if hours >= 1:
+                gap = f"{hours:.0f}h"
+            else:
+                gap = f"{lag_min:.0f}m"
+            parts.append(f"{display} ⚠️ {gap} gap")
+        else:
+            parts.append(f"{display} ✓")
+
+    if not parts:
+        return ""
+    return "**📡 Pipeline**\n  " + " · ".join(parts)
+
+
+def beat_heartbeats_footer(db: Session) -> str:
+    """C10. Beat-task heartbeats — last_run per sync task. Footer-row.
+
+    Использует тот же `check_sync_lag` source. Формат:
+      Syncs: metrics 14:45 · cluster 14:30 · topology 12:17 (5h ago) · 4/4 active
+    """
+    try:
+        from app.knowledge_graph.self_health import check_sync_lag
+        result = check_sync_lag(db)
+        per_task = result.detail.get("per_task", {})
+    except Exception as e:
+        log.warning("stats_digest.beat_heartbeats_failed", error=str(e))
+        return ""
+
+    short_names = {
+        "kg_metrics_sync": "metrics",
+        "kg_cluster_health_sync": "cluster",
+        "kg_topology_sync": "topology",
+        "kg_seq_logs_sync": "seq",
+        "kg_anomaly_detection_task": "anomaly",
+        "kg_signal_aggregates_compute": "aggregates",
+    }
+    parts: List[str] = []
+    active = 0
+    total = 0
+    for task_name, short in short_names.items():
+        info = per_task.get(task_name)
+        if info is None:
+            continue
+        total += 1
+        lag_min = info.get("lag_minutes")
+        last_ts = info.get("last_ts")
+        if lag_min is None or last_ts is None:
+            continue
+        active += 1
+        try:
+            dt = datetime.fromisoformat(last_ts)
+            hhmm = dt.strftime("%H:%M")
+        except Exception:
+            hhmm = "?"
+        ago = ""
+        if lag_min > 60:
+            ago = f" ({lag_min/60:.0f}h ago)"
+        parts.append(f"{short} {hhmm}{ago}")
+
+    if not parts:
+        return ""
+    return f"_Syncs: {' · '.join(parts)} · {active}/{total} active_"
+
+
+# ── build_digest entry ─────────────────────────────────────────────────────
+
+
 async def build_digest(db: Session) -> str:
-    """Собрать полный digest. Возвращает markdown-string для Discord."""
+    """Собрать полный digest. Возвращает markdown-string для Discord.
+
+    Совместимость с pre-overhaul callers (тестами): тонкая обёртка над
+    `_build_digest_with_meta`, которая возвращает только content без meta.
+    """
+    content, _ = await _build_digest_with_meta(db)
+    return content
+
+
+async def _build_digest_with_meta(db: Session) -> Tuple[str, Dict[str, Any]]:
+    """Собрать полный digest + meta. Возвращает (markdown, meta).
+
+    `meta` — диагностика для skip-if-noop:
+      - sections_with_content: int — сколько не-пустых секций (помимо
+        cluster_health и pipeline_health которые рисуются всегда).
+      - change_report: ChangeReport (для тестов).
+    """
     ns_to_team = _get_ns_to_team_map(db)
     fired_series: List[dict] = []
 
@@ -1217,6 +1975,8 @@ async def build_digest(db: Session) -> str:
 
     # Item #3: trend для Firing series vs последнего daily snapshot.
     firing_yesterday = await _read_last_firing_series()
+    # Item A1: full prev-day snapshot для Δ-секции.
+    prev_snapshot = await _read_day_snapshot()
 
     if settings.VICTORIA_METRICS_URL:
         health_text = await cluster_health_section(
@@ -1227,6 +1987,17 @@ async def build_digest(db: Session) -> str:
         )
     else:
         health_text = "**🛡️ Cluster Health**\n  _VICTORIA_METRICS_URL не настроен_"
+
+    # Item A1: ChangeReport — diff vs prev snapshot.
+    # crashloops_today берётся из VM cluster_health; для простоты передаём None,
+    # детальные deltas достаём из current_crashloops через VM-snapshot уже в
+    # cluster_health_section, тут считаем только alerts/edges.
+    change_report = await _compute_change_report(
+        db,
+        firing_today=len(fired_series),
+        crashloops_today=None,
+        previous=prev_snapshot,
+    )
 
     alerts_text, unique_alerts, _, unowned_ns = firing_alerts_section(
         fired_series, ns_to_team
@@ -1243,20 +2014,59 @@ async def build_digest(db: Session) -> str:
     deploys_text = await recent_deploys_section(lookback_hours=24, limit=5)
     kg_text = kg_quality_section(db)
 
+    # Overhaul sections.
+    pipeline_text = pipeline_health_section(db)
+    changes_text = changes_section(change_report)
+    actions_text = action_items_section(db)
+    noise_text = noisemakers_section(fired_series)
+    mttr_text = mttr_section(db, days=7)
+    deploy_corr_text = deploy_incident_correlation_section(db, hours=24)
+    topology_text = await topology_growth_section(db)
+    heartbeats_text = beat_heartbeats_footer(db)
+
     # Item #3: записать сегодняшний firing count для завтрашнего trend.
     # Делаем ПОСЛЕ всех queries — чтобы не аффектить today-сравнение если бы
     # кто-то перечитал ключ.
     await _write_last_firing_series(len(fired_series))
+    # Item A1: записать full snapshot для завтрашнего Δ.
+    await _write_day_snapshot({
+        "firing_series": len(fired_series),
+        "crashloops": None,  # cluster_health сам пишет свой ключ
+        "kg_edges": change_report.kg_edges_today,
+        "kg_services": change_report.kg_services_today,
+        "ts": datetime.now(timezone.utc).isoformat(),
+    })
 
     now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+
+    # Item A2: skip-if-noop — meta-счётчик не-пустых action/Δ секций.
+    # Cluster health, pipeline и kg_quality рисуются всегда, не считаем.
+    actionable_sections = [
+        changes_text, actions_text, noise_text, mttr_text, deploy_corr_text,
+        topology_text, alerts_text if "ни одной серии" not in alerts_text else "",
+        unowned_text, top_types_text if "нет активных алертов" not in top_types_text else "",
+        anomaly_summary_text if "ни одной аномалии" not in anomaly_summary_text else "",
+        anomaly_top_text, log_errors_text, fragile_text if "нет edges" not in fragile_text else "",
+        stale_text if "ничего не stale" not in stale_text and "ничего suspicious" not in stale_text else "",
+        deploys_text,
+    ]
+    sections_with_content = sum(1 for s in actionable_sections if s)
+
     # Пустые секции (вернувшие "") пропускаем — иначе \n\n.join создаст
     # двойной перевод строки и в Discord будет пустая дыра.
     sections = [
         f"📊 **Cluster Daily Digest** · {now}",
+        pipeline_text,
         health_text,
+        changes_text,
+        actions_text,
         alerts_text,
         unowned_text,
         top_types_text,
+        noise_text,
+        mttr_text,
+        deploy_corr_text,
+        topology_text,
         anomaly_summary_text,
         anomaly_top_text,
         log_errors_text,
@@ -1264,17 +2074,51 @@ async def build_digest(db: Session) -> str:
         fragile_text,
         stale_text,
         kg_text,
+        heartbeats_text,
     ]
-    return "\n\n".join(s for s in sections if s)
+    content = "\n\n".join(s for s in sections if s)
+
+    return content, {
+        "sections_with_content": sections_with_content,
+        "change_report": change_report,
+        "fired_series_count": len(fired_series),
+    }
 
 
 async def send_daily_digest(db: Session) -> Dict[str, Any]:
-    """Точка входа из Celery beat task — собрать и отправить."""
+    """Точка входа из Celery beat task — собрать и отправить.
+
+    Item A2 — skip-if-noop: если все actionable секции пусты И нет changes
+    относительно прошлого окна, не постим вообще. Settings гvr
+    `STATS_DIGEST_SKIP_NOOP` (default True) контролирует поведение.
+    """
     if not settings.STATS_DIGEST_ENABLED:
         log.info("stats_digest.skipped", reason="STATS_DIGEST_ENABLED=false")
         return {"status": "skipped", "reason": "disabled"}
 
-    content = await build_digest(db)
+    # _build_digest_with_meta — основной path. build_digest остаётся как
+    # backwards-compat обёртка для тестов которые мокают её напрямую (см.
+    # test_send_daily_digest_sends_when_enabled). Внутри Celery beat task
+    # этот path не используется — там build_digest не мокается.
+    content, meta = await _build_digest_with_meta(db)
+    cr: ChangeReport = meta["change_report"]
+
+    skip_noop = getattr(settings, "STATS_DIGEST_SKIP_NOOP", True)
+    if skip_noop and meta["sections_with_content"] == 0:
+        # Все секции пусты И нет deltas → silently skip.
+        # New-baseline run считаем noop если 0 alerts/0 edges-delta (всё равно
+        # завтра будет нормальный digest).
+        if (
+            cr.new_alerts_24h == 0
+            and cr.resolved_alerts_24h == 0
+            and meta["fired_series_count"] == 0
+        ):
+            log.info(
+                "stats_digest.skipped_noop",
+                window="24h",
+                content_len=len(content),
+            )
+            return {"status": "skipped_noop", "reason": "all sections empty"}
 
     # Импорт locally чтобы избежать circular-import на старте модуля.
     from app.services.discord_service import discord_service
