@@ -192,10 +192,12 @@ async def test_send_enriched_alert_builds_grouped_embed():
     # Owner field
     owner = next(f for f in embed["fields"] if f["name"] == "Owner")
     assert "gameplay-team" in owner["value"]
-    # Цвет critical
-    assert embed["color"] == 0xE53935
-    # Без mention payload
-    assert sent["payload"]["allowed_mentions"] == {"parse": []}
+    # Цвет critical (B-блок overhaul — 0xED4245 red Discord palette,
+    # см. SEVERITY_COLOR_CRITICAL в embed_builder.py).
+    assert embed["color"] == 0xED4245
+    # Mention payload: critical → @here + parse=["everyone"].
+    assert sent["payload"]["allowed_mentions"] == {"parse": ["everyone"]}
+    assert sent["payload"].get("content") == "@here"
 
 
 @pytest.mark.asyncio
