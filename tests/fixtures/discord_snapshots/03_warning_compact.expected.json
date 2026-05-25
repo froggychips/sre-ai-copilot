@@ -1,7 +1,12 @@
 {
-  "title": "🟡 PREPROD · KubeStatefulSetReplicasMismatch · clickhouse-keeper",
-  "color": 16635957,
+  "title": "⚠️ PREPROD · KubeStatefulSetReplicasMismatch · clickhouse-keeper",
+  "color": 16426522,
   "fields": [
+    {
+      "name": "🎯 TL;DR",
+      "value": "StatefulSet preprod-shared/clickhouse-keeper has not matched the expected number…",
+      "inline": false
+    },
     {
       "name": "Namespaces",
       "value": "`preprod-shared`",
@@ -30,6 +35,11 @@
     {
       "name": "⭐ Почему важно",
       "value": "⚙️ **Infra-critical**: team_owner=`platform` — обычно shared/foundational",
+      "inline": false
+    },
+    {
+      "name": "📖 Runbook",
+      "value": "[KubeStatefulSetReplicasMismatch](https://github.com/froggychips/sre-ai-copilot/blob/master/docs/RUNBOOK.md#kube-statefulset-replicas-mismatch)",
       "inline": false
     },
     {

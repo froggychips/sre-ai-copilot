@@ -1,7 +1,12 @@
 {
-  "title": "🔴 PREPROD · KubePodCrashLooping · clickhouse-shard0 · 🔁 ×2 за 24h · 🌀 RESURFACED",
-  "color": 15022389,
+  "title": "🔁 PREPROD · KubePodCrashLooping · clickhouse-shard0 · 🔁 ×2 за 24h · 🌀 RESURFACED",
+  "color": 16088064,
   "fields": [
+    {
+      "name": "🎯 TL;DR",
+      "value": "Pod prod-shared/clickhouse-shard0-0 is in waiting state (reason: \"CrashLoopBackO…",
+      "inline": false
+    },
     {
       "name": "Namespaces",
       "value": "`prod-shared`",
@@ -35,6 +40,11 @@
     {
       "name": "⭐ Почему важно",
       "value": "🌐 **Shared dep**: 25 inbound callers — blast radius широкий\n⚙️ **Infra-critical**: team_owner=`platform` — обычно shared/foundational\n🔥 **Хроник**: pod_event `BackOff` × 1389 retries — несколько суток крашится, нужен owner",
+      "inline": false
+    },
+    {
+      "name": "📖 Runbook",
+      "value": "[KubePodCrashLooping](https://github.com/froggychips/sre-ai-copilot/blob/master/docs/RUNBOOK.md#kube-pod-crashlooping)",
       "inline": false
     },
     {
