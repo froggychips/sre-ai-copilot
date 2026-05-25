@@ -157,7 +157,7 @@ def _extract_pvc_fields(pvc: Dict[str, Any]) -> Dict[str, Any]:
     spec = pvc.get("spec") or {}
     status = pvc.get("status") or {}
     requests = (spec.get("resources") or {}).get("requests") or {}
-    capacity_str = requests.get("storage")
+    capacity_str = requests.get("storage")  # nosec B113 — bandit false positive: requests это dict, не httpx
     # При Bound — реальный capacity берётся из status.capacity (= размер PV).
     # Это полезно, когда PVC запросил 100Gi, а dynamic provisioner выдал 110Gi.
     if status.get("capacity") and status["capacity"].get("storage"):

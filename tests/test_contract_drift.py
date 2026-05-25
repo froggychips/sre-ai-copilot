@@ -22,8 +22,6 @@ import re
 from pathlib import Path
 from typing import Set
 
-import pytest
-
 from app.knowledge_graph.contract import (
     EDGE_KINDS,
     KG_SCHEMA_VERSION,

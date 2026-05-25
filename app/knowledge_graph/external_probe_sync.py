@@ -64,7 +64,7 @@ async def _probe_https_head(host: str, timeout: float) -> Dict[str, Any]:
     start = time.monotonic()
     result: Dict[str, Any] = {"http_code": None, "latency_ms": None, "error": None}
     try:
-        async with httpx.AsyncClient(timeout=timeout, verify=False) as client:
+        async with httpx.AsyncClient(timeout=timeout, verify=False) as client:  # nosec B501 — external probe ходит на любые hosts включая self-signed cert
             r = await client.head(f"https://{host}/", follow_redirects=False)
             result["http_code"] = r.status_code
     except Exception as e:
