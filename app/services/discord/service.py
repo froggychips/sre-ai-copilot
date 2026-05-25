@@ -32,13 +32,17 @@ from .dedup import (
     _webhook_edit_endpoint,
 )
 from .embed_builder import (
+    _age_decay_severity,
     _build_blast_radius_field,
     _build_deploy_correlation_field,
     _build_log_error_rate_field,
     _build_nats_impact_field,
     _build_pod_trail_field,
+    _build_similar_past_field,
+    _decay_color,
     _format_recurrence_tag,
     _format_sha_link,
+    _lookup_similar_past_incident_cached,
     _summarize_self_health_detail,
 )
 from .routing import _ensure_wait_param, _pick_webhook_url, _should_route_to_error
@@ -150,6 +154,8 @@ class DiscordService:
         incident_ts: Optional[datetime] = None,
         pod_event_reason: Optional[str] = None,
         metric_source: Optional[str] = None,
+        fired_at: Optional[datetime] = None,
+        acked_by: Optional[str] = None,
     ) -> None:
         """Единый embed-отчёт, заменяющий сырой алерт от Spidey Bot.
 
@@ -182,12 +188,36 @@ class DiscordService:
             )
             return
 
-        color = (
+        # A2 severity decay: critical >24h без ack → orange + 🪦 STALE prefix.
+        # Helper покрывает все edge-cases (acked / younger / non-critical).
+        # Используем fired_at если он передан, иначе fallback на incident_ts.
+        decay_basis = fired_at or incident_ts
+        decayed_sev, stale_title_prefix, stale_footer_marker = _age_decay_severity(
+            severity=severity,
+            fired_at=decay_basis,
+            acked_by=acked_by,
+        )
+        is_stale_critical = decayed_sev == "stale_critical"
+
+        base_color = (
             _COLOR_RESOLVED if resolution_quality == "resolved"
             else _SEVERITY_COLORS.get(severity.lower(), _COLOR_UNKNOWN)
         )
+        # Stale-critical перекрашиваем в orange ТОЛЬКО когда инцидент не
+        # помечен как resolved (resolved уже отдельный зелёный кейс).
+        if resolution_quality != "resolved":
+            color = _decay_color(base_color, decayed_sev)
+        else:
+            color = base_color
 
-        status_icon = "✅" if resolution_quality == "resolved" else "⚠️"
+        if resolution_quality == "resolved":
+            status_icon = "✅"
+        elif is_stale_critical:
+            # 🪦 STALE заменяет дефолтный 🚨/⚠️ префикс — оператор сразу
+            # видит «висит без ack 24h+», а не «новый critical».
+            status_icon = stale_title_prefix
+        else:
+            status_icon = "⚠️"
         # #13: recurrence label с окном (24h/7d). Fallback на старый
         # "🔁 RECURRENCE" если counts не пробросили (тесты, ручной запуск).
         recurrence_tag = _format_recurrence_tag(
@@ -215,6 +245,29 @@ class DiscordService:
         suspect_field = _build_deploy_correlation_field(deploy_correlation or {})
         if suspect_field is not None:
             fields.append(suspect_field)
+
+        # B4: Similar past incident lookup. Best-effort, без LLM.
+        # Skip-if-not-applicable: нет alertname/service/namespace → не делаем
+        # DB lookup. resolved-инциденту тоже не показываем (поле "что было
+        # раньше с той же проблемой" нужно только для firing).
+        if (
+            resolution_quality != "resolved"
+            and alertname
+            and service
+            and namespace
+        ):
+            try:
+                similar = await _lookup_similar_past_incident_cached(
+                    alertname=alertname,
+                    service_name=service,
+                    namespace=namespace,
+                )
+                similar_field = _build_similar_past_field(similar)
+                if similar_field is not None:
+                    fields.append(similar_field)
+            except Exception as e:
+                # Best-effort: embed уходит без поля.
+                logging.debug("similar_past_lookup_skipped: %s", type(e).__name__)
 
         # #8: Log error rate ±10min. Best-effort — пропускается тихо, если
         # service_id не резолвится или kg_log_observations пуст.
@@ -327,12 +380,16 @@ class DiscordService:
         if approve_row:
             components.append({"type": 1, "components": approve_row})
 
+        # A2: декей-маркер в футере, если инцидент stale-critical (>24h без ack).
+        footer_text = f"incident/{incident_id}"
+        if is_stale_critical and stale_footer_marker:
+            footer_text = f"{footer_text} · {stale_footer_marker}"
         embed: Dict[str, Any] = {
             "title": title,
             "color": color,
             "fields": fields,
             "description": description,
-            "footer": {"text": f"incident/{incident_id}"},
+            "footer": {"text": footer_text[:2048]},
             "timestamp": datetime.now(timezone.utc).isoformat(),
         }
         payload = {

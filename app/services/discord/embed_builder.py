@@ -7,13 +7,22 @@
 """
 
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, List, Optional, cast
+from typing import Any, Dict, List, Optional, Tuple, cast
 
 import structlog
 
+from app.config import settings
 from app.services.pii_redaction import redact_pii
 
 _log = structlog.get_logger("discord.embed_builder")
+
+# Severity-decay porog: critical-alert висящий >24h без ack считается «stale».
+# Renderer должен показать его не красным, а оранжевым с маркером 🪦.
+_STALE_CRITICAL_THRESHOLD_SEC = 24 * 3600
+
+# Discord-цвета (дублируем из service.py чтобы избежать circular import).
+_COLOR_CRITICAL_RED = 0xE53935
+_COLOR_STALE_ORANGE = 0xFB8C00  # mid-orange — отличается от warning (yellow)
 
 
 def _summarize_self_health_detail(name: str, detail: Dict[str, Any]) -> str:
@@ -337,6 +346,346 @@ def _build_pod_trail_field(
         "value": f"{total} evts: {reasons_str}"[:1024],
         "inline": False,
     }
+
+
+def _age_decay_severity(
+    severity: Optional[str],
+    fired_at: Optional[datetime],
+    acked_by: Optional[str] = None,
+    now: Optional[datetime] = None,
+) -> Tuple[str, str, str]:
+    """A2: severity decay для критических алертов которые висят >24h без ack.
+
+    Critical alert который >24h без ack — красные стенки перестают читаться
+    и оператор замыливается. Решение: после порога render как orange + 🪦.
+
+    Возвращает tuple (severity, title_prefix, footer_marker):
+      - severity: исходная severity ИЛИ "stale_critical" при decay-условиях;
+      - title_prefix: emoji-prefix в title — "🪦 STALE" при decay, иначе "".
+      - footer_marker: строка для футера "stale critical · unowned for {dur}"
+        при decay, иначе "".
+
+    Conditions ALL должны быть выполнены для decay:
+      * severity (case-insensitive) == "critical"
+      * fired_at < now - 24h
+      * acked_by is None (или пусто)
+
+    Если хоть одно не выполнено — возвращаем (severity, "", "").
+    """
+    if severity is None or fired_at is None:
+        return (severity or "", "", "")
+    sev_low = severity.lower().strip()
+    if sev_low != "critical":
+        return (severity, "", "")
+    if acked_by:
+        return (severity, "", "")
+    now_ = now or datetime.now(timezone.utc)
+    # Приводим fired_at к aware UTC, если он naive — считаем что он уже UTC.
+    fired = fired_at
+    if fired.tzinfo is None:
+        fired = fired.replace(tzinfo=timezone.utc)
+    if now_.tzinfo is None:
+        now_ = now_.replace(tzinfo=timezone.utc)
+    age = (now_ - fired).total_seconds()
+    if age < _STALE_CRITICAL_THRESHOLD_SEC:
+        return (severity, "", "")
+    # Decay сработал.
+    duration_label = _humanize_duration_seconds(int(age))
+    return (
+        "stale_critical",
+        "🪦 STALE",
+        f"stale critical · unowned for {duration_label}",
+    )
+
+
+def _humanize_duration_seconds(seconds: int) -> str:
+    """`90061` → `25h 1m`; `3700` → `1h 1m`; `300` → `5m`. Используется в
+    decay-footer'е и similar-past лейбле, формат компактный для embed-а.
+    """
+    if seconds < 0:
+        seconds = 0
+    days, rem = divmod(seconds, 86400)
+    hours, rem = divmod(rem, 3600)
+    minutes, _ = divmod(rem, 60)
+    if days > 0:
+        return f"{days}d {hours}h"
+    if hours > 0:
+        return f"{hours}h {minutes}m"
+    return f"{max(1, minutes)}m"
+
+
+def _decay_color(default_color: int, decayed_severity: str) -> int:
+    """Если severity decay-нул (stale_critical) — возвращаем orange.
+    Иначе возвращаем `default_color` как был. Helper изолирует palette
+    от выбора severity, чтобы service.py не таскал color-константы.
+    """
+    if decayed_severity == "stale_critical":
+        return _COLOR_STALE_ORANGE
+    return default_color
+
+
+# ---------------------------------------------------------------------------
+# B4: Similar past incident lookup
+# ---------------------------------------------------------------------------
+
+# In-process кэш (alertname, service_id) -> (ts_cached, payload). Используем
+# как fallback когда Redis недоступен. Module-level чтобы переживать между
+# вызовами в одном процессе. TTL — 1 час.
+_SIMILAR_PAST_TTL_SEC = 3600
+_SIMILAR_PAST_LOCAL_CACHE: Dict[str, Tuple[float, Optional[Dict[str, Any]]]] = {}
+
+
+def _similar_past_cache_key(alertname: str, service_id: int) -> str:
+    return f"discord:similar_past:{alertname}:{service_id}"
+
+
+def _lookup_similar_past_incident(
+    alertname: Optional[str],
+    service_name: Optional[str],
+    namespace: Optional[str],
+    *,
+    lookback_days: int = 30,
+    now: Optional[datetime] = None,
+) -> Optional[Dict[str, Any]]:
+    """B4: ищем resolved incident с тем же (alertname, service_id) за 30 дней.
+
+    Возвращает dict с полями (или None если не нашли):
+      * alertname, service_name, namespace
+      * resolved_at: datetime (aware UTC)
+      * fired_at: datetime
+      * duration_minutes: int
+      * resolved_by_deploy: Optional[dict] — {buildtype_name, build_number,
+        sha, build_id, url} если correlate-marker есть в raw, иначе None.
+
+    Логика поиска:
+      1. Резолв service через kg_services по (name, namespace).
+      2. SELECT kg_alerts с alertname + service_id + resolved_at IS NOT NULL +
+         resolved_at >= now - 30d ORDER BY resolved_at DESC LIMIT 1.
+      3. Из raw извлекаем deploy-correlation если backfill пройдено (поле
+         `raw.resolved_by_deploy`).
+
+    Best-effort: при любой ошибке (DB down, нет service) → None, на embed
+    это means «не добавляем поле».
+    """
+    if not alertname or not service_name or not namespace:
+        return None
+    now_ = now or datetime.now(timezone.utc)
+
+    try:
+        from app.database import SessionLocal
+        from app.knowledge_graph.schema import AlertEvent, Service
+    except Exception as e:  # модули недоступны → skip
+        _log.debug("similar_past_import_failed", error=type(e).__name__)
+        return None
+
+    db = None
+    try:
+        db = SessionLocal()
+        svc = (
+            db.query(Service)
+            .filter(Service.namespace == namespace, Service.name == service_name)
+            .one_or_none()
+        )
+        if svc is None:
+            return None
+
+        cutoff = now_ - timedelta(days=lookback_days)
+        cutoff_naive = cutoff.astimezone(timezone.utc).replace(tzinfo=None)
+
+        row = (
+            db.query(AlertEvent)
+            .filter(
+                AlertEvent.alertname == alertname,
+                AlertEvent.service_id == svc.id,
+                AlertEvent.resolved_at.isnot(None),
+                AlertEvent.resolved_at >= cutoff_naive,
+            )
+            .order_by(AlertEvent.resolved_at.desc())
+            .limit(1)
+            .one_or_none()
+        )
+        if row is None:
+            return None
+
+        # resolved_at/fired_at — naive в БД (см. schema). Делаем aware.
+        resolved_at = cast(datetime, row.resolved_at).replace(tzinfo=timezone.utc)
+        fired_at = cast(datetime, row.fired_at).replace(tzinfo=timezone.utc)
+        duration_min = max(0, int((resolved_at - fired_at).total_seconds() // 60))
+
+        deploy_marker: Optional[Dict[str, Any]] = None
+        raw: Any = row.raw or {}
+        if isinstance(raw, dict):
+            rbd = raw.get("resolved_by_deploy")
+            if isinstance(rbd, dict) and rbd:
+                deploy_marker = rbd
+
+        return {
+            "alertname": alertname,
+            "service_name": service_name,
+            "namespace": namespace,
+            "fired_at": fired_at,
+            "resolved_at": resolved_at,
+            "duration_minutes": duration_min,
+            "resolved_by_deploy": deploy_marker,
+            "service_id": int(svc.id),
+        }
+    except Exception as e:
+        _log.debug("similar_past_query_failed", error=type(e).__name__)
+        return None
+    finally:
+        if db is not None:
+            try:
+                db.close()
+            except Exception:
+                pass
+
+
+async def _lookup_similar_past_incident_cached(
+    alertname: Optional[str],
+    service_name: Optional[str],
+    namespace: Optional[str],
+    *,
+    lookback_days: int = 30,
+    now: Optional[datetime] = None,
+) -> Optional[Dict[str, Any]]:
+    """Async-обёртка над `_lookup_similar_past_incident` с Redis-TTL=1h.
+
+    Cache-key: `discord:similar_past:{alertname}:{service_id}`. Так как
+    service_id неизвестен до DB lookup, сначала резолвим svc.id, потом
+    проверяем Redis. Если Redis недоступен — fallback на in-process dict
+    с тем же TTL.
+
+    Negative results тоже кэшируем (как пустой JSON `{}`) — иначе каждый
+    embed бьёт по БД, бесполезно для большинства алертов которые впервые.
+    """
+    if not alertname or not service_name or not namespace:
+        return None
+
+    # Сразу резолвим service_id+row (это OK — без service_id мы не сможем
+    # построить cache_key, а кэш per (alertname, ns, service) дал бы
+    # дубли при namespace-aliases).
+    payload = _lookup_similar_past_incident(
+        alertname=alertname,
+        service_name=service_name,
+        namespace=namespace,
+        lookback_days=lookback_days,
+        now=now,
+    )
+    if payload is None:
+        return None
+
+    cache_key = _similar_past_cache_key(alertname, int(payload["service_id"]))
+    # Попытка положить в Redis. Без него — local fallback.
+    try:
+        from app.celery_worker import redis_client
+        import json
+        # Сериализуем — datetime → isoformat. Best-effort, выкидываем dict-only.
+        serializable = {
+            k: (v.isoformat() if isinstance(v, datetime) else v)
+            for k, v in payload.items()
+        }
+        await redis_client.set(
+            cache_key,
+            json.dumps(serializable),
+            ex=_SIMILAR_PAST_TTL_SEC,
+        )
+    except Exception as e:
+        # Fallback на in-process cache.
+        _log.debug("similar_past_redis_unavailable", error=type(e).__name__)
+        import time
+        _SIMILAR_PAST_LOCAL_CACHE[cache_key] = (time.time(), payload)
+    return payload
+
+
+def _build_similar_past_field(
+    similar: Optional[Dict[str, Any]],
+    now: Optional[datetime] = None,
+) -> Optional[Dict[str, Any]]:
+    """B4: embed-field "🔁 Similar past" если есть resolved-история.
+
+    Формат value:
+      * с deploy-attribution: «3 weeks ago, resolved by [Build #2099](url)
+        (sha `7eee6c`) — duration 47min»
+      * без deploy: «3 weeks ago, resolved (no deploy attribution) —
+        duration 47min»
+
+    Возвращает None если similar пуст или required-поля отсутствуют.
+    """
+    if not similar:
+        return None
+    resolved_at = similar.get("resolved_at")
+    duration_minutes = similar.get("duration_minutes")
+    if resolved_at is None or duration_minutes is None:
+        return None
+    now_ = now or datetime.now(timezone.utc)
+    if isinstance(resolved_at, str):
+        try:
+            resolved_at = datetime.fromisoformat(resolved_at)
+        except ValueError:
+            return None
+    if resolved_at.tzinfo is None:
+        resolved_at = resolved_at.replace(tzinfo=timezone.utc)
+    if now_.tzinfo is None:
+        now_ = now_.replace(tzinfo=timezone.utc)
+    ago_sec = max(0, int((now_ - resolved_at).total_seconds()))
+    ago_label = _humanize_ago(ago_sec)
+    duration_label = _humanize_duration_seconds(int(duration_minutes) * 60)
+
+    deploy = similar.get("resolved_by_deploy")
+    if isinstance(deploy, dict) and deploy:
+        bt_name = deploy.get("buildtype_name") or deploy.get("buildtype_id") or "build"
+        build_num = deploy.get("build_number") or deploy.get("number") or "?"
+        sha = (deploy.get("sha") or "")[:6]
+        build_id = deploy.get("build_id") or deploy.get("id")
+        url = deploy.get("url")
+        if not url and build_id:
+            tc_web = (getattr(settings, "TEAMCITY_WEB_URL", "") or "").rstrip("/")
+            if tc_web:
+                url = f"{tc_web}/viewLog.html?buildId={build_id}"
+        if url:
+            build_label = f"[{bt_name} #{build_num}]({url})"
+        else:
+            build_label = f"{bt_name} #{build_num}"
+        sha_part = f" (sha `{sha}`)" if sha else ""
+        value = (
+            f"{ago_label}, resolved by {build_label}{sha_part} "
+            f"— duration {duration_label}"
+        )
+    else:
+        value = (
+            f"{ago_label}, resolved (no deploy attribution) "
+            f"— duration {duration_label}"
+        )
+
+    return {
+        "name": "🔁 Similar past",
+        "value": value[:1024],
+        "inline": False,
+    }
+
+
+def _humanize_ago(seconds: int) -> str:
+    """`X seconds → "3 weeks ago" / "5 days ago" / "12 hours ago" /
+    "47 minutes ago" / "just now"`. Простая русско-неюзверная локализация
+    оставлена в английской форме чтобы embed-копипаст не ломался при
+    локализации канала.
+    """
+    if seconds < 60:
+        return "just now"
+    minutes = seconds // 60
+    if minutes < 60:
+        return f"{minutes} minute{'s' if minutes != 1 else ''} ago"
+    hours = minutes // 60
+    if hours < 24:
+        return f"{hours} hour{'s' if hours != 1 else ''} ago"
+    days = hours // 24
+    if days < 7:
+        return f"{days} day{'s' if days != 1 else ''} ago"
+    weeks = days // 7
+    if weeks < 8:
+        return f"{weeks} week{'s' if weeks != 1 else ''} ago"
+    months = days // 30
+    return f"{months} month{'s' if months != 1 else ''} ago"
 
 
 def _format_recurrence_tag(
