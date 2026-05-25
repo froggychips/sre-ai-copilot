@@ -66,6 +66,25 @@ _DAY_SNAPSHOT_REDIS_KEY = "stats:digest:last_day_snapshot"
 _TOPOLOGY_SNAPSHOT_REDIS_KEY = "stats:topology:last_day_snapshot"
 _DAY_SNAPSHOT_REDIS_TTL = 25 * 3600
 
+# Beat-task heartbeat ключи (см. _record_task_heartbeat / _get_beat_last_run).
+# Пишутся `task_postrun`-сигналом из app/workers/tasks.py для каждого таска
+# из `BEAT_HEARTBEAT_TASKS`. Используется pipeline_health_section чтобы
+# отличать «task ходит, но данные stale» (VM scrape gap) от «task завис».
+_BEAT_HEARTBEAT_REDIS_PREFIX = "stats:beat:last_run"
+_BEAT_HEARTBEAT_REDIS_TTL = 7 * 24 * 3600  # 7 дней — на случай долгого простоя
+
+# Ожидаемые интервалы (минуты) для тасков, проверяемых в pipeline_health.
+# Совпадают с _SYNC_LAG_TARGETS в self_health, но дублируются здесь чтобы
+# не тащить self_health-импорт в hot path heartbeat-проверки.
+_BEAT_TASK_INTERVAL_MINUTES: Dict[str, int] = {
+    "kg_topology_sync": 60,
+    "kg_metrics_sync": 10,
+    "kg_cluster_health_sync": 5,
+    "kg_seq_logs_sync": 10,
+    "kg_anomaly_detection_task": 10,
+    "kg_signal_aggregates_compute": 60,  # компьютится hourly (window_end шагает /24h)
+}
+
 
 @dataclass
 class ChangeReport:
@@ -207,6 +226,76 @@ async def _write_topology_snapshot(snapshot: Dict[str, Any]) -> None:
         )
     except Exception as e:
         log.warning("stats_digest.topology_snapshot_write_failed", error=str(e))
+
+
+def _detect_first_run(snapshot: Optional[Dict[str, Any]]) -> bool:
+    """First-run = ни snapshot нет, ни ключевых полей в нём.
+
+    Используется topology_growth_section и потенциально другими first-run
+    pill-эффектами. Вынесено в helper для симметрии и тестируемости.
+    """
+    if snapshot is None:
+        return True
+    # Snapshot есть, но пуст / dict без значимых полей — тоже first-run.
+    if not snapshot:
+        return True
+    return False
+
+
+def _beat_heartbeat_key(task_name: str) -> str:
+    return f"{_BEAT_HEARTBEAT_REDIS_PREFIX}:{task_name}"
+
+
+def _record_task_heartbeat(task_name: str, ts: Optional[datetime] = None) -> None:
+    """Зафиксировать факт успешного завершения beat-task'а.
+
+    Sync-функция, вызывается из celery `task_postrun`-сигнала. Использует
+    synchronous redis client (не aioredis), потому что celery signal handler
+    бежит в worker-процессе без event-loop.
+
+    Идемпотентна: пишет ISO-timestamp в Redis с TTL 7d. Fail-open — при
+    недоступности Redis warning в лог, exception не пробрасываем (это
+    monitoring-канал, он не должен ломать сам task).
+    """
+    if ts is None:
+        ts = datetime.now(timezone.utc)
+    try:
+        import redis
+        client = redis.Redis.from_url(settings.REDIS_URL, decode_responses=True)
+        client.set(  # type: ignore[attr-defined]
+            _beat_heartbeat_key(task_name),
+            ts.isoformat(),
+            ex=_BEAT_HEARTBEAT_REDIS_TTL,
+        )
+    except Exception as e:
+        log.warning(
+            "stats_digest.beat_heartbeat_write_failed",
+            task=task_name,
+            error=str(e),
+        )
+
+
+def _get_beat_last_run(task_name: str) -> Optional[datetime]:
+    """Прочитать last_run timestamp beat-task'а.
+
+    Sync — вызывается из sync pipeline_health_section. None если ключа нет
+    (task ещё не отработал ни разу после переразвёртывания copilot'а).
+    """
+    try:
+        import redis
+        client = redis.Redis.from_url(settings.REDIS_URL, decode_responses=True)
+        raw = client.get(_beat_heartbeat_key(task_name))  # type: ignore[attr-defined]
+        if raw is None:
+            return None
+        # decode_responses=True уже даёт str.
+        return datetime.fromisoformat(raw)
+    except Exception as e:
+        log.warning(
+            "stats_digest.beat_heartbeat_read_failed",
+            task=task_name,
+            error=str(e),
+        )
+        return None
 
 
 def _fmt_firing_series_trend(today: int, yesterday: Optional[int]) -> str:
@@ -2105,8 +2194,11 @@ def _deploy_correlation_diagnostics(
 async def topology_growth_section(db: Session) -> str:
     """B8. Δ services / edges / new NATS subjects vs Redis snapshot.
 
-    Если snapshot ещё не записан — секцию скрываем (после первого daily-run
-    snapshot будет, и со 2го дня появится Δ).
+    Если snapshot ещё не записан (first run — fresh deployment, Redis-flush,
+    TTL истёк) — рисуем pill `(new baseline · counting starts now)` вместо
+    abs-count diff. Иначе показывали бы `+2909 services since yesterday`,
+    хотя реально за окно создалось ~200 (реальный сценарий 25 мая).
+    Snapshot сохраняем в любом случае — следующий run даст нормальный Δ.
     """
     services_now = _count_real_services(db)
     edges_now = _count_edges(db)
@@ -2120,9 +2212,17 @@ async def topology_growth_section(db: Session) -> str:
         "nats_subjects": subjects_now,
     })
 
-    if prev is None:
-        return ""
+    if _detect_first_run(prev):
+        # First-run pill — не показываем Δ, чтобы не пугать «+N services since
+        # yesterday», где N = весь существующий граф. Завтра будет нормальный
+        # diff. См. live digest 25 мая 2026 / regression note.
+        return (
+            "**🧬 Topology growth (24h)**\n"
+            f"  `{services_now}` services · `{edges_now}` edges "
+            "_(new baseline · counting starts now)_"
+        )
 
+    assert prev is not None  # narrow для mypy после _detect_first_run
     prev_services = int(prev.get("services") or 0)
     prev_edges = int(prev.get("edges") or 0)
     prev_subjects = set(prev.get("nats_subjects") or [])
@@ -2152,9 +2252,20 @@ async def topology_growth_section(db: Session) -> str:
 def pipeline_health_section(db: Session, stale_minutes: Optional[int] = None) -> str:
     """C9. Pipeline gauge header — vmsingle/vmagent/AM/copilot/seq freshness.
 
-    Использует `check_sync_lag` из app.knowledge_graph.self_health — единый
-    источник истины по last_ts per task. Если task lag > stale_minutes
-    threshold → mark `⚠️ Xh gap`. Иначе `✓`.
+    Two-tier check:
+      1. **task.last_run** (Redis heartbeat, см. `_get_beat_last_run`) —
+         задача *запускается*? Сравниваем с expected_interval*2. Это
+         основной gauge: если beat scheduler жив и task не падает, мы видим
+         `✓` даже если *данные* отстают (VM scrape gap, downstream API down).
+      2. **data lag** (fallback на `check_sync_lag` для отсутствующего
+         heartbeat'а + data-stale warning) — если task ходит, но materialized
+         timestamp отстаёт > stale_minutes, рисуем отдельный `data lag Xh`
+         мессадж. Это разделяет «scheduled OK, data lag» от «task завис».
+
+    Regression note (live digest 25 мая 2026): старая версия рисовала
+    `vmsingle/vmalert/AM ⚠️ 2h gap` хотя kg_metrics_sync ходил каждые 10 мин;
+    причиной было чтение data-timestamp (`max(ServiceHealth.ts)`), а не
+    timestamp последнего запуска task'а. См. также `ref_wo_vm_scrape_gap`.
 
     stale_minutes default — settings.STATS_PIPELINE_STALE_MINUTES (60).
     """
@@ -2177,9 +2288,40 @@ def pipeline_health_section(db: Session, stale_minutes: Optional[int] = None) ->
         "kg_seq_logs_sync": "seq",
         "kg_signal_aggregates_compute": "AM",
     }
+    now = datetime.now(timezone.utc)
     parts: List[str] = []
+    data_lag_parts: List[str] = []
     for task_name, display in display_map.items():
         info = per_task.get(task_name)
+        expected_interval = _BEAT_TASK_INTERVAL_MINUTES.get(task_name)
+        last_run = _get_beat_last_run(task_name) if expected_interval else None
+
+        # Tier 1: prefer task.last_run, если heartbeat есть.
+        if last_run is not None and expected_interval is not None:
+            # Защита от naive datetime — приводим к timezone-aware UTC.
+            if last_run.tzinfo is None:
+                last_run = last_run.replace(tzinfo=timezone.utc)
+            task_lag_min = (now - last_run).total_seconds() / 60.0
+            task_healthy = task_lag_min <= expected_interval * 2
+            if task_healthy:
+                parts.append(f"{display} ✓")
+            else:
+                gap = _format_gap_minutes(task_lag_min)
+                parts.append(f"{display} ⚠️ {gap} since last run")
+
+            # Дополнительный сигнал: task healthy, но данные stale.
+            # Например VM scrape gap → kg_metrics_sync ходит, но 0 rows.
+            data_lag_min = info.get("lag_minutes") if info else None
+            if (
+                task_healthy
+                and data_lag_min is not None
+                and data_lag_min > stale_minutes
+            ):
+                gap = _format_gap_minutes(data_lag_min)
+                data_lag_parts.append(f"{display}: scheduled OK, data lag {gap}")
+            continue
+
+        # Tier 2 fallback: heartbeat недоступен → старая логика по data ts.
         if info is None:
             continue
         lag_min = info.get("lag_minutes")
@@ -2187,18 +2329,25 @@ def pipeline_health_section(db: Session, stale_minutes: Optional[int] = None) ->
             parts.append(f"{display} ⚠️ no data")
             continue
         if lag_min > stale_minutes:
-            hours = lag_min / 60
-            if hours >= 1:
-                gap = f"{hours:.0f}h"
-            else:
-                gap = f"{lag_min:.0f}m"
+            gap = _format_gap_minutes(lag_min)
             parts.append(f"{display} ⚠️ {gap} gap")
         else:
             parts.append(f"{display} ✓")
 
     if not parts:
         return ""
-    return "**📡 Pipeline**\n  " + " · ".join(parts)
+    line = "**📡 Pipeline**\n  " + " · ".join(parts)
+    if data_lag_parts:
+        line += "\n  _" + " · ".join(data_lag_parts) + "_"
+    return line
+
+
+def _format_gap_minutes(lag_min: float) -> str:
+    """`5m` / `90m` → `1h` / `2h` (часы при >= 60m). Используется gauge'ами."""
+    hours = lag_min / 60
+    if hours >= 1:
+        return f"{hours:.0f}h"
+    return f"{lag_min:.0f}m"
 
 
 def beat_heartbeats_footer(db: Session) -> str:

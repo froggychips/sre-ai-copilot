@@ -3,6 +3,7 @@ import logging
 
 from celery import Celery
 from celery.schedules import crontab
+from celery.signals import task_postrun
 
 from app.config import settings
 from app.core.state_machine import IncidentState
@@ -1079,3 +1080,49 @@ def kg_ownership_backfill_task():
         return {"error": str(e)}
     finally:
         db.close()
+
+
+# ── Beat heartbeat tracking (для stats_digest.pipeline_health_section) ──────
+#
+# Pipeline gauge (см. stats_digest._record_task_heartbeat) различает
+# «task ходит, данные stale» vs «task завис», читая Redis-heartbeat
+# `stats:beat:last_run:<task_name>`. Этот сигнал пишет heartbeat ПОСЛЕ
+# успешного завершения каждого beat-task'а из allowlist.
+#
+# Allowlist держим компактный — только тех, кого pipeline_health показывает:
+#   kg_metrics_sync, kg_cluster_health_sync, kg_anomaly_detection_task,
+#   kg_topology_sync, kg_seq_logs_sync, kg_signal_aggregates_compute.
+# Остальным beat-task'ам heartbeat не критичен (есть отдельные observability
+# каналы — KG таблицы, audit-log).
+_BEAT_HEARTBEAT_TASKS = frozenset({
+    "kg_metrics_sync",
+    "kg_cluster_health_sync",
+    "kg_anomaly_detection_task",
+    "kg_topology_sync",
+    "kg_seq_logs_sync",
+    "kg_signal_aggregates_compute",
+})
+
+
+@task_postrun.connect
+def _record_beat_heartbeat(sender=None, task_id=None, task=None, state=None, **kwargs):
+    """Записать heartbeat для beat-task'а после успешного завершения.
+
+    Не пишем для FAILURE — half-broken state как «свежий запуск» ввёл бы
+    pipeline gauge в заблуждение. RETRY тоже игнорируем (Celery сделает
+    новый postrun при успехе).
+
+    Fail-open: любая ошибка тут не должна валить task. Импорт ленивый,
+    чтобы избежать circular на старте модуля.
+    """
+    try:
+        task_name = getattr(task, "name", None) or sender
+        if task_name not in _BEAT_HEARTBEAT_TASKS:
+            return
+        if state != "SUCCESS":
+            return
+        # Lazy import — stats_digest тяжеловат на boot.
+        from app.services.stats_digest import _record_task_heartbeat
+        _record_task_heartbeat(task_name)
+    except Exception as e:
+        logger.warning("beat_heartbeat.write_failed: %s", e)
