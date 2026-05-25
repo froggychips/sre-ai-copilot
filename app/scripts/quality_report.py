@@ -30,15 +30,16 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
 import sys
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Tuple
 
-from sqlalchemy import and_, func, or_
+from sqlalchemy import and_, func, or_, text
 from sqlalchemy.orm import Session
 
-from app.knowledge_graph.contract import SYNTHETIC_KINDS
+from app.knowledge_graph.contract import EDGE_KINDS, SYNTHETIC_KINDS
 from app.knowledge_graph.schema import (AlertEvent, Deployment, K8sJob,
                                         PodEvent, Service, ServiceEdge,
                                         StorageVolume, VolumeEdge)
@@ -47,6 +48,16 @@ from app.knowledge_graph.stale_classifier import (STALE_CLASS_ACTIVE,
                                                   STALE_CLASS_SUSPICIOUS)
 
 log = logging.getLogger(__name__)
+
+
+# ── --check mode default thresholds (см. CLI args + ENV) ─────────────────────
+#
+# Это **warning gate**, не blocker: проверки могут понадобиться recalibrated
+# при росте графа. Поэтому пороги читаются из ENV/CLI overrides, а не
+# хардкод. Если хочется временно отключить gate — `--max-orphan 1.0` и т.п.
+DEFAULT_MAX_ORPHAN_PCT: float = 20.0    # services без edges > N% → fail
+DEFAULT_MIN_OWNER_PCT: float = 50.0     # owner coverage < N% → fail
+DEFAULT_MAX_STALE_NULL_PCT: float = 10.0  # stale_class IS NULL > N% → fail
 
 
 # ── helpers ──────────────────────────────────────────────────────────────────
@@ -744,6 +755,203 @@ def render_json(report: QualityReport) -> str:
     return json.dumps(asdict(report), indent=2, ensure_ascii=False, sort_keys=True)
 
 
+# ── --check mode ─────────────────────────────────────────────────────────────
+
+
+@dataclass
+class CheckThresholds:
+    """Пороги для CI gate (warning, не blocker).
+
+    Все 4 проверки можно отключить, выставив порог в "сейф" значение
+    (`max_orphan=1.0`, `min_owner=0.0`, `max_stale_null=1.0`, оставляя
+    unknown_edge_kinds всегда строгим — это всегда drift).
+    """
+    max_orphan_pct: float = DEFAULT_MAX_ORPHAN_PCT
+    min_owner_pct: float = DEFAULT_MIN_OWNER_PCT
+    max_stale_null_pct: float = DEFAULT_MAX_STALE_NULL_PCT
+
+
+@dataclass
+class CheckResult:
+    """Результат CI-gate проверки.
+
+    `failures` — список tuple `(axis, actual_value, threshold, detail)`.
+    `passed` — True если все 4 axes в пределах thresholds.
+    """
+    passed: bool
+    failures: List[Dict[str, Any]] = field(default_factory=list)
+    unknown_edge_kinds: List[str] = field(default_factory=list)
+    orphan_pct: Optional[float] = None
+    owner_pct: Optional[float] = None
+    stale_null_pct: Optional[float] = None
+    thresholds: Dict[str, float] = field(default_factory=dict)
+
+
+def _query_unknown_edge_kinds(db: Session) -> List[str]:
+    """Edge kinds в БД, которых нет в `contract.EDGE_KINDS`."""
+    try:
+        rows = db.execute(
+            text("SELECT DISTINCT kind FROM kg_service_edges")
+        ).fetchall()
+    except Exception as exc:
+        log.warning("quality_report.unknown_edge_kinds_query_failed",
+                    extra={"error": str(exc)})
+        return []
+    db_kinds = {r[0] for r in rows if r and r[0]}
+    known = set(EDGE_KINDS.keys())
+    return sorted(db_kinds - known)
+
+
+def evaluate_check(
+    report: QualityReport,
+    db: Session,
+    thresholds: CheckThresholds,
+) -> CheckResult:
+    """Сравнивает quality-снимок с порогами и возвращает CheckResult.
+
+    Что валидирует:
+      * `unknown_edge_kinds` (запрос к kg_service_edges) — len > 0 → fail.
+      * `orphan_pct` (среди real-services без HTTP-edge) > max_orphan → fail.
+      * `owner_pct` (owner_known среди real) < min_owner → fail.
+      * `stale_null_pct` (stale_class IS NULL среди real) > max_stale_null → fail.
+    """
+    unknown = _query_unknown_edge_kinds(db)
+    failures: List[Dict[str, Any]] = []
+
+    if unknown:
+        failures.append({
+            "axis": "unknown_edge_kinds",
+            "actual": unknown,
+            "threshold": 0,
+            "detail": f"{len(unknown)} edge kind(s) в БД отсутствуют в contract.EDGE_KINDS",
+        })
+
+    # orphan_pct: считаем по services_without_http_edges / real_total.
+    # _pct возвращает None если denom = 0 (пустая БД — gate тихо проходит).
+    orphan_pct = _pct(report.services_without_http_edges, report.services_total_real)
+    if orphan_pct is not None and orphan_pct > thresholds.max_orphan_pct:
+        failures.append({
+            "axis": "orphan_pct",
+            "actual": orphan_pct,
+            "threshold": thresholds.max_orphan_pct,
+            "detail": f"{report.services_without_http_edges}/{report.services_total_real} = {orphan_pct}% > {thresholds.max_orphan_pct}%",
+        })
+
+    owner_pct = report.owner_known_pct
+    if owner_pct is not None and owner_pct < thresholds.min_owner_pct:
+        failures.append({
+            "axis": "owner_pct",
+            "actual": owner_pct,
+            "threshold": thresholds.min_owner_pct,
+            "detail": f"{report.owner_known_count}/{report.services_total_real} = {owner_pct}% < {thresholds.min_owner_pct}%",
+        })
+
+    stale_real_total = (
+        report.stale_active + report.stale_expected
+        + report.stale_suspicious + report.stale_null
+    )
+    stale_null_pct = _pct(report.stale_null, stale_real_total)
+    if stale_null_pct is not None and stale_null_pct > thresholds.max_stale_null_pct:
+        failures.append({
+            "axis": "stale_null_pct",
+            "actual": stale_null_pct,
+            "threshold": thresholds.max_stale_null_pct,
+            "detail": f"{report.stale_null}/{stale_real_total} = {stale_null_pct}% > {thresholds.max_stale_null_pct}% (backfill отстал)",
+        })
+
+    return CheckResult(
+        passed=len(failures) == 0,
+        failures=failures,
+        unknown_edge_kinds=unknown,
+        orphan_pct=orphan_pct,
+        owner_pct=owner_pct,
+        stale_null_pct=stale_null_pct,
+        thresholds={
+            "max_orphan_pct": thresholds.max_orphan_pct,
+            "min_owner_pct": thresholds.min_owner_pct,
+            "max_stale_null_pct": thresholds.max_stale_null_pct,
+        },
+    )
+
+
+def render_check_markdown(result: CheckResult) -> str:
+    """Markdown-таблица для CI-вывода. Показывает все 4 axes + статус."""
+    status = "PASS" if result.passed else "FAIL"
+    lines = [
+        f"# KG Contract Check — {status}",
+        "",
+        "| axis | actual | threshold | status |",
+        "|---|---|---|---|",
+    ]
+
+    def _row(axis: str, actual: Any, threshold: Any, ok: bool) -> str:
+        mark = "OK" if ok else "FAIL"
+        return f"| {axis} | {actual} | {threshold} | {mark} |"
+
+    unknown_ok = len(result.unknown_edge_kinds) == 0
+    lines.append(_row(
+        "unknown_edge_kinds",
+        ", ".join(result.unknown_edge_kinds) or "(none)",
+        "0",
+        unknown_ok,
+    ))
+
+    orphan_thr = result.thresholds.get("max_orphan_pct", DEFAULT_MAX_ORPHAN_PCT)
+    if result.orphan_pct is None:
+        lines.append(_row("orphan_pct", "n/a (empty DB)", f"≤{orphan_thr}%", True))
+    else:
+        ok = result.orphan_pct <= orphan_thr
+        lines.append(_row("orphan_pct", f"{result.orphan_pct}%", f"≤{orphan_thr}%", ok))
+
+    owner_thr = result.thresholds.get("min_owner_pct", DEFAULT_MIN_OWNER_PCT)
+    if result.owner_pct is None:
+        lines.append(_row("owner_pct", "n/a", f"≥{owner_thr}%", True))
+    else:
+        ok = result.owner_pct >= owner_thr
+        lines.append(_row("owner_pct", f"{result.owner_pct}%", f"≥{owner_thr}%", ok))
+
+    stale_thr = result.thresholds.get("max_stale_null_pct", DEFAULT_MAX_STALE_NULL_PCT)
+    if result.stale_null_pct is None:
+        lines.append(_row("stale_null_pct", "n/a", f"≤{stale_thr}%", True))
+    else:
+        ok = result.stale_null_pct <= stale_thr
+        lines.append(_row("stale_null_pct", f"{result.stale_null_pct}%", f"≤{stale_thr}%", ok))
+
+    if result.failures:
+        lines.append("")
+        lines.append("## Failures")
+        for f in result.failures:
+            lines.append(f"- **{f['axis']}**: {f['detail']}")
+
+    return "\n".join(lines) + "\n"
+
+
+def render_check_json(result: CheckResult, report: QualityReport) -> str:
+    """JSON-вывод для CI. Включает `check_passed`, `failures` плюс полный
+    quality-snapshot, чтобы можно было пайпить в `jq` и одним проходом
+    забрать обе вещи.
+    """
+    payload = asdict(report)
+    payload["check_passed"] = result.passed
+    payload["check_failures"] = result.failures
+    payload["check_thresholds"] = result.thresholds
+    payload["check_unknown_edge_kinds"] = result.unknown_edge_kinds
+    return json.dumps(payload, indent=2, ensure_ascii=False, sort_keys=True)
+
+
+def _env_float(name: str, default: float) -> float:
+    """ENV-override для thresholds. Невалидное значение → default + warning."""
+    raw = os.environ.get(name)
+    if raw is None or raw == "":
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        log.warning("quality_report.invalid_env_threshold",
+                    extra={"name": name, "value": raw})
+        return default
+
+
 # ── CLI ──────────────────────────────────────────────────────────────────────
 
 
@@ -753,6 +961,28 @@ def main(argv: Optional[List[str]] = None) -> int:
     fmt.add_argument("--json", action="store_true", help="JSON-вывод")
     fmt.add_argument("--markdown", action="store_true", help="Markdown-вывод (default)")
     parser.add_argument("--output", "-o", help="Файл-вывод (default: stdout)")
+
+    # --check mode: CI gate. Exit 1 при провале одного из axes.
+    parser.add_argument(
+        "--check", action="store_true",
+        help="CI gate mode: проверить thresholds, exit 1 при failure.",
+    )
+    parser.add_argument(
+        "--max-orphan", type=float,
+        default=_env_float("KG_CHECK_MAX_ORPHAN_PCT", DEFAULT_MAX_ORPHAN_PCT),
+        help=f"Max orphan pct (default: {DEFAULT_MAX_ORPHAN_PCT}, ENV: KG_CHECK_MAX_ORPHAN_PCT)",
+    )
+    parser.add_argument(
+        "--min-owner", type=float,
+        default=_env_float("KG_CHECK_MIN_OWNER_PCT", DEFAULT_MIN_OWNER_PCT),
+        help=f"Min owner pct (default: {DEFAULT_MIN_OWNER_PCT}, ENV: KG_CHECK_MIN_OWNER_PCT)",
+    )
+    parser.add_argument(
+        "--max-stale-null", type=float,
+        default=_env_float("KG_CHECK_MAX_STALE_NULL_PCT", DEFAULT_MAX_STALE_NULL_PCT),
+        help=f"Max stale_null pct (default: {DEFAULT_MAX_STALE_NULL_PCT}, ENV: KG_CHECK_MAX_STALE_NULL_PCT)",
+    )
+
     args = parser.parse_args(argv)
 
     # SessionLocal импортируется лениво — без него тесты могут импортировать
@@ -762,21 +992,45 @@ def main(argv: Optional[List[str]] = None) -> int:
     db = SessionLocal()
     try:
         report = build_report(db)
+        check_result: Optional[CheckResult] = None
+        if args.check:
+            thresholds = CheckThresholds(
+                max_orphan_pct=args.max_orphan,
+                min_owner_pct=args.min_owner,
+                max_stale_null_pct=args.max_stale_null,
+            )
+            check_result = evaluate_check(report, db, thresholds)
     finally:
         db.close()
 
+    if args.check:
+        assert check_result is not None
+        if args.json:
+            out = render_check_json(check_result, report)
+        else:
+            out = render_check_markdown(check_result)
+        if args.output:
+            with open(args.output, "w", encoding="utf-8") as f:
+                f.write(out)
+            log.info("quality_report.check_written", extra={"path": args.output})
+        else:
+            sys.stdout.write(out)
+            if not out.endswith("\n"):
+                sys.stdout.write("\n")
+        return 0 if check_result.passed else 1
+
     if args.json:
-        text = render_json(report)
+        out = render_json(report)
     else:
-        text = render_markdown(report)
+        out = render_markdown(report)
 
     if args.output:
         with open(args.output, "w", encoding="utf-8") as f:
-            f.write(text)
+            f.write(out)
         log.info("quality_report.written", extra={"path": args.output})
     else:
-        sys.stdout.write(text)
-        if not text.endswith("\n"):
+        sys.stdout.write(out)
+        if not out.endswith("\n"):
             sys.stdout.write("\n")
     return 0
 

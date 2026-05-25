@@ -55,6 +55,15 @@ class Settings(BaseSettings):
     #   - severity-фильтр сужен до critical + prod-*
     LLM_PIPELINE_ENABLED: bool = False
 
+    # KG schema/quality contract drift guard. При FastAPI startup сверяет
+    # реальное состояние БД с `app.knowledge_graph.contract.EDGE_KINDS` и
+    # quality-thresholds. Логирует info при healthy KG, warning при unknown
+    # edge kinds / orphan rate above threshold / owner coverage below
+    # threshold. НИКОГДА не блокирует boot — purely diagnostic.
+    # Default True (production-safe, чисто read-only). Выключается для
+    # тестов/dev-окружений где KG ещё не наполнен.
+    STARTUP_CONTRACT_CHECK_ENABLED: bool = True
+
     # Celery backpressure / resilience (PR — protect prod worker от перегрузки,
     # memory-leak'ов, висящих задач, OOM при flood incident-ов).
     #
