@@ -116,6 +116,12 @@ class EnrichedContext:
     # rollout-noise — выставляется heuristic-ом в enrich_alert ниже
     rollout_noise: bool = False
 
+    # AM inhibit/silence: если alert.status_extra или labels указывают на
+    # suppressed-состояние — заполняется human-readable строкой («🔇 silenced
+    # by X», «🔇 inhibited by Y»). None — alert активен. Embed-builder
+    # рисует «Status» поле + orange-color override.
+    inhibition_state: Optional[str] = None
+
     kg_data_age_sec: Optional[int] = None
 
     # Wave 7 секции (только для critical-render, skip-if-empty внутри builders).
@@ -313,6 +319,77 @@ def _resolve_target_service_from_labels(
     return (namespace, None)
 
 
+def _inhibition_state(alert_payload: Any) -> Optional[str]:
+    """Возвращает human-readable строку про silence/inhibit состояние alert-а,
+    или None если alert не suppressed.
+
+    Принимает либо `Incident` (через .status_extra / labels), либо raw dict
+    в AM-payload-формате (`{"status": {...}, "labels": {...}}`). Это позволяет
+    звать как из enrichment-пути (Incident), так и из webhook-handler-а
+    (decision до построения Incident).
+
+    Возвращаемая строка — для embed-секции «Status», например:
+      "🔇 silenced (id: abc12345) · expires soon"
+      "🔇 inhibited by KubePodCrashLooping (fp 4f3a...)"
+      "🔇 silenced & inhibited"
+    None — alert активен / не AM-suppressed.
+    """
+    extra: Optional[Dict[str, Any]] = None
+    labels: Dict[str, str] = {}
+    if isinstance(alert_payload, dict):
+        s = alert_payload.get("status")
+        if isinstance(s, dict):
+            extra = s
+        else:
+            extra = alert_payload.get("status_extra")
+        labels = alert_payload.get("labels") or {}
+    else:
+        # Incident-shaped
+        extra = getattr(alert_payload, "status_extra", None)
+        labels = getattr(alert_payload, "labels", {}) or {}
+
+    if not extra:
+        # labels-based fallback — некоторые шлюзы пишут это прямо в labels.
+        sb = labels.get("silenced_by")
+        ib = labels.get("inhibited_by")
+        if not sb and not ib:
+            return None
+        extra = {
+            "state": "suppressed",
+            "silencedBy": [sb] if sb else [],
+            "inhibitedBy": [ib] if ib else [],
+        }
+
+    state = (extra.get("state") or "").lower()
+    if state not in ("suppressed", "silenced", "inhibited"):
+        return None
+
+    silenced_by = extra.get("silencedBy") or extra.get("silenced_by") or []
+    inhibited_by = extra.get("inhibitedBy") or extra.get("inhibited_by") or []
+    # Нормализуем в list-of-str (бывает single str или None в нестрогих payload).
+    if isinstance(silenced_by, str):
+        silenced_by = [silenced_by]
+    if isinstance(inhibited_by, str):
+        inhibited_by = [inhibited_by]
+
+    parts: List[str] = []
+    if silenced_by:
+        sid = str(silenced_by[0])[:8]
+        more = f" (+{len(silenced_by)-1})" if len(silenced_by) > 1 else ""
+        parts.append(f"silenced (id: `{sid}`){more}")
+    if inhibited_by:
+        fp = str(inhibited_by[0])
+        # Если это похоже на alertname — оставляем как есть. Иначе trim hash.
+        if not re.match(r"^[A-Z][a-zA-Z]+$", fp):
+            fp = fp[:8]
+        more = f" (+{len(inhibited_by)-1})" if len(inhibited_by) > 1 else ""
+        parts.append(f"inhibited by `{fp}`{more}")
+    if not parts:
+        # state=suppressed без явных причин — всё равно сигнал, показываем.
+        return "🔇 suppressed (no reason)"
+    return "🔇 " + " · ".join(parts)
+
+
 def _detect_rollout_noise(incident: Incident, recent_deploys: List[Dict[str, Any]]) -> bool:
     """Heuristic: KubeDeploymentGenerationMismatch + deploy <5 мин назад → noise."""
     alertname = incident.labels.get("alertname", "")
@@ -352,6 +429,7 @@ def enrich_alert(db: Session, incident: Incident) -> EnrichedContext:
         incident=incident,
         service=service,
         pod=pod,
+        inhibition_state=_inhibition_state(incident),
     )
 
     if not namespace or not service:
