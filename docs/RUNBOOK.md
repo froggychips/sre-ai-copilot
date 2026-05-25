@@ -542,7 +542,8 @@ OWNERSHIP_MANIFEST_PATH=/etc/sre-ai/ownership.yaml
 
 ```yaml
 # Each entry: ns_pattern (glob), owner (string used as-is in digest),
-# reason (free-form, surfaces in audit log).
+# reason (free-form, surfaces in audit log). Optional name_pattern lets
+# you override a single service inside an otherwise generic ns.
 - ns_pattern: "ml-*"
   owner: "@ml-platform"
   reason: "ML infra not yet labeled — owner confirmed via Slack 2026-05-23"
@@ -554,11 +555,58 @@ OWNERSHIP_MANIFEST_PATH=/etc/sre-ai/ownership.yaml
 - ns_pattern: "*-backup"
   owner: "@platform"
   reason: "All backup CronJobs are platform-owned by policy"
+
+# Per-service override inside a multi-tenant ns:
+- ns_pattern: "*-shared"
+  name_pattern: "clickhouse*"
+  owner: "@data"
+  reason: "Analytics stack owned by data team"
 ```
 
 - `ns_pattern` matches with Python `fnmatch` (glob, not regex).
-- First match wins — order matters; specific patterns above generic ones.
+- `name_pattern` (optional) narrows the rule to a specific service inside
+  the ns. Only applied when the suggester is called per-service
+  (`suggest_owner_multi_signal(ns, db, name=svc.name)` — which is how
+  `app/scripts/backfill_ownership.py` calls it). Digest-level callers
+  pass `name=None`, in which case rules with `name_pattern` are skipped
+  and only ns-level rules match.
+- First match wins — order matters; **place specific rules (with
+  `name_pattern`) above generic ns-level catch-alls**.
 - A manifest match sets `confidence=1.0` and overrides all three heuristics.
+
+### Bundled manifest for `*-shared` infrastructure
+
+The repo ships `config/ownership.yaml` covering 132 services in
+`preprod-shared` / `preupdate-shared` / `prod-shared` / `squad-gd-shared`
+that the multi-signal heuristics cannot resolve (no single squad owns
+them). Categorization:
+
+- ClickHouse (analytics) → `@data`
+- NATS / message bus → `@platform`
+- PostgreSQL replicas / backups / metrics → `@platform`
+- VictoriaMetrics / kube-state-metrics → `@platform`
+- Seq logging, update-service, config-workers → `@platform`
+- `squad-gd-shared` app services (auth, push, mv, …) → `@squad-gd`
+
+Mount it via configmap and point `OWNERSHIP_MANIFEST_PATH` at the file.
+
+### Adding / changing an override
+
+1. Edit `config/ownership.yaml` — add a new rule. Put specific
+   `name_pattern` rules **above** generic `ns_pattern`-only catch-alls.
+2. Run `pytest tests/test_shared_ownership_manifest.py -x` locally to
+   verify the new rule.
+3. Open a PR. Once merged, helm/configmap rollout picks up the change.
+4. Re-classify already-attributed services that should now be re-routed:
+
+   ```bash
+   kubectl -n sre-ai exec deployment/copilot-worker -- \
+     python -m app.scripts.backfill_ownership --apply \
+     --filter-ns '*-shared'
+   ```
+
+   `--filter-ns` accepts a glob. Manifest matches always apply
+   (confidence=1.0 ≥ any threshold).
 
 ### Reload
 
