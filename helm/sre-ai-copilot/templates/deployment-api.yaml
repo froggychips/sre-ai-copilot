@@ -53,6 +53,13 @@ spec:
           value: {{ .Values.env.executorEnabled | default "false" | quote }}
         - name: EXECUTOR_APPROVAL_ENABLED
           value: {{ .Values.env.executorApprovalEnabled | default "false" | quote }}
+        {{- if .Values.ownershipManifest.enabled }}
+        # Stand-by mount: текущие API endpoints не дёргают ownership_suggester
+        # напрямую, но держим единый путь чтобы admin/preview endpoints не
+        # разъезжались с worker-ом по конфигу. См. deployment-worker.yaml.
+        - name: OWNERSHIP_MANIFEST_PATH
+          value: {{ .Values.env.ownershipManifestPath | default "/config/ownership.yaml" | quote }}
+        {{- end }}
         livenessProbe:
           httpGet:
             path: /healthz
@@ -79,3 +86,16 @@ spec:
           failureThreshold: 12
         resources:
           {{- toYaml .Values.resources.api | nindent 10 }}
+        {{- if .Values.ownershipManifest.enabled }}
+        volumeMounts:
+        - name: ownership-manifest
+          mountPath: {{ .Values.env.ownershipManifestPath | default "/config/ownership.yaml" | quote }}
+          subPath: ownership.yaml
+          readOnly: true
+        {{- end }}
+      {{- if .Values.ownershipManifest.enabled }}
+      volumes:
+      - name: ownership-manifest
+        configMap:
+          name: {{ include "sre-ai-copilot.fullname" . }}-ownership
+      {{- end }}
