@@ -1675,11 +1675,17 @@ def _mttr_stats(
             WHERE resolved_at IS NOT NULL
               AND fired_at IS NOT NULL
               AND resolved_at >= fired_at
-              AND resolved_at <  NOW() - (:offset_days || ' days')::interval
-              AND resolved_at >= NOW() - ((:offset_days + :days) || ' days')::interval
-        """), {"days": str(days), "offset_days": str(offset_days)}).fetchone()
+              AND resolved_at <  NOW() - (:offset_days * INTERVAL '1 day')
+              AND resolved_at >= NOW() - ((:offset_days + :days) * INTERVAL '1 day')
+        """), {"days": days, "offset_days": offset_days}).fetchone()
     except Exception as e:
         log.warning("stats_digest.mttr_query_failed", error=str(e))
+        # Rollback aborted transaction чтобы последующие секции digest не падали
+        # каскадом на InFailedSqlTransaction.
+        try:
+            db.rollback()
+        except Exception:
+            pass
         return None
     if row is None or row[2] == 0 or row[2] is None:
         return None
