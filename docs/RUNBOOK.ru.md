@@ -539,7 +539,8 @@ OWNERSHIP_MANIFEST_PATH=/etc/sre-ai/ownership.yaml
 
 ```yaml
 # Каждая запись: ns_pattern (glob), owner (строка как есть в digest),
-# reason (свободная форма, идёт в audit log).
+# reason (свободная форма, идёт в audit log). Опциональный name_pattern —
+# переопределить один сервис внутри общего ns.
 - ns_pattern: "ml-*"
   owner: "@ml-platform"
   reason: "ML infra пока без labels — owner подтверждён в Slack 2026-05-23"
@@ -551,11 +552,58 @@ OWNERSHIP_MANIFEST_PATH=/etc/sre-ai/ownership.yaml
 - ns_pattern: "*-backup"
   owner: "@platform"
   reason: "Все backup CronJob-ы platform-owned по policy"
+
+# Per-service override внутри multi-tenant ns:
+- ns_pattern: "*-shared"
+  name_pattern: "clickhouse*"
+  owner: "@data"
+  reason: "Analytics-стек owned дата-командой"
 ```
 
 - `ns_pattern` — Python `fnmatch` (glob, не regex).
-- Первый match побеждает — порядок важен; специфичные паттерны выше generic-ов.
+- `name_pattern` (опц.) — сужает правило до конкретного сервиса в ns.
+  Применяется только при per-service вызове
+  `suggest_owner_multi_signal(ns, db, name=svc.name)` (так зовёт
+  `app/scripts/backfill_ownership.py`). Digest-level callers передают
+  `name=None`, и тогда правила с `name_pattern` пропускаются —
+  работают только ns-level правила.
+- Первый match побеждает — порядок важен; **специфичные правила
+  (с `name_pattern`) кладите выше catch-all-а по ns**.
 - Match в manifest даёт `confidence=1.0` и оверрайдит все три эвристики.
+
+### Bundled manifest для `*-shared` инфраструктуры
+
+В репо лежит `config/ownership.yaml` покрывающий 132 сервиса в
+`preprod-shared` / `preupdate-shared` / `prod-shared` / `squad-gd-shared`,
+которым multi-signal heuristics не могут найти owner-а (никакой squad
+ими не владеет одним). Категоризация:
+
+- ClickHouse (analytics) → `@data`
+- NATS / message bus → `@platform`
+- PostgreSQL replicas / backups / metrics → `@platform`
+- VictoriaMetrics / kube-state-metrics → `@platform`
+- Seq logging, update-service, config-workers → `@platform`
+- `squad-gd-shared` app services (auth, push, mv, …) → `@squad-gd`
+
+Подмонтируйте через configmap и укажите `OWNERSHIP_MANIFEST_PATH` на
+файл.
+
+### Добавить / изменить override
+
+1. Отредактировать `config/ownership.yaml` — добавить правило. Правила
+   с `name_pattern` кладите **выше** generic ns catch-all-а.
+2. Локально прогнать `pytest tests/test_shared_ownership_manifest.py -x`.
+3. Открыть PR. После merge helm/configmap rollout подхватит изменения.
+4. Перепривязать уже attribute-нутые сервисы при необходимости:
+
+   ```bash
+   kubectl -n sre-ai exec deployment/copilot-worker -- \
+     python -m app.scripts.backfill_ownership --apply \
+     --filter-ns '*-shared'
+   ```
+
+   `--filter-ns` принимает glob. Manifest matches применяются всегда
+   (confidence=1.0 ≥ любой threshold).
 
 ### Reload
 
