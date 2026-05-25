@@ -48,7 +48,7 @@ import logging
 import sys
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
-from typing import List, Optional, Set
+from typing import Any, Dict, List, Optional, Set, cast
 
 from sqlalchemy.orm import Session
 
@@ -149,11 +149,11 @@ def apply_backfill(
     applied = 0
     try:
         for ev in plan:
-            ev.resolved_at = now
-            raw_existing = ev.raw if isinstance(ev.raw, dict) else {}
+            ev.resolved_at = cast(Any, now)
+            raw_existing: Dict[str, Any] = ev.raw if isinstance(ev.raw, dict) else {}
             raw = dict(raw_existing)
             raw["resolved_by"] = marker
-            ev.raw = raw
+            ev.raw = cast(Any, raw)
             applied += 1
         if applied:
             db.commit()

@@ -25,7 +25,7 @@ from __future__ import annotations
 
 import logging
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, Optional, Set
+from typing import Any, Dict, List, Optional, Set, cast
 
 import httpx
 from sqlalchemy.orm import Session
@@ -72,7 +72,7 @@ def _mark_resolved(
     safety_min_fingerprints: int = 1,
     history_days: int = 30,
     fallback_hours: int = 24,
-) -> Dict[str, int]:
+) -> Dict[str, Any]:
     """UPDATE resolved_at для не-firing alerts.
 
     Два прохода:
@@ -139,10 +139,10 @@ def _mark_resolved(
         if ev.fingerprint and ev.fingerprint in active_set_for_fallback:
             continue  # ещё firing в AM — не трогаем
         try:
-            ev.resolved_at = now
+            ev.resolved_at = cast(Any, now)
             # Маркер для отладки / отчётности. raw — JSON, может быть None
             # или string у легаси-записей.
-            raw_existing = ev.raw if isinstance(ev.raw, dict) else {}
+            raw_existing: Dict[str, Any] = ev.raw if isinstance(ev.raw, dict) else {}
             raw = dict(raw_existing)
             raw["resolved_by"] = "age_fallback"
             raw["resolved_age_hours"] = fallback_hours
@@ -167,7 +167,7 @@ def _mark_resolved(
 
     # Sample stuck fingerprints для диагностики если ничего не зарезолвили
     # но stale-кандидаты есть (классический freeze).
-    stuck_sample = []
+    stuck_sample: List[Dict[str, Any]] = []
     if not total_resolved and stale:
         stuck_sample = [
             {
