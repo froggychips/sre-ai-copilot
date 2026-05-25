@@ -71,5 +71,22 @@ spec:
           value: {{ .Values.env.ownershipBackfillEnabled | default "false" | quote }}
         - name: OWNERSHIP_BACKFILL_THRESHOLD
           value: {{ .Values.env.ownershipBackfillThreshold | default "0.7" | quote }}
+        {{- if .Values.ownershipManifest.enabled }}
+        - name: OWNERSHIP_MANIFEST_PATH
+          value: {{ .Values.env.ownershipManifestPath | default "/config/ownership.yaml" | quote }}
+        {{- end }}
         resources:
           {{- toYaml .Values.resources.worker | nindent 10 }}
+        {{- if .Values.ownershipManifest.enabled }}
+        volumeMounts:
+        - name: ownership-manifest
+          mountPath: {{ .Values.env.ownershipManifestPath | default "/config/ownership.yaml" | quote }}
+          subPath: ownership.yaml
+          readOnly: true
+        {{- end }}
+      {{- if .Values.ownershipManifest.enabled }}
+      volumes:
+      - name: ownership-manifest
+        configMap:
+          name: {{ include "sre-ai-copilot.fullname" . }}-ownership
+      {{- end }}

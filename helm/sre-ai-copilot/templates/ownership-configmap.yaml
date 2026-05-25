@@ -1,0 +1,26 @@
+{{- if .Values.ownershipManifest.enabled }}
+# Shared-infra ownership manifest для multi-signal owner inference.
+#
+# Содержимое — точная копия `config/ownership.yaml` из репозитория
+# (Helm не умеет читать файлы вне chart-dir, поэтому держим копию в
+# `helm/sre-ai-copilot/files/ownership.yaml`). CI gate `helm-ownership-sync`
+# проверяет, что файлы синхронизированы.
+#
+# Mount: deployment-worker и deployment-api подцепляют ConfigMap как
+# subPath по пути `{{ .Values.env.ownershipManifestPath }}` (default
+# `/config/ownership.yaml`), который читает `app/services/ownership_suggester.py`
+# через env `OWNERSHIP_MANIFEST_PATH`.
+#
+# Детали: docs/RUNBOOK.md § "Activate *-shared ownership manifest in runtime".
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "sre-ai-copilot.fullname" . }}-ownership
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "sre-ai-copilot.labels" . | nindent 4 }}
+    app.kubernetes.io/component: ownership-manifest
+data:
+  ownership.yaml: |
+{{ .Files.Get "files/ownership.yaml" | indent 4 }}
+{{- end }}
