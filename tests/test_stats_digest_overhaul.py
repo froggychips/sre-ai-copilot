@@ -206,11 +206,13 @@ def test_chronic_action_items_returns_top_3():
 
 def test_action_items_section_renders_three_categories():
     db = MagicMock()
-    # scalar() для unowned/stale, fetchall() для chronic
+    # scalar() для unowned/stale + drill-down (callers, ext/mcp).
+    # fetchall() для chronic + drill-down prod_with_alerts.
     db.execute.return_value.fetchall.return_value = [
         ("svc-a", "AlertX", 15),
     ]
-    db.execute.return_value.scalar.side_effect = [5, 7]
+    # Order: unowned=5, stale_total=7, then drill-down callers=2, ext_mcp=1
+    db.execute.return_value.scalar.side_effect = [5, 7, 2, 1]
     text = stats_digest.action_items_section(db, chronic_threshold=10)
     assert "Action items" in text
     assert "chronic alerts" in text
@@ -265,10 +267,11 @@ def test_noisemakers_section_hides_when_empty():
 
 def test_mttr_section_renders_when_resolved_alerts():
     db = MagicMock()
-    # _mttr_stats called twice (days, days*2)
+    # _mttr_stats called twice (days, days*2). Row format updated 2026-05-25
+    # to include outliers_gt_7d as 4th column.
     db.execute.return_value.fetchone.side_effect = [
-        (8.0, 47.0, 42),  # current 7d
-        (10.0, 60.0, 80),  # prev (combined 14d)
+        (8.0, 47.0, 42, 0),  # current 7d, no outliers
+        (10.0, 60.0, 80, 0),  # prev (combined 14d)
     ]
     text = stats_digest.mttr_section(db, days=7)
     assert "MTTR" in text
@@ -279,7 +282,7 @@ def test_mttr_section_renders_when_resolved_alerts():
 
 def test_mttr_section_hidden_when_no_samples():
     db = MagicMock()
-    db.execute.return_value.fetchone.return_value = (None, None, 0)
+    db.execute.return_value.fetchone.return_value = (None, None, 0, 0)
     text = stats_digest.mttr_section(db, days=7)
     assert text == ""
 
