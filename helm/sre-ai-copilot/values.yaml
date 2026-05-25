@@ -87,6 +87,15 @@ env:
   externalProbeFailThreshold: "3"   # сколько подряд fail-ов до alert (anti-flap)
   externalProbeTimeoutSeconds: "5"
 
+  # Periodic ownership backfill (Celery beat task kg-ownership-backfill,
+  # every 6h at minute=17). Прогоняет multi-signal owner inference по сервисам
+  # без team_owner и применяет high-confidence-кандидатов.
+  # Threshold для beat-режима стоит выше чем для initial ручного backfill
+  # (0.7 vs 0.4) — periodic работает без human review и не должен делать
+  # low-confidence updates. Detail: docs/RUNBOOK.md → "Periodic ownership backfill".
+  ownershipBackfillEnabled: "true"
+  ownershipBackfillThreshold: "0.7"
+
 # All secret keys — fill in before deploying.
 # In production prefer SealedSecrets or ExternalSecrets (see k8s/base/secrets.*.yaml.example).
 secrets:

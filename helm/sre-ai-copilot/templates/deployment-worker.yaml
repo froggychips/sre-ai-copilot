@@ -67,5 +67,9 @@ spec:
           value: {{ .Values.env.externalProbeFailThreshold | default "3" | quote }}
         - name: EXTERNAL_PROBE_TIMEOUT_SECONDS
           value: {{ .Values.env.externalProbeTimeoutSeconds | default "5" | quote }}
+        - name: OWNERSHIP_BACKFILL_ENABLED
+          value: {{ .Values.env.ownershipBackfillEnabled | default "false" | quote }}
+        - name: OWNERSHIP_BACKFILL_THRESHOLD
+          value: {{ .Values.env.ownershipBackfillThreshold | default "0.7" | quote }}
         resources:
           {{- toYaml .Values.resources.worker | nindent 10 }}
