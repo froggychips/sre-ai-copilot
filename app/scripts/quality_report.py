@@ -167,36 +167,57 @@ class QualityReport:
 # ── builders ─────────────────────────────────────────────────────────────────
 
 
+#: Bucket для сервисов с team_owner но без явного ``owner_source`` в
+#: ``metadata_json``. До PR #97 такие сервисы (большая часть — owner
+#: проставлен topology_sync через namespace-prefix эвристику в
+#: ``kg_sync._derive_team_owner``) молча отбрасывались из breakdown:
+#: numerator = 22, denominator = owner_known_count = 3309 → отчёт показывал
+#: "owner_source: namespace_prefix → 21" при том что реально 3287 owners
+#: были выведены без какой-либо разметки в metadata_json. Теперь
+#: классифицируем их как ``inferred_no_source`` — сумма breakdown
+#: совпадает с ``owner_known_count`` (invariant полезен для CI-gate
+#: и diff-сравнения между snapshot-ами).
+OWNER_SOURCE_UNTRACKED = "inferred_no_source"
+
+
 def _section_ownership(db: Session) -> Dict[str, Any]:
     """Группа 1. Service ownership + breakdown по owner_source.
 
     OWNER_SOURCES сейчас в контракте — это семантическая константа
-    (см. ``contract.OWNER_SOURCES``). В БД поле ``owner_source`` ещё не
-    материализовано (он живёт как metadata-key в ``Service.metadata_json``
-    после wave-ов owner inference). Делаем best-effort: разбираем
-    JSON-поле и считаем сколько строк имеют каждое значение.
+    (см. ``contract.OWNER_SOURCES``). Часть owner-ов материализуется
+    как ``metadata_json["owner_source"]`` (через
+    ``backfill_ownership._canonical_owner_source``), часть проставляется
+    topology_sync без явного source-маркера. Считаем breakdown по обоим
+    путям: явный source — точный value, неявные — bucket
+    ``inferred_no_source``. Invariant: ``sum(breakdown) == owner_known_count``.
+
+    Python-side aggregation для max-портабельности: PG-native
+    ``metadata_json->>'owner_source'`` не работает на SQLite (Column(JSON)
+    маппится в TEXT в SQLite, в JSON в PG), и обходить дифф-диалекты
+    SQL-выражением сложнее чем загрузить ~3к dict-ов в Python.
     """
     services_real = db.query(func.count(Service.id)).filter(_is_real_filter()).scalar() or 0
     services_synthetic = (
         db.query(func.count(Service.id)).filter(_is_synthetic_filter()).scalar() or 0
     )
 
+    unknown_owner_markers = {"unknown", "n/a", "-", "none"}
     owner_known_q = db.query(func.count(Service.id)).filter(
         _is_real_filter(),
         Service.team_owner.isnot(None),
         Service.team_owner != "",
         func.lower(func.coalesce(Service.team_owner, "")).notin_(
-            ["unknown", "n/a", "-", "none"]
+            list(unknown_owner_markers)
         ),
     )
     owner_known_count: int = owner_known_q.scalar() or 0
 
-    # Owner-sources breakdown: вытаскиваем metadata_json у real сервисов с
-    # owner, считаем по полю owner_source. Python-side aggregation — JSON-ops
-    # переносимо не для всех бэкендов (PG/SQLite разные).
+    # Owner-sources breakdown: проходим по real-сервисам с осмысленным
+    # team_owner; если в metadata_json есть owner_source — используем его
+    # значение, иначе bucket "inferred_no_source".
     owner_sources: Dict[str, int] = {}
     rows = (
-        db.query(Service.metadata_json)
+        db.query(Service.team_owner, Service.metadata_json)
         .filter(
             _is_real_filter(),
             Service.team_owner.isnot(None),
@@ -204,20 +225,39 @@ def _section_ownership(db: Session) -> Dict[str, Any]:
         )
         .all()
     )
-    for (md,) in rows:
-        if not isinstance(md, dict):
+    for team_owner, md in rows:
+        # фильтр "unknown"-маркеров — тот же что и в owner_known_count выше,
+        # чтобы сумма breakdown сошлась с owner_known_count.
+        if not team_owner or str(team_owner).strip().lower() in unknown_owner_markers:
             continue
-        src = md.get("owner_source")
-        if not src:
-            continue
-        owner_sources[str(src)] = owner_sources.get(str(src), 0) + 1
+        md_dict = _coerce_metadata_dict(md)
+        src_raw = md_dict.get("owner_source") if md_dict else None
+        if src_raw:
+            src = str(src_raw)
+        else:
+            src = OWNER_SOURCE_UNTRACKED
+        owner_sources[src] = owner_sources.get(src, 0) + 1
 
-    note = (
-        "owner_source breakdown пуст — поле ещё не материализовано в metadata_json. "
-        "Заполняется multi-signal owner-inference syncs (planned post-#85)."
-        if not owner_sources
-        else "breakdown по metadata_json.owner_source у сервисов с team_owner."
-    )
+    explicit_sources = {k: v for k, v in owner_sources.items()
+                        if k != OWNER_SOURCE_UNTRACKED}
+    if not owner_sources:
+        note = (
+            "owner_source breakdown пуст — нет сервисов с team_owner. "
+            "Заполняется multi-signal owner-inference syncs (см. PR #85)."
+        )
+    elif not explicit_sources:
+        untracked = owner_sources.get(OWNER_SOURCE_UNTRACKED, 0)
+        note = (
+            f"все {untracked} owners проставлены без явного "
+            f"owner_source-маркера в metadata_json — скорее всего topology_sync "
+            f"(_derive_team_owner) или legacy backfill. См. backfill_ownership."
+        )
+    else:
+        note = (
+            "breakdown по metadata_json.owner_source у сервисов с team_owner; "
+            f"bucket {OWNER_SOURCE_UNTRACKED} — owner проставлен без source-маркера "
+            f"(typически topology_sync namespace-prefix эвристикой)."
+        )
 
     return {
         "services_total_real": services_real,
@@ -227,6 +267,33 @@ def _section_ownership(db: Session) -> Dict[str, Any]:
         "owner_sources": owner_sources,
         "owner_sources_note": note,
     }
+
+
+def _coerce_metadata_dict(md: Any) -> Optional[Dict[str, Any]]:
+    """Привести ``Service.metadata_json`` к dict или None.
+
+    SQLAlchemy ``Column(JSON)`` обычно возвращает уже decoded dict
+    (PG через psycopg2 json-typecast; SQLite через JSON-type-affinity).
+    Но при некоторых legacy-миграциях столбец мог остаться ``TEXT``
+    в SQLite или ``json`` в PG с битым typecast — тогда придёт строка.
+    Гарантируем dict-или-None, не молча отбрасывая non-dict.
+    """
+    if md is None:
+        return None
+    if isinstance(md, dict):
+        return md
+    if isinstance(md, (bytes, bytearray)):
+        try:
+            md = md.decode("utf-8")
+        except UnicodeDecodeError:
+            return None
+    if isinstance(md, str):
+        try:
+            parsed = json.loads(md)
+        except (json.JSONDecodeError, ValueError):
+            return None
+        return parsed if isinstance(parsed, dict) else None
+    return None
 
 
 def _section_topology(db: Session) -> Dict[str, Any]:
@@ -607,6 +674,10 @@ def render_markdown(report: QualityReport) -> str:
         out = ["| owner_source | count |", "|---|---|"]
         for k, v in rows:
             out.append(f"| {k} | {v} |")
+        # Note всегда печатаем, чтобы было видно семантику bucket-а
+        # `inferred_no_source` (главный регрессионный кейс).
+        out.append("")
+        out.append(f"> {r.owner_sources_note}")
         return "\n".join(out)
 
     def _edges_block() -> str:
