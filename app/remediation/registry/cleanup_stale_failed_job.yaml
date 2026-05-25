@@ -1,0 +1,34 @@
+schema_version: remediation.playbook/v1
+name: cleanup_stale_failed_job
+kind: remediation
+description: |
+  Удалить stale failed Jobs. Безопасно только если есть owner CronJob
+  (recreate'нется при следующем schedule) ИЛИ логи captured (forensic OK).
+  Для one-off без owner (helm hook / ad-hoc migration) — approve.
+  Для prod/preprod/system — block.
+match:
+  classification: stale_failed_job
+  job_age_hours: {gte: 24}
+  active_jobs: {eq: 0}
+  failed_jobs: {gte: 1}
+policy:
+  auto:
+    namespace_tier: ["dev", "squad"]
+    owner_kind: "CronJob"
+    logs_captured_or_ttl: true
+  approve:
+    namespace_tier: ["dev", "squad"]
+    owner_kind: ["None", "helm_hook"]
+  block:
+    any:
+      namespace_tier: ["prod", "preprod", "system"]
+plan:
+  command: ["kubectl", "delete", "job", "{job_name}", "-n", "{namespace}"]
+  preview: ["kubectl", "get", "job", "{job_name}", "-n", "{namespace}", "-o", "yaml"]
+observe:
+  timeout: 5m
+  success:
+    job_exists: false
+  failure:
+    job_exists: true
+    new_job_failed: true
