@@ -486,6 +486,17 @@ class Settings(BaseSettings):
     STATS_PIPELINE_STALE_MINUTES: int = Field(
         60, description="Minutes threshold for pipeline section to mark stale"
     )
+    # DQ polish 2026-05-25: anomaly summary секция базируется на
+    # kg_anomaly_observations, которая в свою очередь зависит от
+    # kg_metrics_sync. Если metrics-sync отстаёт от now() более чем на N
+    # минут — anomaly counts могут не отражать current state (это и было
+    # замечено в проде 25 мая: metrics sync 2h ago, anomaly секция показала
+    # 14k events). Degrade-mode рисует пометку, > 4× threshold скрывает
+    # секцию совсем.
+    ANOMALY_STALE_THRESHOLD_MINUTES: int = Field(
+        60,
+        description="Metrics sync lag (min) после которого anomaly секция рисуется как degraded",
+    )
     # NB: TC_URL_PREFIX уже определён выше (line ~249) для clickable Build URL в
     # Recent deploys. Не дублировать здесь.
 

@@ -1176,13 +1176,54 @@ _METRIC_LABELS = {
 }
 
 
+def _metrics_sync_lag_minutes(db: Session) -> Optional[float]:
+    """DQ polish 2026-05-25: возвращает lag в минутах для kg_metrics_sync.
+
+    Источник — self_health.check_sync_lag (тот же что и pipeline_health).
+    Возвращает None если data недоступна (check упал, task не зарегистрирован,
+    last_ts отсутствует). Любая ошибка swallowed — это диагностика, не
+    блокирующий путь.
+    """
+    try:
+        from app.knowledge_graph.self_health import check_sync_lag
+        result = check_sync_lag(db)
+        per_task = result.detail.get("per_task", {})
+        info = per_task.get("kg_metrics_sync")
+        if info is None:
+            return None
+        lag = info.get("lag_minutes")
+        if lag is None:
+            return None
+        return float(lag)
+    except Exception as e:
+        log.warning("stats_digest.metrics_sync_lag_failed", error=str(e))
+        return None
+
+
 def anomaly_summary_section(db: Session) -> str:
     """5. Summary anomaly за 24h из kg_anomaly_observations.
 
     Total + breakdown by severity + by metric + top-5 affected services.
     Если таблицы нет в БД (на dev без миграции) — возвращаем "" (секция
     не показывается). Если таблица есть но 0 anomaly — рисуем «всё в норме».
+
+    DQ polish 2026-05-25: если kg_metrics_sync отстаёт > threshold —
+    рисуем degraded-режим (warning baseline counts могут быть stale).
+    Если отстаёт > 4× threshold — скрываем секцию совсем кроме одной
+    строки-стикера.
     """
+    # Проверяем metrics-sync lag сразу — это контролирует degrade mode.
+    threshold = getattr(settings, "ANOMALY_STALE_THRESHOLD_MINUTES", 60)
+    lag_min = _metrics_sync_lag_minutes(db)
+    severe_threshold = threshold * 4
+
+    if lag_min is not None and lag_min > severe_threshold:
+        # Слишком stale — секция не информативна, ставим одну строку.
+        hours = lag_min / 60
+        return (
+            f"**📈 Anomalies**: skipped (metrics sync stale {hours:.1f}h+)"
+        )
+
     try:
         total_row = db.execute(text("""
             SELECT count(*), count(DISTINCT service_id)
@@ -1196,11 +1237,22 @@ def anomaly_summary_section(db: Session) -> str:
     total = (total_row[0] if total_row else 0) or 0
     distinct_services = (total_row[1] if total_row else 0) or 0
 
+    # DQ polish 2026-05-25: degraded-header при stale metrics sync.
+    degraded_header_suffix = ""
+    degraded_note = ""
+    if lag_min is not None and lag_min > threshold:
+        hours = lag_min / 60
+        degraded_header_suffix = f" ⚠️ stale: metrics sync {hours:.1f}h ago"
+        degraded_note = "  _Counts могут не отражать current state._"
+
     if total == 0:
-        return (
-            "**📈 Anomalies (last 24h)**\n"
+        body = (
+            f"**📈 Anomalies (last 24h){degraded_header_suffix}**\n"
             "  ✅ ни одной аномалии — поведение в норме"
         )
+        if degraded_note:
+            body += "\n" + degraded_note
+        return body
 
     by_severity = {
         sev: cnt for sev, cnt in db.execute(text("""
@@ -1231,7 +1283,9 @@ def anomaly_summary_section(db: Session) -> str:
         ORDER BY count(*) DESC
     """)).fetchall()
 
-    lines = ["**📈 Anomalies (last 24h)**"]
+    lines = [f"**📈 Anomalies (last 24h){degraded_header_suffix}**"]
+    if degraded_note:
+        lines.append(degraded_note)
     lines.append(
         f"  Total: {total} across {distinct_services} svc "
         f"(warning: {warning_cnt}, critical: {critical_cnt})"
@@ -1644,6 +1698,126 @@ def _suspicious_stale_action_items(db: Session, days: int = 60) -> int:
         return 0
 
 
+# ── DQ polish 2026-05-25: suspicious_stale drill-down helpers ────────────
+
+def _suspicious_in_prod_with_alerts(
+    db: Session, days: int = 60
+) -> Tuple[int, List[str]]:
+    """Suspicious-stale сервисы которые сидят в prod-* ns И при этом имеют
+    хотя бы один firing alert (resolved_at IS NULL) — это самый острый
+    actionable bucket: видимо deploys тоже не идут, а alerts горят.
+
+    Возвращает (count, top_3_names).
+    """
+    try:
+        rows = db.execute(text("""
+            SELECT s.name
+            FROM kg_services s
+            WHERE NOT s.synthetic
+              AND s.stale_class = 'suspicious_stale'
+              AND s.namespace LIKE 'prod%'
+              AND NOT EXISTS (
+                  SELECT 1 FROM kg_deployments d
+                  WHERE d.service_id = s.id
+                    AND d.started_at > NOW() - (:days || ' days')::interval
+              )
+              AND EXISTS (
+                  SELECT 1 FROM kg_alerts a
+                  WHERE a.service_id = s.id
+                    AND a.resolved_at IS NULL
+              )
+            ORDER BY s.name
+        """), {"days": str(days)}).fetchall()
+    except Exception as e:
+        log.warning("stats_digest.suspicious_in_prod_failed", error=str(e))
+        try:
+            db.rollback()
+        except Exception:
+            pass
+        return (0, [])
+    names = [r[0] for r in rows if r and r[0]]
+    return (len(names), names[:3])
+
+
+def _suspicious_with_callers(db: Session, days: int = 60) -> int:
+    """Suspicious-stale сервисы у которых ≥1 inbound caller (источник в
+    kg_edges с target = svc). Полезные для других — нельзя просто удалить.
+    """
+    try:
+        cnt = db.execute(text("""
+            SELECT count(*) FROM kg_services s
+            WHERE NOT s.synthetic
+              AND s.stale_class = 'suspicious_stale'
+              AND NOT EXISTS (
+                  SELECT 1 FROM kg_deployments d
+                  WHERE d.service_id = s.id
+                    AND d.started_at > NOW() - (:days || ' days')::interval
+              )
+              AND EXISTS (
+                  SELECT 1 FROM kg_edges e
+                  WHERE e.target_id = s.id
+              )
+        """), {"days": str(days)}).scalar() or 0
+        return int(cnt)
+    except Exception as e:
+        log.warning("stats_digest.suspicious_with_callers_failed", error=str(e))
+        try:
+            db.rollback()
+        except Exception:
+            pass
+        return 0
+
+
+def _suspicious_in_external_or_mcp(db: Session, days: int = 60) -> int:
+    """Suspicious-stale сервисы где namespace или name содержит external/mcp.
+    Скорее всего pet-проекты или экспериментальные, можно удалять смело.
+    """
+    try:
+        cnt = db.execute(text("""
+            SELECT count(*) FROM kg_services s
+            WHERE NOT s.synthetic
+              AND s.stale_class = 'suspicious_stale'
+              AND NOT EXISTS (
+                  SELECT 1 FROM kg_deployments d
+                  WHERE d.service_id = s.id
+                    AND d.started_at > NOW() - (:days || ' days')::interval
+              )
+              AND (
+                  s.namespace ILIKE '%external%'
+                  OR s.namespace ILIKE '%mcp%'
+                  OR s.name ILIKE '%external%'
+                  OR s.name ILIKE '%mcp%'
+              )
+        """), {"days": str(days)}).scalar() or 0
+        return int(cnt)
+    except Exception as e:
+        log.warning("stats_digest.suspicious_external_mcp_failed", error=str(e))
+        try:
+            db.rollback()
+        except Exception:
+            pass
+        return 0
+
+
+def _suspicious_remaining(
+    db: Session,
+    total: int,
+    prod_with_alerts: int,
+    with_callers: int,
+    external_or_mcp: int,
+) -> int:
+    """Остаток после вычитания всех buckets из total.
+
+    NB: buckets могут пересекаться (prod сервис может иметь callers), но
+    для action-items это нормально — мы не делаем strict partition, просто
+    показываем «остальное в batch sweep». Аккуратно гарантируем >=0.
+    """
+    leftover = total - prod_with_alerts - with_callers - external_or_mcp
+    if leftover < 0:
+        return 0
+    return leftover
+
+
 def action_items_section(
     db: Session,
     *,
@@ -1681,10 +1855,40 @@ def action_items_section(
             f"manual в ownership.yaml"
         )
     if stale:
+        # DQ polish 2026-05-25: drill-down — общий счётчик 2000+ не actionable,
+        # разрезаем по priority buckets чтобы команда видела с чего начать.
+        prod_cnt, prod_top = _suspicious_in_prod_with_alerts(
+            db, days=suspicious_days
+        )
+        callers_cnt = _suspicious_with_callers(db, days=suspicious_days)
+        ext_mcp_cnt = _suspicious_in_external_or_mcp(db, days=suspicious_days)
+        remaining = _suspicious_remaining(
+            db, stale, prod_cnt, callers_cnt, ext_mcp_cnt
+        )
+
         lines.append(
             f"  • `{stale}` suspicious_stale без deploys >{suspicious_days}d "
-            f"— review/delete"
+            f"— нужен review:"
         )
+        if prod_cnt:
+            top_str = ""
+            if prod_top:
+                top_str = f" (e.g. {', '.join(f'`{n}`' for n in prod_top)})"
+            lines.append(
+                f"     - `{prod_cnt}` in prod/* (has firing alerts){top_str} → priority"
+            )
+        if callers_cnt:
+            lines.append(
+                f"     - `{callers_cnt}` with inbound_callers >0 → check if needed"
+            )
+        if ext_mcp_cnt:
+            lines.append(
+                f"     - `{ext_mcp_cnt}` in external/mcp (pet projects?) → likely delete"
+            )
+        if remaining:
+            lines.append(
+                f"     - остальные `{remaining}` → batch sweep"
+            )
     return "\n".join(lines)
 
 
@@ -1732,9 +1936,16 @@ def noisemakers_section(fired_series: List[dict], threshold_pct: float = 20.0) -
     lines = ["**🔊 Noisemakers (24h)**"]
     for svc, cnt in notable:
         pct = (cnt / total * 100)
-        ns = ns_map.get(svc, "?")
+        ns = ns_map.get(svc, "")
+        # DQ polish 2026-05-25: формат с `@<ns>` явно подчёркивает что это
+        # namespace (старый italic-формат `_mcp_` смотрелся typo-подобно).
+        # Если ns пустой/неизвестный — без `@` маркера.
+        if ns and ns != "?":
+            ns_part = f" @{ns}"
+        else:
+            ns_part = ""
         lines.append(
-            f"  • `{svc}` _{ns}_ — `{pct:.0f}%` alerts ({cnt} events)"
+            f"  • `{svc}`{ns_part} — `{pct:.0f}%` alerts ({cnt} events)"
         )
     return "\n".join(lines)
 
@@ -1748,18 +1959,29 @@ def _mttr_stats(
     windows для honest trend-сравнения (offset_days=days даёт prev period
     того же размера, не пересекающийся с current).
 
-    Возвращает None если 0 resolved в окне.
+    DQ polish 2026-05-25: winsorize — durations >= 7d считаются "outliers"
+    (backfill artefact, stuck alerts от старых backfill-ов до 22 мая) и не
+    попадают в median/p95. Отдельный счётчик `outliers_gt_7d` рендерится
+    в секции только если >0 — чтобы было видно что грязь есть, но цифры
+    реалистичные.
+
+    Возвращает None если 0 resolved в окне (после фильтрации).
     """
     try:
         row = db.execute(text("""
             SELECT
                 percentile_cont(0.5) WITHIN GROUP (
                     ORDER BY EXTRACT(EPOCH FROM (resolved_at - fired_at)) / 60
-                ) AS median_min,
+                ) FILTER (WHERE (resolved_at - fired_at) < INTERVAL '7 days')
+                    AS median_min,
                 percentile_cont(0.95) WITHIN GROUP (
                     ORDER BY EXTRACT(EPOCH FROM (resolved_at - fired_at)) / 60
-                ) AS p95_min,
-                count(*) AS n
+                ) FILTER (WHERE (resolved_at - fired_at) < INTERVAL '7 days')
+                    AS p95_min,
+                count(*) FILTER (WHERE (resolved_at - fired_at) < INTERVAL '7 days')
+                    AS n,
+                count(*) FILTER (WHERE (resolved_at - fired_at) >= INTERVAL '7 days')
+                    AS outliers
             FROM kg_alerts
             WHERE resolved_at IS NOT NULL
               AND fired_at IS NOT NULL
@@ -1776,12 +1998,28 @@ def _mttr_stats(
         except Exception:
             pass
         return None
-    if row is None or row[2] == 0 or row[2] is None:
+    if row is None:
         return None
+    samples = int(row[2] or 0)
+    outliers = int(row[3] or 0)
+    if samples == 0:
+        # Нет sane samples (<7d) — но если outliers были, всё равно вернём
+        # минимальный dict чтобы вызывающая сторона могла отрисовать degraded
+        # вариант. Текущий callsite mttr_section проверяет samples и скроет —
+        # это окей; outliers видны через возвращаемый dict.
+        if outliers == 0:
+            return None
+        return {
+            "median_min": 0.0,
+            "p95_min": 0.0,
+            "samples": 0,
+            "outliers_gt_7d": outliers,
+        }
     return {
         "median_min": float(row[0] or 0),
         "p95_min": float(row[1] or 0),
-        "samples": int(row[2]),
+        "samples": samples,
+        "outliers_gt_7d": outliers,
     }
 
 
@@ -1789,17 +2027,19 @@ def mttr_section(db: Session, days: int = 7) -> str:
     """B6. MTTR mini-stat — median / p95 + trend vs prev week.
 
     `kg_alerts WHERE resolved_at >= now()-Nd`. Если нет samples — скрываем
-    секцию.
+    секцию. DQ polish 2026-05-25: значения winsorized (durations ≥7d
+    исключены из median/p95). Отдельный counter outliers (>7d) рендерится
+    только при наличии — чтобы видно было что грязь есть.
     """
     now_stats = _mttr_stats(db, days=days)
-    if not now_stats:
+    if not now_stats or now_stats.get("samples", 0) == 0:
         return ""
     prev_stats = _mttr_stats(db, days=days * 2)  # rough: includes current; trend approx
 
     lines = [f"**⏱️ MTTR (resolved alerts last {days}d)**"]
 
     trend_str = ""
-    if prev_stats and prev_stats["samples"] > now_stats["samples"]:
+    if prev_stats and prev_stats.get("samples", 0) > now_stats["samples"]:
         # Очень грубая trend-эвристика: median 7d vs median 14d window.
         # Не идеальная, но даёт сигнал что-то меняется.
         prev_med = prev_stats["median_min"]
@@ -1809,10 +2049,13 @@ def mttr_section(db: Session, days: int = 7) -> str:
             sign = "+" if delta > 0 else ""
             trend_str = f" · trend: `{sign}{delta:.0f}min` vs prev week"
 
+    outliers = int(now_stats.get("outliers_gt_7d", 0) or 0)
+    outliers_str = f" · outliers (>7d): `{outliers}`" if outliers > 0 else ""
+
     lines.append(
         f"  median: `{now_stats['median_min']:.0f}min` · "
         f"p95: `{now_stats['p95_min']:.0f}min` · "
-        f"samples: `{now_stats['samples']}`{trend_str}"
+        f"samples: `{now_stats['samples']}`{trend_str}{outliers_str}"
     )
     return "\n".join(lines)
 
@@ -1880,6 +2123,20 @@ def deploy_incident_correlation_section(db: Session, hours: int = 24) -> str:
         f"  `{total}` deploys · `{attributed}` attributed alerts "
         f"({attributed_pct:.0f}%) · success rate `{success_pct:.0f}%`"
     )
+
+    # DQ polish 2026-05-25: если attributed=0 при большом N — это почти
+    # наверняка не "deploy-free день", а linkage gap (service_id NULL на
+    # одной из сторон JOIN-а). Покажем диагностику чтобы было понятно
+    # где править.
+    if attributed == 0 and total >= 10:
+        deploys_linked_pct, alerts_linked_pct = _deploy_correlation_diagnostics(
+            db, hours=hours
+        )
+        lines.append(
+            f"  ⚠️ Likely linkage gap: `{deploys_linked_pct:.0f}%` deploys linked "
+            f"to service, `{alerts_linked_pct:.0f}%` alerts linked"
+        )
+
     if worst and int(worst[2] or 0) >= 2:
         b_num, b_user, b_cnt = worst
         user_str = f"by `{b_user}`" if b_user else "_auto_"
@@ -1888,6 +2145,50 @@ def deploy_incident_correlation_section(db: Session, hours: int = 24) -> str:
             f"(rollback recommended)"
         )
     return "\n".join(lines)
+
+
+def _deploy_correlation_diagnostics(
+    db: Session, hours: int = 24
+) -> Tuple[float, float]:
+    """DQ helper: % rows с not-NULL service_id в kg_deployments / kg_alerts
+    в окне hours.
+
+    Используется чтобы при attributed=0 показать, что причина — отсутствие
+    привязки к service_id, а не реальное «всё чисто после деплоя».
+    Возвращает (deploys_linked_pct, alerts_linked_pct). При ошибках — (0,0).
+    """
+    try:
+        row = db.execute(text("""
+            WITH d AS (
+                SELECT count(*) AS total,
+                       count(*) FILTER (WHERE service_id IS NOT NULL) AS linked
+                FROM kg_deployments
+                WHERE started_at > NOW() - (:hours || ' hours')::interval
+            ),
+            a AS (
+                SELECT count(*) AS total,
+                       count(*) FILTER (WHERE service_id IS NOT NULL) AS linked
+                FROM kg_alerts
+                WHERE fired_at > NOW() - (:hours || ' hours')::interval
+            )
+            SELECT d.total, d.linked, a.total, a.linked FROM d, a
+        """), {"hours": str(hours)}).fetchone()
+    except Exception as e:
+        log.warning("stats_digest.deploy_diagnostics_failed", error=str(e))
+        try:
+            db.rollback()
+        except Exception:
+            pass
+        return (0.0, 0.0)
+    if row is None:
+        return (0.0, 0.0)
+    d_total = int(row[0] or 0)
+    d_linked = int(row[1] or 0)
+    a_total = int(row[2] or 0)
+    a_linked = int(row[3] or 0)
+    d_pct = (d_linked / d_total * 100) if d_total else 0.0
+    a_pct = (a_linked / a_total * 100) if a_total else 0.0
+    return (d_pct, a_pct)
 
 
 async def topology_growth_section(db: Session) -> str:
