@@ -1,18 +1,59 @@
 from typing import Any, Dict, List, Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 
 class AlertManagerAlert(BaseModel):
-    """Single alert as delivered by Prometheus AlertManager webhook v4."""
+    """Single alert as delivered by Prometheus AlertManager webhook v4.
+
+    `status` поле — формально строка ("firing"|"resolved") в webhook v4,
+    но некоторые AM-роутеры/прокси (notify_resolver, alertmanager-bot, etc.)
+    дополняют payload вложенным объектом вида
+    `{"state": "active"|"suppressed", "silencedBy": [...], "inhibitedBy": [...]}`.
+    Чтобы не терять signal — принимаем оба формата; если пришёл объект,
+    приводим status к "firing"/"resolved" по `state`, а оригинал хранится
+    в `status_extra` и доступен из enrichment-кода.
+    """
 
     status: str  # "firing" | "resolved"
+    status_extra: Optional[Dict[str, Any]] = None
     labels: Dict[str, str] = Field(default_factory=dict)
     annotations: Dict[str, str] = Field(default_factory=dict)
     startsAt: str
     endsAt: Optional[str] = None
     generatorURL: Optional[str] = None
     fingerprint: str
+
+    @model_validator(mode="before")
+    @classmethod
+    def _extract_status_extra(cls, data: Any) -> Any:
+        """Если `status` пришёл объектом — извлекаем state/silenced/inhibited.
+
+        AM webhook v4 spec: `status` — это string. AM API v2 и некоторые
+        прокси расширяют payload до `{"state": "...", "silencedBy": [...],
+        "inhibitedBy": [...]}`. Чтобы существующий pipeline (status==str)
+        не сломался — приводим к string, исходный dict кладём в
+        status_extra. Дополнительно — labels-based fallback (`silenced_by`/
+        `inhibited_by` keys), который встречается у самописных AM-шлюзов.
+        """
+        if not isinstance(data, dict):
+            return data
+        status = data.get("status")
+        if isinstance(status, dict):
+            state = status.get("state")
+            data["status_extra"] = status
+            data["status"] = "resolved" if state == "resolved" else "firing"
+        elif data.get("status_extra") is None:
+            labels = data.get("labels") or {}
+            sb = labels.get("silenced_by")
+            ib = labels.get("inhibited_by")
+            if sb or ib:
+                data["status_extra"] = {
+                    "state": "suppressed",
+                    "silencedBy": [sb] if sb else [],
+                    "inhibitedBy": [ib] if ib else [],
+                }
+        return data
 
 
 class AlertManagerWebhook(BaseModel):
@@ -49,6 +90,10 @@ class Incident(BaseModel):
     teamcity_context: Optional[Dict[str, Any]] = None
     # >0 если алерт снова сработал после RESOLVED — счётчик циклов флаппинга.
     flap_count: int = 0
+    # AM inhibit/silence state (когда payload пришёл расширенным форматом
+    # AM API v2 — `status: {state, silencedBy, inhibitedBy}`). None — обычный
+    # active alert. См. AlertManagerAlert._extract_status_extra.
+    status_extra: Optional[Dict[str, Any]] = None
 
     @classmethod
     def from_alertmanager(cls, alert: AlertManagerAlert) -> "Incident":
@@ -69,6 +114,7 @@ class Incident(BaseModel):
             ends_at=alert.endsAt,
             generator_url=alert.generatorURL,
             raw=alert.model_dump(),
+            status_extra=alert.status_extra,
         )
 
 

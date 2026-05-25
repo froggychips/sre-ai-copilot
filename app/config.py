@@ -128,6 +128,29 @@ class Settings(BaseSettings):
     ROLLOUT_SUPPRESS_ENABLED: bool = True
     ROLLOUT_SUPPRESS_WINDOW_MINUTES: int = 15
 
+    # A3: Explicit alertname allowlist — pure-noise alerts которые AM шлёт
+    # либо для self-monitoring (Watchdog ping), либо как technical helper
+    # (InfoInhibitor — workaround для AM inhibition rules без matchers).
+    # Эти alerts никогда не сигналят реальной проблемы — фильтруем на
+    # самом входе webhook handler-а, до KG-store и enrichment.
+    #
+    # Default — список proven-noise patterns; env override (CSV) расширяет,
+    # но не заменяет. Используется substring-match чтобы покрыть варианты
+    # `KubeAPIServerSloMaster` / `KubeAPIServerSloNode` одним префиксом.
+    ALERT_SUPPRESS_NAMES: List[str] = Field(
+        default_factory=lambda: [
+            "Watchdog",
+            "InfoInhibitor",
+            "KubeAPIServerSlo",
+            "KubeAPIDown",
+        ],
+        description="Alertname-substrings (case-sensitive) фильтруемые на входе",
+    )
+    ALERT_SUPPRESS_NAMES_EXTRA: str = Field(
+        "",
+        description="CSV дополнительных substrings — расширяют ALERT_SUPPRESS_NAMES",
+    )
+
     # Anti-DoS cap для prompt_guard.detect_injection. Поднимать только
     # осознанно — каждый LLM-вызов биллится по входным токенам.
     PROMPT_INPUT_MAX_CHARS: int = 20000
