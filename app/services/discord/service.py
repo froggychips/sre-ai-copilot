@@ -60,6 +60,9 @@ _COLOR_CRITICAL = 0xE53935   # red
 _COLOR_WARNING  = 0xFDD835   # yellow
 _COLOR_RESOLVED = 0x43A047   # green
 _COLOR_UNKNOWN  = 0x9E9E9E   # grey
+# Suppressed (silenced/inhibited) — orange, чтобы on-call видел «есть состояние,
+# но не red». Embed всё ещё уходит, но визуально снижен приоритет.
+_COLOR_SUPPRESSED = 0xFB8C00  # orange
 
 _SEVERITY_COLORS = {
     "critical": _COLOR_CRITICAL,
@@ -727,6 +730,11 @@ class DiscordService:
         color = _SEVERITY_COLORS.get(severity, _COLOR_UNKNOWN)
         if head.rollout_noise:
             color = _COLOR_UNKNOWN
+        # A1: suppressed (silenced/inhibited) — orange override, чтобы on-call
+        # сразу видел «AM уже знает что заглушено». Имеет приоритет над
+        # severity-color, но не над rollout-noise (rollout = grey).
+        if head.inhibition_state and not head.rollout_noise:
+            color = _COLOR_SUPPRESSED
         icon = {"critical": "🔴", "warning": "🟡"}.get(severity, "⚪")
         env_part = f"{env.upper()} · " if env else ""
 
@@ -778,6 +786,17 @@ class DiscordService:
                 "name": "KG",
                 "value": "_сервис не в graph — topology unknown_",
                 "inline": True,
+            })
+
+        # A1: AM inhibit/silence state. Если в AM payload пришло
+        # `status: {state: suppressed, silencedBy/inhibitedBy: [...]}` —
+        # показываем on-call что alert уже залушен и кем. Цвет embed-а уже
+        # переключен на orange выше (см. inhibition_state-блок color-override).
+        if head.inhibition_state:
+            fields.append({
+                "name": "Status",
+                "value": head.inhibition_state[:512],
+                "inline": False,
             })
 
         # On-call UX polish (10:38 feedback). Три inline-поля компактным

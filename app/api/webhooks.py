@@ -1,7 +1,7 @@
 import hashlib
 import hmac
 import re
-from typing import Optional
+from typing import Iterable, List, Optional
 
 import structlog
 from fastapi import APIRouter, Depends, HTTPException, Request
@@ -11,13 +11,88 @@ from app.config import settings
 from app.core.state_machine import IncidentState
 from app.database import IncidentRecord, get_db
 from app.ingestion.raw_collector import raw_collector
-from app.models.incident import AlertManagerWebhook, Incident
+from app.metrics import ALERTS_SUPPRESSED
+from app.models.incident import AlertManagerAlert, AlertManagerWebhook, Incident
 from app.services.teamcity_service import incident_teamcity_context
 from app.workers.tasks import (async_process_incident, celery_app,
                                process_incident_task)
 
 router = APIRouter()
 log = structlog.get_logger()
+
+
+def _suppress_names() -> List[str]:
+    """Объединённый allowlist: defaults из config + env extra (CSV)."""
+    base = list(settings.ALERT_SUPPRESS_NAMES or [])
+    extra_csv = settings.ALERT_SUPPRESS_NAMES_EXTRA or ""
+    extras = [s.strip() for s in extra_csv.split(",") if s.strip()]
+    # Preserve order, drop dups.
+    seen = set()
+    out: List[str] = []
+    for n in base + extras:
+        if n not in seen:
+            seen.add(n)
+            out.append(n)
+    return out
+
+
+def _alert_in_allowlist(alertname: str, patterns: Iterable[str]) -> Optional[str]:
+    """Возвращает matched-pattern если alertname попадает в allowlist.
+
+    Используем substring-match (а не exact), чтобы один префикс
+    `KubeAPIServerSlo` ловил все `*Master`/`*Node`/`*Read` варианты.
+    """
+    if not alertname:
+        return None
+    for p in patterns:
+        if p and p in alertname:
+            return p
+    return None
+
+
+def _is_self_noise(alert: AlertManagerAlert) -> bool:
+    """Эвристика: alert с severity=info из service=monitoring — self-noise.
+
+    Это покрывает алерты из monitoring-стека самого AM/Prometheus,
+    которые не имеют названия в allowlist но являются техническим шумом.
+    """
+    labels = alert.labels or {}
+    sev = (labels.get("severity") or "").lower()
+    service = (labels.get("service") or "").lower()
+    return sev == "info" and service == "monitoring"
+
+
+def _filter_suppressed(
+    alerts: List[AlertManagerAlert],
+) -> tuple[List[AlertManagerAlert], int]:
+    """Возвращает (passed_alerts, suppressed_count). Логирует+метрит каждый skip."""
+    patterns = _suppress_names()
+    passed: List[AlertManagerAlert] = []
+    suppressed = 0
+    for alert in alerts:
+        alertname = (alert.labels or {}).get("alertname", "")
+        matched = _alert_in_allowlist(alertname, patterns)
+        if matched:
+            ALERTS_SUPPRESSED.labels(reason="allowlist", alertname=alertname).inc()
+            log.info(
+                "webhook.alert_suppressed",
+                reason="allowlist",
+                alertname=alertname,
+                matched_pattern=matched,
+            )
+            suppressed += 1
+            continue
+        if _is_self_noise(alert):
+            ALERTS_SUPPRESSED.labels(reason="self_noise", alertname=alertname).inc()
+            log.info(
+                "webhook.alert_suppressed",
+                reason="self_noise",
+                alertname=alertname,
+            )
+            suppressed += 1
+            continue
+        passed.append(alert)
+    return passed, suppressed
 
 
 async def verify_alertmanager_signature(request: Request):
@@ -88,6 +163,10 @@ async def alertmanager_webhook(
     raw_payload.setdefault("id", payload.groupKey)
     raw_collector.ingest(raw_payload)
 
+    # A3: allowlist filter. Применяем сразу после raw-store, чтобы суrnu trace
+    # сохранил исходный batch, но дальше идут только не-noise alerts.
+    payload_alerts, _suppressed = _filter_suppressed(payload.alerts)
+
     # States where the pipeline is already in-flight — skip re-dispatch.
     # FAILED is the only terminal state we allow to re-run (transient infra error).
     # NOTE: RESOLVED is intentionally absent — a re-fire after RESOLVED is flapping
@@ -101,7 +180,7 @@ async def alertmanager_webhook(
     }
 
     accepted = []
-    for alert in payload.alerts:
+    for alert in payload_alerts:
         validate_alert_labels(alert)
         incident = Incident.from_alertmanager(alert)
 
@@ -216,8 +295,12 @@ async def alertmanager_webhook_store_only(
     raw_payload.setdefault("id", payload.groupKey)
     raw_collector.ingest(raw_payload)
 
+    # A3: allowlist filter — pure-noise alerts даже в KG-store не пишем,
+    # чтобы recurrence/incidents_on метрики не были загажены Watchdog'ом.
+    payload_alerts, suppressed_count = _filter_suppressed(payload.alerts)
+
     stored = []
-    for alert in payload.alerts:
+    for alert in payload_alerts:
         try:
             validate_alert_labels(alert)
             incident = Incident.from_alertmanager(alert)
@@ -245,7 +328,7 @@ async def alertmanager_webhook_store_only(
             stored.append({"incident_id": incident.incident_id, "result": "failed"})
 
     db.commit()
-    return {"status": "stored", "alerts": stored}
+    return {"status": "stored", "alerts": stored, "suppressed_allowlist": suppressed_count}
 
 
 @router.post(
@@ -277,10 +360,14 @@ async def alertmanager_webhook_enrich_and_forward(
     raw_payload.setdefault("id", payload.groupKey)
     raw_collector.ingest(raw_payload)
 
+    # A3: allowlist filter — Watchdog/InfoInhibitor и self-noise отсеиваем
+    # ДО enrichment-стадии. Это снимает ~30-40% бесполезного шума.
+    payload_alerts, suppressed_allowlist = _filter_suppressed(payload.alerts)
+
     stored = []
     firing_incidents = []  # (incident, env-hint) — для post-store enrich.
 
-    for alert in payload.alerts:
+    for alert in payload_alerts:
         try:
             validate_alert_labels(alert)
             incident = Incident.from_alertmanager(alert)
@@ -313,8 +400,10 @@ async def alertmanager_webhook_enrich_and_forward(
     enriched_groups = 0
     suppressed_chronic = 0
     suppressed_rollout = 0
+    suppressed_inhibited = 0
     if settings.DISCORD_ENRICH_ENABLED and firing_incidents:
         from app.services.alert_dedup import Decision, decide_send
+        from app.services.alert_enrichment import _inhibition_state
 
         # Группировка по (alertname, severity) — несколько ns в одном embed.
         groups: dict[tuple, list] = {}
@@ -344,6 +433,27 @@ async def alertmanager_webhook_enrich_and_forward(
                     head_inc.labels.get("service")
                     or head_inc.labels.get("deployment")
                 )
+
+                # A1: AM inhibit/silence gate. Если AM payload пришёл
+                # с status: {state: suppressed, silencedBy/inhibitedBy: [...]},
+                # для non-critical алертов skip-аем embed (AM уже принял
+                # решение что это шум). Critical — всё равно шлём, но в
+                # embed-е появится Status-поле + orange color.
+                inhib = _inhibition_state(head_inc)
+                if inhib and sev != "critical":
+                    suppressed_inhibited += 1
+                    ALERTS_SUPPRESSED.labels(
+                        reason="inhibited_warn", alertname=alertname,
+                    ).inc()
+                    log.info(
+                        "enrich_forward.suppress_inhibited",
+                        alertname=alertname,
+                        service=head_service,
+                        severity=sev,
+                        inhibition=inhib,
+                    )
+                    continue
+
                 decision = await decide_send(
                     alertname=alertname,
                     namespace=head_inc.namespace,
@@ -388,6 +498,8 @@ async def alertmanager_webhook_enrich_and_forward(
         "enriched_groups": enriched_groups,
         "suppressed_chronic": suppressed_chronic,
         "suppressed_rollout": suppressed_rollout,
+        "suppressed_inhibited": suppressed_inhibited,
+        "suppressed_allowlist": suppressed_allowlist,
         "enrich_enabled": settings.DISCORD_ENRICH_ENABLED,
     }
 
