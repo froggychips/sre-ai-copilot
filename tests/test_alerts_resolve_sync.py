@@ -28,7 +28,7 @@ from app.knowledge_graph.alerts_resolve_sync import (
     _mark_resolved,
     run_alerts_resolve_sync,
 )
-from app.knowledge_graph.schema import AlertEvent, Service
+from app.knowledge_graph.schema import AlertEvent
 from app.scripts.backfill_resolved_alerts import (
     BACKFILL_MARKER,
     apply_backfill,
