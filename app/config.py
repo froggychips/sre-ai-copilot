@@ -363,6 +363,21 @@ class Settings(BaseSettings):
     VICTORIA_METRICS_URL: str = Field("", description="VMSingle base URL")
     VICTORIA_METRICS_WINDOW_MINUTES: int = 15
 
+    # kg_metrics_sync — параллелизм per-service fetch.
+    # Проблема (recon 2026-05-25): sequential loop по 2908 real services × 5
+    # PromQL занимает >10 мин (больше cron-интервала) → ServiceHealth не
+    # успевает заполниться к моменту kg_anomaly_detection_task → последний
+    # тик репортит `skipped_no_current=8020` (≈2.76 metric points/service).
+    # Fix: gather с semaphore. Default 20 — компромисс между throughput и
+    # нагрузкой на vmsingle (одиночный pod, не cluster). Снизить если VM
+    # отвечает 429/5xx; повысить если sync укладывается в <2 мин и есть запас.
+    KG_METRICS_SYNC_CONCURRENCY: int = Field(
+        20,
+        ge=1,
+        le=200,
+        description="Макс. одновременных per-service fetch в kg_metrics_sync",
+    )
+
     # KG Coverage #2 (storage signals): включить disk_pct enrichment для PVC
     # через VM query `100 * kubelet_volume_stats_used_bytes /
     # kubelet_volume_stats_capacity_bytes`. Default OFF — kubelet stats
