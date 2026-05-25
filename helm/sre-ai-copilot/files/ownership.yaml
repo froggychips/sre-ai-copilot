@@ -1,0 +1,144 @@
+# Manual ownership overrides для shared infrastructure.
+#
+# Применяется через `OWNERSHIP_MANIFEST_PATH=config/ownership.yaml`.
+# Manifest match → confidence=1.0 и source="manual" — перебивает все
+# heuristics (prefix / deploy_history / labels).
+#
+# ── Match-логика ─────────────────────────────────────────────────────────
+# Правила пробегаются сверху-вниз, первое совпавшее побеждает. Поэтому
+# **специфичные правила (с name_pattern) — выше catch-all-а по ns**.
+#
+# Поля:
+#   ns_pattern    — обязательный glob по namespace (fnmatch)
+#   name_pattern  — опциональный glob по имени сервиса. Если задан, правило
+#                   применяется только при per-service вызове
+#                   `suggest_owner_multi_signal(ns, db, name=svc.name)`.
+#                   Если caller имени не дал (digest-level), правила с
+#                   name_pattern пропускаются.
+#   owner         — team handle (`@squad-N` / `@platform` / `@data`).
+#                   Caller сам решает, рисовать ли `@` префикс — мы
+#                   нормализуем (lstrip).
+#   reason        — свободная форма, попадает в audit log.
+#
+# ── Скоуп этой версии ────────────────────────────────────────────────────
+# Цель — покрыть 132 unowned-сервиса в `*-shared` namespaces из снапшота
+# KG 2026-05-25 (preprod-shared 25, preupdate-shared 23, prod-shared 23,
+# squad-gd-shared 61). Разбивка по категориям:
+#   - ClickHouse (analytics)         → @data         (~10 svc)
+#   - NATS (message bus)             → @platform     (~12 svc)
+#   - PostgreSQL replicas/backups    → @platform     (~92 svc)
+#   - VictoriaMetrics / kube-state   → @platform     (~3 svc)
+#   - Seq logging stack              → @platform     (1 svc)
+#   - update-service (legacy infra)  → @platform     (1 svc)
+#   - squad-gd-shared прикладные     → @squad-gd     (~11 svc)
+#   - generic catch-alls             → @platform / @squad-gd
+#
+# Решения по категоризации:
+#   * ClickHouse → @data: analytics-стек, owned дата-командой.
+#     Не @platform — DDL и retention live с дата-стороны.
+#   * NATS → @platform: shared message bus, всегда платформенный.
+#   * *-db-* (PG) → @platform: в `*-shared` это **общая** инфра-БД,
+#     не app-БД конкретного squad-а. Replicas, backups, headless services,
+#     metrics — платформенные.
+#   * vm-kube-state-metrics → @platform: kube state экспортёр в monitoring.
+#   * squad-gd-shared прикладные → @squad-gd: game-design squad имеет
+#     отдельный shared realm; prefix `squad-(\d+)-` не матчит «gd», поэтому
+#     manifest обязателен. Username igoncharov уже в owner_aliases.
+#
+# Изменения требуют PR + rollout (manifest подгружается worker'ом из
+# configmap; см. docs/RUNBOOK.md § Ownership manifest).
+
+# ── ClickHouse stack → @data (analytics) ─────────────────────────────────
+- ns_pattern: "*-shared"
+  name_pattern: "clickhouse*"
+  owner: "@data"
+  reason: "ClickHouse analytics stack — data team owns DDL/retention"
+
+# ── NATS message bus → @platform ─────────────────────────────────────────
+- ns_pattern: "*-shared"
+  name_pattern: "nats*"
+  owner: "@platform"
+  reason: "NATS — shared message bus infra"
+
+- ns_pattern: "*-shared"
+  name_pattern: "*-nats-*"
+  owner: "@platform"
+  reason: "NATS sidecars/exporters — platform"
+
+# ── PostgreSQL replicas / backups / metrics → @platform ──────────────────
+# В `*-shared` ns живут replicas + backups + metrics exporters общих БД
+# (chat/config/finance/security/push/mv/map-coordinator/currency-rates).
+# Это инфра-копии, не app-логика — owned платформой. Сами primary-PG
+# (если они в squad-N) — owned squad-ом, но в *-shared их нет.
+- ns_pattern: "*-shared"
+  name_pattern: "*-db-postgresql"
+  owner: "@platform"
+  reason: "Shared PG primary — platform DB infra"
+
+- ns_pattern: "*-shared"
+  name_pattern: "*-db-postgresql-*"
+  owner: "@platform"
+  reason: "Shared PG replica/headless/metrics — platform DB infra"
+
+- ns_pattern: "*-shared"
+  name_pattern: "*-db-backup"
+  owner: "@platform"
+  reason: "PG backup pushers — platform DB infra"
+
+- ns_pattern: "*-shared"
+  name_pattern: "*-redis*"
+  owner: "@platform"
+  reason: "Shared Redis — platform cache infra"
+
+# ── Monitoring / observability → @platform ───────────────────────────────
+- ns_pattern: "*-shared"
+  name_pattern: "vm-*"
+  owner: "@platform"
+  reason: "VictoriaMetrics components — platform monitoring"
+
+- ns_pattern: "*-shared"
+  name_pattern: "prometheus*"
+  owner: "@platform"
+  reason: "Prometheus stack — platform monitoring"
+
+- ns_pattern: "*-shared"
+  name_pattern: "seq"
+  owner: "@platform"
+  reason: "Seq logging — platform observability"
+
+# ── Legacy / shared infra services → @platform ───────────────────────────
+- ns_pattern: "*-shared"
+  name_pattern: "update-service"
+  owner: "@platform"
+  reason: "Legacy update-service — owned platform"
+
+- ns_pattern: "*-shared"
+  name_pattern: "config-workers"
+  owner: "@platform"
+  reason: "Config workers — platform"
+
+# ── squad-gd-shared: специфичные правила (бьют ns-catch-all) ─────────────
+# clickhouse и nats тут уже покрыты выше (*-shared paths). Прикладные
+# сервисы внутри gd realm уходят к squad-gd через ns-catch-all ниже.
+
+# ── ns-level catch-alls (последний шанс) ─────────────────────────────────
+# squad-gd-shared: всё что не подошло выше — squad-gd. Owner verified
+# через owner_aliases.yaml (igoncharov: @squad-gd).
+- ns_pattern: "squad-gd-shared"
+  owner: "@squad-gd"
+  reason: "squad-gd realm catch-all — game-design squad app services"
+
+# Generic *-shared: всё что не подошло выше — platform (PG namespaced
+# services которые не попали в более узкие паттерны, headless variants,
+# misc shared infra).
+- ns_pattern: "preprod-shared"
+  owner: "@platform"
+  reason: "Default preprod-shared infra → platform"
+
+- ns_pattern: "preupdate-shared"
+  owner: "@platform"
+  reason: "Default preupdate-shared infra → platform"
+
+- ns_pattern: "prod-shared"
+  owner: "@platform"
+  reason: "Default prod-shared infra → platform"
