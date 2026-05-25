@@ -588,6 +588,77 @@ OWNERSHIP_MANIFEST_PATH=/etc/sre-ai/ownership.yaml
 Подмонтируйте через configmap и укажите `OWNERSHIP_MANIFEST_PATH` на
 файл.
 
+### Активация `*-shared` ownership manifest в runtime
+
+В master уже лежит и manifest (`config/ownership.yaml`), и Helm-обвязка:
+`templates/ownership-configmap.yaml` рендерит ConfigMap из
+`helm/sre-ai-copilot/files/ownership.yaml` (синхронизированная копия —
+`.Files.Get` в Helm не выходит за пределы chart-dir-а), worker/api
+deployments монтируют его в `OWNERSHIP_MANIFEST_PATH`
+(дефолт `/config/ownership.yaml`).
+
+CI gate `tests/test_helm_ownership_sync.py` проверяет, что
+`config/ownership.yaml` ≡ `helm/sre-ai-copilot/files/ownership.yaml`
+байт-в-байт. Если правите один — синкайте другой:
+
+```bash
+cp config/ownership.yaml helm/sre-ai-copilot/files/ownership.yaml
+```
+
+#### A. Через Helm (рекомендуется)
+
+```bash
+# values.yaml дефолтно ownershipManifest.enabled=true.
+# Поправили helm/sre-ai-copilot/files/ownership.yaml (новое правило):
+helm upgrade --install sre-ai-copilot helm/sre-ai-copilot/ \
+  --namespace sre-ai \
+  -f helm/sre-ai-copilot/values.yaml \
+  -f your-overrides.yaml
+
+# Прокатить worker/api чтобы подцепили configmap:
+kubectl -n sre-ai rollout restart deploy/sre-ai-copilot-worker
+kubectl -n sre-ai rollout restart deploy/sre-ai-copilot-api
+
+# Проверка:
+kubectl -n sre-ai exec deploy/sre-ai-copilot-worker -- \
+  sh -c 'echo $OWNERSHIP_MANIFEST_PATH; head -5 $OWNERSHIP_MANIFEST_PATH'
+# Ожидаем: /config/ownership.yaml + первые 5 строк manifest-а.
+```
+
+#### B. Manual configmap (без Helm)
+
+```bash
+kubectl -n sre-ai create configmap sre-ai-copilot-ownership \
+  --from-file=ownership.yaml=config/ownership.yaml \
+  --dry-run=client -o yaml | kubectl apply -f -
+
+# Затем patch deployments — mount /config/ownership.yaml (subPath
+# ownership.yaml, readOnly) + env OWNERSHIP_MANIFEST_PATH=/config/ownership.yaml.
+# Точная форма — в templates/deployment-worker.yaml и deployment-api.yaml.
+```
+
+#### Backfill уже attribute-нутых сервисов
+
+После того как configmap живой — перегнать inference на `*-shared`,
+чтобы старые attributions сошлись к manifest-вердиктам (confidence=1.0
+всегда выигрывает):
+
+```bash
+kubectl -n sre-ai exec deploy/sre-ai-copilot-worker -- \
+  python -m app.scripts.backfill_ownership --apply --filter-ns '*-shared'
+```
+
+Периодическая beat-таска `kg-ownership-backfill`
+(`OWNERSHIP_BACKFILL_ENABLED=true`) тоже перепрогоняет каждые 6h, но
+явный one-shot быстрее после смены manifest-а.
+
+#### Выключить
+
+`helm upgrade ... --set ownershipManifest.enabled=false` снимает
+ConfigMap, env-var и mount — worker откатывается на три heuristics
+(prefix / deploy-history / labels), 132 `*-shared` сервиса снова
+становятся unowned.
+
 ### Добавить / изменить override
 
 1. Отредактировать `config/ownership.yaml` — добавить правило. Правила
