@@ -591,6 +591,163 @@ Pre-baked defaults в коде; YAML расширяет/оверрайдит. К
 
 ---
 
+## Ownership backfill (`app.scripts.backfill_ownership`)
+
+`suggest_owner_multi_signal` подвязан в `unowned_namespaces`-секцию
+digest-а, но **периодический `kg_topology_sync` его не зовёт** —
+сервисы без owner-а на initial discovery так и остаются `owner=NULL`
+forever, пока что-то не пнёт. Скрипт `backfill_ownership` закрывает
+эту дыру: пробегает по всем `kg_services` где `team_owner IS NULL`,
+гоняет multi-signal inference и пишет результат, если confidence
+прошёл threshold.
+
+Заодно бэкфилит `stale_class` для строк с `stale_class IS NULL` через
+тот же классификатор что у `kg_sync` (см. `--stale` / `--all`).
+
+### Когда запускать
+
+- **После initial deploy / свежего restore.** Topology sync знает
+  только что говорят k8s-labels; backfill подтягивает сигналы
+  deploy-history + prefix, которым нужна история.
+- **Когда `owner_known < 80%`** в дневном digest или
+  `kg_quality_report` (секция "KG quality_report" выше). Стагнация
+  обычно означает, что сервисы создавались до того, как сигналы
+  inference стали работать.
+- **Еженедельно.** Когда beat-таска включена (следующая секция) —
+  периодический цикл делает это автоматом; ручной прогон нужен только
+  для первого rollout-а или когда хочется one-off catch-up с
+  пониженным threshold.
+
+### Dry-run preview (default — безопасно, без записи)
+
+```bash
+kubectl -n sre-ai exec deployment/sre-ai-api -- \
+  python -m app.scripts.backfill_ownership --dry-run --threshold 0.5
+```
+
+Печатает `total_candidates_owner`, `would_update_owner`,
+`skipped_low_confidence` и `kept_existing` — без записи в БД. По
+этой цифре решаем — стоит ли apply.
+
+### Пониженный threshold для понимания gap-а
+
+```bash
+kubectl -n sre-ai exec deployment/sre-ai-api -- \
+  python -m app.scripts.backfill_ownership --dry-run --threshold 0.3
+```
+
+Threshold `0.3` показывает prefix-only suggestions (confidence ≈ 0.4),
+которые `0.5` режет. Полезно понять **почему** gap всё ещё висит:
+если `would_update_owner` подскакивает с ~50 на `0.5` до ~2000 на
+`0.3` — фикс не "поднять threshold у beat", а "настроить
+`OWNERSHIP_MANIFEST_PATH`, чтобы prefix не был единственным сигналом".
+
+### Apply (production-запись)
+
+```bash
+kubectl -n sre-ai exec deployment/sre-ai-api -- \
+  python -m app.scripts.backfill_ownership --apply --threshold 0.4
+```
+
+Threshold `0.4` — рекомендуемый initial-rollout: включает prefix-матчи,
+но не голые single-source guess-ы на `0.3`. Идемпотентно — повторный
+прогон на тех же данных no-op (фильтр по `team_owner IS NULL`).
+
+**Реальный пример (2026-05-24):** прод-кластер стоял на
+`owner_known = 12.40%` (335 / 2702 сервисов). Один прогон
+`--apply --threshold 0.4` поднял до `owner_known = 86.68%`
+(+74 pp, 1994 сервиса забэкфилены с `namespace_prefix` как primary
+source). Оставшиеся ~13% — реально без owner-а: third-party namespaces,
+ad-hoc CronJob-ы — это закрывается через `OWNERSHIP_MANIFEST_PATH`.
+
+### Бэкфил `stale_class` тоже
+
+```bash
+# Только stale_class:
+kubectl -n sre-ai exec deployment/sre-ai-api -- \
+  python -m app.scripts.backfill_ownership --stale --apply
+
+# Оба ownership + stale_class за один прогон:
+kubectl -n sre-ai exec deployment/sre-ai-api -- \
+  python -m app.scripts.backfill_ownership --all --apply --threshold 0.4
+```
+
+### Откат
+
+Скрипт пишет только в строки где `team_owner WAS NULL` (фильтр в
+`plan_ownership`). Также проставляет `metadata_json.owner_source`
+тем сигналом, что победил: `namespace_prefix`, `k8s_labels`,
+`deploy_history` (и `manual` для `OWNERSHIP_MANIFEST_PATH`-матчей).
+Откатить прогон без удара по pre-existing / manual-overriden owner-ам:
+
+```sql
+UPDATE kg_services
+   SET team_owner = NULL
+ WHERE metadata_json->>'owner_source'
+       IN ('namespace_prefix','deploy_history','k8s_labels');
+```
+
+`owner_source = 'manual'` и строки куда backfill не писал
+(`owner_source IS NULL`, pre-existing owners) — не трогаем. После SQL
+следующий sync оставит сервисы `owner=NULL` пока не прогонится
+очередной backfill.
+
+---
+
+## Периодический ownership backfill (beat-таска `kg-ownership-backfill`)
+
+После того как initial ручной `--apply`-rollout прошёл хорошо, переводим
+процесс из "ops запускает руками" в "Celery beat прогоняет сам" — та же
+entry-point `run_backfill`, частота 6 ч, scope — только high-confidence
+сигналы.
+
+### Конфигурация
+
+| Env var | Default | Назначение |
+|---|---|---|
+| `OWNERSHIP_BACKFILL_ENABLED` | `false` | Master switch. Beat-таска no-op-ит когда off. |
+| `OWNERSHIP_BACKFILL_THRESHOLD` | `0.7` | Минимум confidence для периодической записи. |
+
+В Helm — через `values.yaml`:
+
+```yaml
+env:
+  ownershipBackfillEnabled: "true"
+  ownershipBackfillThreshold: "0.7"
+```
+
+Оба прокидываются в worker Deployment (см.
+`helm/sre-ai-copilot/templates/deployment-worker.yaml`).
+
+### Логика порогов: `0.4` initial vs `0.7` periodic
+
+- **Initial rollout (ручной, `0.4`):** ops смотрит результат, поэтому
+  ОК включать prefix-only матчи, которым нужен human plausibility check.
+  Большой one-time win (тот самый +74 pp выше).
+- **Periodic beat (`0.7`):** гоняется без присмотра каждые 6 ч. Высокий
+  порог = commit только при multi-signal agreement (prefix + labels,
+  или deploy_history совпал с prefix). Новые сервисы, не прошедшие
+  bar, остаются `owner=NULL` и всплывают в дневном
+  `unowned_namespaces`-digest-е, где человек или добавит запись в
+  `OWNERSHIP_MANIFEST_PATH`, или следующий sync даст достаточно
+  сигнала.
+
+Не опускать beat-порог до `0.5` и ниже "чтобы закрыть gap" — это
+сносит слой human-review и будет перерисовывать owner-ов каждые 6 ч
+при флипе single-signal-а. Лучше — one-off ручной
+`--apply --threshold 0.5` или расширить ownership manifest.
+
+### Beat schedule + observability
+
+- Schedule: `crontab(minute=17, hour="*/6")` — каждые 6 ч, offset от
+  drift/ingress/stuck-sync-ов, чтобы избежать DB-contention.
+- Имя таски: `kg_ownership_backfill` (Celery flower / логи).
+- Log line на каждый прогон: `kg_ownership_backfill.done updated=N
+  skipped_low_conf=M kept=K`. `updated=0` подряд много прогонов —
+  ожидаемый steady state; non-zero — только когда приходят новые сервисы.
+
+---
+
 ## stale_class на kg_services
 
 Wave 8 вводит `kg_services.stale_class` (PR #86). Три значения:
