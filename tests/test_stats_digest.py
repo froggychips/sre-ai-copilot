@@ -675,9 +675,21 @@ async def test_send_daily_digest_skips_when_disabled():
 async def test_send_daily_digest_sends_when_enabled():
     fake_discord = MagicMock()
     fake_discord.send_stats_report = AsyncMock()
+    # Overhaul: send_daily_digest зовёт _build_digest_with_meta напрямую,
+    # build_digest остался как thin wrapper. Мокаем внутренний помощник,
+    # отключаем skip-if-noop чтобы тест был детерминистичен.
+    fake_meta = {
+        "sections_with_content": 5,
+        "change_report": stats_digest.ChangeReport(new_alerts_24h=3),
+        "fired_series_count": 10,
+    }
     with patch.object(stats_digest.settings, "STATS_DIGEST_ENABLED", True), \
          patch.object(stats_digest.settings, "VICTORIA_METRICS_URL", ""), \
-         patch.object(stats_digest, "build_digest", new=AsyncMock(return_value="DIGEST_BODY")), \
+         patch.object(stats_digest.settings, "STATS_DIGEST_SKIP_NOOP", False, create=True), \
+         patch.object(
+             stats_digest, "_build_digest_with_meta",
+             new=AsyncMock(return_value=("DIGEST_BODY", fake_meta)),
+         ), \
          patch("app.services.discord_service.discord_service", fake_discord):
         result = await stats_digest.send_daily_digest(db=MagicMock())
     assert result["status"] == "sent"
