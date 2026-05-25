@@ -9,6 +9,14 @@ from unittest.mock import patch
 
 import pytest
 
+from tests.conftest import requires_postgres
+
+# Все тесты в файле зависят от module-scope `app_client` fixture, которая
+# создаёт таблицы через `Base.metadata.create_all(engine)` на реальном
+# postgres-engine из app.database. Без живого postgres вся группа падает
+# с psycopg2.OperationalError (см. conftest для обоснования conditional skip).
+pytestmark = requires_postgres
+
 
 @pytest.fixture(scope="module")
 def app_client():
