@@ -31,8 +31,13 @@
   prefix-only + второй сигнал ≥ default threshold 0.5.
 
   **Manual override** — `OWNERSHIP_MANIFEST_PATH=ownership.yaml` со списком
-  `[{ns_pattern, owner, reason}]`. Match по pattern (glob) → confidence=1.0,
-  все эвристики игнорируются.
+  `[{ns_pattern, owner, reason}]` или
+  `[{ns_pattern, name_pattern, owner, reason}]`. Match по pattern (glob)
+  → confidence=1.0, все эвристики игнорируются. Если задан `name_pattern`,
+  правило применяется только когда caller передал имя сервиса и оно
+  glob-матчится. Порядок в файле = приоритет: первое совпавшее правило
+  побеждает, так что **специфичные правила (с name_pattern) кладите
+  выше catch-all-а по ns**.
 
 Слияние: для каждого кандидата суммируются weights × signal_strength,
 top-1 побеждает; `confidence` — итоговый score, ограничен [0, 1].
@@ -323,6 +328,7 @@ class _ManifestRule:
     ns_pattern: str
     owner: str
     reason: str = "manual"
+    name_pattern: Optional[str] = None  # опциональный glob по имени сервиса
 
 
 _MANIFEST_CACHE: Optional[List[_ManifestRule]] = None
@@ -355,7 +361,20 @@ def _load_manifest(path: str) -> List[_ManifestRule]:
             reason = entry.get("reason", "manual")
             if not isinstance(reason, str):
                 reason = "manual"
-            out.append(_ManifestRule(ns_pattern=pat, owner=owner, reason=reason))
+            name_pat = entry.get("name_pattern")
+            if name_pat is not None and not isinstance(name_pat, str):
+                log.warning(
+                    "ownership_manifest: %s — name_pattern должен быть строкой, "
+                    "получили %s; правило пропущено",
+                    path, type(name_pat).__name__,
+                )
+                continue
+            out.append(_ManifestRule(
+                ns_pattern=pat,
+                owner=owner,
+                reason=reason,
+                name_pattern=name_pat or None,
+            ))
         return out
     except Exception as e:
         log.warning("ownership_manifest: не смог прочитать %s: %s", path, e)
@@ -376,11 +395,29 @@ def _get_manifest() -> List[_ManifestRule]:
     return rules
 
 
-def _try_manifest_match(ns: str) -> Optional[_ManifestRule]:
-    """Match ns против manifest rules (glob через fnmatch). Первый совпавший."""
+def _try_manifest_match(
+    ns: str,
+    name: Optional[str] = None,
+) -> Optional[_ManifestRule]:
+    """Match ns (+ optional service name) против manifest rules.
+
+    Glob через fnmatch. Первое совпавшее правило побеждает.
+
+    Правило с `name_pattern` применяется только если caller передал `name`
+    и оно glob-матчится. Если caller имени не передал, правила с
+    `name_pattern` пропускаются (они «специфичнее» — не должны срабатывать
+    на ns-only level).
+    """
     for rule in _get_manifest():
-        if fnmatch.fnmatchcase(ns, rule.ns_pattern):
-            return rule
+        if not fnmatch.fnmatchcase(ns, rule.ns_pattern):
+            continue
+        if rule.name_pattern is not None:
+            if name is None:
+                # Caller не передал service name — правило не применимо.
+                continue
+            if not fnmatch.fnmatchcase(name, rule.name_pattern):
+                continue
+        return rule
     return None
 
 
@@ -421,6 +458,8 @@ def _try_kg_lookup(db: Session, ns: str) -> Optional[str]:
 def suggest_owner_multi_signal(
     ns: str,
     db: Optional[Session] = None,
+    *,
+    name: Optional[str] = None,
 ) -> OwnerSuggestion:
     """Главная функция multi-signal. ns → OwnerSuggestion.
 
@@ -429,13 +468,17 @@ def suggest_owner_multi_signal(
       - Manual manifest match → confidence=1.0, sources=['manual'].
       - Иначе — fusion трёх сигналов (см. модульный docstring).
 
+    `name` (опционально): имя сервиса. Нужно для manifest-правил с
+    `name_pattern` (per-service overrides внутри одного ns). Если None,
+    такие правила пропускаются — работают только ns-level правила.
+
     Никогда не бросает: при ошибках БД деградирует до доступных сигналов.
     """
     if not ns or ns == "(no-ns)":
         return OwnerSuggestion(None, 0.0, [])
 
     # 1. Manual override — высший приоритет.
-    rule = _try_manifest_match(ns)
+    rule = _try_manifest_match(ns, name=name)
     if rule is not None:
         # Strip leading `@` из manifest owner-а — caller добавит сам.
         owner = rule.owner.lstrip("@")
@@ -504,7 +547,12 @@ def suggest_owner_multi_signal(
 # ── Backward-compat legacy API ───────────────────────────────────────────
 
 
-def suggest_owner_for_ns(ns: str, db: Optional[Session] = None) -> Optional[str]:
+def suggest_owner_for_ns(
+    ns: str,
+    db: Optional[Session] = None,
+    *,
+    name: Optional[str] = None,
+) -> Optional[str]:
     """**DEPRECATED** — use `suggest_owner_multi_signal`.
 
     Старая prefix + KG-fallback логика (PR #81). Оставлено для не-мигрированных
@@ -512,7 +560,8 @@ def suggest_owner_for_ns(ns: str, db: Optional[Session] = None) -> Optional[str]
 
     Контракт (без изменений):
       - ns пустой / `(no-ns)` → None.
-      - manual manifest match → owner оттуда.
+      - manual manifest match → owner оттуда (учитывает name_pattern, если
+        передан `name`).
       - префикс match → owner из паттерна.
       - KG match → owner из БД.
       - иначе None.
@@ -523,7 +572,7 @@ def suggest_owner_for_ns(ns: str, db: Optional[Session] = None) -> Optional[str]
     # Manual override и здесь должен выигрывать — иначе legacy callers будут
     # игнорировать override-ы. Это безопасное расширение (раньше manifest
     # просто не существовал).
-    rule = _try_manifest_match(ns)
+    rule = _try_manifest_match(ns, name=name)
     if rule is not None:
         return rule.owner.lstrip("@")
 

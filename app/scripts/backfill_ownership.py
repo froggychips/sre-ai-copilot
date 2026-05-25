@@ -149,7 +149,9 @@ def plan_ownership(
         ns = str(svc.namespace)
         if not _matches_ns_filter(ns, filter_ns):
             continue
-        sug: OwnerSuggestion = suggest_owner_multi_signal(ns, db=db)
+        sug: OwnerSuggestion = suggest_owner_multi_signal(
+            ns, db=db, name=str(svc.name)
+        )
         if sug.owner is None:
             continue
         # Manual override — всегда применяем (confidence=1.0).
