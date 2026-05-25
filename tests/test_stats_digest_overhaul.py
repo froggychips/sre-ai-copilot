@@ -361,8 +361,14 @@ async def test_topology_growth_section_renders_diff():
 
 
 @pytest.mark.asyncio
-async def test_topology_growth_section_hidden_on_first_run():
-    """previous=None → секция скрыта, но snapshot записан."""
+async def test_topology_growth_section_first_run_renders_baseline_pill():
+    """previous=None → first-run pill `(new baseline · counting starts now)`.
+
+    Regression-fix 2026-05-25: раньше возвращали "" (секция скрыта), но
+    в live digest это приводило к багу когда Redis snapshot empty
+    из-за restart'а beat-pod'а — следующий run считал prev=0 и рисовал
+    `+2909 services since yesterday`. Теперь first-run явно помечен.
+    """
     db = MagicMock()
     db.execute.return_value.scalar.side_effect = [300, 1500]
     db.execute.return_value.fetchall.return_value = []
@@ -372,7 +378,9 @@ async def test_topology_growth_section_hidden_on_first_run():
                       new=AsyncMock(return_value=None)), \
          patch.object(stats_digest, "_write_topology_snapshot", new=write_mock):
         text = await stats_digest.topology_growth_section(db)
-    assert text == ""
+    assert "new baseline" in text
+    assert "counting starts now" in text
+    assert "since yesterday" not in text  # без ложного diff
     write_mock.assert_awaited_once()  # snapshot всё равно сохранён
 
 
