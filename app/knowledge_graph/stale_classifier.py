@@ -56,12 +56,12 @@ INFRA_EXPECTED_DAYS = 60
 # Канонические значения хранятся в `contract.py` (источник истины для
 # enum). Здесь ре-экспортируем под старыми именами ради backward-compat
 # с импортёрами (`stats_digest`, тесты), которые жили до выноса в contract.
-from app.knowledge_graph.contract import (
+from app.knowledge_graph.contract import (  # noqa: E402 — re-export после module constants
     STALE_CLASS_ACTIVE,
     STALE_CLASS_EXPECTED_STALE as STALE_CLASS_EXPECTED,
     STALE_CLASS_SUSPICIOUS_STALE as STALE_CLASS_SUSPICIOUS,
 )
-from app.knowledge_graph.contract import STALE_CLASS_VALUES as _CONTRACT_STALE_CLASS_VALUES
+from app.knowledge_graph.contract import STALE_CLASS_VALUES as _CONTRACT_STALE_CLASS_VALUES  # noqa: E402
 
 # Для backward-compat сохраняем tuple-форму (старый API). В новых местах
 # использовать `contract.STALE_CLASS_VALUES` (set).
