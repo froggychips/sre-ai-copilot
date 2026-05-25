@@ -1,0 +1,76 @@
+name: KG Contract Drift Check
+
+# Warning-only gate: `python -m app.scripts.quality_report --check`.
+# НЕ блокирует merge (continue-on-error: true). Сначала наблюдаем
+# trend несколько недель, потом recalibrate thresholds + flip continue-on-error.
+#
+# Логика gate'а — см. app/scripts/quality_report.py (evaluate_check):
+#   * unknown_edge_kinds > 0  (edge kind в БД отсутствует в contract.EDGE_KINDS)
+#   * orphan_pct > KG_CHECK_MAX_ORPHAN_PCT  (default 20%)
+#   * owner_pct < KG_CHECK_MIN_OWNER_PCT    (default 50%)
+#   * stale_null_pct > KG_CHECK_MAX_STALE_NULL_PCT (default 10%)
+#
+# DB-источник — read-only kg_reader. Подключение секрет хранит как
+# `KG_READER_DATABASE_URL` (не main DATABASE_URL — separate role).
+
+on:
+  pull_request:
+    branches: [master, main]
+    paths:
+      - 'app/knowledge_graph/**'
+      - 'app/scripts/quality_report.py'
+      - 'tests/test_contract_guards.py'
+      - 'tests/test_kg_contract.py'
+  schedule:
+    # Каждые 6 часов — trend-tracking даже без PR.
+    - cron: '0 */6 * * *'
+  workflow_dispatch:
+
+jobs:
+  contract-check:
+    name: KG contract drift gate
+    runs-on: [self-hosted, macOS, ARM64]
+    # Warning-only gate. Перевести в blocker когда thresholds стабилизируются.
+    continue-on-error: true
+    env:
+      DATABASE_URL: ${{ secrets.KG_READER_DATABASE_URL }}
+      KG_CHECK_MAX_ORPHAN_PCT: "20"
+      KG_CHECK_MIN_OWNER_PCT: "50"
+      KG_CHECK_MAX_STALE_NULL_PCT: "10"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          clean: false
+
+      - name: Setup venv
+        run: |
+          /opt/homebrew/bin/python3.12 -m venv .venv
+          .venv/bin/pip install --upgrade pip
+          if [ -f requirements.txt ]; then .venv/bin/pip install -r requirements.txt; fi
+
+      - name: Run quality_report --check (markdown)
+        id: check
+        run: |
+          .venv/bin/python -m app.scripts.quality_report --check \
+            --output kg-check.md \
+          || echo "CHECK_FAILED=true" >> $GITHUB_ENV
+          cat kg-check.md
+
+      - name: Run quality_report --check (json для programmatic anti-drift)
+        run: |
+          .venv/bin/python -m app.scripts.quality_report --check --json \
+            --output kg-check.json \
+          || true
+          # Подсветим check_passed
+          .venv/bin/python -c "import json; d=json.load(open('kg-check.json')); print('check_passed=', d.get('check_passed'))"
+
+      - name: Upload check artifacts
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: kg-contract-check-${{ github.sha }}
+          path: |
+            kg-check.md
+            kg-check.json

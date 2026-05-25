@@ -16,7 +16,11 @@ from app.evaluation import feedback
 from app.auth import User, get_current_user
 from app.celery_worker import celery_app, generate_reply
 from app.config import settings
-from app.database import engine
+from app.database import SessionLocal, engine
+from app.knowledge_graph.contract import (
+    QUALITY_THRESHOLDS,
+    STARTUP_CONTRACT_CHECK,
+)
 from app.metrics import observe_request_latency
 from app.middleware import RequestIDMiddleware
 from app.models import MessageRole
@@ -25,11 +29,63 @@ from app.telemetry import setup_telemetry
 log = structlog.get_logger()
 
 
+def _run_startup_contract_check() -> None:
+    """Wrapper для STARTUP_CONTRACT_CHECK с graceful error handling.
+
+    Логика:
+      * Открываем SessionLocal(), вызываем contract check, закрываем.
+      * Если settings.STARTUP_CONTRACT_CHECK_ENABLED=False — skip целиком.
+      * Если БД недоступна / `kg_services` ещё не создана (например
+        in-memory sqlite до Base.metadata.create_all) — graceful skip
+        с warning, не падаем.
+      * Если report содержит unknown_edge_kinds или orphan_pct > порог —
+        логируем warning. Healthy — info.
+    Никогда не throws — это диагностический шаг при boot.
+    """
+    if not getattr(settings, "STARTUP_CONTRACT_CHECK_ENABLED", True):
+        log.info("kg_contract.startup_check_disabled")
+        return
+
+    db = None
+    try:
+        db = SessionLocal()
+        report = STARTUP_CONTRACT_CHECK(db)
+    except Exception as exc:  # pragma: no cover - boot-time safety net
+        # БД может быть недоступна на самом раннем шаге boot (в тестах /
+        # перед миграциями). Не блокируем startup.
+        log.warning("kg_contract.startup_check_skipped", error=str(exc))
+        return
+    finally:
+        if db is not None:
+            db.close()
+
+    unknown_edge_kinds = report.get("unknown_edge_kinds") or []
+    orphan_pct = report.get("orphan_pct")
+    owner_pct = report.get("owner_pct")
+    orphan_threshold = QUALITY_THRESHOLDS["orphan_rate_max_pct"]
+
+    warning_level = bool(unknown_edge_kinds)
+    if isinstance(orphan_pct, (int, float)) and orphan_pct > orphan_threshold:
+        warning_level = True
+
+    log_fn = log.warning if warning_level else log.info
+    log_fn(
+        "kg_contract.startup_check",
+        schema_version=report.get("schema_version"),
+        unknown_edge_kinds=unknown_edge_kinds,
+        planned_in_db=report.get("planned_in_db") or [],
+        orphan_pct=orphan_pct,
+        owner_pct=owner_pct,
+    )
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Startup: поднимаем prometheus-сервер.
     start_http_server(port=8001)
     log.info("application_startup", prometheus_port=8001)
+    # KG contract drift guard — read-only diagnostic, не блокирует boot.
+    _run_startup_contract_check()
     yield
     # Shutdown: закрытие локальных ресурсов только.
     # engine — синхронный sqlalchemy.Engine (create_engine), dispose() не awaitable.
