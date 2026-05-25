@@ -10,14 +10,21 @@ Beat-task `kg_metrics_sync` каждые ~10 мин:
 Идемпотентность: UNIQUE(service_id, ts); commit чанками. Все exceptions
 ловятся per-service — один проблемный сервис не валит весь sync.
 
+Параллелизм (recon 2026-05-25): fetch-фаза идёт через `asyncio.gather`
+с `asyncio.Semaphore(KG_METRICS_SYNC_CONCURRENCY)` — раньше sequential
+loop по 2908 services × 5 PromQL не укладывался в 10-минутный cron, и
+kg_anomaly_detection_task репортил `skipped_no_current=8020`. Запись в
+БД остаётся серийной после gather: SQLAlchemy Session не thread-safe.
+
 CLI: `python -m app.knowledge_graph.metrics_sync`.
 """
 from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from datetime import datetime
-from typing import Any, Dict, List, Optional, cast
+from typing import Any, Dict, List, Optional, Tuple, cast
 
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
@@ -174,6 +181,27 @@ def _insert_idempotent(
         return False
 
 
+async def _fetch_with_semaphore(
+    sem: asyncio.Semaphore,
+    vm: VMClient,
+    svc_id: int,
+    namespace: str,
+    name: str,
+) -> Tuple[int, str, str, Optional[Dict[str, Optional[float]]], Optional[BaseException]]:
+    """Per-service wrapper: ждёт slot в semaphore, ловит исключения.
+
+    Возвращает tuple `(svc_id, namespace, name, metrics_or_None, exc_or_None)`.
+    Исключение в одном сервисе НЕ роняет gather — оно сериализуется в результат
+    и обрабатывается в основном цикле.
+    """
+    async with sem:
+        try:
+            metrics = await _fetch_service_metrics(vm, namespace, name)
+            return (svc_id, namespace, name, metrics, None)
+        except BaseException as e:  # noqa: BLE001 — фиксируем всё, классифицируем выше
+            return (svc_id, namespace, name, None, e)
+
+
 async def _sync_service_health_async(db: Session) -> Dict[str, Any]:
     if not settings.VICTORIA_METRICS_URL:
         log.info("metrics_sync.skipped reason=no_vm_url")
@@ -185,37 +213,58 @@ async def _sync_service_health_async(db: Session) -> Dict[str, Any]:
     )
     ts = datetime.utcnow()
 
+    concurrency = max(1, int(settings.KG_METRICS_SYNC_CONCURRENCY))
     stats: Dict[str, Any] = {
         "real_services": len(services),
+        "concurrency": concurrency,
         "fetched": 0,
         "with_signal": 0,
         "inserted": 0,
         "skipped_empty": 0,
         "skipped_dup": 0,
         "errors": 0,
+        "duration_ms": 0,
     }
 
-    for svc in services:
-        try:
-            metrics = await _fetch_service_metrics(
-                vm, cast(str, svc.namespace), cast(str, svc.name)
+    if not services:
+        log.info("metrics_sync.done real=0 (no real services in KG)")
+        return stats
+
+    # ── Fetch phase: параллельно, с semaphore-капом ────────────────────────
+    # SQLAlchemy Session не thread/async-safe → запись делаем серийно после
+    # gather. Per-service exception ловится в _fetch_with_semaphore и в виде
+    # тапла `(..., None, exc)` попадает в результат — gather не падает.
+    sem = asyncio.Semaphore(concurrency)
+    t0 = time.monotonic()
+    results = await asyncio.gather(
+        *[
+            _fetch_with_semaphore(
+                sem, vm, cast(int, s.id), cast(str, s.namespace), cast(str, s.name),
             )
-            stats["fetched"] += 1
-        except Exception as e:
+            for s in services
+        ],
+        return_exceptions=False,
+    )
+    fetch_elapsed = time.monotonic() - t0
+
+    # ── Write phase: серийно (одна Session) ────────────────────────────────
+    for svc_id, namespace, name, metrics, exc in results:
+        if exc is not None or metrics is None:
             stats["errors"] += 1
             log.warning(
                 "metrics_sync.fetch_failed ns=%s name=%s err=%s",
-                svc.namespace, svc.name, e,
+                namespace, name, exc,
             )
             continue
 
+        stats["fetched"] += 1
         if not _has_any_signal(metrics):
             stats["skipped_empty"] += 1
             continue
 
         stats["with_signal"] += 1
         inserted = _insert_idempotent(
-            db, service_id=cast(int, svc.id), ts=ts, metrics=metrics, source="vm",
+            db, service_id=svc_id, ts=ts, metrics=metrics, source="vm",
         )
         if inserted:
             stats["inserted"] += 1
@@ -223,12 +272,15 @@ async def _sync_service_health_async(db: Session) -> Dict[str, Any]:
             stats["skipped_dup"] += 1
 
     db.commit()
+    stats["duration_ms"] = int((time.monotonic() - t0) * 1000)
+
     log.info(
-        "metrics_sync.done real=%d fetched=%d with_signal=%d inserted=%d "
-        "skipped_empty=%d skipped_dup=%d errors=%d",
-        stats["real_services"], stats["fetched"], stats["with_signal"],
+        "metrics_sync.done real=%d concurrency=%d fetched=%d with_signal=%d "
+        "inserted=%d skipped_empty=%d skipped_dup=%d errors=%d "
+        "fetch_ms=%d total_ms=%d",
+        stats["real_services"], concurrency, stats["fetched"], stats["with_signal"],
         stats["inserted"], stats["skipped_empty"], stats["skipped_dup"],
-        stats["errors"],
+        stats["errors"], int(fetch_elapsed * 1000), stats["duration_ms"],
     )
     return stats
 
