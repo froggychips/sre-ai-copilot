@@ -13,6 +13,14 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
+from tests.conftest import requires_postgres
+
+# Все тесты в файле используют module-scope `app_client` fixture, которая
+# зовёт `Base.metadata.create_all(engine)` на реальном postgres-engine из
+# app.database. Без живого postgres вся группа падает (см. conftest для
+# обоснования conditional skip).
+pytestmark = requires_postgres
+
 
 @pytest.fixture(scope="module")
 def app_client():

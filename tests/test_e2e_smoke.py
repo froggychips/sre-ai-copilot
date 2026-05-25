@@ -10,6 +10,15 @@ from unittest.mock import patch
 
 import pytest
 
+from tests.conftest import requires_postgres
+
+# E2E smoke использует реальный `engine` из app.database через
+# `Base.metadata.create_all(engine)` + чтение IncidentRecord. На
+# self-hosted CI runner'е postgres не запущен (services: блок GitHub
+# Actions работает только на ubuntu-latest). Conditional skip — см.
+# conftest._has_live_postgres / requires_postgres marker.
+pytestmark = requires_postgres
+
 
 @pytest.fixture(scope="module")
 def app_client():
