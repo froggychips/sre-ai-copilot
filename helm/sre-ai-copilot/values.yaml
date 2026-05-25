@@ -96,6 +96,24 @@ env:
   ownershipBackfillEnabled: "true"
   ownershipBackfillThreshold: "0.7"
 
+  # Путь внутри pod, по которому worker/api читают shared-infra ownership
+  # manifest (`OWNERSHIP_MANIFEST_PATH`). Mount-ится через ConfigMap
+  # `<fullname>-ownership` (см. templates/ownership-configmap.yaml). Сам
+  # манифест живёт в `helm/sre-ai-copilot/files/ownership.yaml` (копия
+  # `config/ownership.yaml`). Detail: docs/RUNBOOK.md § "Activate *-shared
+  # ownership manifest in runtime".
+  ownershipManifestPath: "/config/ownership.yaml"
+
+# Shared-infra ownership manifest (PR #96 — 14 правил, 132/132 *-shared
+# сервиса). Cm рендерится из `helm/sre-ai-copilot/files/ownership.yaml`,
+# mount-ится в worker/api как read-only subPath по
+# `env.ownershipManifestPath`. Выключить можно через
+# `--set ownershipManifest.enabled=false` — тогда worker откатывается на
+# чистые multi-signal heuristics (prefix/deploy-history/labels) и 132
+# *-shared сервиса снова становятся unowned.
+ownershipManifest:
+  enabled: true
+
 # All secret keys — fill in before deploying.
 # In production prefer SealedSecrets or ExternalSecrets (see k8s/base/secrets.*.yaml.example).
 secrets:
