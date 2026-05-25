@@ -14,6 +14,14 @@ spec:
       labels:
         app: copilot-worker
     spec:
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: env
+                    operator: In
+                    values: ["dev"]
       serviceAccountName: sre-ai
       automountServiceAccountToken: true
       securityContext:
@@ -80,6 +88,14 @@ spec:
       labels:
         app: copilot-beat
     spec:
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: env
+                    operator: In
+                    values: ["dev"]
       serviceAccountName: sre-ai
       automountServiceAccountToken: true
       securityContext:

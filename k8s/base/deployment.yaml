@@ -24,6 +24,14 @@ spec:
       labels:
         app: sre-ai-api
     spec:
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: env
+                    operator: In
+                    values: ["dev"]
       serviceAccountName: sre-ai
       automountServiceAccountToken: true
       securityContext:

@@ -68,6 +68,14 @@ spec:
       labels:
         app: redis
     spec:
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: env
+                    operator: In
+                    values: ["dev"]
       securityContext:
         runAsNonRoot: true
         runAsUser: 999
