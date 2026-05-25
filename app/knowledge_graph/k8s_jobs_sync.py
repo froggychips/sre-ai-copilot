@@ -38,10 +38,11 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import subprocess
 import sys
 from datetime import datetime
-from typing import Any, Dict, List, Optional, cast
+from typing import Any, Dict, List, Optional, Tuple, cast
 
 from sqlalchemy.orm import Session
 
@@ -63,6 +64,152 @@ DISCOVERED_BY_CRONJOB = "k8s_jobs_sync/cronjob"
 # `app` — fallback на legacy chart'ы. Можно расширить (`app.kubernetes.io/name`)
 # но пока two-level хватает; больше label'ов → шире false-match risk.
 _OWNER_LABEL_KEYS = ("app.kubernetes.io/part-of", "app")
+
+# ── Name-pattern fallback resolver ──────────────────────────────────────────
+#
+# Большинство Job/CronJob в кластере не имеют canonical `app.kubernetes.io/
+# part-of` label — особенно те, что созданы ручным `kubectl apply` или
+# helm-чарты, написанные «как принято в команде». Однако имена следуют
+# устойчивому паттерну: `<service>-backup`, `<service>-cron`,
+# `<service>-migration-<timestamp>` и т.п.
+#
+# Прод-recon 2026-05-25 показал linkage = 5/63 = 7.94%. Большинство
+# unlinked — `*-backup`, `*-cleanup`, `*-migration-*`. Этот fallback
+# восстанавливает связь, не требуя trip к owner-команде.
+#
+# Каждый regex должен:
+#   * якоривать конец строки (`$`), чтобы случайный `-backupcheck` не
+#     цеплялся за `-backup$`;
+#   * захватывать сам suffix в одну named group `suffix`, чтобы strip
+#     был тривиален через `name[:-len(match.group())]`;
+#   * НЕ хватать service-name в нулевую группу (используем строковое
+#     отрезание suffix-а — стабильнее и быстрее).
+#
+# Order не важен: матчится первый, любой matching кандидат строится
+# одинаково. Но мы держим _NAME_SUFFIX_PATTERNS как tuple для
+# детерминированной диагностики.
+_NAME_SUFFIX_PATTERNS: Tuple[re.Pattern[str], ...] = (
+    # `foo-backup`, `foo-backup-20240101120000`, `foo-backup-2024-01-01`,
+    # `foo-backup-abc123`. CronJob создаёт Job с auto-suffix (unix-ts,
+    # ISO-date или 5-char hash). Принимаем alphanumerics + `-` внутри
+    # auto-suffix, потому что k8s name pattern это допускает.
+    re.compile(r"-backup(?:-[a-z0-9-]+)?$"),
+    # `foo-cron`, `foo-cronjob`.
+    re.compile(r"-cron(?:job)?$"),
+    # `foo-migration`, `foo-migration-20240101`, `foo-migration-2024-01-01`,
+    # `foo-migration-abc12`. Alembic / ad-hoc DB migrations почти всегда
+    # такого вида.
+    re.compile(r"-migration(?:-[a-z0-9-]+)?$"),
+    # `foo-migrate`, `foo-migrate-1716542400`, `foo-migrate-2024-06-01`.
+    re.compile(r"-migrate(?:-[a-z0-9-]+)?$"),
+    # `foo-init`, `foo-init-job`.
+    re.compile(r"-init(?:-job)?$"),
+    # `foo-cleanup`, `foo-cleanup-20240101`, `foo-cleanup-2024-01-01`.
+    re.compile(r"-cleanup(?:-[a-z0-9-]+)?$"),
+    # `foo-restore`, `foo-restore-from-snap`.
+    re.compile(r"-restore(?:-[a-z0-9-]+)?$"),
+    # `foo-reindex`, `foo-reindex-20240101`, `foo-reindex-2024-01-01`.
+    re.compile(r"-reindex(?:-[a-z0-9-]+)?$"),
+)
+
+# Provenance values для metadata_json.owner_resolved_via.
+# Используется для debug + quality_report (распределение источников).
+_RESOLVED_VIA_PART_OF = "part-of_label"
+_RESOLVED_VIA_APP = "app_label"
+_RESOLVED_VIA_NAME_PATTERN = "name_pattern"
+_RESOLVED_VIA_NONE = "none"
+
+
+def _strip_name_suffix(name: str) -> Optional[str]:
+    """Strip известный jobs-suffix → predicted service name, либо None.
+
+    Идёт по `_NAME_SUFFIX_PATTERNS` и возвращает имя без первого matching
+    suffix-а. Сам поиск — `re.search` (НЕ `fullmatch`), потому что мы
+    хотим найти suffix как hвостовую часть, а не сматчить всю строку.
+
+    Edge-кейсы:
+      * пустое имя → None;
+      * имя совпадает с suffix-ом без префикса (`-backup` целиком) → None,
+        иначе получили бы пустой service name;
+      * имя без любого matching suffix → None — линковать нечего.
+    """
+    if not name:
+        return None
+    for pat in _NAME_SUFFIX_PATTERNS:
+        m = pat.search(name)
+        if not m:
+            continue
+        candidate = name[: m.start()]
+        if not candidate:
+            # `-backup` без префикса — patalogical, не служба.
+            return None
+        return candidate
+    return None
+
+
+def _resolve_owner_via_name_pattern(
+    db: Session, namespace: str, name: str,
+) -> Optional[Tuple[str, int]]:
+    """Найти owner Service по name-pattern fallback'у.
+
+    Стрипаем известный suffix (`-backup`, `-migration`, …) и проверяем
+    наличие kg_services row с этим именем в _том же_ namespace. Cross-NS
+    matching намеренно ЗАПРЕЩЁН: backup-job в `prod-shared` не должен
+    указывать на сервис из `dev-shared` (false-positive risk).
+
+    Returns (service_name, service_id) или None.
+    """
+    candidate = _strip_name_suffix(name)
+    if not candidate:
+        return None
+    svc = (
+        db.query(Service)
+        .filter_by(namespace=namespace, name=candidate)
+        .one_or_none()
+    )
+    if svc is None:
+        return None
+    return candidate, cast(int, svc.id)
+
+
+def _resolve_owner(
+    db: Session,
+    *,
+    namespace: str,
+    name: str,
+    obj_labels: Dict[str, str],
+    pod_labels: Dict[str, str],
+) -> Tuple[Optional[str], Optional[int], str]:
+    """Унифицированный owner-resolver с provenance.
+
+    Приоритет:
+      1. label `app.kubernetes.io/part-of` (canonical k8s)
+      2. label `app` (legacy charts)
+      3. name-pattern fallback (heuristic, ns-local)
+      4. none
+
+    Returns (owner_name, owner_service_id, resolved_via).
+    owner_name None ↔ resolved_via == 'none'.
+    owner_service_id может быть None даже когда owner_name найден (label
+    указывает на сервис, которого нет в kg_services — kept for backward
+    compat с текущим pipeline'ом, sync ещё может пометить skip).
+    """
+    # Label-based: смотрим metadata Job/CronJob, потом pod-template.
+    for src in (obj_labels, pod_labels):
+        if not src:
+            continue
+        if src.get("app.kubernetes.io/part-of"):
+            return src["app.kubernetes.io/part-of"], None, _RESOLVED_VIA_PART_OF
+        if src.get("app"):
+            return src["app"], None, _RESOLVED_VIA_APP
+
+    # Name-pattern fallback: ходит в БД, поэтому только после label-checks.
+    pat_match = _resolve_owner_via_name_pattern(db, namespace, name)
+    if pat_match is not None:
+        owner_name, owner_id = pat_match
+        return owner_name, owner_id, _RESOLVED_VIA_NAME_PATTERN
+
+    return None, None, _RESOLVED_VIA_NONE
 
 
 # ── kubectl wrappers ────────────────────────────────────────────────────────
@@ -305,13 +452,16 @@ def sync_all_jobs(db: Session) -> Dict[str, int]:
     Returns stats:
         jobs_fetched
         nodes_upserted
-        exit_codes_resolved   — сколько Failed Job-ов получили exit_code
+        exit_codes_resolved      — сколько Failed Job-ов получили exit_code
+        linked_via_name_pattern  — сколько Job-ов получили owner через
+                                   name-pattern fallback (без labels)
     """
     jobs = _kubectl_get_all("jobs")
     stats = {
         "jobs_fetched": len(jobs),
         "nodes_upserted": 0,
         "exit_codes_resolved": 0,
+        "linked_via_name_pattern": 0,
     }
 
     for job in jobs:
@@ -334,17 +484,30 @@ def sync_all_jobs(db: Session) -> Dict[str, int]:
 
         obj_labels = meta.get("labels") or {}
         pod_labels = _extract_pod_template_labels(job, "job")
-        owner_name = _resolve_owner_service_name(obj_labels, pod_labels)
+        owner_name, owner_id, resolved_via = _resolve_owner(
+            db, namespace=ns, name=name,
+            obj_labels=obj_labels, pod_labels=pod_labels,
+        )
 
-        metadata_json = {
+        metadata_json: Dict[str, Any] = {
             "labels": obj_labels,
             "owner_label": owner_name,
+            "owner_resolved_via": resolved_via,
             # Job чаще всего создаётся CronJob-ом, ownerReferences даёт parent.
             "owner_references": [
                 {"kind": r.get("kind"), "name": r.get("name")}
                 for r in (meta.get("ownerReferences") or [])
             ],
         }
+        # name_pattern уже дал нам service_id — кладём сразу, не ждём
+        # transitive линка через CronJob (Job может быть orphan: ad-hoc
+        # `kubectl apply` без parent).
+        if owner_id is not None:
+            metadata_json["owner_service_id"] = owner_id
+            stats["linked_via_name_pattern"] = (
+                stats.get("linked_via_name_pattern", 0)
+                + (1 if resolved_via == _RESOLVED_VIA_NAME_PATTERN else 0)
+            )
 
         fields = dict(status_fields)
         fields["last_pod_exit_code"] = exit_code
@@ -375,8 +538,9 @@ def sync_all_cronjobs(db: Session) -> Dict[str, int]:
         cronjobs_fetched
         nodes_upserted
         edges_runs_as_job        — сколько runs_as_job edges создано/обновлено
-        skipped_no_owner_label   — нет owner label вообще
+        skipped_no_owner_label   — owner не резолвится (ни label, ни name pattern)
         skipped_no_owner_match   — label есть, но в kg_services нет matching service
+        linked_via_name_pattern  — из них сматчено name-pattern fallback'ом
     """
     cronjobs = _kubectl_get_all("cronjobs")
     stats = {
@@ -385,6 +549,7 @@ def sync_all_cronjobs(db: Session) -> Dict[str, int]:
         "edges_runs_as_job": 0,
         "skipped_no_owner_label": 0,
         "skipped_no_owner_match": 0,
+        "linked_via_name_pattern": 0,
     }
 
     for cj in cronjobs:
@@ -397,11 +562,15 @@ def sync_all_cronjobs(db: Session) -> Dict[str, int]:
         cron_fields = _extract_cronjob_status(cj)
         obj_labels = meta.get("labels") or {}
         pod_labels = _extract_pod_template_labels(cj, "cronjob")
-        owner_name = _resolve_owner_service_name(obj_labels, pod_labels)
+        owner_name, owner_id_from_resolver, resolved_via = _resolve_owner(
+            db, namespace=ns, name=name,
+            obj_labels=obj_labels, pod_labels=pod_labels,
+        )
 
-        metadata_json = {
+        metadata_json: Dict[str, Any] = {
             "labels": obj_labels,
             "owner_label": owner_name,
+            "owner_resolved_via": resolved_via,
             "concurrency_policy": (cj.get("spec") or {}).get("concurrencyPolicy"),
         }
 
@@ -419,20 +588,26 @@ def sync_all_cronjobs(db: Session) -> Dict[str, int]:
         stats["nodes_upserted"] += 1
 
         # Edge runs_as_job: CronJob → owner Service из kg_services.
-        # ServiceEdge ожидает Service в обоих концах, поэтому src — это
-        # synthetic-service-обёртка над CronJob? Нет — мы хотим связать
-        # CronJob (kg_k8s_jobs) с реальным kg_services. Используем
-        # отдельный edge-механизм: store в metadata_json.
+        # Используем отдельный edge-механизм: store в metadata_json.
         if not owner_name:
             stats["skipped_no_owner_label"] += 1
             continue
 
-        owner_svc = (
-            db.query(Service)
-            .filter_by(namespace=ns, name=owner_name)
-            .one_or_none()
-        )
-        if owner_svc is None:
+        # Если resolver дал нам owner_id (name_pattern path), используем его
+        # сразу. Иначе — ищем по label.
+        if owner_id_from_resolver is not None:
+            owner_svc_id: Optional[int] = owner_id_from_resolver
+        else:
+            owner_svc = (
+                db.query(Service)
+                .filter_by(namespace=ns, name=owner_name)
+                .one_or_none()
+            )
+            owner_svc_id = (
+                cast(int, owner_svc.id) if owner_svc is not None else None
+            )
+
+        if owner_svc_id is None:
             stats["skipped_no_owner_match"] += 1
             continue
 
@@ -440,10 +615,12 @@ def sync_all_cronjobs(db: Session) -> Dict[str, int]:
         # CronJob-а (owner_service_id). Это semantic «runs_as_job»: owner
         # Service _имеет_ CronJob как побочный workflow.
         meta_with_link: Dict[str, Any] = dict(cj_node.metadata_json or {})
-        meta_with_link["owner_service_id"] = owner_svc.id
+        meta_with_link["owner_service_id"] = owner_svc_id
         cj_node.metadata_json = cast(Any, meta_with_link)
         db.flush()
         stats["edges_runs_as_job"] += 1
+        if resolved_via == _RESOLVED_VIA_NAME_PATTERN:
+            stats["linked_via_name_pattern"] += 1
 
     db.commit()
     logger.info(

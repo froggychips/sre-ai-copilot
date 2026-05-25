@@ -21,7 +21,8 @@ from app.database import Base
 from app.knowledge_graph.k8s_jobs_sync import (
     _extract_cronjob_status, _extract_job_status,
     _extract_pod_template_labels, _kubectl_get_all, _parse_k8s_time,
-    _resolve_owner_service_name, _upsert_k8s_job,
+    _resolve_owner, _resolve_owner_service_name,
+    _resolve_owner_via_name_pattern, _strip_name_suffix, _upsert_k8s_job,
     sync_all_cronjobs, sync_all_jobs, sync_k8s_jobs,
 )
 from app.knowledge_graph.populator import upsert_service
@@ -346,19 +347,24 @@ def test_sync_all_cronjobs_skip_no_owner_match(db):
 
 
 def test_link_jobs_to_cronjob_owners_transitive(db):
-    """Failed Job, созданный CronJob-ом, получает owner_service_id parent-а."""
+    """Failed Job, созданный CronJob-ом, получает owner_service_id parent-а.
+
+    Job-name намеренно НЕ соответствует name-pattern (`-unusual-suffix`),
+    чтобы изолировать тест transitive-линкера от name-pattern fallback.
+    """
     upsert_service(db, namespace="prod-shared", name="town")
     db.commit()
 
     cj = _mk_cronjob(
-        "town-backup", "prod-shared",
+        "town-unusual-suffix", "prod-shared",
         labels={"app.kubernetes.io/part-of": "town"},
     )
-    # Job без своих labels, но с ownerReferences на CronJob.
+    # Job без своих labels, без matching name-pattern, но с ownerReferences
+    # на CronJob — линкуется только через transitive resolve.
     job = _mk_job(
-        "town-backup-1716542400", "prod-shared",
+        "town-unusual-suffix-1716542400", "prod-shared",
         failed=1,
-        owner_refs=[{"kind": "CronJob", "name": "town-backup"}],
+        owner_refs=[{"kind": "CronJob", "name": "town-unusual-suffix"}],
     )
     with patch(
         "app.knowledge_graph.k8s_jobs_sync._kubectl_get_all",
@@ -371,7 +377,9 @@ def test_link_jobs_to_cronjob_owners_transitive(db):
 
     assert result["transitive_linked"] == 1
     job_node = (
-        db.query(K8sJob).filter_by(name="town-backup-1716542400", kind="job").one()
+        db.query(K8sJob)
+        .filter_by(name="town-unusual-suffix-1716542400", kind="job")
+        .one()
     )
     town = db.query(Service).filter_by(name="town").one()
     assert job_node.metadata_json["owner_service_id"] == town.id
@@ -420,3 +428,245 @@ def test_upsert_k8s_job_unique_per_kind(db):
     )
     db.commit()
     assert db.query(K8sJob).count() == 2
+
+
+# ── name-pattern fallback resolver ──────────────────────────────────────────
+
+
+@pytest.mark.parametrize("name,expected", [
+    ("foo-backup", "foo"),
+    ("foo-backup-20240101120000", "foo"),
+    ("foo-backup-2024-01-01", "foo"),
+    ("foo-backup-abc12", "foo"),
+    ("auth-cron", "auth"),
+    ("auth-cronjob", "auth"),
+    ("billing-migration", "billing"),
+    ("billing-migration-20240601", "billing"),
+    ("billing-migration-2024-06-01", "billing"),
+    ("alembic-migrate", "alembic"),
+    ("alembic-migrate-1716542400", "alembic"),
+    ("redis-init", "redis"),
+    ("redis-init-job", "redis"),
+    ("logs-cleanup", "logs"),
+    ("logs-cleanup-20240101", "logs"),
+    ("logs-cleanup-2024-01-01", "logs"),
+    ("pg-restore", "pg"),
+    ("pg-restore-from-snap", "pg"),
+    ("elastic-reindex", "elastic"),
+    ("elastic-reindex-20240105", "elastic"),
+])
+def test_strip_name_suffix_known_patterns(name, expected):
+    assert _strip_name_suffix(name) == expected
+
+
+@pytest.mark.parametrize("name", [
+    "",
+    "service-without-known-suffix",
+    "random-thing",
+    "-backup",                # patalogical: suffix без префикса
+    "foo-backupcheck",        # не якорится: -backup в середине
+    "foo-cronified",          # mid-substring, не суффикс
+])
+def test_strip_name_suffix_unknown_returns_none(name):
+    assert _strip_name_suffix(name) is None
+
+
+def test_resolve_owner_via_name_pattern_finds_service(db):
+    """`foo-backup` без labels + Service `foo` в том же ns → matched."""
+    upsert_service(db, namespace="prod-shared", name="foo")
+    db.commit()
+    result = _resolve_owner_via_name_pattern(db, "prod-shared", "foo-backup")
+    assert result is not None
+    name, svc_id = result
+    assert name == "foo"
+    svc = db.query(Service).filter_by(name="foo", namespace="prod-shared").one()
+    assert svc_id == svc.id
+
+
+def test_resolve_owner_via_name_pattern_namespace_isolated(db):
+    """Cross-namespace matching запрещён: `foo` в dev-shared ≠ owner foo-backup в prod."""
+    upsert_service(db, namespace="dev-shared", name="foo")
+    db.commit()
+    result = _resolve_owner_via_name_pattern(db, "prod-shared", "foo-backup")
+    assert result is None
+
+
+def test_resolve_owner_via_name_pattern_no_matching_service(db):
+    """Strip даёт candidate, но в kg_services этого сервиса нет → None."""
+    # Никакого `qux` сервиса не создаём.
+    result = _resolve_owner_via_name_pattern(db, "prod-shared", "qux-migration")
+    assert result is None
+
+
+# ── _resolve_owner с priority ───────────────────────────────────────────────
+
+
+def test_resolve_owner_label_priority_over_name_pattern(db):
+    """Label `app.kubernetes.io/part-of` приоритетнее name-pattern fallback'а.
+
+    Даже если name-pattern strip даст другой результат — label выигрывает.
+    """
+    upsert_service(db, namespace="prod-shared", name="canonical")
+    upsert_service(db, namespace="prod-shared", name="other")
+    db.commit()
+    # name → `other-backup` strip → `other`. Но part-of label → `canonical`.
+    owner, owner_id, via = _resolve_owner(
+        db, namespace="prod-shared", name="other-backup",
+        obj_labels={"app.kubernetes.io/part-of": "canonical"},
+        pod_labels={},
+    )
+    assert owner == "canonical"
+    # label-path не делает SELECT, owner_id остаётся None — оригинальный
+    # pipeline догоняет резолв через kg_services-lookup ниже по стеку.
+    assert owner_id is None
+    assert via == "part-of_label"
+
+
+def test_resolve_owner_app_label_priority_over_name_pattern(db):
+    upsert_service(db, namespace="prod-shared", name="myapp")
+    upsert_service(db, namespace="prod-shared", name="foo")
+    db.commit()
+    owner, owner_id, via = _resolve_owner(
+        db, namespace="prod-shared", name="foo-cron",
+        obj_labels={"app": "myapp"}, pod_labels={},
+    )
+    assert owner == "myapp"
+    assert owner_id is None
+    assert via == "app_label"
+
+
+def test_resolve_owner_falls_back_to_name_pattern_without_labels(db):
+    upsert_service(db, namespace="prod-shared", name="foo")
+    db.commit()
+    owner, owner_id, via = _resolve_owner(
+        db, namespace="prod-shared", name="foo-backup",
+        obj_labels={}, pod_labels={},
+    )
+    assert owner == "foo"
+    assert owner_id is not None
+    assert via == "name_pattern"
+
+
+def test_resolve_owner_returns_none_when_no_signal(db):
+    owner, owner_id, via = _resolve_owner(
+        db, namespace="kube-system", name="cleanup-old-things",
+        obj_labels={}, pod_labels={},
+    )
+    # `cleanup-old-things` → strip `-things`? нет такого suffix-а в нашем
+    # списке. Возвращает None по всем веткам.
+    assert owner is None
+    assert owner_id is None
+    assert via == "none"
+
+
+def test_resolve_owner_name_pattern_skipped_when_no_kg_service_match(db):
+    """Pattern даёт candidate, но в kg_services его нет → resolved_via='none'."""
+    # `qux-migration-2024-01-01` → strip `-migration-2024-01-01` → `qux`.
+    # Но Service `qux` отсутствует.
+    owner, owner_id, via = _resolve_owner(
+        db, namespace="prod-shared", name="qux-migration-2024-01-01",
+        obj_labels={}, pod_labels={},
+    )
+    assert owner is None
+    assert owner_id is None
+    assert via == "none"
+
+
+# ── end-to-end sync с name-pattern fallback ─────────────────────────────────
+
+
+def test_sync_all_jobs_links_via_name_pattern_without_labels(db):
+    """Job без labels, name=foo-backup, Service foo в ns → linked + provenance."""
+    upsert_service(db, namespace="prod-shared", name="foo")
+    db.commit()
+
+    job = _mk_job("foo-backup", "prod-shared", succeeded=1)
+    with patch(
+        "app.knowledge_graph.k8s_jobs_sync._kubectl_get_all",
+        return_value=[job],
+    ):
+        stats = sync_all_jobs(db)
+    assert stats["linked_via_name_pattern"] == 1
+
+    node = db.query(K8sJob).one()
+    assert node.owner_service_name == "foo"
+    foo = db.query(Service).filter_by(name="foo").one()
+    assert node.metadata_json["owner_service_id"] == foo.id
+    assert node.metadata_json["owner_resolved_via"] == "name_pattern"
+
+
+def test_sync_all_jobs_migration_with_date_suffix_linked(db):
+    """`qux-migration-2024-01-01` без labels → strip → линкуется к qux."""
+    upsert_service(db, namespace="sre-ai", name="qux")
+    db.commit()
+
+    job = _mk_job("qux-migration-2024-01-01", "sre-ai", succeeded=1)
+    with patch(
+        "app.knowledge_graph.k8s_jobs_sync._kubectl_get_all",
+        return_value=[job],
+    ):
+        stats = sync_all_jobs(db)
+    assert stats["linked_via_name_pattern"] == 1
+
+    node = db.query(K8sJob).one()
+    assert node.owner_service_name == "qux"
+    assert node.metadata_json["owner_resolved_via"] == "name_pattern"
+
+
+def test_sync_all_jobs_no_matching_service_records_none_provenance(db):
+    """`cleanup-old-things` в kube-system без matching kg_service → resolved_via=none."""
+    job = _mk_job("cleanup-old-things", "kube-system", succeeded=1)
+    with patch(
+        "app.knowledge_graph.k8s_jobs_sync._kubectl_get_all",
+        return_value=[job],
+    ):
+        stats = sync_all_jobs(db)
+    assert stats["linked_via_name_pattern"] == 0
+
+    node = db.query(K8sJob).one()
+    assert node.owner_service_name is None
+    assert node.metadata_json["owner_resolved_via"] == "none"
+    assert "owner_service_id" not in node.metadata_json
+
+
+def test_sync_all_cronjobs_links_via_name_pattern(db):
+    """CronJob без labels + Service в ns → edge через name_pattern."""
+    upsert_service(db, namespace="prod-shared", name="auth")
+    db.commit()
+    cj = _mk_cronjob("auth-cron", "prod-shared", schedule="0 * * * *")
+    with patch(
+        "app.knowledge_graph.k8s_jobs_sync._kubectl_get_all",
+        return_value=[cj],
+    ):
+        stats = sync_all_cronjobs(db)
+    assert stats["edges_runs_as_job"] == 1
+    assert stats["linked_via_name_pattern"] == 1
+    assert stats["skipped_no_owner_label"] == 0
+    assert stats["skipped_no_owner_match"] == 0
+
+    node = db.query(K8sJob).one()
+    auth = db.query(Service).filter_by(name="auth").one()
+    assert node.metadata_json["owner_service_id"] == auth.id
+    assert node.metadata_json["owner_resolved_via"] == "name_pattern"
+
+
+def test_sync_all_jobs_part_of_label_wins_over_pattern(db):
+    """part-of label приоритетнее name-pattern, даже если оба сматчились бы."""
+    upsert_service(db, namespace="prod-shared", name="canonical")
+    upsert_service(db, namespace="prod-shared", name="foo")
+    db.commit()
+
+    job = _mk_job(
+        "foo-backup", "prod-shared", succeeded=1,
+        labels={"app.kubernetes.io/part-of": "canonical"},
+    )
+    with patch(
+        "app.knowledge_graph.k8s_jobs_sync._kubectl_get_all",
+        return_value=[job],
+    ):
+        stats = sync_all_jobs(db)
+    # name_pattern path НЕ срабатывает — label выиграл.
+    assert stats["linked_via_name_pattern"] == 0
+    node = db.query(K8sJob).one()
+    assert node.owner_service_name == "canonical"
+    assert node.metadata_json["owner_resolved_via"] == "part-of_label"
