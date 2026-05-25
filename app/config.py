@@ -139,10 +139,11 @@ class Settings(BaseSettings):
     # `KubeAPIServerSloMaster` / `KubeAPIServerSloNode` одним префиксом.
     ALERT_SUPPRESS_NAMES: List[str] = Field(
         default_factory=lambda: [
-            "Watchdog",
-            "InfoInhibitor",
-            "KubeAPIServerSlo",
-            "KubeAPIDown",
+            "Watchdog",  # AM ping
+            "InfoInhibitor",  # AM technical
+            "KubeAPIServerSlo",  # SLO error budget duplicate (есть KubeAPI4xxResponseRate etc.)
+            # NB: KubeAPIDown НЕ в default — реальный отказ API критичен.
+            # Включить через ALERT_SUPPRESS_NAMES_EXTRA если в кластере доказано duplicate.
         ],
         description="Alertname-substrings (case-sensitive) фильтруемые на входе",
     )
