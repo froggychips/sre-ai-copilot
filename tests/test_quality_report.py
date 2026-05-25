@@ -30,7 +30,8 @@ from app.knowledge_graph.schema import (AlertEvent, Deployment, K8sJob,
 from app.knowledge_graph.stale_classifier import (STALE_CLASS_ACTIVE,
                                                   STALE_CLASS_EXPECTED,
                                                   STALE_CLASS_SUSPICIOUS)
-from app.scripts.quality_report import (QualityReport, build_report,
+from app.scripts.quality_report import (OWNER_SOURCE_UNTRACKED, QualityReport,
+                                        _coerce_metadata_dict, build_report,
                                         render_json, render_markdown)
 
 
@@ -131,7 +132,12 @@ def test_owner_known_pct_excludes_unknown_marker(db):
 
 
 def test_owner_sources_breakdown_from_metadata(db):
-    """metadata_json.owner_source → breakdown."""
+    """metadata_json.owner_source → breakdown по каноническим source-ам.
+
+    Регрессионный тест против бага "owner_source: namespace_prefix → 21
+    при 1994 реально проставленных owners": сумма всех бакетов должна
+    совпадать с owner_known_count, иначе breakdown врёт.
+    """
     _mk_svc(db, name="a", team_owner="squad-1",
             metadata_json={"owner_source": "namespace_prefix"})
     _mk_svc(db, name="b", team_owner="squad-2",
@@ -139,17 +145,101 @@ def test_owner_sources_breakdown_from_metadata(db):
     _mk_svc(db, name="c", team_owner="platform",
             metadata_json={"owner_source": "k8s_labels"})
     _mk_svc(db, name="d", team_owner="data")  # no metadata
+    _mk_svc(db, name="e", team_owner="kingdom1",
+            metadata_json={"owner_source": "deploy_history"})
     db.commit()
 
     r = build_report(db)
-    assert r.owner_sources == {"namespace_prefix": 2, "k8s_labels": 1}
+    assert r.owner_sources == {
+        "namespace_prefix": 2,
+        "k8s_labels": 1,
+        "deploy_history": 1,
+        OWNER_SOURCE_UNTRACKED: 1,  # svc "d" — owner есть, source нет
+    }
+    # Invariant: сумма breakdown == owner_known_count
+    assert sum(r.owner_sources.values()) == r.owner_known_count == 5
+
+
+def test_owner_sources_breakdown_counts_inferred_without_source(db):
+    """Главный регрессионный кейс: topology_sync пишет team_owner через
+    namespace-prefix эвристику без owner_source маркера. До PR #97 такие
+    сервисы выпадали из breakdown — отчёт показывал "21 namespace_prefix"
+    при ~2000 реально owned-сервисов. После PR — они в bucket
+    ``inferred_no_source``.
+    """
+    # 22 services with explicit namespace_prefix (как backfill_ownership пишет)
+    for i in range(22):
+        _mk_svc(db, name=f"explicit-{i}", namespace=f"squad-{i}",
+                team_owner=f"squad-{i}",
+                metadata_json={"owner_source": "namespace_prefix"})
+    # 100 services где topology_sync проставил owner без source-маркера
+    for i in range(100):
+        _mk_svc(db, name=f"inferred-{i}", namespace=f"squad-{i % 10}",
+                team_owner=f"squad-{i % 10}")
+    db.commit()
+
+    r = build_report(db)
+    assert r.owner_known_count == 122
+    assert r.owner_sources["namespace_prefix"] == 22
+    assert r.owner_sources[OWNER_SOURCE_UNTRACKED] == 100
+    # Invariant
+    assert sum(r.owner_sources.values()) == r.owner_known_count
+
+
+def test_owner_sources_excludes_unknown_marker_from_breakdown(db):
+    """team_owner='unknown' / 'n/a' / '-' / 'none' не считается owned —
+    значит и в breakdown не попадает (тот же фильтр что и в owner_known).
+    """
+    _mk_svc(db, name="a", team_owner="squad-1",
+            metadata_json={"owner_source": "namespace_prefix"})
+    _mk_svc(db, name="b", team_owner="unknown",
+            metadata_json={"owner_source": "namespace_prefix"})
+    _mk_svc(db, name="c", team_owner="n/a")
+    _mk_svc(db, name="d", team_owner="-")
+    db.commit()
+
+    r = build_report(db)
+    assert r.owner_known_count == 1  # только squad-1
+    assert r.owner_sources == {"namespace_prefix": 1}
+    assert sum(r.owner_sources.values()) == r.owner_known_count
 
 
 def test_owner_sources_note_when_empty(db):
-    _mk_svc(db, name="a", team_owner="squad-1")  # no owner_source in md
+    """Без сервисов с team_owner — owner_sources пустой, note об этом."""
+    _mk_svc(db, name="a")  # no owner at all
     db.commit()
     r = build_report(db)
-    assert "не материализовано" in r.owner_sources_note
+    assert r.owner_sources == {}
+    assert "пуст" in r.owner_sources_note
+
+
+def test_owner_sources_note_when_all_inferred(db):
+    """Все owners проставлены без source-маркера → note об этом."""
+    _mk_svc(db, name="a", team_owner="squad-1")
+    _mk_svc(db, name="b", team_owner="squad-2")
+    db.commit()
+    r = build_report(db)
+    assert r.owner_sources == {OWNER_SOURCE_UNTRACKED: 2}
+    assert "без явного" in r.owner_sources_note
+
+
+def test_owner_sources_handles_metadata_json_as_string(db):
+    """Defensive: если metadata_json пришёл строкой (legacy migration на
+    TEXT-колонку) — должны распарсить, а не молча отбросить.
+    """
+    # SQLAlchemy JSON-колонка на SQLite де-факто хранит как text — но
+    # ORM-сериализатор при assign-е dict проворачивает json.dumps. Чтобы
+    # сэмулировать "пришла строка" — bypass через прямую установку
+    # сырого значения через executemany не работает (SA всё равно пройдёт
+    # десериализацию). Поэтому юнит-тестируем _coerce_metadata_dict напрямую.
+    assert _coerce_metadata_dict(
+        '{"owner_source": "namespace_prefix"}'
+    ) == {"owner_source": "namespace_prefix"}
+    assert _coerce_metadata_dict({"owner_source": "labels"}) == {"owner_source": "labels"}
+    assert _coerce_metadata_dict(None) is None
+    assert _coerce_metadata_dict("not-json") is None
+    assert _coerce_metadata_dict("[1,2,3]") is None  # JSON но не dict
+    assert _coerce_metadata_dict(b'{"owner_source": "manual"}') == {"owner_source": "manual"}
 
 
 # ── topology ─────────────────────────────────────────────────────────────────
@@ -419,9 +509,19 @@ def test_render_markdown_contains_expected_sections(db):
     assert "## 5. Deploy attribution" in md
 
 
-def test_render_markdown_owner_sources_note_when_empty(db):
-    """Когда owner_sources пуст — markdown показывает note."""
+def test_render_markdown_owner_sources_note_when_all_inferred(db):
+    """Когда все owners проставлены без owner_source — markdown показывает
+    note про inferred_no_source, и сервис попадает в bucket."""
     _mk_svc(db, name="a", team_owner="squad-1")  # no metadata
     db.commit()
     md = render_markdown(build_report(db))
-    assert "не материализовано" in md
+    assert OWNER_SOURCE_UNTRACKED in md
+    assert "без явного" in md
+
+
+def test_render_markdown_owner_sources_note_when_no_owners(db):
+    """Когда нет owners вообще — markdown показывает note про пустоту."""
+    _mk_svc(db, name="a")  # no owner
+    db.commit()
+    md = render_markdown(build_report(db))
+    assert "пуст" in md
