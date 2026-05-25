@@ -1650,10 +1650,16 @@ def noisemakers_section(fired_series: List[dict], threshold_pct: float = 20.0) -
     return "\n".join(lines)
 
 
-def _mttr_stats(db: Session, days: int) -> Optional[Dict[str, float]]:
+def _mttr_stats(
+    db: Session, days: int, offset_days: int = 0
+) -> Optional[Dict[str, float]]:
     """Median + p95 MTTR (resolved_at - fired_at) for alerts resolved в окне.
 
-    Возвращает None если 0 resolved.
+    Окно: [now - (offset_days + days), now - offset_days). Non-overlapping
+    windows для honest trend-сравнения (offset_days=days даёт prev period
+    того же размера, не пересекающийся с current).
+
+    Возвращает None если 0 resolved в окне.
     """
     try:
         row = db.execute(text("""
@@ -1669,8 +1675,9 @@ def _mttr_stats(db: Session, days: int) -> Optional[Dict[str, float]]:
             WHERE resolved_at IS NOT NULL
               AND fired_at IS NOT NULL
               AND resolved_at >= fired_at
-              AND resolved_at > NOW() - (:days || ' days')::interval
-        """), {"days": str(days)}).fetchone()
+              AND resolved_at <  NOW() - (:offset_days || ' days')::interval
+              AND resolved_at >= NOW() - ((:offset_days + :days) || ' days')::interval
+        """), {"days": str(days), "offset_days": str(offset_days)}).fetchone()
     except Exception as e:
         log.warning("stats_digest.mttr_query_failed", error=str(e))
         return None
