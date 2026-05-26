@@ -2064,14 +2064,16 @@ def mttr_section(db: Session, days: int = 7) -> str:
 def deploy_incident_correlation_section(db: Session, hours: int = 24) -> str:
     """B7. Deploy → incident correlation.
 
-    JOIN kg_deployments × kg_alerts: service_id same AND alert fired_at
-    в окне ≤30m после deploy.started_at. Возвращает success-rate + worst deploy.
+    JOIN kg_deployments × kg_alerts: service_id same AND alert last_notified_at
+    в окне [-5m, finished_at+60m] вокруг деплоя. Используем last_notified_at
+    вместо fired_at — хронические алерты (fired_at недели назад) попадают в
+    окно по факту повторной нотификации от AM во время деплоя.
     """
     try:
-        # Сначала overall: сколько deploys, сколько attributed (≥1 alert в 30m).
+        # Сначала overall: сколько deploys, сколько attributed (≥1 alert в окне).
         overall = db.execute(text("""
             WITH recent_deploys AS (
-                SELECT id, service_id, started_at, status, build_number, triggered_by, extras
+                SELECT id, service_id, started_at, finished_at, status, build_number, triggered_by, extras
                 FROM kg_deployments
                 WHERE started_at > NOW() - (:hours || ' hours')::interval
             )
@@ -2080,8 +2082,8 @@ def deploy_incident_correlation_section(db: Session, hours: int = 24) -> str:
                 count(*) FILTER (WHERE EXISTS (
                     SELECT 1 FROM kg_alerts a
                     WHERE a.service_id = recent_deploys.service_id
-                      AND a.fired_at BETWEEN recent_deploys.started_at
-                                         AND recent_deploys.started_at + INTERVAL '30 minutes'
+                      AND a.last_notified_at BETWEEN recent_deploys.started_at - INTERVAL '5 minutes'
+                                                 AND COALESCE(recent_deploys.finished_at, recent_deploys.started_at) + INTERVAL '60 minutes'
                 )) AS attributed,
                 count(*) FILTER (WHERE status = 'SUCCESS') AS successes
             FROM recent_deploys
@@ -2106,8 +2108,8 @@ def deploy_incident_correlation_section(db: Session, hours: int = 24) -> str:
                 count(a.id) AS alert_cnt
             FROM kg_deployments d
             JOIN kg_alerts a ON a.service_id = d.service_id
-                AND a.fired_at BETWEEN d.started_at
-                                   AND d.started_at + INTERVAL '30 minutes'
+                AND a.last_notified_at BETWEEN d.started_at - INTERVAL '5 minutes'
+                                           AND COALESCE(d.finished_at, d.started_at) + INTERVAL '60 minutes'
             WHERE d.started_at > NOW() - (:hours || ' hours')::interval
             GROUP BY d.id, d.build_number, d.triggered_by
             ORDER BY count(a.id) DESC

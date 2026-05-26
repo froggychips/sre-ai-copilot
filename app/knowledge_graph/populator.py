@@ -314,6 +314,7 @@ def record_alert_event(
         )
     if existing is not None:
         existing.severity = severity or existing.severity
+        existing.last_notified_at = datetime.utcnow()
         if raw is not None:
             existing.raw = raw
         return existing
@@ -324,6 +325,7 @@ def record_alert_event(
         severity=severity,
         fingerprint=fingerprint,
         fired_at=fired_at,
+        last_notified_at=datetime.utcnow(),
         incident_id=incident_id,
         raw=raw,
     )
