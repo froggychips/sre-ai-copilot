@@ -24,6 +24,10 @@ from app.knowledge_graph.schema import (AlertEvent, Deployment, PodEvent,
 logger = structlog.get_logger()
 
 
+def _is_postgresql(db: Session) -> bool:
+    return db.get_bind().dialect.name == "postgresql"
+
+
 def upsert_service(
     db: Session,
     namespace: str,
@@ -31,6 +35,68 @@ def upsert_service(
     team_owner: Optional[str] = None,
     metadata: Optional[Dict[str, Any]] = None,
     synthetic: Optional[bool] = None,
+) -> Service:
+    """Idempotent upsert.
+
+    На PostgreSQL использует INSERT ON CONFLICT DO UPDATE — атомарно, без
+    race condition при параллельных worker'ах.
+    На других диалектах (SQLite в тестах) — старый SELECT+INSERT.
+    """
+    if _is_postgresql(db):
+        return _upsert_service_pg(db, namespace, name, team_owner, metadata, synthetic)
+    return _upsert_service_fallback(db, namespace, name, team_owner, metadata, synthetic)
+
+
+def _upsert_service_pg(
+    db: Session,
+    namespace: str,
+    name: str,
+    team_owner: Optional[str],
+    metadata: Optional[Dict[str, Any]],
+    synthetic: Optional[bool],
+) -> Service:
+    from sqlalchemy.dialects.postgresql import insert as pg_insert
+
+    now = datetime.utcnow()
+    values: Dict[str, Any] = {
+        "namespace": namespace,
+        "name": name,
+        "team_owner": team_owner,
+        "metadata_json": metadata,
+        "synthetic": bool(synthetic) if synthetic is not None else False,
+        "created_at": now,
+        "updated_at": now,
+    }
+    set_clause: Dict[str, Any] = {"updated_at": now}
+    if team_owner:
+        set_clause["team_owner"] = team_owner
+    if metadata is not None:
+        set_clause["metadata_json"] = metadata
+    if synthetic is not None:
+        set_clause["synthetic"] = bool(synthetic)
+
+    stmt = (
+        pg_insert(Service.__table__)
+        .values(**values)
+        .on_conflict_do_update(
+            constraint="uq_kg_service_ns_name",
+            set_=set_clause,
+        )
+        .returning(Service.__table__.c.id)
+    )
+    db.execute(stmt)
+    db.flush()
+    logger.info("kg.service_upserted", namespace=namespace, name=name)
+    return db.query(Service).filter_by(namespace=namespace, name=name).one()
+
+
+def _upsert_service_fallback(
+    db: Session,
+    namespace: str,
+    name: str,
+    team_owner: Optional[str],
+    metadata: Optional[Dict[str, Any]],
+    synthetic: Optional[bool],
 ) -> Service:
     svc = (
         db.query(Service)
@@ -75,48 +141,97 @@ def upsert_edge(
 ) -> ServiceEdge:
     """Idempotent upsert по (src_id, dst_id, kind).
 
-    `extras` (JSON) — место для метаданных, которые не заслуживают отдельной
-    колонки: confidence (inferred_env / runtime_seen / stale / confirmed),
-    semantics (sync / async), retry, timeout, etc. На update — JSON merge,
-    не overwrite, чтобы более поздний (runtime) источник не стёр манульные
-    annotations.
+    На PostgreSQL — INSERT ON CONFLICT, исключает race condition.
+    `extras` (JSON): discovery_sources и confidence — merge, не overwrite.
     """
+    if _is_postgresql(db):
+        return _upsert_edge_pg(db, src, dst, kind, weight, discovered_by, extras)
+    return _upsert_edge_fallback(db, src, dst, kind, weight, discovered_by, extras)
+
+
+def _upsert_edge_pg(
+    db: Session,
+    src: Service,
+    dst: Service,
+    kind: str,
+    weight: int,
+    discovered_by: Optional[str],
+    extras: Optional[Dict[str, Any]],
+) -> ServiceEdge:
+    from sqlalchemy.dialects.postgresql import insert as pg_insert
+
+    now = datetime.utcnow()
+    initial_extras = dict(extras or {})
+    if discovered_by:
+        initial_extras.setdefault("discovery_sources", [discovered_by])
+
+    stmt = (
+        pg_insert(ServiceEdge.__table__)
+        .values(
+            src_id=src.id, dst_id=dst.id, kind=kind,
+            weight=weight, discovered_by=discovered_by,
+            extras=initial_extras or None, last_seen_at=now,
+        )
+        .on_conflict_do_update(
+            constraint="uq_kg_edge_src_dst_kind",
+            set_={"last_seen_at": now, "weight": weight,
+                  **({"discovered_by": discovered_by} if discovered_by else {})},
+        )
+    )
+    db.execute(stmt)
+    db.flush()
+
+    edge = db.query(ServiceEdge).filter_by(src_id=src.id, dst_id=dst.id, kind=kind).one()
+    # C3: merge extras + discovery_sources в Python (JSONB merge в SQL сложнее).
+    merged = dict(edge.extras or {})
+    changed = False
+    if extras:
+        merged.update(extras)
+        changed = True
+    if discovered_by:
+        sources = list(merged.get("discovery_sources") or [])
+        if discovered_by not in sources:
+            sources.append(discovered_by)
+            merged["discovery_sources"] = sources
+            changed = True
+    if changed and merged != (edge.extras or {}):
+        edge.extras = merged
+        db.flush()
+    return edge
+
+
+def _upsert_edge_fallback(
+    db: Session,
+    src: Service,
+    dst: Service,
+    kind: str,
+    weight: int,
+    discovered_by: Optional[str],
+    extras: Optional[Dict[str, Any]],
+) -> ServiceEdge:
     edge = (
         db.query(ServiceEdge)
-        .filter(
-            ServiceEdge.src_id == src.id,
-            ServiceEdge.dst_id == dst.id,
-            ServiceEdge.kind == kind,
-        )
+        .filter(ServiceEdge.src_id == src.id, ServiceEdge.dst_id == dst.id,
+                ServiceEdge.kind == kind)
         .one_or_none()
     )
     now = datetime.utcnow()
-    # C3: список discovery_sources для confidence-tracking. Edge увиденный
-    # из 2+ источников (например env_url_v2 + nats_env) — выше confidence
-    # чем одиночный inference.
     initial_extras = dict(extras or {})
     if discovered_by:
         initial_extras.setdefault("discovery_sources", [discovered_by])
 
     if edge is None:
         edge = ServiceEdge(
-            src_id=src.id,
-            dst_id=dst.id,
-            kind=kind,
-            weight=weight,
-            discovered_by=discovered_by,
-            extras=initial_extras or None,
+            src_id=src.id, dst_id=dst.id, kind=kind, weight=weight,
+            discovered_by=discovered_by, extras=initial_extras or None,
             last_seen_at=now,
         )
         db.add(edge)
         db.flush()
     else:
-        # C1: каждый upsert — refresh last_seen_at. Edges, не подтверждённые
-        # N дней, попадут в decay-task (см. queries.upstream_of(fresh_only=)).
         edge.last_seen_at = now
         if edge.weight != weight:
             edge.weight = weight
-        # C3: merge discovery_sources unique-list, не overwrite одним источником.
         merged = dict(edge.extras or {})
         if extras:
             merged.update(extras)

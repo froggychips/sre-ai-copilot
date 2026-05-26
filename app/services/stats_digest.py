@@ -777,6 +777,7 @@ def fragile_services_section(db: Session, ns_to_team: Dict[str, str]) -> str:
             LEFT JOIN kg_service_edges e ON e.dst_id = s.id
             WHERE NOT s.synthetic
               AND (s.team_owner IS NULL OR s.team_owner != 'platform')
+              AND s.name !~ '(-metrics|-backup|-exporter|-postgresql-metrics)$'
             GROUP BY s.id, s.name, s.namespace, s.health_score
             HAVING count(e.id) > 0
             ORDER BY callers DESC
