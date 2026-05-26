@@ -96,6 +96,10 @@ class AlertEvent(Base):
     severity = Column(String, nullable=True)
     fingerprint = Column(String, nullable=True, unique=True, index=True)
     fired_at = Column(DateTime, nullable=False, index=True)
+    # Последний раз, когда AM прислал webhook по этому alert-у (repeat_interval).
+    # Для хронических алертов (fired_at недели назад) именно это поле попадает
+    # в окно деплоя и используется в deploy_incident_correlation_section.
+    last_notified_at = Column(DateTime, nullable=True, index=True)
     resolved_at = Column(DateTime, nullable=True)
     incident_id = Column(String, nullable=True, index=True)  # связь с IncidentRecord
     raw = Column(JSON, nullable=True)
