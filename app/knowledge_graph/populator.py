@@ -328,10 +328,18 @@ def record_alert_event(
         db.flush()
         return ev
 
-    from sqlalchemy import func
     from sqlalchemy.dialects.postgresql import insert as pg_insert
 
     tbl = AlertEvent.__table__
+    # На конфликт обновляем только переданные поля (как было до upsert):
+    # severity/raw трогаем лишь если непустые, last_notified_at — всегда.
+    # COALESCE здесь не годится: JSON-колонка сериализует None как JSON
+    # `null` (не SQL NULL), и COALESCE(EXCLUDED.raw, ...) затёр бы raw.
+    set_clause: Dict[str, Any] = {"last_notified_at": now}
+    if severity:
+        set_clause["severity"] = severity
+    if raw is not None:
+        set_clause["raw"] = raw
     stmt = pg_insert(tbl).values(
         service_id=service.id if service else None,
         alertname=alertname,
@@ -341,14 +349,9 @@ def record_alert_event(
         last_notified_at=now,
         incident_id=incident_id,
         raw=raw,
-    )
-    stmt = stmt.on_conflict_do_update(
+    ).on_conflict_do_update(
         index_elements=["fingerprint"],
-        set_={
-            "severity": func.coalesce(stmt.excluded.severity, tbl.c.severity),
-            "last_notified_at": stmt.excluded.last_notified_at,
-            "raw": func.coalesce(stmt.excluded.raw, tbl.c.raw),
-        },
+        set_=set_clause,
     )
     db.execute(stmt)
     db.flush()
