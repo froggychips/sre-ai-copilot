@@ -355,9 +355,13 @@ def record_alert_event(
     )
     db.execute(stmt)
     db.flush()
+    # populate_existing(): upsert шёл через Core, поэтому identity-map мог
+    # держать stale-инстанс (severity/raw с прошлого вызова). Перечитываем
+    # строку поверх него, иначе вернём устаревшие атрибуты.
     return (
         db.query(AlertEvent)
         .filter(AlertEvent.fingerprint == fingerprint)
+        .populate_existing()
         .one()
     )
 
