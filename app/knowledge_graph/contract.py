@@ -474,6 +474,31 @@ def STARTUP_CONTRACT_CHECK(db: "Session") -> Dict[str, object]:
             },
         )
 
+    # Physical-schema integrity. Регрессия 2026-06-01: restore из
+    # `pg_dump --data-only` срезал PRIMARY KEY/индексы со ВСЕХ kg_* таблиц
+    # (alembic_version при этом остался на head). Без PK суррогатный id
+    # переставал быть уникальным → ORM `UPDATE WHERE id=` цеплял >1 строки
+    # → StaleDataError → kg_alerts_resolve_sync/kg_jobs_sync падали каждый
+    # прогон. Этот guard ловит такой дрейф на boot (log.error — не gate).
+    try:
+        rows = db.execute(text(
+            "SELECT c.relname, EXISTS(SELECT 1 FROM pg_constraint x "
+            "  WHERE x.conrelid = c.oid AND x.contype = 'p') "
+            "FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace "
+            "WHERE n.nspname = 'public' AND c.relkind = 'r'"
+        )).fetchall()
+        missing_pk = sorted(r[0] for r in rows if r[0].startswith("kg_") and not r[1])
+        report["missing_primary_key"] = missing_pk
+        if missing_pk:
+            log.error(
+                "kg_contract.missing_primary_key",
+                extra={"tables": missing_pk},
+            )
+    except Exception as exc:  # pragma: no cover - best-effort
+        log.warning(
+            "kg_contract.schema_integrity_check_failed", extra={"error": str(exc)}
+        )
+
     return report
 
 

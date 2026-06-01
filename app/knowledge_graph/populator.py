@@ -304,34 +304,59 @@ def record_alert_event(
     incident_id: Optional[str] = None,
     raw: Optional[Dict[str, Any]] = None,
 ) -> AlertEvent:
-    """Идемпотентно по fingerprint — если уже есть, обновляем resolved_at и raw."""
-    existing: Optional[AlertEvent] = None
-    if fingerprint:
-        existing = (
-            db.query(AlertEvent)
-            .filter(AlertEvent.fingerprint == fingerprint)
-            .one_or_none()
-        )
-    if existing is not None:
-        existing.severity = severity or existing.severity
-        existing.last_notified_at = datetime.utcnow()
-        if raw is not None:
-            existing.raw = raw
-        return existing
+    """Идемпотентно по fingerprint через INSERT ON CONFLICT — race-safe при
+    нескольких репликах воркера (раньше check-then-insert ловил гонку, а с
+    восстановленным UNIQUE(fingerprint) — ещё и IntegrityError). На конфликт:
+    severity/raw обновляются только если переданы (COALESCE), last_notified_at
+    всегда; service_id/fired_at/incident_id/resolved_at не трогаем.
 
-    ev = AlertEvent(
+    Без fingerprint идемпотентность невозможна — обычный insert.
+    """
+    now = datetime.utcnow()
+    if not fingerprint:
+        ev = AlertEvent(
+            service_id=service.id if service else None,
+            alertname=alertname,
+            severity=severity,
+            fingerprint=None,
+            fired_at=fired_at,
+            last_notified_at=now,
+            incident_id=incident_id,
+            raw=raw,
+        )
+        db.add(ev)
+        db.flush()
+        return ev
+
+    from sqlalchemy import func
+    from sqlalchemy.dialects.postgresql import insert as pg_insert
+
+    tbl = AlertEvent.__table__
+    stmt = pg_insert(tbl).values(
         service_id=service.id if service else None,
         alertname=alertname,
         severity=severity,
         fingerprint=fingerprint,
         fired_at=fired_at,
-        last_notified_at=datetime.utcnow(),
+        last_notified_at=now,
         incident_id=incident_id,
         raw=raw,
     )
-    db.add(ev)
+    stmt = stmt.on_conflict_do_update(
+        index_elements=["fingerprint"],
+        set_={
+            "severity": func.coalesce(stmt.excluded.severity, tbl.c.severity),
+            "last_notified_at": stmt.excluded.last_notified_at,
+            "raw": func.coalesce(stmt.excluded.raw, tbl.c.raw),
+        },
+    )
+    db.execute(stmt)
     db.flush()
-    return ev
+    return (
+        db.query(AlertEvent)
+        .filter(AlertEvent.fingerprint == fingerprint)
+        .one()
+    )
 
 
 def record_pod_event(
