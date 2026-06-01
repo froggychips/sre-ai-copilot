@@ -1,0 +1,17 @@
+.git
+.gitignore
+.claude
+.github
+**/__pycache__
+*.pyc
+*.pyo
+.pytest_cache
+.ruff_cache
+.mypy_cache
+.venv
+venv
+*.md
+docs
+tests
+*.sql
+*.dump

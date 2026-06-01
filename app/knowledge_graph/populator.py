@@ -304,34 +304,66 @@ def record_alert_event(
     incident_id: Optional[str] = None,
     raw: Optional[Dict[str, Any]] = None,
 ) -> AlertEvent:
-    """Идемпотентно по fingerprint — если уже есть, обновляем resolved_at и raw."""
-    existing: Optional[AlertEvent] = None
-    if fingerprint:
-        existing = (
-            db.query(AlertEvent)
-            .filter(AlertEvent.fingerprint == fingerprint)
-            .one_or_none()
-        )
-    if existing is not None:
-        existing.severity = severity or existing.severity
-        existing.last_notified_at = datetime.utcnow()
-        if raw is not None:
-            existing.raw = raw
-        return existing
+    """Идемпотентно по fingerprint через INSERT ON CONFLICT — race-safe при
+    нескольких репликах воркера (раньше check-then-insert ловил гонку, а с
+    восстановленным UNIQUE(fingerprint) — ещё и IntegrityError). На конфликт:
+    severity/raw обновляются только если переданы (COALESCE), last_notified_at
+    всегда; service_id/fired_at/incident_id/resolved_at не трогаем.
 
-    ev = AlertEvent(
+    Без fingerprint идемпотентность невозможна — обычный insert.
+    """
+    now = datetime.utcnow()
+    if not fingerprint:
+        ev = AlertEvent(
+            service_id=service.id if service else None,
+            alertname=alertname,
+            severity=severity,
+            fingerprint=None,
+            fired_at=fired_at,
+            last_notified_at=now,
+            incident_id=incident_id,
+            raw=raw,
+        )
+        db.add(ev)
+        db.flush()
+        return ev
+
+    from sqlalchemy.dialects.postgresql import insert as pg_insert
+
+    tbl = AlertEvent.__table__
+    # На конфликт обновляем только переданные поля (как было до upsert):
+    # severity/raw трогаем лишь если непустые, last_notified_at — всегда.
+    # COALESCE здесь не годится: JSON-колонка сериализует None как JSON
+    # `null` (не SQL NULL), и COALESCE(EXCLUDED.raw, ...) затёр бы raw.
+    set_clause: Dict[str, Any] = {"last_notified_at": now}
+    if severity:
+        set_clause["severity"] = severity
+    if raw is not None:
+        set_clause["raw"] = raw
+    stmt = pg_insert(tbl).values(
         service_id=service.id if service else None,
         alertname=alertname,
         severity=severity,
         fingerprint=fingerprint,
         fired_at=fired_at,
-        last_notified_at=datetime.utcnow(),
+        last_notified_at=now,
         incident_id=incident_id,
         raw=raw,
+    ).on_conflict_do_update(
+        index_elements=["fingerprint"],
+        set_=set_clause,
     )
-    db.add(ev)
+    db.execute(stmt)
     db.flush()
-    return ev
+    # populate_existing(): upsert шёл через Core, поэтому identity-map мог
+    # держать stale-инстанс (severity/raw с прошлого вызова). Перечитываем
+    # строку поверх него, иначе вернём устаревшие атрибуты.
+    return (
+        db.query(AlertEvent)
+        .filter(AlertEvent.fingerprint == fingerprint)
+        .populate_existing()
+        .one()
+    )
 
 
 def record_pod_event(
