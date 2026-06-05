@@ -7,8 +7,11 @@ TC build details и UPDATE sha (если есть revisions).
 from __future__ import annotations
 
 import argparse
+import json
 import logging
+import re
 import time
+from typing import Any
 
 from sqlalchemy import text
 
@@ -21,9 +24,21 @@ logger = logging.getLogger(__name__)
 _FIELDS = "revisions(revision(version,vcs-root-instance(name,vcs-root-id)))"
 
 
-def _fetch_sha(client: TeamCityClient, buildtype_id: str, build_number: str) -> tuple[str | None, list[dict]]:
+def _build_id_from_extras(extras: Any) -> str | None:
+    """TC build id из extras.url (?buildId=<N>) — для надёжного id-локатора."""
+    if not extras:
+        return None
+    if isinstance(extras, str):
+        try:
+            extras = json.loads(extras)
+        except Exception:
+            return None
+    m = re.search(r"buildId=(\d+)", (extras or {}).get("url") or "")
+    return m.group(1) if m else None
+
+
+def _fetch_sha(client: TeamCityClient, locator: str) -> tuple[str | None, list[dict]]:
     """Вернёт (sha, all_revisions). Если revisions пусто или 404 — (None, [])."""
-    locator = f"buildType:{buildtype_id},number:{build_number}"
     try:
         data = client.get_json(f"/app/rest/builds/{locator}", params={"fields": _FIELDS})
     except TCError as e:
@@ -50,7 +65,7 @@ def run(limit: int = 0, dry_run: bool = False, sleep_sec: float = 0.05) -> dict:
     updated = skipped_no_rev = errors = 0
     with SessionLocal() as db:
         sql = """
-            SELECT id, buildtype_id, build_number
+            SELECT id, buildtype_id, build_number, extras
             FROM kg_deployments
             WHERE sha IS NULL
               AND buildtype_id IS NOT NULL
@@ -64,9 +79,17 @@ def run(limit: int = 0, dry_run: bool = False, sleep_sec: float = 0.05) -> dict:
         logger.info("backfill_existing_sha.start", extra={"candidates": total, "dry_run": dry_run})
         print(f"candidates: {total}, dry_run={dry_run}")
 
-        for i, (dep_id, bt, num) in enumerate(rows, 1):
+        for i, (dep_id, bt, num, extras) in enumerate(rows, 1):
+            # id-локатор надёжнее number: number:<N> у branched/FAILURE-билдов
+            # отдаёт 404 (поиск по default-branch). build id берём из
+            # extras.url (?buildId=); fallback — number + branch:any,state:any.
+            build_id = _build_id_from_extras(extras)
+            locator = (
+                f"id:{build_id}" if build_id
+                else f"buildType:{bt},number:{num},branch:(default:any),state:any"
+            )
             try:
-                sha, all_rev = _fetch_sha(client, bt, str(num))
+                sha, all_rev = _fetch_sha(client, locator)
             except Exception as e:
                 errors += 1
                 if errors <= 5:
