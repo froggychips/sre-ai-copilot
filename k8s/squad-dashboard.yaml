@@ -21,11 +21,11 @@
 #     --from-literal=WINDOW=400 \
 #     --from-literal=CH_USER=analytics \
 #     --from-literal=CH_PORT=8123 \
-#     --from-literal=CH_SQUAD1_HOST=clickhouse.squad-1.svc.cluster.local \
-#     --from-literal=CH_SQUAD2_HOST=clickhouse.squad-2.svc.cluster.local \
 #     --dry-run=client -o yaml | kubectl apply -f -
-#   # (squad-3..24 резолвятся по фолбэку clickhouse.squad-N-shared.svc.cluster.local;
-#   #  CH_USER/PORT и хосты squad-1/2 = те же, что в configMap mcp-tools-server-config)
+#   # Все сквады резолвятся по фолбэку clickhouse.squad-N-shared.svc.cluster.local.
+#   # (bare-ns clickhouse.squad-N.svc из mcp-tools-server-config из ns sre-ai НЕ резолвится;
+#   #  при необходимости индивидуальный override — env CH_SQUAD{N}_HOST.)
+#   # CH_USER=analytics — тот же юзер, что у mcp-tools-server.
 #
 #   # 3. Секрет с токенами (значения не в репо; --from-file без эха в shell):
 #   kubectl -n sre-ai create secret generic squad-dashboard-secrets \
