@@ -230,25 +230,31 @@ async def _sync_service_health_async(db: Session) -> Dict[str, Any]:
         log.info("metrics_sync.done real=0 (no real services in KG)")
         return stats
 
-    # ── Fetch phase: параллельно, с semaphore-капом ────────────────────────
-    # SQLAlchemy Session не thread/async-safe → запись делаем серийно после
-    # gather. Per-service exception ловится в _fetch_with_semaphore и в виде
-    # тапла `(..., None, exc)` попадает в результат — gather не падает.
+    # ── Fetch + write, чередуя через as_completed ──────────────────────────
+    # SQLAlchemy Session не thread/async-safe → запись делаем серийно в этом
+    # же event-loop по мере готовности фетчей. Per-service exception ловится
+    # в _fetch_with_semaphore и в виде тапла `(..., None, exc)` попадает в
+    # результат — итерация не падает.
+    #
+    # КРИТИЧНО (recon 2026-06-05): раньше был один `db.commit()` в самом конце
+    # после полного gather. При росте до ~2.4k сервисов полный проход стал
+    # вылезать за soft-time-limit (а наложение прогонов перегружало одиночный
+    # vmsingle) → задача убивалась ДО commit → kg_service_health/anomaly
+    # замёрзли с 2026-06-01. Теперь коммитим батчами по мере готовности:
+    # убитый/затянувшийся прогон всё равно персистит всё, что успел собрать.
     sem = asyncio.Semaphore(concurrency)
     t0 = time.monotonic()
-    results = await asyncio.gather(
-        *[
-            _fetch_with_semaphore(
-                sem, vm, cast(int, s.id), cast(str, s.namespace), cast(str, s.name),
-            )
-            for s in services
-        ],
-        return_exceptions=False,
-    )
-    fetch_elapsed = time.monotonic() - t0
+    coros = [
+        _fetch_with_semaphore(
+            sem, vm, cast(int, s.id), cast(str, s.namespace), cast(str, s.name),
+        )
+        for s in services
+    ]
 
-    # ── Write phase: серийно (одна Session) ────────────────────────────────
-    for svc_id, namespace, name, metrics, exc in results:
+    COMMIT_BATCH = 250
+    since_commit = 0
+    for fut in asyncio.as_completed(coros):
+        svc_id, namespace, name, metrics, exc = await fut
         if exc is not None or metrics is None:
             stats["errors"] += 1
             log.warning(
@@ -271,7 +277,13 @@ async def _sync_service_health_async(db: Session) -> Dict[str, Any]:
         else:
             stats["skipped_dup"] += 1
 
+        since_commit += 1
+        if since_commit >= COMMIT_BATCH:
+            db.commit()
+            since_commit = 0
+
     db.commit()
+    fetch_elapsed = time.monotonic() - t0
     stats["duration_ms"] = int((time.monotonic() - t0) * 1000)
 
     log.info(
