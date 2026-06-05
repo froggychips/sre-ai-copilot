@@ -590,17 +590,26 @@ def _extract_db_targets(
 
 
 def _derive_team_owner(namespace: str) -> Optional[str]:
-    """team_owner = namespace без env-prefix.
+    """team_owner по namespace — каноничная prefix-таблица из ownership_suggester.
 
-    prod-kingdom1     → "kingdom1"
-    preprod-shared    → "shared"
-    preupdate-kingdom3 → "kingdom3"
-    squad-3-shared    → "shared"
-    squad-19-kingdom2 → "kingdom2"
-    sre-ai            → None  (не WO-env-prefix)
+    prod-kingdom1      → "kingdom1"
+    preprod-shared     → "shared"
+    squad-3-shared     → "squad-3"     (realm принадлежит squad, не "shared")
+    squad-19-kingdom2  → "squad-19"
+    monitoring/logging → "platform"
+    sre-ai             → None
+
+    РАНЬШЕ (до 2026-06-05) тут был отдельный regex, который для squad-стендов
+    отдавал суффикс ("shared"/"kingdomN") вместо самого squad-N — отсюда
+    рассинхрон с suggest_owner_multi_signal и ~456 squad-сервисов без
+    осмысленного owner. Делегируем в единый `_try_prefix_match`, чтобы
+    периодический sync (он перезаписывает team_owner при каждом проходе)
+    нормализовал все squad-сервисы автоматически.
     """
-    m = re.match(r"^(?:prod|preprod|preupdate|squad-\d+)-(.+)$", namespace)
-    return m.group(1) if m else None
+    # Локальный импорт — избегаем тяжёлого import-time графа зависимостей.
+    from app.services.ownership_suggester import _try_prefix_match
+
+    return _try_prefix_match(namespace)
 
 
 def _env_prefix(namespace: str) -> Optional[str]:

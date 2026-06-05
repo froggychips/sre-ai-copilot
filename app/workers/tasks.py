@@ -120,6 +120,10 @@ celery_app.conf.beat_schedule = {
     "kg-metrics-sync": {
         "task": "kg_metrics_sync",
         "schedule": crontab(minute="*/10"),
+        # expires < интервал: если воркер не подхватил тик за 9 мин (backlog),
+        # дропаем его вместо накопления параллельных прогонов — наложение
+        # перегружало одиночный vmsingle (recon 2026-06-05, см. metrics_sync).
+        "options": {"expires": 540},
     },
     # Global cluster snapshot — те же поля что в #stats daily report,
     # но раз в 5 мин и материализованно. Используется для trend-аналитики

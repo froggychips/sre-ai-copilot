@@ -73,12 +73,14 @@ log = logging.getLogger(__name__)
 _PREFIX_PATTERNS = [
     # squad-N-realm → squad-N (тимплейт WO: `squad-7-shared` принадлежит squad-7)
     (re.compile(r"^squad-(\d+)-"), lambda m: f"squad-{m.group(1)}"),
-    # <env>-kingdom<N> → kingdom<N>
-    (re.compile(r"^(?:prod|preprod|dev|staging|qa)-kingdom(\d+)$"), lambda m: f"kingdom{m.group(1)}"),
+    # squad-gd-realm → squad-gd (GD-стенд: суффикс не число)
+    (re.compile(r"^squad-(gd)-"), lambda m: f"squad-{m.group(1)}"),
+    # <env>-kingdom<N> → kingdom<N>  (preupdate включён: реальный WO-env)
+    (re.compile(r"^(?:prod|preprod|preupdate|dev|staging|qa)-kingdom(\d+)$"), lambda m: f"kingdom{m.group(1)}"),
     # <env>-shared → shared
-    (re.compile(r"^(?:prod|preprod|dev|staging|qa)-shared$"), lambda _m: "shared"),
+    (re.compile(r"^(?:prod|preprod|preupdate|dev|staging|qa)-shared$"), lambda _m: "shared"),
     # <env>-payments / <env>-data / <env>-tools / т.п. — single-realm
-    (re.compile(r"^(?:prod|preprod|dev|staging|qa)-(payments|data|tools|cdn|statics|logging|monitoring|search)$"),
+    (re.compile(r"^(?:prod|preprod|preupdate|dev|staging|qa)-(payments|data|tools|cdn|statics|logging|monitoring|search)$"),
      lambda m: m.group(1)),
     # bare team-namespaces без env-префикса: monitoring/logging/cert-manager/ingress-nginx
     (re.compile(r"^(monitoring|logging|cert-manager|ingress-nginx|kube-system|cattle-system|metallb-system|local-path-storage)$"),

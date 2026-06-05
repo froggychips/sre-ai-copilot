@@ -218,18 +218,28 @@ def test_team_owner_preprod_and_preupdate():
 
 
 def test_team_owner_non_wo_namespace():
-    """sre-ai, monitoring, kube-system — не WO-формат."""
+    """sre-ai/default — не WO-формат → None.
+
+    monitoring/kube-system теперь канонизируются в "platform" (единая
+    prefix-таблица из ownership_suggester, fix 2026-06-05).
+    """
     assert _derive_team_owner("sre-ai") is None
-    assert _derive_team_owner("monitoring") is None
-    assert _derive_team_owner("kube-system") is None
     assert _derive_team_owner("default") is None
+    assert _derive_team_owner("monitoring") == "platform"
+    assert _derive_team_owner("kube-system") == "platform"
 
 
 def test_team_owner_squad_realms():
-    """A1: squad-N-shared/kingdom* — owner = последний компонент."""
-    assert _derive_team_owner("squad-3-shared") == "shared"
-    assert _derive_team_owner("squad-19-kingdom2") == "kingdom2"
-    assert _derive_team_owner("squad-1-payments") == "payments"
+    """squad-N-realm принадлежит самому squad-N (а не суффиксу realm).
+
+    Унифицировано с suggest_owner_multi_signal (fix 2026-06-05): раньше
+    отдавали суффикс "shared"/"kingdomN" — отсюда ~456 squad-сервисов без
+    осмысленного owner.
+    """
+    assert _derive_team_owner("squad-3-shared") == "squad-3"
+    assert _derive_team_owner("squad-19-kingdom2") == "squad-19"
+    assert _derive_team_owner("squad-1-payments") == "squad-1"
+    assert _derive_team_owner("squad-gd-kingdom1") == "squad-gd"
 
 
 # ── NATS cluster extraction ─────────────────────────────────────────────────
