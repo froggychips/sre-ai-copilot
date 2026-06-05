@@ -1,0 +1,101 @@
+# WO-11335 — авто-генерация Confluence-дашборда по сквадам (раз в час).
+#
+# Скрипт: scripts/squad_dashboard.py (KG через DATABASE_URL, лейблы ns через in-cluster
+# k8s API по SA, TeamCity REST, рендер storage-XHTML, PUT в Confluence).
+#
+# Все env-специфичные значения (URL'ы инстансов, email, page-id) и токены НЕ в этом
+# манифесте — они в in-cluster объектах, чтобы манифест оставался generic:
+#
+#   # 1. ConfigMap со скриптом:
+#   kubectl -n sre-ai create configmap squad-dashboard-script \
+#     --from-file=squad_dashboard.py=scripts/squad_dashboard.py \
+#     --dry-run=client -o yaml | kubectl apply -f -
+#
+#   # 2. ConfigMap с env (НЕ секретные значения окружения):
+#   kubectl -n sre-ai create configmap squad-dashboard-env \
+#     --from-literal=TC_URL=https://<teamcity-host> \
+#     --from-literal=CONFLUENCE_BASE=https://<confluence-host>/wiki \
+#     --from-literal=CONFLUENCE_EMAIL=<atlassian-account-email> \
+#     --from-literal=CONFLUENCE_PAGE_ID=<page-id> \
+#     --from-literal=CONFLUENCE_TITLE='<page-title>' \
+#     --from-literal=WINDOW=400 \
+#     --dry-run=client -o yaml | kubectl apply -f -
+#
+#   # 3. Секрет с токенами (значения не в репо; --from-file без эха в shell):
+#   kubectl -n sre-ai create secret generic squad-dashboard-secrets \
+#     --from-file=tc_token=/path/tc_token \
+#     --from-file=confluence_token=/path/confluence_token \
+#     --dry-run=client -o yaml | kubectl apply -f -
+#
+# DATABASE_URL берётся из существующего секрета sre-ai-secrets (envFrom).
+# Образ: в проде патчится на внутренний реестр (kubectl set image), как у copilot-worker.
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: squad-dashboard
+  labels:
+    app: squad-dashboard
+spec:
+  schedule: "0 * * * *"          # ежечасно, в начале часа (UTC)
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 5
+  jobTemplate:
+    spec:
+      backoffLimit: 1
+      activeDeadlineSeconds: 600
+      template:
+        metadata:
+          labels:
+            app: squad-dashboard
+        spec:
+          serviceAccountName: sre-ai          # умеет list namespaces (лейблы ns)
+          automountServiceAccountToken: true
+          restartPolicy: Never
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 10001
+            fsGroup: 10001
+            seccompProfile:
+              type: RuntimeDefault
+          containers:
+          - name: squad-dashboard
+            image: ghcr.io/froggychips/sre-ai-copilot:latest
+            imagePullPolicy: IfNotPresent
+            command: ["python3", "/scripts/squad_dashboard.py"]
+            securityContext:
+              readOnlyRootFilesystem: true
+              allowPrivilegeEscalation: false
+              capabilities:
+                drop: ["ALL"]
+            envFrom:
+            - secretRef:
+                name: sre-ai-secrets           # даёт DATABASE_URL
+            - configMapRef:
+                name: squad-dashboard-env       # TC_URL / CONFLUENCE_* / WINDOW
+            env:                                # remap lowercase secret-ключей в env-имена скрипта
+            - name: TC_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: squad-dashboard-secrets
+                  key: tc_token
+            - name: CONFLUENCE_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: squad-dashboard-secrets
+                  key: confluence_token
+            resources:
+              limits:
+                cpu: 500m
+                memory: 256Mi
+              requests:
+                cpu: 100m
+                memory: 128Mi
+            volumeMounts:
+            - name: script
+              mountPath: /scripts
+              readOnly: true
+          volumes:
+          - name: script
+            configMap:
+              name: squad-dashboard-script
