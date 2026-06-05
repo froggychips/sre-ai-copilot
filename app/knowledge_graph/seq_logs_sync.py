@@ -114,8 +114,9 @@ def _seq_app_candidates(app_name: str) -> List[str]:
         seg = rest.split(".")[0].strip().lower()
         if seg:
             cands.append(f"{seg}-service")
-    seen: set = set()
-    return [c for c in cands if not (c in seen or seen.add(c))]
+    # dedup с сохранением порядка (dict сохраняет insertion order с 3.7);
+    # прежняя идиома `c in seen or seen.add(c)` валила mypy (func-returns-value).
+    return list(dict.fromkeys(cands))
 
 
 def _match_service(
