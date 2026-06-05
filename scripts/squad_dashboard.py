@@ -289,13 +289,13 @@ def activity_cell(act, today):
     last = act.get("last")
     if not last:
         return loz("тихо", "Green")     # CH есть, живых логинов нет
-    days = (today - last).total_seconds() / 86400.0
-    if days < 1 / 48:
+    hours = (today - last).total_seconds() / 3600.0
+    if hours < 0.5:
         ago = "только что"
-    elif days < 1:
-        ago = f"{int(round(days * 24))}ч"
+    elif hours < 48:                      # до 2 суток — в часах (точнее, без вранья усечения)
+        ago = f"{int(round(hours))}ч"
     else:
-        ago = f"{int(days)}д"
+        ago = f"{int(round(hours / 24.0))}д"
     n = act.get("users_7d") or 0
     return f'{esc(n)} чел · {ago}'
 
