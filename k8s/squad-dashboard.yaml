@@ -19,13 +19,21 @@
 #     --from-literal=CONFLUENCE_PAGE_ID=<page-id> \
 #     --from-literal=CONFLUENCE_TITLE='<page-title>' \
 #     --from-literal=WINDOW=400 \
+#     --from-literal=CH_USER=analytics \
+#     --from-literal=CH_PORT=8123 \
+#     --from-literal=CH_SQUAD1_HOST=clickhouse.squad-1.svc.cluster.local \
+#     --from-literal=CH_SQUAD2_HOST=clickhouse.squad-2.svc.cluster.local \
 #     --dry-run=client -o yaml | kubectl apply -f -
+#   # (squad-3..24 резолвятся по фолбэку clickhouse.squad-N-shared.svc.cluster.local;
+#   #  CH_USER/PORT и хосты squad-1/2 = те же, что в configMap mcp-tools-server-config)
 #
 #   # 3. Секрет с токенами (значения не в репо; --from-file без эха в shell):
 #   kubectl -n sre-ai create secret generic squad-dashboard-secrets \
 #     --from-file=tc_token=/path/tc_token \
 #     --from-file=confluence_token=/path/confluence_token \
+#     --from-file=ch_password=/path/ch_password \
 #     --dry-run=client -o yaml | kubectl apply -f -
+#   # ch_password = CH_PASSWORD из secret mcp-shared-secret (ns mcp), юзер analytics
 #
 # DATABASE_URL берётся из существующего секрета sre-ai-secrets (envFrom).
 # Образ: в проде патчится на внутренний реестр (kubectl set image), как у copilot-worker.
@@ -84,6 +92,11 @@ spec:
                 secretKeyRef:
                   name: squad-dashboard-secrets
                   key: confluence_token
+            - name: CH_PASSWORD                 # пароль аналитического CH-юзера (per-squad)
+              valueFrom:
+                secretKeyRef:
+                  name: squad-dashboard-secrets
+                  key: ch_password
             resources:
               limits:
                 cpu: 500m
