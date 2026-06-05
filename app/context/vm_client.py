@@ -130,6 +130,35 @@ class VMClient:
             logger.debug("vm_client.query_instant failed query=%r: %s", query, e)
         return 0.0
 
+    async def query_instant_by(self, query: str, by_label: str) -> Dict[str, float]:
+        """Instant query → {label_value: float} по одной метке (напр. "pod").
+
+        Для namespace-агрегированных запросов вида `... by (pod)`: один HTTP
+        вместо N per-service. Серии без нужной метки или с NaN/Inf
+        отбрасываются. Пустой dict при ошибке/пустом ответе (graceful degrade).
+        """
+        out: Dict[str, float] = {}
+        params = {"query": query}
+        try:
+            async with httpx.AsyncClient(timeout=self._timeout) as client:
+                r = await client.get(f"{self._url}/api/v1/query", params=params)
+                r.raise_for_status()
+                data = r.json()
+            for series in data.get("data", {}).get("result", []):
+                key = series.get("metric", {}).get(by_label)
+                if not key:
+                    continue
+                val = series.get("value", [None, None])[1]
+                if val in ("NaN", "Inf", "+Inf", "-Inf", None):
+                    continue
+                try:
+                    out[str(key)] = float(val)
+                except (TypeError, ValueError):
+                    continue
+        except Exception as e:
+            logger.debug("vm_client.query_instant_by failed query=%r: %s", query, e)
+        return out
+
     @with_external_retry(max_attempts=3, initial_delay=0.5, name="vm.cluster_health")
     async def get_cluster_health(self) -> ClusterHealth:
         """Cluster-wide health snapshot — те же метрики что в #stats daily report.
