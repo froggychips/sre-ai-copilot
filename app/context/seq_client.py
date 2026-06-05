@@ -165,13 +165,18 @@ class SeqClient:
             events = []
         return [e for e in events if isinstance(e, dict)]
 
+    # Recon 2026-06-05 (per-realm Seq live): реальные WO-события НЕ имеют
+    # `Application`; сервис-тег лежит в `App` (.NET assembly, напр.
+    # "GR.WO.Bot", "GR.WO.Push.Service"). `ContainerName` обычно пустой,
+    # `SourceContext` — FQ-класс. Порядок предпочтения ниже отражает это.
+    _APP_PROP_KEYS = ("App", "Application", "ContainerName", "service", "ServiceName")
+
     @staticmethod
     def extract_application(event: Dict[str, Any]) -> Optional[str]:
-        """Best-effort выдрать тэг сервиса из Seq event.
+        """Best-effort выдрать тэг сервиса (.NET App name) из Seq event.
 
-        В WO Seq использует поле `Application` (структурированное property)
-        или `SourceContext` (NLog-стиль). TODO: финализировать при первом
-        запуске на проде — возможно потребуется fallback chain.
+        Возвращает «сырое» значение `App` (напр. "GR.WO.Bot") — маппинг в
+        k8s-имя сервиса делает `seq_logs_sync._match_service`.
         """
         # Properties у Seq лежат либо в Properties[] (legacy) либо
         # в плоских polymorphic-ключах. Покрываем оба формата.
@@ -180,13 +185,12 @@ class SeqClient:
             for p in props:
                 if not isinstance(p, dict):
                     continue
-                name = p.get("Name")
-                if name in ("Application", "service", "ServiceName"):
+                if p.get("Name") in SeqClient._APP_PROP_KEYS:
                     val = p.get("Value")
                     if val:
                         return str(val)
-        # Плоский формат — например `{"Application": "town-service", ...}`.
-        for key in ("Application", "service", "ServiceName"):
+        # Плоский формат — например `{"App": "GR.WO.Bot", ...}`.
+        for key in SeqClient._APP_PROP_KEYS:
             v = event.get(key)
             if v:
                 return str(v)

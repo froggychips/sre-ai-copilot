@@ -27,6 +27,7 @@ import asyncio
 import hashlib
 import json
 import logging
+import re
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, cast
 
@@ -96,34 +97,56 @@ def _load_instances() -> List[Dict[str, Optional[str]]]:
     return instances
 
 
+def _seq_app_candidates(app_name: str) -> List[str]:
+    """Кандидаты k8s-имени сервиса по .NET `App`-тэгу из Seq.
+
+    WO пишет `App` как .NET assembly (recon 2026-06-05):
+      "GR.WO.Bot"          → bot-service
+      "GR.WO.Push.Service" → push-service
+    Правило: убрать префикс `GR.WO.`, отбросить хвост `.Service`, взять
+    первый сегмент, lowercase, добавить `-service`. Плюс само сырое имя —
+    на случай, если где-то App уже == k8s-имени.
+    """
+    cands: List[str] = [app_name]
+    m = re.match(r"^GR\.WO\.(.+)$", app_name, re.IGNORECASE)
+    if m:
+        rest = re.sub(r"\.Service$", "", m.group(1), flags=re.IGNORECASE)
+        seg = rest.split(".")[0].strip().lower()
+        if seg:
+            cands.append(f"{seg}-service")
+    seen: set = set()
+    return [c for c in cands if not (c in seen or seen.add(c))]
+
+
 def _match_service(
     db: Session,
     app_name: str,
     namespace_hint: Optional[str],
 ) -> Optional[Service]:
-    """Best-effort матч `Application`-тэга против kg_services.
+    """Best-effort матч `App`-тэга против kg_services.
 
-    Приоритеты:
-      1. `namespace=hint && name=app_name`
-      2. Единственный non-synthetic Service с `name=app_name` across namespaces
-    Если несколько — None (неопределённость, лучше service_id=NULL).
+    Для каждого кандидата имени (см. `_seq_app_candidates`):
+      1. `namespace=hint && name=cand`
+      2. Единственный non-synthetic Service с `name=cand` across namespaces
+    Первый успех выигрывает. Если ничего — None (service_id=NULL, как раньше).
     """
-    if namespace_hint:
-        svc = (
-            db.query(Service)
-            .filter(Service.namespace == namespace_hint, Service.name == app_name)
-            .one_or_none()
-        )
-        if svc is not None:
-            return svc
+    for cand in _seq_app_candidates(app_name):
+        if namespace_hint:
+            svc = (
+                db.query(Service)
+                .filter(Service.namespace == namespace_hint, Service.name == cand)
+                .one_or_none()
+            )
+            if svc is not None:
+                return svc
 
-    candidates = (
-        db.query(Service)
-        .filter(Service.name == app_name, Service.synthetic.is_(False))
-        .all()
-    )
-    if len(candidates) == 1:
-        return candidates[0]
+        candidates = (
+            db.query(Service)
+            .filter(Service.name == cand, Service.synthetic.is_(False))
+            .all()
+        )
+        if len(candidates) == 1:
+            return candidates[0]
     return None
 
 
