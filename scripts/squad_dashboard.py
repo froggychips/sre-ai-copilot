@@ -264,37 +264,75 @@ def build_cell(lb):
 def inst_cell(inst):
     if not inst:
         return ""
-    return esc(f'{inst["buildtype"]} #{inst["number"]} ({inst["by"]}, {fmt_ts(inst["started"])})')
+    # компактнее: RebuildSquadFromSource -> Rebuild, InstallSquadEnv -> Install; дата без времени
+    bt = inst["buildtype"].replace("SquadFromSource", "").replace("SquadEnv", "")
+    date = fmt_ts(inst["started"]).split(" ")[0]
+    return esc(f'{bt} #{inst["number"]} · {inst["by"]} · {date}')
 
 
 def td(content):
     return f"<td><p>{content}</p></td>" if content else "<td></td>"
 
 
+def td_hl(content, colour):
+    """Ячейка с фоновой подсветкой (Confluence highlight-colour)."""
+    attr = f' data-highlight-colour="{colour}"' if colour else ""
+    return f"<td{attr}><p>{content}</p></td>" if content else f"<td{attr}></td>"
+
+
+# базовые/idle-ветки: деплой с них = сквад никем не занят под конкретную работу
+BASE_BRANCHES = {"preprod", "default", "master", "main", "develop"}
+
+
+def is_busy(branch, task):
+    """Занят = есть WO-задача ИЛИ деплой с фиче-ветки (не базовой)."""
+    if task:
+        return True
+    if not branch:
+        return False
+    b = branch.lower().replace("refs-heads-", "").replace("refs/heads/", "")
+    return b not in BASE_BRANCHES
+
+
 def render(rows, gen_date):
-    hdr = ["Squad", "Занявший", "Задача", "Ветка", "Последняя сборка (OneService)",
-           "Установка / Rebuild", "Возр., дн", "NS", "Svc", "Health",
-           "Краши 7д", "Ev 24ч", "Alerts"]
-    head = "<tr>" + "".join(f"<th><p>{h}</p></th>" for h in hdr) + "</tr>"
+    # (заголовок, ширина px). Цифровые колонки — узкие, текстовые — широкие.
+    cols = [
+        ("Статус", 78), ("Squad", 78), ("Занявший", 100), ("Задача", 110),
+        ("Ветка", 150), ("Последняя сборка (OneService)", 250),
+        ("Установка / Rebuild", 170), ("Возраст, дн", 70), ("NS", 45),
+        ("Svc", 50), ("Health", 65), ("Краши 7д", 150), ("Ev 24ч", 62),
+        ("Alerts", 58),
+    ]
+    colgroup = ("<colgroup>"
+                + "".join(f'<col style="width: {w}.0px;" />' for _, w in cols)
+                + "</colgroup>")
+    head = "<tr>" + "".join(f"<th><p>{h}</p></th>" for h, _ in cols) + "</tr>"
     trs = []
     jira = "https://juicybuttons.atlassian.net/browse/"
     for r in rows:
+        busy = is_busy(r["branch"], r["task"])
+        status = loz("занят", "Red") if busy else loz("свободен", "Green")
+        sq_bg = "#ffebe6" if busy else "#e3fcef"   # красный / зелёный фон ячейки Squad
         task = f'<a href="{jira}{esc(r["task"])}">{esc(r["task"])}</a>' if r["task"] else ""
         owner = esc(r["owner"]) if r["owner"] else loz("нет лейбла")
         age = esc(r["age"]) if r["age"] is not None else loz("нет в KG")
         alerts = loz(str(r["al"]), "Red") if r["al"] else (esc(r["al"]) if r["al"] is not None else "")
         ev24 = (loz(str(r["ev24h"]), "Yellow") if (r["ev24h"] and r["ev24h"] > 20)
                 else (esc(r["ev24h"]) if r["ev24h"] is not None else ""))
-        cells = [
-            f'<strong>{esc(r["squad"])}</strong>', owner, task, esc(r["branch"]),
-            build_cell(r["lb"]), inst_cell(r["inst"]), str(age),
-            esc(r["ns"]) if r["ns"] is not None else "",
-            esc(r["svcs"]) if r["svcs"] is not None else "",
-            health_cell(r["wh"]), crash_cell(r["bo7"], r["un7"], r["ev7"]),
-            str(ev24), str(alerts),
-        ]
-        trs.append("<tr>" + "".join(td(c) for c in cells) + "</tr>")
-    table = (f'<table data-layout="full-width"><tbody>{head}{"".join(trs)}</tbody></table>')
+        trs.append(
+            "<tr>"
+            + td(status)
+            + td_hl(f'<strong>{esc(r["squad"])}</strong>', sq_bg)
+            + td(owner) + td(task) + td(esc(r["branch"]))
+            + td(build_cell(r["lb"])) + td(inst_cell(r["inst"])) + td(str(age))
+            + td(esc(r["ns"]) if r["ns"] is not None else "")
+            + td(esc(r["svcs"]) if r["svcs"] is not None else "")
+            + td(health_cell(r["wh"])) + td(crash_cell(r["bo7"], r["un7"], r["ev7"]))
+            + td(str(ev24)) + td(str(alerts))
+            + "</tr>"
+        )
+    table = (f'<table data-layout="full-width">{colgroup}'
+             f'<tbody>{head}{"".join(trs)}</tbody></table>')
     body = (
         f'<ac:structured-macro ac:name="info"><ac:rich-text-body>'
         f'<p><strong>Дашборд по сквадам (dev-стенды).</strong> Кто чем занял каждый squad, над какой задачей, '
@@ -304,11 +342,27 @@ def render(rows, gen_date):
         f'health, pod_events, alerts; TeamCity REST + лейблы namespace — занявший (deployed-by), задача '
         f'(deployed-branch → WO-тикет), последняя сборка (OneServiceBuildAndUpdate), провенанс install/rebuild.</p>'
         f'{table}'
-        f'<h2>Как читать</h2><ul>'
+        f'<h2>Как читать — расшифровка колонок</h2><ul>'
+        f'<li><strong>Статус</strong> — '
+        f'{loz("свободен", "Green")} деплой с базовой ветки (preprod/default/master) '
+        f'или нет лейбла — можно занимать / '
+        f'{loz("занят", "Red")} есть WO-задача либо деплой с фиче-ветки. Ячейка '
+        f'<strong>Squad</strong> подсвечена тем же цветом (зелёная = свободен).</li>'
+        f'<li><strong>Занявший</strong> — кто задеплоил (лейбл namespace <code>deployed-by</code> = TC-логин).</li>'
+        f'<li><strong>Задача</strong> — WO-тикет из ветки деплоя; пусто при preprod/default.</li>'
+        f'<li><strong>Ветка</strong> — <code>deployed-branch</code> из лейбла namespace.</li>'
+        f'<li><strong>Последняя сборка (OneService)</strong> — последний '
+        f'OneServiceBuildAndUpdate в окне; idle = сборок в окне не было.</li>'
+        f'<li><strong>Установка / Rebuild</strong> — последний Install/Rebuild стенда '
+        f'(TC-билд #, кто, дата).</li>'
+        f'<li><strong>Возраст, дн</strong> — дней с создания первого сервиса сквада '
+        f'(обрезано baseline KG, floor 2026-05-15).</li>'
+        f'<li><strong>NS</strong> — число namespace’ов сквада (shared + kingdom).</li>'
+        f'<li><strong>Svc</strong> — число сервисов сквада в Knowledge Graph.</li>'
         f'<li><strong>Health</strong> — worst health_score (дискретный; триаж лучше по «Краши 7д»).</li>'
         f'<li><strong>Краши 7д</strong> — pod_events за 7д: BackOff (CrashLoop) / Unhealthy (фейл проб) / Evicted. «чисто» = пусто.</li>'
-        f'<li><strong>Последняя сборка</strong> — OneServiceBuildAndUpdate; idle = в окне сборок не было.</li>'
-        f'<li><strong>Задача</strong> — WO-тикет из ветки деплоя; пусто при preprod/default.</li></ul>'
+        f'<li><strong>Ev 24ч</strong> — всего pod_events за последние 24 часа.</li>'
+        f'<li><strong>Alerts</strong> — открытые (неразрешённые) алерты по сервисам сквада.</li></ul>'
         f'<ac:structured-macro ac:name="note"><ac:rich-text-body>'
         f'<p><strong>Пробелы данных:</strong> squad без лейблов ns → занявший/задача пусты; возраст обрезан baseline KG '
         f'(floor 2026-05-15); свежие/частичные стенды — мало сервисов; last build тянется из TeamCity (deploy→squad '
