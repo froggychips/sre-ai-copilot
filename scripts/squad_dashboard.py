@@ -23,8 +23,18 @@ import requests
 import psycopg2
 
 WINDOW = int(os.environ.get("WINDOW", "400"))
-STALE_DAYS = int(os.environ.get("STALE_DAYS", "14"))  # нет деплоя дольше → «протух»
+STALE_DAYS = int(os.environ.get("STALE_DAYS", "14"))  # нет деплоя/активности дольше → «протух»
+ACTIVE_DAYS = float(os.environ.get("ACTIVE_DAYS", "2"))  # живой логин не старше → стенд используется
 SQUADS = os.environ.get("SQUADS")
+
+# Per-squad ClickHouse (живая игровая активность). Хост по DNS сервиса в ns сквада,
+# креды из env (для in-cluster CronJob — из secret). Нет кред/CH → сигнал просто пропускается.
+CH_USER = os.environ.get("CH_USER")
+CH_PASSWORD = os.environ.get("CH_PASSWORD")
+CH_PORT = os.environ.get("CH_PORT", "8123")
+CH_DB = os.environ.get("CH_DB", "WOAnalytics")
+CH_HOST_TEMPLATE = os.environ.get("CH_HOST_TEMPLATE",
+                                  "clickhouse.{squad}-shared.svc.cluster.local")
 SQUAD_NUMS = [int(x) for x in SQUADS.split()] if SQUADS else list(range(1, 25))
 DRY_RUN = os.environ.get("DRY_RUN", "") not in ("", "0", "false", "False")
 
@@ -206,8 +216,9 @@ def build_rows():
         lb = ov.get("last_build")
         inst = fetch_install(s)
         owner = lbl.get("owner")
+        act = fetch_ch_activity(s)
         # пропускаем сквады, по которым нет вообще ничего
-        if not (owner or lb or inst or k):
+        if not (owner or lb or inst or k or act):
             continue
         rows.append(dict(
             squad=s, age=k.get("age_days"), ns=k.get("ns"), svcs=k.get("svcs"),
@@ -215,7 +226,7 @@ def build_rows():
             ev24h=k.get("ev24h"), bo7=k.get("backoff7d"), ev7=k.get("evict7d"),
             un7=k.get("unhlth7d"), al=k.get("alerts"),
             owner=owner, task=lbl.get("task"), branch=lbl.get("branch"),
-            lb=lb, inst=inst))
+            lb=lb, inst=inst, act=act))
     return rows
 
 
@@ -271,6 +282,24 @@ def inst_cell(inst):
     return esc(f'{bt} #{inst["number"]} · {inst["by"]} · {date}')
 
 
+def activity_cell(act, today):
+    """Живая активность: '5 чел · 3ч' / 'тихо' / '' (нет CH/данных)."""
+    if act is None:
+        return ""                       # нет CH / кред / ошибка — сигнал недоступен
+    last = act.get("last")
+    if not last:
+        return loz("тихо", "Green")     # CH есть, живых логинов нет
+    days = (today - last).total_seconds() / 86400.0
+    if days < 1 / 48:
+        ago = "только что"
+    elif days < 1:
+        ago = f"{int(round(days * 24))}ч"
+    else:
+        ago = f"{int(days)}д"
+    n = act.get("users_7d") or 0
+    return f'{esc(n)} чел · {ago}'
+
+
 def td(content):
     return f"<td><p>{content}</p></td>" if content else "<td></td>"
 
@@ -322,21 +351,31 @@ def classify(r, jira_statuses, today):
     Сигналы: ветка/задача (заявка), свежесть деплоя (TC), статус Jira-тикета,
     старый+крашащийся стенд. Порядок приоритетов снизу вверх в коде.
     """
-    if not is_busy(r["branch"], r["task"]):
+    busy_label = is_busy(r["branch"], r["task"])
+    # живая игровая активность (ExtLogin без автоплея) — самый честный сигнал использования
+    act = r.get("act")
+    act_days = None
+    if act and act.get("last"):
+        act_days = (today - act["last"]).total_seconds() / 86400.0
+    recent_act = act_days is not None and act_days <= ACTIVE_DAYS
+    quiet_act = act_days is not None and act_days > STALE_DAYS   # CH есть, давно тихо
+
+    # свободен: никем не заявлен И не используется живыми логинами
+    if not busy_label and not recent_act:
         return ("свободен", "Green", "#e3fcef")
-    # заявлен занятым — проверяем, не «зомби» ли это
+    # реально используется прямо сейчас → занят (в т.ч. preprod-стенд с тестерами)
+    if recent_act:
+        return ("занят", "Red", "#ffebe6")
+    # заявлен занятым, но свежей активности нет — проверяем заброшенность ПОЗИТИВНЫМИ признаками:
+    # закрытый Jira-тикет, достоверно старый деплой, либо CH-молчание >STALE_DAYS.
+    # idle=None (дыра атрибуции TC) и отсутствие CH — это «не знаю», НЕ протух.
     closed = False
     if r["task"]:
         st = (jira_statuses.get(r["task"]) or "").lower()
         closed = any(s in st for s in CLOSED_JIRA)
     idle = last_activity_days(r, today)
-    # «протух» только по ПОЗИТИВНОМУ признаку заброшенности: закрытый тикет либо
-    # достоверно старый деплой (известная дата >STALE_DAYS). idle=None = «не знаю»
-    # (дыра атрибуции TC: сборка без NAMESPACE-свойства / не OneService) — НЕ протух,
-    # иначе ложно метим активные стенды (прецедент squad-9: собран 39ч назад, но lb/inst пусты).
-    # Краши — сигнал здоровья, в занятость не входят (см. колонку «Краши 7д»).
-    stale = idle is not None and idle > STALE_DAYS
-    if closed or stale:
+    stale_deploy = idle is not None and idle > STALE_DAYS
+    if closed or stale_deploy or quiet_act:
         return ("протух", "Yellow", "#fffae6")
     return ("занят", "Red", "#ffebe6")
 
@@ -363,16 +402,68 @@ def fetch_jira_statuses(tasks):
     return out
 
 
+def _parse_ch_ts(s):
+    """CH DateTime64 '2026-06-05T08:15:37.934000' / без дробной части → datetime (naive UTC)."""
+    if not s:
+        return None
+    for fmt in ("%Y-%m-%dT%H:%M:%S.%f", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M:%S.%f", "%Y-%m-%d %H:%M:%S"):
+        try:
+            return datetime.datetime.strptime(s, fmt)
+        except ValueError:
+            continue
+    return None
+
+
+# боты-автоплея пишут в server-side CreateUserSessionFact, но НЕ в клиентский ExtLoginFact;
+# Autoplay=false отсекает автотест-клиентов → остаётся реальная живая активность тестеров
+CH_ACTIVITY_SQL = (
+    "SELECT uniqExactIf(DynUserId, Timestamp > now()-interval 24 hour) users_24h, "
+    "uniqExact(DynUserId) users_7d, max(Timestamp) last "
+    "FROM ExtLoginFact WHERE Autoplay=false AND Timestamp > now()-interval 7 day "
+    "FORMAT JSONCompact"
+)
+
+
+def fetch_ch_activity(squad):
+    """Живая игровая активность сквада из его ClickHouse.
+
+    Возвращает:
+      None                                  — нет кред / нет CH / ошибка (сигнал недоступен)
+      {"users_24h":0,"users_7d":0,"last":None} — CH есть, активности нет («тихо»)
+      {"users_24h":N,"users_7d":M,"last":dt}   — есть живые логины
+    """
+    if not (CH_USER and CH_PASSWORD):
+        return None
+    url = f"http://{CH_HOST_TEMPLATE.format(squad=squad)}:{CH_PORT}/"
+    try:
+        r = requests.post(url, params={"database": CH_DB},
+                          data=CH_ACTIVITY_SQL.encode(),
+                          auth=(CH_USER, CH_PASSWORD), timeout=8)
+        if r.status_code != 200:
+            return None
+        rows = r.json().get("data") or []
+        if not rows:
+            return {"users_24h": 0, "users_7d": 0, "last": None}
+        u24, u7, last = rows[0]
+        dt = _parse_ch_ts(last)
+        if dt is None or dt.year < 2000:   # epoch 1970 = логинов не было
+            return {"users_24h": 0, "users_7d": 0, "last": None}
+        return {"users_24h": int(u24), "users_7d": int(u7), "last": dt}
+    except Exception as e:
+        log(f"  ch {squad}: {e}")
+        return None
+
+
 def render(rows, gen_date, jira_statuses=None, today=None):
     jira_statuses = jira_statuses or {}
     today = today or datetime.datetime.utcnow()
     # (заголовок, ширина px). Цифровые колонки — узкие, текстовые — широкие.
     cols = [
         ("Статус", 78), ("Squad", 78), ("Занявший", 100), ("Задача", 110),
-        ("Ветка", 150), ("Последняя сборка (OneService)", 250),
-        ("Установка / Rebuild", 170), ("Возраст, дн", 70), ("NS", 45),
-        ("Svc", 50), ("Health", 65), ("Краши 7д", 150), ("Ev 24ч", 62),
-        ("Alerts", 58),
+        ("Ветка", 140), ("Активность", 110), ("Последняя сборка (OneService)", 240),
+        ("Установка / Rebuild", 165), ("Возраст, дн", 68), ("NS", 45),
+        ("Svc", 50), ("Health", 62), ("Краши 7д", 145), ("Ev 24ч", 60),
+        ("Alerts", 56),
     ]
     colgroup = ("<colgroup>"
                 + "".join(f'<col style="width: {w}.0px;" />' for _, w in cols)
@@ -394,6 +485,7 @@ def render(rows, gen_date, jira_statuses=None, today=None):
             + td(status)
             + td_hl(f'<strong>{esc(r["squad"])}</strong>', sq_bg)
             + td(owner) + td(task) + td(esc(r["branch"]))
+            + td(activity_cell(r.get("act"), today))
             + td(build_cell(r["lb"])) + td(inst_cell(r["inst"])) + td(str(age))
             + td(esc(r["ns"]) if r["ns"] is not None else "")
             + td(esc(r["svcs"]) if r["svcs"] is not None else "")
@@ -414,15 +506,20 @@ def render(rows, gen_date, jira_statuses=None, today=None):
         f'{table}'
         f'<h2>Как читать — расшифровка колонок</h2><ul>'
         f'<li><strong>Статус</strong> — '
-        f'{loz("свободен", "Green")} базовая ветка (preprod/default/master) или нет лейбла — можно занимать; '
-        f'{loz("занят", "Red")} WO-задача / фиче-ветка + свежий деплой и открытый тикет; '
-        f'{loz("протух", "Yellow")} заявлен занятым, но похож на брошенный: известный деплой &gt;'
-        f'{STALE_DAYS}д назад либо тикет закрыт (Done/Closed) — кандидат на возврат. '
-        f'(Нет данных о деплое — оставляем «занят», не метим протухшим.) '
+        f'{loz("свободен", "Green")} не заявлен (базовая ветка / нет лейбла) И нет живых логинов — можно занимать; '
+        f'{loz("занят", "Red")} заявлен (WO-задача / фиче-ветка) ИЛИ есть живая активность ≤{int(ACTIVE_DAYS)}д '
+        f'(в т.ч. preprod-стенд, который реально тестируют); '
+        f'{loz("протух", "Yellow")} заявлен, но без свежей активности И похож на брошенный: тикет закрыт (Done/Closed), '
+        f'либо известный деплой &gt;{STALE_DAYS}д назад, либо живых логинов нет &gt;{STALE_DAYS}д — кандидат на возврат. '
+        f'(Нет данных о деплое/активности — «не знаю», оставляем «занят».) '
         f'Ячейка <strong>Squad</strong> подсвечена тем же цветом.</li>'
         f'<li><strong>Занявший</strong> — кто задеплоил (лейбл namespace <code>deployed-by</code> = TC-логин).</li>'
         f'<li><strong>Задача</strong> — WO-тикет из ветки деплоя; пусто при preprod/default.</li>'
         f'<li><strong>Ветка</strong> — <code>deployed-branch</code> из лейбла namespace.</li>'
+        f'<li><strong>Активность</strong> — живые игровые логины из ClickHouse сквада '
+        f'(<code>ExtLoginFact</code>, боты-автоплея отфильтрованы): «<em>N чел · Xч/д</em>» = уникальных '
+        f'тестеров за 7д и давность последнего логина; «тихо» = CH есть, логинов нет; пусто = нет CH/данных. '
+        f'Самый честный сигнал реального использования стенда.</li>'
         f'<li><strong>Последняя сборка (OneService)</strong> — последний '
         f'OneServiceBuildAndUpdate в окне; idle = сборок в окне не было.</li>'
         f'<li><strong>Установка / Rebuild</strong> — последний Install/Rebuild стенда '
