@@ -14,7 +14,7 @@ click-didyoumean==0.3.1
 click-plugins==1.1.1.2
 click-repl==0.3.0
 distro==1.9.0
-fastapi==0.136.1
+fastapi==0.136.3
 googleapis-common-protos==1.75.0
 greenlet==3.5.0
 grpcio==1.80.0
