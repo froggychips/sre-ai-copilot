@@ -23,6 +23,7 @@ import requests
 import psycopg2
 
 WINDOW = int(os.environ.get("WINDOW", "400"))
+STALE_DAYS = int(os.environ.get("STALE_DAYS", "14"))  # нет деплоя дольше → «протух»
 SQUADS = os.environ.get("SQUADS")
 SQUAD_NUMS = [int(x) for x in SQUADS.split()] if SQUADS else list(range(1, 25))
 DRY_RUN = os.environ.get("DRY_RUN", "") not in ("", "0", "false", "False")
@@ -282,10 +283,12 @@ def td_hl(content, colour):
 
 # базовые/idle-ветки: деплой с них = сквад никем не занят под конкретную работу
 BASE_BRANCHES = {"preprod", "default", "master", "main", "develop"}
+# подстроки статуса Jira, означающие, что тикет закрыт (сквад освобождается)
+CLOSED_JIRA = ("done", "closed", "resolved", "выполнено", "закрыт", "готово", "отмен")
 
 
 def is_busy(branch, task):
-    """Занят = есть WO-задача ИЛИ деплой с фиче-ветки (не базовой)."""
+    """Заявлен занятым = есть WO-задача ИЛИ деплой с фиче-ветки (не базовой)."""
     if task:
         return True
     if not branch:
@@ -294,7 +297,73 @@ def is_busy(branch, task):
     return b not in BASE_BRANCHES
 
 
-def render(rows, gen_date):
+def _parse_dt(s):
+    try:
+        return datetime.datetime.strptime(s[:15], "%Y%m%dT%H%M%S")
+    except Exception:
+        return None
+
+
+def last_activity_days(r, today):
+    """Дней с последней активности деплоя (max из OneService и install/rebuild). None — не было."""
+    ds = []
+    for key in ("lb", "inst"):
+        v = r.get(key)
+        if v and v.get("started"):
+            d = _parse_dt(v["started"])
+            if d:
+                ds.append(d)
+    return (today - max(ds)).days if ds else None
+
+
+def classify(r, jira_statuses, today):
+    """Трёхуровневый статус: (надпись, цвет лозенга, фон ячейки Squad).
+
+    Сигналы: ветка/задача (заявка), свежесть деплоя (TC), статус Jira-тикета,
+    старый+крашащийся стенд. Порядок приоритетов снизу вверх в коде.
+    """
+    if not is_busy(r["branch"], r["task"]):
+        return ("свободен", "Green", "#e3fcef")
+    # заявлен занятым — проверяем, не «зомби» ли это
+    closed = False
+    if r["task"]:
+        st = (jira_statuses.get(r["task"]) or "").lower()
+        closed = any(s in st for s in CLOSED_JIRA)
+    idle = last_activity_days(r, today)
+    crashy = (r.get("bo7") or 0) > 50 or (r.get("un7") or 0) > 100
+    stale = idle is not None and idle > STALE_DAYS          # деплой был, но давно
+    dead = idle is None and crashy and (r.get("age") or 0) > 14  # деплоя в окне нет + старый крашащийся стенд
+    # свежий деплой (idle <= STALE_DAYS) переопределяет краши — это здоровье, не заброшенность
+    if closed or stale or dead:
+        return ("протух", "Yellow", "#fffae6")
+    return ("занят", "Red", "#ffebe6")
+
+
+def fetch_jira_statuses(tasks):
+    """Статусы WO-тикетов через Jira REST (те же Atlassian-креды, что и Confluence)."""
+    base = os.environ.get("CONFLUENCE_BASE", "").rstrip("/")
+    email = os.environ.get("CONFLUENCE_EMAIL")
+    token = os.environ.get("CONFLUENCE_TOKEN")
+    if not (base and email and token):
+        return {}
+    site = base[:-5] if base.endswith("/wiki") else base   # отрезаем /wiki → корень сайта
+    auth = (email.strip(), token.strip())
+    out = {}
+    for t in sorted({x for x in tasks if x}):
+        try:
+            r = requests.get(f"{site}/rest/api/3/issue/{t}?fields=status", auth=auth, timeout=20)
+            if r.status_code == 200:
+                out[t] = (((r.json().get("fields") or {}).get("status") or {}).get("name"))
+            else:
+                log(f"  jira {t}: HTTP {r.status_code}")
+        except Exception as e:
+            log(f"  jira {t}: {e}")
+    return out
+
+
+def render(rows, gen_date, jira_statuses=None, today=None):
+    jira_statuses = jira_statuses or {}
+    today = today or datetime.datetime.utcnow()
     # (заголовок, ширина px). Цифровые колонки — узкие, текстовые — широкие.
     cols = [
         ("Статус", 78), ("Squad", 78), ("Занявший", 100), ("Задача", 110),
@@ -310,9 +379,8 @@ def render(rows, gen_date):
     trs = []
     jira = "https://juicybuttons.atlassian.net/browse/"
     for r in rows:
-        busy = is_busy(r["branch"], r["task"])
-        status = loz("занят", "Red") if busy else loz("свободен", "Green")
-        sq_bg = "#ffebe6" if busy else "#e3fcef"   # красный / зелёный фон ячейки Squad
+        status_txt, status_col, sq_bg = classify(r, jira_statuses, today)
+        status = loz(status_txt, status_col)
         task = f'<a href="{jira}{esc(r["task"])}">{esc(r["task"])}</a>' if r["task"] else ""
         owner = esc(r["owner"]) if r["owner"] else loz("нет лейбла")
         age = esc(r["age"]) if r["age"] is not None else loz("нет в KG")
@@ -344,10 +412,11 @@ def render(rows, gen_date):
         f'{table}'
         f'<h2>Как читать — расшифровка колонок</h2><ul>'
         f'<li><strong>Статус</strong> — '
-        f'{loz("свободен", "Green")} деплой с базовой ветки (preprod/default/master) '
-        f'или нет лейбла — можно занимать / '
-        f'{loz("занят", "Red")} есть WO-задача либо деплой с фиче-ветки. Ячейка '
-        f'<strong>Squad</strong> подсвечена тем же цветом (зелёная = свободен).</li>'
+        f'{loz("свободен", "Green")} базовая ветка (preprod/default/master) или нет лейбла — можно занимать; '
+        f'{loz("занят", "Red")} WO-задача / фиче-ветка + свежий деплой и открытый тикет; '
+        f'{loz("протух", "Yellow")} заявлен занятым, но похож на брошенный: нет деплоя &gt;'
+        f'{STALE_DAYS}д, либо тикет закрыт (Done/Closed), либо старый стенд с крашами — '
+        f'кандидат на возврат. Ячейка <strong>Squad</strong> подсвечена тем же цветом.</li>'
         f'<li><strong>Занявший</strong> — кто задеплоил (лейбл namespace <code>deployed-by</code> = TC-логин).</li>'
         f'<li><strong>Задача</strong> — WO-тикет из ветки деплоя; пусто при preprod/default.</li>'
         f'<li><strong>Ветка</strong> — <code>deployed-branch</code> из лейбла namespace.</li>'
@@ -393,13 +462,20 @@ def publish(body, gen_date):
 
 
 def main():
-    gen_date = datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M")
+    now = datetime.datetime.utcnow()
+    gen_date = now.strftime("%Y-%m-%d %H:%M")
     rows = build_rows()
-    body = render(rows, gen_date)
+    jira_statuses = fetch_jira_statuses([r["task"] for r in rows])
+    body = render(rows, gen_date, jira_statuses, now)
     n_owner = sum(1 for r in rows if r["owner"])
     n_lb = sum(1 for r in rows if r["lb"])
     n_task = sum(1 for r in rows if r["task"])
-    log(f"rows={len(rows)} owner={n_owner} last_build={n_lb} task={n_task} body_bytes={len(body)}")
+    n_stat = {}
+    for r in rows:
+        s = classify(r, jira_statuses, now)[0]
+        n_stat[s] = n_stat.get(s, 0) + 1
+    log(f"rows={len(rows)} owner={n_owner} last_build={n_lb} task={n_task} "
+        f"status={n_stat} body_bytes={len(body)}")
     if DRY_RUN:
         log("DRY_RUN=1 → Confluence не трогаем.")
         return
