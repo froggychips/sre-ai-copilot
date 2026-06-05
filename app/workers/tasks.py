@@ -578,6 +578,11 @@ async def _tc_deploys_to_kg_logic() -> dict:
                             service=svc,
                             started_at=started_naive,
                             finished_at=finished_naive,
+                            # sha/repo: A3-рерайт ns-wide broadcast (2026-05-24)
+                            # потерял эти поля → kg_deployments.sha=NULL с 05-25.
+                            # recent_deploys() их уже отдаёт; пробрасываем обратно.
+                            sha=b.get("sha"),
+                            repo=(b.get("all_revisions") or [{}])[0].get("root"),
                             buildtype_id=b.get("buildtype_id"),
                             build_number=str(b.get("number") or ""),
                             status=b.get("status"),
@@ -587,6 +592,7 @@ async def _tc_deploys_to_kg_logic() -> dict:
                                 "buildtype_name": b.get("buildtype_name"),
                                 "url": b.get("url"),
                                 "namespace_scope": True,  # маркер ns-wide attribution
+                                "all_revisions": b.get("all_revisions"),  # monorepo: все VCS root
                             },
                         )
                         added += 1
