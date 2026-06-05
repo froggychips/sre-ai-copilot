@@ -434,7 +434,11 @@ def fetch_ch_activity(squad):
     """
     if not (CH_USER and CH_PASSWORD):
         return None
-    url = f"http://{CH_HOST_TEMPLATE.format(squad=squad)}:{CH_PORT}/"
+    # резолвинг хоста как в tools-server: явный CH_SQUAD{N}_HOST (squad-1/2 = bare ns
+    # clickhouse.squad-N.svc), иначе фолбэк-шаблон clickhouse.squad-N-shared.svc
+    n = squad.split("-")[1] if "-" in squad else squad
+    host = os.environ.get(f"CH_SQUAD{n}_HOST") or CH_HOST_TEMPLATE.format(squad=squad)
+    url = f"http://{host}:{CH_PORT}/"
     try:
         r = requests.post(url, params={"database": CH_DB},
                           data=CH_ACTIVITY_SQL.encode(),
