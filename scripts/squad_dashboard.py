@@ -330,11 +330,13 @@ def classify(r, jira_statuses, today):
         st = (jira_statuses.get(r["task"]) or "").lower()
         closed = any(s in st for s in CLOSED_JIRA)
     idle = last_activity_days(r, today)
-    crashy = (r.get("bo7") or 0) > 50 or (r.get("un7") or 0) > 100
-    stale = idle is not None and idle > STALE_DAYS          # деплой был, но давно
-    dead = idle is None and crashy and (r.get("age") or 0) > 14  # деплоя в окне нет + старый крашащийся стенд
-    # свежий деплой (idle <= STALE_DAYS) переопределяет краши — это здоровье, не заброшенность
-    if closed or stale or dead:
+    # «протух» только по ПОЗИТИВНОМУ признаку заброшенности: закрытый тикет либо
+    # достоверно старый деплой (известная дата >STALE_DAYS). idle=None = «не знаю»
+    # (дыра атрибуции TC: сборка без NAMESPACE-свойства / не OneService) — НЕ протух,
+    # иначе ложно метим активные стенды (прецедент squad-9: собран 39ч назад, но lb/inst пусты).
+    # Краши — сигнал здоровья, в занятость не входят (см. колонку «Краши 7д»).
+    stale = idle is not None and idle > STALE_DAYS
+    if closed or stale:
         return ("протух", "Yellow", "#fffae6")
     return ("занят", "Red", "#ffebe6")
 
@@ -414,9 +416,10 @@ def render(rows, gen_date, jira_statuses=None, today=None):
         f'<li><strong>Статус</strong> — '
         f'{loz("свободен", "Green")} базовая ветка (preprod/default/master) или нет лейбла — можно занимать; '
         f'{loz("занят", "Red")} WO-задача / фиче-ветка + свежий деплой и открытый тикет; '
-        f'{loz("протух", "Yellow")} заявлен занятым, но похож на брошенный: нет деплоя &gt;'
-        f'{STALE_DAYS}д, либо тикет закрыт (Done/Closed), либо старый стенд с крашами — '
-        f'кандидат на возврат. Ячейка <strong>Squad</strong> подсвечена тем же цветом.</li>'
+        f'{loz("протух", "Yellow")} заявлен занятым, но похож на брошенный: известный деплой &gt;'
+        f'{STALE_DAYS}д назад либо тикет закрыт (Done/Closed) — кандидат на возврат. '
+        f'(Нет данных о деплое — оставляем «занят», не метим протухшим.) '
+        f'Ячейка <strong>Squad</strong> подсвечена тем же цветом.</li>'
         f'<li><strong>Занявший</strong> — кто задеплоил (лейбл namespace <code>deployed-by</code> = TC-логин).</li>'
         f'<li><strong>Задача</strong> — WO-тикет из ветки деплоя; пусто при preprod/default.</li>'
         f'<li><strong>Ветка</strong> — <code>deployed-branch</code> из лейбла namespace.</li>'
