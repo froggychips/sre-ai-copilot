@@ -320,7 +320,8 @@ def test_orphan_app_excludes_expected_stale_infra(db):
     assert r.services_app_scope_total == 2
     assert r.services_orphan_app == 1  # только app-orphan
 
-    # gate: 1/2 = 50% > 20% дефолт → fail; но axis считается по app-метрике.
+    # gate: 1/2 = 50% > 10% дефолт (contract.orphan_rate_max_pct) → fail;
+    # axis считается по app-метрике.
     result = evaluate_check(r, db, CheckThresholds())
     assert result.orphan_pct == 50.0
     orphan_fail = [f for f in result.failures if f["axis"] == "orphan_pct"]
