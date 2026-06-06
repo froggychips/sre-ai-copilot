@@ -14,8 +14,10 @@ from app.knowledge_graph.schema import (ServiceEdge)  # noqa: F401
 from app.knowledge_graph.populator import (record_alert_event,
                                            record_deployment, upsert_edge,
                                            upsert_service)
-from app.knowledge_graph.queries import (incidents_on, nearby_alerts,
-                                         recent_deploys_for, upstream_of)
+from app.knowledge_graph.queries import (incidents_on, log_error_rate_for,
+                                         nearby_alerts, recent_deploys_for,
+                                         upstream_of)
+from app.knowledge_graph.schema import LogObservation
 
 
 @pytest.fixture
@@ -313,3 +315,83 @@ def test_recurrence_false_for_old_resolved_same_service(db):
     match = next((r for r in results if r["incident_id"] == "old-notificator-stale"), None)
     if match:
         assert match["recurrence"] is False
+
+
+# ---------- log_error_rate_for (Seq-derived proxy) ------------------------
+
+def _add_log_obs(db, svc, *, ts, level, count, source="prod"):
+    db.add(LogObservation(
+        service_id=svc.id, ts=ts, level=level, count=count, source=source,
+        namespace=svc.namespace,
+    ))
+    db.commit()
+
+
+def test_log_error_rate_unknown_service(db):
+    """Сервиса в графе нет — None (не путать с «тихо»)."""
+    assert log_error_rate_for(db, "squad-1", "nope", now=datetime(2026, 6, 6, 8, 0)) is None
+
+
+def test_log_error_rate_no_observations_is_zero(db):
+    """Сервис есть, наблюдений нет — нули, не None."""
+    upsert_service(db, "prod-kingdom5", "town-service")
+    out = log_error_rate_for(db, "prod-kingdom5", "town-service",
+                             now=datetime(2026, 6, 6, 8, 0))
+    assert out is not None
+    assert out["error_count"] == 0
+    assert out["log_error_rate_per_min"] == 0.0
+    assert out["buckets"] == 0
+    assert out["is_proxy"] is True
+
+
+def test_log_error_rate_sums_error_and_fatal_in_window(db):
+    svc = upsert_service(db, "prod-kingdom5", "town-service")
+    now = datetime(2026, 6, 6, 8, 0)
+    # В окне 60 мин: Error=10 + Fatal=2 = 12 событий → 12/60 = 0.2/min.
+    _add_log_obs(db, svc, ts=now - timedelta(minutes=10), level="Error", count=10)
+    _add_log_obs(db, svc, ts=now - timedelta(minutes=5), level="Fatal", count=2)
+    # Warning по умолчанию НЕ учитывается.
+    _add_log_obs(db, svc, ts=now - timedelta(minutes=5), level="Warning", count=999)
+
+    out = log_error_rate_for(db, "prod-kingdom5", "town-service",
+                             window_minutes=60, now=now)
+    assert out["error_count"] == 12
+    assert out["log_error_rate_per_min"] == 0.2
+    assert out["buckets"] == 2
+    assert out["levels"] == ["Error", "Fatal"]
+
+
+def test_log_error_rate_excludes_out_of_window(db):
+    svc = upsert_service(db, "prod-kingdom5", "town-service")
+    now = datetime(2026, 6, 6, 8, 0)
+    _add_log_obs(db, svc, ts=now - timedelta(minutes=5), level="Error", count=6)
+    # За пределами 60-мин окна — не учитывается.
+    _add_log_obs(db, svc, ts=now - timedelta(minutes=120), level="Error", count=100)
+
+    out = log_error_rate_for(db, "prod-kingdom5", "town-service",
+                             window_minutes=60, now=now)
+    assert out["error_count"] == 6
+    assert out["buckets"] == 1
+
+
+def test_log_error_rate_does_not_touch_http_5xx(db):
+    """Семантический guard: helper не трогает kg_service_health и не
+    выдаёт себя за HTTP 5xx — только log-proxy с явным маркером."""
+    svc = upsert_service(db, "prod-kingdom5", "town-service")
+    now = datetime(2026, 6, 6, 8, 0)
+    _add_log_obs(db, svc, ts=now - timedelta(minutes=5), level="Error", count=3)
+    out = log_error_rate_for(db, "prod-kingdom5", "town-service", now=now)
+    # ключ http_5xx_rate тут отсутствует — мы НЕ маскируемся под него.
+    assert "http_5xx_rate" not in out
+    assert out["is_proxy"] is True
+
+
+def test_log_error_rate_custom_levels(db):
+    svc = upsert_service(db, "prod-kingdom5", "town-service")
+    now = datetime(2026, 6, 6, 8, 0)
+    _add_log_obs(db, svc, ts=now - timedelta(minutes=5), level="Error", count=4)
+    _add_log_obs(db, svc, ts=now - timedelta(minutes=5), level="Warning", count=20)
+    out = log_error_rate_for(db, "prod-kingdom5", "town-service",
+                             levels=["Warning"], now=now)
+    assert out["error_count"] == 20
+    assert out["levels"] == ["Warning"]
