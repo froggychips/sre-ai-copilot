@@ -534,6 +534,15 @@ async def _tc_deploys_to_kg_logic() -> dict:
 
         for b in builds:
             branch_full = (b.get("branch") or "").replace("refs/heads/", "")
+            # TC рапортует ветку дефолтных deploy-конфигов литералом '<default>'
+            # (BuildAndDeploy/OneServiceBuildAndUpdate), а не именем ветки. Для
+            # K8sNewCluster дефолт == preprod (VCS-роуты *Preprod). Без этой
+            # нормализации целый класс preprod-деплоев молча дропался (ns_match=0)
+            # → deploy-stream протухал, как только переставали идти явно-preprod
+            # билды (BuildAndUpdate). Prod-деплои несут ветку 'prod' явно, prod-
+            # конфиги содержат 'Prod_' в id — их под '<default>' не подменяем.
+            if branch_full == "<default>" and "Prod_" not in (b.get("buildtype_id") or ""):
+                branch_full = "preprod"
             target_namespaces = ns_by_branch.get(branch_full, [])
             if not target_namespaces:
                 continue
