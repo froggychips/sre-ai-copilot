@@ -15,10 +15,11 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
 from app.database import Base
-from app.knowledge_graph.anomaly_detection import (VOLUME_GUARD_MAX_PER_HOUR,
+from app.knowledge_graph.anomaly_detection import (LOG_ERROR_METRIC,
+                                                   VOLUME_GUARD_MAX_PER_HOUR,
                                                    detect_anomalies)
-from app.knowledge_graph.schema import (AnomalyObservation, Service,
-                                        ServiceHealth)
+from app.knowledge_graph.schema import (AnomalyObservation, LogObservation,
+                                        Service, ServiceHealth)
 
 
 @pytest.fixture
@@ -277,3 +278,56 @@ def test_baseline_with_outliers_still_detects(db):
     assert obs.severity == "critical"
     # robust median ~20, не подскочившая до ~30 (как было бы у среднего).
     assert obs.baseline_mean < 25.0
+
+
+# ---------- log-error anomaly (kg_log_observations consumer) --------------
+
+def _seed_log_errors(db, svc_id, points, level="Error"):
+    """points: iterable of (ts, count) — пишет Error-логи в kg_log_observations."""
+    db.add_all([
+        LogObservation(service_id=svc_id, ts=ts, level=level, count=int(c),
+                       source="seq")
+        for ts, c in points
+    ])
+    db.commit()
+
+
+def test_log_error_spike_triggers_anomaly(db):
+    """Всплеск Error-логов относительно типичного объёма → log_error_rate-аномалия."""
+    now = datetime(2026, 6, 6, 12, 0, 0)
+    svc = _svc(db, name="map-service", namespace="prod-kingdom5")
+    # baseline: ~2 дня варьирующихся мелких error-бакетов (MAD>0), все < now-1h
+    base = []
+    for i in range(60):
+        ts = now - timedelta(hours=2) - timedelta(minutes=30 * i)
+        base.append((ts, 1 + (i % 4)))  # 1..4 ошибок/бакет
+    _seed_log_errors(db, svc.id, base)
+    # current: последний час — резкий всплеск
+    cur = [(now - timedelta(minutes=10 * k), 40) for k in range(3)]
+    _seed_log_errors(db, svc.id, cur)
+
+    stats = detect_anomalies(db, now=now)
+
+    obs = db.query(AnomalyObservation).filter(
+        AnomalyObservation.metric == LOG_ERROR_METRIC).all()
+    assert len(obs) == 1
+    assert obs[0].z_score > 0            # только рост
+    assert obs[0].extras["is_log_proxy"] is True
+    assert stats["log_error_services"] >= 1
+
+
+def test_log_error_no_spike_no_anomaly(db):
+    """Стабильный мелкий объём ошибок без всплеска → нет log_error_rate-аномалии."""
+    now = datetime(2026, 6, 6, 12, 0, 0)
+    svc = _svc(db, name="quiet-svc", namespace="prod-shared")
+    pts = []
+    for i in range(70):
+        ts = now - timedelta(minutes=20 * i)
+        pts.append((ts, 1 + (i % 3)))   # 1..3, без всплеска
+    _seed_log_errors(db, svc.id, pts)
+
+    detect_anomalies(db, now=now)
+
+    obs = db.query(AnomalyObservation).filter(
+        AnomalyObservation.metric == LOG_ERROR_METRIC).all()
+    assert obs == []
