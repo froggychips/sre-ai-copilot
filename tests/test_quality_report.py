@@ -30,8 +30,9 @@ from app.knowledge_graph.schema import (AlertEvent, Deployment, K8sJob,
 from app.knowledge_graph.stale_classifier import (STALE_CLASS_ACTIVE,
                                                   STALE_CLASS_EXPECTED,
                                                   STALE_CLASS_SUSPICIOUS)
-from app.scripts.quality_report import (OWNER_SOURCE_UNTRACKED, QualityReport,
-                                        _coerce_metadata_dict, build_report,
+from app.scripts.quality_report import (OWNER_SOURCE_UNTRACKED, CheckThresholds,
+                                        QualityReport, _coerce_metadata_dict,
+                                        build_report, evaluate_check,
                                         render_json, render_markdown)
 
 
@@ -273,6 +274,62 @@ def test_orphan_by_http_and_nats(db):
     r = build_report(db)
     assert r.services_without_http_edges == 1  # c
     assert r.services_without_nats_edges == 1  # b
+    # app-orphan (любой meaningful edge calls/routes_to/uses_db/uses_nats):
+    # a,b связаны через calls; c — через uses_nats. Все три connected → 0.
+    assert r.services_orphan_app == 0
+    assert r.services_app_scope_total == 3
+
+
+def test_orphan_app_nats_only_not_orphan(db):
+    """Сервис, связанный ТОЛЬКО через uses_nats, не считается app-orphan.
+
+    WO-сервисы общаются в основном через NATS/Orleans, а не HTTP REST —
+    HTTP-only метрика давала ложные orphan-ы (issue #2).
+    """
+    a = _mk_svc(db, name="a")  # HTTP src
+    b = _mk_svc(db, name="b")  # связан только через uses_nats
+    c = _mk_svc(db, name="c")  # связан только через uses_db
+    isolated = _mk_svc(db, name="isolated")  # вообще без edges → orphan
+    _mk_edge(db, a.id, a.id, "calls")  # a имеет HTTP
+    _mk_edge(db, a.id, b.id, "uses_nats")
+    _mk_edge(db, c.id, c.id, "uses_db")
+    db.commit()
+
+    r = build_report(db)
+    # b (uses_nats) и c (uses_db) connected; orphan только isolated.
+    assert r.services_orphan_app == 1  # isolated
+    assert r.services_app_scope_total == 4
+    # но HTTP-only метрика по-прежнему считает b/c/isolated orphan-ами:
+    assert r.services_without_http_edges == 3  # b, c, isolated
+
+
+def test_orphan_app_excludes_expected_stale_infra(db):
+    """expected_stale-инфра (DB/headless/system) исключена из знаменателя.
+
+    Такие сервисы edge-less by design и не должны валить gate.
+    """
+    app_ok = _mk_svc(db, name="app-ok", stale_class=STALE_CLASS_ACTIVE)
+    app_orphan = _mk_svc(db, name="app-orphan",
+                         stale_class=STALE_CLASS_SUSPICIOUS)
+    # инфра без edges — не должна попасть ни в orphan, ни в знаменатель:
+    _mk_svc(db, name="infra-db", stale_class=STALE_CLASS_EXPECTED)
+    _mk_edge(db, app_ok.id, app_ok.id, "uses_nats")
+    db.commit()
+
+    r = build_report(db)
+    # scope = {app-ok, app-orphan}; infra-db исключён.
+    assert r.services_app_scope_total == 2
+    assert r.services_orphan_app == 1  # только app-orphan
+
+    # gate: 1/2 = 50% > 20% дефолт → fail; но axis считается по app-метрике.
+    result = evaluate_check(r, db, CheckThresholds())
+    assert result.orphan_pct == 50.0
+    orphan_fail = [f for f in result.failures if f["axis"] == "orphan_pct"]
+    assert orphan_fail and "expected_stale" in orphan_fail[0]["detail"]
+
+    # А если поднять порог — orphan-axis проходит (инфра не мешает).
+    result_relaxed = evaluate_check(r, db, CheckThresholds(max_orphan_pct=60.0))
+    assert not [f for f in result_relaxed.failures if f["axis"] == "orphan_pct"]
 
 
 def test_jobs_linkage_pct(db):
@@ -469,6 +526,8 @@ def test_render_json_contains_all_keys(db):
         "storage_volumes_by_kind",
         "services_without_http_edges",
         "services_without_nats_edges",
+        "services_orphan_app",
+        "services_app_scope_total",
         "stale_active",
         "stale_expected",
         "stale_suspicious",
