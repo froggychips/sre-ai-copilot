@@ -289,7 +289,7 @@ def test_orphan_app_nats_only_not_orphan(db):
     a = _mk_svc(db, name="a")  # HTTP src
     b = _mk_svc(db, name="b")  # связан только через uses_nats
     c = _mk_svc(db, name="c")  # связан только через uses_db
-    isolated = _mk_svc(db, name="isolated")  # вообще без edges → orphan
+    _mk_svc(db, name="isolated")  # вообще без edges → orphan
     _mk_edge(db, a.id, a.id, "calls")  # a имеет HTTP
     _mk_edge(db, a.id, b.id, "uses_nats")
     _mk_edge(db, c.id, c.id, "uses_db")
@@ -309,8 +309,7 @@ def test_orphan_app_excludes_expected_stale_infra(db):
     Такие сервисы edge-less by design и не должны валить gate.
     """
     app_ok = _mk_svc(db, name="app-ok", stale_class=STALE_CLASS_ACTIVE)
-    app_orphan = _mk_svc(db, name="app-orphan",
-                         stale_class=STALE_CLASS_SUSPICIOUS)
+    _mk_svc(db, name="app-orphan", stale_class=STALE_CLASS_SUSPICIOUS)
     # инфра без edges — не должна попасть ни в orphan, ни в знаменатель:
     _mk_svc(db, name="infra-db", stale_class=STALE_CLASS_EXPECTED)
     _mk_edge(db, app_ok.id, app_ok.id, "uses_nats")
