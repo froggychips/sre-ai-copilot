@@ -135,6 +135,11 @@ class QualityReport:
     storage_volumes_by_kind: Dict[str, int]
     services_without_http_edges: int
     services_without_nats_edges: int
+    # orphan-by-app-topology: real-сервис без ЛЮБОГО meaningful edge
+    # (calls/routes_to/uses_db/uses_nats), исключая expected_stale-инфру.
+    # Это gate-метрика (см. evaluate_check / issue #2).
+    services_orphan_app: int
+    services_app_scope_total: int
 
     # 3. Stale classification
     stale_active: int
@@ -354,6 +359,35 @@ def _section_topology(db: Session) -> Dict[str, Any]:
     nats_svc_ids = {r[0] for r in nats_svc_ids_q.all() if r[0] is not None}
     no_nats = len(real_ids - nats_svc_ids)
 
+    # Orphan-by-app-topology (gate-метрика, см. issue #2):
+    # сервис считается connected, если у него есть ЛЮБОЙ meaningful edge
+    # (calls/routes_to/uses_db/uses_nats) как src ИЛИ dst. WO-сервисы общаются
+    # в основном через NATS/Orleans и БД, а не HTTP REST, поэтому учитывать
+    # только HTTP-kinds = ложные orphan-ы. Дополнительно из знаменателя
+    # исключаем expected_stale (инфра: DB/headless/system — безрёберны by design),
+    # оставляя active + suspicious_stale (реальные app-сервисы).
+    meaningful_kinds = ("calls", "routes_to", "uses_db", "uses_nats")
+    connected_ids_q = (
+        db.query(ServiceEdge.src_id).filter(ServiceEdge.kind.in_(meaningful_kinds)).union(
+            db.query(ServiceEdge.dst_id).filter(ServiceEdge.kind.in_(meaningful_kinds))
+        )
+    )
+    connected_ids = {r[0] for r in connected_ids_q.all() if r[0] is not None}
+
+    app_scope_rows = (
+        db.query(Service.id)
+        .filter(
+            _is_real_filter(),
+            or_(
+                Service.stale_class != STALE_CLASS_EXPECTED,
+                Service.stale_class.is_(None),
+            ),
+        )
+        .all()
+    )
+    app_scope_ids = {r[0] for r in app_scope_rows}
+    orphan_app = len(app_scope_ids - connected_ids)
+
     return {
         "edges_by_kind": edges_by_kind,
         "jobs_total": jobs_total,
@@ -363,6 +397,8 @@ def _section_topology(db: Session) -> Dict[str, Any]:
         "storage_volumes_by_kind": storage_volumes_by_kind,
         "services_without_http_edges": no_http,
         "services_without_nats_edges": no_nats,
+        "services_orphan_app": orphan_app,
+        "services_app_scope_total": len(app_scope_ids),
     }
 
 
@@ -769,8 +805,12 @@ Snapshot для Phase A (remediation). Все denominators прописаны я
 ### Orphans (среди real-сервисов)
 
 {_table_block([
-    ("без HTTP-edges (calls/serves_traffic/routes_to)", str(r.services_without_http_edges)),
-    ("без NATS-edges (uses_nats)", str(r.services_without_nats_edges)),
+    ("app-orphan (без meaningful edge, excl expected_stale) — gate-метрика",
+     f"{r.services_orphan_app}/{r.services_app_scope_total}"),
+    ("без HTTP-edges (calls/serves_traffic/routes_to) — диагностика",
+     str(r.services_without_http_edges)),
+    ("без NATS-edges (uses_nats) — диагностика",
+     str(r.services_without_nats_edges)),
 ])}
 
 ---
@@ -882,7 +922,10 @@ def evaluate_check(
 
     Что валидирует:
       * `unknown_edge_kinds` (запрос к kg_service_edges) — len > 0 → fail.
-      * `orphan_pct` (среди real-services без HTTP-edge) > max_orphan → fail.
+      * `orphan_pct` (app-сервисы без ЛЮБОГО meaningful edge
+        calls/routes_to/uses_db/uses_nats, исключая expected_stale-инфру)
+        > max_orphan → fail. Это app-topology completeness, а не HTTP-only:
+        WO общается через NATS/Orleans/БД, а не REST (issue #2).
       * `owner_pct` (owner_known среди real) < min_owner → fail.
       * `stale_null_pct` (stale_class IS NULL среди real) > max_stale_null → fail.
     """
@@ -897,15 +940,17 @@ def evaluate_check(
             "detail": f"{len(unknown)} edge kind(s) в БД отсутствуют в contract.EDGE_KINDS",
         })
 
-    # orphan_pct: считаем по services_without_http_edges / real_total.
-    # _pct возвращает None если denom = 0 (пустая БД — gate тихо проходит).
-    orphan_pct = _pct(report.services_without_http_edges, report.services_total_real)
+    # orphan_pct: app-topology completeness — сервисы без ЛЮБОГО meaningful
+    # edge (calls/routes_to/uses_db/uses_nats), знаменатель без expected_stale
+    # инфры (см. _section_topology + issue #2). _pct возвращает None если
+    # denom = 0 (пустая БД — gate тихо проходит).
+    orphan_pct = _pct(report.services_orphan_app, report.services_app_scope_total)
     if orphan_pct is not None and orphan_pct > thresholds.max_orphan_pct:
         failures.append({
             "axis": "orphan_pct",
             "actual": orphan_pct,
             "threshold": thresholds.max_orphan_pct,
-            "detail": f"{report.services_without_http_edges}/{report.services_total_real} = {orphan_pct}% > {thresholds.max_orphan_pct}%",
+            "detail": f"{report.services_orphan_app}/{report.services_app_scope_total} = {orphan_pct}% > {thresholds.max_orphan_pct}% (app без meaningful edge, excl expected_stale)",
         })
 
     owner_pct = report.owner_known_pct
