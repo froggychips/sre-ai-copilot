@@ -39,7 +39,8 @@ from typing import Any, Dict, List, Optional, Tuple
 from sqlalchemy import and_, func, or_, text
 from sqlalchemy.orm import Session
 
-from app.knowledge_graph.contract import EDGE_KINDS, SYNTHETIC_KINDS
+from app.knowledge_graph.contract import (EDGE_KINDS, QUALITY_THRESHOLDS,
+                                          SYNTHETIC_KINDS, compute_orphan_stats)
 from app.knowledge_graph.schema import (AlertEvent, Deployment, K8sJob,
                                         PodEvent, Service, ServiceEdge,
                                         StorageVolume, VolumeEdge)
@@ -55,8 +56,13 @@ log = logging.getLogger(__name__)
 # Это **warning gate**, не blocker: проверки могут понадобиться recalibrated
 # при росте графа. Поэтому пороги читаются из ENV/CLI overrides, а не
 # хардкод. Если хочется временно отключить gate — `--max-orphan 1.0` и т.п.
-DEFAULT_MAX_ORPHAN_PCT: float = 20.0    # services без edges > N% → fail
-DEFAULT_MIN_OWNER_PCT: float = 50.0     # owner coverage < N% → fail
+#
+# orphan/owner пороги живут в ОДНОМ месте — `contract.QUALITY_THRESHOLDS`
+# (single source). Здесь только re-export ради CLI/ENV-defaults.
+DEFAULT_MAX_ORPHAN_PCT: float = QUALITY_THRESHOLDS["orphan_rate_max_pct"]   # 10.0
+DEFAULT_MIN_OWNER_PCT: float = QUALITY_THRESHOLDS["owner_coverage_min_pct"]  # 90.0
+# stale_null — собственный порог quality_report (нет в contract): он про
+# отставание backfill-а stale_class, а не про KG quality как таковую.
 DEFAULT_MAX_STALE_NULL_PCT: float = 10.0  # stale_class IS NULL > N% → fail
 
 
@@ -359,34 +365,12 @@ def _section_topology(db: Session) -> Dict[str, Any]:
     nats_svc_ids = {r[0] for r in nats_svc_ids_q.all() if r[0] is not None}
     no_nats = len(real_ids - nats_svc_ids)
 
-    # Orphan-by-app-topology (gate-метрика, см. issue #2):
-    # сервис считается connected, если у него есть ЛЮБОЙ meaningful edge
-    # (calls/routes_to/uses_db/uses_nats) как src ИЛИ dst. WO-сервисы общаются
-    # в основном через NATS/Orleans и БД, а не HTTP REST, поэтому учитывать
-    # только HTTP-kinds = ложные orphan-ы. Дополнительно из знаменателя
-    # исключаем expected_stale (инфра: DB/headless/system — безрёберны by design),
-    # оставляя active + suspicious_stale (реальные app-сервисы).
-    meaningful_kinds = ("calls", "routes_to", "uses_db", "uses_nats")
-    connected_ids_q = (
-        db.query(ServiceEdge.src_id).filter(ServiceEdge.kind.in_(meaningful_kinds)).union(
-            db.query(ServiceEdge.dst_id).filter(ServiceEdge.kind.in_(meaningful_kinds))
-        )
-    )
-    connected_ids = {r[0] for r in connected_ids_q.all() if r[0] is not None}
-
-    app_scope_rows = (
-        db.query(Service.id)
-        .filter(
-            _is_real_filter(),
-            or_(
-                Service.stale_class != STALE_CLASS_EXPECTED,
-                Service.stale_class.is_(None),
-            ),
-        )
-        .all()
-    )
-    app_scope_ids = {r[0] for r in app_scope_rows}
-    orphan_app = len(app_scope_ids - connected_ids)
+    # Orphan-by-app-topology (gate-метрика, см. issue #2) — единый источник
+    # `contract.compute_orphan_stats`: real-сервис без ЛЮБОГО edge (любого
+    # kind, src ИЛИ dst), знаменатель без expected_stale-инфры (DB/headless/
+    # system — безрёберны by design). WO общается через NATS/Orleans/БД, а не
+    # только HTTP REST — поэтому any-edge, не HTTP-only.
+    orphan_stats = compute_orphan_stats(db)
 
     return {
         "edges_by_kind": edges_by_kind,
@@ -397,8 +381,8 @@ def _section_topology(db: Session) -> Dict[str, Any]:
         "storage_volumes_by_kind": storage_volumes_by_kind,
         "services_without_http_edges": no_http,
         "services_without_nats_edges": no_nats,
-        "services_orphan_app": orphan_app,
-        "services_app_scope_total": len(app_scope_ids),
+        "services_orphan_app": orphan_stats["orphan"],
+        "services_app_scope_total": orphan_stats["app_scope"],
     }
 
 

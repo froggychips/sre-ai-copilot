@@ -18,9 +18,11 @@ from app.knowledge_graph.contract import (
     QUALITY_THRESHOLDS,
     REAL_SERVICE_KINDS,
     SERVICE_KINDS,
+    STALE_CLASS_EXPECTED_STALE,
     STARTUP_CONTRACT_CHECK,
     SYNTHETIC_KINDS,
     active_edge_kinds,
+    compute_orphan_stats,
     is_edge_kind_known,
     is_orphan,
     is_synthetic,
@@ -193,6 +195,12 @@ def test_is_orphan_with_recent_deploy_excluded():
     assert not is_orphan(s, edge_ids_seen=[], has_recent_deploy=True)
 
 
+def test_is_orphan_expected_stale_excluded():
+    """expected_stale-инфра (edge-less by design) — не orphan (v2.3)."""
+    s = _svc(name="postgres-squad-1", svc_id=42)
+    assert not is_orphan(s, edge_ids_seen=[], is_expected_stale=True)
+
+
 def test_owner_known_basic():
     assert owner_known(_svc(team_owner="squad-1"))
     assert not owner_known(_svc(team_owner=None))
@@ -296,3 +304,42 @@ def test_startup_contract_check_orphan_pct_calculated(db):
     # 3 real, 1 orphan (c) — 33%; a и b связаны edge'ом
     assert report["orphan_pct"] is not None
     assert 30.0 <= report["orphan_pct"] <= 35.0
+
+
+def test_compute_orphan_stats_app_scope_and_orphan(db):
+    """Canonical helper: synthetic скрыт, expected_stale вне scope,
+    edge-less active → orphan, с edge → не orphan.
+
+    Seed:
+      * syn — synthetic (вне scope, вне orphan)
+      * infra — expected_stale без edge (вне scope, вне orphan)
+      * orphan-svc — active без edge → orphan
+      * linked — active с edge → не orphan
+    app_scope = {orphan-svc, linked} = 2; orphan = 1 → 50%.
+    """
+    syn = Service(name="ingress:foo.com", namespace="ns", team_owner="t")
+    syn.synthetic = True
+    infra = Service(name="postgres-x", namespace="ns", team_owner="t")
+    infra.synthetic = False
+    infra.stale_class = STALE_CLASS_EXPECTED_STALE
+    orphan_svc = Service(name="orphan-svc", namespace="ns", team_owner="t")
+    orphan_svc.synthetic = False
+    linked = Service(name="linked", namespace="ns", team_owner="t")
+    linked.synthetic = False
+    db.add_all([syn, infra, orphan_svc, linked])
+    db.flush()
+    db.add(ServiceEdge(src_id=linked.id, dst_id=linked.id, kind="uses_nats", weight=1))
+    db.commit()
+
+    stats = compute_orphan_stats(db)
+    assert stats["app_scope"] == 2
+    assert stats["orphan"] == 1
+    assert stats["orphan_pct"] == 50.0
+
+
+def test_compute_orphan_stats_empty_db_pct_none(db):
+    """Пустой scope → orphan_pct = None (не ложный 0%)."""
+    stats = compute_orphan_stats(db)
+    assert stats["app_scope"] == 0
+    assert stats["orphan"] == 0
+    assert stats["orphan_pct"] is None

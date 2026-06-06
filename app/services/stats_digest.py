@@ -842,6 +842,7 @@ def fragile_services_section(db: Session, ns_to_team: Dict[str, str]) -> str:
 # `_EXPECTED_STALE_NAMESPACES` не падали.
 from app.knowledge_graph.contract import (  # noqa: E402
     STALE_CLASS_EXPECTED_STALE,
+    compute_orphan_stats,
 )
 from app.knowledge_graph.schema import Service  # noqa: E402
 # Re-exports для legacy-import паттерна (stats_digest._EXPECTED_STALE_*) —
@@ -1417,25 +1418,21 @@ def kg_quality_section(db: Session) -> str:
     synthetic = db.execute(
         text("SELECT count(*) FROM kg_services WHERE synthetic = true")
     ).scalar() or 0
-    # Orphan = real services без edges. Synthetic (backup-cron'ы, nats-tools,
-    # observability-exporters) исключены: они никогда edges не имеют по дизайну
-    # и засчитывались бы как ложно-orphan.
-    orphan = db.execute(text("""
-        SELECT count(*) FROM kg_services s
-        WHERE NOT s.synthetic
-          AND s.id NOT IN (
-              SELECT src_id FROM kg_service_edges
-              UNION SELECT dst_id FROM kg_service_edges
-          )
-    """)).scalar() or 0
-    real_total = services_total - synthetic
-    pct_orphan = (100 * orphan // real_total) if real_total else 0
+    # Orphan — единый источник `contract.compute_orphan_stats` (app-scope:
+    # real-сервисы без ЛЮБОГО edge, знаменатель без expected_stale-инфры).
+    # Synthetic (backup-cron'ы, nats-tools, observability-exporters) и
+    # expected_stale (DB/headless/system) исключены — они безрёберны by design.
+    orphan_stats = compute_orphan_stats(db)
+    orphan = orphan_stats["orphan"]
+    app_scope = orphan_stats["app_scope"]
+    pct_orphan = (100 * orphan // app_scope) if app_scope else 0
     edges_str = ", ".join(f"{k}={v}" for k, v in sorted(edges_by_kind.items()))
     synthetic_suffix = f" · synthetic скрыты: `{synthetic}`" if synthetic else ""
 
     return "\n".join([
         "**🧬 KG quality**",
-        f"  Services: `{services_total}` · Orphan: `{orphan}`/`{real_total}` ({pct_orphan}%){synthetic_suffix}",
+        # Знаменатель — app-scope (real, excl expected_stale), не real_total.
+        f"  Services: `{services_total}` · Orphan: `{orphan}`/`{app_scope}` ({pct_orphan}%){synthetic_suffix}",
         f"  Edges: `{edges_total}` ({edges_str})",
     ])
 

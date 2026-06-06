@@ -587,7 +587,8 @@ def test_kg_quality_renders_full_state():
        2. edges_total .scalar
        3. edges_by_kind .fetchall
        4. synthetic .scalar
-       5. orphan (исключая synthetic) .scalar
+       5. compute_orphan_stats → app_scope .scalar
+       6. compute_orphan_stats → orphan .scalar
     """
     db = MagicMock()
     call_results = [
@@ -595,13 +596,14 @@ def test_kg_quality_renders_full_state():
         MagicMock(scalar=lambda: 696),
         MagicMock(fetchall=lambda: [("calls", 36), ("uses_nats", 660)]),
         MagicMock(scalar=lambda: 82),   # synthetic
-        MagicMock(scalar=lambda: 47),   # real-orphan
+        MagicMock(scalar=lambda: 302),  # compute_orphan_stats: app_scope
+        MagicMock(scalar=lambda: 47),   # compute_orphan_stats: orphan
     ]
     db.execute.side_effect = call_results
 
     rendered = stats_digest.kg_quality_section(db)
     assert "`384`" in rendered
-    assert "`47`/`302`" in rendered  # orphan / (total - synthetic)
+    assert "`47`/`302`" in rendered  # orphan / app_scope (excl expected_stale)
     assert "(15%)" in rendered  # 47/302 = 15.56% → 15
     assert "synthetic скрыты: `82`" in rendered
     assert "calls=36" in rendered
@@ -618,8 +620,9 @@ def test_kg_quality_no_synthetic_no_suffix():
         MagicMock(scalar=lambda: 100),
         MagicMock(scalar=lambda: 200),
         MagicMock(fetchall=lambda: [("calls", 200)]),
-        MagicMock(scalar=lambda: 0),   # synthetic = 0
-        MagicMock(scalar=lambda: 10),
+        MagicMock(scalar=lambda: 0),    # synthetic = 0
+        MagicMock(scalar=lambda: 100),  # compute_orphan_stats: app_scope
+        MagicMock(scalar=lambda: 10),   # compute_orphan_stats: orphan
     ]
     rendered = stats_digest.kg_quality_section(db)
     assert "synthetic скрыты" not in rendered
