@@ -43,8 +43,8 @@ from typing import Any, Dict, List, Optional, Tuple, cast
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from app.knowledge_graph.schema import (AnomalyObservation, Service,
-                                        ServiceHealth)
+from app.knowledge_graph.schema import (AnomalyObservation, LogObservation,
+                                        Service, ServiceHealth)
 
 log = logging.getLogger(__name__)
 
@@ -56,6 +56,14 @@ METRICS: Tuple[str, ...] = (
     "http_5xx_rate",
     "p95_latency_ms",
 )
+
+# Лог-производный app-сигнал (consumer для log_error_rate, см. queries.py).
+# Отдельная метрика поверх kg_log_observations — НЕ из ServiceHealth, т.к.
+# http_5xx/p95 там всегда 0 (scrape-gap), а лог-ошибки реально есть.
+# Семантика: всплеск Error/Fatal-логов сервиса относительно его ЖЕ типичного
+# объёма ошибок (НЕ HTTP 5xx). Это proxy — помечаем в extras.
+LOG_ERROR_METRIC = "log_error_rate"
+LOG_ERROR_LEVELS: Tuple[str, ...] = ("Error", "Fatal")
 
 # Параметры окон.
 CURRENT_POINTS = 6              # последние ≈1ч при 10-мин ритме
@@ -347,6 +355,101 @@ def _detect_for_service(
     return counters
 
 
+def _detect_log_errors_for_service(
+    db: Session,
+    service: Service,
+    now: datetime,
+    *,
+    warn_thresh: float,
+    crit_thresh: float,
+) -> Dict[str, int]:
+    """Robust-z по объёму Error/Fatal-логов сервиса (из kg_log_observations).
+
+    Серия строится из НЕНУЛЕВЫХ error-бакетов (Error+Fatal, суммированных по
+    ts-окну): baseline = «типичный объём ошибок когда они есть», current —
+    последние CURRENT_POINTS бакетов. z ловит «ошибок сильно больше обычного».
+
+    Ограничение v1: «впервые ошибся» (пустой baseline / MAD=0) НЕ ловится —
+    robust-z требует baseline-разброс. Это всё равно строго лучше нуля
+    app-слойных аномалий (http_5xx/p95 в ServiceHealth всегда 0, scrape-gap).
+    Флагуем только ПОЛОЖИТЕЛЬНЫЙ z (рост ошибок; падение — не инцидент).
+    """
+    counters = {
+        "inserted": 0, "skipped_dup": 0, "skipped_no_baseline": 0,
+        "skipped_no_current": 0, "skipped_volume_guard": 0,
+    }
+    current_start = now - timedelta(hours=BASELINE_EXCLUDE_HOURS)
+    baseline_start = now - timedelta(days=BASELINE_DAYS)
+
+    rows: List[LogObservation] = (
+        db.query(LogObservation)
+        .filter(
+            LogObservation.service_id == service.id,
+            LogObservation.level.in_(LOG_ERROR_LEVELS),
+            LogObservation.ts >= baseline_start,
+            LogObservation.ts <= now,
+        )
+        .order_by(LogObservation.ts.asc())
+        .all()
+    )
+    if not rows:
+        return counters
+
+    # Error+Fatal в одном ts-окне суммируем в один бакет.
+    by_ts: Dict[datetime, int] = {}
+    for r in rows:
+        by_ts[r.ts] = by_ts.get(r.ts, 0) + int(r.count or 0)
+    series = sorted(by_ts.items())  # [(ts, count)] возрастающе
+
+    baseline_vals = [float(c) for ts, c in series if ts < current_start]
+    current_buckets = [(ts, c) for ts, c in series if ts >= current_start][-CURRENT_POINTS:]
+    if not current_buckets:
+        counters["skipped_no_current"] += 1
+        return counters
+
+    anomaly_ts = current_buckets[-1][0]
+    current_value = statistics.fmean([float(c) for _, c in current_buckets])
+
+    res = _compute_robust_z(current_value, baseline_vals)
+    if res is None:
+        counters["skipped_no_baseline"] += 1
+        return counters
+    z, median, mad = res
+    if z < warn_thresh:  # только рост (положительный z); |z| не нужен
+        return counters
+
+    recent = _count_recent_observations(
+        db, cast(int, service.id), LOG_ERROR_METRIC, now,
+    )
+    if recent >= VOLUME_GUARD_MAX_PER_HOUR:
+        counters["skipped_volume_guard"] += 1
+        return counters
+
+    sev = _severity(z, warn_thresh, crit_thresh)
+    extras = {
+        "method": "robust_z_log_errors",
+        "median": median,
+        "mad": mad,
+        "baseline_n": len(baseline_vals),
+        "levels": list(LOG_ERROR_LEVELS),
+        "is_log_proxy": True,  # НЕ HTTP 5xx — лог-производный сигнал
+    }
+    ok = _insert_idempotent(
+        db,
+        service_id=cast(int, service.id),
+        ts=cast(datetime, anomaly_ts),
+        metric=LOG_ERROR_METRIC,
+        value=current_value,
+        baseline_mean=median,
+        baseline_stddev=MAD_GAUSS_CONST * mad,
+        z_score=z,
+        severity=sev,
+        extras=extras,
+    )
+    counters["inserted" if ok else "skipped_dup"] += 1
+    return counters
+
+
 def detect_anomalies(
     db: Session,
     now: Optional[datetime] = None,
@@ -354,6 +457,8 @@ def detect_anomalies(
     """Beat-task entry — детектировать аномалии по всем real services.
 
     `now` — для тестов (фиксированное время). Default = datetime.utcnow().
+    Помимо robust-z по ServiceHealth-метрикам, прогоняет лог-error детектор
+    (log_error_rate) по сервисам с записями в kg_log_observations.
     """
     now = now or datetime.utcnow()
     warn_thresh = _threshold_warn()
@@ -394,6 +499,40 @@ def detect_anomalies(
         stats["skipped_no_baseline"] += counters["skipped_no_baseline"]
         stats["skipped_no_current"] += counters["skipped_no_current"]
         stats["skipped_volume_guard"] += counters["skipped_volume_guard"]
+
+    # Лог-error аномалии: только сервисы с записями в kg_log_observations за
+    # baseline-окно (обычно ~36, не все 2.4k real svc → дёшево).
+    log_svc_ids = {
+        sid for (sid,) in (
+            db.query(LogObservation.service_id)
+            .filter(
+                LogObservation.ts >= now - timedelta(days=BASELINE_DAYS),
+                LogObservation.service_id.isnot(None),
+            )
+            .distinct()
+            .all()
+        )
+    }
+    svc_by_id = {s.id: s for s in services}
+    stats["log_error_services"] = len(log_svc_ids)
+    for sid in log_svc_ids:
+        svc = svc_by_id.get(sid)
+        if svc is None:
+            continue
+        try:
+            lc = _detect_log_errors_for_service(
+                db, svc, now, warn_thresh=warn_thresh, crit_thresh=crit_thresh,
+            )
+        except Exception as e:
+            stats["errors"] += 1
+            log.warning(
+                "anomaly_detection.log_errors_failed ns=%s name=%s err=%s",
+                svc.namespace, svc.name, e,
+            )
+            continue
+        for k in ("inserted", "skipped_dup", "skipped_no_baseline",
+                  "skipped_no_current", "skipped_volume_guard"):
+            stats[k] += lc[k]
 
     db.commit()
 
