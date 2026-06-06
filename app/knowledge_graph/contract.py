@@ -364,20 +364,23 @@ def compute_orphan_stats(db: "Session") -> OrphanStats:
     """
     from sqlalchemy import text
 
+    # Значение expected_stale — bound param (:exp), не конкатенация в SQL
+    # (Bandit B608 + чистая практика; значение и так доверенная константа).
+    params = {"exp": STALE_CLASS_EXPECTED_STALE}
     app_scope = db.execute(text(
         "SELECT count(*) FROM kg_services s "
         "WHERE NOT s.synthetic "
-        "  AND coalesce(s.stale_class, '') <> '" + STALE_CLASS_EXPECTED_STALE + "'"
-    )).scalar() or 0
+        "  AND coalesce(s.stale_class, '') <> :exp"
+    ), params).scalar() or 0
     orphan = db.execute(text(
         "SELECT count(*) FROM kg_services s "
         "WHERE NOT s.synthetic "
-        "  AND coalesce(s.stale_class, '') <> '" + STALE_CLASS_EXPECTED_STALE + "' "
+        "  AND coalesce(s.stale_class, '') <> :exp "
         "  AND s.id NOT IN ("
         "      SELECT src_id FROM kg_service_edges "
         "      UNION SELECT dst_id FROM kg_service_edges"
         "  )"
-    )).scalar() or 0
+    ), params).scalar() or 0
     orphan_pct = round(100.0 * orphan / app_scope, 1) if app_scope > 0 else None
     return {"orphan": int(orphan), "app_scope": int(app_scope), "orphan_pct": orphan_pct}
 
