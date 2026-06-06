@@ -398,7 +398,8 @@ def _detect_log_errors_for_service(
     # Error+Fatal в одном ts-окне суммируем в один бакет.
     by_ts: Dict[datetime, int] = {}
     for r in rows:
-        by_ts[r.ts] = by_ts.get(r.ts, 0) + int(r.count or 0)
+        ts = cast(datetime, r.ts)
+        by_ts[ts] = by_ts.get(ts, 0) + int(r.count or 0)
     series = sorted(by_ts.items())  # [(ts, count)] возрастающе
 
     baseline_vals = [float(c) for ts, c in series if ts < current_start]
@@ -516,18 +517,18 @@ def detect_anomalies(
     svc_by_id = {s.id: s for s in services}
     stats["log_error_services"] = len(log_svc_ids)
     for sid in log_svc_ids:
-        svc = svc_by_id.get(sid)
-        if svc is None:
+        svc_opt = svc_by_id.get(sid)
+        if svc_opt is None:
             continue
         try:
             lc = _detect_log_errors_for_service(
-                db, svc, now, warn_thresh=warn_thresh, crit_thresh=crit_thresh,
+                db, svc_opt, now, warn_thresh=warn_thresh, crit_thresh=crit_thresh,
             )
         except Exception as e:
             stats["errors"] += 1
             log.warning(
                 "anomaly_detection.log_errors_failed ns=%s name=%s err=%s",
-                svc.namespace, svc.name, e,
+                svc_opt.namespace, svc_opt.name, e,
             )
             continue
         for k in ("inserted", "skipped_dup", "skipped_no_baseline",
