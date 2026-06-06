@@ -11,12 +11,14 @@ from sqlalchemy.orm import sessionmaker
 
 from app.database import Base
 from app.knowledge_graph.schema import (AlertEvent, AnomalyObservation,
-                                        ClusterObservation, LogObservation,
+                                        ClusterObservation, Deployment,
+                                        LogObservation,
                                         PodEvent, Service, ServiceEdge,
                                         ServiceHealth, SignalAggregate)
 from app.knowledge_graph.self_health import (aggregate_status,
                                              check_alerts_resolve_freshness,
                                              check_anomaly_signal_health,
+                                             check_deploy_stream_ingestion,
                                              check_edges_freshness,
                                              check_materialization_zero_rate,
                                              check_pod_events_link_rate,
@@ -470,3 +472,65 @@ def test_fingerprint_stable_across_order():
     r1 = [CheckResult("z", "fail", {}), CheckResult("a", "fail", {})]
     r2 = [CheckResult("a", "fail", {}), CheckResult("z", "fail", {})]
     assert fingerprint(r1) == fingerprint(r2)
+
+
+# ── check_deploy_stream_ingestion ───────────────────────────────────────────
+
+def _patch_tc(monkeypatch, builds):
+    """Подменить recent_deploys (async) + branch_for_namespace в teamcity_service
+    (check импортирует их локально оттуда)."""
+    import app.services.teamcity_service as tc
+
+    async def _fake_recent(**_kw):
+        return builds
+
+    monkeypatch.setattr(tc, "recent_deploys", _fake_recent)
+    monkeypatch.setattr(
+        tc, "branch_for_namespace",
+        lambda ns: "preprod" if ns == "preprod-shared" else None,
+    )
+
+
+def test_deploy_stream_ingestion_ok_when_all_present(db, monkeypatch):
+    svc = _mk_service(db, "auth", "preprod-shared")
+    db.add(Deployment(service_id=svc.id, buildtype_id="BT", build_number="100",
+                      started_at=datetime.utcnow()))
+    db.commit()
+    _patch_tc(monkeypatch, [{"buildtype_id": "BT", "number": "100", "branch": "preprod"}])
+    r = check_deploy_stream_ingestion(db)
+    assert r.status == "ok"
+    assert r.detail["present_in_kg"] == 1
+
+
+def test_deploy_stream_ingestion_fail_when_all_missing(db, monkeypatch):
+    _mk_service(db, "auth", "preprod-shared")
+    db.commit()
+    # TC отдаёт 2 deploy-ветко-билда, в KG их нет → ingestion сломан
+    _patch_tc(monkeypatch, [
+        {"buildtype_id": "BT", "number": "200", "branch": "<default>"},  # норм → preprod
+        {"buildtype_id": "BT", "number": "201", "branch": "preprod"},
+    ])
+    r = check_deploy_stream_ingestion(db)
+    assert r.status == "fail"
+    assert r.detail["missing"] == 2
+
+
+def test_deploy_stream_ingestion_ok_when_nothing_to_ingest(db, monkeypatch):
+    _mk_service(db, "auth", "preprod-shared")
+    db.commit()
+    # ветки билдов не маппятся ни на один KG-ns → нечего ингестить (тихо)
+    _patch_tc(monkeypatch, [{"buildtype_id": "BT", "number": "1", "branch": "feature/x"}])
+    r = check_deploy_stream_ingestion(db)
+    assert r.status == "ok"
+
+
+def test_deploy_stream_ingestion_prod_default_not_remapped(db, monkeypatch):
+    """'<default>' у prod-конфига НЕ подменяется на preprod (как и в task)."""
+    _mk_service(db, "auth", "preprod-shared")
+    db.commit()
+    _patch_tc(monkeypatch, [
+        {"buildtype_id": "Wo_..._Prod_BuildAndDeploy", "number": "9", "branch": "<default>"},
+    ])
+    r = check_deploy_stream_ingestion(db)
+    # prod '<default>' → ветка остаётся '<default>', на preprod-shared не маппится → нечего ингестить
+    assert r.status == "ok"
