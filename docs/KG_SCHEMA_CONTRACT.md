@@ -1,7 +1,7 @@
 # KG Schema / Quality Contract
 
-> **Версия контракта:** `kg_schema: 2.2`
-> **Дата:** 2026-05-24 (после merge PR #82/#84/#86 — k8s_jobs / k8s_storage / stale_class)
+> **Версия контракта:** `kg_schema: 2.3`
+> **Дата:** 2026-06-06 (orphan-метрика → app-scope + единый `compute_orphan_stats`)
 > **Источник истины кода:** [`app/knowledge_graph/contract.py`](../app/knowledge_graph/contract.py)
 
 Документ описывает что в Knowledge Graph считается **service**,
@@ -20,7 +20,7 @@
 ## 1. Версия
 
 ```
-KG_SCHEMA_VERSION = "2.2"
+KG_SCHEMA_VERSION = "2.3"
 ```
 
 `major.minor`:
@@ -38,6 +38,7 @@ KG_SCHEMA_VERSION = "2.2"
 | 2.0 | Wave 6 (2026-05-16) | Базовый contract: `calls` / `uses_db` / `uses_nats`, synthetic flag, health_score |
 | 2.1 | Wave 7 (2026-05-22) | + `serves_traffic`, `routes_to`, `pod_event_of`; `subject:` synthetic |
 | **2.2** | 2026-05-24 (PR #82/#84/#86) | + `runs_as_job` (через `K8sJob.owner_service_id`), `uses_volume`/`bound_to` (в `kg_volume_edges`), `kg_services.stale_class` column (active/expected_stale/suspicious_stale), `deploy_history` owner source |
+| **2.3** | 2026-06-06 | orphan-метрика → **app-scope**: знаменатель = real-сервисы с `stale_class != 'expected_stale'`, orphan = из них без ЛЮБОГО edge (any-kind). Единый источник `compute_orphan_stats(db)`; все consumer'ы (`STARTUP_CONTRACT_CHECK`/`quality_report`/`stats_digest`) считают через него. EDGE_KINDS без изменений |
 
 ---
 
@@ -97,36 +98,53 @@ NB: `pvc`/`pv` — это `kg_storage_volumes.kind`, не `kg_services.kind`. О
 
 ## 3. Orphan
 
-**Orphan** = service, существующий в БД, но **не имеющий участия в
-графе и без свежей активности**.
+**Orphan** = real-сервис, существующий в БД, но **не имеющий участия в
+графе** — и при этом не инфра-узел (который безрёберен by design).
 
-Формальное правило (см. `is_orphan()` в `contract.py`):
+Каноническое правило (см. `is_orphan()` / `compute_orphan_stats()` в
+`contract.py`):
 
 ```
 orphan(s) := NOT s.synthetic
+         AND s.stale_class != 'expected_stale'
          AND s.id NOT IN (SELECT src_id FROM kg_service_edges
                           UNION SELECT dst_id FROM kg_service_edges)
-         AND NOT has_recent_deploy(s)  -- последние 30d
 ```
 
-Параметр `has_recent_deploy` опциональный — текущая `stats_digest.kg_quality_section`
-использует **только** edge-проверку (это исторический поведенческий
-контракт; новые consumer'ы могут включать deploy-фильтр).
+* **any-edge, не HTTP-only**: WO-сервисы общаются через NATS/Orleans/БД,
+  а не только HTTP REST — учитываем edge ЛЮБОГО kind, иначе получаем
+  ложные orphan-ы (issue #2).
+* **excl `expected_stale`**: инфра (DB/headless/system) edge-less by
+  design — исключается и из числителя, и из знаменателя (app-scope).
+
+**Denominator (app-scope)** = real (NOT synthetic) сервисы с
+`stale_class != 'expected_stale'`. Это `app_scope` в `compute_orphan_stats`.
+
+`is_orphan()` принимает опциональные `is_expected_stale` (default False —
+тогда сервис не orphan) и `has_recent_deploy` (backward-compat). Все
+агрегатные consumer'ы обязаны звать `compute_orphan_stats(db)` — это
+**единственный источник** orphan-метрики, не дублировать SQL.
 
 **Threshold**: `orphan_rate_max_pct = 10.0` (см. `QUALITY_THRESHOLDS`).
-Превышение → warning в `STARTUP_CONTRACT_CHECK` логом.
+Превышение → warning в `STARTUP_CONTRACT_CHECK` логом. На текущем графе
+orphan-rate ≈ 50% (all-env) / ≈ 17% (prod) — это честно **выше** target
+10%; цель не достигнута, не gamed.
 
 ---
 
 ## 4. Synthetic — почему исключаются из counts
 
-`stats_digest` показывает orphan как `orphan / real_total`, где
-`real_total = services_total - synthetic`. Причина:
+`stats_digest` показывает orphan как `orphan / app_scope`, где
+`app_scope = real-сервисы с stale_class != 'expected_stale'` (см.
+`compute_orphan_stats`). Причина исключать synthetic из знаменателя:
 
 * Synthetic-узлы по дизайну могут не иметь edges и не имеют pod-а.
 * Включение их в знаменатель искажает «насколько ваши *реальные*
   workload-ы привязаны к графу».
 * Synthetic = bookkeeping узел, не subject of operation.
+
+`expected_stale`-инфра исключается из app-scope по той же логике —
+DB/headless/system безрёберны by design (см. секцию 3).
 
 Текущее field: `kg_services.synthetic` (Boolean, default=false).
 Эвристика fallback (`is_synthetic` в `contract.py`) — по префиксу
@@ -244,7 +262,7 @@ Storage: `String`, не PG enum (sqlite-compat тестов; см. миграц�
 
 | Метрика | Threshold | Direction | Где считается |
 |---|---|---|---|
-| `orphan_rate_max_pct` | 10.0 | ≤ | `stats_digest.kg_quality_section` |
+| `orphan_rate_max_pct` | 10.0 | ≤ | `compute_orphan_stats` (app-scope) — зовут `stats_digest.kg_quality_section`, `quality_report`, `STARTUP_CONTRACT_CHECK` |
 | `owner_coverage_min_pct` | 90.0 | ≥ | `stats_digest` (planned) |
 | `sha_coverage_min_pct` | 50.0 | ≥ | KG DQ audit (см. memory `project_kg_dq_audit_2026_05_22`) |
 | `deploy_attribution_min_pct` | 50.0 | ≥ | per-service: ≥1 deploy за 30d |
@@ -257,8 +275,15 @@ Baseline (на момент 2026-05-22, см. memory `project_kg_snapshot_2026_0
 
 * services real: 364
 * team_owner coverage: 92% (✓)
-* orphan rate: ~16% (✗ — выше threshold; работа в progress)
 * sha coverage: 44.8% (✗)
+
+Orphan-rate (app-scope, v2.3 — any-edge, excl `expected_stale`):
+
+* all-env: ≈ 50% (✗ — выше target 10%; работа в progress, **не** gamed)
+* prod-only: ≈ 17% (✗ — тоже выше target)
+
+Target `orphan_rate_max_pct = 10.0` пока **не достигнут** — это честный
+текущий снимок, threshold намеренно не ослаблялся.
 
 ---
 
@@ -287,6 +312,7 @@ Baseline (на момент 2026-05-22, см. memory `project_kg_snapshot_2026_0
 |---|---|
 | Новый edge kind, новый synthetic prefix | minor (2.1 → 2.2) |
 | Новый QUALITY_THRESHOLD | minor |
+| Уточнение семантики quality-метрики (напр. orphan → app-scope) без смены threshold-значений | minor (2.2 → 2.3) |
 | Изменение semantic существующего kind | major (2.x → 3.0) |
 | Удаление kind | major |
 | Renaming таблиц / breaking schema | major |
