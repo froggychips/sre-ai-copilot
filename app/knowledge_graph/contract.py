@@ -39,7 +39,11 @@ log = logging.getLogger(__name__)
 #: 2.1 = после Wave 7 (PodEvent corr / Service+Ingress topology / NATS subjects).
 #: 2.2 = после PR #82 (k8s_jobs_sync), #84 (k8s_storage_sync) и #86
 #: (kg_services.stale_class column + multi-signal owner inference).
-KG_SCHEMA_VERSION: str = "2.2"
+#: 2.3 = orphan-метрика переведена на app-scope (знаменатель — real-сервисы
+#: без expected_stale-инфры) + единый источник `compute_orphan_stats`; все
+#: consumer'ы (STARTUP_CONTRACT_CHECK, quality_report, stats_digest) считают
+#: orphan через него. EDGE_KINDS не менялись.
+KG_SCHEMA_VERSION: str = "2.3"
 
 
 # ---------------------------------------------------------------------------
@@ -297,22 +301,34 @@ def is_orphan(
     edge_ids_seen: Iterable[int],
     *,
     has_recent_deploy: bool = False,
+    is_expected_stale: bool = False,
 ) -> bool:
-    """Orphan service по контракту:
+    """Orphan service по **каноническому** правилу (v2.3):
 
       * НЕ synthetic, И
-      * нет ни одной edge'и (src или dst), И
-      * нет deploy'я за последние `DEPLOY_ATTRIBUTION_WINDOW_DAYS`.
+      * нет ни одной edge'и ЛЮБОГО kind (как src ИЛИ dst), И
+      * stale_class != 'expected_stale' (инфра — DB/headless/system —
+        безрёберна by design, исключается).
+
+    WO общается через NATS/Orleans/БД, а не только HTTP — поэтому учитываем
+    edge ЛЮБОГО kind, не только HTTP. expected_stale-узлы edge-less by design
+    и не должны загрязнять метрику.
 
     `edge_ids_seen` — итерируемое со всеми service_id, которые
     встречаются как src или dst в kg_service_edges (caller получает
     через `SELECT DISTINCT src_id UNION DISTINCT dst_id`).
 
-    Параметр `has_recent_deploy` опциональный: caller может пропустить
-    deploy-проверку, передав default=False; тогда orphan определяется
-    только по edges (это поведение текущей stats_digest.kg_quality_section).
+    Параметр `is_expected_stale` опциональный: если True — сервис не
+    считается orphan (он инфра по дизайну без рёбер). Caller, не имеющий
+    stale_class под рукой, передаёт default=False.
+
+    Параметр `has_recent_deploy` сохранён для backward-compat: если True —
+    сервис не orphan. Caller'ы которые его не передают → поведение без
+    изменений.
     """
     if is_synthetic(service):
+        return False
+    if is_expected_stale:
         return False
     svc_id = getattr(service, "id", None)
     if svc_id is None:
@@ -322,6 +338,48 @@ def is_orphan(
     if has_recent_deploy:
         return False
     return True
+
+
+class OrphanStats(TypedDict):
+    """Результат `compute_orphan_stats`."""
+    orphan: int
+    app_scope: int
+    orphan_pct: Optional[float]
+
+
+def compute_orphan_stats(db: "Session") -> OrphanStats:
+    """**Единственный источник** orphan-метрики (v2.3).
+
+    Считает в SQL то же, что per-service сумма `is_orphan(...)`:
+
+      * `app_scope` = count real (NOT synthetic) сервисов с
+        `coalesce(stale_class,'') <> 'expected_stale'`.
+      * `orphan` = из них те, чей id НЕ встречается ни как src, ни как dst
+        ни в одной edge ЛЮБОГО kind (`kg_service_edges`).
+      * `orphan_pct` = round(100*orphan/app_scope, 1), или None если
+        app_scope == 0 (пустая БД — не показываем ложный 0%).
+
+    Read-only. Все consumer'ы (STARTUP_CONTRACT_CHECK / quality_report /
+    stats_digest) обязаны звать именно это, а не дублировать SQL.
+    """
+    from sqlalchemy import text
+
+    app_scope = db.execute(text(
+        "SELECT count(*) FROM kg_services s "
+        "WHERE NOT s.synthetic "
+        "  AND coalesce(s.stale_class, '') <> '" + STALE_CLASS_EXPECTED_STALE + "'"
+    )).scalar() or 0
+    orphan = db.execute(text(
+        "SELECT count(*) FROM kg_services s "
+        "WHERE NOT s.synthetic "
+        "  AND coalesce(s.stale_class, '') <> '" + STALE_CLASS_EXPECTED_STALE + "' "
+        "  AND s.id NOT IN ("
+        "      SELECT src_id FROM kg_service_edges "
+        "      UNION SELECT dst_id FROM kg_service_edges"
+        "  )"
+    )).scalar() or 0
+    orphan_pct = round(100.0 * orphan / app_scope, 1) if app_scope > 0 else None
+    return {"orphan": int(orphan), "app_scope": int(app_scope), "orphan_pct": orphan_pct}
 
 
 def owner_known(service: "Service") -> bool:
@@ -429,24 +487,12 @@ def STARTUP_CONTRACT_CHECK(db: "Session") -> Dict[str, object]:
         services_total = db.execute(
             text("SELECT count(*) FROM kg_services")
         ).scalar() or 0
-        synthetic_count = db.execute(
-            text("SELECT count(*) FROM kg_services WHERE synthetic = true")
-        ).scalar() or 0
         with_owner = db.execute(text(
             "SELECT count(*) FROM kg_services "
             "WHERE team_owner IS NOT NULL AND team_owner <> ''"
         )).scalar() or 0
-        orphan = db.execute(text("""
-            SELECT count(*) FROM kg_services s
-            WHERE NOT s.synthetic
-              AND s.id NOT IN (
-                  SELECT src_id FROM kg_service_edges
-                  UNION SELECT dst_id FROM kg_service_edges
-              )
-        """)).scalar() or 0
-        real_total = services_total - synthetic_count
-        if real_total > 0:
-            report["orphan_pct"] = round(100.0 * orphan / real_total, 1)
+        # orphan_pct — единый источник (app-scope, excl expected_stale).
+        report["orphan_pct"] = compute_orphan_stats(db)["orphan_pct"]
         if services_total > 0:
             report["owner_pct"] = round(100.0 * with_owner / services_total, 1)
     except Exception as exc:  # pragma: no cover - best-effort
@@ -522,6 +568,8 @@ __all__ = [
     "STALE_CLASS_VALUES",
     "is_synthetic",
     "is_orphan",
+    "OrphanStats",
+    "compute_orphan_stats",
     "owner_known",
     "service_kind_of",
     "is_edge_kind_known",
