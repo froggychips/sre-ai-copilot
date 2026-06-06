@@ -43,7 +43,7 @@ from sqlalchemy.orm import Session
 
 from app.config import settings
 from app.knowledge_graph.schema import (AlertEvent, AnomalyObservation,
-                                        ClusterObservation,
+                                        ClusterObservation, Deployment,
                                         LogObservation,
                                         PodEvent, Service, ServiceEdge,
                                         ServiceHealth, SignalAggregate)
@@ -366,6 +366,90 @@ def check_edges_freshness(db: Session) -> CheckResult:
     )
 
 
+def check_deploy_stream_ingestion(db: Session) -> CheckResult:
+    """TC отдаёт deploy-билды для известных KG-namespace'ов, а в kg_deployments
+    их нет → ingestion сломан.
+
+    Зачем отдельный чек (а не sync_lag по max(started_at)): freshness не
+    отличает реальный сбой ingestion от тихого периода без деплоев (gap
+    выходных ~60ч > 36ч-сбоя 2026-06-06 из-за веток '<default>'). Этот чек
+    семантический и независим от каденса: если TC за 24h вернул N deploy-
+    билдов для KG-веток, а в KG присутствует <50% — fail (>0% — warn). Если
+    «should-ingest» билдов 0 (тихо) — ok. TC недоступен → ok/skip (это вотчина
+    отдельного мониторинга, не наша).
+    """
+    try:
+        import asyncio
+
+        from app.services.teamcity_service import (branch_for_namespace,
+                                                   recent_deploys)
+        builds = asyncio.run(recent_deploys(lookback_hours=24, limit=200))
+    except Exception as e:  # TC не настроен / недоступен — не наш сигнал
+        return CheckResult(
+            name="deploy_stream_ingestion",
+            status="ok",
+            detail={"skipped": f"TC unavailable: {type(e).__name__}: {str(e)[:120]}"},
+        )
+    if not builds:
+        return CheckResult(
+            name="deploy_stream_ingestion", status="ok",
+            detail={"reason": "TC вернул 0 builds (не настроен / тихо)"},
+        )
+
+    # branch → list[ns] (обратное к branch_for_namespace по distinct ns в KG)
+    ns_by_branch: Dict[str, bool] = {}
+    for (ns,) in db.query(Service.namespace).distinct().all():
+        br = branch_for_namespace(ns)
+        if br:
+            ns_by_branch[br] = True
+
+    should_ingest = []
+    for b in builds:
+        branch = (b.get("branch") or "").replace("refs/heads/", "")
+        # Та же нормализация, что в tc_deploys_to_kg (_tc_deploys_to_kg_logic):
+        # '<default>' deploy-конфигов (не prod) == preprod.
+        if branch == "<default>" and "Prod_" not in (b.get("buildtype_id") or ""):
+            branch = "preprod"
+        if ns_by_branch.get(branch):
+            should_ingest.append(b)
+
+    if not should_ingest:
+        return CheckResult(
+            name="deploy_stream_ingestion", status="ok",
+            detail={"reason": "нет deploy-ветко-билдов в окне 24h",
+                    "tc_builds": len(builds)},
+        )
+
+    present = 0
+    for b in should_ingest:
+        exists = (
+            db.query(Deployment.id)
+            .filter(Deployment.buildtype_id == b.get("buildtype_id"),
+                    Deployment.build_number == str(b.get("number") or ""))
+            .first()
+        )
+        if exists:
+            present += 1
+    missing = len(should_ingest) - present
+    miss_rate = missing / len(should_ingest)
+    if miss_rate > 0.5:
+        status = "fail"
+    elif miss_rate > 0.0:
+        status = "warn"
+    else:
+        status = "ok"
+    return CheckResult(
+        name="deploy_stream_ingestion",
+        status=status,
+        detail={
+            "should_ingest": len(should_ingest),
+            "present_in_kg": present,
+            "missing": missing,
+            "miss_pct": round(miss_rate * 100, 1),
+        },
+    )
+
+
 # ── Orchestrator ──────────────────────────────────────────────────────────
 
 _ALL_CHECKS = (
@@ -375,6 +459,7 @@ _ALL_CHECKS = (
     check_alerts_resolve_freshness,
     check_pod_events_link_rate,
     check_edges_freshness,
+    check_deploy_stream_ingestion,
 )
 
 
