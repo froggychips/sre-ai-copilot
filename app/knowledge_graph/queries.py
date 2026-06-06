@@ -9,11 +9,13 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
+from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from app.knowledge_graph.confidence import (confidence_label,
                                             confidence_score)
-from app.knowledge_graph.schema import (AlertEvent, Deployment, PodEvent,
+from app.knowledge_graph.schema import (AlertEvent, Deployment,
+                                        LogObservation, PodEvent,
                                         Service, ServiceEdge)
 
 
@@ -559,3 +561,101 @@ def recent_pod_events_for(
             "message": (r.message or "")[:200],
         })
     return out
+
+
+# Уровни Seq, которые трактуем как «ошибка приложения» для сигнала.
+# Warning намеренно НЕ включён по умолчанию: в WO Warning — это шумный
+# уровень (≈150k событий/24h vs ≈4k Error), он раздул бы rate и сделал
+# сигнал бесполезным. Caller может попросить уровни явно.
+_LOG_ERROR_LEVELS = ("Error", "Fatal")
+
+
+def log_error_rate_for(
+    db: Session,
+    namespace: str,
+    service_name: str,
+    *,
+    window_minutes: int = 60,
+    levels: Optional[List[str]] = None,
+    now: Optional[datetime] = None,
+) -> Optional[Dict[str, Any]]:
+    """Per-service лог-производный error-rate из ``kg_log_observations``.
+
+    ВАЖНО — СЕМАНТИКА: это **log-derived proxy** уровня приложения, а НЕ
+    HTTP 5xx и НЕ latency. Источник — счётчики Error/Fatal-логов из Seq
+    (beat ``kg_seq_logs_sync``), агрегированные по 10-мин окнам. Сигнал
+    отвечает на вопрос «сервис стал больше ругаться в логах?», но НЕ на
+    «сколько запросов вернули 5xx» — лог-ошибка может быть retry'ем,
+    фоновой джобой, health-probe или вообще не относиться к user-facing
+    трафику. НЕ записывать это в ``kg_service_health.http_5xx_rate``:
+    смешение двух разных сигналов введёт consumer'ов в заблуждение
+    (см. WO scrape-gap — http_5xx всегда 0 именно потому, что ingress
+    metrics нет; подменять их логами было бы фальшивым «зелёным»).
+
+    Считается on-read, без новых Seq-запросов и без изменения схемы:
+        rate_per_min = SUM(count за окно) / window_minutes
+
+    Окно — [now-window_minutes, now]. ``now`` инъектится для тестов;
+    по умолчанию ``datetime.utcnow()`` (ts в БД — naive UTC).
+
+    Возвращает dict или None если сервис не в графе. Если сервис есть, но
+    лог-наблюдений в окне нет — вернёт нули (это валидный сигнал «тихо»,
+    в отличие от «сервиса не знаем»).
+
+        {
+          "service_id": int,
+          "namespace": str,
+          "name": str,
+          "window_minutes": int,
+          "levels": ["Error", "Fatal"],
+          "error_count": int,          # SUM(count) за окно
+          "log_error_rate_per_min": float,  # округл. до 3 знаков
+          "buckets": int,              # сколько 10-мин строк попало
+          "is_proxy": True,            # маркер: НЕ настоящий HTTP 5xx
+        }
+
+    ОГРАНИЧЕНИЯ (документируем честно):
+      * ``count`` снизу ограничен Seq fetch-cap (``top_messages limit=500``
+        на level/instance/окно). На очень шумном realm rate под-считан.
+      * Атрибуция сервиса — best-effort матч ``App``-тэга (≈96% на recon
+        2026-06-05); немэтченные строки (service_id=NULL) сюда НЕ попадают.
+      * Это per-service, не per-endpoint и не per-status-code сигнал.
+    """
+    svc = _service_by_namespace_name(db, namespace, service_name)
+    if svc is None:
+        return None
+
+    use_levels = list(levels) if levels else list(_LOG_ERROR_LEVELS)
+    ref = (now or datetime.utcnow())
+    if ref.tzinfo is not None:
+        ref = ref.replace(tzinfo=None)
+    since = ref - timedelta(minutes=window_minutes)
+
+    total, buckets = (
+        db.query(
+            func.coalesce(func.sum(LogObservation.count), 0),
+            func.count(LogObservation.id),
+        )
+        .filter(
+            LogObservation.service_id == svc.id,
+            LogObservation.level.in_(use_levels),
+            LogObservation.ts >= since,
+            LogObservation.ts <= ref,
+        )
+        .one()
+    )
+    error_count = int(total or 0)
+    bucket_count = int(buckets or 0)
+    rate = error_count / window_minutes if window_minutes > 0 else 0.0
+
+    return {
+        "service_id": int(svc.id),
+        "namespace": svc.namespace,
+        "name": svc.name,
+        "window_minutes": window_minutes,
+        "levels": use_levels,
+        "error_count": error_count,
+        "log_error_rate_per_min": round(rate, 3),
+        "buckets": bucket_count,
+        "is_proxy": True,
+    }
