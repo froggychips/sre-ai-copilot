@@ -28,12 +28,23 @@ from typing import Optional
 # ── Константы (вынесены из stats_digest.py) ──────────────────────────────────
 
 # Suffix-эвристика: имя deployment'а заканчивается на `-backup` / `-cron` / …
-_EXPECTED_STALE_NAME_SUFFIXES = ("-backup", "-cron", "-cronjob", "-job")
+# `-hl`/`-headless`/`-metrics`/`-replicas`/`-master` — k8s Service-shape под-сервисы
+# bitnami-чартов (postgresql/redis): это не деплоящиеся workload'ы, у них никогда
+# не будет deploy-recency → иначе ошибочно попадают в suspicious_stale.
+_EXPECTED_STALE_NAME_SUFFIXES = (
+    "-backup", "-cron", "-cronjob", "-job",
+    "-hl", "-headless", "-metrics", "-replicas", "-master",
+)
 
 # Infix-эвристика: backup-postgresql, postgres-backup-restore, …
 _EXPECTED_STALE_NAME_INFIXES = ("backup-", "-backup-", "-cron-")
 
 # Системные namespace — deployments в них «не катились» по design'у.
+# Расширено 2026-06-06: инфра/система/AI-ML namespaces (infra*/statics/sre-ai/
+# ai-platform/ai-reviewer/mcp/jupyter/ambassador/tools/default) — их сервисы
+# (БД, headless, экспортёры, MCP-серверы) не деплоятся через TC → ошибочно
+# классифицировались suspicious_stale при NULL team_owner. cattle-* покрыт
+# отдельной startswith-веткой ниже.
 _EXPECTED_STALE_NAMESPACES = frozenset({
     "kube-system",
     "cattle-system",
@@ -43,6 +54,17 @@ _EXPECTED_STALE_NAMESPACES = frozenset({
     "ingress-nginx",
     "metallb-system",
     "local-path-storage",
+    "default",
+    "infra",
+    "infra-2",
+    "statics",
+    "sre-ai",
+    "ai-platform",
+    "ai-reviewer",
+    "mcp",
+    "jupyter",
+    "ambassador",
+    "tools",
 })
 
 # Infra/platform owner: для них допускается «не катился 60d» если запас

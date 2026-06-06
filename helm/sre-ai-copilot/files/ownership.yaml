@@ -142,3 +142,58 @@
 - ns_pattern: "prod-shared"
   owner: "@platform"
   reason: "Default prod-shared infra → platform"
+
+# ── Non-shared инфра/система/AI-ML namespaces (KG snapshot 2026-06-06) ────────
+# 61 unowned-сервисов жили вне *-shared (предыдущий скоуп манифеста). Эти ns
+# целиком инфраструктурные/системные (нет game-app сервисов), поэтому ns-level
+# catch-all безопасен. Без owner'а rule-3 stale_classifier не срабатывал и они
+# ошибочно висели suspicious_stale. Owner по характеру стека: операционная
+# инфра → @platform, AI/ML + notebooks → @data.
+# ВНИМАНИЕ: назначения сделаны по типу сервиса, не по org-схеме WO — при
+# наличии точных owner'ов (особенно mcp/jupyter/ai-platform) поправить.
+
+# kube-state-metrics экспортёр встречается и вне *-shared (напр. prod-lo-legal)
+- ns_pattern: "*"
+  name_pattern: "vm-kube-state-metrics"
+  owner: "@platform"
+  reason: "kube-state-metrics экспортёр — platform monitoring (любой ns)"
+
+# Операционная / системная инфра → @platform
+- ns_pattern: "infra"
+  owner: "@platform"
+  reason: "infra ns (airflow и т.п.) — platform"
+- ns_pattern: "infra-2"
+  owner: "@platform"
+  reason: "infra-2: gitlab/nexus/teamcity/airflow + их БД/headless — platform"
+- ns_pattern: "statics"
+  owner: "@platform"
+  reason: "CDN-origin / avatars-s3 / statics-db — platform"
+- ns_pattern: "sre-ai"
+  owner: "@platform"
+  reason: "SRE-AI copilot собственная инфра (api/postgres/redis) — platform"
+- ns_pattern: "cattle-*"
+  owner: "@platform"
+  reason: "Rancher system namespaces (fleet/capi) — platform"
+- ns_pattern: "ambassador"
+  owner: "@platform"
+  reason: "Ambassador/Telepresence agent-injector/traffic-manager — platform"
+- ns_pattern: "tools"
+  owner: "@platform"
+  reason: "tools ns (ubuntu-ssh и т.п.) — platform"
+- ns_pattern: "default"
+  owner: "@platform"
+  reason: "kube default (kubernetes API service) — platform/system"
+
+# AI / ML / data-science стек → @data
+- ns_pattern: "ai-platform"
+  owner: "@data"
+  reason: "AI platform (paperclip/jira-bridge/discord-bot-repo-sync) — data/ML"
+- ns_pattern: "ai-reviewer"
+  owner: "@data"
+  reason: "AI reviewer — data/ML"
+- ns_pattern: "mcp"
+  owner: "@data"
+  reason: "MCP/AI стек (qdrant/embeddings/knowledge-generator/tools) — data/ML"
+- ns_pattern: "jupyter"
+  owner: "@data"
+  reason: "JupyterHub notebooks — data science"
