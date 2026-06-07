@@ -287,6 +287,26 @@ Target `orphan_rate_max_pct = 10.0` пока **не достигнут** — э�
 
 ---
 
+## 7.5. Consumer caveats — ограничения сигналов (для LLM/дашбордов)
+
+Канонический список «чему НЕ доверять вслепую». MCP-tool descriptions
+(`external/mcp` kg_*) и LLM-промпты обязаны это отражать — иначе модель
+выдаёт confident-but-wrong.
+
+| Сигнал | Ограничение | Как трактовать |
+|---|---|---|
+| `kg_service_health.http_5xx_rate`, `p95_latency_ms` | В prod-ns **всегда 0** — ingress/aspnetcore-метрик нет (WO scrape-gap). | `0` = **«нет данных»**, НЕ «нет ошибок / быстро». Не делать вывод о user-facing impact. |
+| `kg_services.health_score` | Формула включает 5xx/p95, но они =0 → компоненты не срабатывают. Фактически = cpu/mem + alerts + pod_events + deploy/slo. | Высокий score = «инфра/события в норме», **НЕ «нет 5xx»**. Не «здоровье для пользователя». |
+| Отсутствие edge (`kg_service_edges`) | Топология неполна (prod-app ~82%, dev меньше); WO общается через NATS/Orleans, не только HTTP. | Отсутствие ребра **≠ «нет зависимости»**. Edge есть → зависимость реальна; нет → неизвестно. |
+| `kg_anomaly_observations.metric='log_error_rate'` | Log-derived прокси (Error/Fatal-логи из Seq), НЕ HTTP 5xx. Seq fetch-cap, per-service не per-endpoint, «впервые ошибся» не ловит. | Сигнал «сервис стал больше ругаться в логах», НЕ «сколько запросов вернули 5xx». |
+| `orphan_pct` (≈50% all-env) | app-scope (excl expected_stale); high из-за dev/preprod неполноты, prod-app ~17%. | Не «граф сломан» — см. §3 (single-source `compute_orphan_stats`). |
+
+Единый источник вычислений orphan/owner — `contract.compute_orphan_stats` /
+`QUALITY_THRESHOLDS` (§3, §7). Реализация health_score — см. docstring
+`app/knowledge_graph/health_score.py`.
+
+---
+
 ## 8. Compatibility policy
 
 ### 8.1. Добавление нового edge kind

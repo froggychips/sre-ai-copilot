@@ -25,6 +25,16 @@ Score [0, 1], 1.0 = perfect health, 0.0 = down/broken. Деривируется
 точек в окне) или нет свежей записи signal_aggregates (< 1h) — компонент
 просто скипается (graceful degradation, не penalty).
 
+⚠️ ОГРАНИЧЕНИЕ (WO scrape-gap, 2026-06): `p95 latency` и `http_5xx_rate`
+в `kg_service_health` в prod-ns **всегда 0** — ingress/aspnetcore-метрик
+там нет. Поэтому app-слойные компоненты (5xx, p95) по факту НЕ срабатывают,
+и health_score деривируется из инфра/событийных сигналов (alerts +
+pod_events + deploy/slo aggregates), а НЕ из user-facing latency/errors.
+Не интерпретировать как «пользователю хорошо/плохо»: высокий score = «cpu/
+события в норме», НЕ «нет 5xx». Реальный app-error прокси — `log_error_rate`
+(`queries.log_error_rate_for`, log-derived, тоже НЕ HTTP 5xx). Канон
+ограничений — `docs/KG_SCHEMA_CONTRACT.md` §Consumer caveats.
+
 Refresh периодический (beat task `kg_health_recompute`), хранится в
 kg_services.health_score + health_computed_at.
 
