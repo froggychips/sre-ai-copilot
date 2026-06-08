@@ -17,7 +17,10 @@ Beat-task `kg_anomaly_detection_task` каждые ~10 мин:
    shower при day/night паттернах.
 4. Защиты от ложных срабатываний:
    - baseline_n < 10 → пропускаем метрику (мало данных).
-   - MAD < 1e-6 → пропускаем (flat-line после удаления outlier-ов).
+   - Noise floor: знаменатель z = max(scaled_mad, rel_floor×|median|,
+     abs_floor[metric]). Near-flat baseline (MAD≈0) больше не даёт z=900 на
+     сдвиге в пару п.п.; severity не инфлируется. rel_floor — env
+     KG_ANOMALY_REL_SPREAD_FLOOR (default 0.10).
    - NULL в value → пропускаем эту метрику для этой точки.
 5. **Volume guard**: per-service per-metric не более 3 anomaly
    observations за последний час. После 3-го — игнорируем (защита от
@@ -78,6 +81,38 @@ MIN_MAD = 1e-6
 # распределении даёт MAD ≈ stddev, поэтому robust_z сопоставим со стандартным.
 MAD_GAUSS_CONST = 1.4826
 
+# ── Noise floor (WO-11335/KG-polish) ──────────────────────────────────────
+# Без пола near-flat baseline (MAD≈0) раздувает robust-z на ничтожном
+# АБСОЛЮТНОМ сдвиге: наблюдали z=916 при mem 6.87→8.04% (1.2 п.п.) и z=−679
+# при mem 61.8→59.5% (2.3 п.п.) — формально critical, практически шум.
+# Решение: эффективный разброс в знаменателе z не может быть меньше
+#   max(scaled_mad, REL_floor × |median|, ABS_floor[metric]).
+# Тогда z остаётся осмысленным (мелкие относительные колебания дают малый z),
+# а severity (warn/crit) перестаёт инфлироваться. Бонус: сервис, годами
+# стоявший на месте (MAD=0), при реальном крупном скачке теперь детектируется
+# (раньше MAD<MIN_MAD его молча пропускал).
+def _rel_spread_floor() -> float:
+    """Относительный пол разброса (доля |median|). Env-tunable без редеплоя."""
+    raw = os.environ.get("KG_ANOMALY_REL_SPREAD_FLOOR", "0.10")
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        log.warning("anomaly.bad_rel_spread_floor raw=%r → using 0.10", raw)
+        return 0.10
+
+
+# Абсолютный пол разброса в нативных единицах метрики — для случаев, когда
+# median≈0 и относительный пол вырождается в ноль.
+MIN_ABS_SPREAD_BY_METRIC: Dict[str, float] = {
+    "cpu_pct": 0.02,
+    "mem_pct": 1.0,
+    "restarts_rate": 0.05,
+    "http_5xx_rate": 0.1,
+    "p95_latency_ms": 5.0,
+    LOG_ERROR_METRIC: 1.0,
+}
+DEFAULT_MIN_ABS_SPREAD = 1e-3
+
 # Seasonal baseline активируется только при достаточном объёме.
 SEASONAL_MIN_POINTS = 50
 SEASONAL_HOUR_BAND = 1          # ±1 час от target hour-of-day
@@ -133,11 +168,21 @@ def _mad(values: List[float]) -> Optional[float]:
 
 
 def _compute_robust_z(
-    current: float, baseline: List[float],
-) -> Optional[Tuple[float, float, float]]:
-    """Возвращает (robust_z, median, mad) или None если baseline недостаточен.
+    current: float,
+    baseline: List[float],
+    *,
+    rel_floor: float = 0.0,
+    abs_floor: float = 0.0,
+) -> Optional[Tuple[float, float, float, float]]:
+    """Возвращает (robust_z, median, effective_spread, raw_mad) или None.
 
-    robust_z = (current - median) / (1.4826 × MAD).
+    robust_z = (current - median) / effective_spread, где
+      effective_spread = max(1.4826 × MAD, rel_floor × |median|, abs_floor).
+
+    Пол разброса (rel_floor/abs_floor) гасит z-взрыв на near-flat baseline:
+    без него крошечный MAD делал любой микро-сдвиг «critical» (см. noise floor
+    в шапке модуля). При rel_floor=abs_floor=0 поведение — как раньше (чистый MAD),
+    но тогда MAD≈0 даёт вырожденный спред → None.
     """
     if len(baseline) < MIN_BASELINE_POINTS:
         return None
@@ -146,13 +191,15 @@ def _compute_robust_z(
     except statistics.StatisticsError:
         return None
     mad = _mad(baseline)
-    if mad is None or mad < MIN_MAD:
+    if mad is None:
         return None
     scaled_mad = MAD_GAUSS_CONST * mad
-    if scaled_mad < MIN_MAD:
+    effective_spread = max(scaled_mad, rel_floor * abs(med), abs_floor)
+    # Полностью вырожденный случай (median≈0, нет пола) — z неинформативен.
+    if effective_spread < MIN_MAD:
         return None
-    z = (current - med) / scaled_mad
-    return z, med, mad
+    z = (current - med) / effective_spread
+    return z, med, effective_spread, mad
 
 
 def _seasonal_baseline(
@@ -246,6 +293,7 @@ def _detect_for_service(
     *,
     warn_thresh: float,
     crit_thresh: float,
+    rel_floor: float = 0.0,
 ) -> Dict[str, int]:
     """Считает аномалии для одного сервиса.
 
@@ -305,11 +353,15 @@ def _detect_for_service(
                 baseline_vals = seasonal
                 method = "robust_z_seasonal"
 
-        res = _compute_robust_z(current_value, baseline_vals)
+        res = _compute_robust_z(
+            current_value, baseline_vals,
+            rel_floor=rel_floor,
+            abs_floor=MIN_ABS_SPREAD_BY_METRIC.get(metric, DEFAULT_MIN_ABS_SPREAD),
+        )
         if res is None:
             counters["skipped_no_baseline"] += 1
             continue
-        z, median, mad = res
+        z, median, spread, mad = res
         if abs(z) < warn_thresh:
             continue
 
@@ -326,6 +378,8 @@ def _detect_for_service(
             "method": method,
             "median": median,
             "mad": mad,
+            "spread": spread,          # фактический знаменатель z (с учётом пола)
+            "rel_floor": rel_floor,
             "baseline_n": len(baseline_vals),
             "warn_thresh": warn_thresh,
             "crit_thresh": crit_thresh,
@@ -333,8 +387,8 @@ def _detect_for_service(
         }
 
         # baseline_mean/baseline_stddev по схеме — пишем median и
-        # scaled_mad (MAD × 1.4826). Это сохраняет смысл колонок
-        # (центр + разброс) и читаемо для downstream-сервисов.
+        # effective_spread (max(scaled_mad, rel_floor×|median|, abs_floor)).
+        # Это фактический разброс, по которому считался z — честно для downstream.
         ok = _insert_idempotent(
             db,
             service_id=cast(int, service.id),
@@ -342,7 +396,7 @@ def _detect_for_service(
             metric=metric,
             value=current_value,
             baseline_mean=median,
-            baseline_stddev=MAD_GAUSS_CONST * mad,
+            baseline_stddev=spread,
             z_score=z,
             severity=sev,
             extras=extras,
@@ -362,6 +416,7 @@ def _detect_log_errors_for_service(
     *,
     warn_thresh: float,
     crit_thresh: float,
+    rel_floor: float = 0.0,
 ) -> Dict[str, int]:
     """Robust-z по объёму Error/Fatal-логов сервиса (из kg_log_observations).
 
@@ -411,11 +466,15 @@ def _detect_log_errors_for_service(
     anomaly_ts = current_buckets[-1][0]
     current_value = statistics.fmean([float(c) for _, c in current_buckets])
 
-    res = _compute_robust_z(current_value, baseline_vals)
+    res = _compute_robust_z(
+        current_value, baseline_vals,
+        rel_floor=rel_floor,
+        abs_floor=MIN_ABS_SPREAD_BY_METRIC.get(LOG_ERROR_METRIC, DEFAULT_MIN_ABS_SPREAD),
+    )
     if res is None:
         counters["skipped_no_baseline"] += 1
         return counters
-    z, median, mad = res
+    z, median, spread, mad = res
     if z < warn_thresh:  # только рост (положительный z); |z| не нужен
         return counters
 
@@ -431,6 +490,8 @@ def _detect_log_errors_for_service(
         "method": "robust_z_log_errors",
         "median": median,
         "mad": mad,
+        "spread": spread,
+        "rel_floor": rel_floor,
         "baseline_n": len(baseline_vals),
         "levels": list(LOG_ERROR_LEVELS),
         "is_log_proxy": True,  # НЕ HTTP 5xx — лог-производный сигнал
@@ -442,7 +503,7 @@ def _detect_log_errors_for_service(
         metric=LOG_ERROR_METRIC,
         value=current_value,
         baseline_mean=median,
-        baseline_stddev=MAD_GAUSS_CONST * mad,
+        baseline_stddev=spread,
         z_score=z,
         severity=sev,
         extras=extras,
@@ -464,6 +525,7 @@ def detect_anomalies(
     now = now or datetime.utcnow()
     warn_thresh = _threshold_warn()
     crit_thresh = _threshold_crit()
+    rel_floor = _rel_spread_floor()
 
     services: List[Service] = (
         db.query(Service).filter(Service.synthetic.is_(False)).all()
@@ -487,6 +549,7 @@ def detect_anomalies(
             counters = _detect_for_service(
                 db, svc, now,
                 warn_thresh=warn_thresh, crit_thresh=crit_thresh,
+                rel_floor=rel_floor,
             )
         except Exception as e:
             stats["errors"] += 1
@@ -523,6 +586,7 @@ def detect_anomalies(
         try:
             lc = _detect_log_errors_for_service(
                 db, svc_opt, now, warn_thresh=warn_thresh, crit_thresh=crit_thresh,
+                rel_floor=rel_floor,
             )
         except Exception as e:
             stats["errors"] += 1
