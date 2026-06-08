@@ -280,6 +280,65 @@ def test_baseline_with_outliers_still_detects(db):
     assert obs.baseline_mean < 25.0
 
 
+# ---------- noise floor (WO-11335 / KG-polish) ----------------------------
+
+def _near_flat_baseline(now):
+    """20 baseline-точек ~6.87 с микро-jitter (MAD≈0.001) + current 8.04.
+
+    Воспроизводит prod-артефакт: mem 6.87→8.04% давал z≈900 (scaled_mad≈0.0015),
+    хотя сдвиг всего 1.2 п.п. (~17% относительно).
+    """
+    pts = []
+    start = now - timedelta(days=6)
+    for i in range(20):
+        pts.append((start + timedelta(hours=4 * i), 6.870 + (0.002 if i % 2 else 0.0)))
+    for i in range(6):
+        pts.append((now - timedelta(minutes=10 * (5 - i)), 8.04))
+    return pts
+
+
+def test_near_flat_micro_jitter_suppressed_by_floor(db):
+    """Near-flat baseline + малый абсолютный сдвиг → noise floor давит z,
+    аномалия НЕ пишется (раньше был z≈900 critical)."""
+    svc = _svc(db)
+    now = datetime(2026, 5, 23, 12, 0, 0)
+    _seed_health(db, svc.id, _near_flat_baseline(now))
+    stats = detect_anomalies(db, now=now)
+    assert stats["inserted"] == 0
+
+
+def test_without_rel_floor_same_bump_would_trigger(db, monkeypatch):
+    """Тот же near-flat кейс при выключенном rel-floor (=0) → срабатывает.
+    Доказывает, что давит именно относительный пол, а не порог z."""
+    monkeypatch.setenv("KG_ANOMALY_REL_SPREAD_FLOOR", "0")
+    svc = _svc(db)
+    now = datetime(2026, 5, 23, 12, 0, 0)
+    _seed_health(db, svc.id, _near_flat_baseline(now))
+    stats = detect_anomalies(db, now=now)
+    assert stats["inserted"] == 1
+
+
+def test_flat_zero_mad_large_jump_now_detected(db):
+    """Сервис, годами стоявший ровно (MAD=0), при РЕАЛЬНОМ крупном скачке
+    теперь детектируется через abs/rel floor (раньше MAD=0 молча скипал)."""
+    svc = _svc(db)
+    now = datetime(2026, 5, 23, 12, 0, 0)
+    pts = []
+    start = now - timedelta(days=6)
+    for i in range(20):
+        pts.append((start + timedelta(hours=4 * i), 50.0))  # абсолютно плоско
+    for i in range(6):
+        pts.append((now - timedelta(minutes=10 * (5 - i)), 200.0))  # x4 скачок
+    _seed_health(db, svc.id, pts)
+    stats = detect_anomalies(db, now=now)
+    assert stats["inserted"] == 1
+    obs = db.query(AnomalyObservation).one()
+    assert obs.severity == "critical"
+    # baseline_stddev = effective_spread = max(0, 0.10×50, 0.02) = 5.0; z=(200-50)/5=30.
+    assert obs.baseline_stddev == pytest.approx(5.0, rel=1e-3)
+    assert abs(obs.z_score) == pytest.approx(30.0, rel=1e-2)
+
+
 # ---------- log-error anomaly (kg_log_observations consumer) --------------
 
 def _seed_log_errors(db, svc_id, points, level="Error"):
