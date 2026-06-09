@@ -5,6 +5,7 @@ from typing import Iterable, List, Optional
 
 import structlog
 from fastapi import APIRouter, Depends, HTTPException, Request
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.config import settings
@@ -264,7 +265,19 @@ async def alertmanager_webhook(
             existing.data = incident.model_dump()
         # Commit before pipeline: the worker opens its own SessionLocal and needs
         # the row to be visible before it starts writing state transitions.
-        db.commit()
+        try:
+            db.commit()
+        except IntegrityError:
+            # Конкурентный дубль: другой воркер уже создал строку с этим
+            # incident_id (UNIQUE). Откатываемся и трактуем как dedup —
+            # пайплайн уже запущен тем воркером, второй dispatch не нужен.
+            db.rollback()
+            log.info("webhook.insert_race_deduplicated", incident_id=incident.incident_id)
+            accepted.append({
+                "incident_id": incident.incident_id,
+                "task_id": "deduplicated",
+            })
+            continue
 
         if settings.PIPELINE_DIRECT_INVOKE:
             await async_process_incident(incident.model_dump())
