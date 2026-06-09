@@ -328,6 +328,11 @@ class Settings(BaseSettings):
     JWT_ALGORITHM: str = "RS256"
     JWT_AUDIENCE: Optional[str] = None
 
+    # Адрес bind для Prometheus-сервера метрик (:8001). Default "0.0.0.0" —
+    # in-cluster scraping не должен сломаться. В PROD порт ограничивать
+    # через NetworkPolicy.
+    METRICS_BIND_ADDR: str = "0.0.0.0"
+
     # CORS
     ALLOWED_ORIGINS: List[str] = Field(default_factory=lambda: ["*"])
 
@@ -630,6 +635,20 @@ class Settings(BaseSettings):
                 raise ValueError(
                     "ALERTMANAGER_WEBHOOK_SECRET must be set in production "
                     "to authenticate AlertManager webhook calls."
+                )
+            # В проде JWT-валидация обязана работать: без публичного ключа
+            # все защищённые эндпоинты отвалятся (или, хуже, проскочат).
+            if not self.JWT_PUBLIC_KEY:
+                raise RuntimeError(
+                    "JWT_PUBLIC_KEY must be set in production "
+                    "to validate JWT-protected endpoints."
+                )
+            # Плейсхолдерный DATABASE_URL по умолчанию недопустим в проде —
+            # это явный признак незаполненного конфига.
+            if self.DATABASE_URL == "postgresql://user:password@localhost:5432/dbname":
+                raise RuntimeError(
+                    "DATABASE_URL is still the placeholder default in production. "
+                    "Set a real PostgreSQL connection string."
                 )
         return self
 

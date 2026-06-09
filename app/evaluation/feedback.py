@@ -1,23 +1,27 @@
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
+from app.auth import User, get_current_user
 from app.database import IncidentRecord, get_db
 
 router = APIRouter()
 
 
 class FeedbackSubmit(BaseModel):
-    score: int  # 1 to 5
+    score: int = Field(ge=1, le=5)  # 1 to 5
     is_accepted: bool
-    comment: Optional[str] = None
+    comment: Optional[str] = Field(default=None, max_length=2000)
 
 
 @router.post("/{incident_id}/submit")
 async def submit_feedback(
-    incident_id: str, feedback: FeedbackSubmit, db: Session = Depends(get_db)
+    incident_id: str,
+    feedback: FeedbackSubmit,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
 ):
     """
     Эндпоинт для сбора обратной связи от инженеров по результатам RCA.
@@ -31,7 +35,12 @@ async def submit_feedback(
     if not record:
         raise HTTPException(status_code=404, detail="Incident record not found")
 
-    record.user_feedback = {"score": feedback.score, "comment": feedback.comment}
+    # Привязываем автора фидбэка из JWT (sub).
+    record.user_feedback = {
+        "score": feedback.score,
+        "comment": feedback.comment,
+        "author": user.sub,
+    }
     record.is_accepted = "ACCEPTED" if feedback.is_accepted else "REJECTED"
 
     db.commit()
