@@ -319,7 +319,7 @@ async def async_process_incident(incident_data: dict):
                 # похода в OTel/логи). Отдельный try/except — persist-сбой
                 # не должен маскировать исходную ошибку pipeline-а.
                 try:
-                    record.analysis = {
+                    record.analysis = {  # type: ignore[assignment]
                         **(record.analysis or {}),
                         "failed": {
                             "error": str(e),
