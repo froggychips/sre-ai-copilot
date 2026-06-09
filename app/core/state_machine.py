@@ -15,6 +15,11 @@ class IncidentState(str, Enum):
     APPROVAL_PENDING = "APPROVAL_PENDING"
     EXECUTING = "EXECUTING"
     RESOLVED = "RESOLVED"
+    # TRIAGE_REQUIRED — терминальное состояние для инцидентов, которые пайплайн
+    # НЕ смог разрешить (ни одна гипотеза не пережила adversarial critique,
+    # resolution_quality=="unresolved"). Раньше такие инциденты ошибочно
+    # помечались RESOLVED. Достижимо из тех же состояний, что и RESOLVED.
+    TRIAGE_REQUIRED = "TRIAGE_REQUIRED"
     FAILED = "FAILED"
 
 
@@ -55,11 +60,18 @@ class StateMachine:
         IncidentState.FIX_PROPOSED: {
             IncidentState.APPROVAL_PENDING,
             IncidentState.RESOLVED,
+            # Зеркалим RESOLVED: un-resolved инцидент уходит в triage.
+            IncidentState.TRIAGE_REQUIRED,
             IncidentState.FAILED,
         },
         IncidentState.APPROVAL_PENDING: {IncidentState.EXECUTING, IncidentState.FAILED},
-        IncidentState.EXECUTING: {IncidentState.RESOLVED, IncidentState.FAILED},
+        IncidentState.EXECUTING: {
+            IncidentState.RESOLVED,
+            IncidentState.TRIAGE_REQUIRED,
+            IncidentState.FAILED,
+        },
         IncidentState.RESOLVED: set(),
+        IncidentState.TRIAGE_REQUIRED: set(),
         IncidentState.FAILED: set(),
     }
 

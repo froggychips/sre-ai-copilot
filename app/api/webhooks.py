@@ -169,8 +169,10 @@ async def alertmanager_webhook(
 
     # States where the pipeline is already in-flight — skip re-dispatch.
     # FAILED is the only terminal state we allow to re-run (transient infra error).
-    # NOTE: RESOLVED is intentionally absent — a re-fire after RESOLVED is flapping
-    # and must be re-processed (see flapping detection below).
+    # NOTE: RESOLVED и TRIAGE_REQUIRED намеренно отсутствуют — re-fire после
+    # любого из них является flapping и должен быть переобработан (см. flapping
+    # detection ниже). TRIAGE_REQUIRED — это «unresolved» терминал, его re-fire
+    # обрабатываем так же, как re-fire после RESOLVED.
     _SKIP_STATES = {
         IncidentState.OPEN.value,
         IncidentState.INVESTIGATING.value,
@@ -194,6 +196,7 @@ async def alertmanager_webhook(
         if alert.status == "resolved":
             if existing is not None and existing.status not in {
                 IncidentState.RESOLVED.value,
+                IncidentState.TRIAGE_REQUIRED.value,
                 IncidentState.FAILED.value,
             }:
                 existing.status = IncidentState.RESOLVED.value
@@ -203,8 +206,13 @@ async def alertmanager_webhook(
             accepted.append({"incident_id": incident.incident_id, "task_id": "resolved"})
             continue
 
-        # ── FIRING: detect flapping (re-fire after RESOLVED) ───────────────
-        if existing is not None and existing.status == IncidentState.RESOLVED.value:
+        # ── FIRING: detect flapping (re-fire after RESOLVED/TRIAGE_REQUIRED) ─
+        # TRIAGE_REQUIRED — терминал для неразрешённых инцидентов; его re-fire
+        # тоже flapping и переобрабатывается как re-fire после RESOLVED.
+        if existing is not None and existing.status in {
+            IncidentState.RESOLVED.value,
+            IncidentState.TRIAGE_REQUIRED.value,
+        }:
             prev_flap_count = (existing.data or {}).get("flap_count", 0)
             incident = incident.model_copy(update={"flap_count": prev_flap_count + 1})
             log.info(
@@ -319,6 +327,9 @@ async def alertmanager_webhook_store_only(
             stats = populate_from_incident(db, incident)
             stored.append({"incident_id": incident.incident_id, "result": "stored", **stats})
         except Exception as e:
+            # Откатываем failed-транзакцию, иначе session остаётся в
+            # сорванном состоянии и финальный db.commit() уронит весь batch.
+            db.rollback()
             log.warning(
                 "kg_store.populate_failed",
                 incident_id=incident.incident_id,
@@ -384,6 +395,9 @@ async def alertmanager_webhook_enrich_and_forward(
             stats = populate_from_incident(db, incident)
             stored.append({"incident_id": incident.incident_id, "result": "stored", **stats})
         except Exception as e:
+            # Откатываем failed-транзакцию, иначе session остаётся в
+            # сорванном состоянии и финальный db.commit() уронит весь batch.
+            db.rollback()
             log.warning(
                 "enrich_forward.populate_failed",
                 incident_id=incident.incident_id,
