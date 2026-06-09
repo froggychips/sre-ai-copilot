@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Union
 
@@ -32,8 +33,6 @@ _CPU_THROTTLE_PCT = 0.20
 # и сырыми f-string'ом подставляются в PromQL-матчеры → потенциальная инъекция
 # (закрытие фигурной скобки/добавление селектора). Валидируем по charset имён
 # k8s-объектов; на mismatch — fail-safe (не строим запрос, отдаём нулевой dict).
-import re
-
 _K8S_NAME_RE = re.compile(r"^[a-z0-9]([a-z0-9.\-]*[a-z0-9])?$")
 
 
