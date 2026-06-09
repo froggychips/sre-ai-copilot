@@ -28,6 +28,19 @@ _MEM_PRESSURE_PCT = 0.85
 # cpu: throttled_ratio >20% = pressure.
 _CPU_THROTTLE_PCT = 0.20
 
+# k8s-charset для имён namespace/pod. namespace и pod приходят из alert-label'ов
+# и сырыми f-string'ом подставляются в PromQL-матчеры → потенциальная инъекция
+# (закрытие фигурной скобки/добавление селектора). Валидируем по charset имён
+# k8s-объектов; на mismatch — fail-safe (не строим запрос, отдаём нулевой dict).
+import re
+
+_K8S_NAME_RE = re.compile(r"^[a-z0-9]([a-z0-9.\-]*[a-z0-9])?$")
+
+
+def _valid_label(value: str) -> bool:
+    """True если value безопасно подставлять в PromQL-матчер (charset имён k8s)."""
+    return bool(value) and bool(_K8S_NAME_RE.match(value))
+
 
 class ClusterHealth:
     """Snapshot кластерного здоровья — результат get_cluster_health()."""
@@ -258,6 +271,17 @@ class VMClient:
             "memory_pct": 0.0,
             "cpu_throttle_ratio": 0.0,
         }
+
+        # Fail-safe против PromQL-инъекции: namespace/pod из alert-label'ов могут
+        # содержать спецсимволы. На невалидном значении не строим запрос — отдаём
+        # тот же нулевой result, что и при ошибке VM.
+        if not _valid_label(namespace) or not _valid_label(pod):
+            logger.warning(
+                "vm_client.get_pod_metrics: invalid namespace/pod label "
+                "ns=%r pod=%r — пропускаю запрос",
+                namespace, pod,
+            )
+            return result
 
         try:
             # gather(return_exceptions=True) даёт tuple[list | BaseException, ...] —
