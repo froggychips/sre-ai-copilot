@@ -35,6 +35,7 @@ async def test_apply_step1_shows_confirm_buttons():
 
     with patch.object(discord_interactions, "_verify_signature", return_value=True), \
          patch.object(discord_interactions.settings, "DISCORD_PUBLIC_KEY", "deadbeef"), \
+         patch.object(discord_interactions, "_is_authorized_approver", return_value=(True, "ok")), \
          patch.object(discord_interactions.settings, "EXECUTOR_APPROVAL_ENABLED", True):
         request = MagicMock()
         request.body = AsyncMock(return_value=__import__("json").dumps(payload).encode())
@@ -87,6 +88,7 @@ async def test_apply_confirm_returns_deferred_response():
 
     with patch.object(discord_interactions, "_verify_signature", return_value=True), \
          patch.object(discord_interactions.settings, "DISCORD_PUBLIC_KEY", "deadbeef"), \
+         patch.object(discord_interactions, "_is_authorized_approver", return_value=(True, "ok")), \
          patch.object(discord_interactions.settings, "EXECUTOR_APPROVAL_ENABLED", True), \
          patch("asyncio.create_task", side_effect=spy_create_task):
         request = MagicMock()
@@ -109,6 +111,7 @@ async def test_apply_confirm_without_token_returns_immediate_error():
 
     with patch.object(discord_interactions, "_verify_signature", return_value=True), \
          patch.object(discord_interactions.settings, "DISCORD_PUBLIC_KEY", "deadbeef"), \
+         patch.object(discord_interactions, "_is_authorized_approver", return_value=(True, "ok")), \
          patch.object(discord_interactions.settings, "EXECUTOR_APPROVAL_ENABLED", True):
         request = MagicMock()
         request.body = AsyncMock(return_value=__import__("json").dumps(payload).encode())
