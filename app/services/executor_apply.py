@@ -24,7 +24,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 import structlog
 from sqlalchemy.orm.attributes import flag_modified
@@ -49,8 +49,15 @@ def _refuse(incident_id: str, reason: str, applied_by: str) -> Dict[str, Any]:
     return {"ok": False, "reason": reason}
 
 
-def apply_intent(incident_id: str, applied_by: str) -> Dict[str, Any]:
-    """Запустить kubectl для утверждённой ExecutionIntent. См. модульный docstring."""
+def apply_intent(
+    incident_id: str, applied_by: str, expected_signature: Optional[str] = None
+) -> Dict[str, Any]:
+    """Запустить kubectl для утверждённой ExecutionIntent. См. модульный docstring.
+
+    expected_signature: если передан (из approve-кнопки custom_id), сверяем его с
+    compute_signature(loaded_intent) и отказываем при расхождении — закрывает TOCTOU
+    «оператор подтвердил intent A, в БД лежит intent B». None = проверка пропускается.
+    """
     db = SessionLocal()
     try:
         record = (
@@ -79,6 +86,14 @@ def apply_intent(incident_id: str, applied_by: str) -> Dict[str, Any]:
 
         if intent.risk.lower() not in _ELIGIBLE_RISKS:
             return _refuse(incident_id, f"risk_too_high:{intent.risk}", applied_by)
+
+        # Integrity-gate: intent, который видел оператор в embed, должен совпадать
+        # с тем, что сейчас в БД (защита от подмены записи между показом и кликом).
+        if expected_signature is not None:
+            from app.services.intent_signature import compute_signature
+
+            if compute_signature(intent) != expected_signature:
+                return _refuse(incident_id, "signature_mismatch", applied_by)
 
         executor_result: Dict[str, Any] = analysis.get("executor_result") or {}
         if executor_result.get("status") != "dry_run_ok":

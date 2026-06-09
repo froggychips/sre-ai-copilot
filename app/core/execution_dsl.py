@@ -41,6 +41,37 @@ class ExecutionIntent(BaseModel):
             )
         return v
 
+    @field_validator("resource_name")
+    @classmethod
+    def validate_resource_name(cls, v: str):
+        # resource_name уходит в kubectl-команду (DSLTranslator.to_kubectl) и
+        # затем в argv через command.split(). Без валидации значение вроде
+        # `x --namespace=kube-system` подменяет namespace мимо guard'а
+        # (flag-инъекция). Ограничиваем charset'ом имён k8s-объектов: ни
+        # пробелов, ни ведущего '-', ни флагов.
+        if not re.fullmatch(r"[a-z0-9]([a-z0-9.\-]{0,251}[a-z0-9])?", v or ""):
+            raise ValueError(f"Invalid resource_name: {v!r}")
+        return v
+
+    @field_validator("params")
+    @classmethod
+    def validate_params(cls, v: Dict[str, Any]):
+        # params тоже попадают в argv. replicas → целое в разумном диапазоне
+        # (строку-цифру коэрсим); label → селектор без пробелов/флагов.
+        v = dict(v or {})
+        if "replicas" in v:
+            r = v["replicas"]
+            if isinstance(r, str) and r.isdigit():
+                r = int(r)
+                v["replicas"] = r
+            if isinstance(r, bool) or not isinstance(r, int) or not (1 <= r <= 100):
+                raise ValueError(f"Invalid replicas: {v['replicas']!r}")
+        label = v.get("label")
+        if label:
+            if not re.fullmatch(r"[A-Za-z0-9._/=,\-]{1,253}", str(label)):
+                raise ValueError(f"Invalid label selector: {label!r}")
+        return v
+
     @classmethod
     def from_llm_response(cls, text: str) -> Optional["ExecutionIntent"]:
         """Распарсить JSON ExecutionIntent из LLM-ответа.
@@ -127,8 +158,8 @@ class DSLTranslator:
                     f"-n {intent.namespace}"
                 ),
                 ActionType.GET_PODS: (
-                    f"kubectl get pods -n {intent.namespace} "
-                    f"-l {intent.params.get('label', '')}"
+                    f"kubectl get pods -n {intent.namespace}"
+                    + (f" -l {intent.params['label']}" if intent.params.get("label") else "")
                 ),
             }
             cmd = mapping.get(intent.action)
