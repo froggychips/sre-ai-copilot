@@ -67,6 +67,17 @@ from app.services.teamcity_service import incident_teamcity_context, teamcity_co
 
 logger = structlog.get_logger()
 
+# Per-stage timeout: каждая LLM/enrichment-стадия оборачивается в
+# asyncio.wait_for(..., timeout=_STAGE_TIMEOUT). При TimeoutError исключение
+# пробрасывается наверх — вызывающий код переводит инцидент в FAILED.
+# getattr с дефолтом, чтобы не трогать config.py (отдельный batch/миграция).
+_STAGE_TIMEOUT = float(getattr(settings, "PIPELINE_STAGE_TIMEOUT_SECONDS", 240.0))
+
+
+async def _staged(coro):
+    """Обернуть стадию в per-stage timeout. TimeoutError НЕ глушим."""
+    return await asyncio.wait_for(coro, timeout=_STAGE_TIMEOUT)
+
 _LEGACY_STATUS_ALIAS: dict[str, IncidentState] = {
     "PENDING": IncidentState.OPEN,
     "COMPLETED": IncidentState.RESOLVED,
@@ -837,7 +848,14 @@ class IncidentPipeline:
                 ),
                 "executor_result": self.executor_result,
             }
-            self._safe_transition(IncidentState.RESOLVED, synth_snap)
+            # Если ни одна гипотеза не пережила critique (self.best is None,
+            # resolution_quality=="unresolved") — инцидент НЕ разрешён, уводим
+            # его в TRIAGE_REQUIRED вместо RESOLVED. Это прекращает помечать
+            # неразрешённые инциденты как RESOLVED.
+            final_state = (
+                IncidentState.RESOLVED if self.best else IncidentState.TRIAGE_REQUIRED
+            )
+            self._safe_transition(final_state, synth_snap)
             record.trace = self.traces + [synth_snap]
             self.db.commit()
         else:
@@ -954,13 +972,16 @@ class IncidentPipeline:
 
     async def run(self) -> None:
         self.incident = Incident(**self.incident_data)
+        # _populate_kg — best-effort, оставляем без timeout-обёртки.
         await self._populate_kg()
-        await self.stage_analyze()
-        await self.stage_diagnose()
-        await self.stage_hypothesize()
-        await self.stage_critique()
-        await self.stage_jira_enrich()
-        await self.stage_fix()
-        await self.stage_risk()
-        await self.stage_executor()
-        await self.stage_synthesize()
+        # LLM/enrichment-стадии — под per-stage timeout (_STAGE_TIMEOUT).
+        # TimeoutError пробрасывается → вызывающий код переводит в FAILED.
+        await _staged(self.stage_analyze())
+        await _staged(self.stage_diagnose())
+        await _staged(self.stage_hypothesize())
+        await _staged(self.stage_critique())
+        await _staged(self.stage_jira_enrich())
+        await _staged(self.stage_fix())
+        await _staged(self.stage_risk())
+        await _staged(self.stage_executor())
+        await _staged(self.stage_synthesize())
