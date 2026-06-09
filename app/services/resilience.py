@@ -10,6 +10,15 @@ from redis.asyncio import Redis
 logger = structlog.get_logger()
 
 
+class LLMCircuitOpen(Exception):
+    """Брейкер провайдера открыт — fail fast, без ретраев.
+
+    Отличается от транзиентного сбоя вызова: открытый circuit означает, что
+    мы СОЗНАТЕЛЬНО не зовём провайдера, поэтому llm_retry_strategy не должен
+    его ретраить (иначе просто 3× перепроверит открытый circuit с backoff-ом).
+    """
+
+
 def llm_retry_strategy(func):
     """Simple async retry decorator for transient LLM failures."""
 
@@ -21,6 +30,8 @@ def llm_retry_strategy(func):
         for attempt in range(1, retries + 1):
             try:
                 return await func(*args, **kwargs)
+            except LLMCircuitOpen:
+                raise  # брейкер открыт → fail fast, не ретраим
             except Exception as exc:
                 last_exc = exc
                 logger.warning("llm_call_retry", attempt=attempt, error=str(exc))

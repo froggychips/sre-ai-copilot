@@ -14,7 +14,7 @@ from app import repository
 from app.api import approvals, discord_interactions, rate_limit, replay, webhooks
 from app.evaluation import feedback
 from app.auth import User, get_current_user
-from app.celery_worker import celery_app, generate_reply
+from app.celery_worker import celery_app, generate_reply, resilience
 from app.config import settings
 from app.database import SessionLocal, engine
 from app.knowledge_graph.contract import (
@@ -176,6 +176,17 @@ async def post_copilot(
     prompt: str = Body(...),
     user: User = Depends(get_current_user),
 ):
+    # Per-user rate limit (resilience.py token-bucket). /copilot — user-facing
+    # точка входа, ровно под что check_rate_limit(user_id) и спроектирован
+    # (НЕ автономный alert-пайплайн, который этот бакет задушил бы на fan-out).
+    # Fail-open: redis недоступен → пропускаем, как rate_limit_middleware на вебхуке.
+    try:
+        allowed = await resilience.check_rate_limit(user.sub)
+    except Exception:
+        allowed = True
+    if not allowed:
+        raise HTTPException(status_code=429, detail="Rate limit exceeded")
+
     if not conversation_id:
         conversation_id = await repository.create_conversation()
     await repository.add_message(
