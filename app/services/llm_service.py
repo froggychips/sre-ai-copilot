@@ -6,7 +6,36 @@ from anthropic import AsyncAnthropic
 
 from app.config import settings
 from app.services.claude_cli_service import ClaudeCliService
-from app.services.resilience import llm_retry_strategy
+from app.services.resilience import LLMCircuitOpen, llm_retry_strategy
+
+_LLM_PROVIDER = "anthropic"
+
+
+def _get_resilience():
+    """Лениво достаём LLMResilienceManager-синглтон из celery_worker.
+
+    Ленивый импорт (как в llm_cache.py) рвёт цикл llm_service↔celery_worker.
+    Любая ошибка → None: circuit breaker — best-effort и НИКОГДА не должен
+    ронять сам LLM-вызов.
+    """
+    try:
+        from app.celery_worker import resilience
+        return resilience
+    except Exception:
+        return None
+
+
+async def _report_provider(resilience, *, success: bool) -> None:
+    """report_success/report_failure, проглатывая любые ошибки резильенса."""
+    if resilience is None:
+        return
+    try:
+        if success:
+            await resilience.report_success(_LLM_PROVIDER)
+        else:
+            await resilience.report_failure(_LLM_PROVIDER)
+    except Exception:
+        pass
 
 
 class LLMService:
@@ -52,6 +81,10 @@ class LLMService:
         Для claude_cli (subprocess без usage API) input/output_tokens = 0
         (правильнее чем char-approximation — counter с 0 не искажает sum).
         """
+        # Circuit breaker применяем только к anthropic-провайдеру; claude_cli —
+        # локальный subprocess, у него своя модель отказа (resilience=None →
+        # _report_provider/проверка circuit no-op).
+        resilience = None if self.backend == "claude_cli" else _get_resilience()
         try:
             if self.backend == "claude_cli":
                 assert self.cli is not None
@@ -64,6 +97,18 @@ class LLMService:
                     "backend": "claude_cli",
                 }
             assert self.client is not None
+            # Circuit breaker (resilience.py): fail fast, если anthropic уже
+            # сыпет ошибками — не долбим лежащий провайдер. Fail-open: любая
+            # ошибка резильенса/redis → считаем circuit закрытым, идём дальше.
+            if resilience is not None:
+                try:
+                    circuit_open = await resilience.is_circuit_open(_LLM_PROVIDER)
+                except Exception:
+                    circuit_open = False
+                if circuit_open:
+                    raise LLMCircuitOpen(
+                        f"LLM circuit open for provider {_LLM_PROVIDER!r}"
+                    )
             llm_timeout = getattr(settings, "LLM_TIMEOUT_SECONDS", 30.0)
             # NB: НЕ добавлять Anthropic prompt caching (cache_control) сюда.
             # Разбор 2026-06: в IncidentPipeline каждый агент шлёт уникальный
@@ -95,6 +140,7 @@ class LLMService:
                 raise ValueError("Empty response from LLM")
             # Anthropic SDK: response.usage.input_tokens / .output_tokens
             usage = getattr(response, "usage", None)
+            await _report_provider(resilience, success=True)
             return {
                 "text": text,
                 "input_tokens": int(getattr(usage, "input_tokens", 0) or 0),
@@ -102,10 +148,16 @@ class LLMService:
                 "model": self.model,
                 "backend": "anthropic",
             }
+        except LLMCircuitOpen:
+            # Брейкер сработал — это НЕ новый сбой провайдера, не считаем его
+            # и не ретраим (см. llm_retry_strategy).
+            raise
         except asyncio.TimeoutError:
+            await _report_provider(resilience, success=False)
             logging.error("LLM call timed out")
             raise ValueError("LLM timeout")
         except Exception as e:
+            await _report_provider(resilience, success=False)
             logging.error(f"LLM call attempt failed: {e}")
             raise
 
