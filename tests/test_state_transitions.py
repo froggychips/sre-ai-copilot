@@ -147,11 +147,19 @@ def test_transition_to_accepts_legacy_pending_as_open():
 
 def test_failed_is_reachable_from_every_non_terminal_state():
     for state in IncidentState:
-        if state in (IncidentState.RESOLVED, IncidentState.FAILED):
+        if state in (
+            IncidentState.RESOLVED,
+            IncidentState.TRIAGE_REQUIRED,
+            IncidentState.FAILED,
+        ):
             continue
         assert StateMachine.validate_transition(state, IncidentState.FAILED), (
             f"FAILED must be reachable from {state.value}"
         )
+
+
+def test_triage_required_is_terminal():
+    assert StateMachine.TRANSITIONS[IncidentState.TRIAGE_REQUIRED] == set()
 
 
 def test_terminal_states_have_no_outgoing_transitions():
