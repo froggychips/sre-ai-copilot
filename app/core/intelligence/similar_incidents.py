@@ -126,6 +126,6 @@ class SimilarIncidentEngine:
                     }
                 )
 
-            return sorted(matches, key=lambda x: x["score"], reverse=True)[:limit]
+            return sorted(matches, key=lambda x: x["score"], reverse=True)[:limit]  # type: ignore[return-value]
         finally:
             db.close()
