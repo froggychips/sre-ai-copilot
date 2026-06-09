@@ -1,9 +1,12 @@
 import asyncio
 import logging
 
+import httpx
 from celery import Celery
 from celery.schedules import crontab
 from celery.signals import task_postrun
+from sqlalchemy.exc import OperationalError
+from sqlalchemy.orm.attributes import flag_modified
 
 from app.config import settings
 from app.core.state_machine import IncidentState
@@ -245,10 +248,26 @@ celery_app.conf.beat_schedule = {
 }
 
 
+# Авто-ретрай ТОЛЬКО для transient-сбоев (сеть/БД/HTTP-транспорт): сетевой
+# обрыв до Redis/PG, таймаут, недоступность апстрима — это recoverable, имеет
+# смысл повторить с экспоненциальным backoff + jitter. НЕ ретраим generic
+# Exception / ValueError / ValidationError — это non-recoverable (битый payload,
+# баг в коде): повторять их 3× бессмысленно и только жжёт LLM-бюджет.
 @celery_app.task(
     name="process_incident",
     bind=True,
     max_retries=3,
+    autoretry_for=(
+        ConnectionError,
+        TimeoutError,
+        OSError,
+        OperationalError,
+        httpx.TransportError,
+        httpx.TimeoutException,
+    ),
+    retry_backoff=True,
+    retry_backoff_max=600,
+    retry_jitter=True,
     rate_limit=settings.CELERY_PROCESS_INCIDENT_RATE_LIMIT,
 )
 def process_incident_task(self, incident_data: dict):
@@ -295,6 +314,26 @@ async def async_process_incident(incident_data: dict):
             await pipeline.run()
         except Exception as e:
             if record is not None:
+                # Пишем post-mortem в analysis ДО перехода в FAILED, чтобы
+                # упавшая строка была self-describing (видна причина без
+                # похода в OTel/логи). Отдельный try/except — persist-сбой
+                # не должен маскировать исходную ошибку pipeline-а.
+                try:
+                    record.analysis = {
+                        **(record.analysis or {}),
+                        "failed": {
+                            "error": str(e),
+                            "error_type": type(e).__name__,
+                        },
+                    }
+                    flag_modified(record, "analysis")
+                    db.commit()
+                except Exception as persist_err:
+                    logger.warning(
+                        "async_process_incident.postmortem_persist_failed: %s",
+                        persist_err,
+                    )
+                    db.rollback()
                 try:
                     transition_to(record, IncidentState.FAILED, db)
                 except ValueError:
@@ -318,6 +357,8 @@ def kg_topology_sync_task():
     except Exception as e:
         logger.error("kg_topology_sync.failed: %s", e)
         raise
+    finally:
+        db.close()
 
 
 @celery_app.task(name="k8s_pod_events_sync")
@@ -722,6 +763,8 @@ def kg_anomaly_detection_task():
         return detect_anomalies(db)
     except Exception as e:
         logger.warning("kg_anomaly_detection_task.failed: %s", e)
+    finally:
+        db.close()
 
 
 @celery_app.task(name="kg_runtime_correlation_sync")
