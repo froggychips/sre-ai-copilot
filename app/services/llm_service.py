@@ -65,6 +65,18 @@ class LLMService:
                 }
             assert self.client is not None
             llm_timeout = getattr(settings, "LLM_TIMEOUT_SECONDS", 30.0)
+            # NB: НЕ добавлять Anthropic prompt caching (cache_control) сюда.
+            # Разбор 2026-06: в IncidentPipeline каждый агент шлёт уникальный
+            # контент (потребляет вывод предыдущей стадии), а стабильный префикс
+            # (role+instruction из BaseAgent) — пара сотен токенов, ниже
+            # 4096-токенного минимума кэша Opus → cache_control молча не кэширует
+            # (cache_creation_input_tokens=0) и на уникальных префиксах ещё и
+            # добавляет 1.25× write-премию без reads = НЕТТО-МИНУС по стоимости.
+            # Реальный повтор (идентичные ретраи) уже покрыт llm_cache.py
+            # (Redis response-cache по role+instruction+context). Единственная
+            # точка, где prompt caching был бы net-positive — общий префикс
+            # fan-out'а MultiHypothesisAgent (shared-prefix/varying-suffix); это
+            # отдельный hot-path рефактор, не «воткнуть cache_control».
             response = await asyncio.wait_for(
                 self.client.messages.create(
                     model=self.model,
