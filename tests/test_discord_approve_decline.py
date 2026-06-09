@@ -92,7 +92,7 @@ def test_intent_signature_differs_for_different_intents():
     b = ExecutionIntent(
         action=ActionType.RESTART_DEPLOYMENT,
         resource_type="deployment",
-        resource_name="OTHER",
+        resource_name="other-svc",
         namespace="squad-1",
         risk="medium",
     )
