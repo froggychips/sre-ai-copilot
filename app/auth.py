@@ -39,11 +39,13 @@ async def get_current_user(
 
     try:
         # Decode and validate the token
+        # aud проверяется только когда задан JWT_AUDIENCE (иначе не требуем).
         payload = jwt.decode(
             token,
             settings.JWT_PUBLIC_KEY,  # RSA Public Key string from ENV
             algorithms=[settings.JWT_ALGORITHM],
             audience=settings.JWT_AUDIENCE,
+            options={"require": ["exp", "sub"]},
         )
 
         # sub обязателен — пустую строку всё равно отсекаем дальше через InvalidTokenError.

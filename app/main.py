@@ -82,7 +82,10 @@ def _run_startup_contract_check() -> None:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Startup: поднимаем prometheus-сервер.
-    start_http_server(port=8001)
+    # addr берётся из settings.METRICS_BIND_ADDR (default "0.0.0.0", чтобы
+    # in-cluster scraping продолжал работать). В PROD порт :8001 ОБЯЗАТЕЛЬНО
+    # ограничивать через NetworkPolicy — иначе метрики доступны всему поду/сети.
+    start_http_server(port=8001, addr=settings.METRICS_BIND_ADDR)
     log.info("application_startup", prometheus_port=8001)
     # KG contract drift guard — read-only diagnostic, не блокирует boot.
     _run_startup_contract_check()
@@ -139,7 +142,7 @@ async def rate_limit_middleware(request: Request, call_next):
     # Redis-backed sliding window — общий счётчик между api-репликами.
     # См. app/api/rate_limit.py. Fail-open: при недоступности Redis запрос
     # пропускается с warning-логом (auth остаётся на HMAC-подписи).
-    if request.url.path == "/webhooks/alertmanager":
+    if request.url.path.startswith("/webhooks/alertmanager"):
         client_ip = request.client.host if request.client else ""
         if not await rate_limit.check_alertmanager(client_ip):
             return Response(status_code=429, content="Rate limit exceeded")
@@ -156,7 +159,12 @@ async def metrics_middleware(request: Request, call_next):
 
 app.include_router(webhooks.router, prefix="/webhooks")
 app.include_router(approvals.router, prefix="/approvals", tags=["approvals"])
-app.include_router(replay.router, prefix="/replay", tags=["replay"])
+app.include_router(
+    replay.router,
+    prefix="/replay",
+    tags=["replay"],
+    dependencies=[Depends(get_current_user)],
+)
 app.include_router(feedback.router, prefix="/evaluation", tags=["evaluation"])
 app.include_router(discord_interactions.router, prefix="/discord", tags=["discord"])
 
@@ -190,13 +198,17 @@ async def readyz():
             conn.execute(text("SELECT 1"))
         return {"status": "ready"}
     except Exception as e:
-        raise HTTPException(
-            status_code=503, detail=f"Database connectivity failed: {e}"
-        )
+        # Не светим детали исключения наружу — логируем server-side,
+        # клиенту отдаём статичный detail.
+        log.warning("readyz_db_unreachable", error=str(e))
+        raise HTTPException(status_code=503, detail="database unavailable")
 
 
 @app.get("/jobs/{task_id}")
-async def get_job_status(task_id: str):
+async def get_job_status(
+    task_id: str,
+    user: User = Depends(get_current_user),
+):
     result = AsyncResult(task_id, app=celery_app)
     response_data = {"task_id": task_id, "status": result.status}
 
@@ -204,6 +216,9 @@ async def get_job_status(task_id: str):
         if result.successful():
             response_data["result"] = result.result
         else:
-            response_data["error"] = str(result.result)
+            # Не отдаём наружу детали ошибки задачи (могут содержать
+            # внутренние сообщения/traceback) — логируем server-side.
+            log.warning("job_failed", task_id=task_id, error=str(result.result))
+            response_data["error"] = "task failed"
 
     return response_data
