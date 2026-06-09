@@ -257,9 +257,14 @@ celery_app.conf.beat_schedule = {
     name="process_incident",
     bind=True,
     max_retries=3,
+    # NB: НЕ включаем голый TimeoutError. На Python 3.11+ asyncio.TimeoutError —
+    # его alias, а per-stage asyncio.wait_for в pipeline.run() (_staged) кидает
+    # именно его как НАМЕРЕННЫЙ терминальный stage-cap. Ретрай TimeoutError
+    # перезапускал бы весь инцидент 3× и пережигал LLM-бюджет (ломая и контракт
+    # «timeout→FAILED», и смысл transient-only retry). Сетевые таймауты покрыты
+    # httpx.TimeoutException / OSError.
     autoretry_for=(
         ConnectionError,
-        TimeoutError,
         OSError,
         OperationalError,
         httpx.TransportError,
