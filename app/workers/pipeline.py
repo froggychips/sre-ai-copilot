@@ -148,8 +148,13 @@ class IncidentPipeline:
         self.similar_past: List[dict] = []
         self.is_recurrence: bool = False
         self.flap_count: int = incident_data.get("flap_count", 0)
-        self.critiqued = None
-        self.best = None
+        # _hypothesis_set: вывод MultiHypothesisAgent (stage_hypothesize) →
+        # вход FactCriticAgent (stage_critique). Объявляем в __init__, чтобы
+        # mypy видел атрибут (иначе [attr-defined]/[has-type] на доступе в
+        # stage_critique, где он раньше появлялся только как self._hypothesis_set=…).
+        self._hypothesis_set: Optional[Any] = None
+        self.critiqued: Optional[Any] = None
+        self.best: Optional[Any] = None
         self.final_cause: str = ""
         self.hypotheses_text: str = ""
         self.jira_context: Optional[Dict[str, Any]] = None
