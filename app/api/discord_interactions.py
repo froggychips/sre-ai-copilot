@@ -144,6 +144,29 @@ def _check_rate_limit(user_id: str) -> bool:
         return True
 
 
+def _deny_apply_if_unauthorized(payload: dict, user_id: str, incident_id: str):
+    """Authz + rate-limit gate для apply-кнопок (реальный kubectl write).
+
+    Возвращает _ephemeral-Response при отказе, иначе None. Тот же fail-closed
+    whitelist, что и approve/decline — раньше apply-ветки его НЕ вызывали, поэтому
+    любой кликнувший в канале мог запустить write мимо DISCORD_APPROVERS_*.
+    """
+    allowed, reason = _is_authorized_approver(payload)
+    if not allowed:
+        audit_service.log_event(
+            "EXECUTOR_APPLY_DENIED_UNAUTHORIZED",
+            {"incident_id": incident_id, "discord_user_id": user_id, "reason": reason},
+        )
+        return _ephemeral("You are not authorized to apply actions for this incident.")
+    if not _check_rate_limit(user_id):
+        audit_service.log_event(
+            "EXECUTOR_APPLY_DENIED_RATE_LIMIT",
+            {"incident_id": incident_id, "discord_user_id": user_id},
+        )
+        return _ephemeral("Rate limit exceeded — too many apply clicks in the last hour.")
+    return None
+
+
 def _verify_signature(public_key_hex: str, signature_hex: str, timestamp: str, body: bytes) -> bool:
     try:
         pub = Ed25519PublicKey.from_public_bytes(bytes.fromhex(public_key_hex))
@@ -492,6 +515,9 @@ async def discord_interactions(
         incident_id = custom_id[len("apply_"):]
         if not settings.EXECUTOR_APPROVAL_ENABLED:
             return _ephemeral("❌ EXECUTOR_APPROVAL_ENABLED=false — apply отключён.")
+        denied = _deny_apply_if_unauthorized(payload, user_id, incident_id)
+        if denied is not None:
+            return denied
         return _ephemeral(
             "⚠️ Запустить **kubectl** для этой команды? "
             "dry-run уже прошёл (kube-apiserver валидировал команду), "
@@ -505,6 +531,9 @@ async def discord_interactions(
         incident_id = custom_id[len("apply_confirm_"):]
         if not settings.EXECUTOR_APPROVAL_ENABLED:
             return _ephemeral("❌ EXECUTOR_APPROVAL_ENABLED=false — apply отключён.")
+        denied = _deny_apply_if_unauthorized(payload, user_id, incident_id)
+        if denied is not None:
+            return denied
 
         interaction_token = payload.get("token", "")
         if not interaction_token:
@@ -634,7 +663,10 @@ async def discord_interactions(
             try:
                 from app.services.executor_apply import apply_intent
                 import asyncio
-                asyncio.create_task(asyncio.to_thread(apply_intent, incident_id, user_name))
+                # intent_sig из custom_id → integrity-сверка в apply_intent (TOCTOU).
+                asyncio.create_task(
+                    asyncio.to_thread(apply_intent, incident_id, user_name, intent_sig)
+                )
                 return _ephemeral(
                     f"✅ Approved by @{user_name}. Executor launched (fire-and-forget). "
                     "Audit-trail: INCIDENT_ACTION_APPROVED."
