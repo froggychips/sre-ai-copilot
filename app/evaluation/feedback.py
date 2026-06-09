@@ -52,7 +52,10 @@ async def submit_feedback(
 
 
 @router.get("/stats")
-async def get_governance_stats(db: Session = Depends(get_db)):
+async def get_governance_stats(
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
     """
     Возвращает агрегированную статистику точности ИИ.
     """
