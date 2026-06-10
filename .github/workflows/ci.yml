@@ -64,7 +64,10 @@ jobs:
   build-and-push:
     name: Build and Push Docker Image
     needs: test
-    runs-on: ubuntu-latest
+    # ubuntu-latest (GitHub-hosted) на froggychips даёт startup_failure —
+    # джоба умирает за секунды без раннера (та же болезнь, что и macos-latest).
+    # Self-hosted Mac: docker от Rancher Desktop, amd64 через эмуляцию VM.
+    runs-on: [self-hosted, macOS, ARM64]
     if: github.event_name == 'push'
     permissions:
       contents: read
@@ -91,6 +94,9 @@ jobs:
         with:
           context: .
           push: true
+          # ОБЯЗАТЕЛЬНО на ARM64-раннере: k8s-ноды amd64, образ без
+          # --platform получится arm64 и не запустится (прецедент deploy.sh).
+          platforms: linux/amd64
           tags: |
             ghcr.io/${{ github.repository }}:${{ github.sha }}
           # Не публикуем :latest — в k8s pin по digest. Перетягиваем тег
