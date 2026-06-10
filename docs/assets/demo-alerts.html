@@ -1,0 +1,413 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<title>sre-ai-copilot — demo (synthetic data)</title>
+<style>
+  * { box-sizing: border-box; }
+  html, body {
+    margin: 0; padding: 0;
+    background: #313338;
+    color: #dcddde;
+    font-family: "gg sans", "Noto Sans", "Helvetica Neue", Helvetica, Arial, sans-serif;
+    font-size: 15px; line-height: 1.4;
+  }
+  .channel-header {
+    position: sticky; top: 0; z-index: 100;
+    background: #2b2d31; color: #fff;
+    padding: 12px 20px; font-size: 15px; font-weight: 600;
+    border-bottom: 1px solid #1e1f22;
+    box-shadow: 0 2px 4px rgba(0,0,0,.3);
+  }
+  .channel-header .muted { font-weight: 400; }
+  .container { max-width: 760px; margin: 0 auto; padding: 20px 24px 60px; }
+  .channel-divider {
+    color: #949ba4; font-size: 13px; font-weight: 600;
+    margin: 36px 0 14px; display: flex; align-items: center; gap: 10px;
+  }
+  .channel-divider::before, .channel-divider::after {
+    content: ""; flex: 1; height: 1px; background: #3f4147;
+  }
+  .bot-author { display: flex; align-items: center; gap: 8px; margin: 18px 0 6px; }
+  .bot-avatar {
+    width: 28px; height: 28px; border-radius: 50%;
+    background: linear-gradient(135deg, #5865f2 0%, #3ba55d 100%);
+    display: flex; align-items: center; justify-content: center;
+    font-size: 13px; color: #fff; font-weight: 700;
+  }
+  .bot-name { color: #fff; font-weight: 600; font-size: 15px; }
+  .bot-tag { background: #5865f2; color: #fff; font-size: 10px; padding: 1px 4px; border-radius: 3px; font-weight: 600; }
+  .bot-time { color: #72767d; font-size: 12px; }
+  .mention {
+    background: rgba(88,101,242,.3); color: #c9cdfb;
+    border-radius: 3px; padding: 0 3px; font-weight: 500;
+  }
+  .msg-text { margin: 0 0 4px; color: #dcddde; }
+  .embed {
+    background: #2b2d31; border-radius: 4px;
+    padding: 12px 16px; margin-bottom: 4px; max-width: 620px;
+    border-left: 4px solid #5865f2;
+    box-shadow: 0 0 0 1px rgba(0,0,0,.1);
+  }
+  .embed.red    { border-left-color: #ed4245; }
+  .embed.yellow { border-left-color: #faa61a; }
+  .embed.blue   { border-left-color: #5865f2; }
+  .embed.green  { border-left-color: #3ba55d; }
+  .embed-title { color: #fff; font-weight: 600; font-size: 15px; margin-bottom: 8px; line-height: 1.3; }
+  .embed-description { color: #dcddde; font-size: 14px; margin-bottom: 10px; line-height: 1.4; white-space: pre-wrap; }
+  .embed-description code, .field-block code, .field-value code {
+    background: #1e1f22; padding: 1px 4px; border-radius: 3px;
+    font-family: Consolas, "Liberation Mono", Menlo, monospace; font-size: 13px;
+  }
+  .row { display: flex; flex-wrap: wrap; gap: 16px; margin-bottom: 10px; }
+  .field-inline { min-width: 110px; flex: 1 1 0; }
+  .field-name { color: #fff; font-weight: 600; font-size: 13px; margin-bottom: 2px; }
+  .field-value { color: #dcddde; font-size: 14px; line-height: 1.4; }
+  .field-block { margin-bottom: 10px; }
+  .field-block .field-value { white-space: pre-wrap; }
+  .embed-footer {
+    color: #72767d; font-size: 12px; margin-top: 10px;
+    padding-top: 8px; border-top: 1px solid #3f4147;
+  }
+  .muted { color: #8e9297; }
+</style>
+</head>
+<body>
+
+<div class="channel-header" id="chan-header"># infra-error <span class="muted">— sre-ai-copilot · demo (synthetic data)</span></div>
+
+<div class="container">
+
+<!-- ====================== 1. PreprodEndpointDown ====================== -->
+<div class="bot-author">
+  <div class="bot-avatar">🤖</div>
+  <div class="bot-name">sre-copilot</div>
+  <div class="bot-tag">BOT</div>
+  <div class="bot-time">сегодня в 16:16</div>
+</div>
+<p class="msg-text"><span class="mention">@oncall-sre</span></p>
+
+<div class="embed red">
+  <div class="embed-title">🚨 PREPROD · PreprodEndpointDown</div>
+  <div class="embed-description">Blackbox-проба <code>https://api2-preprod.example.com/core/health/ready</code> падает уже ≥3м.
+Ожидаемый здоровый ответ — 200/401; сейчас 5xx/timeout, т.е. ingress или сам сервис не отвечают. Это user-facing «препрод лежит».
+Проверить: <code>kubectl get pods -n preprod-shared &amp;&amp; kubectl get pods -n preprod-realm2</code></div>
+
+  <div class="row">
+    <div class="field-inline">
+      <div class="field-name">Namespaces</div>
+      <div class="field-value">preprod-shared</div>
+    </div>
+    <div class="field-inline">
+      <div class="field-name">KG</div>
+      <div class="field-value">сервис не в graph — topology unknown</div>
+    </div>
+    <div class="field-inline">
+      <div class="field-name">Source</div>
+      <div class="field-value">Prometheus query</div>
+    </div>
+  </div>
+
+  <div class="embed-footer">copilot/enrich · groupKey=PreprodEndpointDown · KG sync 0m ago · alerts_resolve OK · owner 99.8% · build master-v4-wave10p1 · Сегодня, в 16:16</div>
+</div>
+
+<!-- ====================== 2. PreprodRestartsSpike ====================== -->
+<div class="bot-author">
+  <div class="bot-avatar">🤖</div>
+  <div class="bot-name">sre-copilot</div>
+  <div class="bot-tag">BOT</div>
+  <div class="bot-time">сегодня в 16:16</div>
+</div>
+
+<div class="embed red">
+  <div class="embed-title">🚨 PREPROD · PreprodRestartsSpike (2 ns)</div>
+  <div class="embed-description">Суммарно по namespace &gt;5 рестартов контейнеров за 30 минут — медленный crashloop (startup probe kill-цикл), который штатные KubePodCrashLooping/KubePodNotReady не ловят: каждая pod-серия живёт меньше for:15m. Агрегация по namespace иммунна к label churn.
+Проверить: <code>kubectl get pods -n preprod-realm2 | grep -v Running</code></div>
+
+  <div class="row">
+    <div class="field-inline">
+      <div class="field-name">Namespaces</div>
+      <div class="field-value">preprod-realm2, preprod-shared</div>
+    </div>
+    <div class="field-inline">
+      <div class="field-name">KG</div>
+      <div class="field-value">сервис не в graph — topology unknown</div>
+    </div>
+    <div class="field-inline">
+      <div class="field-name">Source</div>
+      <div class="field-value">Prometheus query</div>
+    </div>
+  </div>
+
+  <div class="embed-footer">copilot/enrich · groupKey=PreprodRestartsSpike · KG sync 0m ago · alerts_resolve OK · owner 99.8% · build master-v4-wave10p1 · Сегодня, в 16:16</div>
+</div>
+
+<!-- ====================== 3. KubePodCrashLooping — full enrichment ====================== -->
+<div class="bot-author">
+  <div class="bot-avatar">🤖</div>
+  <div class="bot-name">sre-copilot</div>
+  <div class="bot-tag">BOT</div>
+  <div class="bot-time">сегодня в 10:38</div>
+</div>
+
+<div class="embed red">
+  <div class="embed-title">🔴 PREPROD · KubePodCrashLooping · clickhouse-shard0-0</div>
+  <div class="embed-description">Pod <code>preprod-shared/clickhouse-shard0-0</code> (<code>clickhouse</code>) is in waiting state (reason: <code>"CrashLoopBackOff"</code>)</div>
+
+  <div class="row">
+    <div class="field-inline">
+      <div class="field-name">Pod</div>
+      <div class="field-value">clickhouse-shard0-0</div>
+    </div>
+    <div class="field-inline">
+      <div class="field-name">Replicas</div>
+      <div class="field-value">0/3</div>
+    </div>
+    <div class="field-inline">
+      <div class="field-name">Reason</div>
+      <div class="field-value">CrashLoopBackOff</div>
+    </div>
+  </div>
+
+  <div class="field-block">
+    <div class="field-name">🎯 Скорее всего</div>
+    <div class="field-value">Deploy #2126 (<code>4b2daaa</code>) 14 min ago — возможный регресс</div>
+  </div>
+
+  <div class="field-block">
+    <div class="field-name">⭐ Почему важно</div>
+    <div class="field-value">🔥 Хроник: pod_event CrashLoopBackOff × 47 retries — несколько часов крашится</div>
+  </div>
+
+  <div class="field-block">
+    <div class="field-name">🎯 Blast radius</div>
+    <div class="field-value">3 svc → events-service, coordinator-service, core-service · 2 URL → api.preprod.example.com, admin.preprod.example.com</div>
+  </div>
+
+  <div class="field-block">
+    <div class="field-name">📨 NATS impact</div>
+    <div class="field-value">pub→eventfinished (2 sub-консьюмера) · sub←leaderboardrefreshed</div>
+  </div>
+
+  <div class="field-block">
+    <div class="field-name">🕒 Pod trail (1h)</div>
+    <div class="field-value">5 evts: 3 CrashLoopBackOff, 2 BackOff</div>
+  </div>
+
+  <div class="field-block">
+    <div class="field-name">🔧 Recent deploys (~34h)</div>
+    <div class="field-value">• by nsmirnov · Build and update service (preprod #2433) · 14 min ago</div>
+  </div>
+
+  <div class="embed-footer">copilot/enrich · groupKey=KubePodCrashLooping · KG sync 0m ago · alerts_resolve OK · Сегодня, в 10:38</div>
+</div>
+
+<!-- ====================== 4. TooManyScrapeErrors — KG upstream cascade ====================== -->
+<div class="bot-author">
+  <div class="bot-avatar">🤖</div>
+  <div class="bot-name">sre-copilot</div>
+  <div class="bot-tag">BOT</div>
+  <div class="bot-time">сегодня в 14:25</div>
+</div>
+
+<div class="embed yellow">
+  <div class="embed-title">⚠️ TooManyScrapeErrors · vmagent-vm-victoria-metrics-k8s-stack</div>
+  <div class="embed-description">Job <code>"vmagent-vm-victoria-metrics-k8s-stack"</code> on instance <code>10.0.31.7:8429</code> fails to scrape targets for last 15m</div>
+
+  <div class="row">
+    <div class="field-inline">
+      <div class="field-name">Namespaces</div>
+      <div class="field-value">monitoring</div>
+    </div>
+    <div class="field-inline">
+      <div class="field-name">Owner</div>
+      <div class="field-value">platform</div>
+    </div>
+    <div class="field-inline">
+      <div class="field-name">Replicas</div>
+      <div class="field-value">1/1</div>
+    </div>
+  </div>
+
+  <div class="field-block">
+    <div class="field-name">🎯 Скорее всего</div>
+    <div class="field-value">Upstream vmagent-vm-victoria-metrics-k8s-stack алертит ScrapePoolHasNoTargets (2 cascading)</div>
+  </div>
+
+  <div class="field-block">
+    <div class="field-name">⭐ Почему важно</div>
+    <div class="field-value">⚙️ Infra-critical: team_owner=platform — обычно shared/foundational</div>
+  </div>
+
+  <div class="field-block">
+    <div class="field-name">Upstream сейчас (KG)</div>
+    <div class="field-value">• ✗ vmagent-vm-victoria-metrics-k8s-stack @ monitoring — ScrapePoolHasNoTargets (just now, edge=serves_traffic)
+• ✗ vmagent-vm-victoria-metrics-k8s-stack @ monitoring — TooManyScrapeErrors (just now, edge=serves_traffic)</div>
+  </div>
+
+  <div class="field-block">
+    <div class="field-name">🔗 Deps</div>
+    <div class="field-value">1 serves_traffic <span class="muted">(full в critical)</span></div>
+  </div>
+
+  <div class="embed-footer">copilot/enrich · groupKey=TooManyScrapeErrors · KG sync 0m ago · alerts_resolve OK · owner 99.9% · build master-v4-wave10p1 · Сегодня, в 14:25</div>
+</div>
+
+<!-- ====================== 5. Resolved green notice ====================== -->
+<div class="bot-author">
+  <div class="bot-avatar">🤖</div>
+  <div class="bot-name">sre-copilot</div>
+  <div class="bot-tag">BOT</div>
+  <div class="bot-time">сегодня в 17:03</div>
+</div>
+
+<div class="embed green">
+  <div class="embed-title">✅ resolved: PreprodEndpointDown</div>
+  <div class="embed-description">preprod-shared, длился 47м</div>
+</div>
+
+<!-- ====================== INFRA-STATS ====================== -->
+<div class="channel-divider" id="chan-stats"># infra-stats</div>
+
+<div class="bot-author">
+  <div class="bot-avatar">🤖</div>
+  <div class="bot-name">sre-copilot</div>
+  <div class="bot-tag">BOT</div>
+  <div class="bot-time">сегодня в 09:07</div>
+</div>
+
+<div class="embed blue">
+  <div class="embed-title">📊 Cluster Daily Digest · 09:07 UTC</div>
+
+  <div class="field-block">
+    <div class="field-name">📡 Pipeline</div>
+    <div class="field-value">vmsingle ✓ · vmagent ✓ · vmalert ✓ · copilot ✓ · seq ✓ · AM ✓
+AM: scheduled OK, data lag 1h</div>
+  </div>
+
+  <div class="field-block">
+    <div class="field-name">🛡️ Cluster Health</div>
+    <div class="field-value">Nodes ready: 23 · Crashloops: 25 · Firing series: 547 (−27 vs вчера, −4.7%)
+Trend (vs yesterday): cpu 38→38% (+1pp), mem 42→42% (±0pp), crashloops avg 6→3 (−3), disk peak 84→79% (−5pp)</div>
+  </div>
+
+  <div class="field-block">
+    <div class="field-name">📈 Changes since yesterday</div>
+    <div class="field-value">+12 new alerts · −13 resolved · +4 KG edges</div>
+  </div>
+
+  <div class="field-block">
+    <div class="field-name">🎯 Action items</div>
+    <div class="field-value">• 1 services без owner после backfill — нужен manual в ownership.yaml
+• 1043 suspicious_stale без deploys &gt;60d — нужен review: остальные → batch sweep</div>
+  </div>
+
+  <div class="field-block">
+    <div class="field-name">🚨 Firing alerts by team (последние 5 минут)</div>
+    <div class="field-value">@external 306 series, @data 209 series</div>
+  </div>
+
+  <div class="field-block">
+    <div class="field-name">🔎 Unowned namespaces — нужны owner</div>
+    <div class="field-value">• kube-system — 23 series · suggest: @platform
+• sre-ai — 5 series · suggest: @platform (manual)
+• (no-ns) — 2 series · suggest: ?
+• metallb-system — 2 series · suggest: @platform</div>
+  </div>
+
+  <div class="field-block">
+    <div class="field-name">📋 Top alert types (без infra-noise)</div>
+    <div class="field-value">KubeDeploymentReplicasMismatch × 25 (Δ24h +24)
+ScrapePoolHasNoTargets × 14 (Δ24h +14)
+KubePodNotReady × 10 (Δ24h +10)</div>
+  </div>
+
+  <div class="field-block">
+    <div class="field-name">🔊 Noisemakers (24h)</div>
+    <div class="field-value">• prometheus-kube-prometheus-kubelet @platform — 24% alerts (131 events)</div>
+  </div>
+
+  <div class="field-block">
+    <div class="field-name">⏱️ MTTR (resolved alerts last 7d)</div>
+    <div class="field-value">median: 17min · p95: 531min · samples: 123 · trend: −4410min vs prev week · outliers (&gt;7d): 4</div>
+  </div>
+
+  <div class="field-block">
+    <div class="field-name">🚀 Deploy → incident correlation (24h)</div>
+    <div class="field-value">1584 deploys · 0 attributed alerts (0%) · success rate 100%
+⚠️ Likely linkage gap: 100% deploys linked to service, 100% alerts linked</div>
+  </div>
+
+  <div class="field-block">
+    <div class="field-name">📈 Anomalies (last 24h)</div>
+    <div class="field-value">Total: 11278 across 625 svc (warning: 5891, critical: 5387)
+Top affected: core-db-postgresql ×122, core-grainhost ×112, auth-service ×92, dev-service ×82
+By metric: cpu×8344, mem×2887, restarts×47</div>
+  </div>
+
+  <div class="field-block">
+    <div class="field-name">🔬 Persistent anomalies (last 7d)</div>
+    <div class="field-value">update-service mem — 265 events, latest z=8.1 · @data
+core-worker mem — 259 events, latest z=4.0 · @external
+dev-service mem — 258 events, latest z=10.4 · @data</div>
+  </div>
+
+  <div class="field-block">
+    <div class="field-name">📜 Log errors (last 24h)</div>
+    <div class="field-value">map-service — 87 errors · @data
+core-service — 30 errors · @external
+core-service — 16 errors · @data</div>
+  </div>
+
+  <div class="field-block">
+    <div class="field-name">🔧 Recent deploys (24h)</div>
+    <div class="field-value">• by apetrov · Build and full deploy (preprod #694) · 24m ago
+• by nsmirnov · Build and update (&lt;default&gt; #2385) · 50m ago
+• by kvolkov · Build and full deploy (preprod #693) · 14h ago
+• by dorlov · Build and update (&lt;default&gt; #2374) · 22h ago</div>
+  </div>
+
+  <div class="field-block">
+    <div class="field-name">⚠️ Top fragile services (health_score &lt; 0.7 + ≥3 callers)</div>
+    <div class="field-value">🔴 core-grainhost team-9-realm2 — health 0.00 · 3 callers · @data
+🟡 mv-service team-3-shared — health 0.65 · 3 callers · @data
+🟡 push-service team-3-shared — health 0.65 · 3 callers · @data</div>
+  </div>
+
+  <div class="field-block">
+    <div class="field-name">🔗 Top blast-radius services (по inbound callers)</div>
+    <div class="field-value">auth-service prod-shared — 9 callers · health 1.00 · @data
+auth-service preupdate-shared — 8 callers · health 1.00 · @data
+auth-service preprod-shared — 6 callers · health 1.00 · @data</div>
+  </div>
+
+  <div class="field-block">
+    <div class="field-name">⏳ Stale deployments (alive, не катились ≥30d)</div>
+    <div class="field-value">✅ ничего suspicious · скрыто 9 expected (backup/system)</div>
+  </div>
+
+  <div class="field-block">
+    <div class="field-name">🧬 KG quality</div>
+    <div class="field-value">Services: 4559 · Orphan: 360/1312 (27%) · synthetic скрыты: 2180
+Edges: 5487 (calls=960, routes_to=818, serves_traffic=1579, uses_db=1307, uses_nats=823)</div>
+  </div>
+
+  <div class="embed-footer">Syncs: metrics 09:00 · cluster 09:05 · topology 09:06 · seq 08:50 · anomaly 09:00 · aggregates 08:00 (1h ago) · 6/6 active</div>
+</div>
+
+</div>
+
+<script>
+// Заголовок канала следует за прокруткой: infra-error → infra-stats
+const header = document.getElementById('chan-header');
+const statsDivider = document.getElementById('chan-stats');
+window.addEventListener('scroll', () => {
+  const past = statsDivider.getBoundingClientRect().top < 60;
+  header.innerHTML = past
+    ? '# infra-stats <span class="muted">— sre-ai-copilot · demo (synthetic data)</span>'
+    : '# infra-error <span class="muted">— sre-ai-copilot · demo (synthetic data)</span>';
+});
+</script>
+
+</body>
+</html>
