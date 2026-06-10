@@ -153,6 +153,10 @@ jobs:
 
       - name: Upload SBOM artifact
         uses: actions/upload-artifact@v7
+        # Дублирующая копия для удобства: канонический SBOM уже приаттачен
+        # к образу cosign'ом (степ выше). Artifact storage квота аккаунта
+        # переполнена — не валим джобу из-за convenience-копии.
+        continue-on-error: true
         with:
           name: sbom-${{ github.sha }}
           path: sbom.spdx.json
