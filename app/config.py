@@ -94,6 +94,11 @@ class Settings(BaseSettings):
     # Не отправлять реальный Discord webhook, только логировать (для local e2e).
     DISCORD_DRY_RUN: bool = False
 
+    # Кого пинговать в critical-алертах. Пусто — @here (исторический
+    # default). Численный Discord role ID — пинг роли <@&ID>;
+    # allowed_mentions при этом сужается до этой роли вместо everyone.
+    DISCORD_ALERT_MENTION_ROLE_ID: str = ""
+
     # Discord-enrich tier — детерминированный embed с KG-контекстом,
     # без LLM. Принимает alert на /webhooks/alertmanager/enrich-and-forward,
     # обогащает recent_deploys/upstream-alerts/recurrence/owner-team и
