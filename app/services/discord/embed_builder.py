@@ -710,17 +710,35 @@ def _severity_to_color(severity: str, *, resurfaced: bool = False, resolved: boo
 
 
 def _mention_block(severity: str, env: Optional[str] = None) -> str:
-    """B-блок #11 — `@here` префикс для critical (только critical).
+    """B-блок #11 — mention-префикс для critical (только critical).
 
-    Возвращает строку с trailing newline или пустую строку. Используется
-    как content-префикс embed-payload (не внутри embed-text — Discord не
-    рендерит mentions в embed.title/description).
+    DISCORD_ALERT_MENTION_ROLE_ID задан → пинг роли `<@&ID>`, иначе
+    `@here`. Возвращает строку с trailing newline или пустую строку.
+    Используется как content-префикс embed-payload (не внутри embed-text —
+    Discord не рендерит mentions в embed.title/description).
 
     env пока не используется (на будущее — `prod` mention, `dev` skip).
     """
-    if (severity or "").lower() == "critical":
-        return "@here\n"
-    return ""
+    if (severity or "").lower() != "critical":
+        return ""
+    role_id = (getattr(settings, "DISCORD_ALERT_MENTION_ROLE_ID", "") or "").strip()
+    if role_id:
+        return f"<@&{role_id}>\n"
+    return "@here\n"
+
+
+def _allowed_mentions(mention_prefix: str) -> Dict[str, Any]:
+    """allowed_mentions под mention-префикс из `_mention_block`.
+
+    Роль → разрешаем только её id; `@here` → ["everyone"] (Discord
+    трактует @here через everyone в parse-list); нет префикса — пусто.
+    """
+    if not mention_prefix:
+        return {"parse": []}
+    role_id = (getattr(settings, "DISCORD_ALERT_MENTION_ROLE_ID", "") or "").strip()
+    if role_id:
+        return {"parse": [], "roles": [role_id]}
+    return {"parse": ["everyone"]}
 
 
 # Runbook anchor map. Ключ — alertname (точное совпадение), значение —
