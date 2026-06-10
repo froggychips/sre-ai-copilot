@@ -331,7 +331,7 @@ class Settings(BaseSettings):
     # Адрес bind для Prometheus-сервера метрик (:8001). Default "0.0.0.0" —
     # in-cluster scraping не должен сломаться. В PROD порт ограничивать
     # через NetworkPolicy.
-    METRICS_BIND_ADDR: str = "0.0.0.0"
+    METRICS_BIND_ADDR: str = "0.0.0.0"  # nosec B104
 
     # CORS
     ALLOWED_ORIGINS: List[str] = Field(default_factory=lambda: ["*"])
