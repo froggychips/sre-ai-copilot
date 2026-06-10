@@ -21,6 +21,12 @@
 
 ### What's new
 
+- **2026-06-10 — KG ingress coverage live**: nginx-ingress metrics enabled on
+  both WO controllers (shared + prod); `kg_ingress_observations` is now
+  populated every ~10 min with per-host/path p95/p99/rps/4xx/5xx, 100% of
+  rows linked to `kg_services`. Caveat: per-service `http_5xx_rate` /
+  `p95_latency_ms` in `kg_service_health` are still always 0 — app `/metrics`
+  (Kestrel) is behind JWT; pending backend ticket WO-12483.
 - **v0.12.0 — Wave 8 (KG Metadata + UX Polish)**: k8s Jobs/CronJobs coverage
   (`kg_k8s_jobs`, `runs_as_job` edge), PVC/PV storage subgraph (`kg_storage_volumes`,
   `uses_volume` + `bound_to` edges in `kg_volume_edges`), multi-signal owner
@@ -248,6 +254,12 @@ See [docs/RUNBOOK.md → Executor incidents](docs/RUNBOOK.md#executor-incidents)
 
 ### Что нового
 
+- **2026-06-10 — KG ingress coverage live**: nginx-ingress метрики включены
+  на обоих контроллерах WO (shared + prod); `kg_ingress_observations`
+  наполняется каждые ~10 мин per-host/path p95/p99/rps/4xx/5xx, 100% рядов
+  слинкованы с `kg_services`. Caveat: per-service `http_5xx_rate` /
+  `p95_latency_ms` в `kg_service_health` по-прежнему всегда 0 — app
+  `/metrics` (Kestrel) за JWT; ждёт бэкенд-тикета WO-12483.
 - **v0.12.0 — Wave 8 (KG Metadata + UX Polish)**: покрытие k8s Jobs/CronJobs
   (`kg_k8s_jobs`, edge `runs_as_job`), storage-подграф PVC/PV
   (`kg_storage_volumes`, edges `uses_volume` + `bound_to` в `kg_volume_edges`),

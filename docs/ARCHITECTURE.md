@@ -34,9 +34,9 @@ The application consists of: an HTTP API (FastAPI), background tasks (Celery), a
 | `kg_drift_cleanup` | hourly @ :17 | services from missing namespaces → `synthetic=true` |
 | `daily_stats_digest` | daily | KG-summary digest to Discord #stats |
 | `chronic_alerts_digest` | every 6h | chronic-suppressed alerts visibility digest |
-| `kg_metrics_sync` | every 5 min | VictoriaMetrics PromQL → `kg_service_health` (cpu_pct, mem_pct, restarts_rate, http_5xx_rate, p95_latency_ms) |
+| `kg_metrics_sync` | every 5 min | VictoriaMetrics PromQL → `kg_service_health` (cpu_pct, mem_pct, restarts_rate, http_5xx_rate, p95_latency_ms — the last two are still always 0: app `/metrics` is behind JWT, pending WO-12483) |
 | `kg_cluster_health_sync` | every 5 min | k8s node-level snapshot → `kg_cluster_observations` |
-| `kg_ingress_observations_sync` | every 5 min | ingress-controller PromQL → `kg_ingress_observations` (schema present; scrape config for WO ns not in place, so http_5xx/p95 are currently 0) |
+| `kg_ingress_observations_sync` | every ~10 min | nginx-ingress PromQL → `kg_ingress_observations` (per-host/path p95/p99/rps/4xx/5xx; live since 2026-06-10 — ingress metrics enabled cluster-wide) |
 | `kg_anomaly_detect` | every 5 min | rolling robust-z scan → `kg_anomaly_observations` |
 | `kg_signal_aggregates` | every 10 min | 24h roll-up of anomalies/alerts/deploys/pod_events → `kg_signal_aggregates` |
 | `kg_seq_logs_sync` | every 10 min | Seq REST API → `kg_log_observations` (per service × level) |
@@ -126,14 +126,16 @@ Beyond the discrete event tables (deployments / alerts / pod_events), the KG als
 |---|---|---|
 | `kg_service_health` | VictoriaMetrics PromQL via `metrics_sync.py` | 5-min, per service |
 | `kg_cluster_observations` | k8s node API via `cluster_health_sync.py` | 5-min, per node |
-| `kg_ingress_observations` | ingress-controller PromQL via `ingress_observations_sync.py` | 5-min, per host |
+| `kg_ingress_observations` | nginx-ingress PromQL via `ingress_observations_sync.py` | ~10-min, per host/path |
 | `kg_signal_aggregates` | 24-h roll-up via `signal_aggregates.py` | hourly refresh, per service |
 
 Every PromQL fetch is wrapped in a Postgres `SAVEPOINT` per row insert; an `IntegrityError` on the unique key (e.g. duplicate `(service_id, ts)`) rolls back to the savepoint and continues. This makes the sync naturally idempotent on overlapping windows.
 
 Wave 5 PromQL gotcha (documented for future authors): `mem_pct` must be computed as `avg(rate(container_memory_working_set_bytes) / on(pod) kube_pod_container_resource_limits)` — i.e. divide first, aggregate second. The aggregate-then-divide form ran for several days returning silent 0s because the many-to-one join collapsed before the division. The kg_self_health canary (see below) was added specifically to detect this class of silent failure.
 
-Honest limitation: ingress observations are materialised into the schema, but the scrape config that would expose `nginx_ingress_controller_*` for WO namespaces is not in place, so `http_5xx_rate` and `p95_latency_ms` are currently 0 for all services. The pipeline degrades gracefully — anomaly detection on a flat-zero metric simply produces no observations.
+Coverage update (2026-06-10): nginx-ingress metrics are now enabled on both WO controllers (`--enable-metrics=true` on the shared `ingress-nginx-controller`, 16 nodes, and `ingress-prod-controller`, 5 prod nodes). Per-host labels are kept — `metrics-per-host` defaults to true and must NOT be disabled: the copilot sync filters by host. Scraping goes through VMPodScrape `ingress-nginx-shared` + `ingress-prod` in ns `cattle-system` with `honorLabels: true` (mandatory — otherwise the `namespace` label gets overwritten into `exported_namespace`), picked up by the VMAgent in ns `monitoring` (`selectAllByDefault`). As a result `kg_ingress_observations` is populated with per-host/path p95/p99/rps/4xx/5xx; the first 50 minutes produced 156 rows across 23 hosts covering all contours (prod/squad/preprod/preupdate/infra), with 100% of rows linked to `kg_services`.
+
+Remaining honest limitation: per-service `http_5xx_rate` and `p95_latency_ms` in `kg_service_health` are STILL always 0 — `/metrics` of the ASP.NET services (Kestrel) is closed by JWT middleware (401). Backend ticket WO-12483 tracks the fix (recommendation: a separate management port without auth); once it ships, a VMServiceScrape on the app namespaces will be added and these fields come alive. Until then `health_score` remains an infra proxy (alerts + pod_events + aggregates), and `log_error_rate` is a log-derived proxy, not HTTP 5xx. The pipeline degrades gracefully — anomaly detection on a flat-zero metric simply produces no observations.
 
 ### Anomaly detection (Wave 2 + Wave 6 update)
 
@@ -236,7 +238,7 @@ Semantics:
 
 Runs every 30 minutes. Six checks, each returning `ok` / `warn` / `fail`:
 
-1. **`materialization_zero_rate`** — % of rows in `kg_service_health` where a metric is 0 or NULL over 24h. Allowlist for known-zero metrics (`http_5xx_rate`, `p95_latency_ms` while WO scrape config is missing).
+1. **`materialization_zero_rate`** — % of rows in `kg_service_health` where a metric is 0 or NULL over 24h. Allowlist for known-zero metrics (`http_5xx_rate`, `p95_latency_ms` while app `/metrics` stays behind JWT — WO-12483).
 2. **`sync_lag`** — `max(ts)` per beat task vs expected interval; >2× → warn, >5× → fail.
 3. **`anomaly_signal_health`** — count of `kg_anomaly_observations` over 24h. 0 → warn (flat baseline or detector broken). >500 → warn (threshold too loose, overload).
 4. **`alerts_resolve_freshness`** — count of `kg_alerts` with `fired_at < 7d ago` and `resolved_at IS NULL`. >20 → warn.

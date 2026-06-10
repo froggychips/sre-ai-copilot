@@ -25,9 +25,12 @@ Score [0, 1], 1.0 = perfect health, 0.0 = down/broken. Деривируется
 точек в окне) или нет свежей записи signal_aggregates (< 1h) — компонент
 просто скипается (graceful degradation, не penalty).
 
-⚠️ ОГРАНИЧЕНИЕ (WO scrape-gap, 2026-06): `p95 latency` и `http_5xx_rate`
-в `kg_service_health` в prod-ns **всегда 0** — ingress/aspnetcore-метрик
-там нет. Поэтому app-слойные компоненты (5xx, p95) по факту НЕ срабатывают,
+⚠️ ОГРАНИЧЕНИЕ (частично закрыто 2026-06-10): `p95 latency` и `http_5xx_rate`
+в `kg_service_health` **всё ещё всегда 0** — app `/metrics` (Kestrel) закрыт
+JWT-middleware, скрейпа нет (бэкенд-тикет WO-12483). Ingress-часть закрыта:
+nginx-ingress метрики собираются по всем окружениям, per-host/path 5xx и
+latency живут в `kg_ingress_observations` — но это другой разрез (endpoint,
+не service). Поэтому app-слойные компоненты (5xx, p95) по факту НЕ срабатывают,
 и health_score деривируется из инфра/событийных сигналов (alerts +
 pod_events + deploy/slo aggregates), а НЕ из user-facing latency/errors.
 Не интерпретировать как «пользователю хорошо/плохо»: высокий score = «cpu/

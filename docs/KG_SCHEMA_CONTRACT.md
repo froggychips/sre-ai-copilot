@@ -1,7 +1,9 @@
 # KG Schema / Quality Contract
 
 > **Версия контракта:** `kg_schema: 2.3`
-> **Дата:** 2026-06-06 (orphan-метрика → app-scope + единый `compute_orphan_stats`)
+> **Дата:** 2026-06-10 (doc-update: `kg_ingress_observations` наполняется — §6.6;
+> уточнены consumer caveats §7.5: причина нулей `http_5xx`/`p95` в
+> `kg_service_health` — только app `/metrics` за JWT, не ingress-метрики)
 > **Источник истины кода:** [`app/knowledge_graph/contract.py`](../app/knowledge_graph/contract.py)
 
 Документ описывает что в Knowledge Graph считается **service**,
@@ -256,6 +258,44 @@ Storage: `String`, не PG enum (sqlite-compat тестов; см. миграц�
 
 ---
 
+## 6.6. Ingress observations (`kg_ingress_observations`)
+
+Endpoint-level снапшоты HTTP-трафика через ingress. ORM —
+`IngressObservation` в `app/knowledge_graph/schema.py`; sync —
+`app/knowledge_graph/ingress_observations_sync.py` (beat task
+`kg_ingress_observations_sync`, каждые ~10 мин).
+
+**Наполняется с 2026-06-10**: метрики nginx-ingress включены на обоих
+DaemonSet-контроллерах кластера, скрейп через VMPodScrape с
+`honorLabels`. 100% рядов слинкованы с `kg_services` через `service_id`.
+
+| Колонка | Тип | Семантика |
+|---|---|---|
+| `id` | int PK | |
+| `ts` | datetime | момент снапшота |
+| `ingress_name` | str | имя Ingress-ресурса |
+| `host` | str | host из ingress rule |
+| `path` | str, nullable | path из ingress rule |
+| `service_id` | FK → `kg_services.id`, nullable | backend-сервис (резолв по namespace+name из ingress backend) |
+| `p95_latency_ms` / `p99_latency_ms` | float, nullable | latency-квантили (окно 5m) |
+| `rps` | float, nullable | requests per second |
+| `error_5xx_rate` / `error_4xx_rate` | float, nullable | rate 5xx/4xx ответов (req/s) |
+
+Идемпотентность: `UNIQUE (ingress_name, host, path, ts)`.
+
+**Семантика нулей** (отличается от `kg_service_health`!):
+`error_5xx_rate = 0` при ненулевых `rps`/`p95_latency_ms` означает
+**реально «ошибок нет»** — данные собираются. Ряды, где ВСЕ метрики = 0,
+sync пропускает (экспортёр не накрывает endpoint) — «нет данных»
+проявляется как отсутствие ряда, а не как нули.
+
+**Разрез — endpoint (host/path), НЕ per-service агрегат**: один сервис
+может стоять за несколькими host/path и наоборот. Не схлопывать в
+per-service метрику без взвешивания по `rps` и не путать с
+`kg_service_health` (см. §7.5).
+
+---
+
 ## 7. Quality metrics
 
 `QUALITY_THRESHOLDS` фиксирует что считается «good KG»:
@@ -295,10 +335,11 @@ Target `orphan_rate_max_pct = 10.0` пока **не достигнут** — э�
 
 | Сигнал | Ограничение | Как трактовать |
 |---|---|---|
-| `kg_service_health.http_5xx_rate`, `p95_latency_ms` | В prod-ns **всегда 0** — ingress/aspnetcore-метрик нет (WO scrape-gap). | `0` = **«нет данных»**, НЕ «нет ошибок / быстро». Не делать вывод о user-facing impact. |
-| `kg_services.health_score` | Формула включает 5xx/p95, но они =0 → компоненты не срабатывают. Фактически = cpu/mem + alerts + pod_events + deploy/slo. | Высокий score = «инфра/события в норме», **НЕ «нет 5xx»**. Не «здоровье для пользователя». |
+| `kg_service_health.http_5xx_rate`, `p95_latency_ms` | По-прежнему **всегда 0** (на 2026-06-10) — app `/metrics` ASP.NET-сервисов закрыт JWT (401), скрейпа нет. Бэкенд-тикет **WO-12483**; после раскатки поля оживут (через VMServiceScrape на app-ns). Ingress-метрики тут НЕ причина — они собираются (см. §6.6). | `0` = **«нет данных»**, НЕ «нет ошибок / быстро». Не делать вывод о user-facing impact. Per-host/path HTTP-сигнал смотреть в `kg_ingress_observations`. |
+| `kg_ingress_observations` (`p95`/`p99`/`rps`/`4xx`/`5xx`) | Наполняется с 2026-06-10 (nginx-ingress метрики на обоих DS + VMPodScrape honorLabels). Endpoint-разрез (host/path), **НЕ per-service агрегат**. | `error_5xx_rate=0` при ненулевых `rps`/`p95` = реально **«ошибок нет»** (данные есть). Отсутствие ряда = нет данных по endpoint'у. |
+| `kg_services.health_score` | Формула включает 5xx/p95 из `kg_service_health`, но они =0 (app `/metrics` за JWT, WO-12483) → компоненты не срабатывают. Фактически инфра-прокси: alerts + pod_events + deploy/slo aggregates. | Высокий score = «инфра/события в норме», **НЕ «нет 5xx»**. Не «здоровье для пользователя». |
 | Отсутствие edge (`kg_service_edges`) | Топология неполна (prod-app ~82%, dev меньше); WO общается через NATS/Orleans, не только HTTP. | Отсутствие ребра **≠ «нет зависимости»**. Edge есть → зависимость реальна; нет → неизвестно. |
-| `kg_anomaly_observations.metric='log_error_rate'` | Log-derived прокси (Error/Fatal-логи из Seq), НЕ HTTP 5xx. Seq fetch-cap, per-service не per-endpoint, «впервые ошибся» не ловит. | Сигнал «сервис стал больше ругаться в логах», НЕ «сколько запросов вернули 5xx». |
+| `kg_anomaly_observations.metric='log_error_rate'` | Log-derived прокси (Error/Fatal-логи из Seq), НЕ HTTP 5xx. Seq fetch-cap, per-service не per-endpoint, «впервые ошибся» не ловит. | Сигнал «сервис стал больше ругаться в логах», НЕ «сколько запросов вернули 5xx». Реальный HTTP 5xx (endpoint-разрез) — в `kg_ingress_observations`. |
 | `orphan_pct` (≈50% all-env) | app-scope (excl expected_stale); high из-за dev/preprod неполноты, prod-app ~17%. | Не «граф сломан» — см. §3 (single-source `compute_orphan_stats`). |
 
 Единый источник вычислений orphan/owner — `contract.compute_orphan_stats` /

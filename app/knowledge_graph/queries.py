@@ -589,8 +589,10 @@ def log_error_rate_for(
     фоновой джобой, health-probe или вообще не относиться к user-facing
     трафику. НЕ записывать это в ``kg_service_health.http_5xx_rate``:
     смешение двух разных сигналов введёт consumer'ов в заблуждение
-    (см. WO scrape-gap — http_5xx всегда 0 именно потому, что ingress
-    metrics нет; подменять их логами было бы фальшивым «зелёным»).
+    (http_5xx в service_health всегда 0, потому что app /metrics закрыт
+    JWT — WO-12483; подменять его логами было бы фальшивым «зелёным».
+    Per-host/path HTTP 5xx с 2026-06-10 есть в kg_ingress_observations —
+    это endpoint-разрез, а не per-service).
 
     Считается on-read, без новых Seq-запросов и без изменения схемы:
         rate_per_min = SUM(count за окно) / window_minutes

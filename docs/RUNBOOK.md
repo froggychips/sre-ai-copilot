@@ -303,7 +303,7 @@ Audit-log event names: `KG_SELF_HEALTH_OK` / `KG_SELF_HEALTH_WARN` / `KG_SELF_HE
 
 What it means: more than the allowed % of `kg_service_health` rows over the last 24h have value 0 or NULL for that metric.
 
-Allowlist: `http_5xx_rate` and `p95_latency_ms` are expected to be zero until ingress scrape config is in place — they should NOT trigger this canary. If they do, the allowlist in `self_health.py` is stale.
+Allowlist: `http_5xx_rate` and `p95_latency_ms` are still expected to be zero — application `/metrics` endpoints sit behind JWT and return 401 to the scraper; fixing that is a backend change tracked as WO-12483. They should NOT trigger this canary; if they do, the allowlist in `self_health.py` is stale. Until WO-12483 lands, `health_score` is an infra-proxy (no app-level HTTP signal). Note: this no longer applies to ingress-level HTTP metrics — `kg_ingress_observations` is populated (see "Ingress metrics flow" below).
 
 Diagnose in this order:
 
@@ -321,15 +321,27 @@ Common causes by sync:
 - `kg_metrics_sync` — VM unreachable.
 - `kg_topology_sync` — kubeconfig invalid or k8s API throttled.
 - `tc_deploys_to_kg` — TeamCity MCP unreachable or token expired.
+- `kg_ingress_observations_sync` — VM unreachable, the `VMPodScrape` objects `ingress-nginx-shared` / `ingress-prod` (ns `cattle-system`) gone, or per-host metrics disabled on the controller DaemonSet (see "Ingress metrics flow" below).
 
 Generic check: tail the celery worker logs and grep for the task name; look for exceptions or repeated retries.
+
+### Ingress metrics flow (kg_ingress_observations)
+
+Current state (2026-06-10): nginx-ingress metrics are enabled on **both** controllers of the WO cluster (`--enable-metrics=true`; per-host labels must stay on — the sync filters by the `host` label). Scraping goes through `VMPodScrape` objects in ns `cattle-system` with `honorLabels: true`. The beat task `kg_ingress_observations_sync` runs every ~10 minutes and writes per-host/path p95/p99/rps/4xx/5xx rows into `kg_ingress_observations`; 100% of rows are linked to `kg_services`. `error_5xx_rate = 0` with non-zero `rps` now genuinely means "no errors" — not "no data".
+
+If `kg_ingress_observations` stops filling (or goes empty), diagnose in this order:
+
+1. Are the scrape objects alive? `kubectl -n cattle-system get vmpodscrape ingress-nginx-shared ingress-prod`. If either is missing, the metric flow into VM is dead.
+2. Is metrics-per-host still enabled on the controller DaemonSets? Disabling it kills the `host` label — and with it the entire sync, even though the controller still exports metrics.
+3. Is the flow visible in VictoriaMetrics? Run `count(nginx_ingress_controller_requests) by (namespace)` against `vmsingle-vm-victoria-metrics-k8s-stack.monitoring.svc:8428`. Zero / no series → scrape problem; non-zero → the gap is on the copilot side.
+4. If VM has the data but the table doesn't fill — tail the celery worker/beat logs for `kg_ingress_observations_sync` exceptions.
 
 ### `anomaly_signal_health: 0 observations`
 
 What it means: the anomaly detector wrote zero rows in the last 24h.
 
 Two distinct interpretations:
-- **Flat baseline** — the source metric is all zeros (e.g. ingress metrics with no scrape config). Expected; not a problem.
+- **Flat baseline** — the source metric is all zeros (e.g. `kg_service_health.http_5xx_rate` / `p95_latency_ms`, which stay 0 until WO-12483 lands). Expected; not a problem. Note: ingress metrics no longer qualify — `kg_ingress_observations` has been populated since 2026-06; if the ingress source went flat, check the scrape first (see "Ingress metrics flow" above).
 - **Detector regression** — the detector ran but never produced output despite non-zero source data. Inspect `kg_service_health` for variance, then run `anomaly_detection.py` interactively on a known-anomalous service and check the `extras.method` field.
 
 ### `anomaly_signal_health: >500 observations`

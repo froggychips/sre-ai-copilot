@@ -57,9 +57,10 @@
 - `K8sJob` (PR #82, `kg_k8s_jobs`) — Job/CronJob узлы вне `kg_services`; `kind` ∈ `job` / `cronjob`; `owner_service_id` метаколонка реализует semantic edge `runs_as_job` без отдельного edge-row.
 - `StorageVolume` (PR #84, `kg_storage_volumes`) — PVC/PV узлы; `kind` ∈ `pvc` / `pv` (PVC — namespace-scoped, PV — cluster-scoped с `namespace=''`); атрибуты: phase, capacity_bytes, storage_class.
 - `VolumeEdge` (PR #84, `kg_volume_edges`) — heterogeneous edges (`uses_volume` Service→PVC, `bound_to` PVC→PV); tagged `src_kind`/`dst_kind` без FK constraint.
+- `IngressObservation` (`kg_ingress_observations`) — per-endpoint (host/path) HTTP-снапшоты: `p95_latency_ms` / `p99_latency_ms` / `rps` / `error_5xx_rate` / `error_4xx_rate`, `service_id` FK на backend-сервис; `UNIQUE (ingress_name, host, path, ts)`. Наполняется с 2026-06-10 (см. Ingress observations sync).
 
 ### Schema / quality contract (`app/knowledge_graph/contract.py`)
-- `KG_SCHEMA_VERSION` — текущая версия (`2.2`, после PR #82/#84/#86). Bump rules — `docs/KG_SCHEMA_CONTRACT.md` §8.
+- `KG_SCHEMA_VERSION` — текущая версия (`2.3`, после orphan → app-scope 2026-06-06). Bump rules — `docs/KG_SCHEMA_CONTRACT.md` §8.
 - `EDGE_KINDS` — реестр всех edge kinds + spec (`semantic` / `src_kinds` / `dst_kinds` / `source` / `status` / `table`). `table` = где edge живёт: `kg_service_edges` / `kg_volume_edges` / `fk_only` (через FK) / `metadata_only` (через owner_service_id).
 - `OWNER_SOURCES` / `OWNER_SOURCE_ALIASES` — canonical источники owner-а + маппинг коротких имён из `ownership_suggester`.
 - `STALE_CLASS_VALUES` — enum значений `kg_services.stale_class`.
@@ -110,16 +111,19 @@
 - Идемпотентность: каждая запись оборачивается в Postgres `SAVEPOINT`; `IntegrityError` на UNIQUE `(service_id, ts)` откатывает savepoint, цикл продолжается. Повторный запуск на пересекающемся окне безопасен.
 - **Wave 5 gotcha (читать ДО правок запросов):** `mem_pct` должен считаться как `avg(rate(working_set) / on(pod) container_limit)` — сначала делим, потом агрегируем. Форма "aggregate-then-divide" молча возвращает 0, потому что many-to-one join схлопывает результат до деления. Canary `materialization_zero_rate` в `kg_self_health` существует именно ради этого класса регрессий.
 - Настраивается через env (VM query window, lookback, per-service timeout). Если VM недоступна — задача no-op'ит (следующий тик retry'ит); сигнал об упавших тиках — `kg_self_health.sync_lag`.
+- **Семантика нулей (актуально на 2026-06-10):** `http_5xx_rate` и `p95_latency_ms` по-прежнему всегда 0 — `/metrics` ASP.NET-сервисов закрыт JWT (401), app-level скрейпа нет. Бэкенд-тикет **WO-12483**; после раскатки поля оживут через VMServiceScrape на app-namespace'ы. До тех пор `0` = «нет данных», НЕ «нет ошибок / быстро». Per-host/path HTTP-сигнал есть в `kg_ingress_observations` (наполняется с 2026-06-10, см. ниже); ingress-метрики больше не являются причиной этих нулей.
 
 ### Cluster health sync (`app/knowledge_graph/cluster_health_sync.py`)
 - `sync_cluster_observations()` — каждые 5 мин, снэпшотит k8s node-уровень (Ready/SchedulingDisabled, allocatable vs requested CPU/mem, pod count) в `kg_cluster_observations`. Источник истины для cluster-wide capacity view.
 
 ### Ingress observations sync (`app/knowledge_graph/ingress_observations_sync.py`)
-- `sync_ingress_observations()` — каждые 5 мин, ingress-controller PromQL (`nginx_ingress_controller_*`) → `kg_ingress_observations` на host.
-- Честный статус на сегодня: схема и sync рабочие, но scrape config, который выставлял бы ingress-метрики для application namespace'ов, не настроен — поэтому `http_5xx_rate` и `p95_latency_ms` приходят как 0. Downstream-потребители (anomaly, digest) трактуют это как no-signal, а не как healthy.
+- `sync_ingress_observations()` — каждые ~10 мин (beat task `kg_ingress_observations_sync`), ingress-controller PromQL (`nginx_ingress_controller_*`) → `kg_ingress_observations`, одна строка на `(ingress_name, host, path)` с `p95_latency_ms` / `p99_latency_ms` / `rps` / `error_5xx_rate` / `error_4xx_rate`. Идемпотентно по `UNIQUE (ingress_name, host, path, ts)`.
+- **Наполняется с 2026-06-10:** метрики nginx-ingress включены на обоих DaemonSet-контроллерах кластера, скрейп — VMPodScrape с `honorLabels`. 100% рядов слинкованы с `kg_services` через `service_id` (backend резолвится из ingress rule).
+- **Семантика нулей:** `error_5xx_rate = 0` при ненулевых `rps`/`p95` теперь означает реально «ошибок нет» — данные собираются. Ряды, где ВСЕ метрики = 0, sync пропускает (экспортёр не накрывает endpoint), поэтому «нет данных» проявляется как отсутствие ряда, а не как нули.
+- **Разрез:** endpoint (host/path), НЕ per-service агрегат — не путать с `kg_service_health` (там `http_5xx_rate`/`p95_latency_ms` по-прежнему всегда 0, см. Metrics sync выше).
 
 ### Anomaly detection (`app/knowledge_graph/anomaly_detection.py`)
-- `scan_anomalies()` — каждые 5 мин, читает `kg_service_health` (и `kg_ingress_observations` где наполнено) и пишет `kg_anomaly_observations` для каждой `(service, metric)` где текущее значение статистически вне baseline.
+- `scan_anomalies()` — каждые 5 мин, читает `kg_service_health` и `kg_ingress_observations` (наполняется с 2026-06-10) и пишет `kg_anomaly_observations` для каждой `(service, metric)` где текущее значение статистически вне baseline. NB: app-level `http_5xx_rate`/`p95_latency_ms` в `kg_service_health` по-прежнему всегда 0 (app `/metrics` за JWT, WO-12483), поэтому app-слойные аномалии идут из `log_error_rate` (лог-производный прокси, НЕ HTTP 5xx) и из ingress observations.
 - **Метод:** rolling robust-z, `robust_z = (current − median(baseline)) / (1.4826 × MAD(baseline))`. Устойчив к выбросам в самом baseline-окне.
 - **Seasonal baseline:** при ≥50 исторических точках baseline стратифицируется по hour-of-day. `extras.method = robust_z_seasonal`. Иначе — `robust_z_flat`.
 - **Пороги:** `KG_ANOMALY_ROBUST_Z_WARN` (default `3.5`) → `warning` строка, `KG_ANOMALY_ROBUST_Z_CRIT` (default `6.0`) → `critical`.

@@ -34,9 +34,9 @@
 | `kg_drift_cleanup` | каждый час @ :17 | services из несуществующих namespaces → `synthetic=true` |
 | `daily_stats_digest` | раз в день | KG-summary digest в Discord #stats |
 | `chronic_alerts_digest` | каждые 6 ч | digest по chronic-suppressed alerts (видимость) |
-| `kg_metrics_sync` | каждые 5 мин | VictoriaMetrics PromQL → `kg_service_health` (cpu_pct, mem_pct, restarts_rate, http_5xx_rate, p95_latency_ms) |
+| `kg_metrics_sync` | каждые 5 мин | VictoriaMetrics PromQL → `kg_service_health` (cpu_pct, mem_pct, restarts_rate, http_5xx_rate, p95_latency_ms — последние два по-прежнему всегда 0: app `/metrics` за JWT, ждёт WO-12483) |
 | `kg_cluster_health_sync` | каждые 5 мин | снэпшот k8s node-уровня → `kg_cluster_observations` |
-| `kg_ingress_observations_sync` | каждые 5 мин | ingress-controller PromQL → `kg_ingress_observations` (схема готова; scrape config для WO ns не настроен — http_5xx/p95 пока 0) |
+| `kg_ingress_observations_sync` | каждые ~10 мин | nginx-ingress PromQL → `kg_ingress_observations` (per-host/path p95/p99/rps/4xx/5xx; live с 2026-06-10 — ingress-метрики включены на кластере) |
 | `kg_anomaly_detect` | каждые 5 мин | rolling robust-z → `kg_anomaly_observations` |
 | `kg_signal_aggregates` | каждые 10 мин | 24h roll-up по anomalies/alerts/deploys/pod_events → `kg_signal_aggregates` |
 | `kg_seq_logs_sync` | каждые 10 мин | Seq REST API → `kg_log_observations` (per service × level) |
@@ -126,14 +126,16 @@ Latency budget: <500ms p95 synchronous в HTTP handler. 0 LLM-токенов. С
 |---|---|---|
 | `kg_service_health` | VictoriaMetrics PromQL через `metrics_sync.py` | 5 мин, на сервис |
 | `kg_cluster_observations` | k8s node API через `cluster_health_sync.py` | 5 мин, на ноду |
-| `kg_ingress_observations` | ingress-controller PromQL через `ingress_observations_sync.py` | 5 мин, на host |
+| `kg_ingress_observations` | nginx-ingress PromQL через `ingress_observations_sync.py` | ~10 мин, на host/path |
 | `kg_signal_aggregates` | 24-h roll-up через `signal_aggregates.py` | hourly refresh, на сервис |
 
 Каждая запись из PromQL оборачивается в Postgres `SAVEPOINT`; `IntegrityError` на UNIQUE-ключе (например, дубль `(service_id, ts)`) откатывает savepoint и продолжает цикл. Поэтому sync естественно идемпотентен на пересекающихся окнах.
 
 Wave 5 PromQL gotcha (фиксируем для будущих авторов): `mem_pct` нужно считать как `avg(rate(container_memory_working_set_bytes) / on(pod) kube_pod_container_resource_limits)` — сначала делим, потом агрегируем. Форма «aggregate-then-divide» несколько дней молча возвращала нули, потому что many-to-one join схлопывал результат до деления. Canary `kg_self_health` (ниже) добавлен специально, чтобы такие тихие деградации детектились автоматически.
 
-Честное ограничение: ingress observations материализуются в схему, но scrape config, который выставлял бы `nginx_ingress_controller_*` для WO namespace'ов, не настроен — поэтому `http_5xx_rate` и `p95_latency_ms` сейчас 0 у всех сервисов. Pipeline деградирует gracefully: anomaly detection на плоском нуле просто не выдаёт observations.
+Coverage-апдейт (2026-06-10): nginx-ingress метрики включены на обоих контроллерах кластера WO (`--enable-metrics=true` на shared `ingress-nginx-controller`, 16 нод, и `ingress-prod-controller`, 5 prod-нод). Per-host лейблы сохранены — `metrics-per-host` по умолчанию true и выключать его НЕЛЬЗЯ: sync копилота фильтрует по host. Скрейп идёт через VMPodScrape `ingress-nginx-shared` + `ingress-prod` в ns `cattle-system` с `honorLabels: true` (обязателен — иначе лейбл `namespace` перетирается в `exported_namespace`), подхватывается VMAgent-ом в ns `monitoring` (`selectAllByDefault`). В результате `kg_ingress_observations` наполняется per-host/path p95/p99/rps/4xx/5xx; первые 50 минут дали 156 рядов по 23 хостам, покрыты все контуры (prod/squad/preprod/preupdate/infra), 100% рядов слинкованы с `kg_services`.
+
+Оставшееся честное ограничение: per-service `http_5xx_rate` и `p95_latency_ms` в `kg_service_health` ПО-ПРЕЖНЕМУ всегда 0 — `/metrics` ASP.NET-сервисов (Kestrel) закрыт JWT-middleware (401). Фикс — бэкенд-тикет WO-12483 (рекомендация: отдельный management-порт без auth); после его раскатки добавится VMServiceScrape на app-ns и поля оживут. До этого `health_score` остаётся инфра-прокси (alerts + pod_events + aggregates), а `log_error_rate` — лог-прокси, не HTTP 5xx. Pipeline деградирует gracefully: anomaly detection на плоском нуле просто не выдаёт observations.
 
 ### Anomaly detection (Wave 2 + Wave 6 update)
 
@@ -236,7 +238,7 @@ Discord interactions endpoint (`app/api/discord_interactions.py`) теперь �
 
 Запускается раз в 30 минут. Шесть проверок, каждая возвращает `ok` / `warn` / `fail`:
 
-1. **`materialization_zero_rate`** — % строк в `kg_service_health` где метрика = 0/NULL за 24 ч. Allowlist для known-zero метрик (`http_5xx_rate`, `p95_latency_ms`, пока scrape config не на месте).
+1. **`materialization_zero_rate`** — % строк в `kg_service_health` где метрика = 0/NULL за 24 ч. Allowlist для known-zero метрик (`http_5xx_rate`, `p95_latency_ms`, пока app `/metrics` за JWT — WO-12483).
 2. **`sync_lag`** — `max(ts)` на beat-задачу vs ожидаемый интервал; >2× → warn, >5× → fail.
 3. **`anomaly_signal_health`** — count `kg_anomaly_observations` за 24 ч. 0 → warn (flat baseline или детектор сломан). >500 → warn (порог слишком слабый, overload).
 4. **`alerts_resolve_freshness`** — count `kg_alerts` с `fired_at < 7d ago` и `resolved_at IS NULL`. >20 → warn.
