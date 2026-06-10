@@ -8,6 +8,10 @@
 
 > **[English](#english) · [Русский](#русский)**
 
+![Demo: enriched critical alerts, KG cascade reasoning and daily digest in Discord](docs/assets/copilot-demo.gif)
+
+*Live output formats on synthetic data: user-facing endpoint-down critical with a `kubectl` hint, slow-crashloop catcher, deploy-regression enrichment with blast radius, KG upstream-cascade reasoning, resolved notice and the daily cluster digest. Source page: [docs/assets/demo-alerts.html](docs/assets/demo-alerts.html).*
+
 ---
 
 <a name="english"></a>
