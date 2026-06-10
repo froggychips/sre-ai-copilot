@@ -111,6 +111,12 @@ class Settings(BaseSettings):
     ENRICH_DEPLOY_LOOKBACK_MIN: int = 60
     ENRICH_RECURRENCE_LOOKBACK_MIN: int = 1440  # 24 ч
     ENRICH_UPSTREAM_WINDOW_MIN: int = 15
+    # NS-level deploy attribution (запрос on-call 2026-06-10): для алертов
+    # без резолва сервиса (PreprodRestartsSpike/PreprodEndpointDown —
+    # namespace-агрегаты) отвечаем на triage-вопрос «деплой или нет»
+    # деплоями по всему namespace. Fallback только для app-namespace'ов
+    # (по префиксам) — в monitoring/kube-system деплои нерелевантны.
+    ENRICH_NS_DEPLOY_FALLBACK_NS_PREFIXES: str = "prod-,preprod-,preupdate-,squad-"
 
     # UX polish: если KG не дал ready/desired через metadata_json,
     # делать прямой read_namespaced_stateful_set/deployment (3s timeout).

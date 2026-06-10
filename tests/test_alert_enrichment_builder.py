@@ -68,7 +68,10 @@ def test_rollout_noise_false_for_other_alertname():
 
 
 def test_enrich_alert_returns_empty_when_no_service():
-    inc = _make_incident(service="")
+    # infra-ns (monitoring): старый контракт «нет сервиса → пустой ctx,
+    # 0 SQL» сохраняется. Для app-ns (preprod-* и т.п.) теперь срабатывает
+    # NS-level deploy fallback — см. test_ns_deploy_attribution.py.
+    inc = _make_incident(namespace="monitoring", service="")
     inc.labels.pop("service")
     inc.labels.pop("deployment", None)
     db = MagicMock()
@@ -77,6 +80,7 @@ def test_enrich_alert_returns_empty_when_no_service():
     assert ctx.in_kg is False
     assert ctx.recent_deploys == []
     assert ctx.upstream_alerts == []
+    assert ctx.deploy_scope == "service"
     # 0 SQL вызовов — раньше выходим
     db.query.assert_not_called()
 
