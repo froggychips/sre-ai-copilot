@@ -2,6 +2,31 @@
 
 All notable changes to this project are documented in this file.
 
+## [Unreleased]
+
+### KG coverage — ingress-метрики live (2026-06-10)
+
+- **nginx-ingress метрики включены на кластере**: `--enable-metrics=true` на
+  обоих контроллерах WO (shared `ingress-nginx-controller`, 16 нод +
+  `ingress-prod-controller`, 5 prod-нод); per-host лейблы сохранены
+  (`metrics-per-host` по умолчанию true — выключать нельзя, sync фильтрует
+  по host). Скрейп: VMPodScrape `ingress-nginx-shared` / `ingress-prod`
+  в ns cattle-system с `honorLabels: true` (иначе `namespace` перетирается
+  в `exported_namespace`), VMAgent в ns monitoring (`selectAllByDefault`).
+- **`kg_ingress_observations` наполняется**: beat `kg_ingress_observations_sync`
+  каждые ~10 мин пишет per-host/path p95/p99/rps/4xx/5xx. Первые 50 минут:
+  156 рядов, 23 хоста, все контуры (prod/squad/preprod/preupdate/infra),
+  100% рядов слинкованы с `kg_services`.
+- **Доки и код-комменты про scrape-gap обновлены** под новое состояние:
+  `app/knowledge_graph/{metrics_sync,health_score,anomaly_detection,queries}.py`,
+  `docs/ARCHITECTURE.md` / `ARCHITECTURE.ru.md`, README.
+- **Per-service `http_5xx_rate`/`p95_latency_ms` в `kg_service_health`
+  по-прежнему всегда 0** — `/metrics` ASP.NET-сервисов (Kestrel) закрыт
+  JWT-middleware (401); ждут бэкенд-тикета WO-12483 (отдельный
+  management-порт без auth), после раскатки добавится VMServiceScrape на
+  app-ns. До тех пор `health_score` — инфра-прокси, `log_error_rate` —
+  лог-прокси, не HTTP 5xx.
+
 ## [0.13.0] — 2026-06-10 — Security Hardening + Remediation Phase A
 
 Три недели после Wave 8: фундамент remediation-пайплайна (Phase A — decision

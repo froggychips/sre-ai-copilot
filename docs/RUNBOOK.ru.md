@@ -302,7 +302,7 @@ Audit-log event'ы: `KG_SELF_HEALTH_OK` / `KG_SELF_HEALTH_WARN` / `KG_SELF_HEALT
 
 Что значит: больше допустимого % строк `kg_service_health` за 24 ч имеют значение 0 или NULL для этой метрики.
 
-Allowlist: `http_5xx_rate` и `p95_latency_ms` ожидаемо ноль, пока ingress scrape config не настроен — на них этот canary НЕ должен срабатывать. Если срабатывает — allowlist в `self_health.py` устарел.
+Allowlist: `http_5xx_rate` и `p95_latency_ms` по-прежнему ожидаемо ноль — application `/metrics` сидят за JWT и отдают 401 scraper-у; фикс требует изменений в бэкенде — тикет WO-12483. На них этот canary НЕ должен срабатывать; если срабатывает — allowlist в `self_health.py` устарел. Пока WO-12483 не закрыт, `health_score` — инфра-прокси (без app-level HTTP-сигнала). Внимание: к ingress-level HTTP-метрикам это больше не относится — `kg_ingress_observations` наполняется (см. «Поток ingress-метрик» ниже).
 
 Диагностика по порядку:
 
@@ -320,15 +320,27 @@ Allowlist: `http_5xx_rate` и `p95_latency_ms` ожидаемо ноль, пок
 - `kg_metrics_sync` — VM недоступна.
 - `kg_topology_sync` — kubeconfig невалиден или k8s API throttled.
 - `tc_deploys_to_kg` — TC MCP недоступен или token протух.
+- `kg_ingress_observations_sync` — VM недоступна, `VMPodScrape`-объекты `ingress-nginx-shared` / `ingress-prod` (ns `cattle-system`) пропали, либо на controller DaemonSet выключен per-host metrics (см. «Поток ingress-метрик» ниже).
 
 Generic check: tail логов celery-worker, grep по имени задачи; искать exceptions или repeated retries.
+
+### Поток ingress-метрик (kg_ingress_observations)
+
+Текущее состояние (2026-06-10): метрики nginx-ingress включены на **обоих** контроллерах кластера WO (`--enable-metrics=true`; per-host лейблы обязаны оставаться включёнными — sync фильтрует по лейблу `host`). Скрейп идёт через `VMPodScrape`-объекты в ns `cattle-system` с `honorLabels: true`. Beat-задача `kg_ingress_observations_sync` запускается каждые ~10 минут и пишет per-host/path строки p95/p99/rps/4xx/5xx в `kg_ingress_observations`; 100% строк слинкованы с `kg_services`. `error_5xx_rate = 0` при ненулевом `rps` теперь реально означает «ошибок нет», а не «нет данных».
+
+Если `kg_ingress_observations` перестала наполняться (или опустела), диагностика по порядку:
+
+1. Живы ли scrape-объекты? `kubectl -n cattle-system get vmpodscrape ingress-nginx-shared ingress-prod`. Если какого-то нет — поток метрик в VM мёртв.
+2. Не выключен ли metrics-per-host на controller DaemonSet-ах? Его выключение убивает лейбл `host` — а с ним весь sync, хотя контроллер по-прежнему экспортирует метрики.
+3. Виден ли поток в VictoriaMetrics? Запрос `count(nginx_ingress_controller_requests) by (namespace)` к `vmsingle-vm-victoria-metrics-k8s-stack.monitoring.svc:8428`. Ноль / нет series → проблема со скрейпом; ненулевые значения → дыра на стороне копилота.
+4. Если в VM данные есть, а таблица не наполняется — tail логов celery worker/beat, искать exceptions у `kg_ingress_observations_sync`.
 
 ### `anomaly_signal_health: 0 observations`
 
 Что значит: anomaly-детектор написал ноль строк за последние 24 ч.
 
 Две интерпретации:
-- **Flat baseline** — исходная метрика вся нули (например, ingress без scrape). Ожидаемо; не проблема.
+- **Flat baseline** — исходная метрика вся нули (например, `kg_service_health.http_5xx_rate` / `p95_latency_ms`, которые останутся 0 до закрытия WO-12483). Ожидаемо; не проблема. Внимание: ingress-метрики сюда больше не подходят — `kg_ingress_observations` наполняется с 2026-06; если ingress-источник стал flat, сперва проверять скрейп (см. «Поток ingress-метрик» выше).
 - **Detector regression** — детектор отработал, но output не выдал, хотя в источнике есть variance. Посмотреть variance в `kg_service_health`, потом запустить `anomaly_detection.py` интерактивно на известно-аномальном сервисе, проверить поле `extras.method`.
 
 ### `anomaly_signal_health: >500 observations`

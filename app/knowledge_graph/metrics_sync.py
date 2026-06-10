@@ -82,9 +82,10 @@ def _q_ns_restarts_by_pod(namespace: str) -> str:
 
 
 def _q_ns_5xx_by_service(namespace: str) -> str:
-    # ВАЖНО (recon 2026-05-22): prod WO API (60 ns) НЕ скрейпятся центральной
-    # VictoriaMetrics — http_requests_total/microsoft_aspnetcore_* есть только
-    # в namespace=monitoring. В текущем кластере вернёт пусто (→ 0).
+    # ВАЖНО (upd 2026-06-10): nginx-ingress метрики теперь собираются (см.
+    # kg_ingress_observations), но per-service http_requests_total в app-ns
+    # по-прежнему НЕТ — /metrics сервисов закрыт JWT (401), скрейп ждёт
+    # бэкенд-тикета WO-12483. До его раскатки запрос вернёт пусто (→ 0).
     return (
         f'sum by (service) (rate(http_requests_total'
         f'{{namespace="{namespace}",status=~"5.."}}[5m]))'
@@ -92,7 +93,7 @@ def _q_ns_5xx_by_service(namespace: str) -> str:
 
 
 def _q_ns_p95_by_service(namespace: str) -> str:
-    # См. выше — prod WO не скрейпится; запрос валидный, сейчас вернёт пусто.
+    # См. выше — app /metrics за JWT (WO-12483); запрос валидный, сейчас пусто.
     return (
         f'1000 * histogram_quantile(0.95, sum by(le, service)('
         f'rate(http_request_duration_seconds_bucket'

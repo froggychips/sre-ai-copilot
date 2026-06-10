@@ -57,9 +57,10 @@
 - `K8sJob` (PR #82, `kg_k8s_jobs`) — Job/CronJob узлы вне `kg_services`; `kind` ∈ `job` / `cronjob`; `owner_service_id` метаколонка реализует semantic edge `runs_as_job` без отдельного edge-row.
 - `StorageVolume` (PR #84, `kg_storage_volumes`) — PVC/PV узлы; `kind` ∈ `pvc` / `pv` (PVC — namespace-scoped, PV — cluster-scoped с `namespace=''`); атрибуты: phase, capacity_bytes, storage_class.
 - `VolumeEdge` (PR #84, `kg_volume_edges`) — heterogeneous edges (`uses_volume` Service→PVC, `bound_to` PVC→PV); tagged `src_kind`/`dst_kind` без FK constraint.
+- `IngressObservation` (`kg_ingress_observations`) — per-endpoint (host/path) HTTP snapshots: `p95_latency_ms` / `p99_latency_ms` / `rps` / `error_5xx_rate` / `error_4xx_rate`, `service_id` FK to backend; `UNIQUE (ingress_name, host, path, ts)`. Populated since 2026-06-10 (see Ingress observations sync).
 
 ### Schema / quality contract (`app/knowledge_graph/contract.py`)
-- `KG_SCHEMA_VERSION` — текущая версия (`2.2`, после PR #82/#84/#86). Bump rules — `docs/KG_SCHEMA_CONTRACT.md` §8.
+- `KG_SCHEMA_VERSION` — текущая версия (`2.3`, после orphan → app-scope 2026-06-06). Bump rules — `docs/KG_SCHEMA_CONTRACT.md` §8.
 - `EDGE_KINDS` — реестр всех edge kinds + spec (`semantic` / `src_kinds` / `dst_kinds` / `source` / `status` / `table`). `table` = где edge живёт: `kg_service_edges` / `kg_volume_edges` / `fk_only` (через FK) / `metadata_only` (через owner_service_id).
 - `OWNER_SOURCES` / `OWNER_SOURCE_ALIASES` — canonical источники owner-а + маппинг коротких имён из `ownership_suggester` (`prefix`→`namespace_prefix`, `labels`→`k8s_labels` и т.д.).
 - `STALE_CLASS_VALUES` — enum значений `kg_services.stale_class`. Re-export'ится в `stale_classifier` для backward-compat.
@@ -114,16 +115,19 @@ Read-side API used by enrichment + MCP tools:
 - Idempotency: each row insert is wrapped in a Postgres `SAVEPOINT`; an `IntegrityError` on the unique `(service_id, ts)` key rolls back to the savepoint and the loop continues. Re-running on overlapping windows is safe.
 - **Wave 5 gotcha (read this before editing the queries):** `mem_pct` must be `avg(rate(working_set) / on(pod) container_limit)` — divide first, then aggregate. The aggregate-then-divide form silently returns 0 because the many-to-one join collapses before the division. The `kg_self_health` canary `materialization_zero_rate` was added specifically to detect this regression class.
 - Tunable via env vars (VM query window, lookback, per-service timeout). When VM is unreachable the task no-ops (next tick retries); see `kg_self_health.sync_lag` for the dropped-tick signal.
+- **Zero semantics (still true as of 2026-06-10):** `http_5xx_rate` and `p95_latency_ms` are always 0 — the ASP.NET services' `/metrics` endpoints are behind JWT (401), so there is no app-level scrape. Backend ticket **WO-12483**; once rolled out, a `VMServiceScrape` on the app namespaces will bring these fields to life. Until then `0` = "no data", NOT "no errors / fast". Per-host/path HTTP signal lives in `kg_ingress_observations` instead (populated since 2026-06-10, see below); ingress metrics are no longer the missing piece here.
 
 ### Cluster health sync (`app/knowledge_graph/cluster_health_sync.py`)
 - `sync_cluster_observations()` — every 5 min, snapshots k8s node-level state (Ready/SchedulingDisabled, allocatable vs requested CPU/mem, pod count) into `kg_cluster_observations`. Source of truth for the cluster-wide capacity view.
 
 ### Ingress observations sync (`app/knowledge_graph/ingress_observations_sync.py`)
-- `sync_ingress_observations()` — every 5 min, ingress-controller PromQL (`nginx_ingress_controller_*`) → `kg_ingress_observations` per host.
-- Honest status today: the schema and the sync are live, but the scrape config that would expose ingress metrics for application namespaces is not in place — so `http_5xx_rate` and `p95_latency_ms` come out as 0. Downstream consumers (anomaly, digest) treat this as no-signal rather than as healthy.
+- `sync_ingress_observations()` — every ~10 min (beat task `kg_ingress_observations_sync`), ingress-controller PromQL (`nginx_ingress_controller_*`) → `kg_ingress_observations`, one row per `(ingress_name, host, path)` with `p95_latency_ms` / `p99_latency_ms` / `rps` / `error_5xx_rate` / `error_4xx_rate`. Idempotent by `UNIQUE (ingress_name, host, path, ts)`.
+- **Populated since 2026-06-10:** controller metrics are enabled on both nginx-ingress DaemonSets of the cluster and scraped via a `VMPodScrape` with `honorLabels`. 100% of rows are linked to `kg_services` through `service_id` (backend resolved from the ingress rule).
+- **Zero semantics:** `error_5xx_rate = 0` alongside non-zero `rps`/`p95` genuinely means "no errors" — the data is there. Rows where ALL metrics are 0 are skipped by the sync (exporter doesn't cover the endpoint), so "no data" shows up as an absent row, not as zeros.
+- **Granularity:** endpoint-level (host/path), NOT a per-service aggregate — do not conflate with `kg_service_health` (whose `http_5xx_rate`/`p95_latency_ms` are still always 0, see Metrics sync above).
 
 ### Anomaly detection (`app/knowledge_graph/anomaly_detection.py`)
-- `scan_anomalies()` — every 5 min, reads `kg_service_health` (and `kg_ingress_observations` where populated) and writes `kg_anomaly_observations` rows for each `(service, metric)` whose current value is statistically off the baseline.
+- `scan_anomalies()` — every 5 min, reads `kg_service_health` and `kg_ingress_observations` (populated since 2026-06-10) and writes `kg_anomaly_observations` rows for each `(service, metric)` whose current value is statistically off the baseline. Note: app-level `http_5xx_rate`/`p95_latency_ms` in `kg_service_health` are still always 0 (app `/metrics` behind JWT, WO-12483), so app-layer anomalies come from `log_error_rate` (a log-derived proxy, NOT HTTP 5xx) and from ingress observations.
 - **Method:** rolling robust-z, `robust_z = (current − median(baseline)) / (1.4826 × MAD(baseline))`. Robust to outliers in the baseline window itself.
 - **Seasonal baseline:** when ≥50 historical points are available, the baseline is stratified by hour-of-day. `extras.method = robust_z_seasonal`. Otherwise `robust_z_flat`.
 - **Thresholds:** `KG_ANOMALY_ROBUST_Z_WARN` (default `3.5`) → `warning` row, `KG_ANOMALY_ROBUST_Z_CRIT` (default `6.0`) → `critical`.
@@ -317,7 +321,7 @@ Read-side API used by enrichment + MCP tools:
 ### KG schema/quality contract (`app/knowledge_graph/contract.py`)
 - **Единственный источник истины** о том, что в KG считается service /
   orphan / synthetic / owner-known, и какие edge kinds допустимы.
-- `KG_SCHEMA_VERSION: str = "2.2"` — current contract version. Bump rules
+- `KG_SCHEMA_VERSION: str = "2.3"` — current contract version. Bump rules
   в `docs/KG_SCHEMA_CONTRACT.md` §8 (major = breaking, minor = additive).
 - `EDGE_KINDS: Dict[str, EdgeKindSpec]` — реестр всех edge kinds. Каждый
   spec содержит: `semantic`, `src_kinds`, `dst_kinds`, `source`, `status`

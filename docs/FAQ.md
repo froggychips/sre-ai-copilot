@@ -224,6 +224,28 @@ how to reclassify a misclassified service.
 
 ---
 
+## Why are `http_5xx_rate` / `p95_latency_ms` in kg_service_health always 0?
+
+Because application `/metrics` endpoints sit behind JWT and return 401
+to the scraper. Fixing that requires a backend change — tracked as
+WO-12483. Until it lands, `health_score` is an infra-proxy
+(no app-level HTTP signal).
+
+This does **not** mean there is no HTTP signal at all: ingress-level
+metrics are live (as of 2026-06-10). nginx-ingress metrics are enabled
+on both controllers of the WO cluster (`--enable-metrics=true`, per-host
+labels kept on), scraped via `VMPodScrape` in ns `cattle-system` with
+`honorLabels: true`, and the `kg_ingress_observations_sync` beat task
+writes per-host/path p95/p99/rps/4xx/5xx rows into
+`kg_ingress_observations` every ~10 minutes — 100% of rows linked to
+`kg_services`. An `error_5xx_rate = 0` with non-zero `rps` genuinely
+means "no errors", not "no data".
+
+See [Ingress metrics flow in RUNBOOK](RUNBOOK.md#ingress-metrics-flow-kg_ingress_observations)
+for what to check when the table stops filling.
+
+---
+
 ## How do I add a new playbook (Phase A remediation)?
 
 **Short answer: Phase A is planned, not implemented.** As of v0.12.0

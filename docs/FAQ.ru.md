@@ -226,6 +226,27 @@ Column переписывается идемпотентно через `kg_sync
 
 ---
 
+## Почему `http_5xx_rate` / `p95_latency_ms` в kg_service_health всегда 0?
+
+Потому что application `/metrics` сидят за JWT и отдают 401 scraper-у.
+Фикс требует изменений в бэкенде — тикет WO-12483. Пока он не закрыт,
+`health_score` — инфра-прокси (без app-level HTTP-сигнала).
+
+Это **не** значит, что HTTP-сигнала нет вообще: ingress-level метрики
+живые (по состоянию на 2026-06-10). Метрики nginx-ingress включены на
+обоих контроллерах кластера WO (`--enable-metrics=true`, per-host
+лейблы оставлены включёнными), скрейпятся через `VMPodScrape` в ns
+`cattle-system` с `honorLabels: true`, а beat-задача
+`kg_ingress_observations_sync` каждые ~10 минут пишет per-host/path
+строки p95/p99/rps/4xx/5xx в `kg_ingress_observations` — 100% строк
+слинкованы с `kg_services`. `error_5xx_rate = 0` при ненулевом `rps`
+реально означает «ошибок нет», а не «нет данных».
+
+См. [Поток ingress-метрик в RUNBOOK](RUNBOOK.ru.md#поток-ingress-метрик-kg_ingress_observations) —
+что проверять, когда таблица перестала наполняться.
+
+---
+
 ## Как добавить новый playbook (Phase A remediation)?
 
 **Короткий ответ: Phase A в плане, не в коде.** На момент v0.12.0
