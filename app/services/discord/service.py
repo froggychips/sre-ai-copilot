@@ -21,6 +21,7 @@ import structlog
 from app.config import settings
 
 from . import dedup as _dedup_state
+from . import dedup_store
 from .dedup import (
     _LINKED_MIN_COUNT,
     _LINKED_WINDOW_SEC,
@@ -1391,7 +1392,10 @@ class DiscordService:
             payload=payload,
             embed=payload["embeds"][0],
             alertname=alertname,
-            namespace=(namespaces[0] if namespaces else None),
+            # Sorted join: namespaces идут в порядке AM-batch'а, который
+            # не стабилен между ре-mission'ами — namespaces[0] флипал ключ
+            # дедупа у multi-ns групп (новый POST вместо PATCH).
+            namespace=("+".join(sorted(namespaces)) if namespaces else None),
             service=head.service,
             severity=severity,
         )
@@ -1432,9 +1436,10 @@ class DiscordService:
             await self._post_enriched_raw(url, payload)
             return
 
-        with _dedup_lock:
-            _purge_enriched_state(now, ttl_sec=ttl)
-            existing = _dedup_state._recent_enriched.get(key)
+        # Cross-replica store (PG, fallback на in-memory при недоступном PG):
+        # per-process dict ломался на 2 репликах api — каждый под промахивался
+        # мимо чужого кэша и дублировал POST с mention.
+        existing = dedup_store.get_fresh(key, ttl_sec=ttl, now=now)
 
         if existing is not None and (now - existing.get("first_ts", 0)) <= ttl:
             await self._patch_enriched_recurrence(
@@ -1469,19 +1474,17 @@ class DiscordService:
             # не пополняем. Это симметрично с `_post_or_edit_incident`.
             return
 
-        with _dedup_lock:
-            _dedup_state._recent_enriched[key] = {
-                "msg_id": msg_id,
-                "first_ts": now,
-                "last_ts": now,
-                "count": 1,
-                "webhook_url": url,
-                "embed": embed,
-                "alertname": alertname,
-                "namespace": namespace,
-                "service": service,
-                "severity": severity,
-            }
+        dedup_store.save(
+            key,
+            msg_id=msg_id,
+            webhook_url=url,
+            embed=embed,
+            alertname=alertname,
+            namespace=namespace,
+            service=service,
+            severity=severity,
+            now=now,
+        )
 
     async def send_resolved_notice(
         self,
@@ -1547,17 +1550,16 @@ class DiscordService:
         `<base> · ×N в <TTL>мин · first HH:MM · last HH:MM` для consistency
         с incident-каналом.
         """
-        with _dedup_lock:
-            rec = _dedup_state._recent_enriched.get(key)
-            if rec is None:
-                return
-            rec["count"] = rec.get("count", 1) + 1
-            rec["last_ts"] = now
-            msg_id = rec["msg_id"]
-            cached_embed = rec.get("embed") or embed
-            count = rec["count"]
-            first_ts = rec["first_ts"]
-            webhook_url = rec.get("webhook_url") or url
+        rec = dedup_store.bump(key, now=now)
+        if rec is None:
+            # Запись исчезла между get_fresh и bump (purge/race) —
+            # recurrence фиксировать не на чем, молча выходим.
+            return
+        msg_id = rec["msg_id"]
+        cached_embed = rec.get("embed") or embed
+        count = rec["count"]
+        first_ts = rec["first_ts"]
+        webhook_url = rec.get("webhook_url") or url
 
         # Берём новый embed (с актуальными KG-данными — KG mог обновиться
         # за окно дедупа), но обновляем footer counter'ом.
@@ -1597,9 +1599,7 @@ class DiscordService:
             return
         # Кэшируем patched_embed чтобы следующий patch не терял footer'ной
         # истории, если KG-данные между ре-mission'ами одинаковы.
-        with _dedup_lock:
-            if key in _dedup_state._recent_enriched:
-                _dedup_state._recent_enriched[key]["embed"] = patched_embed
+        dedup_store.update_embed(key, patched_embed)
         # Audit-log в structlog (симметрично с incident-каналом).
         try:
             _log.info(
