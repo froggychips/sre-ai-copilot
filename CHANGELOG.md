@@ -2,6 +2,85 @@
 
 All notable changes to this project are documented in this file.
 
+## [0.13.0] — 2026-06-10 — Security Hardening + Remediation Phase A
+
+Три недели после Wave 8: фундамент remediation-пайплайна (Phase A — decision
+preview без executor), большой security-харднинг auth/executor/approval-путей,
+серия KG-фиксов качества данных (unfreeze service_health, deploy attribution,
+log-error-rate сигнал) и подключение resilience-примитивов в hot-path.
+
+### Security hardening (батчи A–D, 2026-06-09)
+
+- **Authz/integrity в executor/approval-пути** — закрыты дыры авторизации
+  на apply/approve; apply/signature-тесты приведены к новому валидатору.
+- **Харднинг auth и эндпоинтов** — убраны утечки в ответах, добавлена
+  авторизация на ранее открытые ручки, включая `/stats`.
+- **Инъекции и ресурсы** — PromQL-инъекция, утечки сессий SQLAlchemy,
+  transient-ретраи, alembic-метаданные, webhook insert-race.
+- **Стейт-машина пайплайна** — корректность переходов, re-fire неразрешённых
+  инцидентов, per-stage timeout; `TRIAGE_REQUIRED` в терминальном skip-сете;
+  фикс регрессии retry×stage-timeout.
+- **Зависимости**: pyjwt 2.12.0 → 2.13.0 (5 CVE, PYSEC-2026-175..179);
+  восстановлены kubernetes/pyjwt pins, снесённые dependabot lock-regen.
+
+### Remediation Phase A — foundation (PR #99)
+
+- Decision preview **без executor**: 8 discrete risk axes, YAML playbooks
+  (match/policy/plan/observe), rule-based policy evaluator.
+- Ownership: manual manifest для `*-shared` инфраструктуры (PR #96) +
+  helm configmap/mount `OWNERSHIP_MANIFEST_PATH` (PR #102) +
+  `backfill_ownership` скрипт + periodic beat (PR #92, #94).
+
+### Resilience в hot-path (PR #138)
+
+- Circuit breaker и token-bucket из `resilience.py` подключены к
+  LLM-сервису и main: до этого примитивы существовали, но не были wired.
+
+### KG — качество данных и self-health
+
+- **Contract drift guards** (PR #97): `STARTUP_CONTRACT_CHECK` на boot +
+  `quality_report --check`; единый источник orphan-метрики, contract 2.3.
+- **Разморозки**: alerts_resolve sync freeze + backfill stuck `resolved_at`
+  (PR #95); unfreeze `service_health` + canonical `team_owner`.
+- **Deploy attribution**: возвращены sha/repo в ns-wide ingest; preprod-деплои
+  с веткой `<default>` больше не теряются; canary на ingestion deploy-стрима.
+- **Новый сигнал**: per-service log-error-rate из `kg_log_observations` +
+  anomaly-consumer; noise floor против z-взрыва на near-flat baseline.
+- **Прочее**: race-safe alert upsert + physical-schema PK guard (PR #118),
+  jobs linkage fallback-resolver по name pattern (PR #106), metrics_sync
+  parallelism + namespace-агрегация (~100% покрытие health, PR #115),
+  owner-backfill 61 unowned infra-svc + `expected_stale` для инфра-ns,
+  real App-tag extraction `.NET → k8s` mapping в seq-синке.
+
+### Discord / stats digest UX
+
+- Error embed: TL;DR + runbook + severity-визуалы + compact + TC-ссылки
+  (PR #110); severity decay >24h + lookup похожих прошлых инцидентов
+  (PR #108); inhibit-aware noise reduction + suppress allowlist (PR #109,
+  `KubeAPIDown` убран из default suppress в PR #112).
+- Stats digest overhaul (PR #111 + фиксы #113–#116): Δ-only, action items,
+  MTTR (winsorize + честное окно), deploy correlation, topology growth,
+  pipeline gauge, кликабельные TC-билды.
+
+### Squad dashboard (WO-11335, PR #120)
+
+- Авто-генерация Confluence-дашборда занятости сквадов: трёхуровневый
+  статус (свободен/занят/протух), живая игровая активность из per-squad
+  ClickHouse, честная давность активности.
+
+### Docs
+
+- **`PHILOSOPHY.md`** — зачем проект существует и как его читать.
+- LLM-guardrails: каноничный список misleading-сигналов; зафиксировано,
+  почему Anthropic prompt caching здесь не применяется.
+
+### Deps / chores
+
+- anthropic 0.40.0 → 0.107.1; sqlalchemy 2.0.50, fastapi 0.136.3,
+  uvicorn 0.49.0, structlog 26.1.0.
+- CI: conditional skip postgres-зависимых тестов (PR #98), ruff/mypy
+  cleanups; `# nosec B104` на намеренный `METRICS_BIND_ADDR=0.0.0.0`.
+
 ## [0.12.0] — 2026-05-24 — Wave 8 (KG Metadata + UX Polish)
 
 Метаданные KG и Discord-UX доведены до состояния, в котором можно строить
