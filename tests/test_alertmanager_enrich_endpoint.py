@@ -210,8 +210,8 @@ def test_enrich_endpoint_resurfaced_flag(app_client):
     assert mock_send.await_args.kwargs.get("resurfaced") is True
 
 
-def test_enrich_endpoint_skips_resolved(app_client):
-    """Resolved-events не идут в Discord."""
+def test_enrich_endpoint_resolved_critical_posts_notice(app_client):
+    """Critical-resolved: embed-пайплайн молчит, но уходит зелёный notice."""
     alert = _alert_payload()
     alert["status"] = "resolved"
     alert["endsAt"] = "2026-05-15T13:00:00Z"
@@ -221,6 +221,8 @@ def test_enrich_endpoint_skips_resolved(app_client):
     from app.config import settings
     with patch("app.services.discord_service.DiscordService.send_enriched_alert",
                new_callable=AsyncMock) as mock_send, \
+         patch("app.services.discord_service.DiscordService.send_resolved_notice",
+               new_callable=AsyncMock) as mock_notice, \
          patch.object(settings, "DISCORD_ENRICH_ENABLED", True):
         resp = app_client.post("/webhooks/alertmanager/enrich-and-forward", json=payload)
 
@@ -228,4 +230,29 @@ def test_enrich_endpoint_skips_resolved(app_client):
     body = resp.json()
     assert body["alerts"][0]["result"] == "resolved-skipped"
     assert body["enriched_groups"] == 0
+    assert body["resolved_posted"] == 1
     mock_send.assert_not_called()
+    mock_notice.assert_awaited_once()
+    kwargs = mock_notice.await_args.kwargs
+    assert kwargs["alertname"] == "KubePodCrashLooping"
+    assert kwargs["duration_min"] == 3  # 12:57 → 13:00
+
+
+def test_enrich_endpoint_resolved_warning_stays_silent(app_client):
+    """Warning-resolved не постится вовсе (анти-шум)."""
+    alert = _alert_payload(severity="warning")
+    alert["status"] = "resolved"
+    alert["endsAt"] = "2026-05-15T13:00:00Z"
+    payload = _batch([alert], groupKey="enrich-resolved-warn")
+    payload["status"] = "resolved"
+
+    from app.config import settings
+    with patch("app.services.discord_service.DiscordService.send_resolved_notice",
+               new_callable=AsyncMock) as mock_notice, \
+         patch.object(settings, "DISCORD_ENRICH_ENABLED", True):
+        resp = app_client.post("/webhooks/alertmanager/enrich-and-forward", json=payload)
+
+    assert resp.status_code == 202
+    body = resp.json()
+    assert body["resolved_posted"] == 0
+    mock_notice.assert_not_called()

@@ -32,6 +32,7 @@ from .dedup import (
     _webhook_edit_endpoint,
 )
 from .embed_builder import (
+    SEVERITY_COLOR_RESOLVED,
     _age_decay_severity,
     _build_blast_radius_field,
     _build_deploy_correlation_field,
@@ -1481,6 +1482,44 @@ class DiscordService:
                 "service": service,
                 "severity": severity,
             }
+
+    async def send_resolved_notice(
+        self,
+        *,
+        alertname: str,
+        namespace: Optional[str] = None,
+        service: Optional[str] = None,
+        duration_min: Optional[int] = None,
+    ) -> None:
+        """Короткий зелёный embed «critical-алерт разрезолвился».
+
+        Инварианты: без mention (хорошими новостями никого не пингуем),
+        без dedup-кэша (резолв одноразовый), только из enrich-and-forward
+        и только для critical — фильтр на стороне вызывающего.
+        """
+        url = settings.DISCORD_WEBHOOK_URL
+        if not url:
+            return
+        target = "/".join(p for p in (namespace, service) if p)
+        duration_label = ""
+        if duration_min is not None and duration_min >= 0:
+            h, m = divmod(duration_min, 60)
+            duration_label = f", длился {h}ч {m}м" if h else f", длился {m}м"
+        embed = {
+            "title": f"✅ resolved: {alertname}"[:256],
+            "description": f"{target}{duration_label}"[:4096],
+            "color": SEVERITY_COLOR_RESOLVED,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }
+        payload = {"embeds": [embed], "allowed_mentions": {"parse": []}}
+        if settings.DISCORD_DRY_RUN:
+            _dry_run_log.info(
+                "discord.dry_run.send_resolved_notice",
+                alertname=alertname, namespace=namespace, service=service,
+                duration_min=duration_min,
+            )
+            return
+        await self._post_enriched_raw(url, payload)
 
     async def _post_enriched_raw(self, url: str, payload: Dict[str, Any]) -> None:
         """Fallback-POST когда _compute_enriched_key вернул None.
