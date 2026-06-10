@@ -28,11 +28,23 @@ from app.knowledge_graph.queries import (blast_radius_for,
                                          nats_impact_for, nearby_alerts,
                                          pod_event_summary_for,
                                          recent_deploys_for,
+                                         recent_deploys_for_namespaces,
                                          recent_pod_events_for, upstream_of)
 from app.knowledge_graph.schema import Service, ServiceEdge
 from app.models.incident import Incident
 
 log = structlog.get_logger()
+
+
+def _ns_deploy_fallback_applies(namespace: str) -> bool:
+    """True если ns подходит под NS-level deploy attribution (app-ns).
+
+    Префиксы из `ENRICH_NS_DEPLOY_FALLBACK_NS_PREFIXES` (CSV). Пустая
+    настройка = fallback выключен полностью.
+    """
+    raw = (getattr(settings, "ENRICH_NS_DEPLOY_FALLBACK_NS_PREFIXES", "") or "")
+    prefixes = [p.strip() for p in raw.split(",") if p.strip()]
+    return any(namespace.startswith(p) for p in prefixes)
 
 
 def _matter_signals(
@@ -88,6 +100,14 @@ class EnrichedContext:
     in_kg: bool = False
 
     recent_deploys: List[Dict[str, Any]] = field(default_factory=list)
+    # Скоуп recent_deploys: "service" — деплои самого сервиса (как было
+    # всегда); "namespace" — NS-level fallback для алертов без резолва
+    # сервиса (PreprodRestartsSpike и т.п.): деплои ЛЮБОГО сервиса в ns
+    # алерта за ns_deploy_window_min. Рендер для namespace-скоупа другой:
+    # отдельное поле «Deploy-связь» с явным вердиктом, включая негативный
+    # («деплоев не было — вряд ли связано с деплоем»).
+    deploy_scope: str = "service"
+    ns_deploy_window_min: Optional[int] = None
     upstream_alerts: List[Dict[str, Any]] = field(default_factory=list)
     recurrence_24h: List[Dict[str, Any]] = field(default_factory=list)
     # Inbound: сколько сервисов вызывают/зависят от этого. Раньше поле
@@ -433,7 +453,28 @@ def enrich_alert(db: Session, incident: Incident) -> EnrichedContext:
     )
 
     if not namespace or not service:
-        log.debug("enrich.skip_no_service", namespace=namespace, service=service)
+        # NS-level deploy attribution (запрос on-call 2026-06-10): сервис
+        # не резолвится (namespace-агрегаты вроде PreprodRestartsSpike), но
+        # triage-вопрос «деплой или нет» отвечается деплоями всего ns.
+        # Только для app-namespace'ов — деплои в monitoring/kube-system
+        # нерелевантны источнику таких алертов.
+        if namespace and _ns_deploy_fallback_applies(namespace):
+            window_min = settings.ENRICH_DEPLOY_LOOKBACK_MIN
+            ctx.deploy_scope = "namespace"
+            ctx.ns_deploy_window_min = window_min
+            try:
+                incident_at = _parse_starts_at(incident.starts_at)
+                now = datetime.now(timezone.utc)
+                starts_age_hours = (now - incident_at).total_seconds() / 3600
+                effective_at = now if starts_age_hours > 24 else incident_at
+                ctx.recent_deploys = recent_deploys_for_namespaces(
+                    db, [namespace], before=effective_at,
+                    lookback_minutes=window_min,
+                )
+            except Exception as e:
+                log.warning("enrich.ns_deploy_fallback_failed", error=str(e))
+        else:
+            log.debug("enrich.skip_no_service", namespace=namespace, service=service)
         return ctx
 
     incident_at = _parse_starts_at(incident.starts_at)
