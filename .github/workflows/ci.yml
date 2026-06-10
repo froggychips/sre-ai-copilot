@@ -77,21 +77,21 @@ jobs:
     outputs:
       image-digest: ${{ steps.build.outputs.digest }}
 
-    env:
-      # macOS keychain недоступен из LaunchAgent-сессии раннера
-      # (errSecInteractionNotAllowed -25308) — креды docker login храним
-      # в job-local конфиге без credsStore, пользовательский
-      # ~/.docker/config.json не трогаем.
-      DOCKER_CONFIG: ${{ runner.temp }}/docker-config
-
     steps:
       - name: Checkout Code
         uses: actions/checkout@v6
 
+      # macOS keychain недоступен из LaunchAgent-сессии раннера
+      # (errSecInteractionNotAllowed -25308) — креды docker login храним
+      # в job-local конфиге без credsStore, пользовательский
+      # ~/.docker/config.json не трогаем. Контекст runner.* в job-level
+      # env не разрешён — поэтому через RUNNER_TEMP + GITHUB_ENV.
       - name: Prepare job-local docker config (no osxkeychain)
         run: |
+          DOCKER_CONFIG="$RUNNER_TEMP/docker-config"
           mkdir -p "$DOCKER_CONFIG"
           echo '{}' > "$DOCKER_CONFIG/config.json"
+          echo "DOCKER_CONFIG=$DOCKER_CONFIG" >> "$GITHUB_ENV"
 
       - name: Log in to GitHub Container Registry
         uses: docker/login-action@v4
