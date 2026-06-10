@@ -90,7 +90,11 @@ jobs:
         run: |
           DOCKER_CONFIG="$RUNNER_TEMP/docker-config"
           mkdir -p "$DOCKER_CONFIG"
-          echo '{}' > "$DOCKER_CONFIG/config.json"
+          # credsStore: none обязателен: с пустым конфигом docker CLI
+          # АВТОДЕТЕКТИТ osxkeychain-хелпер из PATH (~/.rd/bin) и снова
+          # упирается в keychain. none (ships с Rancher Desktop) хранит
+          # креды плоско в этом job-local config.json.
+          echo '{"credsStore": "none"}' > "$DOCKER_CONFIG/config.json"
           echo "DOCKER_CONFIG=$DOCKER_CONFIG" >> "$GITHUB_ENV"
 
       - name: Log in to GitHub Container Registry
