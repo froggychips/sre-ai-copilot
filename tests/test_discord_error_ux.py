@@ -27,6 +27,7 @@ from app.services.discord.embed_builder import (
     SEVERITY_COLOR_WARNING,
     _build_runbook_field,
     _build_tldr_field,
+    _allowed_mentions,
     _is_majority_replicas_down,
     _mention_block,
     _runbook_link,
@@ -64,6 +65,25 @@ def test_mention_block_critical_returns_here():
 def test_mention_block_warning_returns_empty():
     assert _mention_block("warning") == ""
     assert _mention_block("info") == ""
+
+
+def test_mention_block_critical_role_id_pings_role(monkeypatch):
+    from app.config import settings
+    monkeypatch.setattr(settings, "DISCORD_ALERT_MENTION_ROLE_ID", "1425470692895228024")
+    assert _mention_block("critical") == "<@&1425470692895228024>\n"
+    # warning по-прежнему молчит даже с ролью
+    assert _mention_block("warning") == ""
+
+
+def test_allowed_mentions_for_role_and_here(monkeypatch):
+    from app.config import settings
+    assert _allowed_mentions("") == {"parse": []}
+    assert _allowed_mentions("@here\n") == {"parse": ["everyone"]}
+    monkeypatch.setattr(settings, "DISCORD_ALERT_MENTION_ROLE_ID", "1425470692895228024")
+    assert _allowed_mentions("<@&1425470692895228024>\n") == {
+        "parse": [],
+        "roles": ["1425470692895228024"],
+    }
 
 
 # ── runbook link ────────────────────────────────────────────────────────
