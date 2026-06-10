@@ -938,7 +938,15 @@ class DiscordService:
         tldr_field = _build_tldr_field(
             summary=incident.description or incident.summary,
             pod_events=head.pod_events,
-            recent_deploys=head.recent_deploys,
+            # NS-scope deploys в TL;DR не передаём: его heuristics
+            # формулируют «deploy сервиса → регресс», что для деплоев
+            # соседей по ns было бы ложной атрибуцией. NS-вердикт
+            # рендерится своим полем «Deploy-связь».
+            recent_deploys=(
+                head.recent_deploys
+                if getattr(head, "deploy_scope", "service") == "service"
+                else []
+            ),
             replicas_ready_desired=head.replicas_ready_desired,
             recurrence_24h=head.recurrence_24h,
             chronic_count=rec_max,
@@ -1032,7 +1040,8 @@ class DiscordService:
         # alert_enrichment может использовать fallback 7д если узкое окно
         # пусто; заголовок честно показывает фактический диапазон.
         # Phase 3-A: для warning — top-1 строка, для critical — full 3.
-        if head.recent_deploys:
+        # NS-scope deploys рендерятся отдельным полем «Deploy-связь» ниже.
+        if head.recent_deploys and getattr(head, "deploy_scope", "service") == "service":
             lines = []
             max_min = 0
             top_n = 3 if is_critical else 1
@@ -1087,6 +1096,58 @@ class DiscordService:
             fields.append({
                 "name": f"Recent deploys ({window_label})",
                 "value": "\n".join(lines)[:1024],
+                "inline": False,
+            })
+
+        # NS-level deploy attribution (запрос on-call 2026-06-10): для
+        # алертов без резолва сервиса отвечаем «деплой или нет» деплоями
+        # всего namespace. Негативный вердикт не менее ценен позитивного —
+        # «деплоев не было» сразу отсекает ветку triage.
+        ns_scope_ctxs = [
+            c for c in contexts
+            if getattr(c, "deploy_scope", "service") == "namespace"
+        ]
+        if ns_scope_ctxs:
+            window_min = max(
+                (c.ns_deploy_window_min or 0) for c in ns_scope_ctxs
+            ) or int(getattr(settings, "ENRICH_DEPLOY_LOOKBACK_MIN", 60))
+            # Merge по группе (multi-ns embed = несколько контекстов),
+            # dedupe по (buildtype, number) — один TC-билд деплоит чанк
+            # сервисов одного ns и попал бы в поле десятком строк.
+            merged: List[Dict[str, Any]] = []
+            seen_builds = set()
+            for c in ns_scope_ctxs:
+                for d in c.recent_deploys:
+                    bkey = (d.get("buildtype_id"), d.get("number"))
+                    if bkey in seen_builds:
+                        continue
+                    seen_builds.add(bkey)
+                    merged.append(d)
+            merged.sort(key=lambda d: d.get("minutes_before_incident") or 0)
+            ns_label = ", ".join(f"`{n}`" for n in namespaces[:4])
+            if merged:
+                dep_lines = []
+                for d in merged[:3]:
+                    bt_name = d.get("buildtype_name") or d.get("buildtype_id") or "?"
+                    num = d.get("number") or "?"
+                    triggered = d.get("triggered_by") or ""
+                    by_part = f" by `{triggered}`" if triggered else ""
+                    mins = d.get("minutes_before_incident", "?")
+                    d_ns = d.get("namespace") or "?"
+                    dep_lines.append(
+                        f"• {bt_name} #{num}{by_part} — {mins}м до алерта · `{d_ns}`"
+                    )
+                value = (
+                    "🚀 _Возможно связано с деплоем:_\n" + "\n".join(dep_lines)
+                )
+            else:
+                value = (
+                    f"_Деплоев в {ns_label} за {window_min}м до алерта "
+                    f"не было — вряд ли связано с деплоем._"
+                )
+            fields.append({
+                "name": f"Deploy-связь (окно {window_min}м)",
+                "value": value[:1024],
                 "inline": False,
             })
 

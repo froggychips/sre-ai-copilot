@@ -107,6 +107,61 @@ def recent_deploys_for(
     return out
 
 
+def recent_deploys_for_namespaces(
+    db: Session,
+    namespaces: List[str],
+    before: datetime,
+    lookback_minutes: int = 60,
+    limit: int = 5,
+) -> List[Dict[str, Any]]:
+    """Деплои ЛЮБОГО сервиса в указанных namespace за [before-lookback, before].
+
+    NS-level fallback для deploy attribution: алерты-агрегаты по namespace
+    (PreprodRestartsSpike, PreprodEndpointDown) не резолвятся в kg_services →
+    сервисный `recent_deploys_for` бессилен. Но triage-вопрос on-call
+    «это деплой или нет» отвечается и без сервиса: был ли ХОТЬ ОДИН deploy
+    в namespace прямо перед алертом. kg_deployments не хранит namespace —
+    идём через join на kg_services.
+    """
+    if not namespaces:
+        return []
+    before_aware = _ensure_aware(before)
+    since = before_aware - timedelta(minutes=lookback_minutes)
+    rows = (
+        db.query(Deployment, Service)
+        .join(Service, Deployment.service_id == Service.id)
+        .filter(
+            Service.namespace.in_(namespaces),
+            Deployment.started_at >= since.replace(tzinfo=None),
+            Deployment.started_at <= before_aware.replace(tzinfo=None),
+        )
+        .order_by(Deployment.started_at.desc())
+        .limit(limit)
+        .all()
+    )
+    out: List[Dict[str, Any]] = []
+    for d, svc in rows:
+        delta_min = int(
+            (before_aware - d.started_at.replace(tzinfo=timezone.utc)).total_seconds() // 60
+        )
+        extras: Dict[str, Any] = d.extras if isinstance(d.extras, dict) else {}
+        out.append({
+            "name": svc.name,
+            "namespace": svc.namespace,
+            "ts": d.started_at,
+            "sha": d.sha,
+            "repo": d.repo,
+            "buildtype_id": d.buildtype_id,
+            "buildtype_name": extras.get("buildtype_name") or d.buildtype_id,
+            "number": d.build_number,
+            "status": d.status,
+            "triggered_by": d.triggered_by,
+            "url": extras.get("url"),
+            "minutes_before_incident": delta_min,
+        })
+    return out
+
+
 def upstream_of(
     db: Session,
     namespace: str,
