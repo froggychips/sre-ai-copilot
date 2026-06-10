@@ -90,12 +90,17 @@ jobs:
         run: |
           DOCKER_CONFIG="$RUNNER_TEMP/docker-config"
           mkdir -p "$DOCKER_CONFIG"
-          # credsStore: none обязателен: с пустым конфигом docker CLI
-          # АВТОДЕТЕКТИТ osxkeychain-хелпер из PATH (~/.rd/bin) и снова
-          # упирается в keychain. none (ships с Rancher Desktop) хранит
-          # креды плоско в этом job-local config.json.
-          echo '{"credsStore": "none"}' > "$DOCKER_CONFIG/config.json"
+          # Job-local конфиг теряет три вещи из пользовательского
+          # ~/.docker — восстанавливаем явно:
+          # 1) credsStore none: с пустым конфигом docker CLI автодетектит
+          #    osxkeychain из PATH (~/.rd/bin) → -25308 из LaunchAgent.
+          # 2) cliPluginsExtraDirs: buildx/compose живут в
+          #    ~/.docker/cli-plugins, без них «buildx is required».
+          # 3) DOCKER_HOST: без currentContext docker идёт в
+          #    /var/run/docker.sock, которого нет — сокет RD в ~/.rd.
+          printf '{"credsStore":"none","cliPluginsExtraDirs":["%s/.docker/cli-plugins"]}' "$HOME" > "$DOCKER_CONFIG/config.json"
           echo "DOCKER_CONFIG=$DOCKER_CONFIG" >> "$GITHUB_ENV"
+          echo "DOCKER_HOST=unix://$HOME/.rd/docker.sock" >> "$GITHUB_ENV"
 
       - name: Log in to GitHub Container Registry
         uses: docker/login-action@v4
