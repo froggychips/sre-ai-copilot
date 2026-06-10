@@ -128,6 +128,19 @@ async def verify_alertmanager_signature(request: Request):
         raise HTTPException(status_code=401, detail="Invalid AlertManager signature")
 
 
+def _resolved_duration_minutes(starts_at: str, ends_at: Optional[str]) -> Optional[int]:
+    """Минуты между startsAt и endsAt алерта; None если не парсится."""
+    from datetime import datetime
+
+    try:
+        s = datetime.fromisoformat((starts_at or "").replace("Z", "+00:00"))
+        e = datetime.fromisoformat((ends_at or "").replace("Z", "+00:00"))
+        mins = int((e - s).total_seconds() // 60)
+        return mins if mins >= 0 else None
+    except (ValueError, TypeError):
+        return None
+
+
 def validate_alert_labels(alert):
     """Validate alert labels for security."""
     labels = alert.labels
@@ -390,6 +403,7 @@ async def alertmanager_webhook_enrich_and_forward(
 
     stored = []
     firing_incidents = []  # (incident, env-hint) — для post-store enrich.
+    resolved_criticals = []  # critical-резолвы → зелёный notice в Discord.
 
     for alert in payload_alerts:
         try:
@@ -400,8 +414,11 @@ async def alertmanager_webhook_enrich_and_forward(
             continue
 
         if alert.status == "resolved":
-            # Resolved-events не идут в Discord (можно расширить позже).
+            # Warning-резолвы в Discord не идут (шум); critical — короткий
+            # зелёный notice, чтобы был виден конец инцидента.
             stored.append({"incident_id": incident.incident_id, "result": "resolved-skipped"})
+            if (incident.severity or "").lower() == "critical":
+                resolved_criticals.append(incident)
             continue
 
         try:
@@ -519,10 +536,35 @@ async def alertmanager_webhook_enrich_and_forward(
                     message=str(e),
                 )
 
+    # Зелёные notice по critical-резолвам — после firing-блока, чтобы при
+    # смешанном batch (новый fire + старый resolve) порядок был red → green.
+    resolved_posted = 0
+    if settings.DISCORD_ENRICH_ENABLED and resolved_criticals:
+        from app.services.discord_service import DiscordService
+
+        notice_service = DiscordService()
+        for inc in resolved_criticals:
+            try:
+                await notice_service.send_resolved_notice(
+                    alertname=inc.labels.get("alertname", "unknown"),
+                    namespace=inc.namespace,
+                    service=inc.labels.get("service") or inc.labels.get("deployment"),
+                    duration_min=_resolved_duration_minutes(inc.starts_at, inc.ends_at),
+                )
+                resolved_posted += 1
+            except Exception as e:
+                log.warning(
+                    "enrich_forward.resolved_notice_failed",
+                    alertname=inc.labels.get("alertname"),
+                    error=type(e).__name__,
+                    message=str(e),
+                )
+
     return {
         "status": "stored-and-forwarded",
         "alerts": stored,
         "enriched_groups": enriched_groups,
+        "resolved_posted": resolved_posted,
         "suppressed_chronic": suppressed_chronic,
         "suppressed_rollout": suppressed_rollout,
         "suppressed_inhibited": suppressed_inhibited,
