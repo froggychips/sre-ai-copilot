@@ -45,6 +45,7 @@ from .embed_builder import (
     _format_recurrence_tag,
     _format_sha_link,
     _lookup_similar_past_incident_cached,
+    _allowed_mentions,
     _mention_block,
     _self_health_footer,
     _severity_to_color,
@@ -1322,11 +1323,7 @@ class DiscordService:
             )
             payload: Dict[str, Any] = {
                 "content": (mention_prefix + one_line)[:2000],
-                "allowed_mentions": (
-                    {"parse": ["everyone"]}
-                    if mention_prefix
-                    else {"parse": []}
-                ),
+                "allowed_mentions": _allowed_mentions(mention_prefix),
             }
         else:
             payload = {
@@ -1338,15 +1335,10 @@ class DiscordService:
                     "footer": {"text": footer_text},
                     "timestamp": datetime.now(timezone.utc).isoformat(),
                 }],
-                # Mention-payload: для critical-severity сами пингуем `@here`
-                # через `content`; allowed_mentions сужаем до `everyone`
-                # (Discord трактует @here как ["everyone"] в allowed_mentions
-                # parse-list). Для остальных severity — empty.
-                "allowed_mentions": (
-                    {"parse": ["everyone"]}
-                    if mention_prefix
-                    else {"parse": []}
-                ),
+                # Mention-payload: для critical-severity пингуем роль/`@here`
+                # через `content`; allowed_mentions сужаем до роли (или
+                # `everyone` для @here). Для остальных severity — empty.
+                "allowed_mentions": _allowed_mentions(mention_prefix),
             }
             if mention_prefix:
                 payload["content"] = mention_prefix.strip()
