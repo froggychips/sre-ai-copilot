@@ -1106,6 +1106,9 @@ class DiscordService:
             c for c in contexts
             if getattr(c, "deploy_scope", "service") == "namespace"
         ]
+        # Минуты до алерта у ближайшего ns-scope деплоя — вход для
+        # mention-подавления ниже (deploy-related critical не пингует).
+        ns_deploy_min_minutes: Optional[int] = None
         if ns_scope_ctxs:
             window_min = max(
                 (c.ns_deploy_window_min or 0) for c in ns_scope_ctxs
@@ -1125,6 +1128,12 @@ class DiscordService:
             merged.sort(key=lambda d: d.get("minutes_before_incident") or 0)
             ns_label = ", ".join(f"`{n}`" for n in namespaces[:4])
             if merged:
+                # None в minutes (деплой в окне, но время не вычислилось) —
+                # консервативно 0: лучше лишний раз не пингануть, чем пинг
+                # на заведомо deploy-related волну.
+                ns_deploy_min_minutes = min(
+                    int(d.get("minutes_before_incident") or 0) for d in merged
+                )
                 dep_lines = []
                 for d in merged[:3]:
                     bt_name = d.get("buildtype_name") or d.get("buildtype_id") or "?"
@@ -1139,6 +1148,13 @@ class DiscordService:
                 value = (
                     "🚀 _Возможно связано с деплоем:_\n" + "\n".join(dep_lines)
                 )
+                if (
+                    is_critical
+                    and getattr(settings, "DISCORD_SUPPRESS_MENTION_ON_DEPLOY", True)
+                    and ns_deploy_min_minutes
+                    <= int(getattr(settings, "DISCORD_MENTION_SUPPRESS_DEPLOY_WINDOW_MIN", 30))
+                ):
+                    value += "\n🔕 _Mention подавлен — алерт связан с деплоем._"
             else:
                 value = (
                     f"_Деплоев в {ns_label} за {window_min}м до алерта "
@@ -1360,7 +1376,34 @@ class DiscordService:
 
         # B11 — `@here` mention для critical (только critical, и только когда
         # не compact-mode, чтобы compact warning не пинговал).
-        mention_prefix = "" if is_compact else _mention_block(severity, env)
+        #
+        # Deploy-related подавление (запрос 2026-06-11, прецедент
+        # PreprodRestartsSpike при деплое статики): если ближайший ns-scope
+        # деплой ≤ SUPPRESS_WINDOW от алерта или rollout в процессе
+        # (service-scope deploy <5 мин) — embed уходит, но без пинга.
+        suppress_mention_deploy = bool(
+            getattr(settings, "DISCORD_SUPPRESS_MENTION_ON_DEPLOY", True)
+        ) and (
+            head.rollout_noise
+            or (
+                ns_deploy_min_minutes is not None
+                and ns_deploy_min_minutes
+                <= int(getattr(settings, "DISCORD_MENTION_SUPPRESS_DEPLOY_WINDOW_MIN", 30))
+            )
+        )
+        mention_prefix = (
+            ""
+            if (is_compact or suppress_mention_deploy)
+            else _mention_block(severity, env)
+        )
+        if suppress_mention_deploy and severity == "critical":
+            _log.info(
+                "discord.mention_suppressed_deploy",
+                alertname=alertname,
+                namespaces=ns_str,
+                ns_deploy_min_minutes=ns_deploy_min_minutes,
+                rollout_noise=head.rollout_noise,
+            )
 
         if is_compact:
             # Один line — без полей, без description.
