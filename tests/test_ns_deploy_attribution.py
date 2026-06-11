@@ -121,9 +121,9 @@ def _ns_ctx(namespace: str, deploys: list) -> EnrichedContext:
     return ctx
 
 
-def _build_fields(contexts):
+def _build_payload(contexts):
     """Прогнать send_enriched_alert в DRY_RUN недоступно без сети —
-    дёргаем сборку полей через публичный путь: собираем embed и ловим
+    дёргаем сборку через публичный путь: собираем embed и ловим
     payload на _post_or_patch_enriched."""
     import asyncio
 
@@ -141,7 +141,11 @@ def _build_fields(contexts):
         patch("app.services.discord.service.settings.DISCORD_DRY_RUN", False),
     ):
         asyncio.run(svc.send_enriched_alert(contexts))
-    embeds = (captured.get("payload") or {}).get("embeds") or [{}]
+    return captured.get("payload") or {}
+
+
+def _build_fields(contexts):
+    embeds = _build_payload(contexts).get("embeds") or [{}]
     return {f["name"]: f["value"] for f in embeds[0].get("fields", [])}
 
 
@@ -169,6 +173,57 @@ def test_embed_negative_deploy_verdict():
     assert dep_field is not None
     assert "не было" in dep_field
     assert "вряд ли связано" in dep_field
+
+
+# ── mention-подавление для deploy-related алертов ────────────────────────
+# Запрос 2026-06-11: PreprodRestartsSpike при деплое статики — штатная
+# волна self-restart'ов («Newer statics → Will shutdown to reload»),
+# critical с @here на каждую выкатку. Deploy-related → embed без пинга.
+
+def _deploy(minutes_before: int) -> dict:
+    return {
+        "name": "core-service", "namespace": "preprod-kingdom2",
+        "buildtype_id": "Bt1", "buildtype_name": "Deploy statics",
+        "number": "10307", "triggered_by": "gd1",
+        "minutes_before_incident": minutes_before, "sha": None, "repo": None,
+        "status": "SUCCESS", "url": None, "ts": None,
+    }
+
+
+def test_mention_suppressed_when_deploy_within_window():
+    payload = _build_payload([_ns_ctx("preprod-kingdom2", [_deploy(8)])])
+    assert "content" not in payload
+    assert payload["allowed_mentions"] == {"parse": []}
+    fields = {f["name"]: f["value"] for f in payload["embeds"][0]["fields"]}
+    dep_field = next(v for k, v in fields.items() if k.startswith("Deploy-связь"))
+    assert "Mention подавлен" in dep_field
+
+
+def test_mention_kept_when_deploy_outside_suppress_window():
+    """Деплой в lookback-окне (60м), но дальше suppress-окна (30м) —
+    корреляция слабая, пинг остаётся."""
+    payload = _build_payload([_ns_ctx("preprod-kingdom2", [_deploy(45)])])
+    assert payload.get("content", "").strip() == "@here"
+    fields = {f["name"]: f["value"] for f in payload["embeds"][0]["fields"]}
+    dep_field = next(v for k, v in fields.items() if k.startswith("Deploy-связь"))
+    assert "Mention подавлен" not in dep_field
+
+
+def test_mention_kept_when_no_deploys():
+    payload = _build_payload([_ns_ctx("preprod-kingdom2", [])])
+    assert payload.get("content", "").strip() == "@here"
+
+
+def test_mention_kept_when_suppress_disabled():
+    with patch(
+        "app.services.discord.service.settings.DISCORD_SUPPRESS_MENTION_ON_DEPLOY",
+        False,
+    ):
+        payload = _build_payload([_ns_ctx("preprod-kingdom2", [_deploy(8)])])
+    assert payload.get("content", "").strip() == "@here"
+    fields = {f["name"]: f["value"] for f in payload["embeds"][0]["fields"]}
+    dep_field = next(v for k, v in fields.items() if k.startswith("Deploy-связь"))
+    assert "Mention подавлен" not in dep_field
 
 
 def test_embed_multi_ns_dedupes_same_build():

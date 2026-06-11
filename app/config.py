@@ -99,6 +99,16 @@ class Settings(BaseSettings):
     # allowed_mentions при этом сужается до этой роли вместо everyone.
     DISCORD_ALERT_MENTION_ROLE_ID: str = ""
 
+    # Deploy-related алерты постим без mention (запрос 2026-06-11,
+    # прецедент PreprodRestartsSpike: деплой статики → штатная волна
+    # self-restart'ов всех statics-зависимых сервисов → critical с @here).
+    # Embed уходит как обычно — гасится только пинг. Критерий: ns-scope
+    # деплой не дальше SUPPRESS_WINDOW от алерта, либо rollout_noise
+    # (service-scope deploy <5 мин). Окно уже ENRICH_DEPLOY_LOOKBACK_MIN
+    # (60м) сознательно: деплой час назад — слабая корреляция, пинг нужен.
+    DISCORD_SUPPRESS_MENTION_ON_DEPLOY: bool = True
+    DISCORD_MENTION_SUPPRESS_DEPLOY_WINDOW_MIN: int = 30
+
     # Discord-enrich tier — детерминированный embed с KG-контекстом,
     # без LLM. Принимает alert на /webhooks/alertmanager/enrich-and-forward,
     # обогащает recent_deploys/upstream-alerts/recurrence/owner-team и
