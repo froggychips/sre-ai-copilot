@@ -128,6 +128,27 @@ class Settings(BaseSettings):
     # (по префиксам) — в monitoring/kube-system деплои нерелевантны.
     ENRICH_NS_DEPLOY_FALLBACK_NS_PREFIXES: str = "prod-,preprod-,preupdate-,squad-"
 
+    # Cross-namespace deploy collateral (инцидент ProdEndpointDown 2026-06-15):
+    # per-namespace deploy attribution слепа к bulk-rollout в СОСЕДНИХ ns
+    # того же физического кластера. WO "новый кластер" co-locate-ит
+    # prod-*/preprod-*/preupdate-*/squad-gd-* — два конкурентных
+    # BuildAndUpdate (~530 подов) уронили prod-shared через image-pull/CRI
+    # pressure, хотя в prod-shared деплоя не было. Атрибуция сказала
+    # «деплоев не было — вряд ли связано», что ложно.
+    #
+    # Группы ns одного кластера: `;`-разделитель групп, `,`-разделитель
+    # префиксов внутри группы. namespace относится к группе, если матчит
+    # любой её префикс. Пусто = cluster-probe выключен. По умолчанию —
+    # только "новый кластер" (где живёт prod). dev-кластер (squad-1..N)
+    # сейчас не группируем: префикс `squad-` пересёкся бы с `squad-gd-`.
+    ENRICH_CLUSTER_NS_GROUPS: str = "prod-,preprod-,preupdate-,squad-gd-"
+    # Минимум deploy-строк (kg_deployments) в соседних ns за окно, чтобы
+    # счесть cross-namespace collateral вероятным. Полная выкатка shared
+    # одного ns = 40+ строк; конкурентные BuildAndUpdate — сотни. Ниже
+    # порога оставляем прежний негативный вердикт, чтобы не шуметь на
+    # одиночном несвязанном деплое соседа.
+    ENRICH_CLUSTER_DEPLOY_MIN_DEPLOYS: int = 10
+
     # UX polish: если KG не дал ready/desired через metadata_json,
     # делать прямой read_namespaced_stateful_set/deployment (3s timeout).
     # Per-embed lookup — один call на один build (кэш в alert_enrichment).
