@@ -23,6 +23,7 @@ from app.diagnostics.facts import Fact
 from app.diagnostics.rules.recent_deploy import RecentDeployRule
 from app.diagnostics.rules.upstream_degraded import UpstreamDegradedRule
 from app.knowledge_graph.queries import (blast_radius_for,
+                                         cluster_deploy_activity,
                                          current_replicas_from_kg,
                                          incidents_on, latest_pod_event_for,
                                          nats_impact_for, nearby_alerts,
@@ -45,6 +46,23 @@ def _ns_deploy_fallback_applies(namespace: str) -> bool:
     raw = (getattr(settings, "ENRICH_NS_DEPLOY_FALLBACK_NS_PREFIXES", "") or "")
     prefixes = [p.strip() for p in raw.split(",") if p.strip()]
     return any(namespace.startswith(p) for p in prefixes)
+
+
+def _cluster_sibling_prefixes(namespace: str) -> List[str]:
+    """Префиксы ns, делящих физический кластер с `namespace`.
+
+    Группы из `ENRICH_CLUSTER_NS_GROUPS` (`;` между группами, `,` между
+    префиксами). namespace относится к группе, если матчит любой её
+    префикс — возвращаем все префиксы этой группы (включая собственный:
+    вызов исключает сам namespace отдельно). [] если namespace не в одной
+    из групп → cluster-probe для него выключен.
+    """
+    raw = getattr(settings, "ENRICH_CLUSTER_NS_GROUPS", "") or ""
+    for group in raw.split(";"):
+        prefixes = [p.strip() for p in group.split(",") if p.strip()]
+        if any(namespace.startswith(p) for p in prefixes):
+            return prefixes
+    return []
 
 
 def _matter_signals(
@@ -108,6 +126,14 @@ class EnrichedContext:
     # («деплоев не было — вряд ли связано с деплоем»).
     deploy_scope: str = "service"
     ns_deploy_window_min: Optional[int] = None
+    # Cross-namespace deploy collateral (инцидент ProdEndpointDown
+    # 2026-06-15): когда в ns алерта деплоя нет, но в СОСЕДНИХ ns того же
+    # кластера за окно шёл bulk-rollout (image-pull/CRI pressure роняет
+    # соседей). Заполняется только в NS-fallback ветке при пустом
+    # recent_deploys. Структура — см. queries.cluster_deploy_activity.
+    # Рендерится в поле «Deploy-связь»: вместо ложного «деплоев не было —
+    # вряд ли связано» показываем cross-namespace collateral-гипотезу.
+    cluster_deploy_activity: Dict[str, Any] = field(default_factory=dict)
     upstream_alerts: List[Dict[str, Any]] = field(default_factory=list)
     recurrence_24h: List[Dict[str, Any]] = field(default_factory=list)
     # Inbound: сколько сервисов вызывают/зависят от этого. Раньше поле
@@ -471,6 +497,17 @@ def enrich_alert(db: Session, incident: Incident) -> EnrichedContext:
                     db, [namespace], before=effective_at,
                     lookback_minutes=window_min,
                 )
+                # В своём ns деплоя нет — но мог быть bulk-rollout в
+                # соседних ns кластера (cross-namespace collateral).
+                # Иначе атрибуция врёт «не было — вряд ли связано».
+                if not ctx.recent_deploys:
+                    siblings = _cluster_sibling_prefixes(namespace)
+                    if siblings:
+                        ctx.cluster_deploy_activity = cluster_deploy_activity(
+                            db, sibling_prefixes=siblings,
+                            exclude_namespace=namespace,
+                            before=effective_at, lookback_minutes=window_min,
+                        )
             except Exception as e:
                 log.warning("enrich.ns_deploy_fallback_failed", error=str(e))
         else:
