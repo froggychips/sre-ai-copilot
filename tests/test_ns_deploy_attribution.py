@@ -13,6 +13,7 @@ from unittest.mock import MagicMock, patch
 from app.models.incident import Incident
 from app.services.alert_enrichment import (
     EnrichedContext,
+    _cluster_sibling_prefixes,
     _ns_deploy_fallback_applies,
     enrich_alert,
 )
@@ -224,6 +225,104 @@ def test_mention_kept_when_suppress_disabled():
     fields = {f["name"]: f["value"] for f in payload["embeds"][0]["fields"]}
     dep_field = next(v for k, v in fields.items() if k.startswith("Deploy-связь"))
     assert "Mention подавлен" not in dep_field
+
+
+# ── cross-namespace deploy collateral (ProdEndpointDown 2026-06-15) ───────
+
+def test_cluster_sibling_prefixes_groups_new_cluster():
+    """prod-/preprod-/preupdate-/squad-gd- делят «новый кластер»."""
+    assert _cluster_sibling_prefixes("prod-shared") == [
+        "prod-", "preprod-", "preupdate-", "squad-gd-",
+    ]
+    assert _cluster_sibling_prefixes("squad-gd-shared")  # та же группа
+    # monitoring/kube-system не в группе → probe выключен.
+    assert _cluster_sibling_prefixes("monitoring") == []
+
+
+_CLUSTER_ACT = {
+    "total_deploys": 530,
+    "distinct_builds": 2,
+    "earliest_minutes_before": 7,
+    "namespaces": [
+        {"namespace": "squad-gd-shared", "deploys": 60},
+        {"namespace": "preprod-shared", "deploys": 44},
+    ],
+    "sample_builds": [
+        {
+            "namespace": "preprod-shared", "buildtype_id": "Bt1",
+            "buildtype_name": "Build and update", "number": "727",
+            "triggered_by": "ybobryashov", "minutes_before_incident": 7,
+        },
+    ],
+}
+
+
+@patch("app.services.alert_enrichment.cluster_deploy_activity")
+@patch("app.services.alert_enrichment.recent_deploys_for_namespaces", return_value=[])
+def test_empty_ns_window_probes_cluster_siblings(mock_ns_deploys, mock_cluster):
+    """В prod-shared деплоя нет → пробуем соседей кластера."""
+    mock_cluster.return_value = _CLUSTER_ACT
+    inc = _make_incident("ProdEndpointDown", "prod-shared")
+    ctx = enrich_alert(MagicMock(), inc)
+    assert ctx.recent_deploys == []
+    assert ctx.cluster_deploy_activity["total_deploys"] == 530
+    mock_cluster.assert_called_once()
+    # exclude_namespace = свой ns, префиксы — группа нового кластера.
+    _, kwargs = mock_cluster.call_args
+    assert kwargs["exclude_namespace"] == "prod-shared"
+    assert "squad-gd-" in kwargs["sibling_prefixes"]
+
+
+@patch("app.services.alert_enrichment.cluster_deploy_activity")
+@patch("app.services.alert_enrichment.recent_deploys_for_namespaces")
+def test_cluster_probe_skipped_when_ns_has_deploys(mock_ns_deploys, mock_cluster):
+    """Если в своём ns деплой есть — кластерный probe не нужен."""
+    mock_ns_deploys.return_value = [{
+        "name": "core", "namespace": "prod-shared", "buildtype_id": "Bt1",
+        "buildtype_name": "Build", "number": "1", "triggered_by": "u",
+        "minutes_before_incident": 5, "sha": None, "repo": None,
+        "status": "SUCCESS", "url": None, "ts": None,
+    }]
+    inc = _make_incident("ProdEndpointDown", "prod-shared")
+    ctx = enrich_alert(MagicMock(), inc)
+    assert ctx.recent_deploys
+    assert ctx.cluster_deploy_activity == {}
+    mock_cluster.assert_not_called()
+
+
+def _ns_ctx_cluster(namespace: str, activity: dict) -> EnrichedContext:
+    ctx = _ns_ctx(namespace, [])  # в своём ns деплоев нет
+    ctx.cluster_deploy_activity = activity
+    return ctx
+
+
+def test_embed_collateral_verdict_replaces_negative():
+    fields = _build_fields([_ns_ctx_cluster("prod-shared", _CLUSTER_ACT)])
+    dep_field = next((v for k, v in fields.items() if k.startswith("Deploy-связь")), None)
+    assert dep_field is not None
+    # Ложный «вряд ли связано» НЕ выводится.
+    assert "вряд ли связано" not in dep_field
+    assert "cross-namespace rollout-collateral" in dep_field
+    assert "530 деплоев" in dep_field
+    assert "`squad-gd-shared` (60)" in dep_field
+    assert "#727" in dep_field and "ybobryashov" in dep_field
+
+
+def test_embed_keeps_negative_below_threshold():
+    """Одиночный несвязанный деплой соседа (ниже порога) — прежний
+    негативный вердикт, не шумим collateral-гипотезой."""
+    small = {**_CLUSTER_ACT, "total_deploys": 3}
+    fields = _build_fields([_ns_ctx_cluster("prod-shared", small)])
+    dep_field = next(v for k, v in fields.items() if k.startswith("Deploy-связь"))
+    assert "вряд ли связано" in dep_field
+    assert "collateral" not in dep_field
+
+
+def test_embed_negative_when_no_cluster_activity():
+    """Нет ни своих, ни соседских деплоев — чистый негатив."""
+    fields = _build_fields([_ns_ctx_cluster("prod-shared", {})])
+    dep_field = next(v for k, v in fields.items() if k.startswith("Deploy-связь"))
+    assert "вряд ли связано" in dep_field
 
 
 def test_embed_multi_ns_dedupes_same_build():

@@ -1156,10 +1156,46 @@ class DiscordService:
                 ):
                     value += "\n🔕 _Mention подавлен — алерт связан с деплоем._"
             else:
-                value = (
-                    f"_Деплоев в {ns_label} за {window_min}м до алерта "
-                    f"не было — вряд ли связано с деплоем._"
-                )
+                # В ns алерта деплоя нет. Прежде чем выдать негативный
+                # вердикт — проверяем cross-namespace collateral: bulk-
+                # rollout в соседних ns того же кластера (инцидент
+                # ProdEndpointDown 2026-06-15). Берём контекст с самой
+                # массовой активностью среди ns-scope контекстов группы.
+                cluster_act: Dict[str, Any] = {}
+                for c in ns_scope_ctxs:
+                    act = getattr(c, "cluster_deploy_activity", None) or {}
+                    if act.get("total_deploys", 0) > cluster_act.get("total_deploys", 0):
+                        cluster_act = act
+                min_deploys = int(getattr(settings, "ENRICH_CLUSTER_DEPLOY_MIN_DEPLOYS", 10))
+                if cluster_act.get("total_deploys", 0) >= min_deploys:
+                    sib_label = ", ".join(
+                        f"`{n['namespace']}` ({n['deploys']})"
+                        for n in cluster_act.get("namespaces", [])[:4]
+                    )
+                    sample_lines = []
+                    for d in cluster_act.get("sample_builds", [])[:3]:
+                        bt_name = d.get("buildtype_name") or d.get("buildtype_id") or "?"
+                        num = d.get("number") or "?"
+                        triggered = d.get("triggered_by") or ""
+                        by_part = f" by `{triggered}`" if triggered else ""
+                        mins = d.get("minutes_before_incident", "?")
+                        d_ns = d.get("namespace") or "?"
+                        sample_lines.append(
+                            f"• {bt_name} #{num}{by_part} — {mins}м до алерта · `{d_ns}`"
+                        )
+                    value = (
+                        f"⚠️ _В {ns_label} деплоя не было, но за {window_min}м рядом — "
+                        f"{cluster_act['total_deploys']} деплоев в соседних ns кластера: "
+                        f"{sib_label}. Возможен cross-namespace rollout-collateral "
+                        f"(image-pull/CRI pressure на общих нодах)._"
+                    )
+                    if sample_lines:
+                        value += "\n" + "\n".join(sample_lines)
+                else:
+                    value = (
+                        f"_Деплоев в {ns_label} за {window_min}м до алерта "
+                        f"не было — вряд ли связано с деплоем._"
+                    )
             fields.append({
                 "name": f"Deploy-связь (окно {window_min}м)",
                 "value": value[:1024],

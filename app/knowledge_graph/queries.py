@@ -9,7 +9,7 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
-from sqlalchemy import func
+from sqlalchemy import func, or_
 from sqlalchemy.orm import Session
 
 from app.knowledge_graph.confidence import (confidence_label,
@@ -160,6 +160,99 @@ def recent_deploys_for_namespaces(
             "minutes_before_incident": delta_min,
         })
     return out
+
+
+def cluster_deploy_activity(
+    db: Session,
+    *,
+    sibling_prefixes: List[str],
+    exclude_namespace: str,
+    before: datetime,
+    lookback_minutes: int = 60,
+    sample_limit: int = 3,
+) -> Dict[str, Any]:
+    """Агрегат deploy-активности в СОСЕДНИХ ns одного кластера за окно.
+
+    Cross-namespace collateral (инцидент ProdEndpointDown 2026-06-15):
+    bulk-rollout в соседних namespace одного физического кластера роняет
+    соседей через image-pull/CRI-pressure, а per-namespace deploy
+    attribution это не видит (в самом ns алерта деплоя нет). Эта функция
+    отвечает на вопрос «а каталось ли что-то рядом, на том же железе».
+
+    `sibling_prefixes` — префиксы ns кластера (Service.namespace LIKE
+    'prefix%'); `exclude_namespace` — namespace алерта, исключается, чтобы
+    не дублировать его собственную (пустую) атрибуцию. kg_deployments не
+    хранит namespace — идём через join на kg_services.
+
+    Возвращает `{}` если активности нет, иначе:
+      total_deploys, distinct_builds, earliest_minutes_before,
+      namespaces: [{namespace, deploys}, ...]  (desc by deploys),
+      sample_builds: [{buildtype_name, number, triggered_by, namespace,
+                       minutes_before_incident}, ...]  (ближайшие по времени).
+    """
+    prefixes = [p for p in (sibling_prefixes or []) if p]
+    if not prefixes:
+        return {}
+    before_aware = _ensure_aware(before)
+    since = before_aware - timedelta(minutes=lookback_minutes)
+    rows = (
+        db.query(Deployment, Service)
+        .join(Service, Deployment.service_id == Service.id)
+        .filter(
+            or_(*[Service.namespace.like(f"{p}%") for p in prefixes]),
+            Service.namespace != exclude_namespace,
+            Deployment.started_at >= since.replace(tzinfo=None),
+            Deployment.started_at <= before_aware.replace(tzinfo=None),
+        )
+        .order_by(Deployment.started_at.desc())
+        .all()
+    )
+    if not rows:
+        return {}
+
+    per_ns: Dict[str, int] = {}
+    distinct_builds = set()
+    enriched: List[Dict[str, Any]] = []
+    for d, svc in rows:
+        per_ns[svc.namespace] = per_ns.get(svc.namespace, 0) + 1
+        distinct_builds.add((d.buildtype_id, d.build_number))
+        delta_min = int(
+            (before_aware - d.started_at.replace(tzinfo=timezone.utc)).total_seconds() // 60
+        )
+        extras: Dict[str, Any] = d.extras if isinstance(d.extras, dict) else {}
+        enriched.append({
+            "namespace": svc.namespace,
+            "buildtype_id": d.buildtype_id,
+            "buildtype_name": extras.get("buildtype_name") or d.buildtype_id,
+            "number": d.build_number,
+            "triggered_by": d.triggered_by,
+            "minutes_before_incident": delta_min,
+        })
+
+    # sample_builds — ближайшие к алерту, dedup по (buildtype, number):
+    # один TC-билд деплоит десятки сервисов и забил бы выборку дублями.
+    enriched.sort(key=lambda r: r["minutes_before_incident"])
+    sample_builds: List[Dict[str, Any]] = []
+    seen_builds = set()
+    for r in enriched:
+        bkey = (r["buildtype_id"], r["number"])
+        if bkey in seen_builds:
+            continue
+        seen_builds.add(bkey)
+        sample_builds.append(r)
+        if len(sample_builds) >= sample_limit:
+            break
+
+    return {
+        "total_deploys": len(rows),
+        "distinct_builds": len(distinct_builds),
+        "earliest_minutes_before": min(r["minutes_before_incident"] for r in enriched),
+        "namespaces": [
+            {"namespace": ns, "deploys": n}
+            for ns, n in sorted(per_ns.items(), key=lambda kv: kv[1], reverse=True)
+        ],
+        "sample_builds": sample_builds,
+    }
 
 
 def upstream_of(
