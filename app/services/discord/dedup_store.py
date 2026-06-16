@@ -17,7 +17,7 @@ PK, на фоне HTTP-roundtrip'а к Discord это шум.
 import logging
 import time
 from datetime import datetime, timezone
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, cast
 
 from sqlalchemy import Column, DateTime, Integer, String, JSON
 
@@ -64,8 +64,11 @@ def _row_to_dict(row: DiscordDedupEntry) -> Dict[str, Any]:
         "msg_id": row.msg_id,
         "webhook_url": row.webhook_url,
         "embed": row.embed,
-        "first_ts": _to_ts(row.first_ts),
-        "last_ts": _to_ts(row.last_ts),
+        # cast: на инстансе ORM-атрибуты — datetime; стабы SQLAlchemy после
+        # bump'а (kubernetes/starlette deps, 2026-06-16) стали инферить их
+        # как Column[datetime] → mypy arg-type. Рантайм-тип корректен.
+        "first_ts": _to_ts(cast(datetime, row.first_ts)),
+        "last_ts": _to_ts(cast(datetime, row.last_ts)),
         "count": row.count,
     }
 
