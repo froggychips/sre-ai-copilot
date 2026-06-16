@@ -170,6 +170,16 @@ class Settings(BaseSettings):
     ROLLOUT_SUPPRESS_ENABLED: bool = True
     ROLLOUT_SUPPRESS_WINDOW_MINUTES: int = 15
 
+    # Meta-aggregate / scrape-plumbing noise (alert-quality, прецедент
+    # ProdNewCriticalAlerts 2026-06-16). В отличие от rollout-noise эти
+    # алёрты шумные ВСЕГДА, не в окне деплоя: `*NewCriticalAlerts` — агрегат-
+    # счётчик (каждый реальный критикал и так приходит отдельной карточкой),
+    # etcdInsufficientMembers / ScrapePoolHasNoTargets / RecordingRulesNoData —
+    # производные control-plane scrape-gap (CP-метрики на 127.0.0.1). НЕ дропаем
+    # (это делает ALERT_SUPPRESS_NAMES на входе), а приглушаем в render-е:
+    # grey + 🔇, без 🚨/@mention, карточка остаётся видимой для глазной проверки.
+    META_NOISE_ENABLED: bool = True
+
     # A3: Explicit alertname allowlist — pure-noise alerts которые AM шлёт
     # либо для self-monitoring (Watchdog ping), либо как technical helper
     # (InfoInhibitor — workaround для AM inhibition rules без matchers).

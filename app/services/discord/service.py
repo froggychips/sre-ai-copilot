@@ -881,16 +881,20 @@ class DiscordService:
         # Старая `_SEVERITY_COLORS` map оставлена для обратной совместимости
         # incident-path; enriched alert использует новые tier-цвета.
         color = _severity_to_color(severity, resurfaced=resurfaced)
-        if head.rollout_noise:
+        if head.rollout_noise or head.meta_noise:
             color = _COLOR_UNKNOWN
         # A1: suppressed (silenced/inhibited) — orange override, чтобы on-call
         # сразу видел «AM уже знает что заглушено». Имеет приоритет над
-        # severity-color, но не над rollout-noise (rollout = grey).
-        if head.inhibition_state and not head.rollout_noise:
+        # severity-color, но не над rollout/meta-noise (оба = grey).
+        if head.inhibition_state and not head.rollout_noise and not head.meta_noise:
             color = _COLOR_SUPPRESSED
         # Title prefix: новые severity-aware emoji (🚨/⚠️/✅/🔁). Fallback на
         # старый `🔴/🟡/⚪` для unknown. Suppressed состояние имеет свой icon (🟠).
-        if head.inhibition_state and not head.rollout_noise:
+        # meta-noise (агрегат/scrape-gap) — 🔇, приоритет над 🚨: даёт on-call
+        # сразу понять «это плумбинг-шум, не пожар».
+        if head.meta_noise:
+            icon = "🔇"
+        elif head.inhibition_state and not head.rollout_noise:
             icon = "🟠"
         elif resurfaced:
             icon = "🔁"
@@ -914,7 +918,12 @@ class DiscordService:
         rec_max = max((len(c.recurrence_24h) for c in contexts), default=0)
         if rec_max >= 2:
             recurrence_tag = f" · 🔁 ×{rec_max} за 24h"
-        noise_tag = " · 🤖 ROLLOUT-NORMAL" if head.rollout_noise else ""
+        if head.meta_noise:
+            noise_tag = " · 🔇 META-AGGREGATE"
+        elif head.rollout_noise:
+            noise_tag = " · 🤖 ROLLOUT-NORMAL"
+        else:
+            noise_tag = ""
         ns_tag = f" ({len(namespaces)} ns)" if len(namespaces) > 1 else ""
         resurfaced_tag = " · 🌀 RESURFACED" if resurfaced else ""
 
@@ -1427,9 +1436,12 @@ class DiscordService:
                 <= int(getattr(settings, "DISCORD_MENTION_SUPPRESS_DEPLOY_WINDOW_MIN", 30))
             )
         )
+        # meta-noise (агрегат/scrape-gap) тоже без пинга — карточка видима,
+        # но on-call не будят ради плумбинг-шума.
+        suppress_mention = suppress_mention_deploy or head.meta_noise
         mention_prefix = (
             ""
-            if (is_compact or suppress_mention_deploy)
+            if (is_compact or suppress_mention)
             else _mention_block(severity, env)
         )
         if suppress_mention_deploy and severity == "critical":
