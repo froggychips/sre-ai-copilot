@@ -162,6 +162,11 @@ class EnrichedContext:
     # rollout-noise — выставляется heuristic-ом в enrich_alert ниже
     rollout_noise: bool = False
 
+    # meta-noise — alert является meta-агрегатом (`*NewCriticalAlerts`) или
+    # производным control-plane scrape-gap. Выставляется в enrich_alert.
+    # Render: grey + 🔇, без 🚨/@mention; карточка остаётся видимой.
+    meta_noise: bool = False
+
     # AM inhibit/silence: если alert.status_extra или labels указывают на
     # suppressed-состояние — заполняется human-readable строкой («🔇 silenced
     # by X», «🔇 inhibited by Y»). None — alert активен. Embed-builder
@@ -445,6 +450,34 @@ def _detect_rollout_noise(incident: Incident, recent_deploys: List[Dict[str, Any
         if d.get("minutes_before_incident", 999) <= 5:
             return True
     return False
+
+
+# Meta-агрегаты и scrape-plumbing — шумные ВСЕГДА (в отличие от rollout-noise,
+# не привязаны к окну деплоя). См. config.META_NOISE_ENABLED.
+META_NOISE_ALERTNAMES = frozenset({
+    "ProdNewCriticalAlerts",     # агрегат-счётчик новых критикалов
+    "etcdInsufficientMembers",   # control-plane scrape-gap (CP на 127.0.0.1)
+    "ScrapePoolHasNoTargets",    # scrape-gap
+    "RecordingRulesNoData",      # scrape-gap
+})
+
+
+def _detect_meta_noise(incident: Incident) -> bool:
+    """True если alert — meta-агрегат или scrape-plumbing шум.
+
+    Безопасно приглушать: `*NewCriticalAlerts` дублирует сигнал (каждый
+    реальный критикал приходит копайлоту отдельной карточкой со своим
+    сервисом/деплоем/KG), а etcd/scrape/recording-rule алёрты — известный
+    control-plane scrape-gap (не инцидент). Не дропаем, а помечаем для
+    muted-render-а (grey + 🔇, без 🚨/@mention).
+    """
+    alertname = (incident.labels or {}).get("alertname", "")
+    if not alertname:
+        return False
+    if alertname in META_NOISE_ALERTNAMES:
+        return True
+    # Семейство `<Env>NewCriticalAlerts` (Prod/Preprod/Squad/...) — все агрегаты.
+    return alertname.endswith("NewCriticalAlerts")
 
 
 def enrich_alert(db: Session, incident: Incident) -> EnrichedContext:
@@ -752,5 +785,13 @@ def enrich_alert(db: Session, incident: Incident) -> EnrichedContext:
     # 7. Rollout-noise heuristic — `KubeDeploymentGenerationMismatch` сразу
     # после деплоя обычно безобиден (rollout в процессе).
     ctx.rollout_noise = _detect_rollout_noise(incident, ctx.recent_deploys)
+
+    # 8. Meta-noise — агрегаты (`*NewCriticalAlerts`) и control-plane
+    # scrape-gap. Приглушаем render, не дропаем (см. _detect_meta_noise).
+    ctx.meta_noise = (
+        _detect_meta_noise(incident)
+        if getattr(settings, "META_NOISE_ENABLED", True)
+        else False
+    )
 
     return ctx
