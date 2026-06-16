@@ -35,7 +35,7 @@ CH_PORT = os.environ.get("CH_PORT", "8123")
 CH_DB = os.environ.get("CH_DB", "WOAnalytics")
 CH_HOST_TEMPLATE = os.environ.get("CH_HOST_TEMPLATE",
                                   "clickhouse.{squad}-shared.svc.cluster.local")
-SQUAD_NUMS = [int(x) for x in SQUADS.split()] if SQUADS else list(range(1, 25))
+SQUAD_NUMS = [int(x) for x in SQUADS.split()] if SQUADS else list(range(1, 40))
 DRY_RUN = os.environ.get("DRY_RUN", "") not in ("", "0", "false", "False")
 
 TC_URL = os.environ["TC_URL"].rstrip("/")
@@ -217,9 +217,8 @@ def build_rows():
         inst = fetch_install(s)
         owner = lbl.get("owner")
         act = fetch_ch_activity(s)
-        # пропускаем сквады, по которым нет вообще ничего
-        if not (owner or lb or inst or k or act):
-            continue
+        # Все сквады в пределах SQUAD_NUMS — реальные провизионированные слоты,
+        # поэтому показываем и пустые: classify() даёт им «свободен» (доступная ёмкость).
         rows.append(dict(
             squad=s, age=k.get("age_days"), ns=k.get("ns"), svcs=k.get("svcs"),
             wh=(float(k["worst_health"]) if k.get("worst_health") is not None else None),
