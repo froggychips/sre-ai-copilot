@@ -11,6 +11,11 @@ kubernetes
 # python-jose was replaced by PyJWT in commit 680b3d0 (CVE-2024-33663 / CVE-2024-33664).
 # Прямая зависимость (app/auth.py: import jwt) — держим явно, чтобы lock-реген её не дропал.
 pyjwt
+# Прямая зависимость (app/api/discord_interactions.py: Ed25519-проверка подписи
+# Discord-вебхуков) — держим явно, иначе pip-compile/dependabot-реген дропает её
+# из requirements.txt (она лишь транзитив google-auth) и CI/чистый venv падает
+# ModuleNotFoundError. Прецедент: PR #161/#158 2026-06-23.
+cryptography
 opentelemetry-api
 opentelemetry-sdk
 opentelemetry-instrumentation-fastapi
