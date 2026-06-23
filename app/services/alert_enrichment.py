@@ -167,6 +167,13 @@ class EnrichedContext:
     # Render: grey + 🔇, без 🚨/@mention; карточка остаётся видимой.
     meta_noise: bool = False
 
+    # gen-mismatch-noise — KubeDeploymentGenerationMismatch при ЗДОРОВЫХ
+    # репликах (ready==desired): observedGeneration отстаёт из-за churn-а
+    # аннотаций внешним контроллером, накат сошёлся. Условный (см.
+    # _detect_gen_mismatch_noise): при ready<desired остаётся громким.
+    # Render тот же muted, что у meta_noise, тег — 🔇 GENERATION-CHURN.
+    gen_mismatch_noise: bool = False
+
     # AM inhibit/silence: если alert.status_extra или labels указывают на
     # suppressed-состояние — заполняется human-readable строкой («🔇 silenced
     # by X», «🔇 inhibited by Y»). None — alert активен. Embed-builder
@@ -478,6 +485,38 @@ def _detect_meta_noise(incident: Incident) -> bool:
         return True
     # Семейство `<Env>NewCriticalAlerts` (Prod/Preprod/Squad/...) — все агрегаты.
     return alertname.endswith("NewCriticalAlerts")
+
+
+def _detect_gen_mismatch_noise(
+    incident: Incident, replicas_ready_desired: Optional[str]
+) -> bool:
+    """True если KubeDeploymentGenerationMismatch — доброкачественный churn.
+
+    metadata.generation != observedGeneration штатно флапает, когда внешний
+    контроллер (Rancher/cattle-cluster-agent дописывает publicEndpoints-
+    аннотацию) бьёт generation, а deployment-контроллер на миг отстаёт —
+    накат при этом давно сошёлся. Тот же alertname, однако, сигналит и
+    реальный зависший накат.
+
+    Различаем по здоровью реплик (ctx.replicas_ready_desired, формат
+    "ready/desired"): приглушаем ТОЛЬКО когда ready==desired и ready>=1.
+    Любая неоднозначность — ready<desired, "?/N", None, нераспарсилось —
+    оставляет alert ГРОМКИМ (fail-safe loud: на проде лучше лишний пинг, чем
+    проспать зависший накат). Не дропаем — помечаем для muted-render-а.
+    """
+    alertname = (incident.labels or {}).get("alertname", "")
+    if alertname != "KubeDeploymentGenerationMismatch":
+        return False
+    if not replicas_ready_desired or "/" not in replicas_ready_desired:
+        return False  # нет данных о репликах → fail-safe loud
+    ready_str, _, desired_str = replicas_ready_desired.partition("/")
+    try:
+        ready = int(ready_str)
+        desired = int(desired_str)
+    except ValueError:
+        return False  # "?/N" и прочее нераспарсиваемое → fail-safe loud
+    # Сошедшийся накат: все желаемые реплики живы и их хотя бы одна.
+    return ready >= 1 and ready == desired
 
 
 def enrich_alert(db: Session, incident: Incident) -> EnrichedContext:
@@ -793,5 +832,17 @@ def enrich_alert(db: Session, incident: Incident) -> EnrichedContext:
         if getattr(settings, "META_NOISE_ENABLED", True)
         else False
     )
+
+    # 9. Gen-mismatch-noise — KubeDeploymentGenerationMismatch при здоровых
+    # репликах = churn observedGeneration, а не зависший накат (прецедент
+    # prod-kingdom7 2026-06-23). Условный, health-gated (см.
+    # _detect_gen_mismatch_noise). Не перекрываем rollout_noise (тот уже
+    # глушит deploy-window кейс) — этот ловит no-deploy churn.
+    if not ctx.rollout_noise and getattr(
+        settings, "GEN_MISMATCH_NOISE_ENABLED", True
+    ):
+        ctx.gen_mismatch_noise = _detect_gen_mismatch_noise(
+            incident, ctx.replicas_ready_desired
+        )
 
     return ctx
