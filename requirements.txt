@@ -12,6 +12,7 @@ attrs==26.1.0
 billiard==4.2.4
 celery[redis]==5.6.3
 certifi==2026.4.22
+cffi==2.0.0
 charset-normalizer==3.4.7
 click==8.3.3
 click-didyoumean==0.3.1
@@ -21,7 +22,7 @@ cryptography==48.0.1
 distro==1.9.0
 docstring-parser==0.18.0
 durationpy==0.10
-fastapi==0.137.1
+fastapi==0.138.0
 frozenlist==1.8.0
 googleapis-common-protos==1.75.0
 greenlet==3.5.0
@@ -57,6 +58,7 @@ prompt-toolkit==3.0.52
 propcache==0.5.2
 protobuf==5.29.6
 psycopg2-binary==2.9.12
+pycparser==3.0
 pydantic==2.13.4
 pydantic-core==2.46.4
 pydantic-settings==2.14.2
