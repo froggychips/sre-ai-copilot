@@ -31,7 +31,7 @@ RUN set -eux; \
 # TCP-upload за один раз (grpcio ~100MB).
 RUN pip install --no-cache-dir \
     grpcio==1.80.0 \
-    cryptography==48.0.0 \
+    cryptography==48.0.1 \
     psycopg2-binary==2.9.12 \
     pydantic-core==2.46.4
 
