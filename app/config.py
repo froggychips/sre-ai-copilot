@@ -180,6 +180,20 @@ class Settings(BaseSettings):
     # grey + 🔇, без 🚨/@mention, карточка остаётся видимой для глазной проверки.
     META_NOISE_ENABLED: bool = True
 
+    # KubeDeploymentGenerationMismatch — УСЛОВНЫЙ шум (alert-quality, прецедент
+    # prod-kingdom7/town-service 2026-06-23). В отличие от meta-noise этот alert
+    # шумный НЕ всегда: generation != observedGeneration штатно флапает, когда
+    # внешний контроллер (Rancher/cattle-cluster-agent дописывает publicEndpoints-
+    # аннотацию на объект) бьёт metadata.generation, а deployment-контроллер на
+    # миг отстаёт observedGeneration — при этом накат давно сошёлся. НО тот же
+    # alertname сигналит и реальный зависший накат («failed but not rolled back»).
+    # Различитель — здоровье реплик: приглушаем ТОЛЬКО при ready==desired (>=1);
+    # при ready<desired / неизвестных репликах оставляем ГРОМКИМ (fail-safe loud,
+    # на проде неоднозначность должна звенеть). Health-gating > namespace-скоуп:
+    # реальный фейл звенит в любом ns. Render как у meta-noise (grey + 🔇, без
+    # 🚨/@mention), тег честный — 🔇 GENERATION-CHURN. kill-switch.
+    GEN_MISMATCH_NOISE_ENABLED: bool = True
+
     # A3: Explicit alertname allowlist — pure-noise alerts которые AM шлёт
     # либо для self-monitoring (Watchdog ping), либо как technical helper
     # (InfoInhibitor — workaround для AM inhibition rules без matchers).

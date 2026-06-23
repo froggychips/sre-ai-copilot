@@ -881,18 +881,21 @@ class DiscordService:
         # Старая `_SEVERITY_COLORS` map оставлена для обратной совместимости
         # incident-path; enriched alert использует новые tier-цвета.
         color = _severity_to_color(severity, resurfaced=resurfaced)
-        if head.rollout_noise or head.meta_noise:
+        # Muted-классы (grey + 🔇, без 🚨/@mention): rollout-normal, meta-агрегат
+        # и gen-mismatch-churn (KubeDeploymentGenerationMismatch при ready==desired).
+        muted_noise = head.rollout_noise or head.meta_noise or head.gen_mismatch_noise
+        if muted_noise:
             color = _COLOR_UNKNOWN
         # A1: suppressed (silenced/inhibited) — orange override, чтобы on-call
         # сразу видел «AM уже знает что заглушено». Имеет приоритет над
-        # severity-color, но не над rollout/meta-noise (оба = grey).
-        if head.inhibition_state and not head.rollout_noise and not head.meta_noise:
+        # severity-color, но не над muted-noise (все = grey).
+        if head.inhibition_state and not muted_noise:
             color = _COLOR_SUPPRESSED
         # Title prefix: новые severity-aware emoji (🚨/⚠️/✅/🔁). Fallback на
         # старый `🔴/🟡/⚪` для unknown. Suppressed состояние имеет свой icon (🟠).
-        # meta-noise (агрегат/scrape-gap) — 🔇, приоритет над 🚨: даёт on-call
-        # сразу понять «это плумбинг-шум, не пожар».
-        if head.meta_noise:
+        # meta/gen-mismatch-noise — 🔇, приоритет над 🚨: даёт on-call сразу
+        # понять «это плумбинг-шум / доброкачественный churn, не пожар».
+        if head.meta_noise or head.gen_mismatch_noise:
             icon = "🔇"
         elif head.inhibition_state and not head.rollout_noise:
             icon = "🟠"
@@ -920,6 +923,8 @@ class DiscordService:
             recurrence_tag = f" · 🔁 ×{rec_max} за 24h"
         if head.meta_noise:
             noise_tag = " · 🔇 META-AGGREGATE"
+        elif head.gen_mismatch_noise:
+            noise_tag = " · 🔇 GENERATION-CHURN"
         elif head.rollout_noise:
             noise_tag = " · 🤖 ROLLOUT-NORMAL"
         else:
@@ -1436,9 +1441,11 @@ class DiscordService:
                 <= int(getattr(settings, "DISCORD_MENTION_SUPPRESS_DEPLOY_WINDOW_MIN", 30))
             )
         )
-        # meta-noise (агрегат/scrape-gap) тоже без пинга — карточка видима,
-        # но on-call не будят ради плумбинг-шума.
-        suppress_mention = suppress_mention_deploy or head.meta_noise
+        # meta-noise (агрегат/scrape-gap) и gen-mismatch-churn тоже без пинга —
+        # карточка видима, но on-call не будят ради плумбинг-шума / churn-а.
+        suppress_mention = (
+            suppress_mention_deploy or head.meta_noise or head.gen_mismatch_noise
+        )
         mention_prefix = (
             ""
             if (is_compact or suppress_mention)
