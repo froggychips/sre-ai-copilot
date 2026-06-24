@@ -450,6 +450,92 @@ Lower thresholds, or check that the seasonal stratification isn't masking the si
 
 ---
 
+## Render-time noise suppression (MUTE) — kill-switches
+
+Two render-time suppression classes (added v0.14.0) keep chronically-noisy
+alert shapes **visible but quiet**: the card still posts — grey + 🔇,
+**without** the 🚨 badge or an `@mention`. These are **MUTE**, not DROP and
+not severity-demote: the incident is still stored and the embed is still
+there for an eyeball check; only the loudness is removed.
+
+They sit in the same render-time row as `rollout_noise`
+(`ROLLOUT_SUPPRESS_ENABLED`, window `ROLLOUT_SUPPRESS_WINDOW_MINUTES`=15 —
+suppress inside a deploy window). Distinguish all three from the
+**input-level DROP** `ALERT_SUPPRESS_NAMES` (Watchdog / InfoInhibitor /
+KubeAPIServerSlo), where the card never appears at all.
+
+| Class | Env (default) | Tag | What it mutes |
+|---|---|---|---|
+| `meta_noise` | `META_NOISE_ENABLED` (true) | 🔇 META-AGGREGATE | Always-noisy meta-aggregates: `*NewCriticalAlerts` (Prod/Preprod/Squad) + control-plane scrape-gap `etcdInsufficientMembers` / `ScrapePoolHasNoTargets` / `RecordingRulesNoData`. Every real critical still arrives as its own loud card, so the aggregate counter adds nothing. |
+| `gen_mismatch_noise` | `GEN_MISMATCH_NOISE_ENABLED` (true) | 🔇 GENERATION-CHURN | **Conditional** churn of `KubeDeploymentGenerationMismatch`. Muted **only** when replicas are healthy (`ready==desired`, `≥1`). When `ready<desired` / `?/N` / `None` / `0/0` → **fail-safe LOUD** — a genuinely stuck rollout still rings in any namespace, including prod. |
+
+### Temporarily restore loudness for a class (kill-switch)
+
+⚠️ These flags are **not** wired into the Helm chart yet — the deployment
+templates only map a fixed set (`executorEnabled`, `safeMode`, `llmBackend`,
+…) via `.Values.env.*`. So `helm upgrade --set env.META_NOISE_ENABLED=false`
+does **nothing**: the chart never consumes that value, and the app keeps its
+config.py default (`true`). The flag is read from env at process **startup**
+(not hot-reloaded), so any change needs a pod restart.
+
+Two ways to disable a class:
+
+**1. Fast / ephemeral — `kubectl set env`.** Set it on **both** deployments:
+render (enrichment + embed build) runs in the worker, while the api holds the
+inline path when `PIPELINE_DIRECT_INVOKE=true`.
+
+```bash
+kubectl set env -n sre-ai \
+  deployment/sre-ai-copilot-api deployment/sre-ai-copilot-worker \
+  META_NOISE_ENABLED=false      # or GEN_MISMATCH_NOISE_ENABLED=false
+```
+
+`kubectl set env` triggers a rollout automatically (no manual restart). This
+override is **wiped by the next `helm upgrade`** — the chart doesn't track it.
+Use it for "make this loud right now while I investigate".
+
+**2. Durable — chart change.** Add the env passthrough to **both**
+`deployment-api.yaml` and `deployment-worker.yaml`, plus a default in
+`values.yaml` (camelCase key, like `executorEnabled`):
+
+```yaml
+# templates/deployment-{api,worker}.yaml — under env:
+- name: META_NOISE_ENABLED
+  value: {{ .Values.env.metaNoiseEnabled | default "true" | quote }}
+
+# values.yaml — under env:
+#   metaNoiseEnabled: "true"
+#   genMismatchNoiseEnabled: "true"
+```
+
+Then `helm upgrade` — now `--set env.metaNoiseEnabled=false` actually takes
+effect and survives subsequent upgrades.
+
+Either way, the muted class reverts to normal severity-routing (loud 🚨 /
+`@mention` on critical). Re-enable by flipping the value back to `true`.
+
+### Diagnosing "why did this alert come in grey with 🔇 and no ping?"
+
+1. **Check the alertname.** Is it a meta-aggregate (`*NewCriticalAlerts`)
+   or a scrape-gap (`etcdInsufficientMembers` / `ScrapePoolHasNoTargets` /
+   `RecordingRulesNoData`)? Then it's `meta_noise` — by design. The real
+   underlying critical, if any, arrives as its own loud card.
+2. **For `KubeDeploymentGenerationMismatch`**, look at the replicas field
+   in the card (`replicas_ready_desired`):
+   - `ready==desired` → intentionally muted (`gen_mismatch_noise`). This is
+     external-controller churn (Rancher rewriting the `publicEndpoints`
+     annotation bumps `metadata.generation` while the rollout has long
+     converged).
+   - card shows degradation (`ready<desired` / `?/N` / `0/0`) **and it's
+     still quiet** → that's a **bug** in the fail-safe path. Inspect the
+     detector and the `replicas_ready_desired` value the embed received —
+     it should have stayed LOUD.
+
+Precedents: `meta_noise` — ProdNewCriticalAlerts 2026-06-16 (PR #154);
+`gen_mismatch_noise` — prod-kingdom7/town-service 2026-06-23 (PR #160).
+
+---
+
 ## Deploy correlator verdict
 
 Every incident enriched by the pipeline gets a `deploy_correlator` block in `analysis`. The verdict tier drives what the Discord embed shows.

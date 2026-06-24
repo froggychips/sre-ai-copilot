@@ -107,14 +107,33 @@ AlertManager webhook
         → JiraClient.search_by_service_sync(...)  # ticket linkback
         → PodEventsRule + RecentDeployRule + UpstreamDegradedRule
         → primary_hypothesis() + why_this_matters()
+        → noise flags: rollout_noise / meta_noise / gen_mismatch_noise (set on EnrichedContext, see §3a-noise)
      → decide_send() (chronic suppress / rollout-silent)
      → DiscordService.send_enriched_alert(contexts, env, resurfaced)
-        → severity-aware embed
+        → severity-aware embed (muted render — grey + 🔇 — when a noise flag is set)
         → confidence badges (●●●/●●○/●○○) with provenance
         → clickable TC build links + deployer name
 ```
 
 Latency budget: <500ms p95 synchronous in HTTP handler. No LLM tokens. Total cost: 0 per alert.
+
+### Alert-quality noise suppression — three distinct mechanisms (v0.14.0)
+
+The pipeline suppresses noise at **three** different layers. They are not interchangeable — keep the taxonomy straight:
+
+| # | Mechanism | Where | Effect on the card | Severity | Examples |
+|---|---|---|---|---|---|
+| 1 | **DROP at ingest** | webhook handler, **before** KG-store and enrichment | card never appears at all | n/a (filtered out) | `ALERT_SUPPRESS_NAMES` (default `Watchdog`, `InfoInhibitor`, `KubeAPIServerSlo…`), extendable via `ALERT_SUPPRESS_NAMES_EXTRA` |
+| 2 | **MUTE at render** | render / `send_enriched_alert` | visible but quiet — grey color + 🔇, no 🚨, no @mention; severity is **not** demoted, card is **not** dropped | preserved | `rollout_noise`, `meta_noise`, `gen_mismatch_noise` (below) |
+| 3 | **chronic suppress** | `decide_send()` | folded into the periodic chronic digest instead of a live ping | preserved | repeatedly-firing chronic alerts (see `chronic_alerts_digest`) |
+
+The three **MUTE** classes (mechanism #2) are set as boolean flags on `EnrichedContext` in `enrich_alert` (step 9 of the enrichment flow above) and consumed by the muted render path in `app/services/discord/service.py` (color / icon / mention):
+
+- **`rollout_noise`** (`ROLLOUT_SUPPRESS_ENABLED`, window `ROLLOUT_SUPPRESS_WINDOW_MINUTES`=15) — suppresses alerts that fire inside an active deploy window (a `kg_deployments` row for the resolved service exists within the last N minutes). Detector `_detect_rollout_noise(incident, recent_deploys)`.
+- **`meta_noise`** (`META_NOISE_ENABLED`, default true) — **always-noisy** meta-aggregates: the `*NewCriticalAlerts` family (Prod/Preprod/Squad/…) plus the derived control-plane scrape-gap alerts `etcdInsufficientMembers` / `ScrapePoolHasNoTargets` / `RecordingRulesNoData`. Safe to mute because every real critical already arrives as its own loud card with service/deploy/KG context — the aggregate counter only restates it. Detector `_detect_meta_noise`, render tag **🔇 META-AGGREGATE**. Precedent: ProdNewCriticalAlerts 2026-06-16 (PR #154).
+- **`gen_mismatch_noise`** (`GEN_MISMATCH_NOISE_ENABLED`, default true) — **conditional** churn of `KubeDeploymentGenerationMismatch`. `metadata.generation != observedGeneration` flaps benignly when an external controller (Rancher / cattle-cluster-agent writing the `publicEndpoints` annotation) bumps `generation` and the deployment controller lags `observedGeneration` for a moment — the rollout has long since converged. But the same alertname also fires for a genuinely stuck rollout. The discriminator is **replica health** `ctx.replicas_ready_desired`: mute **only** when `ready==desired (≥1)`; for `ready<desired` / `?/N` / `None` / `0/0` the alert stays **fail-safe LOUD** (a real stuck rollout rings in any namespace, prod included). Health-gating beats namespace-scope. Detector `_detect_gen_mismatch_noise(incident, replicas_ready_desired)`, render tag **🔇 GENERATION-CHURN**. Precedent: prod-kingdom7 / town-service 2026-06-23 (PR #160). `rollout_noise` takes precedence — `gen_mismatch_noise` is only evaluated when `rollout_noise` is false.
+
+Tests: `tests/test_meta_noise_suppression.py` (12), `tests/test_gen_mismatch_noise.py` (14).
 
 ## 3b. Active Observability Layer (Wave 1–5)
 

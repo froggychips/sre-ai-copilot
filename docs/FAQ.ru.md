@@ -79,6 +79,41 @@ receivers:
 
 ---
 
+## Почему алёрт пришёл серым, с иконкой 🔇 и без пинга/@mention?
+
+Это **намеренное подавление на этапе рендера** (alert-quality), не баг и
+не дроп. Карточку специально оставляют **видимой** (чтобы её можно было
+проверить глазами), но приглушают: серый цвет + 🔇, без 🚨 и без
+@mention. Severity при этом **не** понижается — приглушается только
+рендер.
+
+Приглушают по одной из трёх причин:
+
+- **`🔇 META-AGGREGATE`** (`meta_noise`, env `META_NOISE_ENABLED`):
+  мета-агрегат — счётчик `*NewCriticalAlerts` либо производный
+  control-plane scrape-gap алёрт (`etcdInsufficientMembers` /
+  `ScrapePoolHasNoTargets` / `RecordingRulesNoData`). Каждый реальный
+  критикал и так приходит отдельной громкой карточкой, поэтому агрегат не
+  несёт сигнала.
+- **`🔇 GENERATION-CHURN`** (`gen_mismatch_noise`, env
+  `GEN_MISMATCH_NOISE_ENABLED`): `KubeDeploymentGenerationMismatch` при
+  **здоровых** репликах (`ready==desired`). Внешний контроллер (Rancher)
+  штатно бьёт `metadata.generation`; сам накат давно сошёлся. **Важно:**
+  если реплики деградированы (`ready<desired` или неизвестны) — карточка
+  остаётся **громкой** (fail-safe loud): реальный зависший накат всё
+  равно звенит.
+- **rollout-окно** (`rollout_noise`): алёрт пришёл в окне недавнего
+  деплоя.
+
+Отличие от полностью подавленного (dropped) алёрта: dropped
+(`ALERT_SUPPRESS_NAMES`, Watchdog / InfoInhibitor) вообще не появляется в
+Discord; приглушённый — появляется, но тихо.
+
+Каждый класс можно вернуть в громкий режим, выставив его env-kill-switch
+в `false`.
+
+---
+
 ## Что такое SAFE_MODE?
 
 `SAFE_MODE=true` (по умолчанию): любой `ExecutionIntent` с деструктивным действием (рестарт, скейл, удаление) требует аппрув в Discord перед выполнением.
@@ -249,29 +284,54 @@ Column переписывается идемпотентно через `kg_sync
 
 ## Как добавить новый playbook (Phase A remediation)?
 
-**Короткий ответ: Phase A в плане, не в коде.** На момент v0.12.0
-copilot работает в **advisory-режиме по умолчанию**
-(`EXECUTOR_ENABLED=false`) с opt-in стадией `executor`, которая делает
-только `kubectl --dry-run=server` валидацию. Wave 8 — это «metadata +
-UX polish» фундамент перед тем как строить Phase A (remediation pipeline).
+**Phase A foundation реализован начиная с v0.13.0 (PR #99): decision
+*preview* без executor-а.** Playbook-и матчатся, скорятся по 8 дискретным
+risk axes и прогоняются через rule-based policy evaluator, который выдаёт
+вердикт `auto` / `approve` / `block` — но план **не выполняется**; Phase A
+лишь показывает рекомендованное действие. (Реальные записи остаются за
+отдельным opt-in per-incident `executor`-треком за
+`EXECUTOR_APPROVAL_ENABLED` — он пока не управляется playbook-ами.)
 
-Phase A добавит:
+Playbook — это один YAML-файл со строгой схемой в
+`app/remediation/registry/`, загружается `load_registry()` в
+`app/remediation/playbook.py`. Схема `remediation.playbook/v1` с
+`extra="forbid"` — опечатка в любом ключе падает на parse, не на
+использовании. Чтобы добавить — положи новый `*.yaml` (уникальный `name`)
+с секциями:
 
-- Playbook registry — типизированный `RemediationPlaybook` с
-  preconditions, actions и rollback steps.
-- Confidence gating — только playbook-и с `confidence ≥ 0.8` и
-  KG-quality сигналами выше порога будут пытаться запускаться.
-- Human-in-the-loop — Approve/Decline кнопки на каждом playbook-
-  предложении (HIGH risk auto-apply никогда, by design).
+```yaml
+schema_version: remediation.playbook/v1
+name: cleanup_stale_failed_job          # уникальный; один playbook на файл
+kind: remediation
+description: |
+  Что делает и когда безопасно.
+match:                                   # когда playbook применим
+  classification: stale_failed_job
+  job_age_hours: {gte: 24}               # числовые условия: gte/lte/gt/lt/eq
+  active_jobs: {eq: 0}
+policy:                                  # вердикт по контексту
+  auto:                                  # eligible для auto (когда приедет executor)
+    namespace_tier: ["dev", "squad"]
+    owner_kind: "CronJob"
+  approve:                               # требуется human approval
+    namespace_tier: ["dev", "squad"]
+    owner_kind: ["None", "helm_hook"]
+  block:                                 # никогда не действовать
+    any:
+      namespace_tier: ["prod", "preprod", "system"]
+plan:                                    # шаблонная команда + read-only preview
+  command: ["kubectl", "delete", "job", "{job_name}", "-n", "{namespace}"]
+  preview: ["kubectl", "get", "job", "{job_name}", "-n", "{namespace}", "-o", "yaml"]
+observe:                                 # сигналы success / failure
+  timeout: 5m
+  success: {job_exists: false}
+  failure: {job_exists: true, new_job_failed: true}
+```
 
-План лежит в user-memory `project_remediation_pipeline_plan.md` (пока
-не в репо). Когда Phase A приедет, эта запись FAQ будет обновлена с
-реальными инструкциями по авторству playbook-ов.
-
-Пока что см. [Roadmap → Execution](../README.md#roadmap--execution-1) в
-README — executor-трек построен (PR #23/#26/#27) и закрыт за
-`EXECUTOR_APPROVAL_ENABLED=true` для ad-hoc human-approved действий на
-отдельных инцидентах.
+Канонический пример — `app/remediation/registry/cleanup_stale_failed_job.yaml`;
+см. [Roadmap → Execution](../README.md#roadmap--execution-1) про то, как
+executor-трек (per-incident `kubectl --dry-run=server` + Discord Apply,
+PR #23/#26/#27) соотносится с этим preview-слоем.
 
 ---
 
