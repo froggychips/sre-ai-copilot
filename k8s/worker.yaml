@@ -126,7 +126,11 @@ spec:
         resources:
           limits:
             cpu: 100m
-            memory: 128Mi
+            # 128Mi → 256Mi: beat OOMKilled (exit 137) каждые ~10-13 мин (1565
+            # рестартов на старом поде). Import-футпринт стека (kubernetes-client
+            # + opentelemetry + sqlalchemy + anthropic + celery) не влезал в
+            # 128Mi. beat — лёгкий планировщик в рантайме, 256Mi с запасом. 2026-06-24.
+            memory: 256Mi
           requests:
             cpu: 50m
-            memory: 64Mi
+            memory: 128Mi
