@@ -107,14 +107,33 @@ AlertManager webhook
         → JiraClient.search_by_service_sync(...)  # ticket linkback
         → PodEventsRule + RecentDeployRule + UpstreamDegradedRule
         → primary_hypothesis() + why_this_matters()
+        → noise-флаги: rollout_noise / meta_noise / gen_mismatch_noise (ставятся на EnrichedContext, см. §3a-noise)
      → decide_send() (chronic suppress / rollout-silent)
      → DiscordService.send_enriched_alert(contexts, env, resurfaced)
-        → severity-aware embed
+        → severity-aware embed (muted-render — grey + 🔇 — если выставлен noise-флаг)
         → confidence badges (●●●/●●○/●○○) с provenance
         → кликабельные TC build links + deployer name
 ```
 
 Latency budget: <500ms p95 synchronous в HTTP handler. 0 LLM-токенов. Стоимость на alert: 0.
+
+### Подавление шума alert-quality — три разных механизма (v0.14.0)
+
+Пайплайн подавляет шум на **трёх** разных уровнях. Их нельзя путать — держим таксономию явно:
+
+| # | Механизм | Где | Что с карточкой | Severity | Примеры |
+|---|---|---|---|---|---|
+| 1 | **DROP на входе** | webhook handler, **до** KG-store и enrichment | карточка вообще не появляется | n/a (отфильтрована) | `ALERT_SUPPRESS_NAMES` (default `Watchdog`, `InfoInhibitor`, `KubeAPIServerSlo…`), расширяется через `ALERT_SUPPRESS_NAMES_EXTRA` |
+| 2 | **MUTE на render-е** | render / `send_enriched_alert` | видна, но тихо — grey + 🔇, без 🚨, без @mention; severity **не** демотится, карточка **не** дропается | сохраняется | `rollout_noise`, `meta_noise`, `gen_mismatch_noise` (ниже) |
+| 3 | **chronic suppress** | `decide_send()` | сворачивается в периодический chronic-дайджест вместо живого пинга | сохраняется | повторно-флапающие chronic-алёрты (см. `chronic_alerts_digest`) |
+
+Три класса **MUTE** (механизм #2) выставляются булевыми флагами на `EnrichedContext` в `enrich_alert` (шаг 9 enrichment-флоу выше) и читаются muted-render-путём в `app/services/discord/service.py` (color / icon / mention):
+
+- **`rollout_noise`** (`ROLLOUT_SUPPRESS_ENABLED`, окно `ROLLOUT_SUPPRESS_WINDOW_MINUTES`=15) — приглушает алёрты, сработавшие в окне активного деплоя (есть `kg_deployments` для резолвенного сервиса за последние N минут). Детектор `_detect_rollout_noise(incident, recent_deploys)`.
+- **`meta_noise`** (`META_NOISE_ENABLED`, default true) — **ВСЕГДА-шумные** мета-агрегаты: семейство `*NewCriticalAlerts` (Prod/Preprod/Squad/…) плюс производные control-plane scrape-gap `etcdInsufficientMembers` / `ScrapePoolHasNoTargets` / `RecordingRulesNoData`. Приглушать безопасно, потому что каждый реальный критикал и так приходит отдельной громкой карточкой со своим сервисом/деплоем/KG — агрегат-счётчик лишь повторяет его. Детектор `_detect_meta_noise`, тег рендера **🔇 META-AGGREGATE**. Прецедент: ProdNewCriticalAlerts 2026-06-16 (PR #154).
+- **`gen_mismatch_noise`** (`GEN_MISMATCH_NOISE_ENABLED`, default true) — **УСЛОВНЫЙ** churn `KubeDeploymentGenerationMismatch`. `metadata.generation != observedGeneration` штатно флапает, когда внешний контроллер (Rancher / cattle-cluster-agent дописывает аннотацию `publicEndpoints`) бьёт `generation`, а deployment-контроллер на миг отстаёт `observedGeneration` — накат давно сошёлся. Но тот же alertname сигналит и реальный зависший накат. Различитель — **здоровье реплик** `ctx.replicas_ready_desired`: приглушаем **ТОЛЬКО** при `ready==desired (≥1)`; при `ready<desired` / `?/N` / `None` / `0/0` алёрт остаётся **fail-safe LOUD** (реальный зависший накат звенит в любом ns, включая prod). Health-gating > namespace-скоуп. Детектор `_detect_gen_mismatch_noise(incident, replicas_ready_desired)`, тег рендера **🔇 GENERATION-CHURN**. Прецедент: prod-kingdom7 / town-service 2026-06-23 (PR #160). `rollout_noise` имеет приоритет — `gen_mismatch_noise` вычисляется только когда `rollout_noise` false.
+
+Тесты: `tests/test_meta_noise_suppression.py` (12), `tests/test_gen_mismatch_noise.py` (14).
 
 ## 3b. Active Observability Layer (Wave 1–5)
 

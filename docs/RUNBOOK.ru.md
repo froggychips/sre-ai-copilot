@@ -449,6 +449,93 @@ KG_ANOMALY_ROBUST_Z_CRIT="6.0"   # default — производит "critical" �
 
 ---
 
+## Render-time подавление шума (MUTE) — kill-switch'и
+
+Два render-time класса подавления (добавлены в v0.14.0) держат хронически-
+шумные формы алёртов **видимыми, но тихими**: карточка всё равно постится —
+grey + 🔇, **без** бейджа 🚨 и без `@mention`. Это **MUTE**, не DROP и не
+demote severity: инцидент по-прежнему сохраняется, embed на месте для глазной
+проверки — убирается только громкость.
+
+Они в том же render-time ряду, что и `rollout_noise`
+(`ROLLOUT_SUPPRESS_ENABLED`, окно `ROLLOUT_SUPPRESS_WINDOW_MINUTES`=15 —
+подавление в окне деплоя). Отличать все три от **input-level DROP**
+`ALERT_SUPPRESS_NAMES` (Watchdog / InfoInhibitor / KubeAPIServerSlo), где
+карточка вообще не появляется.
+
+| Класс | Env (default) | Тег | Что приглушает |
+|---|---|---|---|
+| `meta_noise` | `META_NOISE_ENABLED` (true) | 🔇 META-AGGREGATE | Всегда-шумные мета-агрегаты: `*NewCriticalAlerts` (Prod/Preprod/Squad) + control-plane scrape-gap `etcdInsufficientMembers` / `ScrapePoolHasNoTargets` / `RecordingRulesNoData`. Каждый реальный критикал и так приходит отдельной громкой карточкой, агрегат-счётчик ничего не добавляет. |
+| `gen_mismatch_noise` | `GEN_MISMATCH_NOISE_ENABLED` (true) | 🔇 GENERATION-CHURN | **Условный** churn `KubeDeploymentGenerationMismatch`. Приглушаем **только** при здоровых репликах (`ready==desired`, `≥1`). При `ready<desired` / `?/N` / `None` / `0/0` → **fail-safe LOUD** — реально зависший накат всё равно звенит в любом namespace, включая prod. |
+
+### Временно вернуть громкость классу (kill-switch)
+
+⚠️ Эти флаги пока **не** проброшены в Helm-чарт — шаблоны деплойментов мапят
+лишь фиксированный набор (`executorEnabled`, `safeMode`, `llmBackend`, …)
+через `.Values.env.*`. Поэтому `helm upgrade --set env.META_NOISE_ENABLED=false`
+**ничего не делает**: чарт это значение не потребляет, приложение остаётся на
+дефолте из config.py (`true`). Флаг читается из env на **старте** процесса
+(не hot-reload), так что любая смена требует рестарта подов.
+
+Два способа отключить класс:
+
+**1. Быстро / эфемерно — `kubectl set env`.** Выставить на **обоих**
+деплойментах: render (enrichment + сборка embed) идёт в worker, а api держит
+inline-путь при `PIPELINE_DIRECT_INVOKE=true`.
+
+```bash
+kubectl set env -n sre-ai \
+  deployment/sre-ai-copilot-api deployment/sre-ai-copilot-worker \
+  META_NOISE_ENABLED=false      # или GEN_MISMATCH_NOISE_ENABLED=false
+```
+
+`kubectl set env` сам триггерит rollout (ручной рестарт не нужен). Этот
+override **затирается следующим `helm upgrade`** — чарт его не отслеживает.
+Использовать для «сделать громким прямо сейчас, пока разбираюсь».
+
+**2. Durable — изменение чарта.** Добавить env-проброс в **оба** шаблона
+`deployment-api.yaml` и `deployment-worker.yaml` + дефолт в `values.yaml`
+(camelCase-ключ, как `executorEnabled`):
+
+```yaml
+# templates/deployment-{api,worker}.yaml — в блок env:
+- name: META_NOISE_ENABLED
+  value: {{ .Values.env.metaNoiseEnabled | default "true" | quote }}
+
+# values.yaml — под env:
+#   metaNoiseEnabled: "true"
+#   genMismatchNoiseEnabled: "true"
+```
+
+Затем `helm upgrade` — теперь `--set env.metaNoiseEnabled=false` реально
+сработает и переживёт последующие upgrade-ы.
+
+В обоих случаях приглушённый класс возвращается к обычному severity-routing
+(громко 🚨 / `@mention` на critical). Вернуть назад — флипнуть значение
+обратно в `true`.
+
+### Диагностика «почему алёрт пришёл серым с 🔇 и без пинга?»
+
+1. **Смотрим alertname.** Это мета-агрегат (`*NewCriticalAlerts`) или
+   scrape-gap (`etcdInsufficientMembers` / `ScrapePoolHasNoTargets` /
+   `RecordingRulesNoData`)? Тогда это `meta_noise` — by design. Реальный
+   критикал под ним, если он есть, приходит отдельной громкой карточкой.
+2. **Для `KubeDeploymentGenerationMismatch`** — смотрим поле реплик в
+   карточке (`replicas_ready_desired`):
+   - `ready==desired` → приглушён намеренно (`gen_mismatch_noise`). Это
+     churn от внешнего контроллера (Rancher дописывает аннотацию
+     `publicEndpoints` → бьёт `metadata.generation`, хотя накат давно
+     сошёлся).
+   - карточка показывает деградацию (`ready<desired` / `?/N` / `0/0`),
+     **а всё равно тихо** → это **баг** в fail-safe-пути. Проверить
+     детектор и значение `replicas_ready_desired`, которое получил embed —
+     он должен был остаться LOUD.
+
+Прецеденты: `meta_noise` — ProdNewCriticalAlerts 2026-06-16 (PR #154);
+`gen_mismatch_noise` — prod-kingdom7/town-service 2026-06-23 (PR #160).
+
+---
+
 ## Deploy correlator verdict
 
 Каждый инцидент, прошедший enrichment, получает блок `deploy_correlator` в `analysis`. Verdict tier управляет тем, что покажет Discord embed.
