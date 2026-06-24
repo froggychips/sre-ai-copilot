@@ -79,6 +79,40 @@ Alert arrives at POST /webhooks/alertmanager
 
 ---
 
+## Why did an alert show up greyed-out with a 🔇 icon and no @mention?
+
+That is **deliberate render-time suppression** (alert-quality), not a bug
+and not a drop. The card is intentionally kept **visible** (so you can
+still eyeball it) but muted: grey colour + 🔇, with no 🚨 and no
+@mention. Severity is **not** downgraded — only the rendering is toned
+down.
+
+There are three reasons a card is muted:
+
+- **`🔇 META-AGGREGATE`** (`meta_noise`, env `META_NOISE_ENABLED`): a
+  meta-aggregate `*NewCriticalAlerts` counter, or a derived control-plane
+  scrape-gap alert (`etcdInsufficientMembers` / `ScrapePoolHasNoTargets` /
+  `RecordingRulesNoData`). Every real critical already arrives as its own
+  loud card, so the aggregate adds no signal.
+- **`🔇 GENERATION-CHURN`** (`gen_mismatch_noise`, env
+  `GEN_MISMATCH_NOISE_ENABLED`): `KubeDeploymentGenerationMismatch` while
+  replicas are **healthy** (`ready==desired`). An external controller
+  (Rancher) bumps `metadata.generation` as a matter of course; the rollout
+  itself converged long ago. **Important:** if replicas are degraded
+  (`ready<desired` or unknown) the card stays **loud** (fail-safe loud) —
+  a genuinely stuck rollout still rings.
+- **rollout window** (`rollout_noise`): the alert arrived inside the
+  window of a recent deploy.
+
+How this differs from a fully suppressed (dropped) alert: a dropped alert
+(`ALERT_SUPPRESS_NAMES`, Watchdog / InfoInhibitor) never appears in
+Discord at all; a muted alert does appear, just quietly.
+
+Each class can be put back into loud mode by setting its env kill-switch
+to `false`.
+
+---
+
 ## What is SAFE_MODE?
 
 `SAFE_MODE=true` (default): any `ExecutionIntent` that would take a destructive action (restart, scale, delete) requires Discord approval before execution.
@@ -248,29 +282,53 @@ for what to check when the table stops filling.
 
 ## How do I add a new playbook (Phase A remediation)?
 
-**Short answer: Phase A is planned, not implemented.** As of v0.12.0
-the copilot is in **advisory mode by default** (`EXECUTOR_ENABLED=false`)
-with an opt-in `executor` stage that does `kubectl --dry-run=server`
-validation only. Wave 8 is the "metadata + UX polish" foundation before
-Phase A (remediation pipeline) is built.
+**Phase A foundation is implemented as of v0.13.0 (PR #99): decision
+*preview* without an executor.** Playbooks are matched, scored against 8
+discrete risk axes, and run through a rule-based policy evaluator that
+produces an `auto` / `approve` / `block` verdict — but the plan is **not
+executed**; Phase A only surfaces the recommended action. (Actual writes
+remain the separate, opt-in per-incident `executor` track gated behind
+`EXECUTOR_APPROVAL_ENABLED` — it is not yet driven by playbooks.)
 
-Phase A will introduce:
+A playbook is a single strict-schema YAML file in
+`app/remediation/registry/`, loaded by `load_registry()` in
+`app/remediation/playbook.py`. Schema is `remediation.playbook/v1` with
+`extra="forbid"` — a typo in any key fails at parse time, not at use.
+To add one, drop a new `*.yaml` (unique `name`) with these sections:
 
-- Playbook registry — typed `RemediationPlaybook` with preconditions,
-  actions, and rollback steps.
-- Confidence gating — only playbooks with `confidence ≥ 0.8` and
-  KG-quality signals above threshold get attempted.
-- Human-in-the-loop — Approve/Decline buttons on every playbook
-  proposal (no auto-apply for HIGH risk, ever).
+```yaml
+schema_version: remediation.playbook/v1
+name: cleanup_stale_failed_job          # unique; one playbook per file
+kind: remediation
+description: |
+  What this does and when it is safe.
+match:                                   # when this playbook applies
+  classification: stale_failed_job
+  job_age_hours: {gte: 24}               # numeric constraints: gte/lte/gt/lt/eq
+  active_jobs: {eq: 0}
+policy:                                  # verdict by context
+  auto:                                  # eligible for auto (when executor lands)
+    namespace_tier: ["dev", "squad"]
+    owner_kind: "CronJob"
+  approve:                               # human approval required
+    namespace_tier: ["dev", "squad"]
+    owner_kind: ["None", "helm_hook"]
+  block:                                 # never act
+    any:
+      namespace_tier: ["prod", "preprod", "system"]
+plan:                                    # templated command + read-only preview
+  command: ["kubectl", "delete", "job", "{job_name}", "-n", "{namespace}"]
+  preview: ["kubectl", "get", "job", "{job_name}", "-n", "{namespace}", "-o", "yaml"]
+observe:                                 # success / failure signals
+  timeout: 5m
+  success: {job_exists: false}
+  failure: {job_exists: true, new_job_failed: true}
+```
 
-The plan lives in user-memory `project_remediation_pipeline_plan.md`
-(not in this repo yet). When Phase A lands, this FAQ entry will be
-updated with the actual playbook authoring instructions.
-
-For now, see [Roadmap → Execution](../README.md#roadmap--execution) in
-the README — the executor track is built (PR #23/#26/#27) and gated
-behind `EXECUTOR_APPROVAL_ENABLED=true` for ad-hoc human-approved actions
-on individual incidents.
+See `app/remediation/registry/cleanup_stale_failed_job.yaml` for the
+canonical example, and [Roadmap → Execution](../README.md#roadmap--execution)
+for how the executor track (per-incident `kubectl --dry-run=server` +
+Discord Apply, PR #23/#26/#27) relates to this preview layer.
 
 ---
 

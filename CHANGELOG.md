@@ -4,6 +4,53 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+_Ничего в очереди — см. [0.14.0] ниже._
+
+## [0.14.0] — 2026-06-23 — Alert-quality: подавление шума + ops-харднинг
+
+Серия алерт-качества: два новых класса подавления шума на этапе render-а (НЕ
+дроп и НЕ демот severity — карточка остаётся видимой, но приглушается: grey +
+🔇, без 🚨/@mention), плюс операционные фиксы (beat OOM, объявление first-party
+зависимостей) и наполнение `kg_ingress_observations`.
+
+### Подавление шума на этапе render (alert-quality)
+
+- **`meta_noise` — мета-агрегаты и scrape-gap (PR #154, прецедент
+  ProdNewCriticalAlerts 2026-06-16)**: класс по образцу `rollout_noise`, но
+  шумящий ВСЕГДА, не в окне деплоя. Ловит `*NewCriticalAlerts`
+  (Prod/Preprod/Squad) — агрегат-счётчик, дублирующий сигнал (каждый реальный
+  критикал и так приходит отдельной громкой карточкой со своим
+  сервисом/деплоем/KG) — и производные control-plane scrape-gap
+  (`etcdInsufficientMembers` / `ScrapePoolHasNoTargets` /
+  `RecordingRulesNoData`). `META_NOISE_ENABLED` kill-switch; `_detect_meta_noise`
+  + флаг `meta_noise` на `EnrichedContext` (выставляется в `enrich_alert`);
+  muted-рендер в `discord/service.py` (тег 🔇 META-AGGREGATE). 12 тестов
+  (`tests/test_meta_noise_suppression.py`).
+- **`gen_mismatch_noise` — условный churn `KubeDeploymentGenerationMismatch`
+  (PR #160, прецедент prod-kingdom7/town-service 2026-06-23)**: в отличие от
+  meta-noise шумит НЕ всегда. `metadata.generation != observedGeneration`
+  штатно флапает, когда внешний контроллер (Rancher/cattle-cluster-agent
+  дописывает publicEndpoints-аннотацию) бьёт generation, а deployment-
+  контроллер на миг отстаёт — накат давно сошёлся. Тот же alertname, однако,
+  сигналит и реальный зависший накат. Различитель — здоровье реплик
+  (`ctx.replicas_ready_desired`): `ready==desired (≥1)` → приглушаем (🔇
+  GENERATION-CHURN); `ready<desired` / `?/N` / `None` / `0/0` → **fail-safe
+  LOUD** (реальный фейл звенит в любом ns, включая prod). Health-gating >
+  namespace-скоуп. Не перекрывает `rollout_noise` (тот глушит deploy-window
+  кейс) — этот ловит no-deploy churn. `GEN_MISMATCH_NOISE_ENABLED` kill-switch.
+  14 тестов (`tests/test_gen_mismatch_noise.py`).
+
+### Операционка / зависимости
+
+- **`copilot-beat` memory 128Mi→256Mi (OOMKilled крашлуп)** — `k8s/worker.yaml`.
+- **Объявлены first-party зависимости `cryptography==48.0.1` +
+  `pydantic-settings==2.14.2` (PR #161/#162)** — импортились, но не были в
+  `requirements.in` → красный CI на dependabot-PR (CI ставит только
+  `requirements.txt`); durable-фикс закрыл дрейф `requirements.in` vs Dockerfile
+  и CVE.
+- **Bumps**: anthropic 0.107→0.111, fastapi 0.136→0.138, sqlalchemy 2.0.50→
+  2.0.51, kubernetes 31.0.0→36.0.2, starlette (pip group), actions/checkout 6→7.
+
 ### KG coverage — ingress-метрики live (2026-06-10)
 
 - **nginx-ingress метрики включены на кластере**: `--enable-metrics=true` на

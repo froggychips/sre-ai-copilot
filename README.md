@@ -2,9 +2,9 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Python](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/)
-[![FastAPI](https://img.shields.io/badge/FastAPI-0.104-009688)](https://fastapi.tiangolo.com/)
-[![Celery](https://img.shields.io/badge/Celery-5.3-37814A)](https://docs.celeryq.dev/)
-[![Release](https://img.shields.io/badge/release-v0.12.0-blue)](CHANGELOG.md)
+[![FastAPI](https://img.shields.io/badge/FastAPI-0.138-009688)](https://fastapi.tiangolo.com/)
+[![Celery](https://img.shields.io/badge/Celery-5.6-37814A)](https://docs.celeryq.dev/)
+[![Release](https://img.shields.io/badge/release-v0.14.0-blue)](CHANGELOG.md)
 
 > **[English](#english) · [Русский](#русский)**
 
@@ -25,6 +25,29 @@
 
 ### What's new
 
+- **v0.14.0 — Alert-quality: noise suppression + ops hardening**: two new
+  render-time suppression classes that keep noisy alerts *visible but muted*
+  (grey + 🔇, no 🚨/@mention) instead of dropping or demoting them. `meta_noise`
+  catches always-noisy meta-aggregates (`*NewCriticalAlerts`,
+  `etcdInsufficientMembers`, `ScrapePoolHasNoTargets`, `RecordingRulesNoData`) —
+  each real critical still arrives as its own loud card. `gen_mismatch_noise`
+  catches *conditional* `KubeDeploymentGenerationMismatch` churn (external
+  controller bumps `metadata.generation`, rollout already converged): muted
+  **only** when replicas `ready==desired (≥1)`; fail-safe **LOUD** when
+  `ready<desired`/unknown so a genuinely stuck rollout still rings in any
+  namespace, including prod. Both gated by kill-switches (`META_NOISE_ENABLED`,
+  `GEN_MISMATCH_NOISE_ENABLED`). Ops: `copilot-beat` memory 128Mi→256Mi
+  (OOMKill crashloop fix), `cryptography`/`pydantic-settings` declared as
+  first-party deps (CI-drift + CVE fix).
+- **v0.13.0 — Security Hardening + Remediation Phase A**: authz/integrity
+  hardening across the executor/approval paths (closed apply/approve gaps,
+  removed response leaks, authz on previously-open handles incl. `/stats`),
+  PromQL-injection + SQLAlchemy session-leak + webhook insert-race fixes,
+  pipeline state-machine correctness (per-stage timeout, `TRIAGE_REQUIRED` in
+  the terminal skip-set). Remediation **Phase A** foundation: decision
+  *preview without executor* (8 discrete risk axes, YAML playbooks, rule-based
+  policy evaluator) + ownership manifest for `*-shared` infra; resilience
+  primitives wired into the hot-path.
 - **2026-06-10 — KG ingress coverage live**: nginx-ingress metrics enabled on
   both WO controllers (shared + prod); `kg_ingress_observations` is now
   populated every ~10 min with per-host/path p95/p99/rps/4xx/5xx, 100% of
@@ -63,6 +86,7 @@
 - Runs a **multi-hypothesis fan-out** across 4 perspectives (app / infra / deps / runtime) filtered by `PERSPECTIVE_PRECONDITIONS`, then adversarially grounds each hypothesis against the `FactStore` via `FactCriticAgent`.
 - Enriches context with **cluster-wide health snapshot** at incident time: nodes ready, pod failures, crashloops, CPU/mem/disk peak, firing alert counts — same metrics as the `#stats` daily report. Lets the LLM distinguish "isolated pod issue" from "cluster-wide pressure."
 - Supports **Node\* alerts** (NodeDiskIOSaturation, NodeMemoryWillExhaustSoon, …): `instance`/`node` labels are used for enrichment and displayed in the Discord embed instead of `pod`.
+- **Alert-quality noise suppression**: meta-aggregate alerts (`*NewCriticalAlerts`, control-plane scrape-gap derivatives) and *conditional* `KubeDeploymentGenerationMismatch` churn are rendered **muted** (grey + 🔇, no 🚨/@mention) rather than dropped — visible for eyeballing but never paging. `gen_mismatch_noise` is health-gated (muted only when `ready==desired`, LOUD otherwise); both classes have kill-switches. Distinct from the input-level `ALERT_SUPPRESS_NAMES` drop and from `rollout_noise` deploy-window suppression.
 - Enriches context from **Atlassian Jira** (open/resolved tickets for the service), **TeamCity** (recent deploys), and **VictoriaMetrics** (memory/CPU window per pod + cluster health).
 - Detects **recurrence**: same service resolved < 7 days → `FixAgent` switches to investigative mode (no restart recommendations).
 - Posts a **single Discord embed** per incident (title + root cause + synthesis + feedback buttons), replacing the previous two-message flow.
@@ -127,6 +151,10 @@ PIPELINE_DIRECT_INVOKE=true
 | `VICTORIA_METRICS_URL` | Pod metrics window + cluster health snapshot | optional |
 | `TEAMCITY_MCP_URL` / `TEAMCITY_MCP_TOKEN` | Deploy context via TeamCity MCP | optional |
 | `PIPELINE_DIRECT_INVOKE` | Run pipeline inline (skip Celery) — for local e2e | dev |
+| `ROLLOUT_SUPPRESS_ENABLED` | Mute alerts inside a deploy window (`rollout_noise`); default `true` | optional |
+| `META_NOISE_ENABLED` | Mute always-noisy meta-aggregate / scrape-gap alerts; default `true` | optional |
+| `GEN_MISMATCH_NOISE_ENABLED` | Mute `KubeDeploymentGenerationMismatch` churn when replicas healthy; default `true` | optional |
+| `EXECUTOR_ENABLED` / `EXECUTOR_APPROVAL_ENABLED` | Opt-in executor stage + Discord Apply button; default `false` | optional |
 
 ### Discord integration
 
@@ -145,9 +173,9 @@ Set `DISCORD_PUBLIC_KEY` (from General Information) in `.env`. For local testing
 cloudflared tunnel --url http://localhost:8000
 ```
 
-> **⏳ Experiment running until 2026-05-15**: single embed replaces the two-message flow
-> (Spidey Bot raw alert + copilot analysis). After evaluation — readability, missed alerts,
-> latency — the routing will be either confirmed or reverted. To activate on the real channel:
+> **✅ Confirmed (post-experiment)**: the single embed replaced the previous two-message flow
+> (Spidey Bot raw alert + copilot analysis) — the routing is now the default in production.
+> To activate on a fresh channel:
 > 1. Remove the direct AlertManager → Discord webhook for incident alerts.
 > 2. Set `DISCORD_WEBHOOK_URL` in production `.env`.
 > 3. Set `DISCORD_DRY_RUN=false`.
@@ -157,7 +185,7 @@ cloudflared tunnel --url http://localhost:8000
 ```bash
 helm install sre-ai-copilot helm/sre-ai-copilot/ \
   --set ingress.host=sre-ai.example.com \
-  --set image.tag=0.6.0
+  --set image.tag=0.14.0
 ```
 
 Fill secrets before installing — see `helm/sre-ai-copilot/templates/secret.yaml`.
@@ -208,9 +236,9 @@ The executor track is **delivered and gated behind explicit opt-in flags** as of
 | 1 | `FixAgent` emits structured `ExecutionIntent` alongside prose | ✅ v0.7.0 (PR #23) |
 | 2 | `executor` stage after `risk` with `dry_run=True` + `K8sSecurityGuard.validate` | ✅ v0.7.0 (PR #26) |
 | 3 | Discord Apply consumer with two-click confirm → real `kubectl` under guard | ✅ v0.7.0 (PR #27) |
-| 4 | End-to-end smoke on non-prod `squad-*` cluster + production ramp-up plan | 🟡 In progress (this PR) |
+| 4 | End-to-end smoke on non-prod `squad-*` cluster + production ramp-up plan | 🟡 Operational ramp-up — advisory mode is the production default; opt-in apply (`EXECUTOR_APPROVAL_ENABLED`) not yet enabled on shared clusters |
 
-**Ramp-up plan (post-merge):**
+**Ramp-up plan:**
 
 1. **Dev**: `EXECUTOR_ENABLED=true`, `EXECUTOR_APPROVAL_ENABLED=true` on local dev with `DISCORD_DRY_RUN=true` — verify embed buttons appear correctly.
 2. **One preprod squad-N namespace**: enable both flags via Helm value override; trigger a synthetic alert (or wait for a real one); click Apply on a low-risk action (`get_logs`, `describe_resource`). Verify `executor_applied` row in DB and audit log.
@@ -258,6 +286,29 @@ See [docs/RUNBOOK.md → Executor incidents](docs/RUNBOOK.md#executor-incidents)
 
 ### Что нового
 
+- **v0.14.0 — Alert-quality: подавление шума + ops-харднинг**: два новых
+  класса подавления на этапе render-а — шумные алёрты остаются *видимыми, но
+  приглушёнными* (grey + 🔇, без 🚨/@mention), а не дропаются и не демотятся по
+  severity. `meta_noise` ловит всегда-шумные мета-агрегаты (`*NewCriticalAlerts`,
+  `etcdInsufficientMembers`, `ScrapePoolHasNoTargets`, `RecordingRulesNoData`) —
+  каждый реальный критикал всё равно приходит отдельной громкой карточкой.
+  `gen_mismatch_noise` ловит *условный* churn `KubeDeploymentGenerationMismatch`
+  (внешний контроллер бьёт `metadata.generation`, накат давно сошёлся):
+  приглушаем **только** при `ready==desired (≥1)`; fail-safe **LOUD** при
+  `ready<desired`/неизвестных репликах, чтобы реально зависший накат звенел в
+  любом ns, включая prod. Оба за kill-switch (`META_NOISE_ENABLED`,
+  `GEN_MISMATCH_NOISE_ENABLED`). Ops: память `copilot-beat` 128Mi→256Mi
+  (фикс OOMKill-крашлупа), `cryptography`/`pydantic-settings` объявлены как
+  first-party зависимости (фикс CI-дрейфа + CVE).
+- **v0.13.0 — Security Hardening + Remediation Phase A**: харднинг
+  authz/integrity на путях executor/approval (закрыты дыры apply/approve,
+  убраны утечки в ответах, авторизация на ранее открытых ручках вкл. `/stats`),
+  фиксы PromQL-инъекции + утечек сессий SQLAlchemy + webhook insert-race,
+  корректность стейт-машины пайплайна (per-stage timeout, `TRIAGE_REQUIRED` в
+  терминальном skip-сете). Remediation **Phase A**: decision *preview без
+  executor* (8 risk axes, YAML playbooks, rule-based policy evaluator) +
+  ownership manifest для `*-shared` инфраструктуры; resilience-примитивы в
+  hot-path.
 - **2026-06-10 — KG ingress coverage live**: nginx-ingress метрики включены
   на обоих контроллерах WO (shared + prod); `kg_ingress_observations`
   наполняется каждые ~10 мин per-host/path p95/p99/rps/4xx/5xx, 100% рядов
@@ -296,6 +347,7 @@ See [docs/RUNBOOK.md → Executor incidents](docs/RUNBOOK.md#executor-incidents)
 - Запускает **многогипотезный fan-out** по 4 перспективам (app / infra / deps / runtime) с фильтром `PERSPECTIVE_PRECONDITIONS`, затем adversarially проверяет каждую гипотезу через `FactCriticAgent`.
 - Обогащает контекст **snapshot кластерного здоровья** в момент инцидента: ноды ready, упавшие поды, crashloop-ы, CPU/mem/disk peak, счётчики firing alerts — те же метрики, что в ежедневном отчёте `#stats`. Позволяет LLM различать «изолированный pod» и «кластерное давление».
 - Поддерживает **Node\*-алерты** (NodeDiskIOSaturation, NodeMemoryWillExhaustSoon, …): labels `instance`/`node` используются для обогащения и отображаются в Discord вместо `pod`.
+- **Подавление шумных алёртов (alert-quality)**: мета-агрегаты (`*NewCriticalAlerts`, производные control-plane scrape-gap) и *условный* churn `KubeDeploymentGenerationMismatch` рендерятся **приглушённо** (grey + 🔇, без 🚨/@mention), а не дропаются — видимы для глазной проверки, но не пейджат. `gen_mismatch_noise` health-gated (приглушаем только при `ready==desired`, иначе LOUD); у обоих классов есть kill-switch. Отличается от input-уровня `ALERT_SUPPRESS_NAMES` (дроп) и от `rollout_noise` (подавление в окне деплоя).
 - Обогащает контекст из **Atlassian Jira** (тикеты по сервису), **TeamCity** (последние деплои), **VictoriaMetrics** (память/CPU пода + кластерный snapshot).
 - Детектирует **рецидивы**: тот же сервис resolved < 7 дней → `FixAgent` переключается в investigative-режим (не рекомендует рестарт).
 - Постит **один Discord embed** на инцидент (заголовок алерта + root cause + синтез + кнопки фидбека), заменяя прежние два сообщения.
@@ -351,6 +403,10 @@ PIPELINE_DIRECT_INVOKE=true
 | `VICTORIA_METRICS_URL` | Метрики пода + кластерный snapshot | опционально |
 | `TEAMCITY_MCP_URL` / `TEAMCITY_MCP_TOKEN` | Контекст деплоев через TeamCity MCP | опционально |
 | `PIPELINE_DIRECT_INVOKE` | Запуск пайплайна inline без Celery | dev |
+| `ROLLOUT_SUPPRESS_ENABLED` | Приглушать алёрты в окне деплоя (`rollout_noise`); по умолчанию `true` | optional |
+| `META_NOISE_ENABLED` | Приглушать всегда-шумные мета-агрегаты / scrape-gap алёрты; по умолчанию `true` | optional |
+| `GEN_MISMATCH_NOISE_ENABLED` | Приглушать churn `KubeDeploymentGenerationMismatch` при здоровых репликах; по умолчанию `true` | optional |
+| `EXECUTOR_ENABLED` / `EXECUTOR_APPROVAL_ENABLED` | Opt-in executor-стадия + Discord-кнопка Apply; по умолчанию `false` | optional |
 
 ### Discord-интеграция
 
@@ -367,9 +423,9 @@ Discord Developer Portal → Application → General Information →
 cloudflared tunnel --url http://localhost:8000
 ```
 
-> **⏳ Эксперимент до 2026-05-15**: один embed заменяет два сообщения (сырой алерт от
-> Spidey Bot + анализ copilot). После оценки (читаемость, пропущенные алерты, latency) —
-> подтверждение или откат. Для активации на боевом канале:
+> **✅ Подтверждено (после эксперимента)**: один embed заменил прежний флоу из двух
+> сообщений (сырой алерт от Spidey Bot + анализ copilot) — это теперь дефолт в проде.
+> Для активации на новом канале:
 > 1. Убрать прямой Alertmanager → Discord webhook для инцидентных алертов.
 > 2. Прописать `DISCORD_WEBHOOK_URL` в production `.env`.
 > 3. Установить `DISCORD_DRY_RUN=false`.
@@ -379,7 +435,7 @@ cloudflared tunnel --url http://localhost:8000
 ```bash
 helm install sre-ai-copilot helm/sre-ai-copilot/ \
   --set ingress.host=sre-ai.example.com \
-  --set image.tag=0.6.0
+  --set image.tag=0.14.0
 ```
 
 Перед установкой заполнить секреты — см. `helm/sre-ai-copilot/templates/secret.yaml`.
@@ -430,9 +486,9 @@ Executor-трек **сделан и закрыт за явные opt-in флаг
 | 1 | `FixAgent` отдаёт структурный `ExecutionIntent` рядом с prose | ✅ v0.7.0 (PR #23) |
 | 2 | `executor`-стадия после `risk` с `dry_run=True` + `K8sSecurityGuard.validate` | ✅ v0.7.0 (PR #26) |
 | 3 | Discord Apply consumer с двухшаговым confirm → реальный `kubectl` под guard | ✅ v0.7.0 (PR #27) |
-| 4 | End-to-end smoke на non-prod `squad-*` кластере + production ramp-up план | 🟡 In progress (этот PR) |
+| 4 | End-to-end smoke на non-prod `squad-*` кластере + production ramp-up план | 🟡 Операционная раскатка — advisory-режим уже дефолт в проде; opt-in apply (`EXECUTOR_APPROVAL_ENABLED`) на shared-кластерах пока не включён |
 
-**Ramp-up план (после merge):**
+**Ramp-up план:**
 
 1. **Dev**: `EXECUTOR_ENABLED=true`, `EXECUTOR_APPROVAL_ENABLED=true` локально с `DISCORD_DRY_RUN=true` — убедиться что кнопки появляются на embed-е корректно.
 2. **Один preprod squad-N namespace**: включить оба флага через Helm value override; спровоцировать синтетический алерт (или дождаться реального); кликнуть Apply на low-risk действии (`get_logs`, `describe_resource`). Проверить `executor_applied` в БД и audit log.
