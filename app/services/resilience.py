@@ -4,6 +4,7 @@ import time
 from functools import wraps
 from typing import Any, Callable, Tuple, Type
 
+import anthropic
 import structlog
 from redis.asyncio import Redis
 
@@ -19,8 +20,56 @@ class LLMCircuitOpen(Exception):
     """
 
 
+def is_retryable_llm_error(exc: BaseException) -> bool:
+    """Предикат: ретраибельна ли ошибка LLM-вызова.
+
+    Ретраим ТОЛЬКО транзиентные сбои, где повтор имеет смысл:
+      - APIConnectionError  — сеть упала до ответа (вкл. APITimeoutError,
+        который её сабкласс);
+      - RateLimitError (429) — провайдер перегружен, backoff поможет;
+      - APIStatusError с 5xx — серверная ошибка/overloaded (500/529).
+
+    НЕ ретраим детерминированные клиентские ошибки — повтор того же запроса
+    даст тот же результат и просто сожжёт квоту/токены:
+      400 BadRequest / 401 Authentication / 403 PermissionDenied /
+      404 NotFound / 422 UnprocessableEntity.
+
+    LLMCircuitOpen намеренно НЕ ретраибелен — брейкер открыт сознательно
+    (см. llm_retry_strategy, где он ещё и пробрасывается до предиката).
+
+    Внешний asyncio.wait_for в llm_service конвертирует таймаут в
+    asyncio.TimeoutError — его тоже считаем ретраибельным (транзиент).
+    """
+    if isinstance(exc, LLMCircuitOpen):
+        return False
+    if isinstance(exc, (anthropic.APIConnectionError, anthropic.RateLimitError)):
+        # APITimeoutError — подкласс APIConnectionError, покрыт здесь же.
+        return True
+    if isinstance(exc, anthropic.APIStatusError):
+        # 5xx (500 api_error / 529 overloaded) — транзиент; 4xx — нет.
+        return exc.status_code >= 500
+    if isinstance(exc, asyncio.TimeoutError):
+        # Верхняя граница wait_for сработала — повтор оправдан.
+        return True
+    # llm_service оборачивает таймаут в ValueError("LLM timeout") from e —
+    # разворачиваем __cause__, чтобы не потерять ретраибельность.
+    cause = exc.__cause__
+    if cause is not None and cause is not exc:
+        return is_retryable_llm_error(cause)
+    return False
+
+
 def llm_retry_strategy(func):
-    """Simple async retry decorator for transient LLM failures."""
+    """Async retry decorator для ТРАНЗИЕНТНЫХ сбоев LLM-вызова.
+
+    Ретраит по предикату is_retryable_llm_error (5xx / rate-limit / сеть /
+    таймаут). Неретраибельные 4xx (400/401/403/404/422) и LLMCircuitOpen
+    пробрасываются сразу — без повторов и backoff-а.
+
+    NB: SDK-клиент сконфигурён с max_retries=0 (см. llm_service), поэтому
+    единственный слой ретраев — этот декоратор; двойного умножения попыток
+    (SDK × декоратор) больше нет.
+    """
 
     @wraps(func)
     async def wrapper(*args, **kwargs):
@@ -33,6 +82,10 @@ def llm_retry_strategy(func):
             except LLMCircuitOpen:
                 raise  # брейкер открыт → fail fast, не ретраим
             except Exception as exc:
+                if not is_retryable_llm_error(exc):
+                    # Детерминированная клиентская ошибка (4xx и т.п.) —
+                    # повтор бессмыслен, пробрасываем немедленно.
+                    raise
                 last_exc = exc
                 logger.warning("llm_call_retry", attempt=attempt, error=str(exc))
                 if attempt < retries:
