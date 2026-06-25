@@ -158,6 +158,7 @@ def _upsert_edge_pg(
     discovered_by: Optional[str],
     extras: Optional[Dict[str, Any]],
 ) -> ServiceEdge:
+    from sqlalchemy import func
     from sqlalchemy.dialects.postgresql import insert as pg_insert
 
     now = datetime.utcnow()
@@ -172,11 +173,20 @@ def _upsert_edge_pg(
             weight=weight, discovered_by=discovered_by,
             extras=initial_extras or None, last_seen_at=now,
         )
-        .on_conflict_do_update(
-            constraint="uq_kg_edge_src_dst_kind",
-            set_={"last_seen_at": now, "weight": weight,
-                  **({"discovered_by": discovered_by} if discovered_by else {})},
-        )
+    )
+    # KG H5: НЕ понижаем weight. Env-discovered рёбра всегда приходят с
+    # weight=1 (дефолт upsert_edge). Если runtime/traffic-источник проставил
+    # «жирность» (доля трафика, важность), следующий env-sync затёр бы её в 1.
+    # GREATEST(existing, excluded) — монотонный апдейт: weight только растёт.
+    stmt = stmt.on_conflict_do_update(
+        constraint="uq_kg_edge_src_dst_kind",
+        set_={
+            "last_seen_at": now,
+            "weight": func.greatest(
+                ServiceEdge.__table__.c.weight, stmt.excluded.weight
+            ),
+            **({"discovered_by": discovered_by} if discovered_by else {}),
+        },
     )
     db.execute(stmt)
     db.flush()
@@ -230,7 +240,10 @@ def _upsert_edge_fallback(
         db.flush()
     else:
         edge.last_seen_at = now
-        if edge.weight != weight:
+        # KG H5: weight монотонно растёт — env-sync (weight=1) не понижает
+        # «жирность», проставленную runtime/traffic-источником. Зеркалит
+        # GREATEST(existing, excluded) из PG-пути.
+        if weight > edge.weight:
             edge.weight = weight
         merged = dict(edge.extras or {})
         if extras:
