@@ -186,9 +186,12 @@ def test_redact_aws_access_key_id():
 
 
 def test_redact_aws_temporary_key_id():
-    out = redact_pii("sts ASIAY34FZKBOKMUTVV7A active")
+    # Собираем из частей, чтобы непрерывный ASIA-литерал не попадал в исходник
+    # и не триггерил GitHub secret-scanning (это фейковая фикстура, не ключ).
+    fake_temp_key = "ASIA" + "Y34FZKBOKMUTVV7A"
+    out = redact_pii(f"sts {fake_temp_key} active")
     assert "<aws-key-id>" in out
-    assert "ASIAY34FZKBOKMUTVV7A" not in out
+    assert fake_temp_key not in out
 
 
 def test_redact_aws_key_in_kv_pair():
