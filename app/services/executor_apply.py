@@ -14,11 +14,16 @@
   1. Загружает IncidentRecord, читает analysis.execution_intent + executor_result.
   2. Проверяет eligibility:
        - запись существует
-       - executor_result.status == "dry_run_ok"
-       - execution_intent распарсен, risk in {"low", "medium"} (advisory LLM-hint)
+       - executor_applied отсутствует (идемпотентность)
+       - execution_intent распарсен
+       - expected_signature ОБЯЗАТЕЛЕН и совпадает с compute_signature(intent)
+         (TOCTOU: intent в БД == тому, что видел оператор)
+       - в kg_action_approvals есть терминальный APPROVED для (incident_id,
+         signature) — независимая проверка одобрения человеком (H1)
+       - risk in {"low", "medium"} (advisory LLM-hint)
        - ДЕТЕРМИНИРОВАННЫЙ policy-gate (evaluate_intent_gate) != BLOCK —
          пересчёт риска из самого intent-а, не из LLM-`risk` (см. executor_gate)
-       - executor_applied отсутствует (идемпотентность)
+       - executor_result.status == "dry_run_ok"
   3. Вызывает k8s_service.execute_intent(intent, dry_run=False, post_approval=True).
   4. Записывает результат в record.analysis.executor_applied с timestamp + user.
   5. Audit-event EXECUTOR_APPLIED (или EXECUTOR_APPLY_REFUSED при отказе).
@@ -49,6 +54,24 @@ def _refuse(incident_id: str, reason: str, applied_by: str) -> Dict[str, Any]:
     )
     log.info("executor_apply.refused", incident_id=incident_id, reason=reason)
     return {"ok": False, "reason": reason}
+
+
+def _load_approval(db, incident_id: str, signature: str):
+    """Вернуть ActionApproval-строку для (incident_id, signature) или None.
+
+    Выделено отдельной функцией, чтобы тесты могли подменять источник
+    одобрения, не поднимая БД.
+    """
+    from app.knowledge_graph.schema import ActionApproval
+
+    return (
+        db.query(ActionApproval)
+        .filter(
+            ActionApproval.incident_id == incident_id,
+            ActionApproval.intent_signature == signature,
+        )
+        .first()
+    )
 
 
 def apply_intent(
@@ -86,16 +109,28 @@ def apply_intent(
         except Exception as e:
             return _refuse(incident_id, f"intent_invalid:{type(e).__name__}", applied_by)
 
+        # ── Authorization gate (#2 TOCTOU + H1) ────────────────────────
+        # Реальный write требует ПРОВЕРЕННУЮ подпись — не доверяем тому, что
+        # вызывающий хэндлер сделал авторизацию. expected_signature теперь
+        # ОБЯЗАТЕЛЕН (раньше None молча пропускал проверку → apply-кнопка
+        # обходила TOCTOU, а будущий вызывающий мог обойти SAFE_MODE).
+        if not expected_signature:
+            return _refuse(incident_id, "signature_required", applied_by)
+        from app.services.intent_signature import compute_signature
+
+        if compute_signature(intent) != expected_signature:
+            # intent в БД ≠ тому, что видел оператор (подмена между показом и кликом).
+            return _refuse(incident_id, "signature_mismatch", applied_by)
+
+        # Независимая проверка: терминальный APPROVED в kg_action_approvals для
+        # (incident_id, signature). Закрывает обход SAFE_MODE «будущим
+        # вызывающим»: без записи об одобрении человеком write не выполняется.
+        approval = _load_approval(db, incident_id, expected_signature)
+        if approval is None or (approval.status or "").lower() != "approved":
+            return _refuse(incident_id, "not_approved", applied_by)
+
         if intent.risk.lower() not in _ELIGIBLE_RISKS:
             return _refuse(incident_id, f"risk_too_high:{intent.risk}", applied_by)
-
-        # Integrity-gate: intent, который видел оператор в embed, должен совпадать
-        # с тем, что сейчас в БД (защита от подмены записи между показом и кликом).
-        if expected_signature is not None:
-            from app.services.intent_signature import compute_signature
-
-            if compute_signature(intent) != expected_signature:
-                return _refuse(incident_id, "signature_mismatch", applied_by)
 
         executor_result: Dict[str, Any] = analysis.get("executor_result") or {}
         if executor_result.get("status") != "dry_run_ok":
