@@ -89,14 +89,18 @@ def populate_from_incident(db: Session, incident: Incident) -> Dict[str, int]:
         # SHA живёт в changes[0]["version"] — TC context не имеет поля "sha" напрямую
         changes = b.get("changes") or []
         sha = (changes[0].get("version") or None) if changes else None
+        # KG H1: _parse_ts может вернуть None даже на непустой строке (мусорный
+        # finished_at у running-билдов) — тогда `.replace()` бросал AttributeError
+        # и весь build молча терялся (ловился внешним except). Считаем через
+        # промежуточную переменную и .replace() только если распарсилось.
+        _fin = _parse_ts(b.get("finished_at"))
         try:
             with db.begin_nested():
                 record_deployment(
                     db,
                     service=svc,
                     started_at=started_at.replace(tzinfo=None),
-                    finished_at=_parse_ts(b.get("finished_at"))
-                    .replace(tzinfo=None) if b.get("finished_at") else None,
+                    finished_at=_fin.replace(tzinfo=None) if _fin else None,
                     sha=sha,
                     repo=b.get("repo"),
                     buildtype_id=b.get("buildtype_id"),

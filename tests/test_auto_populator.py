@@ -96,6 +96,33 @@ def test_populate_records_deployments_from_tc(db):
     assert "abc1234" in shas
 
 
+def test_populate_deploy_not_lost_on_unparseable_finished_at(db):
+    """KG H1: непустой, но непарсящийся finished_at не должен терять деплой.
+
+    До фикса `_parse_ts(...).replace()` бросал AttributeError (None.replace),
+    деплой молча проваливался в except. started_at валиден → деплой обязан
+    записаться с finished_at=None.
+    """
+    tc = {
+        "recent_builds": [
+            {
+                "number": "1300", "status": "RUNNING",
+                "buildtype_id": "Wo_Backend_Town",
+                "started_at": "2026-05-12T09:25:00Z",
+                "finished_at": "in-progress",  # непустой, но не ISO-таймстамп
+                "changes": [{"version": "deadc0de"}],
+            },
+        ]
+    }
+    stats = populate_from_incident(db, _incident(tc=tc))
+    assert stats["deploys_added"] == 1
+    deploys = recent_deploys_for(
+        db, "squad-1", "town-service",
+        before=datetime(2026, 5, 12, 10, 0), lookback_minutes=120,
+    )
+    assert "deadc0de" in {d["sha"] for d in deploys}
+
+
 def test_populate_skips_when_no_service_label(db):
     incident = Incident(
         incident_id="inc-noservice",
