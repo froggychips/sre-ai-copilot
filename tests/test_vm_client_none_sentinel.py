@@ -144,7 +144,6 @@ async def test_cluster_health_partial_failure_not_healthy():
     vm = VMClient("http://vm:8428")
 
     partial = dict(_HEALTHY)
-    seq = iter(partial.values())
     keys = list(partial.keys())
     fail_idx = keys.index("pods_failed")
 
