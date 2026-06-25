@@ -294,10 +294,22 @@ async def _sync_service_health_async(db: Session) -> Dict[str, Any]:
             else:
                 stats["skipped_dup"] += 1
             if since_commit >= COMMIT_BATCH:
-                db.commit()
+                try:
+                    db.commit()
+                except Exception:
+                    # Падение batch-commit (например, deadlock/serialization)
+                    # оставляет Session в aborted-состоянии — без rollback
+                    # все последующие inserts + финальный commit упадут с
+                    # PendingRollbackError, теряя весь оставшийся проход.
+                    db.rollback()
+                    raise
                 since_commit = 0
 
-    db.commit()
+    try:
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
     stats["duration_ms"] = int((time.monotonic() - t0) * 1000)
 
     log.info(

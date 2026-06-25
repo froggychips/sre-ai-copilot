@@ -195,7 +195,14 @@ def _upsert_log_obs(
             },
         )
     )
-    db.execute(stmt)
+    # SAVEPOINT на строку: при DataError/IntegrityError одна битая строка
+    # не переводит Session в aborted-состояние, иначе следующий _upsert_log_obs
+    # и финальный db.commit() падали бы с PendingRollbackError, теряя все
+    # успешно записанные ранее строки этого tick. begin_nested() автоматически
+    # откатывает SAVEPOINT при исключении — оно пробрасывается наверх, где
+    # caller логирует seq_logs_sync.upsert_failed.
+    with db.begin_nested():
+        db.execute(stmt)
 
 
 async def _sync_instance(
