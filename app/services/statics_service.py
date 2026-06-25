@@ -73,6 +73,7 @@ def _run_statics_check(error_text: str, recent_n: int) -> Optional[str]:
     if not keywords:
         return None
 
+    conn = None
     try:
         conn = psycopg2.connect(database="gd", **_conn_kwargs())
         conn.autocommit = True
@@ -102,7 +103,6 @@ def _run_statics_check(error_text: str, recent_n: int) -> Optional[str]:
         if not matching_tables:
             lines.append(f"⚠️  No statics tables found matching keywords {keywords}")
             lines.append("VERDICT: Statics tables missing — likely DI misconfiguration source")
-            conn.close()
             return "\n".join(lines)
 
         lines.append(f"Matching tables: {matching_tables}")
@@ -133,12 +133,17 @@ def _run_statics_check(error_text: str, recent_n: int) -> Optional[str]:
         else:
             lines.append("VERDICT: Statics tables have data — DI issue likely in code, not statics data")
 
-        conn.close()
         return "\n".join(lines)
 
     except Exception as e:
         logger.warning("statics_service.check_failed: %s", e)
         return None
+    finally:
+        # with_external_retry ретраит OperationalError/InterfaceError —
+        # каждая неудачная попытка обязана закрыть свой коннект, иначе они
+        # копятся (psycopg2-leak, Infra H6). conn=None если connect() упал.
+        if conn is not None:
+            conn.close()
 
 
 async def check_statics_for_error(error_text: str) -> Optional[str]:

@@ -74,3 +74,65 @@ def test_update_embed_persists():
     dedup_store.update_embed("k1", {"v": 2})
     rec = dedup_store.get_fresh("k1", ttl_sec=1800, now=1100.0)
     assert rec["embed"] == {"v": 2}
+
+
+def test_get_fresh_does_not_purge(monkeypatch):
+    """Infra H4: get_fresh — чистый SELECT, НЕ удаляет stale-строки.
+
+    Stale-запись остаётся в кэше (невидима для caller-а, но не вычищена) —
+    purge теперь обязанность purge_stale/beat, не hot-path.
+    """
+    # PG-путь: убедимся что get_fresh не дёргает delete() на query.
+    delete_calls = []
+
+    class _FakeQuery:
+        def filter(self, *a, **k):
+            return self
+
+        def delete(self, *a, **k):
+            delete_calls.append(1)
+            return 0
+
+    class _FakeSession:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def query(self, *a, **k):
+            return _FakeQuery()
+
+        def get(self, *a, **k):
+            return None
+
+    monkeypatch.setattr(dedup_store, "_pg_session", lambda: _FakeSession())
+    monkeypatch.setattr(dedup_store, "_pg_warned", True)
+    dedup_store.get_fresh("k1", ttl_sec=1800, now=1000.0)
+    assert delete_calls == [], "get_fresh не должен вызывать DELETE (hot-path)"
+
+
+def test_get_fresh_keeps_stale_row_in_memory():
+    """get_fresh видит stale как None, но строку из кэша НЕ удаляет."""
+    dedup_store.save("k1", msg_id="m1", webhook_url="https://w", embed=None, now=1000.0)
+    # stale относительно ttl=60: now-first_ts=100 > 60
+    assert dedup_store.get_fresh("k1", ttl_sec=60, now=1100.0) is None
+    # строка ещё в кэше — get_fresh её не вычистил
+    assert "k1" in _dedup_state._recent_enriched
+
+
+def test_purge_stale_removes_expired():
+    dedup_store.save("old", msg_id="m1", webhook_url="https://w", embed=None, now=1000.0)
+    dedup_store.save("new", msg_id="m2", webhook_url="https://w", embed=None, now=2000.0)
+    # ttl=600, now=2100: old (first_ts=1000, age 1100>600) stale; new (age 100) свежий
+    removed = dedup_store.purge_stale(ttl_sec=600, now=2100.0)
+    assert removed == 1
+    assert "old" not in _dedup_state._recent_enriched
+    assert "new" in _dedup_state._recent_enriched
+
+
+def test_purge_stale_noop_when_all_fresh():
+    dedup_store.save("k1", msg_id="m1", webhook_url="https://w", embed=None, now=1000.0)
+    removed = dedup_store.purge_stale(ttl_sec=1800, now=1100.0)
+    assert removed == 0
+    assert "k1" in _dedup_state._recent_enriched
