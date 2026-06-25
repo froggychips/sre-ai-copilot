@@ -23,11 +23,13 @@ from app.config import settings
 from . import dedup as _dedup_state
 from . import dedup_store
 from .dedup import (
+    _DEDUP_TTL_SEC,
     _LINKED_MIN_COUNT,
     _LINKED_WINDOW_SEC,
     _compute_content_key,
     _compute_enriched_key,
     _dedup_lock,
+    _incident_dedup_key,
     _purge_dedup_state,
     _webhook_edit_endpoint,
 )
@@ -599,24 +601,22 @@ class DiscordService:
                 alertname, namespace, pod,
             )
         key_alert = (alertname,)
+        # Cross-replica dedup-key (PG-store discord_dedup, как enriched-канал).
+        pg_key = _incident_dedup_key(key_full)
 
-        with _dedup_lock:
-            _purge_dedup_state(now)
-            existing_full = _dedup_state._recent_incidents.get(key_full)
-            existing_alert = _dedup_state._recent_by_alertname.get(key_alert)
-
-        # #1: PATCH сообщения если content-key (или fallback) уже в кэше.
-        if existing_full is not None:
+        # #1: PATCH сообщения если content-key (или fallback) уже в store.
+        # get_fresh ходит в Postgres (fallback на in-memory при недоступном PG):
+        # per-process dict ломался на 2 репликах api — каждый под промахивался
+        # мимо чужого кэша и дублировал critical-POST с mention.
+        existing_full = dedup_store.get_fresh(pg_key, ttl_sec=_DEDUP_TTL_SEC, now=now)
+        if existing_full is not None and (now - existing_full.get("first_ts", 0)) <= _DEDUP_TTL_SEC:
             self._audit_dedup_event(
                 "DEDUP_HIT_CONTENT" if dedup_mode == "content"
                 else "DEDUP_HIT_FINGERPRINT",
                 alertname=alertname, namespace=namespace,
                 service=service, key=key_full,
             )
-            await self._patch_recurrence(
-                url, embed, key_full, key_alert, namespace, pod,
-                mode="exact", now=now,
-            )
+            await self._patch_recurrence_exact(url, embed, pg_key, now)
             return
 
         # Свежий — записываем DEDUP_MISS_FRESH ниже после успешного POST.
@@ -626,8 +626,11 @@ class DiscordService:
             service=service, key=key_full, dedup_mode=dedup_mode,
         )
 
-        # #9: burst-aggregation. Видели ≥3 за 5 мин по alertname → агрегируем
-        # вместо нового сообщения.
+        # #9: burst-aggregation по alertname остаётся per-process (вторичный
+        # путь, не источник дубль-mention: ведёт к PATCH, не к новому POST).
+        with _dedup_lock:
+            _purge_dedup_state(now)
+            existing_alert = _dedup_state._recent_by_alertname.get(key_alert)
         if (
             existing_alert is not None
             and (now - existing_alert.get("first_ts", 0)) <= _LINKED_WINDOW_SEC
@@ -662,22 +665,26 @@ class DiscordService:
             return
 
         if not msg_id:
-            # Без msg_id мы не сможем PATCH-ить. Кэш не пополняем —
+            # Без msg_id мы не сможем PATCH-ить. Store не пополняем —
             # следующий incident-того-же-pod пойдёт как новый POST. Это OK
             # для legacy webhook-конфигов где wait=false.
             return
 
+        # Cross-replica: фиксируем POST в PG-store (UPSERT по pg_key).
+        dedup_store.save(
+            pg_key,
+            msg_id=msg_id,
+            webhook_url=url,
+            embed=embed,
+            alertname=alertname,
+            namespace=namespace,
+            service=service,
+            severity=severity,
+            now=now,
+        )
+
         with _dedup_lock:
-            _dedup_state._recent_incidents[key_full] = {
-                "msg_id": msg_id,
-                "first_ts": now,
-                "last_ts": now,
-                "count": 1,
-                "webhook_url": url,
-                "embed": embed,
-                "alertname": alertname,
-            }
-            # Burst-агрегация: разделяем счётчик по alertname.
+            # Burst-агрегация: разделяем счётчик по alertname (per-process).
             existing_alert = _dedup_state._recent_by_alertname.get(key_alert)
             if existing_alert and (now - existing_alert.get("first_ts", 0)) <= _LINKED_WINDOW_SEC:
                 existing_alert["count"] = existing_alert.get("count", 1) + 1
@@ -692,6 +699,61 @@ class DiscordService:
                     "embed": embed,
                     "group_ns_pod": [f"{namespace}/{pod}"],
                 }
+
+    async def _patch_recurrence_exact(
+        self,
+        url: str,
+        embed: Dict[str, Any],
+        pg_key: str,
+        now: float,
+    ) -> None:
+        """PATCH content-key recurrence через cross-replica dedup_store.
+
+        count++ атомарен в PG (dedup_store.bump) — закрывает дубль-mention на
+        2+ репликах. Footer формата `<base> · ×N в 30мин · first .. last ..`
+        (как раньше у in-memory exact-пути).
+        """
+        rec = dedup_store.bump(pg_key, now=now)
+        if rec is None:
+            # Запись исчезла между get_fresh и bump (purge/race) — выходим.
+            return
+        msg_id = rec["msg_id"]
+        cached_embed = rec.get("embed") or embed
+        count = rec["count"]
+        first_ts = rec["first_ts"]
+        webhook_url = rec.get("webhook_url") or url
+
+        patched_embed = dict(cached_embed)
+        first_seen = datetime.fromtimestamp(first_ts, tz=timezone.utc).strftime("%H:%M")
+        last_seen = datetime.fromtimestamp(now, tz=timezone.utc).strftime("%H:%M")
+        original_footer = (patched_embed.get("footer") or {}).get("text") or ""
+        base_footer = original_footer.split(" · ", 1)[0] if original_footer else ""
+        patched_embed["footer"] = {
+            "text": (
+                f"{base_footer} · ×{count} в 30мин · "
+                f"first {first_seen} · last {last_seen}"
+            )[:2048]
+        }
+        patch_payload = {"embeds": [patched_embed]}
+
+        endpoint = _webhook_edit_endpoint(webhook_url, msg_id)
+        if not endpoint:
+            logging.warning("discord_patch_no_endpoint", extra={"webhook": webhook_url[:40]})
+            return
+        try:
+            async with httpx.AsyncClient() as client:
+                r = await client.patch(endpoint, json=patch_payload)
+                if r.status_code >= 400:
+                    logging.warning(
+                        "discord_incident_patch_failed",
+                        extra={"status": r.status_code, "body": r.text[:200]},
+                    )
+                    return
+        except Exception as e:
+            logging.warning("discord_incident_patch_exception", extra={"error": str(e)})
+            return
+        # Кэшируем обновлённый embed (footer-история) в store.
+        dedup_store.update_embed(pg_key, patched_embed)
 
     async def _patch_recurrence(
         self,
