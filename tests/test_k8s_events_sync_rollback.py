@@ -9,8 +9,6 @@ PendingRollbackError — терялись ВСЕ успешно записанн
 его контекст-менеджер откатывает только битый event. Проверяем на SQLite
 (поддерживает SAVEPOINT; та же семантика, что у PG).
 """
-from datetime import datetime
-
 import pytest
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
