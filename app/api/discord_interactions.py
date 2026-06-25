@@ -34,6 +34,7 @@ from sqlalchemy.orm import Session
 
 from app.config import settings
 from app.database import IncidentRecord, SessionLocal
+from app.security.replay import is_timestamp_fresh
 from app.services.audit_logger import audit_service
 
 logger = logging.getLogger(__name__)
@@ -168,6 +169,12 @@ def _deny_apply_if_unauthorized(payload: dict, user_id: str, incident_id: str):
 
 
 def _verify_signature(public_key_hex: str, signature_hex: str, timestamp: str, body: bytes) -> bool:
+    # Anti-replay: timestamp должен быть свежим. Ed25519-подпись валидна вечно,
+    # поэтому без окна перехваченный apply/approve-запрос можно переиграть и
+    # повторно запустить kubectl. Stale → отказ (как невалидная подпись).
+    if not is_timestamp_fresh(timestamp, settings.DISCORD_INTERACTION_MAX_AGE_SECONDS):
+        logger.warning("discord_signature_stale_timestamp ts=%s", timestamp)
+        return False
     try:
         pub = Ed25519PublicKey.from_public_bytes(bytes.fromhex(public_key_hex))
         pub.verify(bytes.fromhex(signature_hex), timestamp.encode() + body)
