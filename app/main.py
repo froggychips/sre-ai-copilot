@@ -106,7 +106,7 @@ async def lifespan(app: FastAPI):
 if settings.ENV == "production":
     app = FastAPI(
         title="SRE AI Copilot",
-        version="2.4.0",
+        version="1.0.0-rc.1",
         lifespan=lifespan,
         docs_url=None,
         redoc_url=None,
