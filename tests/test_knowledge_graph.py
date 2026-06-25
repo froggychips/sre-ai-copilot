@@ -52,6 +52,21 @@ def test_upsert_edge_idempotent(db):
     assert e2.weight == 10
 
 
+def test_upsert_edge_weight_never_lowered(db):
+    """KG H5: weight монотонно растёт — env-sync (weight=1) не должен затирать
+    «жирность», проставленную runtime/traffic-источником."""
+    a = upsert_service(db, "squad-1", "a")
+    b = upsert_service(db, "squad-1", "b")
+    # Runtime-источник проставил жирное ребро.
+    upsert_edge(db, a, b, kind="calls", weight=42)
+    # Последующий env-sync приходит с дефолтным weight=1.
+    e = upsert_edge(db, a, b, kind="calls", weight=1)
+    assert e.weight == 42  # НЕ понижен до 1
+    # Более жирное наблюдение всё ещё поднимает.
+    e2 = upsert_edge(db, a, b, kind="calls", weight=99)
+    assert e2.weight == 99
+
+
 def test_record_alert_idempotent_by_fingerprint(db):
     svc = upsert_service(db, "squad-1", "x")
     fired = datetime(2026, 5, 12, 10, 0)
