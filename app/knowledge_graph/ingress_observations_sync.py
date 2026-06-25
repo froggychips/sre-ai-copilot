@@ -86,7 +86,8 @@ async def _fetch_ingress_metrics(
     )
     out: Dict[str, Optional[float]] = {}
     for k, v in zip(keys, values):
-        if isinstance(v, BaseException):
+        # query_instant теперь отдаёт None при «нет данных» (а не 0.0).
+        if isinstance(v, BaseException) or v is None:
             out[k] = None
             continue
         out[k] = float(v)

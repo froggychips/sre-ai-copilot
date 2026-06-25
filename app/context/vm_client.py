@@ -44,48 +44,79 @@ def _valid_label(value: str) -> bool:
 class ClusterHealth:
     """Snapshot кластерного здоровья — результат get_cluster_health()."""
 
+    # Метрики, без которых снимок не считается полным/«здоровым».
+    # None у любой из них → data_available=False, health_status="unknown".
+    _CORE_KEYS = ("nodes_total", "nodes_ready", "pods_failed", "crashloops")
+
     def __init__(self, metrics: Dict[str, Any]) -> None:
         self._m = metrics
+
+    def _num(self, key: str, default: float) -> Any:
+        """Сырое значение метрики; None («нет данных») схлопывается в default.
+
+        Геттеры отдают число для форматирования/обратной совместимости. Логика
+        «нет данных» отдельно живёт в data_available/health_status, которые
+        смотрят на сырой None через _missing(), а не на этот default.
+        """
+        v = self._m.get(key, default)
+        return default if v is None else v
+
+    def _missing(self, *keys: str) -> bool:
+        """True если хоть одна из метрик отсутствует или None («нет данных»)."""
+        return any(self._m.get(k) is None for k in keys)
 
     # ── Сырые числа ────────────────────────────────────────────────────────
 
     @property
-    def nodes_ready(self) -> int: return self._m.get("nodes_ready", 0)
+    def nodes_ready(self) -> int: return self._num("nodes_ready", 0)
     @property
-    def nodes_total(self) -> int: return self._m.get("nodes_total", 0)
+    def nodes_total(self) -> int: return self._num("nodes_total", 0)
     @property
-    def pods_running(self) -> int: return self._m.get("pods_running", 0)
+    def pods_running(self) -> int: return self._num("pods_running", 0)
     @property
-    def pods_pending(self) -> int: return self._m.get("pods_pending", 0)
+    def pods_pending(self) -> int: return self._num("pods_pending", 0)
     @property
-    def pods_failed(self) -> int: return self._m.get("pods_failed", 0)
+    def pods_failed(self) -> int: return self._num("pods_failed", 0)
     @property
-    def crashloops(self) -> int: return self._m.get("crashloops", 0)
+    def crashloops(self) -> int: return self._num("crashloops", 0)
     @property
-    def deploy_mismatch(self) -> int: return self._m.get("deploy_mismatch", 0)
+    def deploy_mismatch(self) -> int: return self._num("deploy_mismatch", 0)
     @property
-    def cpu_pct(self) -> float: return self._m.get("cpu_pct", 0.0)
+    def cpu_pct(self) -> float: return self._num("cpu_pct", 0.0)
     @property
-    def mem_pct(self) -> float: return self._m.get("mem_pct", 0.0)
+    def mem_pct(self) -> float: return self._num("mem_pct", 0.0)
     @property
-    def disk_peak_pct(self) -> float: return self._m.get("disk_peak_pct", 0.0)
+    def disk_peak_pct(self) -> float: return self._num("disk_peak_pct", 0.0)
     @property
-    def alerts_critical(self) -> int: return self._m.get("alerts_critical", 0)
+    def alerts_critical(self) -> int: return self._num("alerts_critical", 0)
     @property
-    def alerts_warning(self) -> int: return self._m.get("alerts_warning", 0)
+    def alerts_warning(self) -> int: return self._num("alerts_warning", 0)
     @property
-    def alerts_prod(self) -> int: return self._m.get("alerts_prod", 0)
+    def alerts_prod(self) -> int: return self._num("alerts_prod", 0)
 
     # ── Производные ────────────────────────────────────────────────────────
 
     @property
     def data_available(self) -> bool:
-        """False когда VictoriaMetrics недоступна и все метрики вернули 0."""
+        """False когда снимок неполный.
+
+        Неполный = VM недоступна (все метрики None) ИЛИ частичный сбой
+        ключевых метрик (любая из _CORE_KEYS None) ИЛИ ноль нод. None-метрика
+        ≠ 0: частичный таймаут не должен выглядеть как пустой, но валидный
+        кластер. Раньше тут был только `nodes_total > 0`, и 0-заглушки от
+        упавших query_instant давали ложно-«здоровый» снимок.
+        """
+        if self._missing(*self._CORE_KEYS):
+            return False
         return self.nodes_total > 0
 
     @property
     def nodes_ok(self) -> bool:
         return self.nodes_ready == self.nodes_total and self.nodes_total > 0
+
+    # Сигнальные метрики health_status сверх _CORE_KEYS. None у любой = «не
+    # знаем, есть ли проблема» → не отдаём «healthy» (раньше None→0 это прятал).
+    _SIGNAL_KEYS = ("alerts_prod", "alerts_critical", "disk_peak_pct", "deploy_mismatch")
 
     @property
     def health_status(self) -> str:
@@ -96,6 +127,10 @@ class ClusterHealth:
         if (self.alerts_critical > 0 or self.crashloops > 0 or
                 self.pods_failed > 0 or self.disk_peak_pct > 85 or
                 self.deploy_mismatch > 0):
+            return "degraded"
+        # Ядро здорово, но часть сигнальных метрик не доехала — не врём «healthy»,
+        # помечаем degraded: пусть LLM знает, что снимок неполный.
+        if self._missing(*self._SIGNAL_KEYS):
             return "degraded"
         return "healthy"
 
@@ -125,8 +160,16 @@ class VMClient:
         self._url = base_url.rstrip("/")
         self._timeout = timeout
 
-    async def query_instant(self, query: str) -> float:
-        """Instant query → скалярное значение (0.0 при ошибке или пустом ответе)."""
+    async def query_instant(self, query: str) -> Optional[float]:
+        """Instant query → скалярное значение, либо None при «нет данных».
+
+        Контракт: возвращает float только когда VM реально отдала число.
+        None означает «нет данных» — ошибка запроса, пустой ответ или
+        NaN/Inf. None НЕ равен 0.0: настоящий нуль (метрика есть, значение 0)
+        отличим от отсутствия данных. Это позволяет вызывающему коду
+        (get_cluster_health, ingress-sync) трактовать частичный сбой как
+        `unknown`, а не как ложно-«здоровый» нулевой снимок.
+        """
         params = {"query": query}
         try:
             async with httpx.AsyncClient(timeout=self._timeout) as client:
@@ -135,12 +178,12 @@ class VMClient:
                 data = r.json()
             result = data.get("data", {}).get("result", [])
             if result:
-                val = result[0].get("value", [None, "0"])[1]
+                val = result[0].get("value", [None, None])[1]
                 if val not in ("NaN", "Inf", "+Inf", "-Inf", None):
                     return float(val)
         except Exception as e:
             logger.debug("vm_client.query_instant failed query=%r: %s", query, e)
-        return 0.0
+        return None
 
     async def query_instant_by(self, query: str, by_label: str) -> Dict[str, float]:
         """Instant query → {label_value: float} по одной метке (напр. "pod").
@@ -207,11 +250,18 @@ class VMClient:
             return_exceptions=True,
         )
 
+        # None-sentinel: и исключение из gather, и None из query_instant («нет
+        # данных») кладём как None — НЕ как 0. Иначе частичный сбой (один запрос
+        # таймаутит) дал бы ложно-нулевой и потому «здоровый» снимок в LLM.
         _float_keys = {"cpu_pct", "mem_pct", "disk_peak_pct"}
         metrics: Dict[str, Any] = {}
         for key, val in zip(keys, values):
-            safe = 0.0 if isinstance(val, (Exception, BaseException)) else float(val)
-            metrics[key] = round(safe, 1) if key in _float_keys else int(safe)
+            if isinstance(val, BaseException) or val is None:
+                metrics[key] = None
+            elif key in _float_keys:
+                metrics[key] = round(float(val), 1)
+            else:
+                metrics[key] = int(val)
 
         return ClusterHealth(metrics)
 
