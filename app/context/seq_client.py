@@ -69,6 +69,23 @@ class SeqClient:
             h["X-Seq-ApiKey"] = self._api_key
         return h
 
+    # Лимиты пагинации для count_events. Seq `/api/events` НЕ отдаёт `Total` —
+    # реальный total считаем перелистыванием страниц по курсору `afterId` и
+    # суммированием. Cap нужен чтобы окно с экстремальным error-storm не
+    # утащило нас в десятки запросов; при упоре в cap логируем WARNING и
+    # возвращаем floor-оценку (НЕ обрезаем молча).
+    _COUNT_PAGE_SIZE = 1000
+    _COUNT_MAX_PAGES = 20  # ⇒ потолок ~20k событий на окно/level
+
+    @staticmethod
+    def _event_id(event: Dict[str, Any]) -> Optional[str]:
+        """ID события для курсора пагинации (`afterId`)."""
+        for k in ("Id", "id", "EventId"):
+            v = event.get(k)
+            if v:
+                return str(v)
+        return None
+
     @with_external_retry(max_attempts=2, initial_delay=0.5, name="seq.count")
     async def count_events(
         self,
@@ -78,43 +95,74 @@ class SeqClient:
     ) -> int:
         """Count событий заданного level за окно [since, until].
 
+        Seq REST `/api/events` возвращает СТРАНИЦУ raw-событий (list), без
+        конверта `{Total}`. Поэтому реальный total получаем пагинацией:
+        тащим страницы по `_COUNT_PAGE_SIZE`, перелистывая по курсору
+        `afterId` = Id последнего события предыдущей страницы, и суммируем
+        длины, пока страница не короче запрошенной (= хвост) либо не упёрлись
+        в `_COUNT_MAX_PAGES`. Если cap достигнут — WARNING и возврат floor-оценки
+        (что насчитали), а НЕ тихая обрезка до 1.
+
         Возвращает 0 при любой ошибке (graceful degrade).
         """
         seq_level = _SEQ_LEVELS.get(level, level)
         # Seq фильтр: `@Level = 'Error'`. fromDateUtc / toDateUtc — naive UTC.
-        params: Dict[str, Any] = {
+        base_params: Dict[str, Any] = {
             "filter": f"@Level = '{seq_level}'",
             "fromDateUtc": _iso(since),
             "toDateUtc": _iso(until),
-            "count": 1,  # для count мы не тащим payload, только заголовок
-            # `shaped=false` — Seq возвращает raw events; нам нужен `Total`.
+            "count": self._COUNT_PAGE_SIZE,
         }
+        total = 0
+        after_id: Optional[str] = None
         try:
             async with httpx.AsyncClient(timeout=self._timeout) as client:
-                r = await client.get(
-                    f"{self._url}/api/events",
-                    params=params,
-                    headers=self._headers(),
-                )
-                r.raise_for_status()
-                data = r.json()
+                for page in range(self._COUNT_MAX_PAGES):
+                    params = dict(base_params)
+                    if after_id is not None:
+                        params["afterId"] = after_id
+                    r = await client.get(
+                        f"{self._url}/api/events",
+                        params=params,
+                        headers=self._headers(),
+                    )
+                    r.raise_for_status()
+                    data = r.json()
+                    # Нормализуем: Seq отдаёт list[Event] либо {"Events": [...]}.
+                    if isinstance(data, dict):
+                        events = data.get("Events") or []
+                    elif isinstance(data, list):
+                        events = data
+                    else:
+                        events = []
+                    events = [e for e in events if isinstance(e, dict)]
+                    total += len(events)
+                    # Хвост: страница короче запрошенной → событий больше нет.
+                    if len(events) < self._COUNT_PAGE_SIZE:
+                        break
+                    # Курсор на следующую страницу. Нет Id → дальше идти не можем.
+                    after_id = self._event_id(events[-1])
+                    if after_id is None:
+                        logger.warning(
+                            "seq_client.count_no_cursor url=%s level=%s "
+                            "page=%d total=%d — событие без Id, пагинация оборвана",
+                            self._url, level, page, total,
+                        )
+                        break
+                else:
+                    # for завершился без break ⇒ упёрлись в cap.
+                    logger.warning(
+                        "seq_client.count_cap_hit url=%s level=%s max_pages=%d "
+                        "floor_total=%d — реальный объём БОЛЬШЕ, возвращаю оценку",
+                        self._url, level, self._COUNT_MAX_PAGES, total,
+                    )
         except Exception as e:
             logger.debug(
                 "seq_client.count_failed url=%s level=%s err=%s",
                 self._url, level, e,
             )
             return 0
-        # Seq может вернуть либо {"Total": N, ...} либо list[Event]. Если
-        # totals нет — fallback на len(list). Граничный случай: API вернул
-        # «approximate total», тогда `Total` всё равно числовой.
-        if isinstance(data, dict) and "Total" in data:
-            try:
-                return int(data["Total"])
-            except (TypeError, ValueError):
-                return 0
-        if isinstance(data, list):
-            return len(data)
-        return 0
+        return total
 
     @with_external_retry(max_attempts=2, initial_delay=0.5, name="seq.events")
     async def top_messages(
