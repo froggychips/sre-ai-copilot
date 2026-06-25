@@ -195,3 +195,99 @@ def test_populate_after_full_cycle_enables_nearby_alerts(db):
     assert len(nearby) == 1
     assert nearby[0]["service"] == "auth"
     assert nearby[0]["minutes_before"] == 3
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# KG H2: один битый item не должен валить весь tick и отравлять Session.
+# ──────────────────────────────────────────────────────────────────────────
+# Регресс на P1: в except-ветках per-item циклов не было SAVEPOINT-изоляции,
+# поэтому первая IntegrityError/DataError переводила PG-сессию в aborted —
+# все последующие записи и финальный db.commit() падали с PendingRollbackError.
+# Фикс: каждый populator-вызов обёрнут в db.begin_nested() (SAVEPOINT), его
+# контекст-менеджер откатывает только битый item. Проверяем на SQLite — он
+# поддерживает SAVEPOINT, и логика отката та же, что у PG.
+
+
+def test_populate_one_bad_deploy_does_not_kill_batch(db, monkeypatch):
+    """Битый build в середине списка НЕ роняет соседние builds и alert,
+    а Session остаётся пригодной для commit (нет PendingRollbackError)."""
+    import app.knowledge_graph.auto_populator as ap
+
+    real_record_deployment = ap.record_deployment
+    calls = {"n": 0}
+
+    def flaky_record_deployment(db, *, service, **kwargs):
+        calls["n"] += 1
+        # Роняем ровно второй build (number=1235) — внутри SAVEPOINT.
+        if kwargs.get("build_number") == "1235":
+            raise RuntimeError("simulated DataError on build 1235")
+        return real_record_deployment(db, service=service, **kwargs)
+
+    monkeypatch.setattr(ap, "record_deployment", flaky_record_deployment)
+
+    # Спай на begin_nested: подтверждаем, что каждый build пишется внутри
+    # SAVEPOINT (на PG именно это спасает Session от aborted-состояния).
+    nested_calls = {"n": 0}
+    real_begin_nested = db.begin_nested
+
+    def spy_begin_nested():
+        nested_calls["n"] += 1
+        return real_begin_nested()
+
+    monkeypatch.setattr(db, "begin_nested", spy_begin_nested)
+
+    tc = {
+        "recent_builds": [
+            {"number": "1234", "status": "SUCCESS", "buildtype_id": "Wo_Backend_Town",
+             "started_at": "2026-05-12T09:25:00Z", "finished_at": "2026-05-12T09:30:00Z",
+             "changes": [{"version": "good1"}]},
+            {"number": "1235", "status": "SUCCESS", "buildtype_id": "Wo_Backend_Town",
+             "started_at": "2026-05-12T09:35:00Z",
+             "changes": [{"version": "bad1"}]},
+            {"number": "1236", "status": "SUCCESS", "buildtype_id": "Wo_Backend_Town",
+             "started_at": "2026-05-12T09:45:00Z",
+             "changes": [{"version": "good2"}]},
+        ]
+    }
+
+    stats = populate_from_incident(db, _incident(tc=tc))
+
+    # 2 из 3 builds записаны (битый пропущен), service + alert на месте.
+    assert calls["n"] == 3
+    assert stats["deploys_added"] == 2
+    assert stats["services_touched"] == 1
+    assert stats["alerts_added"] == 1
+    assert db.query(AlertEvent).count() == 1
+    # SAVEPOINT на service + 3 build'а + alert = 5 раз.
+    assert nested_calls["n"] == 5
+
+    # Главное: Session НЕ отравлена — финальный commit проходит без
+    # PendingRollbackError. До фикса упал бы здесь.
+    db.commit()
+
+    deploys = recent_deploys_for(
+        db, "squad-1", "town-service",
+        before=datetime(2026, 5, 12, 10, 0), lookback_minutes=120,
+    )
+    shas = {d["sha"] for d in deploys}
+    assert "good1" in shas and "good2" in shas
+    assert "bad1" not in shas
+
+
+def test_populate_bad_alert_does_not_poison_session(db, monkeypatch):
+    """Падение record_alert_event не отравляет Session: записанный ранее
+    service сохраняется и commit проходит."""
+    import app.knowledge_graph.auto_populator as ap
+
+    def boom(*a, **k):
+        raise RuntimeError("simulated IntegrityError on alert")
+
+    monkeypatch.setattr(ap, "record_alert_event", boom)
+
+    stats = populate_from_incident(db, _incident())
+    assert stats["services_touched"] == 1
+    assert stats["alerts_added"] == 0
+
+    # Session пригодна — service закоммитился.
+    db.commit()
+    assert db.query(Service).filter(Service.name == "town-service").count() == 1
