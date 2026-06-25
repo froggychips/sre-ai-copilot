@@ -209,9 +209,11 @@ def _reset_dedup_state():
     from app.services import discord_service as ds
     ds._recent_incidents.clear()
     ds._recent_by_alertname.clear()
+    ds._recent_enriched.clear()  # incident-дедуп переехал в общий store (fallback)
     yield
     ds._recent_incidents.clear()
     ds._recent_by_alertname.clear()
+    ds._recent_enriched.clear()  # incident-дедуп переехал в общий store (fallback)
 
 
 @pytest.fixture

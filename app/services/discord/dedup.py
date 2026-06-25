@@ -80,6 +80,20 @@ def _compute_content_key(
     return f"{alertname}:{ns}:{resolved_service}:{norm_reason}"
 
 
+def _incident_dedup_key(content_key: str) -> str:
+    """Sha1(40 hex) от incident content-key для cross-replica dedup_store.
+
+    Incident-канал переведён с per-process dict (`_recent_incidents`) на общий
+    PG-store `discord_dedup` (как enriched-канал) — per-process кэш ломался на
+    2+ репликах api: дубль critical-POST с mention. `key` в таблице — String(40),
+    поэтому content-key (читаемая строка `alertname:ns:service:reason`) хэшируем
+    в sha1. Префикс `incident|` отделяет namespace incident-канала от
+    enriched-ключей в той же таблице.
+    """
+    raw = f"incident|{content_key}".encode("utf-8")
+    return hashlib.sha1(raw, usedforsecurity=False).hexdigest()  # nosec B324 — dedup-key, не security
+
+
 def _purge_dedup_state(now: Optional[float] = None) -> None:
     """Удалить из обоих кэшей записи старше TTL. Вызывается при каждом insert."""
     now = now or time.time()
