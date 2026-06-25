@@ -126,9 +126,11 @@ def _reset_dedup_state():
     from app.services import discord_service as ds
     ds._recent_incidents.clear()
     ds._recent_by_alertname.clear()
+    ds._recent_enriched.clear()  # incident-дедуп переехал в общий store (fallback)
     yield
     ds._recent_incidents.clear()
     ds._recent_by_alertname.clear()
+    ds._recent_enriched.clear()  # incident-дедуп переехал в общий store (fallback)
 
 
 @pytest.fixture
@@ -311,3 +313,80 @@ async def test_no_service_fallback_to_fingerprint(webhook_env):
     # Падать не должно. POST=1, PATCH=1 (fallback fingerprint-key совпал).
     assert mock_client.post.await_count == 1
     assert mock_client.patch.await_count == 1
+
+
+# ───────────────────────────────────────────────────────────────────
+# Cross-replica: incident-канал ходит в общий dedup_store (PG), не в
+# per-process dict — иначе на 2+ репликах api дубль critical-POST с mention.
+# ───────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_incident_post_persists_to_dedup_store(webhook_env):
+    """Свежий incident → POST + dedup_store.save (cross-replica персист)."""
+    from app.services.discord import dedup_store
+    from app.services.discord_service import DiscordService
+
+    svc = DiscordService()
+    mock_client = _httpx_mock(msg_id="m-store")
+    with patch("app.services.discord_service.httpx.AsyncClient", return_value=mock_client), \
+         patch.object(dedup_store, "get_fresh", return_value=None), \
+         patch.object(dedup_store, "save") as mock_save:
+        await svc.send_incident_report(
+            incident_id="INC-STORE",
+            alertname="KubePodCrashLooping",
+            namespace="preprod-kingdom1",
+            pod="auth-pod",
+            service="auth-service",
+            node=None,
+            severity="critical",
+            cause="BackOff",
+            resolution_quality="unresolved",
+            synthesis="...",
+            pod_event_reason="BackOff",
+        )
+    assert mock_client.post.await_count == 1
+    mock_save.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_incident_patches_on_store_hit_from_other_replica(webhook_env):
+    """get_fresh вернул запись (другая реплика уже постила) → PATCH, не новый POST."""
+    import time as _t
+
+    from app.services.discord import dedup_store
+    from app.services.discord_service import DiscordService
+
+    svc = DiscordService()
+    mock_client = _httpx_mock(msg_id="m-hit")
+    now = _t.time()
+    rec = {
+        "msg_id": "m-existing-from-replica-A",
+        "webhook_url": "https://discord.com/api/webhooks/1/token",
+        "embed": {"footer": {"text": "incident/x"}},
+        "first_ts": now,
+        "last_ts": now,
+        "count": 1,
+    }
+    with patch("app.services.discord_service.httpx.AsyncClient", return_value=mock_client), \
+         patch.object(dedup_store, "get_fresh", return_value=rec), \
+         patch.object(dedup_store, "bump", return_value={**rec, "count": 2}), \
+         patch.object(dedup_store, "update_embed"):
+        await svc.send_incident_report(
+            incident_id="INC-HIT",
+            alertname="KubePodCrashLooping",
+            namespace="preprod-kingdom1",
+            pod="auth-pod",
+            service="auth-service",
+            node=None,
+            severity="critical",
+            cause="BackOff",
+            resolution_quality="unresolved",
+            synthesis="...",
+            pod_event_reason="BackOff",
+        )
+    # Ни одного нового POST — другая реплика уже отправила; мы PATCH-им.
+    assert mock_client.post.await_count == 0
+    assert mock_client.patch.await_count == 1
+    footer = mock_client.patch.await_args_list[-1].kwargs["json"]["embeds"][0]["footer"]["text"]
+    assert "×2 в 30мин" in footer
