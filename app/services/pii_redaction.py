@@ -15,7 +15,8 @@ Applied:
 
 Idempotency:
     Patterns replace with fixed tokens (`<email>`, `<ip>`, `<jwt>`,
-    `<uuid>`, `Bearer <token>`, `<redacted>`, `<hex:N>`). Re-running
+    `<uuid>`, `Bearer <token>`, `Basic <credentials>`, `<aws-key-id>`,
+    `<private-key>`, `<redacted>`, `<hex:N>`). Re-running
     redact on already-redacted text is a no-op (the placeholders do
     not match the source patterns), so apply-once-on-write is enough,
     but defense-in-depth is cheap.
@@ -38,6 +39,22 @@ from typing import Pattern
 # Order matters: more-specific patterns first. e.g. JWT (eyJ...) before the
 # long-hex catch-all; bearer-prefixed value before the key=value catcher; etc.
 
+# PEM private-key block (RSA/EC/DSA/OPENSSH/generic "PRIVATE KEY"). Matched
+# FIRST and across newlines (DOTALL) because the base64 body would otherwise
+# be shredded into <hex:N> / <email> / <ip> fragments by later patterns,
+# leaving a recognisable (and partially-leaked) key carcass. We collapse the
+# whole armoured block to a single marker.
+_PEM_PRIVATE_KEY: Pattern[str] = re.compile(
+    r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----.*?-----END [A-Z0-9 ]*PRIVATE KEY-----",
+    re.DOTALL,
+)
+
+# AWS Access Key ID. `AKIA` = long-term IAM key, `ASIA` = temporary/STS key.
+# Always exactly the 4-char prefix + 16 uppercase-alnum chars. NOT hex, so the
+# long-hex catch-all never sees it — must be an explicit pattern. Placed before
+# the kv-rule so `aws_access_key_id=AKIA...` still collapses the id cleanly.
+_AWS_ACCESS_KEY_ID: Pattern[str] = re.compile(r"\b(?:AKIA|ASIA)[0-9A-Z]{16}\b")
+
 # RFC-light email. We deliberately don't try to follow RFC 5322 — too greedy
 # regexes have caused CPU bombs in the wild. `\S` excluded so we don't eat
 # spaces, and we cap the local-part at 64 / domain-part at 253.
@@ -55,6 +72,14 @@ _JWT: Pattern[str] = re.compile(
 # We keep the literal "Bearer" so logs remain readable but strip the secret.
 _BEARER: Pattern[str] = re.compile(
     r"\bBearer\s+[A-Za-z0-9_\-\.=\+/]{8,}",
+    re.IGNORECASE,
+)
+
+# `Basic <base64>` (HTTP Basic Authorization header). The base64 blob encodes
+# `user:password`, so it must be scrubbed just like Bearer. Case-insensitive on
+# `Basic`; we keep the literal "Basic" so logs stay readable.
+_BASIC_AUTH: Pattern[str] = re.compile(
+    r"\bBasic\s+[A-Za-z0-9+/]{8,}={0,2}",
     re.IGNORECASE,
 )
 
@@ -120,28 +145,38 @@ def redact_pii(text: str) -> str:
     inputs return empty string.
 
     Order of operations:
-        1. Emails       → `<email>`
-        2. JWT          → `<jwt>`
-        3. Bearer ...   → `Bearer <token>`
-        4. UUIDs        → `<uuid>`
-        5. key=value    → `key=<redacted>` (password/token/secret/api_key/...)
-        6. Long hex     → `<hex:N>`
-        7. IPv6         → `<ip>`
-        8. IPv4         → `<ip>`
-        9. Truncate     → first `_MAX_LEN` chars + marker if longer
+        1.  PEM key      → `<private-key>` (whole armoured block, DOTALL)
+        2.  Emails       → `<email>`
+        3.  JWT          → `<jwt>`
+        4.  AWS key id   → `<aws-key-id>` (AKIA.../ASIA...)
+        5.  Bearer ...   → `Bearer <token>`
+        6.  Basic ...    → `Basic <credentials>`
+        7.  UUIDs        → `<uuid>`
+        8.  key=value    → `key=<redacted>` (password/token/secret/api_key/...)
+        9.  Long hex     → `<hex:N>`
+        10. IPv6         → `<ip>`
+        11. IPv4         → `<ip>`
+        12. Truncate     → first `_MAX_LEN` chars + marker if longer
 
+    PEM blocks are scrubbed first so the base64 body isn't shredded into
+    `<hex:N>` / `<email>` fragments (which would leave a partial key carcass).
     JWT is processed before long-hex even though base64 chars aren't hex —
-    the explicit `eyJ` prefix is the strongest signal. UUID is processed
-    before long-hex because UUIDs share the hex alphabet.
+    the explicit `eyJ` prefix is the strongest signal. AWS key ids are
+    explicit because they're uppercase-alnum (not hex) and would otherwise
+    slip past the long-hex catch-all. UUID is processed before long-hex
+    because UUIDs share the hex alphabet.
     """
     if not text:
         return ""
 
     out = text
 
+    out = _PEM_PRIVATE_KEY.sub("<private-key>", out)
     out = _EMAIL.sub("<email>", out)
     out = _JWT.sub("<jwt>", out)
+    out = _AWS_ACCESS_KEY_ID.sub("<aws-key-id>", out)
     out = _BEARER.sub("Bearer <token>", out)
+    out = _BASIC_AUTH.sub("Basic <credentials>", out)
     out = _UUID.sub("<uuid>", out)
     out = _KV_SECRET.sub(_kv_replace, out)
     out = _LONG_HEX.sub(lambda m: f"<hex:{len(m.group(0))}>", out)
