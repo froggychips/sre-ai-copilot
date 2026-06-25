@@ -16,10 +16,18 @@ Beat task периодически:
 hiccup AM; всё что старше — обрабатывает fallback (см. п.3), иначе stale
 накапливается вечно как сейчас.
 
-Регрессия 2026-04-10..2026-05-25: задача замёрзла, 16 alerts от 22 мая
-остались с resolved_at IS NULL. Root cause: AM fetch raised → ранний
-return без запуска fallback. Fix 2026-05-25: fallback запускается даже
-при AM-failure (по возрасту — AM-снимок не нужен).
+ОБА прохода требуют ЖИВОЙ AM-снимок (`active_fingerprints is not None`).
+При AM down мы НЕ резолвим ничего автоматически: возраст алерта сам по
+себе не доказывает, что он потух (долгоживущие critical etcd/disk/
+prod-down — как раз старые firing). Stale, накопленный из-за длительной
+недоступности AM, добивается отдельным CLI backfill_resolved_alerts под
+присмотром оператора, а не молча beat-таском.
+
+Регрессия 2026-06-25 (CRITICAL): age-fallback запускался даже при AM down
+(active=None трактовался как пустой set) → при простом hiccup-е AM любой
+firing critical старше 24h ложно гасился и улетал фейковым resolved в
+Discord. Fix: при `active_fingerprints is None` fallback пропускается так
+же, как recent-проход.
 """
 from __future__ import annotations
 
@@ -40,9 +48,9 @@ async def _fetch_active_fingerprints(timeout: float = 10.0) -> Set[str]:
     """GET /api/v2/alerts с AM → set активных fingerprints.
 
     AM v0.28+ возвращает массив объектов с полем `fingerprint`. Если
-    AM недоступен — raise; caller (beat task) ловит и запускает только
-    age-fallback (alerts < age_cutoff не трогаются — те защищены окном
-    history_days, а старые резолвятся по возрасту).
+    AM недоступен — raise; caller (beat task) ловит, передаёт active=None
+    в _mark_resolved, и оба прохода (recent + age-fallback) пропускаются:
+    без живого AM-снимка резолвить нельзя (риск ложно погасить firing).
 
     Регрессия 2026-05-25: раньше дёргали только `active=true&silenced=true`,
     что в AM v2 API трактуется как exclusion-filter (inhibited / unprocessed
@@ -83,10 +91,17 @@ def _mark_resolved(
     2) Age-fallback (fired_at старше fallback_hours): AM не помнит старые
        fingerprints (TTL/restart), классическое сопоставление их не
        зацепит — помечаем resolved=now с raw.resolved_by='age_fallback'.
-       Идёт даже при `active_fingerprints is None` (AM down): решение
-       принимается по возрасту, а не по AM-снимку. Это safety net против
-       сценария 2026-04-10 (AM unreachable → recent-pass skipped → fallback
-       не запускался → freeze на 6 недель).
+
+       КРИТИЧНО (fix 2026-06-25): age-fallback запускается ТОЛЬКО при
+       подтверждённом живом active-set (`active_fingerprints is not None`).
+       При AM down (`is None`) проход ПОЛНОСТЬЮ пропускается — иначе active
+       трактуется как пустой, и ЛЮБОЙ алерт старше fallback_hours (включая
+       реально firing critical: etcd/disk/prod-down) ложно гасится и
+       улетает фейковым resolved в Discord при простом hiccup-е AM.
+       Возраст сам по себе НЕ доказывает, что алерт потух — долгоживущие
+       critical как раз и есть старые firing. `active=set()` (AM ответил
+       пустым списком) — это валидный снимок «firing нет», fallback при нём
+       работает штатно.
     """
     now = datetime.utcnow()
     resolved_recent = 0
@@ -120,10 +135,13 @@ def _mark_resolved(
         if resolved_recent:
             db.flush()
 
-    # Fallback по возрасту — независим от AM-снимка. Если active==None
-    # (AM down), считаем active пустым: ничего не «защищено» AM-снимком,
-    # все старые алерты резолвятся по возрасту. Это корректно потому что
-    # окно fallback_hours (24h по умолчанию) уже отсекает свежие алерты.
+    # Fallback по возрасту резолвит только при ЖИВОМ AM-снимке.
+    # При active==None (AM down/fetch упал) проход пропускается целиком —
+    # см. docstring: возраст не доказывает, что алерт потух, а пустой
+    # active-set ложно зарезолвил бы любой долгоживущий firing critical.
+    # active==set() (AM ответил «firing нет») — валидный снимок, fallback
+    # при нём работает.
+    can_run_fallback = active_fingerprints is not None
     age_cutoff = datetime.utcnow() - timedelta(hours=fallback_hours)
     stale = (
         db.query(AlertEvent)
@@ -132,6 +150,8 @@ def _mark_resolved(
             AlertEvent.fired_at < age_cutoff,
         )
         .all()
+        if can_run_fallback
+        else []
     )
     resolved_fallback = 0
     active_set_for_fallback = active_fingerprints or set()
@@ -189,6 +209,7 @@ def _mark_resolved(
         "resolved_age_fallback": resolved_fallback,
         "stale_candidates": len(stale),
         "ran_recent_pass": can_run_recent,
+        "ran_fallback_pass": can_run_fallback,
         "stuck_sample": stuck_sample,
     }
 
@@ -196,9 +217,10 @@ def _mark_resolved(
 async def run_alerts_resolve_sync(db: Session) -> Dict[str, Any]:
     """Главная entry-point для beat task.
 
-    Регрессия-fix 2026-05-25: при AM-failure всё равно запускаем fallback.
-    Раньше ранний return при fetch-exception полностью гасил задачу —
-    альерты копились вечно (см. April 10 freeze).
+    При AM-failure fetch бросает → active=None → _mark_resolved пропускает
+    ОБА прохода и ничего не резолвит (fix 2026-06-25: иначе age-fallback
+    ложно гасил firing critical при hiccup-е AM). Stale, накопленный за
+    длительный AM-outage, добивается оператором через CLI backfill.
     """
     active: Optional[Set[str]] = None
     fetch_error: Optional[str] = None

@@ -163,20 +163,59 @@ def test_fallback_skips_still_firing_in_am(db):
     assert stats["resolved_age_fallback"] == 0
 
 
-def test_fallback_runs_when_active_is_none(db):
-    """РЕГРЕССИЯ 2026-04-10: AM-fetch failed → active=None → fallback всё
-    равно должен работать."""
+def test_fallback_skipped_when_active_is_none(db):
+    """CRITICAL fix 2026-06-25: AM down (active=None) → age-fallback НЕ
+    запускается. Даже старый алерт может быть реально firing critical
+    (etcd/disk/prod-down); без живого AM-снимка резолвить нельзя, иначе
+    в Discord улетает ложный resolved."""
     old = datetime.utcnow() - timedelta(hours=48)
     a1 = _mk_alert(db, fingerprint="fp-old", fired_at=old)
 
     stats = _mark_resolved(db, active_fingerprints=None)
     db.refresh(a1)
 
-    assert a1.resolved_at is not None
-    assert stats["resolved_age_fallback"] == 1
+    # НИ один алерт не зарезолвлен по возрасту при AM down.
+    assert a1.resolved_at is None
+    assert stats["resolved_age_fallback"] == 0
+    assert stats["resolved"] == 0
     assert stats["ran_recent_pass"] is False
+    assert stats["ran_fallback_pass"] is False
     # active_fingerprints=None помечается как -1 для отчётности.
     assert stats["active_fingerprints"] == -1
+
+
+def test_am_down_does_not_false_resolve_old_firing_critical(db):
+    """CRITICAL fix 2026-06-25: долгоживущий firing critical (etcd/disk/
+    prod-down) старше fallback_hours при AM down НЕ должен погаснуть.
+
+    Это ровно сценарий ложного resolved в Discord: AM hiccup → active=None
+    → раньше age-fallback гасил всё старое скопом."""
+    old = datetime.utcnow() - timedelta(days=10)  # 10 дней firing
+    etcd = _mk_alert(db, alertname="etcdMembersDown", fingerprint="fp-etcd", fired_at=old)
+    disk = _mk_alert(db, alertname="NodeDiskFull", fingerprint="fp-disk", fired_at=old)
+
+    stats = _mark_resolved(db, active_fingerprints=None)
+    db.refresh(etcd)
+    db.refresh(disk)
+
+    assert etcd.resolved_at is None
+    assert disk.resolved_at is None
+    assert stats["resolved"] == 0
+
+
+def test_fallback_runs_on_empty_am_snapshot(db):
+    """Граница: active==set() (AM ответил «firing нет») — это ВАЛИДНЫЙ
+    живой снимок, age-fallback при нём работает. Только active==None
+    (AM down) пропускает проход."""
+    old = datetime.utcnow() - timedelta(hours=48)
+    a1 = _mk_alert(db, fingerprint="fp-old", fired_at=old)
+
+    stats = _mark_resolved(db, active_fingerprints=set())
+    db.refresh(a1)
+
+    assert a1.resolved_at is not None
+    assert stats["resolved_age_fallback"] == 1
+    assert stats["ran_fallback_pass"] is True
 
 
 def test_fallback_resolves_null_fingerprint_alerts(db):
@@ -249,8 +288,11 @@ def test_stuck_sample_emitted_when_freeze(db):
 
 
 @pytest.mark.asyncio
-async def test_run_with_am_failure_still_resolves_old(db):
-    """РЕГРЕССИЯ-fix: AM unreachable → продолжаем fallback, резолвим >24h."""
+async def test_run_with_am_failure_resolves_nothing(db):
+    """CRITICAL fix 2026-06-25: AM unreachable → НИЧЕГО не резолвим (ни
+    recent, ни age-fallback). Старый firing critical не должен ложно
+    погаснуть при hiccup-е AM. fetch_error фиксируется для диагностики;
+    накопленный stale добивает оператор через CLI backfill."""
     old = datetime.utcnow() - timedelta(hours=48)
     a1 = _mk_alert(db, fingerprint="fp-old", fired_at=old)
 
@@ -264,9 +306,11 @@ async def test_run_with_am_failure_still_resolves_old(db):
         stats = await run_alerts_resolve_sync(db)
 
     db.refresh(a1)
-    assert a1.resolved_at is not None
-    assert stats["resolved"] == 1
-    assert stats["resolved_age_fallback"] == 1
+    assert a1.resolved_at is None
+    assert stats["resolved"] == 0
+    assert stats["resolved_age_fallback"] == 0
+    assert stats["ran_recent_pass"] is False
+    assert stats["ran_fallback_pass"] is False
     assert "fetch_error" in stats
     assert "AM unreachable" in stats["fetch_error"]
 
