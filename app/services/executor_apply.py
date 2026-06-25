@@ -85,9 +85,16 @@ def apply_intent(
     """
     db = SessionLocal()
     try:
+        # with_for_update() берёт row-lock (SELECT ... FOR UPDATE) на строку
+        # инцидента и держит его до commit/rollback в конце функции. Это
+        # сериализует конкурентные apply (double-click / реплей / approve+apply):
+        # второй вызов блокируется на этом SELECT, пока первый не закоммитит
+        # executor_applied, и затем УВИДИТ его → отказ already_applied. Без лока
+        # оба читают executor_applied=None и оба выполняют реальный kubectl дважды.
         record = (
             db.query(IncidentRecord)
             .filter(IncidentRecord.incident_id == incident_id)
+            .with_for_update()
             .first()
         )
         if record is None:
