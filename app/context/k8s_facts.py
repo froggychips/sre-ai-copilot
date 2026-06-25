@@ -237,7 +237,9 @@ class K8sFacts:
         m = re.match(r"^(squad-)(\d+)(-.+)$", namespace)
         if m:
             n = int(m.group(2))
-            peer_n = 2 if n != 2 else 3
+            # Сосед = N+1 (как обещает docstring). Если соседнего сквада нет,
+            # это обрабатывается выше по стеку как "peer unavailable".
+            peer_n = n + 1
             return f"{m.group(1)}{peer_n}{m.group(3)}"
         return None
 
