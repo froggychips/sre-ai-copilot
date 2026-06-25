@@ -156,6 +156,29 @@ def test_apply_persists_failure_result(mock_session):
     assert "forbidden" in applied["result"]["stderr"]
 
 
+def test_apply_refuses_prod_intent_even_when_llm_risk_low(mock_session):
+    """Headline fix: LLM-`risk=low` НЕ обходит детерминированный policy-gate.
+
+    Intent с namespace prod-* и risk=low проходит _ELIGIBLE_RISKS, но
+    evaluate_intent_gate блокирует его по namespace_tier — реальный
+    kubectl не вызывается.
+    """
+    _, query = mock_session
+    prod_intent = {**_valid_intent_dict(), "namespace": "prod-kingdom7", "risk": "low"}
+    query.first.return_value = _make_record({
+        "execution_intent": prod_intent,
+        "executor_result": {"status": "dry_run_ok"},
+    })
+
+    with patch.object(executor_apply.k8s_service, "execute_intent") as mock_exec:
+        out = executor_apply.apply_intent("inc-prod", "user1")
+
+    assert out["ok"] is False
+    assert out["reason"].startswith("policy_block:")
+    # Реальный write не должен был произойти.
+    mock_exec.assert_not_called()
+
+
 def test_apply_catches_exception(mock_session):
     _, query = mock_session
     query.first.return_value = _make_record({
