@@ -343,34 +343,44 @@ def sync_namespace_events(
             last_seen = _parse_k8s_timestamp(ev.get("lastTimestamp")) or first_seen
             count = ev.get("count")
 
-            record_pod_event(
-                db,
-                service=svc,
-                namespace=namespace,
-                pod_name=obj_name,
-                reason=reason,
-                event_uid=uid,
-                first_seen=first_seen,
-                last_seen=last_seen,
-                count=count if isinstance(count, int) else None,
-                message=(ev.get("message") or "")[:500],
-                type_=ev.get("type"),
-                extras={
-                    "field_path": involved.get("fieldPath"),
-                    "source_component": (ev.get("source") or {}).get("component"),
-                    "source_host": (ev.get("source") or {}).get("host"),
-                    "resolver": resolver_tag,
-                },
-            )
+            # SAVEPOINT на событие: при IntegrityError/DataError на одном
+            # event Session не уходит в aborted-состояние, и финальный
+            # db.commit() этого ns не падает с PendingRollbackError, теряя
+            # все успешно записанные ранее события.
+            with db.begin_nested():
+                record_pod_event(
+                    db,
+                    service=svc,
+                    namespace=namespace,
+                    pod_name=obj_name,
+                    reason=reason,
+                    event_uid=uid,
+                    first_seen=first_seen,
+                    last_seen=last_seen,
+                    count=count if isinstance(count, int) else None,
+                    message=(ev.get("message") or "")[:500],
+                    type_=ev.get("type"),
+                    extras={
+                        "field_path": involved.get("fieldPath"),
+                        "source_component": (ev.get("source") or {}).get("component"),
+                        "source_host": (ev.get("source") or {}).get("host"),
+                        "resolver": resolver_tag,
+                    },
+                )
             stats["added"] += 1
         except Exception as e:
+            # begin_nested() уже откатил SAVEPOINT битого event; Session чиста.
             stats["errors"] += 1
             logger.warning(
                 "k8s_events.record_failed ns=%s reason=%s err=%s",
                 namespace, ev.get("reason"), e,
             )
 
-    db.commit()
+    try:
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
     return stats
 
 

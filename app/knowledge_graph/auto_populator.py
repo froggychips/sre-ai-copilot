@@ -63,13 +63,17 @@ def populate_from_incident(db: Session, incident: Incident) -> Dict[str, int]:
 
     try:
         team = labels.get("team") or labels.get("squad")
-        svc = upsert_service(
-            db, namespace=namespace, name=service_name,
-            team_owner=team,
-            metadata={k: v for k, v in labels.items() if k in {"app", "component", "version"}},
-        )
+        with db.begin_nested():
+            svc = upsert_service(
+                db, namespace=namespace, name=service_name,
+                team_owner=team,
+                metadata={k: v for k, v in labels.items() if k in {"app", "component", "version"}},
+            )
         stats["services_touched"] += 1
     except Exception as e:
+        # begin_nested() уже откатил SAVEPOINT при выходе по исключению —
+        # Session очищена от aborted-состояния, внешняя транзакция цела.
+        # Тут можно выйти: без service остальные записи бессмысленны.
         logger.warning(
             "kg.populate.service_failed",
             error=type(e).__name__, message=str(e),
@@ -86,22 +90,26 @@ def populate_from_incident(db: Session, incident: Incident) -> Dict[str, int]:
         changes = b.get("changes") or []
         sha = (changes[0].get("version") or None) if changes else None
         try:
-            record_deployment(
-                db,
-                service=svc,
-                started_at=started_at.replace(tzinfo=None),
-                finished_at=_parse_ts(b.get("finished_at"))
-                .replace(tzinfo=None) if b.get("finished_at") else None,
-                sha=sha,
-                repo=b.get("repo"),
-                buildtype_id=b.get("buildtype_id"),
-                build_number=str(b.get("number") or ""),
-                status=b.get("status"),
-                triggered_by=b.get("triggered_by"),
-                extras={"branch": b.get("branch")} if b.get("branch") else None,
-            )
+            with db.begin_nested():
+                record_deployment(
+                    db,
+                    service=svc,
+                    started_at=started_at.replace(tzinfo=None),
+                    finished_at=_parse_ts(b.get("finished_at"))
+                    .replace(tzinfo=None) if b.get("finished_at") else None,
+                    sha=sha,
+                    repo=b.get("repo"),
+                    buildtype_id=b.get("buildtype_id"),
+                    build_number=str(b.get("number") or ""),
+                    status=b.get("status"),
+                    triggered_by=b.get("triggered_by"),
+                    extras={"branch": b.get("branch")} if b.get("branch") else None,
+                )
             stats["deploys_added"] += 1
         except Exception as e:
+            # Битый build не должен валить остальные builds/alert этого
+            # инцидента. begin_nested() откатил SAVEPOINT только этого item,
+            # прежде записанные узлы и внешняя транзакция остаются целы.
             logger.warning(
                 "kg.populate.deployment_failed",
                 error=type(e).__name__, message=str(e),
@@ -111,18 +119,20 @@ def populate_from_incident(db: Session, incident: Incident) -> Dict[str, int]:
     fired_at = _parse_ts(incident.starts_at)
     if fired_at is not None:
         try:
-            record_alert_event(
-                db,
-                service=svc,
-                alertname=labels.get("alertname") or "unknown",
-                severity=labels.get("severity") or incident.severity,
-                fingerprint=incident.incident_id,  # fingerprint == incident_id
-                fired_at=fired_at.replace(tzinfo=None),
-                incident_id=incident.incident_id,
-                raw={"description": incident.description},
-            )
+            with db.begin_nested():
+                record_alert_event(
+                    db,
+                    service=svc,
+                    alertname=labels.get("alertname") or "unknown",
+                    severity=labels.get("severity") or incident.severity,
+                    fingerprint=incident.incident_id,  # fingerprint == incident_id
+                    fired_at=fired_at.replace(tzinfo=None),
+                    incident_id=incident.incident_id,
+                    raw={"description": incident.description},
+                )
             stats["alerts_added"] += 1
         except Exception as e:
+            # begin_nested() откатил SAVEPOINT этого item; Session чиста.
             logger.warning(
                 "kg.populate.alert_failed",
                 error=type(e).__name__, message=str(e),
