@@ -10,6 +10,7 @@ from sqlalchemy.orm import Session
 
 from app.config import settings
 from app.core.state_machine import IncidentState
+from app.security.replay import is_timestamp_fresh
 from app.database import IncidentRecord, get_db
 from app.ingestion.raw_collector import raw_collector
 from app.metrics import ALERTS_SUPPRESSED
@@ -120,8 +121,26 @@ async def verify_alertmanager_signature(request: Request):
         signature = signature[len("sha256="):]
 
     body = await request.body()
+
+    # Anti-replay: если signer присылает X-Alertmanager-Timestamp, HMAC
+    # считается над `ts.body` и проверяется окно свежести. Без заголовка —
+    # backward-compatible body-only HMAC (если не включён REQUIRE_SIGNED_TIMESTAMP).
+    timestamp = request.headers.get("X-Alertmanager-Timestamp")
+    if timestamp:
+        if not is_timestamp_fresh(
+            timestamp, settings.ALERTMANAGER_WEBHOOK_MAX_AGE_SECONDS
+        ):
+            raise HTTPException(status_code=401, detail="Stale AlertManager timestamp")
+        signed_payload = timestamp.encode() + b"." + body
+    else:
+        if settings.ALERTMANAGER_REQUIRE_SIGNED_TIMESTAMP:
+            raise HTTPException(
+                status_code=401, detail="Missing AlertManager timestamp"
+            )
+        signed_payload = body
+
     expected_signature = hmac.new(
-        settings.ALERTMANAGER_WEBHOOK_SECRET.encode(), body, hashlib.sha256
+        settings.ALERTMANAGER_WEBHOOK_SECRET.encode(), signed_payload, hashlib.sha256
     ).hexdigest()
 
     if not hmac.compare_digest(signature, expected_signature):

@@ -387,6 +387,13 @@ class Settings(BaseSettings):
         None,
         description="Discord channel ID для incident-сообщений с buttons (через bot API)",
     )
+    # Anti-replay: окно свежести X-Signature-Timestamp у Discord interactions.
+    # Подпись Ed25519 валидна вечно — без окна перехваченный apply/approve-клик
+    # можно переиграть и повторно запустить kubectl. Discord рекомендует ±5 мин.
+    # 0 / отрицательное → проверка отключена (не рекомендуется).
+    DISCORD_INTERACTION_MAX_AGE_SECONDS: int = Field(
+        300, description="Max age (сек) для Discord interaction timestamp (anti-replay)"
+    )
 
     # Auth
     JWT_PUBLIC_KEY: str = Field("", description="RSA Public Key for JWT validation")
@@ -404,6 +411,18 @@ class Settings(BaseSettings):
 
     # Security
     ALERTMANAGER_WEBHOOK_SECRET: Optional[str] = None
+    # Anti-replay для AlertManager webhook. HMAC покрывает только body, что не
+    # защищает от повторной отправки валидного запроса. Если signer добавляет
+    # заголовок X-Alertmanager-Timestamp, HMAC считается над `ts.body` и
+    # проверяется окно свежести. Backward-compatible: без заголовка остаётся
+    # body-only HMAC (если REQUIRE_SIGNED_TIMESTAMP=false).
+    ALERTMANAGER_WEBHOOK_MAX_AGE_SECONDS: int = Field(
+        300, description="Max age (сек) для AlertManager webhook timestamp (anti-replay)"
+    )
+    ALERTMANAGER_REQUIRE_SIGNED_TIMESTAMP: bool = Field(
+        False,
+        description="Требовать X-Alertmanager-Timestamp (отклонять body-only подпись)",
+    )
     # Точка роста #2 (Phase 2): AlertManager API URL для resolve-sync.
     # Сейчас kg_alerts держит `firing` записи без resolved_at годами (видим
     # etcd alerts от 10 апреля). Beat task kg_alerts_resolve_sync периодически
