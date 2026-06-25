@@ -14,7 +14,7 @@ _LLM_PROVIDER = "anthropic"
 def _get_resilience():
     """Лениво достаём LLMResilienceManager-синглтон из celery_worker.
 
-    Ленивый импорт (как в llm_cache.py) рвёт цикл llm_service↔celery_worker.
+    Ленивый импорт рвёт цикл llm_service↔celery_worker.
     Любая ошибка → None: circuit breaker — best-effort и НИКОГДА не должен
     ронять сам LLM-вызов.
     """
@@ -88,9 +88,13 @@ class LLMService:
 
         Возвращает:
           {text: str, input_tokens: int, output_tokens: int,
-           model: str, backend: str}
+           model: str, backend: str,
+           stop_reason: Optional[str], truncated: bool}
         Для claude_cli (subprocess без usage API) input/output_tokens = 0
-        (правильнее чем char-approximation — counter с 0 не искажает sum).
+        (правильнее чем char-approximation — counter с 0 не искажает sum);
+        stop_reason=None, truncated=False (subprocess не отдаёт stop_reason).
+        truncated=True при stop_reason="max_tokens" (anthropic) — ответ оборван
+        по лимиту, JSON может быть невалиден; см. логику ниже.
         """
         # Circuit breaker применяем только к anthropic-провайдеру; claude_cli —
         # локальный subprocess, у него своя модель отказа (resilience=None →
@@ -106,6 +110,10 @@ class LLMService:
                     "output_tokens": 0,
                     "model": self.model,
                     "backend": "claude_cli",
+                    # claude_cli (subprocess --print) не отдаёт stop_reason →
+                    # обрезку по max_tokens здесь не отличить; считаем не-обрезанным.
+                    "stop_reason": None,
+                    "truncated": False,
                 }
             assert self.client is not None
             # Circuit breaker (resilience.py): fail fast, если anthropic уже
@@ -128,8 +136,9 @@ class LLMService:
             # 4096-токенного минимума кэша Opus → cache_control молча не кэширует
             # (cache_creation_input_tokens=0) и на уникальных префиксах ещё и
             # добавляет 1.25× write-премию без reads = НЕТТО-МИНУС по стоимости.
-            # Реальный повтор (идентичные ретраи) уже покрыт llm_cache.py
-            # (Redis response-cache по role+instruction+context). Единственная
+            # NB: response-кэша в боевом пути НЕТ — BaseAgent.ask зовёт LLM
+            # напрямую (каждый вызов = реальный round-trip; идентичные ретраи
+            # не дедуплицируются). Единственная
             # точка, где prompt caching был бы net-positive — общий префикс
             # fan-out'а MultiHypothesisAgent (shared-prefix/varying-suffix); это
             # отдельный hot-path рефактор, не «воткнуть cache_control».
@@ -159,6 +168,22 @@ class LLMService:
             )
             if not text:
                 raise ValueError("Empty response from LLM")
+            # stop_reason="max_tokens" → ответ оборван по лимиту, а не закончен
+            # естественно. Для JSON-агентов (multi_hypothesis/fact_critic/fix)
+            # обрезка даёт невалидный JSON, который парсеры молча превращают в
+            # пусто — неотличимо от честного пустого ответа. Делаем обрезку
+            # ВИДИМОЙ: warning + признак truncated в dict (НЕ роняем вызов —
+            # частичный ответ всё равно может быть полезен вызывающему).
+            stop_reason = getattr(response, "stop_reason", None)
+            truncated = stop_reason == "max_tokens"
+            if truncated:
+                logging.warning(
+                    "LLM response truncated by max_tokens "
+                    "(model=%s, max_tokens=%s, text_len=%d)",
+                    self.model,
+                    settings.MAX_TOKENS,
+                    len(text),
+                )
             # Anthropic SDK: response.usage.input_tokens / .output_tokens
             usage = getattr(response, "usage", None)
             await _report_provider(resilience, success=True)
@@ -168,6 +193,8 @@ class LLMService:
                 "output_tokens": int(getattr(usage, "output_tokens", 0) or 0),
                 "model": self.model,
                 "backend": "anthropic",
+                "stop_reason": stop_reason,
+                "truncated": truncated,
             }
         except LLMCircuitOpen:
             # Брейкер сработал — это НЕ новый сбой провайдера, не считаем его
