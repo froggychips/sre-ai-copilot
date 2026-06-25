@@ -2,7 +2,6 @@ import asyncio
 import json
 
 import structlog
-from celery import Celery
 from redis.asyncio import from_url
 
 from app.agents.analyzer import AnalyzerAgent
@@ -15,23 +14,22 @@ from app.replay.contract import assert_replay_isolated_runtime
 from app.services.resilience import LLMResilienceManager
 from app.services.session_manager import SessionManager
 
+# Единое Celery-приложение. Раньше здесь жил отдельный Celery("worker") без
+# backpressure-конфигурации — на общем Redis-broker/backend это давало ДВА
+# app ("worker" + "sre_tasks") и пользовательский /copilot-трафик шёл в
+# незащищённый app (нет max_tasks_per_child/prefetch/soft-time-limit, риск
+# OOM/перегрузки/висящих задач + коллизия result-ключей на общем backend).
+# Теперь `generate_reply` регистрируется на том же sre_tasks-app, что и
+# incident-pipeline, и наследует ПОЛНЫЙ backpressure-конфиг из workers.tasks.
+# `celery_app` остаётся реэкспортом для обратной совместимости импортов
+# (app/main.py, app/api/replay.py и тесты по-прежнему берут его отсюда).
+from app.workers.tasks import celery_app
+
 # Initialize services
 logger = structlog.get_logger()
 redis_client = from_url(settings.REDIS_URL)
 resilience = LLMResilienceManager(redis_client)
 session_manager = SessionManager(redis_client)
-
-celery_app = Celery("worker", broker=settings.REDIS_URL, backend=settings.REDIS_URL)
-
-celery_app.conf.update(
-    task_serializer="json",
-    accept_content=["json"],
-    result_serializer="json",
-    timezone="UTC",
-    enable_utc=True,
-    task_track_started=True,
-    task_time_limit=300,
-)
 
 
 async def _generate_reply_logic(
