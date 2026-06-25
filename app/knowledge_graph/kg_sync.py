@@ -731,6 +731,32 @@ def _upsert_service_pg(
     return svc
 
 
+def _known_db_node_namespaces(db: Session) -> Dict[str, str]:
+    """C2: map `db:<driver>:<host>` node-name → namespace где он УЖЕ есть в KG.
+
+    Реестр реальных db-узлов для дедупа secret_hint-таргетов. Физический
+    кластер БД один (напр. town-db), но secret_hint строит host эвристикой и
+    кладёт узел в own_namespace — отсюда per-namespace фантом-дубли одного
+    кластера, раздувающие blast-radius.
+
+    Если узел с тем же каноническим именем уже создан где-то (через точный
+    dsn_env или предыдущий sync), переиспользуем тот namespace вместо
+    плодения копии. При нескольких — берём «канонический»: lexicographically
+    minimal (детерминизм; shared-кластеры обычно в *-shared).
+    """
+    idx: Dict[str, str] = {}
+    rows = (
+        db.query(Service.name, Service.namespace)
+        .filter(Service.name.like("db:%"))
+        .all()
+    )
+    for name, ns in rows:
+        cur = idx.get(name)
+        if cur is None or ns < cur:
+            idx[name] = ns
+    return idx
+
+
 def sync_namespace(
     db: Session,
     namespace: str,
@@ -746,6 +772,11 @@ def sync_namespace(
         deploys = _kubectl_get_deployments(namespace)
 
     src_team = _derive_team_owner(namespace)
+
+    # C2: реестр уже существующих db-узлов — лениво, только когда встретится
+    # secret_hint-таргет (host угадан) и нужна дедупликация против реальных
+    # узлов. None = ещё не загружали (избегаем лишнего запроса для ns без БД).
+    known_db: Optional[Dict[str, str]] = None
 
     for deploy in deploys:
         name = deploy.get("metadata", {}).get("name", "")
@@ -799,6 +830,34 @@ def sync_namespace(
         # confidence отражает точность источника: dsn_env — точно (host из
         # реального значения), secret_hint — нестрого (host угадан из имени).
         for db_node, db_ns, driver, source in _extract_db_targets(deploy, namespace):
+            edge_extras: Dict[str, Any] = {
+                "driver": driver,
+                "semantics": _KIND_TO_SEMANTICS["uses_db"],
+            }
+            if source == "dsn_env":
+                # Точный host из реального DSN-значения — доверяем как есть.
+                edge_extras["confidence"] = "inferred_env"
+            else:
+                # C2: secret_hint — host УГАДАН regex'ом из имени secret/ключа,
+                # а db_ns всегда == own_namespace. Без проверки это плодит
+                # per-namespace фантом-дубли одного физического кластера
+                # (напр. db:postgres:town в каждом ns town-db) → раздутый
+                # blast-radius. Сверяемся с реестром реальных db-узлов:
+                #   - матч → переиспользуем канонический namespace узла
+                #     (не плодим копию), confidence остаётся inferred_secret_name;
+                #   - нет матча → host не подтверждён ничем; всё равно создаём
+                #     (не теряем сигнал), но помечаем confidence='unverified_host'
+                #     + unverified_host=True, чтобы консьюмеры (blast-radius)
+                #     могли отфильтровать.
+                if known_db is None:
+                    known_db = _known_db_node_namespaces(db)
+                canonical_ns = known_db.get(db_node)
+                if canonical_ns is not None:
+                    db_ns = canonical_ns
+                    edge_extras["confidence"] = "inferred_secret_name"
+                else:
+                    edge_extras["confidence"] = "unverified_host"
+                    edge_extras["unverified_host"] = True
             dst = _upsert_service_pg(
                 db,
                 namespace=db_ns,
@@ -806,16 +865,11 @@ def sync_namespace(
                 team_owner="data",
                 synthetic=True,
             )
-            confidence = "inferred_env" if source == "dsn_env" else "inferred_secret_name"
             upsert_edge(
                 db, src=src, dst=dst,
                 kind="uses_db",
                 discovered_by=f"kg_sync/{source}",
-                extras={
-                    "driver": driver,
-                    "confidence": confidence,
-                    "semantics": _KIND_TO_SEMANTICS["uses_db"],
-                },
+                extras=edge_extras,
             )
             stats["edges"] += 1
 
