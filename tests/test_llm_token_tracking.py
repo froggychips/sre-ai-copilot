@@ -70,6 +70,69 @@ async def test_generate_full_anthropic_missing_usage_defaults_to_zero():
     assert result["output_tokens"] == 0
 
 
+# ── stop_reason / truncation visibility ─────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_generate_full_anthropic_flags_max_tokens_truncation():
+    """stop_reason='max_tokens' → truncated=True + warning (обрезка видна)."""
+    from app.services.llm_service import LLMService
+
+    fake_response = MagicMock(
+        content=[MagicMock(type="text", text='{"partial": ')],
+        usage=MagicMock(input_tokens=100, output_tokens=1024),
+        stop_reason="max_tokens",
+    )
+    with patch("app.services.llm_service.settings") as mock_settings, patch(
+        "app.services.llm_service.logging.warning"
+    ) as mock_warn:
+        mock_settings.LLM_BACKEND = "anthropic"
+        mock_settings.MODEL_NAME = "claude-sonnet-4-6"
+        mock_settings.MAX_TOKENS = 1024
+        mock_settings.LLM_TIMEOUT_SECONDS = 30.0
+        mock_settings.ANTHROPIC_API_KEY = "k"
+
+        svc = LLMService()
+        svc.client = MagicMock()
+        svc.client.messages.create = AsyncMock(return_value=fake_response)
+
+        result = await svc.generate_full("prompt")
+
+    assert result["stop_reason"] == "max_tokens"
+    assert result["truncated"] is True
+    # обрезка должна быть залогирована (не молча)
+    mock_warn.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_generate_full_anthropic_end_turn_not_truncated():
+    """stop_reason='end_turn' → truncated=False, без warning."""
+    from app.services.llm_service import LLMService
+
+    fake_response = MagicMock(
+        content=[MagicMock(type="text", text="complete answer")],
+        usage=MagicMock(input_tokens=100, output_tokens=50),
+        stop_reason="end_turn",
+    )
+    with patch("app.services.llm_service.settings") as mock_settings, patch(
+        "app.services.llm_service.logging.warning"
+    ) as mock_warn:
+        mock_settings.LLM_BACKEND = "anthropic"
+        mock_settings.MODEL_NAME = "claude-sonnet-4-6"
+        mock_settings.MAX_TOKENS = 1024
+        mock_settings.LLM_TIMEOUT_SECONDS = 30.0
+        mock_settings.ANTHROPIC_API_KEY = "k"
+
+        svc = LLMService()
+        svc.client = MagicMock()
+        svc.client.messages.create = AsyncMock(return_value=fake_response)
+
+        result = await svc.generate_full("prompt")
+
+    assert result["stop_reason"] == "end_turn"
+    assert result["truncated"] is False
+    mock_warn.assert_not_called()
+
+
 # ── claude_cli backend ──────────────────────────────────────────────────────
 
 @pytest.mark.asyncio
