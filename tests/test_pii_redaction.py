@@ -147,6 +147,110 @@ def test_redact_bearer_keeps_subsequent_text():
 
 
 # ---------------------------------------------------------------------------
+# Basic auth
+# ---------------------------------------------------------------------------
+
+def test_redact_basic_auth():
+    # base64("admin:hunter2") = "YWRtaW46aHVudGVyMg=="
+    out = redact_pii("Authorization: Basic YWRtaW46aHVudGVyMg==")
+    assert "Basic <credentials>" in out
+    assert "YWRtaW46aHVudGVyMg" not in out
+
+
+def test_redact_basic_auth_case_insensitive():
+    out = redact_pii("BASIC dXNlcjpwYXNzd29yZA==")
+    assert "Basic <credentials>" in out
+    assert "dXNlcjpwYXNzd29yZA" not in out
+
+
+def test_redact_basic_auth_keeps_subsequent_text():
+    out = redact_pii("Basic YWRtaW46c2VjcmV0Cg== ; charset=utf-8")
+    assert "Basic <credentials>" in out
+    assert "charset=utf-8" in out
+
+
+def test_basic_auth_does_not_eat_plain_word():
+    # The bare English word "Basic" with non-base64 short token must stay put.
+    out = redact_pii("this is Basic stuff")
+    assert out == "this is Basic stuff"
+
+
+# ---------------------------------------------------------------------------
+# AWS Access Key ID
+# ---------------------------------------------------------------------------
+
+def test_redact_aws_access_key_id():
+    out = redact_pii("creds AKIAIOSFODNN7EXAMPLE leaked")
+    assert "<aws-key-id>" in out
+    assert "AKIAIOSFODNN7EXAMPLE" not in out
+
+
+def test_redact_aws_temporary_key_id():
+    out = redact_pii("sts ASIAY34FZKBOKMUTVV7A active")
+    assert "<aws-key-id>" in out
+    assert "ASIAY34FZKBOKMUTVV7A" not in out
+
+
+def test_redact_aws_key_in_kv_pair():
+    out = redact_pii("aws_access_key_id=AKIAIOSFODNN7EXAMPLE region=eu")
+    # AWS pattern runs before the kv-rule; the id itself is gone either way.
+    assert "AKIAIOSFODNN7EXAMPLE" not in out
+    assert "region=eu" in out
+
+
+def test_aws_key_does_not_eat_lowercase_or_short():
+    # Lowercase "akia..." or wrong length must NOT be treated as a key id.
+    out = redact_pii("word akiaIOSFODNN7example and AKIA12345 short")
+    assert "<aws-key-id>" not in out
+    assert "akiaIOSFODNN7example" in out
+    assert "AKIA12345" in out
+
+
+# ---------------------------------------------------------------------------
+# PEM private-key block
+# ---------------------------------------------------------------------------
+
+def test_redact_pem_private_key_block():
+    pem = (
+        "-----BEGIN RSA PRIVATE KEY-----\n"
+        "MIIEpAIBAAKCAQEA1234567890abcdefABCDEF/+xyz\n"
+        "Zm9vYmFyYmF6cXV4MTIzNDU2Nzg5MGFiY2RlZg==\n"
+        "-----END RSA PRIVATE KEY-----"
+    )
+    out = redact_pii(f"loaded key:\n{pem}\ndone")
+    assert "<private-key>" in out
+    assert "BEGIN RSA PRIVATE KEY" not in out
+    assert "MIIEpAIBAAKCAQEA" not in out
+    assert "loaded key:" in out
+    assert "done" in out
+
+
+def test_redact_pem_openssh_and_ec_variants():
+    for label in ("OPENSSH", "EC", ""):
+        head = f"{label} " if label else ""
+        pem = (
+            f"-----BEGIN {head}PRIVATE KEY-----\n"
+            "c2VjcmV0a2V5bWF0ZXJpYWxoZXJlMTIzNDU2Nzg5MA==\n"
+            f"-----END {head}PRIVATE KEY-----"
+        )
+        out = redact_pii(pem)
+        assert out == "<private-key>", f"variant {label!r} not collapsed: {out!r}"
+
+
+def test_pem_body_not_partially_leaked():
+    # The base64 body must not survive as <hex:N> / <email> fragments.
+    pem = (
+        "-----BEGIN PRIVATE KEY-----\n"
+        "deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef\n"
+        "-----END PRIVATE KEY-----"
+    )
+    out = redact_pii(pem)
+    assert "<hex:" not in out
+    assert "deadbeef" not in out
+    assert out == "<private-key>"
+
+
+# ---------------------------------------------------------------------------
 # UUID
 # ---------------------------------------------------------------------------
 
@@ -266,10 +370,24 @@ def test_empty_input():
 def test_idempotent_on_redacted_output():
     """Running redact_pii twice must give the same output (placeholders don't
     match source patterns)."""
-    raw = "user a@b.co at 10.0.0.1 with token=xyz123 and uuid 550e8400-e29b-41d4-a716-446655440000"
+    raw = (
+        "user a@b.co at 10.0.0.1 with token=xyz123 and "
+        "uuid 550e8400-e29b-41d4-a716-446655440000 key AKIAIOSFODNN7EXAMPLE "
+        "Authorization: Basic YWRtaW46aHVudGVyMg=="
+    )
     once = redact_pii(raw)
     twice = redact_pii(once)
     assert once == twice
+
+
+def test_idempotent_on_pem_block():
+    pem = (
+        "-----BEGIN RSA PRIVATE KEY-----\n"
+        "MIIEpAIBAAKCAQEA1234567890abcdef\n"
+        "-----END RSA PRIVATE KEY-----"
+    )
+    once = redact_pii(pem)
+    assert once == redact_pii(once) == "<private-key>"
 
 
 # ---------------------------------------------------------------------------
