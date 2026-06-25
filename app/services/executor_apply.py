@@ -15,7 +15,9 @@
   2. Проверяет eligibility:
        - запись существует
        - executor_result.status == "dry_run_ok"
-       - execution_intent распарсен, risk in {"low", "medium"}
+       - execution_intent распарсен, risk in {"low", "medium"} (advisory LLM-hint)
+       - ДЕТЕРМИНИРОВАННЫЙ policy-gate (evaluate_intent_gate) != BLOCK —
+         пересчёт риска из самого intent-а, не из LLM-`risk` (см. executor_gate)
        - executor_applied отсутствует (идемпотентность)
   3. Вызывает k8s_service.execute_intent(intent, dry_run=False, post_approval=True).
   4. Записывает результат в record.analysis.executor_applied с timestamp + user.
@@ -103,6 +105,31 @@ def apply_intent(
                 applied_by,
             )
 
+        # ── Детерминированный policy-gate ──────────────────────────────
+        # Финальный серверный рубеж: пересчитываем риск из самого intent-а
+        # (namespace/kind/replicas — структурные поля, не свободный LLM-текст)
+        # и блокируем prod/system/data-plane/необратимое. LLM-`risk` выше —
+        # лишь advisory; этот gate модель обойти prompt-injection'ом не может.
+        from app.remediation.executor_gate import (PolicyMode,
+                                                   evaluate_intent_gate)
+
+        gate = evaluate_intent_gate(intent)
+        gate_dict = gate.to_dict()
+        if gate.mode == PolicyMode.BLOCK:
+            reason_code = "no_match"
+            if gate.reasons:
+                first = gate.reasons[0]
+                reason_code = first.get("axis") or first.get("rule") or "no_match"
+            audit_service.log_event(
+                "EXECUTOR_APPLY_REFUSED_POLICY",
+                {
+                    "incident_id": incident_id,
+                    "applied_by": applied_by,
+                    "policy_decision": gate_dict,
+                },
+            )
+            return _refuse(incident_id, f"policy_block:{reason_code}", applied_by)
+
         # ── Выполнение ─────────────────────────────────────────────────
         result = k8s_service.execute_intent(intent, dry_run=False, post_approval=True)
 
@@ -118,6 +145,7 @@ def apply_intent(
                 "exit_code": result.get("exit_code"),
                 "error": result.get("error"),
             },
+            "policy_decision": gate_dict,
         }
         analysis["executor_applied"] = applied_entry
         record.analysis = analysis
@@ -132,6 +160,7 @@ def apply_intent(
                 "applied_by": applied_by,
                 "command": result.get("command"),
                 "success": result.get("success", False),
+                "policy_decision": gate_dict,
             },
         )
         track_executor_applied(bool(result.get("success", False)))

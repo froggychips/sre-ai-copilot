@@ -322,6 +322,12 @@ def _format_apply_refusal(incident_id: str, reason: str) -> str:
         return _APPLY_REFUSAL_MESSAGES[key].format(incident_id=incident_id)
     if key == "risk_too_high":
         return "❌ Action risk=`high` — auto-apply запрещён, действуй вручную."
+    if key == "policy_block":
+        axis = reason.split(":", 1)[1] if ":" in reason else "policy"
+        return (
+            f"❌ Policy-gate заблокировал действие (`{axis}`): prod/system ns, "
+            "data-plane, необратимое или low-confidence. Действуй вручную."
+        )
     if key == "intent_invalid":
         return "❌ ExecutionIntent невалиден после round-trip — manual triage."
     return f"❌ Не могу применить: {reason}"
