@@ -252,6 +252,14 @@ celery_app.conf.beat_schedule = {
         "task": "kg_ownership_backfill",
         "schedule": crontab(minute=17, hour="*/6"),
     },
+    # Janitor для discord_dedup: вынесенный из hot-path get_fresh purge
+    # stale-строк (Infra H4). Раз в 10 мин — таблица всегда в пределах
+    # активных групп алертов, отставание purge от TTL некритично (свежесть
+    # всё равно сверяется по first_ts в get_fresh). Offset minute=29.
+    "discord-dedup-purge": {
+        "task": "discord_dedup_purge",
+        "schedule": crontab(minute="29,59"),
+    },
 }
 
 
@@ -537,6 +545,24 @@ def kg_drift_cleanup_task():
         return {"error": str(e)}
     finally:
         db.close()
+
+
+@celery_app.task(name="discord_dedup_purge")
+def discord_dedup_purge_task():
+    """Janitor discord_dedup: удалить stale-строки PATCH-dedup.
+
+    Purge вынесен из hot-path get_fresh (Infra H4) — теперь это периодический
+    DELETE здесь. TTL = ENRICHED_DEDUP_WINDOW_SECONDS (то же окно, что
+    использует send_enriched_alert). БЕЗ LLM-вызовов.
+    """
+    from app.services.discord.dedup_store import purge_stale
+
+    try:
+        deleted = purge_stale(settings.ENRICHED_DEDUP_WINDOW_SECONDS)
+        return {"deleted": deleted}
+    except Exception as e:
+        logger.warning("discord_dedup_purge.failed: %s", e)
+        return {"error": str(e)}
 
 
 @celery_app.task(name="tc_deploys_to_kg")

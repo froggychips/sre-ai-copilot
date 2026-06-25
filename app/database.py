@@ -11,12 +11,34 @@ from sqlalchemy.orm import declarative_base, sessionmaker
 
 from app.config import settings
 
+# Пул-параметры применимы только к серверным БД (Postgres). У sqlite
+# дефолтный пул — SingletonThreadPool/StaticPool, и pool_size/max_overflow/
+# pool_timeout/pool_recycle ему передавать нельзя (TypeError на части
+# реализаций / бессмысленно). Тесты гоняют на sqlite — отделяем явно.
+_is_sqlite = settings.DATABASE_URL.startswith("sqlite")
+
+_pool_kwargs: dict = {}
+if not _is_sqlite:
+    # Под нагрузкой sync-сессии гоняются через run_in_threadpool (Starlette,
+    # до ~40 потоков) + Celery beat-задачи + dedup_store. Дефолтный QueuePool
+    # (pool_size=5/max_overflow=10 → потолок 15) → `QueuePool limit ... timed
+    # out`. Поднимаем потолок до 40 одновременных коннектов.
+    _pool_kwargs = {
+        "pool_size": 20,
+        "max_overflow": 20,
+        "pool_timeout": 30,
+        # Профилактически пересоздаём коннекты раз в 30 мин — k8s LB/PG
+        # могут молча рвать долгоживущие idle-соединения.
+        "pool_recycle": 1800,
+    }
+
 engine = create_engine(
     settings.DATABASE_URL,
     echo=False,
     # pool_pre_ping вытаскивает stale connections при возврате из пула —
     # обязателен в k8s, где DB pod может рестартиться без уведомления.
     pool_pre_ping=True,
+    **_pool_kwargs,
 )
 SessionLocal = sessionmaker(
     bind=engine,

@@ -89,21 +89,23 @@ def _fallback(e: Exception) -> None:
 def get_fresh(key: str, ttl_sec: int, now: Optional[float] = None) -> Optional[Dict[str, Any]]:
     """Вернуть запись, если она в TTL-окне; stale-записи невидимы.
 
-    Заодно opportunistic purge: protухшие строки удаляются (дешевле, чем
-    отдельный janitor; таблица всегда в пределах активных групп алертов).
+    Hot-path (enriched + incident alert, бюджет <500ms): ЧИСТЫЙ single-row
+    SELECT, без write-amplification. Раньше тут на каждый запрос гонялся
+    full-scan `DELETE ... first_ts < cutoff` + commit() (Infra H4) — purge
+    вынесен в `purge_stale`, который дёргает beat (см. app/workers/tasks.py
+    `discord-dedup-purge`). Свежесть всё равно проверяется по first_ts ниже,
+    так что stale-строка до прихода janitor-а остаётся невидимой.
     """
     now = now or time.time()
-    cutoff = _to_dt(now - ttl_sec)
+    cutoff = now - ttl_sec
     try:
         with _pg_session() as db:
-            (
-                db.query(DiscordDedupEntry)
-                .filter(DiscordDedupEntry.first_ts < cutoff)
-                .delete(synchronize_session=False)
-            )
-            db.commit()
             row = db.get(DiscordDedupEntry, key)
             if row is None:
+                return None
+            # stale-строка (ещё не вычищенная purge_stale) невидима:
+            # сверяем first_ts, как и в in-memory fallback ниже.
+            if _to_ts(cast(datetime, row.first_ts)) < cutoff:
                 return None
             return _row_to_dict(row)
     except Exception as e:
@@ -113,6 +115,39 @@ def get_fresh(key: str, ttl_sec: int, now: Optional[float] = None) -> Optional[D
             if rec is None or (now - rec.get("first_ts", 0)) > ttl_sec:
                 return None
             return dict(rec)
+
+
+def purge_stale(ttl_sec: int, now: Optional[float] = None) -> int:
+    """Удалить stale-строки (first_ts < now-ttl) одним DELETE. Janitor.
+
+    Вынесено из get_fresh (hot-path), дёргается beat-задачей
+    `discord-dedup-purge` (app/workers/tasks.py). Возвращает число
+    удалённых строк. PG недоступен → чистим in-memory fallback-кэш.
+    """
+    now = now or time.time()
+    cutoff = _to_dt(now - ttl_sec)
+    try:
+        with _pg_session() as db:
+            deleted = (
+                db.query(DiscordDedupEntry)
+                .filter(DiscordDedupEntry.first_ts < cutoff)
+                .delete(synchronize_session=False)
+            )
+            db.commit()
+            return int(deleted or 0)
+    except Exception as e:
+        _fallback(e)
+        removed = 0
+        with _dedup_lock:
+            stale = [
+                k
+                for k, rec in _dedup_state._recent_enriched.items()
+                if (now - rec.get("first_ts", 0)) > ttl_sec
+            ]
+            for k in stale:
+                del _dedup_state._recent_enriched[k]
+                removed += 1
+        return removed
 
 
 def bump(key: str, now: Optional[float] = None) -> Optional[Dict[str, Any]]:
