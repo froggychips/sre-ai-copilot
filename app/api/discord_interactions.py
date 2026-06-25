@@ -246,15 +246,18 @@ async def _send_followup(interaction_token: str, content: str) -> None:
         logger.error("discord_followup_exception error=%s", str(e))
 
 
-async def _apply_in_background(incident_id: str, user_id: str, interaction_token: str) -> None:
+async def _apply_in_background(
+    incident_id: str, user_id: str, intent_sig: str, interaction_token: str
+) -> None:
     """Запустить apply_intent + отправить followup-ответ.
 
     apply_intent — sync (subprocess), запускаем в to_thread; результат форматируем
-    тем же _format_apply_result-style как раньше и PATCH в Discord.
+    тем же _format_apply_result-style как раньше и PATCH в Discord. intent_sig
+    прокидывается в apply_intent как expected_signature (TOCTOU-сверка).
     """
     import asyncio
     from app.services.executor_apply import apply_intent
-    outcome = await asyncio.to_thread(apply_intent, incident_id, user_id)
+    outcome = await asyncio.to_thread(apply_intent, incident_id, user_id, intent_sig)
 
     if not outcome["ok"]:
         content = _format_apply_refusal(incident_id, outcome.get("reason", "unknown"))
@@ -292,8 +295,12 @@ def _confirm_neg_buttons(incident_id: str) -> list:
     }]
 
 
-def _confirm_apply_buttons(incident_id: str) -> list:
-    """Двухшаговое подтверждение запуска kubectl. Защита от случайного клика."""
+def _confirm_apply_buttons(incident_id: str, intent_sig: str) -> list:
+    """Двухшаговое подтверждение запуска kubectl. Защита от случайного клика.
+
+    intent_sig вшивается в custom_id (colon-формат, как approve/decline), чтобы
+    apply_confirm мог прокинуть его в apply_intent для TOCTOU-сверки.
+    """
     return [{
         "type": _ACTION_ROW,
         "components": [
@@ -301,13 +308,13 @@ def _confirm_apply_buttons(incident_id: str) -> list:
                 "type": _BUTTON,
                 "style": _BTN_DANGER,
                 "label": "Да, запустить kubectl",
-                "custom_id": f"apply_confirm_{incident_id}",
+                "custom_id": f"apply_confirm:{incident_id}:{intent_sig}",
             },
             {
                 "type": _BUTTON,
                 "style": _BTN_SECONDARY,
                 "label": "Отмена",
-                "custom_id": f"apply_cancel_{incident_id}",
+                "custom_id": f"apply_cancel:{incident_id}",
             },
         ],
     }]
@@ -318,6 +325,9 @@ _APPLY_REFUSAL_MESSAGES = {
     "no_intent":          "❌ Нет ExecutionIntent для применения — пайплайн не выдал структурный фикс.",
     "already_applied":    "ℹ️ Уже применено ранее — действие идемпотентно.",
     "dry_run_not_ok":     "❌ dry-run не прошёл — реальный запуск заблокирован.",
+    "signature_required": "❌ Подпись действия отсутствует — apply не запущен.",
+    "signature_mismatch": "❌ Действие изменилось с момента подтверждения (signature mismatch) — повтори триаж.",
+    "not_approved":       "❌ Нет записи об одобрении (kg_action_approvals) — apply заблокирован.",
 }
 
 
@@ -524,8 +534,14 @@ async def discord_interactions(
         return _ephemeral("Отменено.")
 
     # ── ⚙️ Apply: шаг 1, ephemeral-подтверждение ────────────────────────────
-    if custom_id.startswith("apply_") and not custom_id.startswith("apply_confirm_") and not custom_id.startswith("apply_cancel_"):
-        incident_id = custom_id[len("apply_"):]
+    # custom_id формат `apply:{incident_id}:{intent_signature}` (colon, как
+    # approve/decline — incident_id содержит подчёркивания). Подпись несём
+    # дальше в apply_confirm для TOCTOU-сверки.
+    if custom_id.startswith("apply:"):
+        parts = custom_id.split(":", 2)
+        if len(parts) != 3:
+            return _ephemeral("❌ Неверный формат custom_id.")
+        _, incident_id, intent_sig = parts
         if not settings.EXECUTOR_APPROVAL_ENABLED:
             return _ephemeral("❌ EXECUTOR_APPROVAL_ENABLED=false — apply отключён.")
         denied = _deny_apply_if_unauthorized(payload, user_id, incident_id)
@@ -536,12 +552,15 @@ async def discord_interactions(
             "dry-run уже прошёл (kube-apiserver валидировал команду), "
             "сейчас будет реальный write.\n"
             "-# Действие записывается в audit + OTEL.",
-            components=_confirm_apply_buttons(incident_id),
+            components=_confirm_apply_buttons(incident_id, intent_sig),
         )
 
     # ── ⚙️ Apply: шаг 2, выполнить kubectl (deferred response) ──────────────
-    if custom_id.startswith("apply_confirm_"):
-        incident_id = custom_id[len("apply_confirm_"):]
+    if custom_id.startswith("apply_confirm:"):
+        parts = custom_id.split(":", 2)
+        if len(parts) != 3:
+            return _ephemeral("❌ Неверный формат custom_id.")
+        _, incident_id, intent_sig = parts
         if not settings.EXECUTOR_APPROVAL_ENABLED:
             return _ephemeral("❌ EXECUTOR_APPROVAL_ENABLED=false — apply отключён.")
         denied = _deny_apply_if_unauthorized(payload, user_id, incident_id)
@@ -553,15 +572,28 @@ async def discord_interactions(
             # Без token-а не сможем сделать followup; fallback на sync-режим.
             return _ephemeral("❌ Discord interaction token отсутствует — apply не запущен.")
 
+        # Клик «Да, запустить kubectl» = одобрение человеком. Фиксируем его в
+        # kg_action_approvals (как approve-кнопка), чтобы apply_intent мог
+        # НЕЗАВИСИМО проверить терминальный APPROVED. UNIQUE(incident_id, sig)
+        # даёт дедуп; declined-коллизия → apply отменяется.
+        member = payload.get("member") or {}
+        user_obj = member.get("user") or payload.get("user") or {}
+        user_name = user_obj.get("username") or user_obj.get("global_name") or user_id or "unknown"
+        decision = _record_decision(incident_id, intent_sig, "approved", user_name)
+        if decision["already_decided"] and decision["status"] != "approved":
+            return _ephemeral(f"ℹ️ Уже {decision['status']} — apply отменён.")
+
         # Сразу возвращаем "thinking..." (type=5), apply работает в background-task.
         # Discord даёт 15 минут на followup через PATCH @original — этого хватит
         # даже для большого rollout restart с тяжёлыми initContainers.
         import asyncio
-        asyncio.create_task(_apply_in_background(incident_id, user_id, interaction_token))
+        asyncio.create_task(
+            _apply_in_background(incident_id, user_id, intent_sig, interaction_token)
+        )
         return _deferred_ephemeral()
 
     # ── ⚙️ Apply: отмена ───────────────────────────────────────────────────
-    if custom_id.startswith("apply_cancel_"):
+    if custom_id.startswith("apply_cancel:"):
         return _ephemeral("Apply отменён.")
 
     # ── ✅/❌ Approve / Decline proposed action ─────────────────────────────

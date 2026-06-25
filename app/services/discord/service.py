@@ -435,6 +435,13 @@ class DiscordService:
                 "custom_id": f"feedback_neg_{incident_id}",
             },
         ]
+        # Подпись intent-а нужна и для apply-кнопки (TOCTOU на apply-пути), и
+        # для approve/decline. Считаем один раз.
+        intent_sig: Optional[str] = None
+        if execution_intent is not None:
+            from app.services.intent_signature import compute_signature
+            intent_sig = compute_signature(execution_intent)
+
         if (
             settings.EXECUTOR_APPROVAL_ENABLED
             and execution_intent is not None
@@ -445,7 +452,7 @@ class DiscordService:
             action_row.append({
                 "type": 2, "style": 1,  # BUTTON PRIMARY (blurple)
                 "label": "⚙️ Apply (kubectl)",
-                "custom_id": f"apply_{incident_id}",
+                "custom_id": f"apply:{incident_id}:{intent_sig}",
             })
 
         # Approve/Decline кнопки для proposed action (PR #12 executor track).
@@ -454,8 +461,7 @@ class DiscordService:
         # поэтому второй row добавляется только когда _can_send_via_bot()==True.
         approve_row: Optional[list] = None
         if execution_intent is not None and self._can_send_via_bot():
-            from app.services.intent_signature import compute_signature
-            sig = compute_signature(execution_intent)
+            sig = intent_sig
             approve_row = [
                 {
                     "type": 2, "style": 3,  # SUCCESS (green)
