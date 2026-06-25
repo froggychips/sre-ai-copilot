@@ -4,7 +4,7 @@
 [![Python](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/)
 [![FastAPI](https://img.shields.io/badge/FastAPI-0.138-009688)](https://fastapi.tiangolo.com/)
 [![Celery](https://img.shields.io/badge/Celery-5.6-37814A)](https://docs.celeryq.dev/)
-[![Release](https://img.shields.io/badge/release-v0.14.0-blue)](CHANGELOG.md)
+[![Release](https://img.shields.io/badge/release-v1.0.0--rc.1-blue)](CHANGELOG.md)
 
 > **[English](#english) · [Русский](#русский)**
 
@@ -25,6 +25,27 @@
 
 ### What's new
 
+- **v1.0.0-rc.1 — Security & reliability hardening (release candidate)**: the
+  largest hardening pass to date — closes the full CRITICAL/P0 tier from an
+  internal deep review and makes the opt-in executor genuinely safe.
+  **Executor:** a deterministic server-side policy gate (`app/remediation`,
+  8 risk axes) recomputes risk from the *structured* intent and blocks
+  prod/system/data-plane/irreversible actions — the LLM `risk` field is now
+  advisory only; the `apply_confirm` path carries the intent signature
+  (TOCTOU), and `apply_intent` requires a matching signature **and** a
+  recorded `ActionApproval` before any real `kubectl`, with a row-lock against
+  double-apply. **Webhooks:** anti-replay timestamp-freshness on both the
+  Discord interactions (Ed25519) and AlertManager (HMAC) endpoints.
+  **Reliability:** retry-storm fix (SDK `max_retries=0` + client timeout +
+  narrowed retry predicate — no more 9× fan-out / zombie requests),
+  AlertManager-down no longer false-resolves live critical alerts, incident
+  dedup moved to a cross-replica Postgres store (no duplicate `@here`),
+  savepoint-isolated KG synchronizers (one bad row no longer kills the tick),
+  a single Celery app with backpressure, and prompt-guard no longer
+  false-blocks real crash tracebacks. **Plus:** PII-redaction gaps
+  (AWS/Basic/PEM), `/replay` RBAC + SSRF allowlist, VM None-sentinel (no
+  false-healthy snapshot), RCAExplainer fail-safe approval gating, DB-pool
+  tuning, psycopg2 leak fix. ~22 fixes; full suite 1591 passed.
 - **v0.14.0 — Alert-quality: noise suppression + ops hardening**: two new
   render-time suppression classes that keep noisy alerts *visible but muted*
   (grey + 🔇, no 🚨/@mention) instead of dropping or demoting them. `meta_noise`
@@ -146,6 +167,9 @@ PIPELINE_DIRECT_INVOKE=true
 | `DISCORD_PUBLIC_KEY` | Ed25519 key for `/discord/interactions` signature verification | for buttons |
 | `DISCORD_DRY_RUN` | `true` = log instead of posting to Discord | dev |
 | `ALERTMANAGER_WEBHOOK_SECRET` | HMAC-SHA256 webhook auth — mandatory in `ENV=production` | prod |
+| `DISCORD_INTERACTION_MAX_AGE_SECONDS` | Anti-replay window for Discord interaction timestamp; default 300 | optional |
+| `ALERTMANAGER_WEBHOOK_MAX_AGE_SECONDS` | Anti-replay window for AlertManager timestamp (if signer sends it); default 300 | optional |
+| `ALERTMANAGER_REQUIRE_SIGNED_TIMESTAMP` | Reject body-only HMAC without a timestamp; default `false` | optional |
 | `JWT_PUBLIC_KEY` | `/copilot` endpoint auth | prod |
 | `JIRA_BASE_URL` / `JIRA_EMAIL` / `JIRA_API_TOKEN` | Jira enrichment | optional |
 | `VICTORIA_METRICS_URL` | Pod metrics window + cluster health snapshot | optional |
@@ -185,7 +209,7 @@ cloudflared tunnel --url http://localhost:8000
 ```bash
 helm install sre-ai-copilot helm/sre-ai-copilot/ \
   --set ingress.host=sre-ai.example.com \
-  --set image.tag=0.14.0
+  --set image.tag=1.0.0-rc.1
 ```
 
 Fill secrets before installing — see `helm/sre-ai-copilot/templates/secret.yaml`.
@@ -219,12 +243,12 @@ Full details: [docs/RUNBOOK.md](docs/RUNBOOK.md)
 
 ### Security
 
-- **Defence in depth around kubectl**: AI never calls kubectl directly — `FixAgent` emits structured `ExecutionIntent` (JSON, pydantic-validated, `FORBIDDEN_NAMESPACES` rejected at parse time), the `DSLTranslator` produces the canonical `kubectl` string deterministically, and `K8sSecurityGuard` validates `(verb, resource, namespace)` derived structurally from the action — not from text-parsing the command. Real writes (`dry_run=False`) additionally require `post_approval=True` set only by the Discord approval consumer.
+- **Defence in depth around kubectl** (hardened in v1.0.0-rc.1): AI never calls kubectl directly — `FixAgent` emits structured `ExecutionIntent` (JSON, pydantic-validated, `FORBIDDEN_NAMESPACES` rejected at parse time), the `DSLTranslator` produces the canonical `kubectl` string deterministically, and `K8sSecurityGuard` validates `(verb, resource, namespace)` derived structurally from the action — not from text-parsing the command. Before any real write the apply path now passes a **deterministic server-side policy gate** (`app/remediation`, 8 risk axes) that recomputes risk from the *structured* intent and blocks prod/system/data-plane/irreversible — the LLM `risk` field is advisory only and cannot be talked past via prompt injection. `apply_intent` additionally requires a matching intent **signature** (TOCTOU) **and** a recorded `ActionApproval` for the incident before executing, with a row-lock against double-apply. `post_approval=True` (the legacy SAFE_MODE bypass) is no longer trusted on its own.
 - Tiered namespace policy enforced by `K8sSecurityGuard.validate`: `prod`/`preprod` read-only; `squad-*` write via approval; `kube-*`/`mcp` forbidden.
 - `SAFE_MODE=true` enforced in `ENV=production` (config validator raises otherwise) — a real write outside an approved path returns `SAFE_MODE: Manual approval required.`
-- AlertManager webhook auth: HMAC-SHA256 on the body (`ALERTMANAGER_WEBHOOK_SECRET` is mandatory in production, the config validator refuses to start without it).
-- Prompt injection guard with `PROMPT_INPUT_MAX_CHARS` cap.
-- Discord interactions endpoint verifies Ed25519 signature on every request (Discord requirement). Apply button uses two-click confirmation (mirror of the 👎 feedback flow) to prevent accidental writes.
+- AlertManager webhook auth: HMAC-SHA256 on the body (`ALERTMANAGER_WEBHOOK_SECRET` is mandatory in production, the config validator refuses to start without it). Anti-replay: when the signer sends `X-Alertmanager-Timestamp` the HMAC covers `ts.body` and a freshness window is enforced (`ALERTMANAGER_WEBHOOK_MAX_AGE_SECONDS`, default 300s); `ALERTMANAGER_REQUIRE_SIGNED_TIMESTAMP=true` rejects body-only signatures.
+- Prompt injection guard: real injection patterns (`ignore previous instructions`, …) are blocked; oversized input is **truncated** (not rejected) so large but legitimate incidents aren't dropped, and code-shaped strings (`import os`, `eval(`) are no longer blocked — crash tracebacks legitimately contain them.
+- Discord interactions endpoint verifies Ed25519 signature on every request (Discord requirement) **and enforces timestamp freshness** (`DISCORD_INTERACTION_MAX_AGE_SECONDS`, default 300s) as anti-replay — a captured signed apply/approve click can no longer be replayed. Apply button uses two-click confirmation (mirror of the 👎 feedback flow) to prevent accidental writes.
 - Full OTEL audit trail and `EXECUTOR_APPLIED` / `EXECUTOR_APPLY_REFUSED` events — see [docs/AUDIT.md](docs/AUDIT.md).
 
 ### Roadmap — Execution
@@ -286,6 +310,26 @@ See [docs/RUNBOOK.md → Executor incidents](docs/RUNBOOK.md#executor-incidents)
 
 ### Что нового
 
+- **v1.0.0-rc.1 — Харднинг безопасности и надёжности (release candidate)**:
+  крупнейший проход харднинга — закрыт весь CRITICAL/P0-тир внутреннего
+  глубокого ревью, opt-in executor сделан реально безопасным.
+  **Executor:** детерминированный серверный policy-gate (`app/remediation`,
+  8 risk axes) пересчитывает риск из *структурного* intent-а и блокирует
+  prod/system/data-plane/необратимое — LLM-`risk` теперь лишь advisory; путь
+  `apply_confirm` несёт подпись intent-а (TOCTOU), а `apply_intent` перед
+  реальным `kubectl` требует совпадения подписи **и** записи `ActionApproval`,
+  с row-lock против двойного apply. **Вебхуки:** anti-replay по свежести
+  timestamp на Discord-interactions (Ed25519) и AlertManager (HMAC).
+  **Надёжность:** фикс retry-шторма (SDK `max_retries=0` + client-timeout +
+  сужённый retry-предикат — без 9× fan-out / зомби-запросов), AM-down больше
+  не гасит ложно живые critical, дедуп инцидентов переехал в cross-replica
+  Postgres-стор (нет дублей `@here`), savepoint-изоляция в KG-синхронизаторах
+  (один битый ряд не валит tick), единый Celery-app с backpressure,
+  prompt-guard не блокирует реальные крэш-трейсбэки. **Плюс:** пробелы
+  PII-редакции (AWS/Basic/PEM), `/replay` RBAC + SSRF-allowlist, VM
+  None-sentinel (нет ложно-healthy снимка), fail-safe гейт аппрува в
+  RCAExplainer, тюнинг пула БД, фикс psycopg2-leak. ~22 фикса; полный
+  сьют 1591 passed.
 - **v0.14.0 — Alert-quality: подавление шума + ops-харднинг**: два новых
   класса подавления на этапе render-а — шумные алёрты остаются *видимыми, но
   приглушёнными* (grey + 🔇, без 🚨/@mention), а не дропаются и не демотятся по
@@ -398,6 +442,9 @@ PIPELINE_DIRECT_INVOKE=true
 | `DISCORD_PUBLIC_KEY` | Ed25519-ключ для верификации `/discord/interactions` | для кнопок |
 | `DISCORD_DRY_RUN` | `true` = логировать вместо отправки | dev |
 | `ALERTMANAGER_WEBHOOK_SECRET` | HMAC-SHA256 аутентификация вебхука | prod |
+| `DISCORD_INTERACTION_MAX_AGE_SECONDS` | Anti-replay окно для timestamp Discord-interaction; дефолт 300 | опционально |
+| `ALERTMANAGER_WEBHOOK_MAX_AGE_SECONDS` | Anti-replay окно для AlertManager timestamp (если signer шлёт); дефолт 300 | опционально |
+| `ALERTMANAGER_REQUIRE_SIGNED_TIMESTAMP` | Отвергать body-only HMAC без timestamp; дефолт `false` | опционально |
 | `JWT_PUBLIC_KEY` | Аутентификация `/copilot` | prod |
 | `JIRA_BASE_URL` / `JIRA_EMAIL` / `JIRA_API_TOKEN` | Обогащение из Jira | опционально |
 | `VICTORIA_METRICS_URL` | Метрики пода + кластерный snapshot | опционально |
@@ -435,7 +482,7 @@ cloudflared tunnel --url http://localhost:8000
 ```bash
 helm install sre-ai-copilot helm/sre-ai-copilot/ \
   --set ingress.host=sre-ai.example.com \
-  --set image.tag=0.14.0
+  --set image.tag=1.0.0-rc.1
 ```
 
 Перед установкой заполнить секреты — см. `helm/sre-ai-copilot/templates/secret.yaml`.
@@ -469,12 +516,12 @@ helm install sre-ai-copilot helm/sre-ai-copilot/ \
 
 ### Безопасность
 
-- **Defence in depth вокруг kubectl**: AI не вызывает kubectl напрямую — `FixAgent` выдаёт структурный `ExecutionIntent` (JSON, pydantic-валидирован, `FORBIDDEN_NAMESPACES` отбрасываются на парсе), `DSLTranslator` детерминированно строит kubectl-строку, `K8sSecurityGuard` валидирует `(verb, resource, namespace)` структурно (не через text-parsing). Реальный write (`dry_run=False`) дополнительно требует `post_approval=True`, который ставится только из Discord approval consumer-а.
+- **Defence in depth вокруг kubectl** (усилено в v1.0.0-rc.1): AI не вызывает kubectl напрямую — `FixAgent` выдаёт структурный `ExecutionIntent` (JSON, pydantic-валидирован, `FORBIDDEN_NAMESPACES` отбрасываются на парсе), `DSLTranslator` детерминированно строит kubectl-строку, `K8sSecurityGuard` валидирует `(verb, resource, namespace)` структурно (не через text-parsing). Перед любым реальным write apply-путь теперь проходит **детерминированный серверный policy-gate** (`app/remediation`, 8 risk axes): риск пересчитывается из *структурного* intent-а и блокируется prod/system/data-plane/необратимое — LLM-`risk` лишь advisory, его нельзя обойти prompt-injection'ом. `apply_intent` дополнительно требует совпадения **подписи** intent-а (TOCTOU) **и** записи `ActionApproval` для инцидента до выполнения, с row-lock против двойного apply. `post_approval=True` (прежний обход SAFE_MODE) больше не является достаточным сам по себе.
 - Tiered namespace policy в `K8sSecurityGuard.validate`: `prod`/`preprod` — read-only; `squad-*` — write через approval; `kube-*`/`mcp` — forbidden.
 - `SAFE_MODE=true` принудительно в `ENV=production` (config-validator валит старт иначе) — реальный write вне утверждённого пути возвращает `SAFE_MODE: Manual approval required.`
-- AlertManager-webhook аутентификация: HMAC-SHA256 на body (`ALERTMANAGER_WEBHOOK_SECRET` обязателен в production, без него config-validator не даёт стартовать).
-- Защита от prompt injection с лимитом `PROMPT_INPUT_MAX_CHARS`.
-- Discord Interactions endpoint верифицирует Ed25519-подпись на каждом запросе (требование Discord). Кнопка Apply имеет двухшаговое подтверждение (паттерн зеркал 👎) — защита от случайных кликов.
+- AlertManager-webhook аутентификация: HMAC-SHA256 на body (`ALERTMANAGER_WEBHOOK_SECRET` обязателен в production, без него config-validator не даёт стартовать). Anti-replay: если signer шлёт `X-Alertmanager-Timestamp`, HMAC считается над `ts.body` + проверяется окно свежести (`ALERTMANAGER_WEBHOOK_MAX_AGE_SECONDS`, дефолт 300с); `ALERTMANAGER_REQUIRE_SIGNED_TIMESTAMP=true` отвергает body-only подпись.
+- Защита от prompt injection: реальные injection-паттерны (`ignore previous instructions`, …) блокируются; слишком длинный ввод **обрезается** (не отклоняется), чтобы крупные легит-инциденты не терялись, а код-образные строки (`import os`, `eval(`) больше не блокируются — крэш-трейсбэки их легитимно содержат.
+- Discord Interactions endpoint верифицирует Ed25519-подпись на каждом запросе (требование Discord) **и проверяет свежесть timestamp** (`DISCORD_INTERACTION_MAX_AGE_SECONDS`, дефолт 300с) как anti-replay — перехваченный подписанный apply/approve-клик нельзя переиграть. Кнопка Apply имеет двухшаговое подтверждение (паттерн зеркал 👎) — защита от случайных кликов.
 - Полный OTEL audit trail + события `EXECUTOR_APPLIED` / `EXECUTOR_APPLY_REFUSED` — см. [docs/AUDIT.md](docs/AUDIT.md).
 
 ### Roadmap — Execution

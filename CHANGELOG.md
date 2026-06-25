@@ -4,7 +4,97 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
-_Ничего в очереди — см. [0.14.0] ниже._
+_Ничего в очереди — см. [1.0.0-rc.1] ниже._
+
+## [1.0.0-rc.1] — 2026-06-25 — Security & reliability hardening (release candidate)
+
+Крупнейший проход харднинга за историю проекта: ~22 фикса по итогам внутреннего
+глубокого код-ревью. Закрыт весь CRITICAL/P0-тир; opt-in executor сделан реально
+безопасным (решение «можно ли применить kubectl» больше не отдано LLM). Полный
+сьют на финальном master: **1591 passed, 12 skipped**.
+
+> RC перед финальным 1.0.0. Дефолты не изменились (advisory-режим, executor за
+> opt-in флагами). Версии сведены: FastAPI app `2.4.0` → `1.0.0-rc.1`.
+
+### Executor / approval — безопасность реального write
+
+- **Детерминированный policy-gate вместо LLM-`risk` (#165, CRITICAL).** Раньше
+  единственным гейтом перед `kubectl --dry-run=false` была строка `intent.risk`
+  из ответа `FixAgent` — её можно было занизить prompt-injection'ом, а весь
+  `app/remediation/*` (8 risk axes, policy evaluator) был мёртвым кодом. Теперь
+  `apply_intent` пересчитывает риск из *структурного* intent-а
+  (`app/remediation/executor_gate.py`) и блокирует prod/system/data-plane/
+  необратимое; LLM-`risk` — лишь advisory. Попутно закрыт exact-match
+  `READ_ONLY_NAMESPACES` (теперь префиксная классификация — `prod-*` ловится).
+- **Подпись на apply-пути + проверка `ActionApproval` (#167, CRITICAL+HIGH).**
+  `apply_confirm` теперь несёт подпись intent-а в `custom_id` (TOCTOU-сверка), а
+  `apply_intent` перед write требует совпадения подписи **и** записи
+  `ActionApproval` (approved) для инцидента. `post_approval=True` (прежний обход
+  SAFE_MODE) больше не достаточен сам по себе.
+- **Anti-replay по timestamp (#166, CRITICAL).** Discord-interactions (Ed25519) и
+  AlertManager (HMAC) проверяют свежесть timestamp
+  (`DISCORD_INTERACTION_MAX_AGE_SECONDS`, `ALERTMANAGER_WEBHOOK_MAX_AGE_SECONDS`,
+  дефолт 300с; `ALERTMANAGER_REQUIRE_SIGNED_TIMESTAMP` для enforce). Перехваченный
+  подписанный apply/approve-клик больше нельзя переиграть.
+- **Row-lock идемпотентность `apply_intent` (#168, M3).** `SELECT … FOR UPDATE` на
+  инциденте — double-click / реплей больше не выполняют `kubectl` дважды.
+- **`/replay` RBAC + SSRF-allowlist (#186).** `require_role("approver")` на
+  replay-ручках; `validate_snapshot_uri` (allowlist `s3://`/`file://`); попутно
+  фикс latent routing-бага `/by-snapshot` и утечки сессии.
+
+### Надёжность / стоимость
+
+- **Retry-шторм LLM (#170, CRITICAL).** SDK `max_retries=0` + client-timeout +
+  сужённый retry-предикат (только 5xx/429/сеть/таймаут) — вместо до 9× HTTP на
+  один agent-вызов и «зомби»-запросов после `asyncio.wait_for`.
+- **AM-down больше не гасит ложно живые алерты (#169, CRITICAL).** Age-fallback
+  в `alerts_resolve_sync` резолвит только при подтверждённом живом AM-снимке;
+  при AM down проход пропускается (иначе долгоживущие firing critical
+  — etcd/disk/prod-down — ложно «гасли» в Discord).
+- **Дедуп incident-канала → cross-replica PG (#171, CRITICAL).** `_post_or_edit_incident`
+  переведён с per-process dict на общий `dedup_store` — на 2+ репликах api больше
+  нет дубль-POST critical с повторным `@here`.
+- **Savepoint-изоляция KG-синхронизаторов (#175, H2).** `db.begin_nested()` per-item
+  в `auto_populator`/`k8s_events_sync`/`seq_logs_sync`/`metrics_sync` — один битый
+  ряд больше не отравляет сессию и не валит весь tick.
+- **Единый Celery-app (#174, C2).** Два `Celery()` на одном Redis сведены к одному;
+  пользовательский `generate_reply` наследует backpressure-конфиг.
+- **stop_reason / удаление мёртвого llm_cache (#182).** Обрезка по `max_tokens`
+  теперь видна (`truncated`-флаг), а не маскируется под пустой ответ; dead-code
+  `llm_cache.py` удалён + честный комментарий.
+
+### Корректность / данные / контекст
+
+- **prompt_guard не блокирует легит (#176, H4).** Длинный ввод обрезается (не
+  отклоняется), код-паттерны (`import os`/`eval(`) больше не блокируются —
+  крэш-трейсбэки их легитимно содержат; injection-паттерны блокируются как прежде.
+- **VM None-sentinel (#180, H1).** `query_instant` возвращает `None` (не `0.0`) при
+  сбое — частичный сбой метрик больше не маскируется под «здоровый» кластер;
+  `data_available`/`degraded` учитывают отсутствие данных.
+- **RCAExplainer fail-safe (#178, H3).** `.get()` вместо жёстких индексов, маппинг
+  действий по стабильному `kind`, неузнанная причина → `approval_required=True`
+  (раньше дрейф имени делал OOM-фикс auto-approvable).
+- **pod_event service_id backfill (#177, H3).** Атрибуция до-проставляется при
+  позднем появлении сервиса — OOM/CrashLoop больше не остаются orphan.
+- **KG H1 — деплои не теряются (#184).** Непарсящийся `finished_at` больше не
+  роняет build через `None.replace()`.
+- **kg_sync: weight не понижается + фильтр фантомных db-узлов (#185, H5/C2).**
+  `GREATEST(existing, excluded)` для weight; secret-hint db-узлы сверяются с
+  реестром реальных, без `unverified_host` помечаются для фильтрации.
+- **Seq `count_events` реальный total (#179, H4).** Пагинация по `afterId` вместо
+  `count=1` → error-rate сигнал больше не мёртв.
+- **`_peer_namespace` N+1 (#172, C1).** Дифф-диагностика сравнивает сквад с
+  реальным соседом, а не с хардкод-`squad-2`.
+- **socket.setdefaulttimeout убран (#173, C2).** Per-call `_request_timeout` вместо
+  процесс-глобальной мутации, рвавшей таймауты unrelated клиентов под concurrency.
+
+### Безопасность данных / инфра
+
+- **PII-редакция: AWS (`AKIA`/`ASIA`), Basic-auth, PEM private-key (#181).**
+- **Пул БД (#183, H3):** явные `pool_size/max_overflow/pool_timeout/pool_recycle`
+  (дефолтный потолок 15 не держал threadpool + Celery); psycopg2-leak в
+  `statics_service` (close в `finally`); `dedup_store.get_fresh` больше не делает
+  `DELETE+COMMIT` в hot-path — purge вынесен в beat-задачу.
 
 ## [0.14.0] — 2026-06-23 — Alert-quality: подавление шума + ops-харднинг
 
