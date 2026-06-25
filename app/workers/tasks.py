@@ -22,6 +22,13 @@ logger = logging.getLogger(__name__)
 
 celery_app = Celery("sre_tasks", broker=settings.REDIS_URL, backend=settings.REDIS_URL)
 
+# task_track_started: выставляем безусловно (в т.ч. eager) — раньше это жило
+# на legacy-app Celery("worker") в celery_worker.py, который теперь сведён сюда.
+# /copilot-флоу (generate_reply) опрашивает AsyncResult в main.py и опирается
+# на STARTED-состояние для in-flight задач; без него running-задача рапортует
+# PENDING. Не зависит от backpressure-блока ниже (тот gated на non-eager).
+celery_app.conf.task_track_started = True
+
 # Backpressure-настройки (см. config.py для пояснений).
 # Не применяются в eager-mode чтобы тесты не упирались в time-limit'ы.
 if not settings.CELERY_TASK_ALWAYS_EAGER:
