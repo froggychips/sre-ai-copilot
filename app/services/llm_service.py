@@ -69,7 +69,18 @@ class LLMService:
                 ),
             )
         else:
-            self.client = AsyncAnthropic(api_key=settings.ANTHROPIC_API_KEY)
+            # max_retries=0 — НЕ полагаемся на встроенные ретраи SDK (по дефолту 2).
+            # Иначе SDK-ретраи (2) × наш llm_retry_strategy (3) = до 9 HTTP на один
+            # agent-вызов (retry-storm + сжигание токенов). Единственный слой
+            # ретраев — наш декоратор; предикат там сужен до транзиентных ошибок.
+            # timeout на уровне клиента — реальная отмена httpx-запроса по дедлайну
+            # (внешний asyncio.wait_for НЕ обрывает уже улетевший HTTP → «зомби»-
+            # запрос жжёт токены в фоне). LLM_TIMEOUT_SECONDS из settings.
+            self.client = AsyncAnthropic(
+                api_key=settings.ANTHROPIC_API_KEY,
+                max_retries=0,
+                timeout=float(getattr(settings, "LLM_TIMEOUT_SECONDS", 30.0)),
+            )
 
     @llm_retry_strategy
     async def generate_full(self, prompt: str) -> Dict[str, Any]:
@@ -122,11 +133,21 @@ class LLMService:
             # точка, где prompt caching был бы net-positive — общий префикс
             # fan-out'а MultiHypothesisAgent (shared-prefix/varying-suffix); это
             # отдельный hot-path рефактор, не «воткнуть cache_control».
+            # Двухслойный таймаут:
+            #  1) per-request timeout= на messages.create → httpx обрывает сам
+            #     HTTP-запрос по дедлайну (реальная отмена, не «зомби»; SDK
+            #     поднимет APITimeoutError). Дублирует client-level timeout, но
+            #     явный per-request делает дедлайн читаемым на call-site.
+            #  2) внешний asyncio.wait_for как верхняя граница — страховка на
+            #     случай, если корутина зависнет ВНЕ httpx (DNS/телo/локи).
+            #     Он НЕ отменяет сетевой сокет сам по себе — поэтому слой (1)
+            #     обязателен, а wait_for оставлен лишь как hard-ceiling.
             response = await asyncio.wait_for(
                 self.client.messages.create(
                     model=self.model,
                     max_tokens=settings.MAX_TOKENS,
                     messages=[{"role": "user", "content": prompt}],
+                    timeout=llm_timeout,
                 ),
                 timeout=llm_timeout,
             )
@@ -152,10 +173,13 @@ class LLMService:
             # Брейкер сработал — это НЕ новый сбой провайдера, не считаем его
             # и не ретраим (см. llm_retry_strategy).
             raise
-        except asyncio.TimeoutError:
+        except asyncio.TimeoutError as e:
             await _report_provider(resilience, success=False)
             logging.error("LLM call timed out")
-            raise ValueError("LLM timeout")
+            # `from e` сохраняет __cause__=TimeoutError → is_retryable_llm_error
+            # распознаёт ретраибельность сквозь обёртку ValueError (таймаут =
+            # транзиент, повтор оправдан).
+            raise ValueError("LLM timeout") from e
         except Exception as e:
             await _report_provider(resilience, success=False)
             logging.error(f"LLM call attempt failed: {e}")
