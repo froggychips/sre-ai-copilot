@@ -12,8 +12,8 @@ from app.database import Base
 # Импортируем schema, чтобы ORM-классы зарегистрировались в Base.metadata
 from app.knowledge_graph.schema import (ServiceEdge)  # noqa: F401
 from app.knowledge_graph.populator import (record_alert_event,
-                                           record_deployment, upsert_edge,
-                                           upsert_service)
+                                           record_deployment, record_pod_event,
+                                           upsert_edge, upsert_service)
 from app.knowledge_graph.queries import (incidents_on, log_error_rate_for,
                                          nearby_alerts, recent_deploys_for,
                                          upstream_of)
@@ -63,6 +63,47 @@ def test_record_alert_idempotent_by_fingerprint(db):
     )
     assert a1.id == a2.id
     assert a2.severity == "critical"
+
+
+def test_record_pod_event_backfills_service_id(db):
+    """H3: первый sync пришёл без сервиса (service_id=NULL),
+    повторный по тому же event_uid принёс резолвящийся сервис →
+    атрибуция до-проставляется (orphan-событие перестаёт быть orphan)."""
+    first_seen = datetime(2026, 5, 12, 10, 0)
+    e1 = record_pod_event(
+        db, None, "squad-1", "town-grainhost-0", "OOMKilled",
+        event_uid="uid-1", first_seen=first_seen, count=1,
+    )
+    assert e1.service_id is None  # сервиса ещё не было в KG
+
+    svc = upsert_service(db, "squad-1", "town-grainhost")
+    e2 = record_pod_event(
+        db, svc, "squad-1", "town-grainhost-0", "OOMKilled",
+        event_uid="uid-1", first_seen=first_seen, count=3,
+    )
+    assert e2.id == e1.id          # то же событие (идемпотентно по uid)
+    assert e2.service_id == svc.id  # service_id до-проставлен
+    assert e2.count == 3           # обычное обновление count тоже работает
+
+
+def test_record_pod_event_does_not_overwrite_service_id(db):
+    """Контроль: уже непустой service_id не перетирается даже если
+    повторный вызов принёс другой сервис."""
+    first_seen = datetime(2026, 5, 12, 10, 0)
+    svc_a = upsert_service(db, "squad-1", "svc-a")
+    e1 = record_pod_event(
+        db, svc_a, "squad-1", "pod-x", "CrashLoopBackOff",
+        event_uid="uid-2", first_seen=first_seen,
+    )
+    assert e1.service_id == svc_a.id
+
+    svc_b = upsert_service(db, "squad-1", "svc-b")
+    e2 = record_pod_event(
+        db, svc_b, "squad-1", "pod-x", "CrashLoopBackOff",
+        event_uid="uid-2", first_seen=first_seen,
+    )
+    assert e2.id == e1.id
+    assert e2.service_id == svc_a.id  # не перетёрт на svc_b
 
 
 # ---------- queries -------------------------------------------------------

@@ -393,6 +393,11 @@ def record_pod_event(
             existing.last_seen = last_seen
         if count is not None:
             existing.count = count
+        # Бэкфилл атрибуции: если первый sync сохранил service_id=NULL
+        # (сервиса ещё не было в KG), а сейчас сервис резолвится —
+        # до-проставляем его. Уже непустой service_id не перетираем.
+        if existing.service_id is None and service is not None:
+            existing.service_id = service.id
         return existing
 
     ev = PodEvent(
