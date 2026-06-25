@@ -31,6 +31,8 @@ def mock_session(monkeypatch):
     """Захватить SessionLocal() и вернуть mock-session с управляемым record."""
     session = MagicMock()
     query = session.query.return_value.filter.return_value
+    # apply_intent грузит record с row-lock: .filter(...).with_for_update().first()
+    query.with_for_update.return_value = query
     monkeypatch.setattr(executor_apply, "SessionLocal", lambda: session)
     return session, query
 
