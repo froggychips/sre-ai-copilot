@@ -7,7 +7,6 @@ flaky kube API.
 """
 from __future__ import annotations
 
-import socket
 from typing import Any, Dict, List, Optional
 
 import structlog
@@ -80,12 +79,19 @@ def fetch_live_replicas(
     """
     if not _load_k8s_once():
         return None
-    # Hard timeout на socket уровне. AppsV1Api не принимает per-call
-    # timeout в k8s-client, поэтому через socket.setdefaulttimeout —
-    # грубо, но достаточно для embed-budget.
-    old_timeout = socket.getdefaulttimeout()
+    # Дедлайн на запрос задаётся ПЕР-ВЫЗОВ через `_request_timeout`,
+    # который kubernetes-client пробрасывает в urllib3 (read/connect
+    # timeout именно этого HTTP-запроса).
+    #
+    # НЕЛЬЗЯ ставить дедлайн через процесс-глобальный socket-таймаут
+    # (socket.set/get default-timeout): это глобальная на весь процесс
+    # настройка. Пайплайн гоняет инциденты конкурентно (Celery + asyncio
+    # .gather в enrichment) → перекрывающиеся вызовы рейсятся, и finally
+    # одного восстанавливает чужой timeout (или None), оставляя ВСЕ
+    # прочие сокеты процесса (httpx к VM/Seq/Jira, DB, redis, k8s) с
+    # неправильным/снятым таймаутом → спорадические зависания в
+    # unrelated клиентах.
     try:
-        socket.setdefaulttimeout(timeout_sec)
         apps = client.AppsV1Api()
         order: List[str] = []
         if kind_hint == "deployment":
@@ -99,12 +105,16 @@ def fetch_live_replicas(
         for kind in order:
             try:
                 if kind == "statefulset":
-                    sts = apps.read_namespaced_stateful_set(name, namespace)
+                    sts = apps.read_namespaced_stateful_set(
+                        name, namespace, _request_timeout=timeout_sec
+                    )
                     desired = int(sts.spec.replicas or 0)
                     ready = int(sts.status.ready_replicas or 0)
                     return {"ready": ready, "desired": desired}
                 else:
-                    dep = apps.read_namespaced_deployment(name, namespace)
+                    dep = apps.read_namespaced_deployment(
+                        name, namespace, _request_timeout=timeout_sec
+                    )
                     desired = int(dep.spec.replicas or 0)
                     ready = int(dep.status.ready_replicas or 0)
                     return {"ready": ready, "desired": desired}
@@ -118,8 +128,6 @@ def fetch_live_replicas(
             namespace=namespace, name=name, error=type(e).__name__,
         )
         return None
-    finally:
-        socket.setdefaulttimeout(old_timeout)
 
 
 def fetch_last_log_line(
