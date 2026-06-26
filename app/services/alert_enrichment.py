@@ -25,7 +25,8 @@ from app.diagnostics.rules.upstream_degraded import UpstreamDegradedRule
 from app.knowledge_graph.queries import (blast_radius_for,
                                          cluster_deploy_activity,
                                          current_replicas_from_kg,
-                                         incidents_on, latest_pod_event_for,
+                                         incidents_on, ingress_health_for,
+                                         latest_pod_event_for,
                                          nats_impact_for, nearby_alerts,
                                          pod_event_summary_for,
                                          recent_deploys_for,
@@ -194,6 +195,11 @@ class EnrichedContext:
     # PodEvent за окно ±60м. Параллельна `pod_events` (top-5 individual),
     # фокус на counts. См. queries.pod_event_summary_for.
     pod_trail: Dict[str, Any] = field(default_factory=dict)
+    # ingress_health — ingress-derived HTTP RED (5xx-rps/p95) per host/path из
+    # kg_ingress_observations. Живой источник (nginx-ingress), в отличие от
+    # per-service kg_service_health.http_5xx (закрыт JWT, WO-12483). Помечен
+    # is_ingress_derived. См. queries.ingress_health_for.
+    ingress_health: Dict[str, Any] = field(default_factory=dict)
 
     # Свободное поле для metadata, которая не имеет первого-класса своего слота:
     # `synthetic_fallback` (resolver hit на synthetic Service), `target_resolve_*` —
@@ -710,6 +716,12 @@ def enrich_alert(db: Session, incident: Incident) -> EnrichedContext:
             )
         except Exception as e:
             log.warning("enrich.pod_trail_failed", error=str(e))
+        try:
+            ctx.ingress_health = ingress_health_for(
+                db, namespace, service, window_minutes=15, top_n=3,
+            )
+        except Exception as e:
+            log.warning("enrich.ingress_health_failed", error=str(e))
 
     # 4c-bis (on-call UX): конкретный pod_name + containerStatus.reason
     # из последнего kg_pod_events. Если оконные fallback пусты — берём

@@ -15,8 +15,8 @@ from sqlalchemy.orm import Session
 from app.knowledge_graph.confidence import (confidence_label,
                                             confidence_score)
 from app.knowledge_graph.schema import (AlertEvent, Deployment,
-                                        LogObservation, PodEvent,
-                                        Service, ServiceEdge)
+                                        IngressObservation, LogObservation,
+                                        PodEvent, Service, ServiceEdge)
 
 
 def _ensure_aware(dt: datetime) -> datetime:
@@ -809,3 +809,104 @@ def log_error_rate_for(
         "buckets": bucket_count,
         "is_proxy": True,
     }
+
+
+def ingress_health_for(
+    db: Session,
+    namespace: str,
+    service_name: str,
+    *,
+    window_minutes: int = 15,
+    top_n: int = 3,
+    now: Optional[datetime] = None,
+) -> Dict[str, Any]:
+    """Per-service HTTP RED-сигнал из ``kg_ingress_observations`` (endpoint-разрез).
+
+    ВАЖНО — СЕМАНТИКА: это **ingress-derived** сигнал (nginx-ingress controller
+    метрики per host/path), а НЕ per-service app `/metrics`. Последний закрыт
+    JWT (WO-12483) → ``kg_service_health.http_5xx_rate/p95`` всегда 0. Этот
+    источник доступен с 2026-06-10 и покрывает сервисы с Ingress'ом. Он
+    меряет трафик НА ГРАНИЦЕ (ingress), не внутренние service-to-service
+    вызовы — поэтому маркируется ``is_ingress_derived=True`` и НЕ пишется в
+    ``kg_service_health`` (чтобы не смешивать два разных разреза).
+
+    Для каждого endpoint (host, path) сервиса берётся ПОСЛЕДНЯЯ запись в окне
+    [now-window_minutes, now]; агрегаты по сервису — пиковые (max) 5xx/p95/p99
+    и суммарный rps. top_endpoints отсортированы по 5xx desc, затем p95 desc.
+
+    Возвращает dict (всегда, даже с нулями — endpoints_total=0 если наблюдений
+    нет) либо ``{}`` если сервиса нет в графе. ``now`` инъектится для тестов.
+
+        {
+          "service_id": int, "namespace": str, "name": str,
+          "window_minutes": int, "endpoints_total": int,
+          "max_5xx_rate": float, "max_p95_ms": float, "max_p99_ms": float,
+          "total_rps": float,
+          "top_endpoints": [{host, path, error_5xx_rate, p95_latency_ms, rps}],
+          "is_ingress_derived": True,
+        }
+    """
+    svc = _service_by_namespace_name(db, namespace, service_name)
+    if svc is None:
+        return {}
+
+    now = now or datetime.utcnow()
+    cutoff = now - timedelta(minutes=window_minutes)
+    rows = (
+        db.query(IngressObservation)
+        .filter(
+            IngressObservation.service_id == svc.id,
+            IngressObservation.ts >= cutoff,
+        )
+        .order_by(IngressObservation.ts.desc())
+        .all()
+    )
+
+    # Последняя запись на каждый endpoint (host, path) — rows уже ts DESC.
+    latest_by_endpoint: Dict[tuple, IngressObservation] = {}
+    for r in rows:
+        key = (r.host, r.path)
+        if key not in latest_by_endpoint:
+            latest_by_endpoint[key] = r
+
+    endpoints = list(latest_by_endpoint.values())
+    result: Dict[str, Any] = {
+        "service_id": svc.id,
+        "namespace": namespace,
+        "name": service_name,
+        "window_minutes": window_minutes,
+        "endpoints_total": len(endpoints),
+        "max_5xx_rate": 0.0,
+        "max_p95_ms": 0.0,
+        "max_p99_ms": 0.0,
+        "total_rps": 0.0,
+        "top_endpoints": [],
+        "is_ingress_derived": True,
+    }
+    if not endpoints:
+        return result
+
+    def _f(v: Optional[float]) -> float:
+        return float(v) if v is not None else 0.0
+
+    result["max_5xx_rate"] = round(max(_f(e.error_5xx_rate) for e in endpoints), 4)
+    result["max_p95_ms"] = round(max(_f(e.p95_latency_ms) for e in endpoints), 1)
+    result["max_p99_ms"] = round(max(_f(e.p99_latency_ms) for e in endpoints), 1)
+    result["total_rps"] = round(sum((_f(e.rps) for e in endpoints), 0.0), 3)
+
+    ranked = sorted(
+        endpoints,
+        key=lambda e: (_f(e.error_5xx_rate), _f(e.p95_latency_ms)),
+        reverse=True,
+    )
+    result["top_endpoints"] = [
+        {
+            "host": e.host,
+            "path": e.path,
+            "error_5xx_rate": round(_f(e.error_5xx_rate), 4),
+            "p95_latency_ms": round(_f(e.p95_latency_ms), 1),
+            "rps": round(_f(e.rps), 3),
+        }
+        for e in ranked[:top_n]
+    ]
+    return result
