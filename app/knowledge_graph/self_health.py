@@ -27,6 +27,9 @@ dev-канал, не #infra-error).
        <80% warn, <50% fail. StS-резолвер регрессия.
     6. edges_freshness — % kg_service_edges с last_seen_at <24h назад или
        NULL. >30% → warn (kg_sync UPSERT регрессия).
+    7. graph_integrity — структурные инварианты (должны быть 0): фантом-дубли
+       db-узлов (#185/#189), serves_traffic self-loops (#190), висячие рёбра.
+       >0 → fail/warn. Regression-watch для багов, вычищенных в rc.2.
 
 Идемпотентность: само по себе read-only, безопасно к повторным запускам.
 Discord-dedup — на уровне beat-задачи (см. tasks.py).
@@ -39,7 +42,7 @@ from typing import Any, Dict, List, Optional, Sequence
 
 import structlog
 from sqlalchemy import func, or_
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, aliased
 
 from app.config import settings
 from app.knowledge_graph.schema import (AlertEvent, AnomalyObservation,
@@ -450,6 +453,79 @@ def check_deploy_stream_ingestion(db: Session) -> CheckResult:
     )
 
 
+# Структурная целостность графа — порог dangling, выше которого fail (а не warn).
+_GRAPH_INTEGRITY_FAIL_DANGLING = 50
+
+
+def check_graph_integrity(db: Session) -> CheckResult:
+    """Структурные инварианты графа — regression-watch для багов, вычищенных
+    в rc.2 (2026-06-26). Эти величины ДОЛЖНЫ быть 0 по построению:
+
+      * db_phantom_dup_names — `db:%`-узлы с одним именем в >1 namespace.
+        #185 (sync-guard) + #189 (backfill) свели 288→16. >0 = guard-регрессия
+        (один физический кластер БД снова размножается в per-ns копии).
+      * serves_traffic_self_loops — рёбра src_id==dst_id kind='serves_traffic'.
+        #190 guard (`dep_node.id==svc_node.id → skip`) гарантирует 0. >0 =
+        регрессия (Service≡Deployment снова плодит петлю → шум в blast-radius).
+      * self_loops_any — любые петли (ловит новые edge-builder'ы с тем же багом).
+      * dangling_edges — рёбра, чей src/dst отсутствует в kg_services (битый
+        delete/merge). Транзиентно при гонке sync → warn; массово → fail.
+
+    fail при dup_names>0 ИЛИ self_loops_any>0 ИЛИ dangling>порога; warn при
+    dangling>0; иначе ok. Read-only.
+    """
+    dup_sub = (
+        db.query(Service.name)
+        .filter(Service.name.like("db:%"))
+        .group_by(Service.name)
+        .having(func.count(Service.id) > 1)
+        .subquery()
+    )
+    db_phantom_dup_names = db.query(func.count()).select_from(dup_sub).scalar() or 0
+
+    self_loops_any = (
+        db.query(func.count(ServiceEdge.id))
+        .filter(ServiceEdge.src_id == ServiceEdge.dst_id)
+        .scalar()
+    ) or 0
+    serves_traffic_self_loops = (
+        db.query(func.count(ServiceEdge.id))
+        .filter(ServiceEdge.src_id == ServiceEdge.dst_id,
+                ServiceEdge.kind == "serves_traffic")
+        .scalar()
+    ) or 0
+
+    src_a = aliased(Service)
+    dst_a = aliased(Service)
+    dangling_edges = (
+        db.query(func.count(ServiceEdge.id))
+        .outerjoin(src_a, ServiceEdge.src_id == src_a.id)
+        .outerjoin(dst_a, ServiceEdge.dst_id == dst_a.id)
+        .filter(or_(src_a.id.is_(None), dst_a.id.is_(None)))
+        .scalar()
+    ) or 0
+
+    if (db_phantom_dup_names > 0 or self_loops_any > 0
+            or dangling_edges > _GRAPH_INTEGRITY_FAIL_DANGLING):
+        status = "fail"
+    elif dangling_edges > 0:
+        status = "warn"
+    else:
+        status = "ok"
+
+    return CheckResult(
+        name="graph_integrity",
+        status=status,
+        detail={
+            "db_phantom_dup_names": db_phantom_dup_names,
+            "self_loops_any": self_loops_any,
+            "serves_traffic_self_loops": serves_traffic_self_loops,
+            "dangling_edges": dangling_edges,
+            "dangling_fail_threshold": _GRAPH_INTEGRITY_FAIL_DANGLING,
+        },
+    )
+
+
 # ── Orchestrator ──────────────────────────────────────────────────────────
 
 _ALL_CHECKS = (
@@ -460,6 +536,7 @@ _ALL_CHECKS = (
     check_pod_events_link_rate,
     check_edges_freshness,
     check_deploy_stream_ingestion,
+    check_graph_integrity,
 )
 
 
