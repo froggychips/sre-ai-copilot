@@ -229,8 +229,43 @@ def test_extract_ingress_routes_empty_spec():
 
 def test_sync_all_services_creates_node_and_edge(db):
     """Полный happy path: Service со selector матчится на существующий
-    Deployment-узел → kg_services upsert + edge serves_traffic."""
+    Deployment-узел с ОТЛИЧНЫМ именем → kg_services upsert + cross-node edge
+    serves_traffic. Имена разные (Service `auth-svc` → Deployment `auth-app`),
+    иначе это был бы один и тот же узел и self-loop (см. отдельный тест)."""
     # Pre-existing deployment node (kg_topology_sync уже его создал)
+    upsert_service(db, "prod-shared", "auth-app", team_owner="auth-team")
+    db.flush()
+
+    services = [_mk_service("auth-svc", "prod-shared", selector={"app": "auth"})]
+    deps = [_mk_deployment("auth-app", "prod-shared", pod_labels={"app": "auth"})]
+    deps_idx = _index_deployments_by_ns(deps)
+
+    with patch(
+        "app.knowledge_graph.k8s_topology_resources_sync._kubectl_get_all",
+        return_value=services,
+    ):
+        stats = sync_all_services(db, deployments_index=deps_idx)
+
+    assert stats["services_fetched"] == 1
+    assert stats["nodes_upserted"] == 1
+    assert stats["edges_serves_traffic"] == 1
+    assert stats["skipped_self_loop"] == 0
+
+    # Edge действительно лежит в БД
+    edges = db.query(ServiceEdge).filter_by(kind=EDGE_SERVES_TRAFFIC).all()
+    assert len(edges) == 1
+    e = edges[0]
+    assert e.src.name == "auth-svc"
+    assert e.dst.name == "auth-app"
+    assert e.src_id != e.dst_id
+    assert e.discovered_by == DISCOVERED_BY_SVC
+    assert (e.extras or {}).get("confidence") == "declared_k8s"
+
+
+def test_sync_all_services_skips_self_loop_same_name(db):
+    """Service и его Deployment одноимённы (Service `auth` бэкает Deployment
+    `auth`) → один и тот же kg_services-узел (ключ name+namespace). edge
+    serves_traffic сам-на-себя бессмыслен (засоряет blast-radius) → пропускаем."""
     upsert_service(db, "prod-shared", "auth", team_owner="auth-team")
     db.flush()
 
@@ -244,18 +279,13 @@ def test_sync_all_services_creates_node_and_edge(db):
     ):
         stats = sync_all_services(db, deployments_index=deps_idx)
 
-    assert stats["services_fetched"] == 1
     assert stats["nodes_upserted"] == 1
-    assert stats["edges_serves_traffic"] == 1
-
-    # Edge действительно лежит в БД
-    edges = db.query(ServiceEdge).filter_by(kind=EDGE_SERVES_TRAFFIC).all()
-    assert len(edges) == 1
-    e = edges[0]
-    assert e.src.name == "auth"
-    assert e.dst.name == "auth"
-    assert e.discovered_by == DISCOVERED_BY_SVC
-    assert (e.extras or {}).get("confidence") == "declared_k8s"
+    assert stats["skipped_self_loop"] == 1
+    assert stats["edges_serves_traffic"] == 0
+    # Ни одного self-loop-ребра в БД
+    assert db.query(ServiceEdge).filter(
+        ServiceEdge.src_id == ServiceEdge.dst_id).count() == 0
+    assert db.query(ServiceEdge).filter_by(kind=EDGE_SERVES_TRAFFIC).count() == 0
 
 
 def test_sync_all_services_no_selector_creates_node_only(db):
@@ -328,11 +358,11 @@ def test_sync_all_services_no_edge_when_deployment_has_different_name(db):
 def test_sync_all_services_idempotent_second_run(db):
     """Повторный sync того же snapshot — не дублирует edges (upsert по
     (src,dst,kind))."""
-    upsert_service(db, "prod-shared", "auth")
+    upsert_service(db, "prod-shared", "auth-app")
     db.flush()
 
-    services = [_mk_service("auth", "prod-shared", selector={"app": "auth"})]
-    deps = [_mk_deployment("auth", "prod-shared", pod_labels={"app": "auth"})]
+    services = [_mk_service("auth-svc", "prod-shared", selector={"app": "auth"})]
+    deps = [_mk_deployment("auth-app", "prod-shared", pod_labels={"app": "auth"})]
     deps_idx = _index_deployments_by_ns(deps)
 
     with patch(
@@ -356,6 +386,7 @@ def test_sync_all_services_empty_when_kubectl_fails(db):
         "services_fetched": 0, "nodes_upserted": 0,
         "edges_serves_traffic": 0,
         "skipped_no_selector": 0, "skipped_no_match": 0,
+        "skipped_self_loop": 0,
     }
 
 
@@ -474,12 +505,12 @@ def test_sync_ingresses_idempotent_second_run(db):
 def test_sync_topology_resources_returns_both_slices(db):
     """sync_topology_resources композирует services+ingresses, оба stats
     возвращаются под отдельными ключами."""
-    upsert_service(db, "prod-shared", "auth")
+    upsert_service(db, "prod-shared", "auth-app")
     upsert_service(db, "prod-shared", "auth-service")
     db.flush()
 
-    services = [_mk_service("auth", "prod-shared", selector={"app": "auth"})]
-    deps = [_mk_deployment("auth", "prod-shared", pod_labels={"app": "auth"})]
+    services = [_mk_service("auth-svc", "prod-shared", selector={"app": "auth"})]
+    deps = [_mk_deployment("auth-app", "prod-shared", pod_labels={"app": "auth"})]
     ing = _mk_ingress("main-ing", "prod-shared", rules=[{
         "host": "x.com",
         "http": {"paths": [{
