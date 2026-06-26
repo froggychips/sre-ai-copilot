@@ -4,7 +4,42 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
-_Ничего в очереди — см. [1.0.0-rc.1] ниже._
+_Ничего в очереди — см. [1.0.0-rc.2] ниже._
+
+## [1.0.0-rc.2] — 2026-06-26 — KG graph-quality: phantom DBs, self-loops, ingress RED
+
+Проход по качеству графа после rc.1. Две структурные дыры закрыты на уровне
+кода И вычищены на живом KG; «в стол» собиравшийся endpoint-RED-сигнал
+подключён в инцидент-пайплайн. Полный сьют: **1617 passed, 12 skipped**.
+Версии сведены: non-prod FastAPI app `2.4.0` → `1.0.0-rc.2` (был дрейф с prod).
+
+### Knowledge Graph — целостность графа
+
+- **Фантомные db-узлы схлопнуты (#189, C2).** До #185 `secret_hint` строил
+  `db:<driver>:<host>`-узел в OWN namespace → один физический кластер БД
+  размножался в per-namespace копии (замер: 16 реальных БД → **288 узлов**,
+  до 24 копий одной). Backfill-модуль `phantom_db_cleanup` (dry-run по
+  умолчанию, savepoint per-name, GREATEST weight, идемпотентно) +
+  CLI `cleanup_phantom_db_nodes`. На живом KG: **288 → 16** узлов, 272
+  удалено, 256 рёбер перенаправлено, 887 слито, висячих рёбер 0.
+
+- **`serves_traffic` self-loops убраны (#190).** Граф ключует `kg_services` по
+  `(name, namespace)` без разделителя типа → одноимённые k8s Service и
+  Deployment это один узел, а `serves_traffic`-ребро между ними — петля.
+  Замер: **2215 петель ≈ 35% всех рёбер**, они засоряли blast-radius (сервис
+  показывал сам себя в «кто пострадает»). Guard `src==dst→skip` в
+  `k8s_topology_resources_sync` + backfill-модуль/CLI. На живом KG: **2215 → 0**.
+
+### Knowledge Graph — сигнал
+
+- **Ingress-derived HTTP RED подключён (B2).** `kg_ingress_observations`
+  (nginx-ingress per host/path 5xx/p95/rps, ~120k строк, 501 сервис) собиралась
+  с 2026-06-10, но **не потреблялась** (per-service `kg_service_health.http_5xx`
+  всегда 0 — app `/metrics` за JWT, WO-12483). Добавлены: `queries
+  .ingress_health_for`, компонент `ingress_5xx_penalty` в health-score, секция
+  «🌐 Endpoint health (ingress-derived)» в critical Discord-embed. Явно помечен
+  ingress-разрезом, НЕ пишется в `kg_service_health` (без «фальшивого зелёного»).
+  Per-service вариант остаётся блокером инфры WO-12483.
 
 ## [1.0.0-rc.1] — 2026-06-25 — Security & reliability hardening (release candidate)
 
