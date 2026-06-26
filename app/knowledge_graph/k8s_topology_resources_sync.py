@@ -236,6 +236,7 @@ def sync_all_services(
         edges_serves_traffic  — сколько Service→Deployment edges
         skipped_no_selector   — Services без selector (headless/ExternalName)
         skipped_no_match      — selector не сматчил ни одного Deployment
+        skipped_self_loop     — Service≡Deployment одноимённый узел (self-edge)
     """
     services = _kubectl_get_all("services")
     if deployments_index is None:
@@ -247,6 +248,7 @@ def sync_all_services(
         "edges_serves_traffic": 0,
         "skipped_no_selector": 0,
         "skipped_no_match": 0,
+        "skipped_self_loop": 0,
     }
 
     for svc in services:
@@ -290,6 +292,14 @@ def sync_all_services(
                 # подхватит его на следующем ежечасном тике. Не создаём
                 # фантом-узлы здесь — это путь к bloat'у.
                 continue
+            if dep_node.id == svc_node.id:
+                # Service и его Deployment одноимённы (Service `foo` бэкает
+                # Deployment `foo`) → это ОДИН и тот же kg_services-узел (граф
+                # ключует по name+namespace без разделителя типа). serves_traffic
+                # сам-на-себя бессмыслен и засоряет blast-radius (сервис
+                # показывает сам себя в IN-edges «кто пострадает»). Пропускаем.
+                stats["skipped_self_loop"] += 1
+                continue
             upsert_edge(
                 db,
                 src=svc_node,
@@ -308,10 +318,11 @@ def sync_all_services(
     db.commit()
     logger.info(
         "k8s_topology_resources.services_done fetched=%d nodes=%d edges=%d "
-        "skipped_no_selector=%d skipped_no_match=%d",
+        "skipped_no_selector=%d skipped_no_match=%d skipped_self_loop=%d",
         stats["services_fetched"], stats["nodes_upserted"],
         stats["edges_serves_traffic"],
         stats["skipped_no_selector"], stats["skipped_no_match"],
+        stats["skipped_self_loop"],
     )
     return stats
 
