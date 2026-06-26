@@ -38,6 +38,7 @@ from .embed_builder import (
     _age_decay_severity,
     _build_blast_radius_field,
     _build_deploy_correlation_field,
+    _build_ingress_health_field,
     _build_log_error_rate_field,
     _build_nats_impact_field,
     _build_pod_trail_field,
@@ -1452,6 +1453,9 @@ class DiscordService:
             trail_field = _build_pod_trail_field(head.pod_trail)
             if trail_field:
                 fields.append(trail_field)
+            ingress_field = _build_ingress_health_field(head.ingress_health)
+            if ingress_field:
+                fields.append(ingress_field)
 
         # Generator link (Grafana) — если есть
         if incident.generator_url:
