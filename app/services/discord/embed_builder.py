@@ -278,6 +278,52 @@ def _build_blast_radius_field(
     }
 
 
+def _build_ingress_health_field(
+    ingress: Optional[Dict[str, Any]],
+) -> Optional[Dict[str, Any]]:
+    """🌐 Endpoint health (ingress-derived) field для critical embed.
+
+    Принимает результат `queries.ingress_health_for(...)`. Показывает HTTP RED
+    на ingress-границе сервиса (nginx-ingress per host/path): пиковый 5xx-rps и
+    p95, с топ-endpoint'ом. Это ЖИВОЙ источник — per-service `/metrics` закрыт
+    JWT (WO-12483), поэтому `kg_service_health.http_5xx` всегда 0. Маркируем
+    «ingress-derived», чтобы on-call не путал с per-service.
+
+    Skip-if-empty: None если endpoint'ов нет или и 5xx, и p95 нулевые.
+    """
+    if not ingress:
+        return None
+    if (ingress.get("endpoints_total") or 0) == 0:
+        return None
+    max_5xx = float(ingress.get("max_5xx_rate") or 0.0)
+    max_p95 = float(ingress.get("max_p95_ms") or 0.0)
+    if max_5xx <= 0.0 and max_p95 <= 0.0:
+        return None
+
+    top = (ingress.get("top_endpoints") or [])
+    top_ep = top[0] if top else None
+
+    def _ep_label(ep: Optional[Dict[str, Any]]) -> str:
+        if not ep:
+            return ""
+        host = ep.get("host") or "?"
+        path = ep.get("path") or "/"
+        return f" @ `{host}{path}`"
+
+    parts: List[str] = []
+    if max_5xx > 0.0:
+        parts.append(f"5xx: {max_5xx:g} rps{_ep_label(top_ep)}")
+    if max_p95 > 0.0:
+        parts.append(f"p95: {max_p95:g} ms")
+    parts.append("_per-service /metrics ждёт WO-12483_")
+
+    return {
+        "name": "🌐 Endpoint health (ingress-derived)",
+        "value": "\n".join(parts)[:1024],
+        "inline": False,
+    }
+
+
 def _build_nats_impact_field(
     impact: Optional[List[Dict[str, Any]]],
 ) -> Optional[Dict[str, Any]]:

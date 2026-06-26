@@ -49,12 +49,13 @@ from __future__ import annotations
 
 import logging
 from datetime import datetime, timedelta
-from typing import Dict, List, Optional, Tuple, cast
+from typing import Any, Dict, List, Optional, Tuple, cast
 
 from sqlalchemy.orm import Session
 
 from app.knowledge_graph.schema import (
     AlertEvent,
+    IngressObservation,
     PodEvent,
     Service,
     ServiceHealth,
@@ -85,6 +86,13 @@ _HTTP_5XX_WEIGHT = 5.0              # 5% 5xx = 0.20 (5% * 5 - порог 0.01*5)
 _DEPLOY_FAILURE_WEIGHT_PER_PCT = 0.005
 _SLO_BURN_WEIGHT_PER_PCT = 0.01
 
+# Ingress-derived 5xx (kg_ingress_observations.error_5xx_rate — 5xx запросов/сек
+# на ingress-границе сервиса). Живой источник (nginx-ingress) в отличие от
+# per-service kg_service_health.http_5xx_rate (закрыт JWT, WO-12483, всегда 0).
+# Меряет трафик НА ГРАНИЦЕ, поэтому отдельный компонент, а не подмена.
+_INGRESS_5XX_TRIGGER_RPS = 0.05    # < 0.05 rps 5xx = шум, не штрафуем
+_INGRESS_5XX_WEIGHT = 1.0          # 0.30 rps over → 0.30 → capped 0.25
+
 # Окна:
 _OPEN_ALERT_LOOKBACK_HOURS = 24    # «активный alert» = fired за 24h без resolve
 _POD_EVENT_LOOKBACK_DAYS = 7
@@ -93,6 +101,7 @@ _METRIC_RECENT_WINDOW_HOURS = 1    # «текущее» значение — п�
 _METRIC_BASELINE_WINDOW_DAYS = 7   # baseline — последние 7д для p95
 _SIGNAL_AGG_FRESHNESS_HOURS = 1    # свежая запись = в пределах часа
 _MIN_POINTS_FOR_METRICS = 6        # < 6 точек за час — данных мало, скипаем
+_INGRESS_RECENT_WINDOW_MINUTES = 30  # окно для свежих ingress-наблюдений
 
 
 # ── helper'ы для оконных метрик ──────────────────────────────────────────────
@@ -154,6 +163,42 @@ def _baseline_p95(
     return sum(vals) / len(vals)
 
 
+def _recent_ingress_5xx_p95(
+    db: Session,
+    service_id: int,
+    now: datetime,
+) -> Tuple[Optional[float], Optional[float]]:
+    """Пиковые ingress-derived 5xx-rate (rps) и p95 (ms) за окно.
+
+    Источник — kg_ingress_observations (nginx-ingress, per host/path). Берём
+    ПОСЛЕДНЮЮ запись на каждый endpoint в окне и возвращаем (max 5xx, max p95).
+    None,None если наблюдений нет (сервис без Ingress'а / нет данных).
+    """
+    cutoff = now - timedelta(minutes=_INGRESS_RECENT_WINDOW_MINUTES)
+    rows = (
+        db.query(IngressObservation)
+        .filter(
+            IngressObservation.service_id == service_id,
+            IngressObservation.ts >= cutoff,
+        )
+        .order_by(IngressObservation.ts.desc())
+        .all()
+    )
+    if not rows:
+        return None, None
+    latest: Dict[Tuple[Any, Any], IngressObservation] = {}
+    for r in rows:
+        key = (r.host, r.path)
+        if key not in latest:
+            latest[key] = r
+    obs = list(latest.values())
+    err_vals = [float(o.error_5xx_rate) for o in obs if o.error_5xx_rate is not None]
+    p95_vals = [float(o.p95_latency_ms) for o in obs if o.p95_latency_ms is not None]
+    max_err = max(err_vals) if err_vals else None
+    max_p95 = max(p95_vals) if p95_vals else None
+    return max_err, max_p95
+
+
 def _latest_signal_aggregate(
     db: Session,
     service_id: int,
@@ -188,7 +233,7 @@ def compute_health_for_service(
     """Compute health [0, 1] для одного service. Returns (score, signal_counts)
     для logging / digest. Signals содержит {open_critical, open_warning,
     chronic_pod_events, recurrence_24h, p95_drift_pct, http_5xx_rate,
-    deploy_failure_pct, slo_burn_pct}.
+    ingress_5xx_rate, ingress_p95_ms, deploy_failure_pct, slo_burn_pct}.
 
     Формула:
       score = 1.0
@@ -197,7 +242,8 @@ def compute_health_for_service(
         - chronic_pod_events * 0.35
         - (recurrence_24h // 5) * 0.10
         - p95_drift_penalty       (capped 0.25)
-        - http_5xx_penalty        (capped 0.25)
+        - http_5xx_penalty        (capped 0.25)  # per-service, 0 пока WO-12483
+        - ingress_5xx_penalty     (capped 0.25)  # ingress-derived, живой
         - deploy_failure_penalty  (capped 0.25)
         - slo_burn_penalty        (capped 0.25)
       clamp [0, 1]
@@ -265,6 +311,18 @@ def compute_health_for_service(
         over = err_recent - _HTTP_5XX_TRIGGER
         http_5xx_penalty = _capped(over * _HTTP_5XX_WEIGHT)
 
+    # ingress-derived 5xx (живой источник nginx-ingress; per-service http_5xx
+    # выше всегда 0 — app /metrics за JWT, WO-12483). Отдельный компонент:
+    # меряет 5xx-rps НА ГРАНИЦЕ сервиса. p95 — информационный (нет baseline'а
+    # для drift'а на ingress-разрезе), штрафуем только 5xx.
+    ingress_5xx_rate, ingress_p95_ms = _recent_ingress_5xx_p95(
+        db, cast(int, service.id), now
+    )
+    ingress_5xx_penalty = 0.0
+    if ingress_5xx_rate is not None and ingress_5xx_rate > _INGRESS_5XX_TRIGGER_RPS:
+        over = ingress_5xx_rate - _INGRESS_5XX_TRIGGER_RPS
+        ingress_5xx_penalty = _capped(over * _INGRESS_5XX_WEIGHT)
+
     # deploy_failure_pct / slo_burn_pct — из свежей записи kg_signal_aggregates
     agg = _latest_signal_aggregate(db, cast(int, service.id), now)
     deploy_failure_pct: Optional[float] = None
@@ -288,6 +346,7 @@ def compute_health_for_service(
     score -= (recurrence_24h // 5) * _PENALTY_RECURRENCE_PER_5
     score -= p95_drift_penalty
     score -= http_5xx_penalty
+    score -= ingress_5xx_penalty
     score -= deploy_failure_penalty
     score -= slo_burn_penalty
     score = max(0.0, min(1.0, score))
@@ -299,6 +358,8 @@ def compute_health_for_service(
         "recurrence_24h": recurrence_24h,
         "p95_drift_pct": p95_drift_pct,
         "http_5xx_rate": err_recent,
+        "ingress_5xx_rate": ingress_5xx_rate,
+        "ingress_p95_ms": ingress_p95_ms,
         "deploy_failure_pct": deploy_failure_pct,
         "slo_burn_pct": slo_burn_pct,
     }
