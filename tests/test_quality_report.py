@@ -290,9 +290,9 @@ def test_orphan_app_nats_only_not_orphan(db):
     b = _mk_svc(db, name="b")  # связан только через uses_nats
     c = _mk_svc(db, name="c")  # связан только через uses_db
     _mk_svc(db, name="isolated")  # вообще без edges → orphan
-    _mk_edge(db, a.id, a.id, "calls")  # a имеет HTTP
+    _mk_edge(db, a.id, a.id, "calls")  # a имеет HTTP (self-loop держит http-метрику)
     _mk_edge(db, a.id, b.id, "uses_nats")
-    _mk_edge(db, c.id, c.id, "uses_db")
+    _mk_edge(db, c.id, a.id, "uses_db")  # cross-node: c связан с a через uses_db
     db.commit()
 
     r = build_report(db)
@@ -311,8 +311,9 @@ def test_orphan_app_excludes_expected_stale_infra(db):
     app_ok = _mk_svc(db, name="app-ok", stale_class=STALE_CLASS_ACTIVE)
     _mk_svc(db, name="app-orphan", stale_class=STALE_CLASS_SUSPICIOUS)
     # инфра без edges — не должна попасть ни в orphan, ни в знаменатель:
-    _mk_svc(db, name="infra-db", stale_class=STALE_CLASS_EXPECTED)
-    _mk_edge(db, app_ok.id, app_ok.id, "uses_nats")
+    infra_db = _mk_svc(db, name="infra-db", stale_class=STALE_CLASS_EXPECTED)
+    # cross-node ребро (app_ok → infra-db): app_ok связан, значит non-orphan.
+    _mk_edge(db, app_ok.id, infra_db.id, "uses_nats")
     db.commit()
 
     r = build_report(db)
