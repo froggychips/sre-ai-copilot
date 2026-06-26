@@ -4,9 +4,25 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
-_Ничего в очереди — см. [1.0.0-rc.2] ниже._
+_Ничего в очереди — см. [1.0.0-rc.3] ниже._
 
-## [1.0.0-rc.2] — 2026-06-26 — KG graph-quality: phantom DBs, self-loops, ingress RED
+## [1.0.0-rc.3] — 2026-06-26 — KG data-quality gate (drift watchdog)
+
+Закрывает главную слабость, вскрытую в rc.2: «build обгонял validate-against-
+reality» — структурный дрейф графа копился незамеченным до ручного аудита.
+Теперь дрейф ловится автоматически.
+
+### Knowledge Graph — self-health
+
+- **`graph_integrity` check в KG self-health (#7).** Добавлен в существующий
+  beat-watchdog `kg_self_health_check` (каждые 30 мин, audit-log + Discord-embed
+  на FAIL в self-health канал, 6h-dedup). Проверяет структурные инварианты,
+  которые ДОЛЖНЫ быть 0 по построению, как regression-watch для багов rc.2:
+  - `db_phantom_dup_names` — `db:%`-узлы в >1 namespace (#185/#189) → fail.
+  - `serves_traffic_self_loops` / `self_loops_any` — петли (#190) → fail.
+  - `dangling_edges` — рёбра с отсутствующим src/dst → warn (>0) / fail (>50).
+  Read-only, ноль новой инфры — переиспользует beat-расписание, Discord и dedup
+  существующего self-health canary.
 
 Проход по качеству графа после rc.1. Две структурные дыры закрыты на уровне
 кода И вычищены на живом KG; «в стол» собиравшийся endpoint-RED-сигнал
