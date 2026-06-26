@@ -1,10 +1,14 @@
 # SRE AI Copilot
 
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Python](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/)
-[![FastAPI](https://img.shields.io/badge/FastAPI-0.138-009688)](https://fastapi.tiangolo.com/)
-[![Celery](https://img.shields.io/badge/Celery-5.6-37814A)](https://docs.celeryq.dev/)
-[![Release](https://img.shields.io/badge/release-v1.0.0--rc.1-blue)](CHANGELOG.md)
+[![Tests](https://img.shields.io/badge/tests-1622%20pass-brightgreen.svg)](tests)
+[![Checks](https://img.shields.io/badge/ruff%20%2B%20mypy-clean-brightgreen.svg)](.github/workflows)
+[![Release](https://img.shields.io/badge/release-v1.0.0--rc.3-blue)](CHANGELOG.md)
+
+**Homepage:** [sre.froggychips.xyz](https://sre.froggychips.xyz) · **Stack:** FastAPI + Celery + Postgres-KG + LLM + MCP
+
+> **Let an AI run incident response for Kubernetes — without letting it touch prod on a hunch.** Whether to apply a `kubectl` fix is decided by a deterministic policy engine (8 risk axes), *not* taken from the model's answer — so the copilot is safe to put next to production. KG-first enrichment, multi-hypothesis RCA, controlled remediation, and honest about its own blind spots.
 
 > **[English](#english) · [Русский](#русский)**
 
