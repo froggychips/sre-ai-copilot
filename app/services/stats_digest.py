@@ -2129,13 +2129,22 @@ def deploy_incident_correlation_section(db: Session, hours: int = 24) -> str:
     # одной из сторон JOIN-а). Покажем диагностику чтобы было понятно
     # где править.
     if attributed == 0 and total >= 10:
-        deploys_linked_pct, alerts_linked_pct = _deploy_correlation_diagnostics(
-            db, hours=hours
-        )
-        lines.append(
-            f"  ⚠️ Likely linkage gap: `{deploys_linked_pct:.0f}%` deploys linked "
-            f"to service, `{alerts_linked_pct:.0f}%` alerts linked"
-        )
+        diag = _deploy_correlation_diagnostics(db, hours=hours)
+        linked_ok = diag["deploys_linked_pct"] >= 80 and diag["alerts_linked_pct"] >= 80
+        if linked_ok and diag["overlap"] == 0:
+            # service_id есть с обеих сторон, но множества не пересекаются —
+            # это НЕ баг привязки, а просто «деплои и алерты на разных сервисах».
+            lines.append(
+                f"  ℹ️ Нет пересечения: деплои на `{diag['deploy_svc']}` svc, "
+                f"алерты на `{diag['alert_svc']}` svc, общих `0` — деплои не на тех "
+                f"сервисах, что горят (не linkage-баг)"
+            )
+        else:
+            lines.append(
+                f"  ⚠️ Likely linkage gap: `{diag['deploys_linked_pct']:.0f}%` deploys "
+                f"linked, `{diag['alerts_linked_pct']:.0f}%` alerts linked, overlap "
+                f"`{diag['overlap']}` svc"
+            )
 
     if worst and int(worst[2] or 0) >= 2:
         b_num, b_user, b_cnt = worst
@@ -2149,29 +2158,50 @@ def deploy_incident_correlation_section(db: Session, hours: int = 24) -> str:
 
 def _deploy_correlation_diagnostics(
     db: Session, hours: int = 24
-) -> Tuple[float, float]:
-    """DQ helper: % rows с not-NULL service_id в kg_deployments / kg_alerts
-    в окне hours.
+) -> Dict[str, Any]:
+    """DQ helper для случая attributed=0: различает две разные причины.
 
-    Используется чтобы при attributed=0 показать, что причина — отсутствие
-    привязки к service_id, а не реальное «всё чисто после деплоя».
-    Возвращает (deploys_linked_pct, alerts_linked_pct). При ошибках — (0,0).
+    Возвращает dict:
+      * deploys_linked_pct / alerts_linked_pct — % rows с not-NULL service_id;
+      * deploy_svc / alert_svc — кол-во РАЗНЫХ сервисов с деплоями / алертами;
+      * overlap — пересечение этих множеств service_id.
+
+    Если linked% высокие, а overlap≈0 — это НЕ linkage-баг (service_id есть),
+    а просто непересекающиеся множества: деплои на одних сервисах, алерты на
+    других. Окно алертов — по COALESCE(last_notified_at, fired_at), как в самой
+    корреляции. При ошибках — все нули.
     """
+    zero = {"deploys_linked_pct": 0.0, "alerts_linked_pct": 0.0,
+            "deploy_svc": 0, "alert_svc": 0, "overlap": 0}
     try:
         row = db.execute(text("""
             WITH d AS (
                 SELECT count(*) AS total,
-                       count(*) FILTER (WHERE service_id IS NOT NULL) AS linked
+                       count(*) FILTER (WHERE service_id IS NOT NULL) AS linked,
+                       count(DISTINCT service_id) FILTER (WHERE service_id IS NOT NULL) AS svc
                 FROM kg_deployments
                 WHERE started_at > NOW() - (:hours || ' hours')::interval
             ),
             a AS (
                 SELECT count(*) AS total,
-                       count(*) FILTER (WHERE service_id IS NOT NULL) AS linked
+                       count(*) FILTER (WHERE service_id IS NOT NULL) AS linked,
+                       count(DISTINCT service_id) FILTER (WHERE service_id IS NOT NULL) AS svc
                 FROM kg_alerts
-                WHERE fired_at > NOW() - (:hours || ' hours')::interval
+                WHERE COALESCE(last_notified_at, fired_at) > NOW() - (:hours || ' hours')::interval
+            ),
+            o AS (
+                SELECT count(*) AS overlap FROM (
+                    SELECT DISTINCT service_id FROM kg_deployments
+                    WHERE started_at > NOW() - (:hours || ' hours')::interval
+                      AND service_id IS NOT NULL
+                    INTERSECT
+                    SELECT DISTINCT service_id FROM kg_alerts
+                    WHERE COALESCE(last_notified_at, fired_at) > NOW() - (:hours || ' hours')::interval
+                      AND service_id IS NOT NULL
+                ) x
             )
-            SELECT d.total, d.linked, a.total, a.linked FROM d, a
+            SELECT d.total, d.linked, d.svc, a.total, a.linked, a.svc, o.overlap
+            FROM d, a, o
         """), {"hours": str(hours)}).fetchone()
     except Exception as e:
         log.warning("stats_digest.deploy_diagnostics_failed", error=str(e))
@@ -2179,16 +2209,19 @@ def _deploy_correlation_diagnostics(
             db.rollback()
         except Exception:
             pass
-        return (0.0, 0.0)
+        return dict(zero)
     if row is None:
-        return (0.0, 0.0)
-    d_total = int(row[0] or 0)
-    d_linked = int(row[1] or 0)
-    a_total = int(row[2] or 0)
-    a_linked = int(row[3] or 0)
-    d_pct = (d_linked / d_total * 100) if d_total else 0.0
-    a_pct = (a_linked / a_total * 100) if a_total else 0.0
-    return (d_pct, a_pct)
+        return dict(zero)
+    d_total, d_linked, d_svc = int(row[0] or 0), int(row[1] or 0), int(row[2] or 0)
+    a_total, a_linked, a_svc = int(row[3] or 0), int(row[4] or 0), int(row[5] or 0)
+    overlap = int(row[6] or 0)
+    return {
+        "deploys_linked_pct": (d_linked / d_total * 100) if d_total else 0.0,
+        "alerts_linked_pct": (a_linked / a_total * 100) if a_total else 0.0,
+        "deploy_svc": d_svc,
+        "alert_svc": a_svc,
+        "overlap": overlap,
+    }
 
 
 async def topology_growth_section(db: Session) -> str:

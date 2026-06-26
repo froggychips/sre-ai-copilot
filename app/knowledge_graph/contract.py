@@ -355,7 +355,11 @@ def compute_orphan_stats(db: "Session") -> OrphanStats:
       * `app_scope` = count real (NOT synthetic) сервисов с
         `coalesce(stale_class,'') <> 'expected_stale'`.
       * `orphan` = из них те, чей id НЕ встречается ни как src, ни как dst
-        ни в одной edge ЛЮБОГО kind (`kg_service_edges`).
+        ни в одной edge ЛЮБОГО kind (`kg_service_edges`). **Self-loop'ы
+        (src_id == dst_id) НЕ считаются связностью**: сервис, соединённый
+        только сам с собой, топологически изолирован = orphan. (До #190
+        serves_traffic-петли маскировали реальных orphan'ов как non-orphan;
+        этот guard не даёт маске вернуться при любом будущем self-loop.)
       * `orphan_pct` = round(100*orphan/app_scope, 1), или None если
         app_scope == 0 (пустая БД — не показываем ложный 0%).
 
@@ -377,8 +381,8 @@ def compute_orphan_stats(db: "Session") -> OrphanStats:
         "WHERE NOT s.synthetic "
         "  AND coalesce(s.stale_class, '') <> :exp "
         "  AND s.id NOT IN ("
-        "      SELECT src_id FROM kg_service_edges "
-        "      UNION SELECT dst_id FROM kg_service_edges"
+        "      SELECT src_id FROM kg_service_edges WHERE src_id <> dst_id "
+        "      UNION SELECT dst_id FROM kg_service_edges WHERE src_id <> dst_id"
         "  )"
     ), params).scalar() or 0
     orphan_pct = round(100.0 * orphan / app_scope, 1) if app_scope > 0 else None

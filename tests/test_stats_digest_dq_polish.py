@@ -79,17 +79,35 @@ def test_deploy_correlation_renders_diagnostic_when_attributed_zero():
     db.execute.return_value.fetchone.side_effect = [
         (1834, 0, 1045),  # total=1834, attributed=0, successes=1045
         None,  # worst — нет alerts → нет ряда
-        (1834, 257, 9000, 3400),  # diagnostic: d_total, d_linked, a_total, a_linked
+        # diagnostic: d_total, d_linked, d_svc, a_total, a_linked, a_svc, overlap
+        (1834, 257, 200, 9000, 3400, 80, 5),
     ]
     text = stats_digest.deploy_incident_correlation_section(db, hours=24)
     assert "Deploy" in text
     assert "1834" in text
+    # linked% низкие (14%) → ветка linkage gap, не «нет пересечения»
     assert "Likely linkage gap" in text
     assert "14%" in text  # 257 / 1834 ≈ 14%
     assert "deploys linked" in text
     # 3400 / 9000 ≈ 37.8% → rounds to 38%
     assert "38%" in text or "37%" in text
     assert "alerts linked" in text
+
+
+def test_deploy_correlation_renders_disjoint_when_linked_but_no_overlap():
+    """attributed=0, но service_id есть с обеих сторон и overlap=0 →
+    это НЕ linkage-баг, а непересекающиеся множества."""
+    db = MagicMock()
+    db.execute.return_value.fetchone.side_effect = [
+        (795, 0, 795),  # total=795, attributed=0
+        None,  # worst
+        # 100% linked с обеих сторон, но overlap=0
+        (795, 795, 265, 77, 77, 32, 0),
+    ]
+    text = stats_digest.deploy_incident_correlation_section(db, hours=24)
+    assert "Likely linkage gap" not in text
+    assert "Нет пересечения" in text
+    assert "265" in text and "32" in text
 
 
 def test_deploy_correlation_no_diagnostic_when_attributed_positive():
@@ -119,18 +137,23 @@ def test_deploy_correlation_no_diagnostic_when_total_too_small():
 
 def test_deploy_correlation_diagnostics_helper_computes_percentages():
     db = MagicMock()
-    db.execute.return_value.fetchone.return_value = (1000, 200, 5000, 1500)
-    d_pct, a_pct = stats_digest._deploy_correlation_diagnostics(db, hours=24)
-    assert d_pct == 20.0
-    assert a_pct == 30.0
+    # d_total, d_linked, d_svc, a_total, a_linked, a_svc, overlap
+    db.execute.return_value.fetchone.return_value = (1000, 200, 50, 5000, 1500, 40, 7)
+    diag = stats_digest._deploy_correlation_diagnostics(db, hours=24)
+    assert diag["deploys_linked_pct"] == 20.0
+    assert diag["alerts_linked_pct"] == 30.0
+    assert diag["deploy_svc"] == 50
+    assert diag["alert_svc"] == 40
+    assert diag["overlap"] == 7
 
 
 def test_deploy_correlation_diagnostics_helper_safe_on_error():
     db = MagicMock()
     db.execute.side_effect = RuntimeError("DB down")
-    d_pct, a_pct = stats_digest._deploy_correlation_diagnostics(db, hours=24)
-    assert d_pct == 0.0
-    assert a_pct == 0.0
+    diag = stats_digest._deploy_correlation_diagnostics(db, hours=24)
+    assert diag["deploys_linked_pct"] == 0.0
+    assert diag["alerts_linked_pct"] == 0.0
+    assert diag["overlap"] == 0
 
 
 # ── 3. Anomalies degrade при stale metrics ─────────────────────────────────

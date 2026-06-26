@@ -328,13 +328,31 @@ def test_compute_orphan_stats_app_scope_and_orphan(db):
     linked.synthetic = False
     db.add_all([syn, infra, orphan_svc, linked])
     db.flush()
-    db.add(ServiceEdge(src_id=linked.id, dst_id=linked.id, kind="uses_nats", weight=1))
+    # cross-node ребро (linked → infra): linked связан, значит non-orphan.
+    db.add(ServiceEdge(src_id=linked.id, dst_id=infra.id, kind="uses_db", weight=1))
     db.commit()
 
     stats = compute_orphan_stats(db)
     assert stats["app_scope"] == 2
     assert stats["orphan"] == 1
     assert stats["orphan_pct"] == 50.0
+
+
+def test_compute_orphan_stats_self_loop_is_orphan(db):
+    """Сервис, у которого ЕДИНСТВЕННОЕ ребро — self-loop (src==dst), —
+    топологически изолирован → orphan (guard против возврата маски #190)."""
+    only_self = Service(name="self-only", namespace="ns", team_owner="t")
+    only_self.synthetic = False
+    db.add(only_self)
+    db.flush()
+    db.add(ServiceEdge(src_id=only_self.id, dst_id=only_self.id,
+                       kind="serves_traffic", weight=1))
+    db.commit()
+
+    stats = compute_orphan_stats(db)
+    assert stats["app_scope"] == 1
+    assert stats["orphan"] == 1  # self-loop НЕ спасает от orphan
+    assert stats["orphan_pct"] == 100.0
 
 
 def test_compute_orphan_stats_empty_db_pct_none(db):
