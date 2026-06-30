@@ -14,6 +14,7 @@ import re
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
+from urllib.parse import urlparse
 
 import structlog
 from sqlalchemy.orm import Session
@@ -383,6 +384,46 @@ def _resolve_target_service_from_labels(
     return (namespace, None)
 
 
+# Blackbox-проба (ProdEndpointDown / PreprodEndpointDown) несёт СТАТИЧЕСКИЙ
+# `namespace`-label (prod-shared), выбранный лишь для AM-роута. Реальный
+# затронутый realm зашит в URL цели пробы (`instance`):
+#   https://wo-api4-prod.lastoasisgame.com/town/health/ready → prod-kingdom4
+#   https://wo-api-prod.lastoasisgame.com/auth/health/ready  → prod-shared
+# Инцидент 2026-06-30: полный прод-релиз prod-280 ролльнул prod-kingdom4 и на
+# время раскатки уронил пробу wo-api4; атрибуция смотрела в prod-shared,
+# деплоя там «не нашла» → ложный «795 деплоев в соседях» + не подавила @here.
+_PROBE_HOST_RE = re.compile(
+    r"^wo-api(?P<n>\d*)-(?P<env>[a-z]+)\.lastoasisgame\.com$"
+)
+
+
+def _resolve_probe_namespace(labels: Dict[str, str]) -> Optional[str]:
+    """Realm-namespace из URL blackbox-пробы (`instance` / `target` label).
+
+    `wo-api<N>-<env>.lastoasisgame.com` → `<env>-kingdom<N>`;
+    `wo-api-<env>...` (без номера) → `<env>-shared`.
+
+    None — `instance` отсутствует или host не матчит prod-blackbox-паттерн
+    (тогда namespace остаётся как был — из labels/incident). Принимает как
+    полный URL (со схемой), так и голый host[:port][/path].
+    """
+    raw = (labels or {}).get("instance") or (labels or {}).get("target") or ""
+    if not raw:
+        return None
+    host = raw
+    if "://" in host:
+        host = urlparse(host).hostname or ""
+    else:
+        # голый host — отрезаем path и port
+        host = host.split("/", 1)[0].split(":", 1)[0]
+    m = _PROBE_HOST_RE.match(host.strip().lower())
+    if not m:
+        return None
+    env = m.group("env")
+    n = m.group("n")
+    return f"{env}-kingdom{n}" if n else f"{env}-shared"
+
+
 def _inhibition_state(alert_payload: Any) -> Optional[str]:
     """Возвращает human-readable строку про silence/inhibit состояние alert-а,
     или None если alert не suppressed.
@@ -549,12 +590,33 @@ def enrich_alert(db: Session, incident: Incident) -> EnrichedContext:
     if not service:
         service = labels.get("service") or labels.get("app")
 
+    # Blackbox-проба: статический `namespace`-label (prod-shared) — лишь
+    # AM-роут-метка, реальный realm в URL `instance`. Переопределяем namespace
+    # на host-derived prod-kingdom<N>, чтобы deploy-атрибуция (NS-fallback ниже)
+    # смотрела в правильный ns. Только для service-less probe-алертов — у
+    # Kube-алертов с резолвенным сервисом instance не трогаем.
+    probe_ns_from: Optional[str] = None
+    if not service and getattr(settings, "ENRICH_PROBE_NS_RESOLVE_ENABLED", True):
+        probe_ns = _resolve_probe_namespace(labels)
+        if probe_ns and probe_ns != namespace:
+            probe_ns_from = namespace
+            namespace = probe_ns
+
     ctx = EnrichedContext(
         incident=incident,
         service=service,
         pod=pod,
         inhibition_state=_inhibition_state(incident),
     )
+    if probe_ns_from is not None:
+        # debug-сигнал: какой ns был в label и куда срезолвили из URL пробы
+        ctx.extras["probe_ns_resolved"] = namespace
+        ctx.extras["probe_ns_static_label"] = probe_ns_from
+        log.info(
+            "enrich.probe_ns_resolved",
+            static_label=probe_ns_from, resolved=namespace,
+            instance=(labels.get("instance") or labels.get("target")),
+        )
 
     if not namespace or not service:
         # NS-level deploy attribution (запрос on-call 2026-06-10): сервис
