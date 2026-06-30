@@ -149,6 +149,17 @@ class Settings(BaseSettings):
     # одиночном несвязанном деплое соседа.
     ENRICH_CLUSTER_DEPLOY_MIN_DEPLOYS: int = 10
 
+    # Blackbox-probe namespace resolution (инцидент ProdEndpointDown 2026-06-30).
+    # ProdEndpointDown/PreprodEndpointDown ставят `namespace` СТАТИЧЕСКИ
+    # (prod-shared) — это лишь AM-роут-метка, а реальный затронутый realm зашит
+    # в URL пробы (`instance`): `wo-api4-prod...` → prod-kingdom4. Без резолва
+    # deploy-атрибуция всегда смотрит в prod-shared, не находит деплой реалма и
+    # ложно списывает падение на cross-ns collateral, а mention-подавление по
+    # окну деплоя не срабатывает → ложный @here на штатной раскатке прод-релиза.
+    # Резолвим namespace из instance-URL; downstream (deploy-связь + suppress)
+    # уже работает правильно с корректным ns. kill-switch.
+    ENRICH_PROBE_NS_RESOLVE_ENABLED: bool = True
+
     # UX polish: если KG не дал ready/desired через metadata_json,
     # делать прямой read_namespaced_stateful_set/deployment (3s timeout).
     # Per-embed lookup — один call на один build (кэш в alert_enrichment).
