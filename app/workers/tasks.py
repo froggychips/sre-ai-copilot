@@ -260,6 +260,15 @@ celery_app.conf.beat_schedule = {
         "task": "discord_dedup_purge",
         "schedule": crontab(minute="29,59"),
     },
+    # Statics version delta tracking (инцидент 2026-07-02): каждые 5 мин
+    # наблюдает номер версии статики для STATICS_TRACK_ENVS и держит «до»-снимок
+    # в Redis (statics:seen:<env>). Даёт enrichment'у время наката (bump), чтобы
+    # волну self-restart'ов не путать с cross-ns collateral. No-op если
+    # STATICS_* не настроен. Лёгкий — 4 быстрых pg_database-запроса.
+    "kg-statics-versions-sync": {
+        "task": "kg_statics_versions_sync",
+        "schedule": crontab(minute="*/5"),
+    },
 }
 
 
@@ -1101,6 +1110,44 @@ def kg_seq_logs_sync_task():
         return {"error": str(e)}
     finally:
         db.close()
+
+
+@celery_app.task(name="kg_statics_versions_sync")
+def kg_statics_versions_sync_task():
+    """Statics version delta tracking → Redis (per ~5 мин).
+
+    Для каждого env из STATICS_TRACK_ENVS наблюдает текущий номер версии
+    статики и обновляет снимок `statics:seen:<env>` (см.
+    statics_service.observe_statics_version). Держит «до»-снимок, чтобы
+    enrichment мог отличить накат статики от cross-ns collateral. No-op
+    если STATICS_* не настроен. Не raise — сбой tick'а не валит beat-loop.
+    """
+    from app.services.statics_service import observe_statics_version
+
+    raw = getattr(settings, "STATICS_TRACK_ENVS", "") or ""
+    envs = [e.strip() for e in raw.split(",") if e.strip()]
+    if not envs:
+        return {"skipped": "no_envs"}
+    observed = 0
+    changed = 0
+    for env in envs:
+        try:
+            state = observe_statics_version(env)
+        except Exception as e:
+            logger.warning("kg_statics_versions_sync.observe_failed env=%s: %s", env, e)
+            continue
+        if not state:
+            continue
+        observed += 1
+        # prev_version выставлен и first_observed_at свежий ⇒ на этом tick'е
+        # зафиксирована смена версии (для observability лога).
+        if state.get("prev_version") is not None:
+            changed += 1
+    logger.info(
+        "kg_statics_versions_sync.done envs=%d observed=%d with_prev=%d",
+        len(envs), observed, changed,
+    )
+    return {"envs": len(envs), "observed": observed, "with_prev": changed}
 
 
 @celery_app.task(name="kg_nats_subjects_sync")

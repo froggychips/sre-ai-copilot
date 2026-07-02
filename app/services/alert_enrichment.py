@@ -35,6 +35,8 @@ from app.knowledge_graph.queries import (blast_radius_for,
                                          recent_pod_events_for, upstream_of)
 from app.knowledge_graph.schema import Service, ServiceEdge
 from app.models.incident import Incident
+from app.services.statics_service import (observe_statics_version,
+                                          statics_env_from_namespace)
 
 log = structlog.get_logger()
 
@@ -65,6 +67,70 @@ def _cluster_sibling_prefixes(namespace: str) -> List[str]:
         if any(namespace.startswith(p) for p in prefixes):
             return prefixes
     return []
+
+
+# Clock-skew допуск: bump с меткой чуть ПОЗЖЕ fired_at (рассинхрон часов
+# statics-Postgres и алерт-конвейера) всё ещё считаем причиной волны рестартов.
+_STATICS_BUMP_SKEW_TOLERANCE_MIN = 2
+
+
+def _detect_statics_bump(namespace: str, fired_at: datetime) -> Dict[str, Any]:
+    """Был ли недавний bump статики для env алерта в окне до fired_at.
+
+    Инцидент 2026-07-02: накат ПРОД-статики (v10400-prod→v10401-prod) заставляет
+    статикозависимые сервисы сами штатно рестартиться (graceful exit 0,
+    `Newer statics … Will shutdown to reload`), при этом k8s Deployment НЕ
+    меняется → deploy-атрибуция видит «деплоя не было» и ложно хватается за
+    cross-namespace collateral. Этот сигнал даёт приоритетный вердикт.
+
+    Источник времени bump'а — version-delta через Redis (см.
+    statics_service.observe_statics_version): момент, когда копайлот впервые
+    увидел СМЕНУ номера версии env. `observe_...` заодно обновляет снимок
+    (on-demand наблюдение в дополнение к beat'у).
+
+    Возвращает `{version, prev_version, env, first_observed_at (iso),
+    minutes_before}` если bump в окне, иначе {}. Пустой dict (→ прежняя
+    collateral-логика) при: выключенном kill-switch, немапящемся ns,
+    ненастроенном statics-Postgres / Redis, отсутствии «до»-снимка версии
+    (prev_version=None) или bump'е вне окна. Best-effort: ошибки не роняют
+    enrichment.
+    """
+    if not getattr(settings, "STATICS_RESTART_ATTRIB_ENABLED", True):
+        return {}
+    env = statics_env_from_namespace(namespace)
+    if not env:
+        return {}
+    try:
+        state = observe_statics_version(env)
+    except Exception as e:
+        log.warning("enrich.statics_bump_lookup_failed", namespace=namespace, error=str(e))
+        return {}
+    if not state:
+        return {}
+    prev_version = state.get("prev_version")
+    if prev_version is None:
+        # Нет «до»-снимка версии (первое наблюдение env) → накат не подтверждён.
+        return {}
+    first_seen_raw = state.get("first_observed_at")
+    if not first_seen_raw:
+        return {}
+    try:
+        first_seen = datetime.fromisoformat(first_seen_raw)
+    except (ValueError, TypeError):
+        return {}
+    first_seen = first_seen if first_seen.tzinfo else first_seen.replace(tzinfo=timezone.utc)
+    fired = fired_at if fired_at.tzinfo else fired_at.replace(tzinfo=timezone.utc)
+    delta_min = (fired - first_seen).total_seconds() / 60.0
+    window = int(getattr(settings, "STATICS_RESTART_WINDOW_MIN", 30))
+    if delta_min < -_STATICS_BUMP_SKEW_TOLERANCE_MIN or delta_min > window:
+        return {}
+    return {
+        "version": state.get("version"),
+        "prev_version": prev_version,
+        "env": env,
+        "first_observed_at": first_seen.isoformat(),
+        "minutes_before": max(0, int(round(delta_min))),
+    }
 
 
 def _matter_signals(
@@ -136,6 +202,12 @@ class EnrichedContext:
     # Рендерится в поле «Deploy-связь»: вместо ложного «деплоев не было —
     # вряд ли связано» показываем cross-namespace collateral-гипотезу.
     cluster_deploy_activity: Dict[str, Any] = field(default_factory=dict)
+    # Statics-aware restart attribution (инцидент 2026-07-02): недавний bump
+    # статики для env алерта. Заполняется в NS-fallback ветке при пустом
+    # recent_deploys. Если непустой — рендер выдаёт вердикт «накат статики →
+    # ожидаемый self-restart wave» с ПРИОРИТЕТОМ над cross-ns collateral и
+    # подавляет @mention. Структура — см. _detect_statics_bump.
+    statics_bump: Dict[str, Any] = field(default_factory=dict)
     upstream_alerts: List[Dict[str, Any]] = field(default_factory=list)
     recurrence_24h: List[Dict[str, Any]] = field(default_factory=list)
     # Inbound: сколько сервисов вызывают/зависят от этого. Раньше поле
@@ -680,6 +752,10 @@ def enrich_alert(db: Session, incident: Incident) -> EnrichedContext:
                 # соседних ns кластера (cross-namespace collateral).
                 # Иначе атрибуция врёт «не было — вряд ли связано».
                 if not ctx.recent_deploys:
+                    # Сначала — накат статики (инцидент 2026-07-02): при bump'е
+                    # статики сервисы сами рестартятся, k8s Deployment не менялся
+                    # → «деплоя нет», но это НЕ collateral. Имеет приоритет.
+                    ctx.statics_bump = _detect_statics_bump(namespace, effective_at)
                     siblings = _cluster_sibling_prefixes(namespace)
                     if siblings:
                         ctx.cluster_deploy_activity = cluster_deploy_activity(
