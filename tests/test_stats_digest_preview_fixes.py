@@ -155,21 +155,25 @@ async def test_recent_deploys_hidden_when_both_windows_empty():
 # ── Регрессия 2: top_alert_types `(new baseline)` placeholder ───────────
 
 
-def _mk_db_for_alert_types(*, yest_has, today_has, yest_rows, chronic_rows, resurf_rows):
+def _mk_db_for_alert_types(
+    *, yest_has, today_has, yest_rows, chronic_rows, resurf_rows, today_rows=None
+):
     """Builder MagicMock(Session) для top_alert_types_section.
 
-    Порядок execute calls:
+    Порядок execute calls (M5-fix добавил today_rows для like-for-like Δ24h):
       1. yest EXISTS preflight
       2. today EXISTS preflight
-      3. yest_rows fetchall
-      4. chronic_rows fetchall
-      5. resurf_rows fetchall
+      3. yest_rows fetchall (24-48h fires)
+      4. today_rows fetchall (0-24h fires)
+      5. chronic_rows fetchall
+      6. resurf_rows fetchall
     """
     db = MagicMock()
     db.execute.side_effect = [
         MagicMock(scalar=lambda: yest_has),
         MagicMock(scalar=lambda: today_has),
         MagicMock(fetchall=lambda: yest_rows),
+        MagicMock(fetchall=lambda: today_rows or []),
         MagicMock(fetchall=lambda: chronic_rows),
         MagicMock(fetchall=lambda: resurf_rows),
     ]
@@ -205,12 +209,13 @@ def test_top_alert_types_renders_q_for_missing_yesterday():
 
 
 def test_top_alert_types_does_not_falsely_mark_new_baseline_when_legit_zero():
-    """В yesterday-окне есть rows, просто наш alertname не fired → Δ24h +5,
-    НЕ `new baseline`."""
+    """В yesterday-окне есть rows, просто наш alertname не fired (0), а сегодня
+    5 fires → Δ24h +5 (today 5 − yesterday 0), НЕ `new baseline`."""
     counter = Counter({"NewAlert": 5})
     db = _mk_db_for_alert_types(
         yest_has=True, today_has=True,
-        yest_rows=[("OtherAlert", 3)],  # был, но не наш
+        yest_rows=[("OtherAlert", 3)],  # был, но не наш → yesterday=0
+        today_rows=[("NewAlert", 5)],   # сегодня 5 fires → Δ = +5
         chronic_rows=[], resurf_rows=[],
     )
     text = stats_digest.top_alert_types_section(counter, db)
