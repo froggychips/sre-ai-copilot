@@ -501,7 +501,7 @@ def render(rows, gen_date, jira_statuses=None, today=None):
     body = (
         f'<ac:structured-macro ac:name="info"><ac:rich-text-body>'
         f'<p><strong>Дашборд по сквадам (dev-стенды).</strong> Кто чем занял каждый squad, над какой задачей, '
-        f'последняя сборка и здоровье окружения. <strong>Авто-обновление раз в час</strong> (k8s CronJob, ns sre-ai). '
+        f'последняя сборка и здоровье окружения. <strong>Авто-обновление раз в 5 минут</strong> (k8s CronJob, ns sre-ai). '
         f'Снимок: {esc(gen_date)} UTC.</p></ac:rich-text-body></ac:structured-macro>'
         f'<p><strong>Источники</strong> (джойн по ключу <code>squad-N</code>): Knowledge Graph (kg_query) — возраст, NS/svc, '
         f'health, pod_events, alerts; TeamCity REST + лейблы namespace — занявший (deployed-by), задача '
