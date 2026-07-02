@@ -37,6 +37,14 @@ logger = logging.getLogger(__name__)
 EDGE_DECAY_DELETE_AFTER_DAYS = 30
 EDGE_DECAY_INACTIVE_AFTER_DAYS = 7
 
+# Deadman для edge-decay: не удаляем stale-edges, если удаление затронуло бы
+# > этого % всех edges. Зеркалит threshold-abort из
+# `drift_cleanup.run_drift_cleanup` (там 20% по namespace). В норме decay
+# удаляет единицы рёбер; массовое удаление = симптом сбоя kubectl/кластера
+# (часть last_seen_at не обновилась на этом проходе), а не реальной убыли
+# топологии. Вместе с fetch-errors guard это защита от wipe графа.
+EDGE_DECAY_MAX_DELETE_PCT = 25.0
+
 # URL-паттерн: http(s)://service-name(.namespace)?(.svc.cluster.local)?(:port)?
 _SVC_URL_RE = re.compile(
     r"https?://([a-z0-9][a-z0-9-]*)(?:\.([a-z0-9][a-z0-9-]*))?(?:\.svc\.cluster\.local)?(?::\d+)?/?$",
@@ -213,20 +221,52 @@ _SKIP_VALUE_FRAGMENTS = ("azure", "google", "openai", "gpt", "amazonaws", "redis
 # конкретные имена клиентской инфры.
 
 
+class KubectlFetchError(RuntimeError):
+    """kubectl-вызов реально упал (rc!=0 / timeout / exception / битый JSON) —
+    в отличие от валидного пустого namespace.
+
+    Раньше на любой сбой возвращался `[]`, из-за чего sync не мог отличить
+    «kubectl упал» от «в namespace нет deployments» и рапортовал
+    success-with-0-services (а edge-decay стирал живые рёбра, т.к. их
+    last_seen_at не обновился). Теперь fetch-ошибка сигналится исключением,
+    вызывающий (`sync_topology`) ловит его per-ns, инкрементит `errors` и
+    включает edge-decay deadman. Зеркалит `drift_cleanup._k8s_live_namespaces`,
+    который тоже raise'ит на kubectl-failure.
+    """
+
+
 def _kubectl_get_deployments(namespace: str) -> List[Dict[str, Any]]:
-    """Вернуть список deployment spec'ов из kubectl."""
+    """Вернуть список deployment spec'ов из kubectl.
+
+    Raises `KubectlFetchError` при РЕАЛЬНОМ сбое (rc!=0 / timeout / exception /
+    невалидный JSON) — чтобы сломанный fetch был отличим от genuinely-empty ns.
+    Пустой список = namespace реально без deployments.
+    """
     try:
         result = subprocess.run(
             ["kubectl", "get", "deployments", "-n", namespace, "-o", "json"],
             capture_output=True, text=True, timeout=15,
         )
-        if result.returncode != 0:
-            logger.debug("kubectl failed ns=%s: %s", namespace, result.stderr[:200])
-            return []
-        return json.loads(result.stdout).get("items", [])
     except Exception as e:
         logger.warning("kg_sync.kubectl_failed ns=%s: %s", namespace, e)
-        return []
+        raise KubectlFetchError(
+            f"kubectl get deployments ns={namespace}: {e}"
+        ) from e
+    if result.returncode != 0:
+        logger.warning(
+            "kg_sync.kubectl_failed ns=%s rc=%d: %s",
+            namespace, result.returncode, result.stderr[:200],
+        )
+        raise KubectlFetchError(
+            f"kubectl get deployments ns={namespace} rc={result.returncode}"
+        )
+    try:
+        return json.loads(result.stdout).get("items", [])
+    except (json.JSONDecodeError, AttributeError) as e:
+        logger.warning("kg_sync.kubectl_bad_json ns=%s: %s", namespace, e)
+        raise KubectlFetchError(
+            f"kubectl get deployments ns={namespace}: bad json: {e}"
+        ) from e
 
 
 def _extract_upstreams(
@@ -997,10 +1037,38 @@ def _enrich_calls_edges_for_ns(
     return edges_count
 
 
+def _edge_decay_should_skip(
+    total_edges: int,
+    to_delete: int,
+    has_fetch_errors: bool,
+    max_delete_pct: float = EDGE_DECAY_MAX_DELETE_PCT,
+) -> Tuple[bool, str]:
+    """Deadman-guard для edge-decay. Возвращает (skip, reason).
+
+    skip=True если:
+      - has_fetch_errors: sync не полностью наблюдал граф (kubectl упал на
+        части ns) → last_seen_at живых edges не обновился, decay удалил бы их
+        ложно;
+      - delete_pct > max_delete_pct: массовое удаление — симптом сбоя, а не
+        реальной убыли топологии (та же логика, что drift_cleanup threshold).
+
+    Чистая функция без БД — тестируется в изоляции.
+    """
+    if has_fetch_errors:
+        return True, "fetch_errors"
+    if total_edges <= 0 or to_delete <= 0:
+        return False, ""
+    delete_pct = 100.0 * to_delete / total_edges
+    if delete_pct > max_delete_pct:
+        return True, f"delete_pct={delete_pct:.1f}>max={max_delete_pct:.1f}"
+    return False, ""
+
+
 def _decay_stale_edges(
     db: Session,
     delete_after_days: int = EDGE_DECAY_DELETE_AFTER_DAYS,
     inactive_after_days: int = EDGE_DECAY_INACTIVE_AFTER_DAYS,
+    has_fetch_errors: bool = False,
 ) -> Dict[str, int]:
     """Decay для kg_service_edges по last_seen_at.
 
@@ -1014,7 +1082,13 @@ def _decay_stale_edges(
          уже свежие) — сюда не попадают; флаг `inactive` чистится в
          основном проходе через `upsert_edge` (см. ниже).
 
-    Возвращает stats: {marked_inactive, deleted, revived}.
+    Deadman: перед мутацией считаем объём удаления. Если sync имел
+    fetch-ошибки ИЛИ удаление затронуло бы > EDGE_DECAY_MAX_DELETE_PCT% всех
+    edges — весь decay-проход пропускается (skipped_decay=1), ничего не
+    удаляем и не помечаем. Защита от wipe графа при kubectl-failure (зеркалит
+    drift_cleanup threshold-abort).
+
+    Возвращает stats: {marked_inactive, deleted, skipped_decay}.
     Revived здесь не считаем — это делает основной проход (см. PR в
     upsert_edge: unset inactive при апдейте last_seen_at).
     """
@@ -1022,7 +1096,26 @@ def _decay_stale_edges(
     inactive_cutoff = now - timedelta(days=inactive_after_days)
     delete_cutoff = now - timedelta(days=delete_after_days)
 
-    stats = {"marked_inactive": 0, "deleted": 0}
+    stats = {"marked_inactive": 0, "deleted": 0, "skipped_decay": 0}
+
+    # Deadman: считаем объём ПЕРЕД любой мутацией, чтобы решить безопасно ли
+    # применять decay. `int(... or 0)` — count() всегда int в реальной БД,
+    # обёртка лишь защищает от None экзотических бэкендов.
+    total_edges = int(db.query(ServiceEdge).count() or 0)
+    to_delete = int(
+        db.query(ServiceEdge)
+        .filter(ServiceEdge.last_seen_at < delete_cutoff)
+        .count()
+        or 0
+    )
+    skip, reason = _edge_decay_should_skip(total_edges, to_delete, has_fetch_errors)
+    if skip:
+        stats["skipped_decay"] = 1
+        logger.warning(
+            "kg_sync.edge_decay_skipped reason=%s total_edges=%d would_delete=%d",
+            reason, total_edges, to_delete,
+        )
+        return stats
 
     # 1) DELETE старых (>= delete_after_days). Делаем первым чтобы не
     #    помечать как inactive то, что сейчас удалим.
@@ -1115,15 +1208,25 @@ def sync_topology(
         "services": 0, "edges": 0, "edges_extended": 0,
         "namespaces": 0, "errors": 0,
         "edges_marked_inactive": 0, "edges_deleted": 0, "edges_revived": 0,
+        "edge_decay_skipped": False,
     }
     deploys_cache: Dict[str, List[Dict[str, Any]]] = {}
 
     # ── Pass 1: services + NATS edges + legacy calls ───────────────────
     for ns in namespaces:
         try:
+            # fetch-ошибка (KubectlFetchError) прилетает сюда → errors++, ns
+            # НЕ кэшируется для Pass 2 и не считается success-with-0.
             deploys = _kubectl_get_deployments(ns)
             deploys_cache[ns] = deploys
-            stats = sync_namespace(db, ns, deploys=deploys)
+            # SAVEPOINT на namespace: flush-ошибка внутри sync_namespace
+            # (IntegrityError/DataError) откатывает только этот ns, не весь
+            # проход. Без изоляции Session уходит в aborted-состояние и все
+            # последующие ns + терминальный db.commit() падают с
+            # PendingRollbackError, теряя весь pass. Зеркалит per-item
+            # SAVEPOINT из k8s_events_sync.sync_namespace_events.
+            with db.begin_nested():
+                stats = sync_namespace(db, ns, deploys=deploys)
             total["services"] += stats["services"]
             total["edges"] += stats["edges"]
             total["namespaces"] += 1
@@ -1154,11 +1257,19 @@ def sync_topology(
     # обновились в Pass 1/2. Затем decay: помечаем/удаляем stale-edges.
     try:
         revived = _revive_active_edges(db)
-        decay_stats = _decay_stale_edges(db)
+        # Deadman: если в Pass 1/2 были fetch-ошибки — decay пропускается
+        # (last_seen_at части живых edges не обновился, удаление было бы ложным).
+        decay_stats = _decay_stale_edges(db, has_fetch_errors=total["errors"] > 0)
         total["edges_revived"] = revived
         total["edges_marked_inactive"] = decay_stats["marked_inactive"]
         total["edges_deleted"] = decay_stats["deleted"]
-        if revived or decay_stats["marked_inactive"] or decay_stats["deleted"]:
+        total["edge_decay_skipped"] = bool(decay_stats.get("skipped_decay"))
+        if decay_stats.get("skipped_decay"):
+            logger.warning(
+                "kg_sync.edge_decay_deadman errors=%d — decay пропущен (граф не тронут)",
+                total["errors"],
+            )
+        elif revived or decay_stats["marked_inactive"] or decay_stats["deleted"]:
             logger.info(
                 "kg_sync.edge_decay revived=%d marked_inactive=%d deleted=%d "
                 "(inactive_after=%dd delete_after=%dd)",
