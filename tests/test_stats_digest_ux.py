@@ -248,27 +248,32 @@ def test_top_alert_types_renders_delta_and_chronic_resurfaced():
     })
     db = MagicMock()
     # preview-fix 2026-05-24: добавлены 2 preflight EXISTS-запроса (есть ли
-    # история в yest-window и today-window) — для различения «alert не fired»
-    # vs «новый baseline». Порядок: yest_exists → today_exists → yest_rows →
-    # chronic_rows → resurf_rows.
+    # история в yest-window и today-window). M5-fix: добавлен today_rows
+    # (0-24h event count) для честной Δ24h (today-fires − yesterday-fires,
+    # обе — event count из kg_alerts). Порядок: yest_exists → today_exists →
+    # yest_rows → today_rows → chronic_rows → resurf_rows.
     db.execute.side_effect = [
         MagicMock(scalar=lambda: True),  # yest history exists
         MagicMock(scalar=lambda: True),  # today history exists
         MagicMock(fetchall=lambda: [
             ("KubeDeploymentReplicasMismatch", 63),
             ("KubePodCrashLooping", 25),
-        ]),
+        ]),  # yest_rows (24-48h fires)
+        MagicMock(fetchall=lambda: [
+            ("KubeDeploymentReplicasMismatch", 75),
+            ("KubePodCrashLooping", 30),
+        ]),  # today_rows (0-24h fires)
         MagicMock(fetchall=lambda: [
             ("KubeDeploymentReplicasMismatch", 23),
             ("KubePodCrashLooping", 12),
-        ]),
+        ]),  # chronic
         MagicMock(fetchall=lambda: [
             ("KubeDeploymentReplicasMismatch", 8),
-        ]),
+        ]),  # resurf
     ]
     text = stats_digest.top_alert_types_section(counter, db)
     assert "`KubeDeploymentReplicasMismatch` × 75" in text
-    assert "Δ24h +12" in text  # 75 - 63
+    assert "Δ24h +12" in text  # today 75 − yesterday 63 (like-for-like)
     assert "23 chronic" in text
     assert "8 resurfaced" in text
     # У KubePodCrashLooping resurfaced=0 → не показываем эту часть

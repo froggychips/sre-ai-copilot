@@ -578,18 +578,36 @@ _NOISE_ALERTNAMES = frozenset({"InfoInhibitor", "Watchdog", "CPUThrottlingHigh"}
 _CONDITIONAL_NOISE_ALERTNAMES = frozenset({"KubeDeploymentGenerationMismatch"})
 
 
+def _safe_rollback(db: Session) -> None:
+    """Best-effort rollback aborted-транзакции.
+
+    Дайджест гоняет ~15 секций последовательно на ОДНОМ shared Session.
+    На PostgreSQL первый же упавший запрос переводит транзакцию в
+    InFailedSqlTransaction — и все последующие секции падают каскадом, пока
+    не сделан rollback. Поэтому каждая под-секция, поймав исключение, обязана
+    откатить транзакцию, чтобы изолировать сбой. Сам rollback тоже best-effort.
+    """
+    try:
+        db.rollback()
+    except Exception:
+        pass
+
+
 def _alert_type_metadata(
     db: Optional[Session],
     alertnames: List[str],
 ) -> Dict[str, Dict[str, Optional[int]]]:
-    """Для каждого alertname посчитать (yesterday_cnt, chronic, resurfaced)
-    из kg_alerts.
+    """Для каждого alertname посчитать (yesterday_cnt, today_cnt, chronic,
+    resurfaced) из kg_alerts.
 
     Definitions:
-      - `yesterday_cnt`: count series с этим alertname за 24-48h назад.
+      - `yesterday_cnt`: count fires с этим alertname за 24-48h назад.
         **None** если за окно 24-48h в `kg_alerts` нет данных вообще
         (например, alert_state ещё не отслеживался ⇒ new baseline);
         **0** если данные есть, но не для этого alertname (legit «не fired»).
+      - `today_cnt`: count fires с этим alertname за 0-24h. Тот же принцип
+        None/0, что и у yesterday. Нужен для честной Δ24h (like-for-like:
+        today-fires минус yesterday-fires, а не firing-series минус fires).
       - `chronic`: число сервисов где (service_id, alertname) имел ≥3 fires
         за последние 24h. None если 24h-окно пусто (нет tracking-а).
       - `resurfaced`: число сервисов где есть resolved_at И позже него ещё один
@@ -631,6 +649,20 @@ def _alert_type_metadata(
         """), {"names": alertnames}).fetchall()
         yesterday: Dict[str, int] = {name: cnt for name, cnt in yest_rows}
 
+        # 1b) today: за окно 0-24h, count(*) по alertname. M5: Δ24h должна
+        # сравнивать like-for-like — today-event-count против
+        # yesterday-event-count (обе из kg_alerts, окна одинаковой длины).
+        # Раньше вычитали yesterday-count из мгновенного firing-series `cnt`
+        # (VM-снимок за 5 минут) — несопоставимые популяции → мусорная дельта.
+        today_rows = db.execute(text("""
+            SELECT alertname, count(*) AS cnt
+            FROM kg_alerts
+            WHERE alertname = ANY(:names)
+              AND fired_at > NOW() - INTERVAL '24 hours'
+            GROUP BY alertname
+        """), {"names": alertnames}).fetchall()
+        today: Dict[str, int] = {name: cnt for name, cnt in today_rows}
+
         # 2) chronic — service где (service_id, alertname) имеет ≥3 fires за 24h.
         chronic_rows = db.execute(text("""
             SELECT alertname, count(*) AS chronic_svc
@@ -671,12 +703,16 @@ def _alert_type_metadata(
 
     except Exception as e:
         log.warning("stats_digest.alert_type_metadata_failed", error=str(e))
+        # M3: откатываем aborted-транзакцию, иначе последующие секции дайджеста
+        # (общий Session) упадут каскадом на InFailedSqlTransaction.
+        _safe_rollback(db)
         return {}
 
     out: Dict[str, Dict[str, Optional[int]]] = {}
     for name in alertnames:
         out[name] = {
             "yesterday": yesterday.get(name, 0) if yest_has_rows else None,
+            "today": today.get(name, 0) if today_has_rows else None,
             "chronic": chronic.get(name, 0) if today_has_rows else None,
             "resurfaced": resurfaced.get(name, 0) if today_has_rows else None,
         }
@@ -723,6 +759,7 @@ def top_alert_types_section(
 
         parts: List[str] = []
         yesterday = meta["yesterday"]
+        today = meta.get("today")
         chronic = meta["chronic"]
         resurfaced = meta["resurfaced"]
 
@@ -733,10 +770,15 @@ def top_alert_types_section(
         if yesterday is None and chronic is None and resurfaced is None:
             parts.append("new baseline")
         else:
-            if yesterday is None:
+            # M5: Δ24h = today-fires − yesterday-fires (обе величины — event
+            # count из kg_alerts за окна одинаковой длины). Мгновенный
+            # firing-series `cnt` (VM-снимок за 5 мин) сюда НЕ подмешиваем —
+            # это была несопоставимая популяция. Если today-окна нет в
+            # kg_alerts (tracking ещё не начался) — честно рисуем `Δ24h ?`.
+            if yesterday is None or today is None:
                 parts.append("Δ24h ?")
             else:
-                delta = cnt - yesterday
+                delta = today - yesterday
                 sign = "+" if delta >= 0 else ""
                 parts.append(f"Δ24h {sign}{delta}")
             if chronic:
@@ -998,12 +1040,14 @@ def stale_deployments_section(
         by_group[key].append(e)
 
     rendered_groups: List[Tuple[int, str]] = []  # (max_idle для sort, rendered_line)
-    seen_namespaces: set = set()
+    # M4: копим КОНКРЕТНЫЕ (name, ns) деплойменты, уже показанные в compacted
+    # группах — а не просто namespaces. Иначе distinct stale-деплой, который
+    # лишь ДЕЛИТ namespace с уже свёрнутой группой, ошибочно выпадал из хвоста.
+    seen_deployments: set = set()
     for (name, idle), group in by_group.items():
         if len(group) >= 3:
-            namespaces = sorted({e[1] for e in group})
             teams = sorted({e[3] for e in group})
-            seen_namespaces.update(namespaces)
+            seen_deployments.update((e[2], e[1]) for e in group)  # (name, ns)
             teams_str = ",".join(f"@{t}" for t in teams[:3])
             if len(teams) > 3:
                 teams_str += f"+{len(teams)-3}"
@@ -1013,7 +1057,7 @@ def stale_deployments_section(
             ))
 
     singular: List[Tuple[int, str, str, str, int, datetime]] = sorted(
-        (e for e in entries if e[1] not in seen_namespaces),
+        (e for e in entries if (e[2], e[1]) not in seen_deployments),
         key=lambda e: (-e[0], e[2]),
     )
     singular_cap = 5
@@ -1273,6 +1317,9 @@ def anomaly_summary_section(db: Session) -> str:
         """)).fetchone()
     except Exception as e:
         log.warning("stats_digest.anomaly_summary_missing_table", error=str(e))
+        # M3: rollback aborted-транзакции — иначе следующие секции дайджеста
+        # (общий Session) упадут каскадом на InFailedSqlTransaction.
+        _safe_rollback(db)
         return ""
 
     total = (total_row[0] if total_row else 0) or 0
@@ -1295,34 +1342,52 @@ def anomaly_summary_section(db: Session) -> str:
             body += "\n" + degraded_note
         return body
 
-    by_severity = {
-        sev: cnt for sev, cnt in db.execute(text("""
-            SELECT severity, count(*)
-            FROM kg_anomaly_observations
-            WHERE ts > NOW() - INTERVAL '24 hours'
-            GROUP BY severity
-        """)).fetchall()
-    }
+    # M3: каждый под-запрос обёрнут в свой guard с rollback — на PostgreSQL
+    # падение любого из них иначе оставляет shared Session в
+    # InFailedSqlTransaction и роняет каскадом все следующие секции дайджеста.
+    try:
+        by_severity = {
+            sev: cnt for sev, cnt in db.execute(text("""
+                SELECT severity, count(*)
+                FROM kg_anomaly_observations
+                WHERE ts > NOW() - INTERVAL '24 hours'
+                GROUP BY severity
+            """)).fetchall()
+        }
+    except Exception as e:
+        log.warning("stats_digest.anomaly_by_severity_failed", error=str(e))
+        _safe_rollback(db)
+        by_severity = {}
     warning_cnt = by_severity.get("warning", 0)
     critical_cnt = by_severity.get("critical", 0)
 
-    top_services = db.execute(text("""
-        SELECT s.name, count(a.id) AS cnt
-        FROM kg_anomaly_observations a
-        JOIN kg_services s ON s.id = a.service_id
-        WHERE a.ts > NOW() - INTERVAL '24 hours'
-        GROUP BY s.id, s.name
-        ORDER BY cnt DESC
-        LIMIT 5
-    """)).fetchall()
+    try:
+        top_services = db.execute(text("""
+            SELECT s.name, count(a.id) AS cnt
+            FROM kg_anomaly_observations a
+            JOIN kg_services s ON s.id = a.service_id
+            WHERE a.ts > NOW() - INTERVAL '24 hours'
+            GROUP BY s.id, s.name
+            ORDER BY cnt DESC
+            LIMIT 5
+        """)).fetchall()
+    except Exception as e:
+        log.warning("stats_digest.anomaly_top_services_failed", error=str(e))
+        _safe_rollback(db)
+        top_services = []
 
-    by_metric = db.execute(text("""
-        SELECT metric, count(*)
-        FROM kg_anomaly_observations
-        WHERE ts > NOW() - INTERVAL '24 hours'
-        GROUP BY metric
-        ORDER BY count(*) DESC
-    """)).fetchall()
+    try:
+        by_metric = db.execute(text("""
+            SELECT metric, count(*)
+            FROM kg_anomaly_observations
+            WHERE ts > NOW() - INTERVAL '24 hours'
+            GROUP BY metric
+            ORDER BY count(*) DESC
+        """)).fetchall()
+    except Exception as e:
+        log.warning("stats_digest.anomaly_by_metric_failed", error=str(e))
+        _safe_rollback(db)
+        by_metric = []
 
     lines = [f"**📈 Anomalies (last 24h){degraded_header_suffix}**"]
     if degraded_note:
@@ -1538,6 +1603,8 @@ def _count_alerts_in_window(db: Session, hours: int) -> Tuple[int, int]:
         return int(fired), int(resolved)
     except Exception as e:
         log.warning("stats_digest.count_alerts_failed", error=str(e))
+        # M3: rollback — не оставляем aborted-транзакцию следующим секциям.
+        _safe_rollback(db)
         return 0, 0
 
 
@@ -1778,9 +1845,11 @@ def _suspicious_in_prod_with_alerts(
 
 def _suspicious_with_callers(db: Session, days: int = 60) -> int:
     """Suspicious-stale сервисы у которых ≥1 inbound caller (источник в
-    kg_edges с target = svc). Полезные для других — нельзя просто удалить.
+    kg_service_edges с dst = svc). Полезные для других — нельзя просто удалить.
     """
     try:
+        # NB: таблица edge-ей — kg_service_edges, колонка назначения — dst_id
+        # (как в остальных edge-запросах файла, см. fragile_services_section).
         cnt = db.execute(text("""
             SELECT count(*) FROM kg_services s
             WHERE NOT s.synthetic
@@ -1791,17 +1860,14 @@ def _suspicious_with_callers(db: Session, days: int = 60) -> int:
                     AND d.started_at > NOW() - (:days || ' days')::interval
               )
               AND EXISTS (
-                  SELECT 1 FROM kg_edges e
-                  WHERE e.target_id = s.id
+                  SELECT 1 FROM kg_service_edges e
+                  WHERE e.dst_id = s.id
               )
         """), {"days": str(days)}).scalar() or 0
         return int(cnt)
     except Exception as e:
         log.warning("stats_digest.suspicious_with_callers_failed", error=str(e))
-        try:
-            db.rollback()
-        except Exception:
-            pass
+        _safe_rollback(db)
         return 0
 
 
@@ -2071,14 +2137,17 @@ def mttr_section(db: Session, days: int = 7) -> str:
     now_stats = _mttr_stats(db, days=days)
     if not now_stats or now_stats.get("samples", 0) == 0:
         return ""
-    prev_stats = _mttr_stats(db, days=days * 2)  # rough: includes current; trend approx
+    # M5: сравниваем с ПРЕДЫДУЩИМ окном той же длины, не пересекающимся с
+    # current (offset_days=days). Раньше передавали days*2 без offset — это
+    # 14-дневный супермножество, включающее current 7d ⇒ trend сравнивал
+    # superset против subset, что бессмысленно.
+    prev_stats = _mttr_stats(db, days=days, offset_days=days)
 
     lines = [f"**⏱️ MTTR (resolved alerts last {days}d)**"]
 
     trend_str = ""
-    if prev_stats and prev_stats.get("samples", 0) > now_stats["samples"]:
-        # Очень грубая trend-эвристика: median 7d vs median 14d window.
-        # Не идеальная, но даёт сигнал что-то меняется.
+    if prev_stats and prev_stats.get("samples", 0) > 0:
+        # Оба окна одной длины и не пересекаются — честное неделя-к-неделе.
         prev_med = prev_stats["median_min"]
         cur_med = now_stats["median_min"]
         delta = cur_med - prev_med

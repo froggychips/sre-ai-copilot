@@ -38,6 +38,20 @@ def test_forbidden_namespaces():
             k8s_guard.validate(op("get", ns))
 
 
+def test_forbidden_namespaces_case_and_whitespace_normalized():
+    """Обход через регистр/пробелы ("Kube-System", "kube-system ") не проходит."""
+    for ns in ("Kube-System", "kube-system ", " kube-system", "KUBE-SYSTEM", "MCP", "Chaos-Mesh"):
+        with pytest.raises(PermissionError, match="blocked by security policy"):
+            k8s_guard.validate(op("get", ns))
+
+
+def test_readonly_namespaces_case_and_whitespace_normalized():
+    """Запись в prod-tier блокируется даже при "Prod"/"prod " (нормализация)."""
+    for ns in ("Prod", "prod ", " PREPROD", "PreUpdate"):
+        with pytest.raises(PermissionError, match="read-only tier"):
+            k8s_guard.validate(op("patch", ns))
+
+
 def test_unknown_verb_rejected():
     with pytest.raises(PermissionError, match="not permitted"):
         k8s_guard.validate(op("delete", "squad-1"))

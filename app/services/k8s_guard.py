@@ -6,8 +6,8 @@ from opentelemetry import trace
 from pydantic import BaseModel
 
 from app.security.namespaces import (
-    FORBIDDEN_NAMESPACES,
-    READ_ONLY_NAMESPACES,
+    is_forbidden,
+    is_read_only,
     is_write_namespace,
 )
 
@@ -52,7 +52,9 @@ class K8sSecurityGuard:
         verb = op.verb.lower()
         ns = op.namespace
 
-        if ns in FORBIDDEN_NAMESPACES:
+        # Нормализованный матч (strip+lower) — "Kube-System"/"kube-system " не
+        # должны обходить блок (kubectl всё равно приведёт их к kube-system).
+        if is_forbidden(ns):
             cls._guard_block("namespace_forbidden", **{"sre.namespace": ns})
             logger.error("security_violation_namespace_forbidden", ns=ns)
             raise PermissionError(
@@ -67,7 +69,7 @@ class K8sSecurityGuard:
             )
 
         if verb in WRITE_VERBS:
-            if ns in READ_ONLY_NAMESPACES:
+            if is_read_only(ns):
                 cls._guard_block("write_to_readonly_ns", **{"sre.namespace": ns, "sre.verb": verb})
                 logger.error(
                     "security_violation_write_to_readonly_ns", ns=ns, verb=verb

@@ -65,6 +65,35 @@ def test_detect_meta_noise_false(alertname: str) -> None:
     assert _detect_meta_noise(_incident(alertname)) is False
 
 
+# ── META_NOISE_ETCD_ENABLED toggle (реальная потеря кворума не должна глохнуть) ─
+
+
+def test_etcd_muted_by_default() -> None:
+    """Default True → etcdInsufficientMembers остаётся meta-noise (scrape-gap)."""
+    assert _detect_meta_noise(_incident("etcdInsufficientMembers")) is True
+
+
+def test_etcd_not_muted_when_flag_off(monkeypatch: pytest.MonkeyPatch) -> None:
+    """META_NOISE_ETCD_ENABLED=False → etcd НЕ глушится (реальный кворум пейджит)."""
+    monkeypatch.setattr(
+        "app.services.alert_enrichment.settings.META_NOISE_ETCD_ENABLED", False
+    )
+    assert _detect_meta_noise(_incident("etcdInsufficientMembers")) is False
+
+
+def test_scrape_gap_still_muted_when_etcd_flag_off(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Флаг etcd не трогает чистые scrape-gap производные — те глушатся всегда."""
+    monkeypatch.setattr(
+        "app.services.alert_enrichment.settings.META_NOISE_ETCD_ENABLED", False
+    )
+    assert _detect_meta_noise(_incident("ScrapePoolHasNoTargets")) is True
+    assert _detect_meta_noise(_incident("RecordingRulesNoData")) is True
+    # Агрегаты тоже не затронуты.
+    assert _detect_meta_noise(_incident("ProdNewCriticalAlerts")) is True
+
+
 # ── render: приглушённый embed ────────────────────────────────────────────────
 
 

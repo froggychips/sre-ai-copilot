@@ -44,6 +44,7 @@ import sys
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple, cast
 
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.knowledge_graph.schema import K8sJob, Service
@@ -429,9 +430,29 @@ def _upsert_k8s_job(
             last_seen_at=now,
             **fields,
         )
-        db.add(node)
-        db.flush()
-        return node
+        # SAVEPOINT: параллельный beat-tick мог вставить ту же строку между
+        # нашим one_or_none() и flush() → INSERT упрётся в UNIQUE
+        # (uq_kg_k8s_job_ns_name_kind), и без savepoint IntegrityError
+        # переведёт Session в aborted-состояние, теряя весь tick. begin_nested
+        # откатывает только этот INSERT; затем перечитываем строку-победителя и
+        # апдейтим её (existing-путь ниже). Зеркалит per-item SAVEPOINT из
+        # k8s_events_sync.
+        try:
+            with db.begin_nested():
+                db.add(node)
+                db.flush()
+            return node
+        except IntegrityError:
+            existing = (
+                db.query(K8sJob)
+                .filter(
+                    K8sJob.namespace == namespace,
+                    K8sJob.name == name,
+                    K8sJob.kind == kind,
+                )
+                .one()
+            )
+            # проваливаемся в update-путь ниже (last-write-wins).
 
     for k, v in fields.items():
         if hasattr(existing, k):

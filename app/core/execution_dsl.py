@@ -35,6 +35,14 @@ class ExecutionIntent(BaseModel):
     @field_validator("namespace")
     @classmethod
     def block_system_ns(cls, v: str):
+        # namespace уходит в kubectl-команду (`-n {namespace}`) и затем в argv
+        # через command.split() — ровно как resource_name/label. Без charset-
+        # валидации значение вроде `squad-1 -n kube-system` подменяет namespace
+        # мимо guard'а (flag-инъекция). Тот же charset имён k8s namespace: ни
+        # пробелов, ни ведущего '-', ни флагов. Дефолт "default" валиден.
+        if not re.fullmatch(r"[a-z0-9]([a-z0-9.\-]{0,251}[a-z0-9])?", v or ""):
+            raise ValueError(f"Invalid namespace: {v!r}")
+        # FORBIDDEN-set проверяем ПОСЛЕ charset — оба контроля обязательны.
         if v in FORBIDDEN_NAMESPACES:
             raise ValueError(
                 f"Access to namespace '{v}' is forbidden by security policy."

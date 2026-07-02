@@ -76,13 +76,34 @@ def _trim_comment(c: str, n: int = 140) -> str:
 
 
 def _parse_tc_date(s: str) -> Optional[datetime]:
-    """TC отдаёт `yyyyMMdd'T'HHmmss±HHmm` без двоеточий."""
+    """Парсит дату в tz-aware datetime. Принимает два формата:
+
+      1. TC compact `yyyyMMdd'T'HHmmss±HHmm` (напр. `20260512T174418+0000`)
+         — сырой формат TC REST API.
+      2. ISO 8601 `YYYY-MM-DDTHH:MM:SSZ` (напр. `2026-05-12T17:44:18Z`)
+         — уже нормализованный _tc_to_iso. Обязателен потому что merge/filter
+         (_fetch_builds_direct / MCP-путь) re-парсят поле `finished`, которое
+         _build_summary_direct кладёт УЖЕ в ISO. Без ISO-фолбэка каждый build
+         дропался (finished=None) и «recent deploys» всегда пустой.
+
+    Возвращает None если формат не распознан.
+    """
     if not s:
         return None
+    # 1) сырой compact TC — strptime уже даёт tz-aware (±HHmm).
     try:
         return datetime.strptime(s, "%Y%m%dT%H%M%S%z")
     except ValueError:
+        pass
+    # 2) ISO 8601 — fromisoformat не ест `Z` до 3.11, приводим к +00:00.
+    try:
+        dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
+    except ValueError:
         return None
+    # naive ISO (без tz) → считаем UTC, чтобы сравнение с tz-aware `since` не падало.
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt
 
 
 def _tc_to_iso(s: Optional[str]) -> Optional[str]:

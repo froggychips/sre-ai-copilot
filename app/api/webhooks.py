@@ -180,6 +180,43 @@ def validate_alert_labels(alert):
         raise HTTPException(status_code=400, detail="Invalid instance format")
 
 
+def _claim_refire(
+    db: Session, incident_id: str, expected_status: str, new_data: dict
+) -> int:
+    """Atomically claim a re-fire (flapping / FAILED-retry) for dispatch.
+
+    Compare-and-swap: flip the row to OPEN только если она ВСЁ ЕЩЁ в том
+    терминальном/re-runnable статусе, который мы прочитали (`expected_status`).
+    Два конкурентных webhook-запроса читают один и тот же статус; первый
+    переводит строку в OPEN, у второго условный UPDATE матчит 0 строк →
+    caller трактует это как dedup и НЕ диспатчит пайплайн (иначе — двойной
+    LLM-burn + дублирующий @here).
+
+    Это ОДИН атомарный `UPDATE ... WHERE status=:expected` + commit, поэтому
+    row-lock НЕ держится через `await incident_teamcity_context(...)` (тот
+    сетевой вызов уже завершился до claim'а).
+
+    Returns rowcount: 1 = этот caller выиграл claim (диспатчим), 0 = другой
+    воркер уже забрал инцидент (deduplicated).
+    """
+    rows = (
+        db.query(IncidentRecord)
+        .filter(
+            IncidentRecord.incident_id == incident_id,
+            IncidentRecord.status == expected_status,
+        )
+        .update(
+            {
+                IncidentRecord.status: IncidentState.OPEN.value,
+                IncidentRecord.data: new_data,
+            },
+            synchronize_session=False,
+        )
+    )
+    db.commit()
+    return rows
+
+
 @router.post(
     "/alertmanager",
     status_code=202,
@@ -283,6 +320,9 @@ async def alertmanager_webhook(
             )
 
         if existing is None:
+            # New incident — INSERT. Commit before pipeline: the worker opens
+            # its own SessionLocal and needs the row visible before it starts
+            # writing state transitions.
             db.add(
                 IncidentRecord(
                     incident_id=incident.incident_id,
@@ -290,26 +330,45 @@ async def alertmanager_webhook(
                     data=incident.model_dump(),
                 )
             )
+            try:
+                db.commit()
+            except IntegrityError:
+                # Конкурентный дубль: другой воркер уже создал строку с этим
+                # incident_id (UNIQUE). Откатываемся и трактуем как dedup —
+                # пайплайн уже запущен тем воркером, второй dispatch не нужен.
+                db.rollback()
+                log.info(
+                    "webhook.insert_race_deduplicated",
+                    incident_id=incident.incident_id,
+                )
+                accepted.append({
+                    "incident_id": incident.incident_id,
+                    "task_id": "deduplicated",
+                })
+                continue
         else:
-            # Reset to OPEN for both FAILED retry and flapping re-fire.
-            # Overwrite data so flap_count is persisted in the row.
-            existing.status = IncidentState.OPEN.value
-            existing.data = incident.model_dump()
-        # Commit before pipeline: the worker opens its own SessionLocal and needs
-        # the row to be visible before it starts writing state transitions.
-        try:
-            db.commit()
-        except IntegrityError:
-            # Конкурентный дубль: другой воркер уже создал строку с этим
-            # incident_id (UNIQUE). Откатываемся и трактуем как dedup —
-            # пайплайн уже запущен тем воркером, второй dispatch не нужен.
-            db.rollback()
-            log.info("webhook.insert_race_deduplicated", incident_id=incident.incident_id)
-            accepted.append({
-                "incident_id": incident.incident_id,
-                "task_id": "deduplicated",
-            })
-            continue
+            # Re-fire (FAILED retry / flapping): atomic compare-and-swap claim.
+            # Reset to OPEN только если строка ВСЁ ЕЩЁ в наблюдаемом статусе —
+            # так ровно ОДИН из двух конкурентных webhook'ов выигрывает claim и
+            # диспатчит, второй получает rowcount 0 и дедупится (без двойного
+            # LLM-burn / дубль-@here). data перезаписывается, чтобы flap_count
+            # сохранился в строке.
+            claimed = _claim_refire(
+                db,
+                incident.incident_id,
+                str(existing.status),
+                incident.model_dump(),
+            )
+            if claimed == 0:
+                log.info(
+                    "webhook.refire_race_deduplicated",
+                    incident_id=incident.incident_id,
+                )
+                accepted.append({
+                    "incident_id": incident.incident_id,
+                    "task_id": "deduplicated",
+                })
+                continue
 
         if settings.PIPELINE_DIRECT_INVOKE:
             await async_process_incident(incident.model_dump())

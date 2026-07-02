@@ -391,7 +391,11 @@ def test_discover_namespaces_handles_exception():
 
 def test_sync_topology_uses_explicit_argument():
     """Аргумент `namespaces` — высший приоритет, ни settings ни discover не дёргаются."""
+    # _kubectl_get_deployments мокаем на успешный-пустой fetch: иначе на машине
+    # без кластера он raise'ит KubectlFetchError (fix #1) и sync_namespace для
+    # ns не вызывается — тест же проверяет только приоритет источника namespaces.
     with patch("app.knowledge_graph.kg_sync.sync_namespace") as mock_sync_ns, \
+         patch("app.knowledge_graph.kg_sync._kubectl_get_deployments", return_value=[]), \
          patch("app.knowledge_graph.kg_sync._discover_namespaces") as mock_disc:
         mock_sync_ns.return_value = {"services": 0, "edges": 0, "skipped": 0}
         sync_topology(db=MagicMock(), namespaces=["a", "b"])
@@ -402,6 +406,7 @@ def test_sync_topology_uses_explicit_argument():
 def test_sync_topology_reads_settings_when_arg_none():
     """namespaces=None → берём из settings.KG_SCAN_NAMESPACES (env-driven)."""
     with patch("app.knowledge_graph.kg_sync.sync_namespace") as mock_sync_ns, \
+         patch("app.knowledge_graph.kg_sync._kubectl_get_deployments", return_value=[]), \
          patch("app.knowledge_graph.kg_sync._discover_namespaces") as mock_disc, \
          patch("app.config.settings") as mock_settings:
         mock_settings.KG_SCAN_NAMESPACES = "team-x, team-y , team-z"  # whitespace стрипается
@@ -415,6 +420,7 @@ def test_sync_topology_reads_settings_when_arg_none():
 def test_sync_topology_falls_back_to_discovery_when_settings_empty():
     """settings.KG_SCAN_NAMESPACES пусто → _discover_namespaces."""
     with patch("app.knowledge_graph.kg_sync.sync_namespace") as mock_sync_ns, \
+         patch("app.knowledge_graph.kg_sync._kubectl_get_deployments", return_value=[]), \
          patch("app.knowledge_graph.kg_sync._discover_namespaces", return_value=["auto-1", "auto-2"]) as mock_disc, \
          patch("app.config.settings") as mock_settings:
         mock_settings.KG_SCAN_NAMESPACES = ""

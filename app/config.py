@@ -204,6 +204,16 @@ class Settings(BaseSettings):
     # grey + 🔇, без 🚨/@mention, карточка остаётся видимой для глазной проверки.
     META_NOISE_ENABLED: bool = True
 
+    # etcdInsufficientMembers — ОПАСНЫЙ участник meta-noise: на этом кластере это
+    # известный false-positive control-plane scrape-gap (CP-метрики на 127.0.0.1,
+    # vmagent их не достаёт), но ТОТ ЖЕ alertname сигналит реальную потерю кворума
+    # etcd (critical). Trade-off: default True сохраняет текущее подавление шума
+    # для этого кластера (иначе scrape-gap будет пейджить постоянно). Выстави
+    # False, чтобы etcdInsufficientMembers НЕ приглушался и звенел как настоящая
+    # потеря кворума. ScrapePoolHasNoTargets/RecordingRulesNoData — чистые
+    # производные scrape-gap, приглушаются всегда независимо от этого флага.
+    META_NOISE_ETCD_ENABLED: bool = True
+
     # KubeDeploymentGenerationMismatch — УСЛОВНЫЙ шум (alert-quality, прецедент
     # prod-kingdom7/town-service 2026-06-23). В отличие от meta-noise этот alert
     # шумный НЕ всегда: generation != observedGeneration штатно флапает, когда
