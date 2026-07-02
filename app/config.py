@@ -544,6 +544,20 @@ class Settings(BaseSettings):
     STATICS_PASSWORD: str = Field("", description="Statics Postgres password")
     STATICS_RECENT_VERSIONS: int = Field(5, description="How many recent statics versions to compare")
 
+    # Statics-aware restart attribution (инцидент 2026-07-02): накат ПРОД-
+    # статики (v10400-prod→v10401-prod) заставляет статикозависимые сервисы
+    # (town-*/map-*/bot/dev/mv/notificator) по всем prod-kingdom+shared
+    # детектить смену хеша и самим штатно рестартиться (graceful exit 0,
+    # `Newer statics … Will shutdown to reload`). k8s Deployment при этом НЕ
+    # меняется → deploy-атрибуция видит «деплоя не было» и ложно хватается за
+    # cross-namespace collateral соседних ns. Перед выдачей collateral-вердикта
+    # проверяем: не было ли недавнего bump'а статики для env алерта. Если был —
+    # вердикт «накат статики → ожидаемый self-restart wave», collateral подавлен.
+    # kill-switch. Источник версии — statics-Postgres (см. statics_service).
+    STATICS_RESTART_ATTRIB_ENABLED: bool = Field(True, description="Attribute prod restart/critical waves to a recent statics bump instead of cross-ns collateral")
+    # Bump статики в пределах этого окна (мин) ДО fired_at алерта ⇒ statics-вердикт.
+    STATICS_RESTART_WINDOW_MIN: int = Field(30, description="Statics bump within this many minutes before the alert ⇒ statics verdict")
+
     # Executor stage (PR #2 executor track). Если False — стадия пропускается,
     # пайплайн остаётся чисто advisory. Включать осознанно после merge PR #2
     # и smoke-теста на non-prod. На текущем этапе stage делает только

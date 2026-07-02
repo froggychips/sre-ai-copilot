@@ -1189,6 +1189,18 @@ class DiscordService:
             c for c in contexts
             if getattr(c, "deploy_scope", "service") == "namespace"
         ]
+        # Statics-aware restart attribution (инцидент 2026-07-02): недавний
+        # bump статики env'а объясняет волну self-restart'ов (k8s Deployment
+        # не менялся) — приоритетнее cross-ns collateral и без @mention. Берём
+        # самый свежий bump среди ns-scope контекстов группы.
+        statics_bump: Dict[str, Any] = {}
+        for c in ns_scope_ctxs:
+            b = getattr(c, "statics_bump", None) or {}
+            if b and (
+                not statics_bump
+                or b.get("minutes_before", 1_000_000) < statics_bump.get("minutes_before", 1_000_000)
+            ):
+                statics_bump = b
         # Минуты до алерта у ближайшего ns-scope деплоя — вход для
         # mention-подавления ниже (deploy-related critical не пингует).
         ns_deploy_min_minutes: Optional[int] = None
@@ -1250,7 +1262,24 @@ class DiscordService:
                     if act.get("total_deploys", 0) > cluster_act.get("total_deploys", 0):
                         cluster_act = act
                 min_deploys = int(getattr(settings, "ENRICH_CLUSTER_DEPLOY_MIN_DEPLOYS", 10))
-                if cluster_act.get("total_deploys", 0) >= min_deploys:
+                if statics_bump:
+                    # Накат статики — приоритетный вердикт над collateral: волна
+                    # рестартов = штатный self-reload статикозависимых сервисов,
+                    # а не image-pull/CRI pressure от соседей.
+                    ver = statics_bump.get("version")
+                    prev = statics_bump.get("prev_version")
+                    env_s = statics_bump.get("env") or "?"
+                    mins = statics_bump.get("minutes_before", "?")
+                    prev_part = f"v{prev}-{env_s}→" if prev else ""
+                    value = (
+                        f"📦 _Накат статики {prev_part}v{ver}-{env_s} "
+                        f"({mins}м до алерта) — ожидаемый self-restart wave "
+                        f"статикозависимых сервисов (town-*/map-*/bot/dev/mv/"
+                        f"notificator сами рестартятся на смену хеша, k8s "
+                        f"Deployment не менялся). Не cross-namespace collateral._"
+                        f"\n🔕 _Mention подавлен — рестарты вызваны накатом статики._"
+                    )
+                elif cluster_act.get("total_deploys", 0) >= min_deploys:
                     sib_label = ", ".join(
                         f"`{n['namespace']}` ({n['deploys']})"
                         for n in cluster_act.get("namespaces", [])[:4]
@@ -1515,8 +1544,13 @@ class DiscordService:
         )
         # meta-noise (агрегат/scrape-gap) и gen-mismatch-churn тоже без пинга —
         # карточка видима, но on-call не будят ради плумбинг-шума / churn-а.
+        # Накат статики (инцидент 2026-07-02) — штатная волна self-restart'ов,
+        # тоже без пинга (карточка остаётся видимой с statics-вердиктом).
         suppress_mention = (
-            suppress_mention_deploy or head.meta_noise or head.gen_mismatch_noise
+            suppress_mention_deploy
+            or head.meta_noise
+            or head.gen_mismatch_noise
+            or bool(statics_bump)
         )
         mention_prefix = (
             ""

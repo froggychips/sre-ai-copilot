@@ -14,7 +14,8 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
-from typing import List, Optional
+from datetime import datetime, timezone
+from typing import Dict, List, Optional
 
 import psycopg2
 import psycopg2.extras
@@ -156,3 +157,129 @@ async def check_statics_for_error(error_text: str) -> Optional[str]:
     return await loop.run_in_executor(
         None, _run_statics_check, error_text, settings.STATICS_RECENT_VERSIONS
     )
+
+
+# ── Statics version lookup (restart-attribution, инцидент 2026-07-02) ──────
+#
+# В statics-Postgres КАЖДАЯ версия статики — отдельная БД вида `v<N>-<env>`
+# (`v10401-prod`, `v10400-preprod`, `v10432-squad-gd`, …). Отдельной таблицы-
+# реестра версий с timestamp'ом НЕТ: `schema_migrations` внутри версии хранит
+# лишь (version bigint, dirty bool). Поэтому «последняя версия env» = максимум
+# номера среди БД `v%-<env>` в `pg_database`, а время создания версии — best-
+# effort commit-timestamp строки `pg_database` (см. ниже).
+
+# k8s-namespace → суффикс env в имени version-БД. prod-*/preprod-*/preupdate-*
+# делят одну статику на весь env (не per-kingdom): `prod-kingdom4` и
+# `prod-shared` → 'prod'. squad изолирован: `squad-12-shared` → 'squad-12',
+# `squad-gd-shared` → 'squad-gd'.
+_SQUAD_NS_RE = re.compile(r"^(squad-(?:gd|\d+))\b")
+
+
+def statics_env_from_namespace(namespace: Optional[str]) -> Optional[str]:
+    """Отобразить k8s-namespace на суффикс env в имени version-БД статики.
+
+    None — namespace не относится к игровым env (monitoring/kube-system/…),
+    статика к нему неприменима.
+    """
+    ns = (namespace or "").strip()
+    if not ns:
+        return None
+    if ns.startswith("prod"):
+        return "prod"
+    if ns.startswith("preprod"):
+        return "preprod"
+    if ns.startswith("preupdate"):
+        return "preupdate"
+    m = _SQUAD_NS_RE.match(ns)
+    if m:
+        return m.group(1)
+    return None
+
+
+@with_external_retry(
+    max_attempts=3, initial_delay=0.5, name="statics.latest_version",
+    retry_on=(psycopg2.OperationalError, psycopg2.InterfaceError),
+)
+def _run_latest_statics_version(env: str) -> Optional[Dict]:
+    """Sync: последняя (и предыдущая) версия статики для env + время создания.
+
+    env — суффикс имени version-БД ('prod'/'preprod'/'preupdate'/'squad-N'/
+    'squad-gd'). Возвращает `{version, prev_version, created_at, datname, env}`
+    либо None если версий для env нет.
+
+    `created_at` — commit-timestamp строки `pg_database` (= момент CREATE
+    DATABASE = публикация версии). Доступен ТОЛЬКО при включённом на сервере
+    `track_commit_timestamp`; иначе None (фича дегрейдит в no-op, а не падает).
+    Retry только на connection-class ошибках."""
+    conn = None
+    try:
+        conn = psycopg2.connect(database="gd", **_conn_kwargs())
+        conn.autocommit = True
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+
+        # `v%-<env>` — литеральный `%`-wildcard после `v` + суффикс env. Наши
+        # env не содержат LIKE-метасимволов (`%`/`_`), инъекция невозможна:
+        # значение связывается параметром.
+        pattern = f"v%-{env}"
+        cur.execute(
+            """
+            SELECT datname,
+                   (substring(datname FROM '^v([0-9]+)-'))::bigint AS ver
+            FROM pg_database
+            WHERE datname LIKE %s
+              AND substring(datname FROM '^v([0-9]+)-') IS NOT NULL
+            ORDER BY ver DESC
+            LIMIT 2
+            """,
+            (pattern,),
+        )
+        rows = cur.fetchall()
+        if not rows:
+            return None
+        top = rows[0]
+        version = int(top["ver"])
+        prev_version = int(rows[1]["ver"]) if len(rows) > 1 else None
+        datname = top["datname"]
+
+        created_at: Optional[datetime] = None
+        try:
+            cur.execute(
+                "SELECT pg_xact_commit_timestamp(xmin) AS ts FROM pg_database WHERE datname = %s",
+                (datname,),
+            )
+            ts_row = cur.fetchone()
+            ts = ts_row["ts"] if ts_row else None
+            if ts is not None:
+                created_at = ts if ts.tzinfo else ts.replace(tzinfo=timezone.utc)
+        except Exception as e:
+            # track_commit_timestamp выключен → commit-ts недоступен. НЕ фейлим:
+            # номер версии важнее, время best-effort. Без времени вызывающий
+            # (enrichment) не сможет оценить окно и просто пропустит statics-вердикт.
+            logger.info("statics_service.commit_ts_unavailable: %s", e)
+
+        return {
+            "version": version,
+            "prev_version": prev_version,
+            "created_at": created_at,
+            "datname": datname,
+            "env": env,
+        }
+    except Exception as e:
+        logger.warning("statics_service.latest_version_failed env=%s: %s", env, e)
+        return None
+    finally:
+        if conn is not None:
+            conn.close()
+
+
+def get_latest_statics_version(env: str) -> Optional[Dict]:
+    """Последняя версия статики для env (sync, best-effort).
+
+    None если statics-Postgres не сконфигурирован или версий нет.
+    Возвращает dict `{version, prev_version, created_at, datname, env}`.
+    """
+    if not settings.STATICS_HOST or not settings.STATICS_PASSWORD:
+        return None
+    if not env:
+        return None
+    return _run_latest_statics_version(env)
