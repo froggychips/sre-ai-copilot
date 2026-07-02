@@ -44,7 +44,7 @@ metadata:
   labels:
     app: squad-dashboard
 spec:
-  schedule: "0 * * * *"          # ежечасно, в начале часа (UTC)
+  schedule: "*/5 * * * *"        # каждые 5 минут (UTC); прогон ~12с, Forbid защищает от нахлёста
   concurrencyPolicy: Forbid
   successfulJobsHistoryLimit: 3
   failedJobsHistoryLimit: 5
