@@ -567,6 +567,14 @@ def _detect_meta_noise(incident: Incident) -> bool:
     alertname = (incident.labels or {}).get("alertname", "")
     if not alertname:
         return False
+    # etcdInsufficientMembers — условный: на этом кластере это scrape-gap
+    # false-positive (default глушим, чтобы не пейджило постоянно), НО тот же
+    # alertname = реальная потеря кворума etcd (critical). Trade-off: default
+    # True сохраняет текущее подавление шума; META_NOISE_ETCD_ENABLED=False
+    # выключает подавление → etcd звенит как настоящий сбой. Прочие scrape-gap
+    # производные (ScrapePool/RecordingRules) глушим всегда.
+    if alertname == "etcdInsufficientMembers":
+        return bool(getattr(settings, "META_NOISE_ETCD_ENABLED", True))
     if alertname in META_NOISE_ALERTNAMES:
         return True
     # Семейство `<Env>NewCriticalAlerts` (Prod/Preprod/Squad/...) — все агрегаты.
