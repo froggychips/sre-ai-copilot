@@ -395,6 +395,50 @@ def test_top_alert_types_excludes_infrastructure_noise():
     assert "etcdInsufficientMembers" in text
 
 
+# ── top_alert_types_section: conditional-noise (gen-churn muted) ────────────
+
+def test_gen_mismatch_rendered_muted_not_in_top():
+    """GenerationMismatch (условный шум) не венчает топ-3, а идёт отдельной
+    🔇-строкой — даже если серий у него больше всех (Rancher publicEndpoints
+    churn). Реальные типы с меньшим счётчиком остаются в топе."""
+    counter = Counter({
+        "KubeDeploymentGenerationMismatch": 348,  # conditional noise → muted
+        "KubeDeploymentReplicasMismatch": 17,      # real
+        "ScrapePoolHasNoTargets": 9,               # real
+    })
+    text = stats_digest.top_alert_types_section(counter)
+    assert "🔇 gen-churn" in text
+    assert "× 348" in text  # счётчик показан честно в muted-строке
+    assert "KubeDeploymentReplicasMismatch" in text
+    assert "ScrapePoolHasNoTargets" in text
+    # gen-mismatch НЕ должен стоять в обычной топ-строке (`  \`name\` × …`)
+    assert "  `KubeDeploymentGenerationMismatch` × 348" not in text
+
+
+def test_gen_mismatch_only_shows_muted_not_empty():
+    """Если кроме gen-churn ничего не firing — рендерим muted-строку, а не
+    «нет активных алертов»."""
+    counter = Counter({"KubeDeploymentGenerationMismatch": 120})
+    text = stats_digest.top_alert_types_section(counter)
+    assert "🔇 gen-churn" in text
+    assert "нет активных алертов" not in text
+
+
+def test_gen_mismatch_killswitch_off_competes_in_top(monkeypatch):
+    """Kill-switch GEN_MISMATCH_NOISE_ENABLED=False → прежнее поведение:
+    gen-mismatch конкурирует в топе, muted-строки нет."""
+    monkeypatch.setattr(
+        stats_digest.settings, "GEN_MISMATCH_NOISE_ENABLED", False, raising=False
+    )
+    counter = Counter({
+        "KubeDeploymentGenerationMismatch": 348,
+        "KubeDeploymentReplicasMismatch": 17,
+    })
+    text = stats_digest.top_alert_types_section(counter)
+    assert "🔇 gen-churn" not in text
+    assert "  `KubeDeploymentGenerationMismatch` × 348" in text
+
+
 # ── anomaly_summary_section (Wave 2) ───────────────────────────────────────
 
 
