@@ -1,5 +1,6 @@
 """Тесты на auto_populator — наполнение KG из инцидентов."""
 from datetime import datetime
+from unittest.mock import patch
 
 import pytest
 from sqlalchemy import create_engine
@@ -163,6 +164,83 @@ def test_populate_picks_app_label_when_no_service(db):
     )
     populate_from_incident(db, incident)
     assert db.query(Service).filter(Service.name == "auth-svc").one() is not None
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# Kube-resource alert attribution (баг «vm-kube-state-metrics noisemaker»).
+# У KubeDeployment*/StatefulSet*/DaemonSet*-алертов лейбл `service` = метрика-
+# источник kube-state-metrics, не target. STORE-путь должен писать в kg_alerts
+# target-workload, не vm-kube-state-metrics.
+# ──────────────────────────────────────────────────────────────────────────
+
+
+def _kube_alert_incident(incident_id="inc-genmismatch"):
+    return Incident(
+        incident_id=incident_id,
+        severity="warning",
+        status="firing",
+        summary="x",
+        description="y",
+        namespace="prod-kingdom4",
+        labels={
+            "alertname": "KubeDeploymentGenerationMismatch",
+            "namespace": "prod-kingdom4",
+            "deployment": "map-service",
+            "service": "vm-kube-state-metrics",  # метрика-источник KSM, не target
+            "severity": "warning",
+        },
+        annotations={},
+        starts_at="2026-07-02T10:00:00Z",
+    )
+
+
+def test_populate_kube_alert_resolves_target_not_ksm_service(db):
+    """(a) gen-mismatch: deployment=map-service + service=vm-kube-state-metrics
+    → в kg_alerts сервис резолвится в map-service, KSM-источника в графе нет."""
+    stats = populate_from_incident(db, _kube_alert_incident())
+    assert stats["services_touched"] == 1
+    assert stats["alerts_added"] == 1
+
+    svc = db.query(Service).one()
+    assert svc.name == "map-service"
+    assert svc.namespace == "prod-kingdom4"
+    assert (
+        db.query(Service).filter(Service.name == "vm-kube-state-metrics").count() == 0
+    )
+
+
+def test_populate_app_alert_keeps_service_label(db):
+    """(b) app-алерт: валидный labels.service, нет kube-resource-лейблов →
+    поведение прежнее (service остаётся auth-service)."""
+    inc = Incident(
+        incident_id="inc-app-auth",
+        severity="warning",
+        status="firing",
+        summary="x",
+        description="y",
+        namespace="prod-shared",
+        labels={
+            "alertname": "HighErrorRate",
+            "namespace": "prod-shared",
+            "service": "auth-service",
+            "severity": "warning",
+        },
+        annotations={},
+        starts_at="2026-07-02T10:00:00Z",
+    )
+    populate_from_incident(db, inc)
+    assert db.query(Service).one().name == "auth-service"
+
+
+def test_populate_kube_alert_kill_switch_off_keeps_legacy_ksm(db):
+    """(c) ATTRIBUTION_RESOLVE_KUBE_TARGET_ENABLED=False → прежнее (баг-)поведение:
+    лейбл `service` в приоритете → vm-kube-state-metrics."""
+    with patch(
+        "app.services.alert_enrichment.settings.ATTRIBUTION_RESOLVE_KUBE_TARGET_ENABLED",
+        False,
+    ):
+        populate_from_incident(db, _kube_alert_incident("inc-genmismatch-off"))
+    assert db.query(Service).one().name == "vm-kube-state-metrics"
 
 
 def test_upsert_edge_merges_extras_does_not_overwrite(db):

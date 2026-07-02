@@ -12,7 +12,8 @@ from unittest.mock import MagicMock, patch
 
 from app.models.incident import Incident
 from app.services.alert_enrichment import (_resolve_target_service_from_labels,
-                                           _strip_pod_hash, enrich_alert)
+                                           _strip_pod_hash, enrich_alert,
+                                           resolve_store_service)
 
 
 # ── _strip_pod_hash: deployment-name derive ──────────────────────────────
@@ -110,6 +111,68 @@ def test_resolver_namespace_separate_from_service():
     assert _resolve_target_service_from_labels(labels) == (
         "prod-kingdom1", "auth-service"
     )
+
+
+# ── resolve_store_service: STORE-путь (kg_alerts) ────────────────────────
+# Правило: kube-resource-лейбл (deployment/statefulset/daemonset) → target
+# workload (лейбл `service` — метрика-источник vm-kube-state-metrics — игнор);
+# иначе legacy_default (прежнее поведение app-алертов не меняется).
+
+
+def test_store_service_kube_alert_prefers_target_over_ksm_service():
+    labels = {
+        "namespace": "prod-kingdom4",
+        "deployment": "map-service",
+        "service": "vm-kube-state-metrics",
+    }
+    legacy = labels.get("service") or labels.get("deployment")
+    assert legacy == "vm-kube-state-metrics"  # прежняя (баг-)ветка
+    assert resolve_store_service(labels, legacy_default=legacy) == "map-service"
+
+
+def test_store_service_statefulset_prefers_target():
+    labels = {
+        "namespace": "prod-shared",
+        "statefulset": "town-db-postgresql",
+        "service": "vm-kube-state-metrics",
+    }
+    assert resolve_store_service(
+        labels, legacy_default=labels.get("service")
+    ) == "town-db-postgresql"
+
+
+def test_store_service_daemonset_prefers_target():
+    labels = {
+        "namespace": "kube-system",
+        "daemonset": "node-exporter",
+        "service": "vm-kube-state-metrics",
+    }
+    assert resolve_store_service(
+        labels, legacy_default=labels.get("service")
+    ) == "node-exporter"
+
+
+def test_store_service_app_alert_keeps_legacy_default():
+    """Нет kube-resource-лейблов → legacy_default (валидный `service`)."""
+    labels = {"namespace": "prod-shared", "service": "auth-service"}
+    assert resolve_store_service(
+        labels, legacy_default=labels.get("service")
+    ) == "auth-service"
+
+
+def test_store_service_kill_switch_off_keeps_legacy():
+    labels = {
+        "namespace": "prod-kingdom4",
+        "deployment": "map-service",
+        "service": "vm-kube-state-metrics",
+    }
+    with patch(
+        "app.services.alert_enrichment.settings.ATTRIBUTION_RESOLVE_KUBE_TARGET_ENABLED",
+        False,
+    ):
+        assert resolve_store_service(
+            labels, legacy_default=labels.get("service")
+        ) == "vm-kube-state-metrics"
 
 
 # ── enrich_alert: end-to-end label resolve ───────────────────────────────
