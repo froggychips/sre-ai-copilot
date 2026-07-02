@@ -568,6 +568,15 @@ def unowned_namespaces_section(
 # на bursty workload.
 _NOISE_ALERTNAMES = frozenset({"InfoInhibitor", "Watchdog", "CPUThrottlingHigh"})
 
+# УСЛОВНЫЙ шум для дайджеста. `_NOISE_ALERTNAMES` — всегда-шум (дропаем из топа).
+# Здесь — alertname'ы, шумные лишь при здоровье реплик (health-gated в
+# per-incident рендере, см. config.GEN_MISMATCH_NOISE_ENABLED). Статически
+# дропнуть их из топа нельзя (иногда сигналят реальный зависший накат), поэтому
+# выносим в отдельную muted-строку (см. `top_alert_types_section`): не венчают
+# «реальный» топ-3, но остаются видимыми. Реальный висяк приходит параллельно
+# как KubeDeploymentReplicasMismatch (ready<desired) — тот НЕ приглушается.
+_CONDITIONAL_NOISE_ALERTNAMES = frozenset({"KubeDeploymentGenerationMismatch"})
+
 
 def _alert_type_metadata(
     db: Optional[Session],
@@ -686,14 +695,20 @@ def top_alert_types_section(
     Если db is None или таблицы нет — рендерим базовый формат без
     дополнительных полей (backwards-compat с тестами).
     """
+    # Условный шум (gen-churn) исключаем из конкуренции за топ-3, но не дропаем —
+    # рендерим отдельной muted-строкой ниже. Gate — тот же kill-switch, что у
+    # per-incident health-gating (config.GEN_MISMATCH_NOISE_ENABLED); если он
+    # выключен, поведение прежнее (gen-mismatch конкурирует в топе).
+    gate_conditional = getattr(settings, "GEN_MISMATCH_NOISE_ENABLED", True)
+    excluded = set(_NOISE_ALERTNAMES)
+    if gate_conditional:
+        excluded |= _CONDITIONAL_NOISE_ALERTNAMES
+
     filtered = Counter({
         name: cnt for name, cnt in unique_alerts.items()
-        if name not in _NOISE_ALERTNAMES
+        if name not in excluded
     })
     lines = ["**📋 Top alert types** (без infra-noise)"]
-    if not filtered:
-        lines.append("  _нет активных алертов_")
-        return "\n".join(lines)
 
     top = filtered.most_common(3)
     top_names = [name for name, _ in top]
@@ -731,6 +746,30 @@ def top_alert_types_section(
 
         suffix = f" ({', '.join(parts)})" if parts else ""
         lines.append(f"  `{name}` × {cnt}{suffix}")
+
+    # Условный шум — отдельная приглушённая строка под реальным топом. Видима
+    # для глазной проверки, но не венчает список. Счётчик — сырые firing-серии
+    # (gen-churn: Rancher/cattle дописывает publicEndpoints-аннотацию, бьёт
+    # metadata.generation, deployment-контроллер на миг отстаёт observedGeneration).
+    muted_lines: List[str] = []
+    if gate_conditional:
+        for cond_name in sorted(_CONDITIONAL_NOISE_ALERTNAMES):
+            if cond_name in _NOISE_ALERTNAMES:
+                continue
+            cond_cnt = unique_alerts.get(cond_name, 0)
+            if cond_cnt <= 0:
+                continue
+            muted_lines.append(
+                f"  🔇 gen-churn: `{cond_name}` × {cond_cnt} "
+                "(Rancher publicEndpoints, health-gated benign; "
+                "реальные висяки → ReplicasMismatch)"
+            )
+
+    if not top and not muted_lines:
+        lines.append("  _нет активных алертов_")
+        return "\n".join(lines)
+
+    lines.extend(muted_lines)
     return "\n".join(lines)
 
 
