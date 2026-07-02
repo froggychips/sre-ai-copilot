@@ -10,6 +10,7 @@ alert, self-health alert). Helpers вынесены в соседние моду
 Класс не трогаем — split первой волны касается только free-function helpers.
 """
 
+import asyncio
 import logging
 import time
 from datetime import datetime, timezone
@@ -84,6 +85,142 @@ _SEVERITY_COLORS = {
     "warning":  _COLOR_WARNING,
     "info":     _COLOR_UNKNOWN,
 }
+
+# ── #3: Discord rate-limit (HTTP 429) retry-параметры ────────────────────────
+# Alert-storm генерит 429 (Discord global/route rate-limit). Bounded-retry:
+# максимум _RATELIMIT_MAX_ATTEMPTS попыток и _RATELIMIT_MAX_TOTAL_WAIT секунд
+# суммарного сна — иначе send-путь мог бы залипнуть на злом Retry-After.
+_RATELIMIT_MAX_ATTEMPTS = 3
+_RATELIMIT_MAX_TOTAL_WAIT = 10.0
+_RATELIMIT_DEFAULT_WAIT = 1.0
+
+# ── #6: Discord 6000-char TOTAL embed limit ──────────────────────────────────
+# Суммарная длина embed-а = title + description + все field.name + field.value +
+# footer.text + author.name. Полностью обогащённый critical (до ~24 полей) может
+# это превысить → Discord 400 → alert дропается. Держим safe-margin ниже лимита.
+_EMBED_TOTAL_LIMIT = 6000
+_EMBED_SAFE_MARGIN = 5900
+
+# Поля-«излишества» enrichment-а в порядке дропа: СНАЧАЛА самые нижние по
+# приоритету (pod-trail/ingress/similar-past/blast-radius), потом остальное.
+# Root-cause («🎯 Скорее всего»), TL;DR, Namespaces/Owner и title/description/
+# footer НЕ трогаем. Матчинг — по подстроке в field.name.
+_EMBED_DROP_ORDER: Tuple[str, ...] = (
+    "Pod trail",          # 🕒 Pod trail (Wave 7)
+    "Endpoint health",    # 🌐 ingress-derived health
+    "Similar past",       # 🔁 Similar past
+    "Blast radius",       # 🎯 Blast radius (Wave 7)
+    "NATS impact",        # 📨 NATS impact (Wave 7)
+    "Inbound callers",    # KG inbound callers
+    "Upstream",           # Upstream сейчас (KG)
+    "Source",             # Prometheus generator link
+    "Tickets",            # 🎫 Jira tickets
+    "Recent pod events",  # k8s pod events
+    "Зависит от",         # outgoing deps (critical)
+    "Deps",               # outgoing deps (warning compact)
+    "Runbook",            # 📖 Runbook
+    "Deploy-связь",       # NS-scope deploy verdict
+    "Recent deploys",     # service-scope deploys
+    "Почему важно",       # ⭐ why-this-matters
+)
+
+# Поля, которые никогда не дропаем и не режем (root-cause + header essentials).
+_EMBED_PROTECTED_FIELDS: Tuple[str, ...] = (
+    "🎯 Скорее всего",  # primary_hypothesis — root cause
+    "🎯 TL;DR",         # header TL;DR
+    "Namespaces",
+    "Owner",
+)
+
+
+def _parse_retry_after(resp: Any, default: float = _RATELIMIT_DEFAULT_WAIT) -> float:
+    """Сколько ждать до ретрая по Discord 429 (в секундах).
+
+    Приоритет: JSON body `retry_after` (Discord отдаёт float-секунды), затем
+    header `Retry-After`. При отсутствии/парс-ошибке — `default`.
+    """
+    # JSON body (Discord-specific, секунды, может быть float).
+    try:
+        body = resp.json()
+        if isinstance(body, dict) and body.get("retry_after") is not None:
+            val = float(body["retry_after"])
+            if val >= 0:
+                return val
+    except (ValueError, TypeError, AttributeError):
+        pass
+    # Header fallback.
+    try:
+        hdr = resp.headers.get("Retry-After")
+        if hdr is not None:
+            val = float(hdr)
+            if val >= 0:
+                return val
+    except (ValueError, TypeError, AttributeError):
+        pass
+    return default
+
+
+def _embed_total_len(embed: Dict[str, Any]) -> int:
+    """Суммарная длина embed-а по правилам Discord 6000-char limit."""
+    total = len(embed.get("title") or "")
+    total += len(embed.get("description") or "")
+    for f in embed.get("fields") or []:
+        total += len(f.get("name") or "") + len(f.get("value") or "")
+    total += len((embed.get("footer") or {}).get("text") or "")
+    total += len((embed.get("author") or {}).get("name") or "")
+    return total
+
+
+def _fit_embed_to_limit(
+    embed: Dict[str, Any],
+    limit: int = _EMBED_TOTAL_LIMIT,
+    margin: int = _EMBED_SAFE_MARGIN,
+) -> Dict[str, Any]:
+    """Ужимает embed под Discord 6000-char TOTAL limit (#6).
+
+    Стратегия (пока не влезем в `margin`):
+      1. дропаем поля-излишества по `_EMBED_DROP_ORDER` (снизу вверх по
+         приоритету);
+      2. усекаем `description`;
+      3. в крайнем случае усекаем/удаляем самое длинное НЕзащищённое поле.
+    Alert НИКОГДА не дропается целиком — title + root-cause + header остаются.
+    Мутирует и возвращает тот же dict.
+    """
+    if _embed_total_len(embed) <= margin:
+        return embed
+
+    # (1) Дропаем излишества по drop-order.
+    fields = list(embed.get("fields") or [])
+    for marker in _EMBED_DROP_ORDER:
+        if _embed_total_len(embed) <= margin:
+            break
+        fields = [f for f in fields if marker not in (f.get("name") or "")]
+        embed["fields"] = fields
+
+    # (2) Усекаем description.
+    if _embed_total_len(embed) > margin and embed.get("description"):
+        over = _embed_total_len(embed) - margin
+        desc = embed["description"]
+        embed["description"] = desc[: max(0, len(desc) - over)]
+
+    # (3) Крайний случай — режем самое длинное НЕзащищённое поле, пока не
+    # уложимся в hard-limit. Защищённые поля (root-cause/header) не трогаем.
+    while _embed_total_len(embed) > limit and embed.get("fields"):
+        candidates = [
+            (i, f)
+            for i, f in enumerate(embed["fields"])
+            if not any(p in (f.get("name") or "") for p in _EMBED_PROTECTED_FIELDS)
+        ]
+        if not candidates:
+            break  # остались только защищённые — они заведомо < limit
+        i, f = max(candidates, key=lambda t: len(t[1].get("value") or ""))
+        over = _embed_total_len(embed) - margin
+        val = f.get("value") or ""
+        if over >= len(val):
+            embed["fields"].pop(i)
+        else:
+            f["value"] = val[: len(val) - over]
+    return embed
 
 
 def _collect_self_health_summary() -> Optional[Dict[str, Any]]:
@@ -648,7 +785,9 @@ class DiscordService:
         msg_id: Optional[str] = None
         try:
             async with httpx.AsyncClient() as client:
-                r = await client.post(post_url, json=payload)
+                r = await self._request_with_ratelimit(
+                    client, "post", post_url, json=payload
+                )
                 if r.status_code >= 400:
                     logging.error(
                         "discord_incident_report_failed",
@@ -743,7 +882,9 @@ class DiscordService:
             return
         try:
             async with httpx.AsyncClient() as client:
-                r = await client.patch(endpoint, json=patch_payload)
+                r = await self._request_with_ratelimit(
+                    client, "patch", endpoint, json=patch_payload
+                )
                 if r.status_code >= 400:
                     logging.warning(
                         "discord_incident_patch_failed",
@@ -831,7 +972,9 @@ class DiscordService:
             return
         try:
             async with httpx.AsyncClient() as client:
-                r = await client.patch(endpoint, json=patch_payload)
+                r = await self._request_with_ratelimit(
+                    client, "patch", endpoint, json=patch_payload
+                )
                 if r.status_code >= 400:
                     logging.warning(
                         "discord_incident_patch_failed",
@@ -877,6 +1020,51 @@ class DiscordService:
             )
         except Exception as e:  # never let telemetry break the send-path
             logging.debug("audit_dedup_event_failed: %s", e)
+
+    async def _request_with_ratelimit(
+        self,
+        client: "httpx.AsyncClient",
+        method: str,
+        url: str,
+        *,
+        json: Dict[str, Any],
+        max_attempts: int = _RATELIMIT_MAX_ATTEMPTS,
+        max_total_wait: float = _RATELIMIT_MAX_TOTAL_WAIT,
+    ) -> "httpx.Response":
+        """POST/PATCH с bounded-retry на Discord rate-limit (HTTP 429) (#3).
+
+        Раньше все send-пути трактовали status >= 400 как терминальный → 429
+        (что и генерит alert-storm) дропался, `Retry-After` не читался, msg_id
+        в dedup_store не сохранялся → следующий идентичный alert ре-POSTил →
+        снова 429 (loop). Теперь на 429 читаем `Retry-After` (header или JSON
+        body `retry_after`, секунды, может быть float), спим и ретраим ТОТ ЖЕ
+        запрос. Кап: `max_attempts` попыток и `max_total_wait` суммарного сна.
+
+        Non-429 ответы (включая прочие 4xx/5xx) возвращаются как есть — их
+        обрабатывает вызывающий (log + return), поведение не меняется.
+        """
+        send = client.post if method == "post" else client.patch
+        resp = await send(url, json=json)
+        attempts = 1
+        total_waited = 0.0
+        while (
+            resp.status_code == 429
+            and attempts < max_attempts
+            and total_waited < max_total_wait
+        ):
+            retry_after = _parse_retry_after(resp)
+            wait = min(retry_after, max_total_wait - total_waited)
+            if wait <= 0:
+                break
+            logging.warning(
+                "discord_rate_limited",
+                extra={"retry_after": retry_after, "attempt": attempts, "url": url[:60]},
+            )
+            await asyncio.sleep(wait)
+            total_waited += wait
+            attempts += 1
+            resp = await send(url, json=json)
+        return resp
 
     def _can_send_via_bot(self) -> bool:
         """Bot API доступен, когда есть token + channel_id. Без них fallback на webhook."""
@@ -1608,6 +1796,11 @@ class DiscordService:
             }
             if mention_prefix:
                 payload["content"] = mention_prefix.strip()
+            # #6: держим embed под Discord 6000-char TOTAL limit. Полностью
+            # обогащённый critical (до ~24 полей) может превысить → 400 → дроп.
+            # Дропаем излишества enrichment-а (pod-trail/ingress/blast/...),
+            # но title + root-cause + header остаются — alert не теряем.
+            _fit_embed_to_limit(payload["embeds"][0])
 
         if settings.DISCORD_DRY_RUN:
             # Главный путь — это то место где видно фактический embed-output
@@ -1633,7 +1826,9 @@ class DiscordService:
         if is_compact:
             try:
                 async with httpx.AsyncClient() as client:
-                    r = await client.post(url, json=payload)
+                    r = await self._request_with_ratelimit(
+                        client, "post", url, json=payload
+                    )
                     if r.status_code >= 400:
                         logging.error(
                             "discord_enriched_alert_compact_failed",
@@ -1717,7 +1912,9 @@ class DiscordService:
         msg_id: Optional[str] = None
         try:
             async with httpx.AsyncClient() as client:
-                r = await client.post(post_url, json=payload)
+                r = await self._request_with_ratelimit(
+                    client, "post", post_url, json=payload
+                )
                 if r.status_code >= 400:
                     logging.error(
                         "discord_enriched_alert_failed",
@@ -1792,7 +1989,9 @@ class DiscordService:
         """Fallback-POST когда _compute_enriched_key вернул None.
         Без dedup — просто шлём embed."""
         async with httpx.AsyncClient() as client:
-            r = await client.post(url, json=payload)
+            r = await self._request_with_ratelimit(
+                client, "post", url, json=payload
+            )
             if r.status_code >= 400:
                 logging.error(
                     "discord_enriched_alert_failed",
@@ -1851,7 +2050,9 @@ class DiscordService:
             return
         try:
             async with httpx.AsyncClient() as client:
-                r = await client.patch(endpoint, json=patch_payload)
+                r = await self._request_with_ratelimit(
+                    client, "patch", endpoint, json=patch_payload
+                )
                 if r.status_code >= 400:
                     logging.warning(
                         "discord_enriched_patch_failed",

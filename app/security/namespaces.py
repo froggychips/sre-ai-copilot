@@ -26,13 +26,22 @@ WRITE_NAMESPACE_PATTERNS: list[Pattern[str]] = [
 ]
 
 
+def _normalize(ns: str) -> str:
+    # kubectl само нормализует namespace через command.split() (обрезает
+    # окружающие пробелы), а k8s namespace-имена всегда lowercase. Значение
+    # вроде "Kube-System" или "kube-system " (хвостовой пробел) обходит точный
+    # `in`-матч, но kubectl вернёт его к "kube-system". Сводим к тому же виду
+    # ДО сравнения, чтобы обход был невозможен. Значения множеств не трогаем.
+    return (ns or "").strip().lower()
+
+
 def is_write_namespace(ns: str) -> bool:
-    return any(p.match(ns) for p in WRITE_NAMESPACE_PATTERNS)
+    return any(p.match(_normalize(ns)) for p in WRITE_NAMESPACE_PATTERNS)
 
 
 def is_forbidden(ns: str) -> bool:
-    return ns in FORBIDDEN_NAMESPACES
+    return _normalize(ns) in FORBIDDEN_NAMESPACES
 
 
 def is_read_only(ns: str) -> bool:
-    return ns in READ_ONLY_NAMESPACES
+    return _normalize(ns) in READ_ONLY_NAMESPACES

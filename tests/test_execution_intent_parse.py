@@ -6,6 +6,9 @@
   - JSON с prose-обёрткой
   - валидационные сбои (FORBIDDEN_NAMESPACES, схема) → None, без exception
 """
+import pytest
+from pydantic import ValidationError
+
 from app.core.execution_dsl import ActionType, ExecutionIntent
 
 
@@ -107,3 +110,66 @@ def test_parse_returns_none_on_invalid_json():
     text = '{"action": "restart_deployment", "resource_name":'  # broken JSON
     intent = ExecutionIntent.from_llm_response(text)
     assert intent is None
+
+
+# ── namespace charset validator (flag-инъекция) ───────────────────────────────
+
+
+def _intent(namespace: str) -> ExecutionIntent:
+    return ExecutionIntent(
+        action=ActionType.RESTART_DEPLOYMENT,
+        resource_type="deployment",
+        resource_name="town-service",
+        namespace=namespace,
+    )
+
+
+def test_namespace_rejects_flag_injection():
+    """`squad-1 -n kube-system` не должен пролезть мимо guard'а через namespace."""
+    with pytest.raises(ValidationError):
+        _intent("squad-1 -n kube-system")
+
+
+@pytest.mark.parametrize(
+    "bad_ns",
+    [
+        "squad-1 -n kube-system",  # пробел + флаг
+        "-nkube-system",           # ведущий '-'
+        "squad 1",                 # пробел
+        "squad;rm",                # спецсимвол
+        "--namespace=kube-system",
+    ],
+)
+def test_namespace_charset_rejects_bad(bad_ns: str):
+    with pytest.raises(ValidationError):
+        _intent(bad_ns)
+
+
+@pytest.mark.parametrize("good_ns", ["squad-1", "default", "preprod-kingdom1", "squad-gd"])
+def test_namespace_charset_accepts_valid(good_ns: str):
+    assert _intent(good_ns).namespace == good_ns
+
+
+def test_namespace_default_still_valid():
+    """Дефолт "default" обязан проходить charset-валидацию."""
+    intent = ExecutionIntent(
+        action=ActionType.GET_PODS,
+        resource_type="pod",
+        resource_name="anything",
+    )
+    assert intent.namespace == "default"
+
+
+def test_namespace_forbidden_still_blocked():
+    """FORBIDDEN-контроль сохраняется поверх charset."""
+    with pytest.raises(ValidationError):
+        _intent("kube-system")
+
+
+def test_from_llm_response_rejects_flag_injection_namespace():
+    """Через from_llm_response flag-инъекция в namespace → None (не exception)."""
+    text = (
+        '{"action": "restart_deployment", "resource_type": "deployment", '
+        '"resource_name": "town-service", "namespace": "squad-1 -n kube-system"}'
+    )
+    assert ExecutionIntent.from_llm_response(text) is None

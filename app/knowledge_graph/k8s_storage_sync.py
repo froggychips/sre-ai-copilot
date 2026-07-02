@@ -43,6 +43,7 @@ import subprocess
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple, cast
 
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.config import settings
@@ -319,9 +320,27 @@ def _upsert_volume(
             metadata_json=fields.get("metadata_json"),
             disk_pct=disk_pct,
         )
-        db.add(vol)
-        db.flush()
-        return vol
+        # SAVEPOINT: параллельный beat-tick мог вставить ту же строку между
+        # one_or_none() и flush() → INSERT упрётся в UNIQUE
+        # (uq_kg_storage_volumes_kind_ns_name). begin_nested откатывает только
+        # этот INSERT (не весь tick); затем перечитываем победителя и апдейтим
+        # его как existing. См. k8s_events_sync per-item SAVEPOINT.
+        try:
+            with db.begin_nested():
+                db.add(vol)
+                db.flush()
+            return vol
+        except IntegrityError:
+            vol = (
+                db.query(StorageVolume)
+                .filter_by(
+                    kind=fields["kind"],
+                    namespace=fields["namespace"],
+                    name=fields["name"],
+                )
+                .one()
+            )
+            # проваливаемся в update-путь ниже (last-write-wins).
 
     # Update mutable fields. Не трогаем disk_pct если на этом тике нет
     # данных (None) — чтобы предыдущее значение не стиралось при
@@ -364,7 +383,7 @@ def _upsert_volume_edge(
     )
     now = datetime.utcnow()
     if edge is None:
-        edge = VolumeEdge(
+        new_edge = VolumeEdge(
             src_kind=src_kind, src_id=src_id,
             dst_kind=dst_kind, dst_id=dst_id,
             kind=kind,
@@ -372,16 +391,34 @@ def _upsert_volume_edge(
             extras=extras or None,
             last_seen_at=now,
         )
-        db.add(edge)
-        db.flush()
-    else:
-        edge.last_seen_at = cast(Any, now)
-        if extras:
-            merged = dict(edge.extras or {})
-            merged.update(extras)
-            if merged != (edge.extras or {}):
-                edge.extras = cast(Any, merged)
-        db.flush()
+        # SAVEPOINT: гонка параллельных tick'ов на UNIQUE
+        # (uq_kg_volume_edge_src_dst_kind) — INSERT после чужого INSERT'а
+        # упал бы IntegrityError'ом и убил tick. begin_nested откатывает
+        # только этот INSERT; далее перечитываем победителя и обновляем его
+        # last_seen_at/extras (update-путь ниже). См. _upsert_volume.
+        try:
+            with db.begin_nested():
+                db.add(new_edge)
+                db.flush()
+            return new_edge
+        except IntegrityError:
+            edge = (
+                db.query(VolumeEdge)
+                .filter_by(
+                    src_kind=src_kind, src_id=src_id,
+                    dst_kind=dst_kind, dst_id=dst_id, kind=kind,
+                )
+                .one()
+            )
+            # проваливаемся в update-путь ниже.
+
+    edge.last_seen_at = cast(Any, now)
+    if extras:
+        merged = dict(edge.extras or {})
+        merged.update(extras)
+        if merged != (edge.extras or {}):
+            edge.extras = cast(Any, merged)
+    db.flush()
     return edge
 
 

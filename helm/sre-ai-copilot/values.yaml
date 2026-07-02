@@ -59,8 +59,17 @@ resources:
 env:
   llmBackend: anthropic
   logLevel: info
+
+  # appEnv=production включает fail-closed-валидаторы в app/config.py:
+  # обязательные ALERTMANAGER_WEBHOOK_SECRET / JWT_PUBLIC_KEY / непустой
+  # DATABASE_URL без placeholder + запрет SAFE_MODE=false в prod. Это
+  # намеренное поведение — чарт предназначен для кластерного деплоя, поэтому
+  # дефолт production. Оператор ОБЯЗАН заполнить secret.yaml до установки,
+  # иначе pod упадёт на старте (fail-closed by design).
+  appEnv: "production"
+
   # Set to "true" to enable safe-mode (disables write k8s actions)
-  safeMode: "false"
+  safeMode: "true"
 
   # Executor track (v0.7.0+). По дефолту оба false — пайплайн чисто advisory.
   # Включать постепенно по ramp-up-плану (см. README → Roadmap → Execution):
