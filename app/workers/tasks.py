@@ -268,6 +268,21 @@ celery_app.conf.beat_schedule = {
 # смысл повторить с экспоненциальным backoff + jitter. НЕ ретраим generic
 # Exception / ValueError / ValidationError — это non-recoverable (битый payload,
 # баг в коде): повторять их 3× бессмысленно и только жжёт LLM-бюджет.
+#
+# Один источник правды: и Celery `autoretry_for`, и решение «писать ли FAILED»
+# в async_process_incident читают ЭТОТ кортеж. isinstance(exc, RETRIABLE_EXC) —
+# ровно тот же тест, которым Celery решает «ретраить ли», поэтому terminal-
+# проверка (см. async_process_incident) не может разъехаться с реальным
+# retry-поведением.
+RETRIABLE_EXC = (
+    ConnectionError,
+    OSError,
+    OperationalError,
+    httpx.TransportError,
+    httpx.TimeoutException,
+)
+
+
 @celery_app.task(
     name="process_incident",
     bind=True,
@@ -278,13 +293,7 @@ celery_app.conf.beat_schedule = {
     # перезапускал бы весь инцидент 3× и пережигал LLM-бюджет (ломая и контракт
     # «timeout→FAILED», и смысл transient-only retry). Сетевые таймауты покрыты
     # httpx.TimeoutException / OSError.
-    autoretry_for=(
-        ConnectionError,
-        OSError,
-        OperationalError,
-        httpx.TransportError,
-        httpx.TimeoutException,
-    ),
+    autoretry_for=RETRIABLE_EXC,
     retry_backoff=True,
     retry_backoff_max=600,
     retry_jitter=True,
@@ -297,10 +306,23 @@ def process_incident_task(self, incident_data: dict):
     # на Python 3.10+ выкидывает DeprecationWarning, а в Python 3.14+
     # без running loop возвращает ошибку. Celery worker — синхронный
     # context, eager-режим (тесты) тоже работает корректно с asyncio.run.
-    return asyncio.run(async_process_incident(incident_data))
+    #
+    # Пробрасываем retry-контекст: FAILED (терминал) пишем только когда Celery
+    # больше НЕ будет ретраить — иначе следующая попытка стартует на FAILED-
+    # строке, валится на невалидном FAILED→INVESTIGATING переходе и жжёт лишний
+    # Analyzer-вызов (см. terminal-логику в async_process_incident).
+    return asyncio.run(
+        async_process_incident(
+            incident_data,
+            retries=self.request.retries,
+            max_retries=self.max_retries,
+        )
+    )
 
 
-async def async_process_incident(incident_data: dict):
+async def async_process_incident(
+    incident_data: dict, retries: int = 0, max_retries: int = 0
+):
     incident_id = incident_data.get("incident_id", "")
     _service = (incident_data.get("labels") or {}).get("service", "")
     _namespace = incident_data.get("namespace", "")
@@ -333,6 +355,21 @@ async def async_process_incident(incident_data: dict):
             pipeline = IncidentPipeline(incident_data, db, record, _root_span)
             await pipeline.run()
         except Exception as e:
+            # FAILED — терминальное состояние. Если писать его ПЕРЕД Celery-
+            # авторетраем, следующая попытка стартует уже на FAILED-строке,
+            # падает на невалидном переходе FAILED→INVESTIGATING и впустую
+            # жжёт Analyzer-вызов, маскируя исходную ошибку. Поэтому фиксируем
+            # провал только когда он терминальный: либо exception non-retriable
+            # (Celery его не ретраит — isinstance-тест тот же, что в
+            # autoretry_for), либо это последняя разрешённая попытка.
+            is_retriable = isinstance(e, RETRIABLE_EXC)
+            is_terminal = (not is_retriable) or (retries >= max_retries)
+            if not is_terminal:
+                # Transient-сбой с оставшимися попытками — НЕ трогаем статус,
+                # чтобы авторетрай возобновил инцидент с его текущего состояния.
+                # Откатываем только незакоммиченный мусор текущей сессии.
+                db.rollback()
+                raise e
             if record is not None:
                 # Пишем post-mortem в analysis ДО перехода в FAILED, чтобы
                 # упавшая строка была self-describing (видна причина без
