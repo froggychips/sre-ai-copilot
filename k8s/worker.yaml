@@ -49,6 +49,13 @@ spec:
         envFrom:
         - secretRef:
             name: sre-ai-secrets
+        env:
+        # ENV=production включает fail-closed-валидаторы в app/config.py
+        # (обязательные секреты + запрет SAFE_MODE=false). Заполни secrets.yaml.
+        - name: ENV
+          value: "production"
+        - name: SAFE_MODE
+          value: "true"
         resources:
           limits:
             cpu: 200m
@@ -123,6 +130,13 @@ spec:
         envFrom:
         - secretRef:
             name: sre-ai-secrets
+        env:
+        # ENV=production включает fail-closed-валидаторы в app/config.py
+        # (обязательные секреты + запрет SAFE_MODE=false). Заполни secrets.yaml.
+        - name: ENV
+          value: "production"
+        - name: SAFE_MODE
+          value: "true"
         resources:
           limits:
             cpu: 100m
