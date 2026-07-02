@@ -160,6 +160,19 @@ class Settings(BaseSettings):
     # уже работает правильно с корректным ns. kill-switch.
     ENRICH_PROBE_NS_RESOLVE_ENABLED: bool = True
 
+    # Kube-resource alert attribution (баг «vm-kube-state-metrics 52% noisemaker»).
+    # У KubeDeployment*/KubeStatefulSet*/KubeDaemonSet*-алертов лейбл `service`
+    # (== job/service метрики-ИСТОЧНИКА kube-state-metrics) равен
+    # `vm-kube-state-metrics`, а не target-workload'у. STORE-путь (kg_alerts) брал
+    # service по приоритету лейбла `service`, из-за чего все gen/replicas-mismatch
+    # схлопывались на фантомный `<ns>/vm-kube-state-metrics`. ENRICHMENT-путь уже
+    # резолвит target правильно (_resolve_target_service_from_labels). При True
+    # STORE-путь приводится к той же логике: если в labels есть
+    # deployment/statefulset/daemonset — берём target workload, иначе (обычные
+    # app-алерты с валидным `service`) сохраняем прежнее поведение. kill-switch:
+    # False → полностью прежнее поведение store-пути.
+    ATTRIBUTION_RESOLVE_KUBE_TARGET_ENABLED: bool = True
+
     # UX polish: если KG не дал ready/desired через metadata_json,
     # делать прямой read_namespaced_stateful_set/deployment (3s timeout).
     # Per-embed lookup — один call на один build (кэш в alert_enrichment).

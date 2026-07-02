@@ -384,6 +384,45 @@ def _resolve_target_service_from_labels(
     return (namespace, None)
 
 
+def resolve_store_service(
+    labels: Dict[str, str],
+    *,
+    legacy_default: Optional[str],
+) -> Optional[str]:
+    """Резолв service-name для STORE-пути (kg_alerts) единообразно с enrichment.
+
+    Баг «vm-kube-state-metrics noisemaker»: у kube-resource-алертов
+    (KubeDeployment*/KubeStatefulSet*/KubeDaemonSet*) лейбл `service` равен
+    job/service метрики-ИСТОЧНИКА kube-state-metrics (`vm-kube-state-metrics`),
+    а не target-workload'у. STORE-путь исторически брал service по приоритету
+    лейбла `service` → все такие алерты схлопывались на один фантомный сервис.
+
+    Правило (совпадает с enrichment-путём, root cause #1):
+        * есть deployment / statefulset / daemonset  →  target workload
+          через `_resolve_target_service_from_labels` (лейбл `service` игнор);
+        * иначе (обычные app-алерты, где `service`-лейбл валиден и нет
+          kube-resource-лейблов)  →  `legacy_default` (прежнее поведение).
+
+    `legacy_default` вычисляет вызывающий по своей прежней fallback-цепочке
+    (в auto_populator это `service→app→deployment`, в webhooks `service→
+    deployment`) — так поведение app-алертов не меняется ни на одном callsite.
+
+    kill-switch `ATTRIBUTION_RESOLVE_KUBE_TARGET_ENABLED=False` → всегда
+    `legacy_default` (полностью прежнее поведение store-пути).
+    """
+    if not settings.ATTRIBUTION_RESOLVE_KUBE_TARGET_ENABLED:
+        return legacy_default
+    if labels and (
+        labels.get("deployment")
+        or labels.get("statefulset")
+        or labels.get("daemonset")
+    ):
+        _, target = _resolve_target_service_from_labels(labels)
+        if target:
+            return target
+    return legacy_default
+
+
 # Blackbox-проба (ProdEndpointDown / PreprodEndpointDown) несёт СТАТИЧЕСКИЙ
 # `namespace`-label (prod-shared), выбранный лишь для AM-роута. Реальный
 # затронутый realm зашит в URL цели пробы (`instance`):

@@ -466,7 +466,8 @@ async def alertmanager_webhook_enrich_and_forward(
     suppressed_inhibited = 0
     if settings.DISCORD_ENRICH_ENABLED and firing_incidents:
         from app.services.alert_dedup import Decision, decide_send
-        from app.services.alert_enrichment import _inhibition_state
+        from app.services.alert_enrichment import (_inhibition_state,
+                                                   resolve_store_service)
 
         # Группировка по (alertname, severity) — несколько ns в одном embed.
         groups: dict[tuple, list] = {}
@@ -492,9 +493,16 @@ async def alertmanager_webhook_enrich_and_forward(
                 # Дедуп решается per первой incident-у группы (один service —
                 # один state-ключ; namespace-агрегацию уже сделал AM group_by).
                 head_inc = incs[0]
-                head_service = (
-                    head_inc.labels.get("service")
-                    or head_inc.labels.get("deployment")
+                # STORE-путь атрибуции: у kube-resource-алертов лейбл `service`
+                # = метрика-источник (vm-kube-state-metrics), не target. Держим
+                # dedup/suppress-ключ на target-workload'е (как в kg_alerts),
+                # иначе gen/replicas-mismatch схлопываются на один KSM-ключ.
+                head_service = resolve_store_service(
+                    head_inc.labels,
+                    legacy_default=(
+                        head_inc.labels.get("service")
+                        or head_inc.labels.get("deployment")
+                    ),
                 )
 
                 # A1: AM inhibit/silence gate. Если AM payload пришёл
@@ -559,6 +567,7 @@ async def alertmanager_webhook_enrich_and_forward(
     # смешанном batch (новый fire + старый resolve) порядок был red → green.
     resolved_posted = 0
     if settings.DISCORD_ENRICH_ENABLED and resolved_criticals:
+        from app.services.alert_enrichment import resolve_store_service
         from app.services.discord_service import DiscordService
 
         notice_service = DiscordService()
@@ -567,7 +576,14 @@ async def alertmanager_webhook_enrich_and_forward(
                 await notice_service.send_resolved_notice(
                     alertname=inc.labels.get("alertname", "unknown"),
                     namespace=inc.namespace,
-                    service=inc.labels.get("service") or inc.labels.get("deployment"),
+                    # Тот же target-резолв, что в firing-notice/kg_alerts —
+                    # иначе зелёный resolve уходит на vm-kube-state-metrics.
+                    service=resolve_store_service(
+                        inc.labels,
+                        legacy_default=(
+                            inc.labels.get("service") or inc.labels.get("deployment")
+                        ),
+                    ),
                     duration_min=_resolved_duration_minutes(inc.starts_at, inc.ends_at),
                 )
                 resolved_posted += 1
