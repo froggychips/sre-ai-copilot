@@ -50,7 +50,18 @@ def populate_from_incident(db: Session, incident: Incident) -> Dict[str, int]:
     stats = {"services_touched": 0, "deploys_added": 0, "alerts_added": 0}
 
     labels = incident.labels or {}
-    service_name = labels.get("service") or labels.get("app") or labels.get("deployment")
+    # STORE-путь синхронизирован с enrichment-путём: у kube-resource-алертов
+    # (KubeDeployment*/StatefulSet*/DaemonSet*) лейбл `service` = метрика-источник
+    # kube-state-metrics (`vm-kube-state-metrics`), не target. resolve_store_service
+    # берёт target workload при наличии deployment/statefulset/daemonset, иначе —
+    # прежнюю fallback-цепочку `service→app→deployment` (app-алерты не трогаем).
+    from app.services.alert_enrichment import resolve_store_service
+    service_name = resolve_store_service(
+        labels,
+        legacy_default=(
+            labels.get("service") or labels.get("app") or labels.get("deployment")
+        ),
+    )
     namespace = incident.namespace
     if not (namespace and service_name):
         # Без identifiable service в графе хранить нечего.
