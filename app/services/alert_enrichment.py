@@ -35,7 +35,7 @@ from app.knowledge_graph.queries import (blast_radius_for,
                                          recent_pod_events_for, upstream_of)
 from app.knowledge_graph.schema import Service, ServiceEdge
 from app.models.incident import Incident
-from app.services.statics_service import (get_latest_statics_version,
+from app.services.statics_service import (observe_statics_version,
                                           statics_env_from_namespace)
 
 log = structlog.get_logger()
@@ -83,11 +83,17 @@ def _detect_statics_bump(namespace: str, fired_at: datetime) -> Dict[str, Any]:
     меняется → deploy-атрибуция видит «деплоя не было» и ложно хватается за
     cross-namespace collateral. Этот сигнал даёт приоритетный вердикт.
 
-    Возвращает `{version, prev_version, env, created_at (iso), minutes_before}`
-    если bump в окне, иначе {}. Пустой dict (→ прежняя collateral-логика) при:
-    выключенном kill-switch, ненастроенном statics-Postgres, немапящемся ns,
-    отсутствии версий или недоступном времени публикации (track_commit_timestamp
-    off). Best-effort: любая ошибка БД не роняет enrichment.
+    Источник времени bump'а — version-delta через Redis (см.
+    statics_service.observe_statics_version): момент, когда копайлот впервые
+    увидел СМЕНУ номера версии env. `observe_...` заодно обновляет снимок
+    (on-demand наблюдение в дополнение к beat'у).
+
+    Возвращает `{version, prev_version, env, first_observed_at (iso),
+    minutes_before}` если bump в окне, иначе {}. Пустой dict (→ прежняя
+    collateral-логика) при: выключенном kill-switch, немапящемся ns,
+    ненастроенном statics-Postgres / Redis, отсутствии «до»-снимка версии
+    (prev_version=None) или bump'е вне окна. Best-effort: ошибки не роняют
+    enrichment.
     """
     if not getattr(settings, "STATICS_RESTART_ATTRIB_ENABLED", True):
         return {}
@@ -95,27 +101,34 @@ def _detect_statics_bump(namespace: str, fired_at: datetime) -> Dict[str, Any]:
     if not env:
         return {}
     try:
-        info = get_latest_statics_version(env)
+        state = observe_statics_version(env)
     except Exception as e:
         log.warning("enrich.statics_bump_lookup_failed", namespace=namespace, error=str(e))
         return {}
-    if not info:
+    if not state:
         return {}
-    created_at = info.get("created_at")
-    if created_at is None:
-        # Без времени публикации окно не оценить → bump не заявляем.
+    prev_version = state.get("prev_version")
+    if prev_version is None:
+        # Нет «до»-снимка версии (первое наблюдение env) → накат не подтверждён.
         return {}
+    first_seen_raw = state.get("first_observed_at")
+    if not first_seen_raw:
+        return {}
+    try:
+        first_seen = datetime.fromisoformat(first_seen_raw)
+    except (ValueError, TypeError):
+        return {}
+    first_seen = first_seen if first_seen.tzinfo else first_seen.replace(tzinfo=timezone.utc)
     fired = fired_at if fired_at.tzinfo else fired_at.replace(tzinfo=timezone.utc)
-    created = created_at if created_at.tzinfo else created_at.replace(tzinfo=timezone.utc)
-    delta_min = (fired - created).total_seconds() / 60.0
+    delta_min = (fired - first_seen).total_seconds() / 60.0
     window = int(getattr(settings, "STATICS_RESTART_WINDOW_MIN", 30))
     if delta_min < -_STATICS_BUMP_SKEW_TOLERANCE_MIN or delta_min > window:
         return {}
     return {
-        "version": info.get("version"),
-        "prev_version": info.get("prev_version"),
+        "version": state.get("version"),
+        "prev_version": prev_version,
         "env": env,
-        "created_at": created.isoformat(),
+        "first_observed_at": first_seen.isoformat(),
         "minutes_before": max(0, int(round(delta_min))),
     }
 

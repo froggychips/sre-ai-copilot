@@ -12,6 +12,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import re
 from datetime import datetime, timezone
@@ -159,20 +160,37 @@ async def check_statics_for_error(error_text: str) -> Optional[str]:
     )
 
 
-# ── Statics version lookup (restart-attribution, инцидент 2026-07-02) ──────
+# ── Statics version delta tracking (restart-attribution, инцидент 2026-07-02) ──
 #
 # В statics-Postgres КАЖДАЯ версия статики — отдельная БД вида `v<N>-<env>`
 # (`v10401-prod`, `v10400-preprod`, `v10432-squad-gd`, …). Отдельной таблицы-
 # реестра версий с timestamp'ом НЕТ: `schema_migrations` внутри версии хранит
-# лишь (version bigint, dirty bool). Поэтому «последняя версия env» = максимум
-# номера среди БД `v%-<env>` в `pg_database`, а время создания версии — best-
-# effort commit-timestamp строки `pg_database` (см. ниже).
+# лишь (version bigint, dirty bool), а времени создания БД в каталоге не достать
+# (`track_commit_timestamp` off, `pg_stat_file` запрещён роли). Поэтому:
+#   1. «последняя версия env» = максимум номера среди БД `v%-<env>` в
+#      `pg_database` (get_latest_statics_version).
+#   2. ВРЕМЯ bump'а получаем version-delta через Redis: копайлот периодически
+#      (beat `kg_statics_versions_sync`) + on-demand (в enrichment) наблюдает
+#      номер версии и хранит `statics:seen:<env> = {version, prev_version,
+#      first_observed_at}`. При СМЕНЕ номера обновляет first_observed_at=now —
+#      это и есть момент наката (с точностью до каденса наблюдения). «Недавний
+#      bump» = first_observed_at в окне до fired_at + известен prev_version.
+# Работает СЕГОДНЯ без правок statics-Postgres. Каденс: без периодического
+# beat'а первый инцидент после наката на «холодном» Redis не даст prev_version
+# (нет «до»-снимка) → тихо дегрейдит в collateral; beat закрывает это окно.
 
 # k8s-namespace → суффикс env в имени version-БД. prod-*/preprod-*/preupdate-*
 # делят одну статику на весь env (не per-kingdom): `prod-kingdom4` и
 # `prod-shared` → 'prod'. squad изолирован: `squad-12-shared` → 'squad-12',
 # `squad-gd-shared` → 'squad-gd'.
 _SQUAD_NS_RE = re.compile(r"^(squad-(?:gd|\d+))\b")
+
+# Redis-ключ version-delta + TTL. TTL с большим запасом над окном наката, чтобы
+# «до»-снимок пережил простой без beat'а; каждое наблюдение продлевает TTL.
+_STATICS_SEEN_KEY = "statics:seen:{env}"
+_STATICS_SEEN_TTL_SECONDS = 7 * 24 * 3600
+
+_redis_client = None
 
 
 def statics_env_from_namespace(namespace: Optional[str]) -> Optional[str]:
@@ -201,16 +219,11 @@ def statics_env_from_namespace(namespace: Optional[str]) -> Optional[str]:
     retry_on=(psycopg2.OperationalError, psycopg2.InterfaceError),
 )
 def _run_latest_statics_version(env: str) -> Optional[Dict]:
-    """Sync: последняя (и предыдущая) версия статики для env + время создания.
+    """Sync: последняя (и предыдущая по номеру) версия статики для env.
 
     env — суффикс имени version-БД ('prod'/'preprod'/'preupdate'/'squad-N'/
-    'squad-gd'). Возвращает `{version, prev_version, created_at, datname, env}`
-    либо None если версий для env нет.
-
-    `created_at` — commit-timestamp строки `pg_database` (= момент CREATE
-    DATABASE = публикация версии). Доступен ТОЛЬКО при включённом на сервере
-    `track_commit_timestamp`; иначе None (фича дегрейдит в no-op, а не падает).
-    Retry только на connection-class ошибках."""
+    'squad-gd'). Возвращает `{version, prev_version, datname, env}` либо None
+    если версий для env нет. Retry только на connection-class ошибках."""
     conn = None
     try:
         conn = psycopg2.connect(database="gd", **_conn_kwargs())
@@ -239,29 +252,10 @@ def _run_latest_statics_version(env: str) -> Optional[Dict]:
         top = rows[0]
         version = int(top["ver"])
         prev_version = int(rows[1]["ver"]) if len(rows) > 1 else None
-        datname = top["datname"]
-
-        created_at: Optional[datetime] = None
-        try:
-            cur.execute(
-                "SELECT pg_xact_commit_timestamp(xmin) AS ts FROM pg_database WHERE datname = %s",
-                (datname,),
-            )
-            ts_row = cur.fetchone()
-            ts = ts_row["ts"] if ts_row else None
-            if ts is not None:
-                created_at = ts if ts.tzinfo else ts.replace(tzinfo=timezone.utc)
-        except Exception as e:
-            # track_commit_timestamp выключен → commit-ts недоступен. НЕ фейлим:
-            # номер версии важнее, время best-effort. Без времени вызывающий
-            # (enrichment) не сможет оценить окно и просто пропустит statics-вердикт.
-            logger.info("statics_service.commit_ts_unavailable: %s", e)
-
         return {
             "version": version,
             "prev_version": prev_version,
-            "created_at": created_at,
-            "datname": datname,
+            "datname": top["datname"],
             "env": env,
         }
     except Exception as e:
@@ -276,10 +270,81 @@ def get_latest_statics_version(env: str) -> Optional[Dict]:
     """Последняя версия статики для env (sync, best-effort).
 
     None если statics-Postgres не сконфигурирован или версий нет.
-    Возвращает dict `{version, prev_version, created_at, datname, env}`.
+    Возвращает dict `{version, prev_version, datname, env}`.
     """
     if not settings.STATICS_HOST or not settings.STATICS_PASSWORD:
         return None
     if not env:
         return None
     return _run_latest_statics_version(env)
+
+
+def _get_redis():
+    """Lazy sync Redis-клиент. None если Redis недоступен (fail-open)."""
+    global _redis_client
+    if _redis_client is None:
+        try:
+            import redis  # локальный импорт — не тянем redis в тестах, где не нужен
+            _redis_client = redis.from_url(settings.REDIS_URL, decode_responses=True)
+        except Exception as e:
+            logger.warning("statics_service.redis_init_failed: %s", e)
+            return None
+    return _redis_client
+
+
+def observe_statics_version(env: str) -> Optional[Dict]:
+    """Наблюдать текущую версию статики env и обновить version-delta в Redis.
+
+    Читает текущий номер версии (statics-Postgres) и сверяет с сохранённым
+    снимком в Redis (`statics:seen:<env>`). При СМЕНЕ номера пишет новый снимок
+    с `first_observed_at=now` и `prev_version`=прежний — это момент наката.
+    При первом наблюдении env `prev_version=None` (нет «до»-снимка → накат ещё
+    не подтверждён). Возвращает актуальный снимок `{version, prev_version,
+    first_observed_at, env}` либо None (statics не настроен / нет версий /
+    Redis недоступен → вызывающий дегрейдит в прежнее поведение).
+
+    Идемпотентно: повторное наблюдение той же версии не двигает
+    first_observed_at (сохраняется момент первого появления версии) — вердикт
+    остаётся стабильным на всю волну рестартов.
+    """
+    latest = get_latest_statics_version(env)
+    if not latest:
+        return None
+    current = latest["version"]
+    client = _get_redis()
+    if client is None:
+        return None
+
+    key = _STATICS_SEEN_KEY.format(env=env)
+    now_iso = datetime.now(timezone.utc).isoformat()
+    try:
+        raw = client.get(key)
+        if raw:
+            try:
+                stored = json.loads(raw)
+            except (json.JSONDecodeError, TypeError):
+                stored = None
+        else:
+            stored = None
+
+        if stored and stored.get("version") == current:
+            # Та же версия — снимок не трогаем (first_observed_at стабилен).
+            return {
+                "version": current,
+                "prev_version": stored.get("prev_version"),
+                "first_observed_at": stored.get("first_observed_at") or now_iso,
+                "env": env,
+            }
+
+        # Смена версии (bump) либо первое наблюдение env.
+        prev_version = stored.get("version") if stored else None
+        snapshot = {
+            "version": current,
+            "prev_version": prev_version,
+            "first_observed_at": now_iso,
+        }
+        client.set(key, json.dumps(snapshot), ex=_STATICS_SEEN_TTL_SECONDS)
+        return {**snapshot, "env": env}
+    except Exception as e:
+        logger.warning("statics_service.observe_failed env=%s: %s", env, e)
+        return None

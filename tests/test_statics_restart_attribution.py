@@ -7,21 +7,30 @@
 меняется → deploy-атрибуция видит «деплоя не было» и ложно хватается за
 cross-namespace collateral соседних ns.
 
-Фикс: перед выдачей collateral-вердикта проверяем недавний bump статики для
-env алерта. Если был в окне — приоритетный вердикт «накат статики → ожидаемый
-self-restart wave», collateral подавлен, @mention снят.
+Фикс: момент наката определяется version-delta через Redis (копайлот
+наблюдает номер версии env — beat + on-demand — и фиксирует first_observed_at
+при смене номера). Перед выдачей collateral-вердикта проверяем недавний bump
+статики для env алерта. Если был в окне — приоритетный вердикт «накат статики
+→ ожидаемый self-restart wave», collateral подавлен, @mention снят.
 """
 import asyncio
+import json
 from datetime import datetime, timedelta, timezone
 from unittest.mock import MagicMock, patch
 
 from app.models.incident import Incident
+from app.services import statics_service
 from app.services.alert_enrichment import (
     EnrichedContext,
     _detect_statics_bump,
     enrich_alert,
 )
-from app.services.statics_service import statics_env_from_namespace
+from app.services.statics_service import (
+    observe_statics_version,
+    statics_env_from_namespace,
+)
+
+_NOW = datetime.now(timezone.utc)
 
 
 def _make_incident(alertname: str, namespace: str) -> Incident:
@@ -59,24 +68,96 @@ def test_env_mapping_infra_ns_is_none():
     assert statics_env_from_namespace(None) is None
 
 
-# ── _detect_statics_bump: окно/фичефлаг/деградация ────────────────────────
+# ── observe_statics_version: version-delta через Redis ────────────────────
 
-_NOW = datetime.now(timezone.utc)
+class _FakeRedis:
+    def __init__(self, initial=None):
+        self.store = dict(initial or {})
+        self.set_calls = []
+
+    def get(self, key):
+        return self.store.get(key)
+
+    def set(self, key, value, ex=None):
+        self.store[key] = value
+        self.set_calls.append((key, value, ex))
 
 
-def _info(created_at, version=10401, prev=10400):
+def _key(env="prod"):
+    return statics_service._STATICS_SEEN_KEY.format(env=env)
+
+
+@patch("app.services.statics_service.get_latest_statics_version")
+def test_observe_first_sighting_prev_none(mock_latest):
+    mock_latest.return_value = {"version": 10400, "prev_version": 10399, "env": "prod"}
+    fake = _FakeRedis()
+    with patch("app.services.statics_service._get_redis", return_value=fake):
+        state = observe_statics_version("prod")
+    # Первое наблюдение env: prev_version None (нет «до»-снимка → не bump).
+    assert state["version"] == 10400
+    assert state["prev_version"] is None
+    assert state["first_observed_at"]
+    # Снимок записан в Redis.
+    assert json.loads(fake.store[_key()])["version"] == 10400
+
+
+@patch("app.services.statics_service.get_latest_statics_version")
+def test_observe_version_change_records_prev_and_now(mock_latest):
+    mock_latest.return_value = {"version": 10401, "prev_version": 10400, "env": "prod"}
+    old_iso = (_NOW - timedelta(hours=3)).isoformat()
+    fake = _FakeRedis({
+        _key(): json.dumps({"version": 10400, "prev_version": None, "first_observed_at": old_iso})
+    })
+    with patch("app.services.statics_service._get_redis", return_value=fake):
+        state = observe_statics_version("prod")
+    # Смена версии: prev = прежний наблюдённый, first_observed_at ~ сейчас.
+    assert state["version"] == 10401
+    assert state["prev_version"] == 10400
+    fo = datetime.fromisoformat(state["first_observed_at"])
+    assert abs((datetime.now(timezone.utc) - fo).total_seconds()) < 60
+
+
+@patch("app.services.statics_service.get_latest_statics_version")
+def test_observe_same_version_keeps_first_observed_at(mock_latest):
+    mock_latest.return_value = {"version": 10401, "prev_version": 10400, "env": "prod"}
+    t = (_NOW - timedelta(minutes=8)).isoformat()
+    fake = _FakeRedis({
+        _key(): json.dumps({"version": 10401, "prev_version": 10400, "first_observed_at": t})
+    })
+    with patch("app.services.statics_service._get_redis", return_value=fake):
+        state = observe_statics_version("prod")
+    # Та же версия — момент первого появления НЕ двигается (вердикт стабилен).
+    assert state["first_observed_at"] == t
+    assert state["prev_version"] == 10400
+    assert fake.set_calls == []  # снимок не переписывался
+
+
+@patch("app.services.statics_service.get_latest_statics_version", return_value=None)
+def test_observe_no_statics_config(mock_latest):
+    assert observe_statics_version("prod") is None
+
+
+@patch("app.services.statics_service.get_latest_statics_version")
+def test_observe_redis_down_returns_none(mock_latest):
+    mock_latest.return_value = {"version": 10401, "prev_version": 10400, "env": "prod"}
+    with patch("app.services.statics_service._get_redis", return_value=None):
+        assert observe_statics_version("prod") is None
+
+
+# ── _detect_statics_bump: окно / prev_version / фичефлаг ──────────────────
+
+def _state(minutes_ago, version=10401, prev=10400):
     return {
         "version": version,
         "prev_version": prev,
-        "created_at": created_at,
-        "datname": f"v{version}-prod",
+        "first_observed_at": (_NOW - timedelta(minutes=minutes_ago)).isoformat(),
         "env": "prod",
     }
 
 
-@patch("app.services.alert_enrichment.get_latest_statics_version")
-def test_recent_bump_within_window_detected(mock_latest):
-    mock_latest.return_value = _info(_NOW - timedelta(minutes=10))
+@patch("app.services.alert_enrichment.observe_statics_version")
+def test_recent_bump_within_window_detected(mock_obs):
+    mock_obs.return_value = _state(10)
     bump = _detect_statics_bump("prod-shared", _NOW)
     assert bump
     assert bump["version"] == 10401
@@ -85,49 +166,42 @@ def test_recent_bump_within_window_detected(mock_latest):
     assert bump["minutes_before"] == 10
 
 
-@patch("app.services.alert_enrichment.get_latest_statics_version")
-def test_old_bump_outside_window_ignored(mock_latest):
-    mock_latest.return_value = _info(_NOW - timedelta(minutes=90))
+@patch("app.services.alert_enrichment.observe_statics_version")
+def test_old_bump_outside_window_ignored(mock_obs):
+    mock_obs.return_value = _state(90)
     assert _detect_statics_bump("prod-shared", _NOW) == {}
 
 
-@patch("app.services.alert_enrichment.get_latest_statics_version")
-def test_future_bump_beyond_skew_ignored(mock_latest):
-    # Версия «создана» сильно ПОЗЖЕ алерта — не может быть причиной.
-    mock_latest.return_value = _info(_NOW + timedelta(minutes=15))
+@patch("app.services.alert_enrichment.observe_statics_version")
+def test_first_sighting_no_prev_ignored(mock_obs):
+    # prev_version None (первое наблюдение env, нет «до»-снимка) → не bump.
+    mock_obs.return_value = {**_state(2), "prev_version": None}
     assert _detect_statics_bump("prod-shared", _NOW) == {}
 
 
-@patch("app.services.alert_enrichment.get_latest_statics_version")
-def test_no_commit_timestamp_degrades_to_empty(mock_latest):
-    # track_commit_timestamp off → created_at=None → окно не оценить → {}.
-    mock_latest.return_value = _info(None)
-    assert _detect_statics_bump("prod-shared", _NOW) == {}
-
-
-@patch("app.services.alert_enrichment.get_latest_statics_version")
-def test_killswitch_off_skips_lookup(mock_latest):
+@patch("app.services.alert_enrichment.observe_statics_version")
+def test_killswitch_off_skips_lookup(mock_obs):
     with patch(
         "app.services.alert_enrichment.settings.STATICS_RESTART_ATTRIB_ENABLED",
         False,
     ):
         assert _detect_statics_bump("prod-shared", _NOW) == {}
-    mock_latest.assert_not_called()
+    mock_obs.assert_not_called()
 
 
-@patch("app.services.alert_enrichment.get_latest_statics_version")
-def test_unmapped_namespace_skips_lookup(mock_latest):
+@patch("app.services.alert_enrichment.observe_statics_version")
+def test_unmapped_namespace_skips_lookup(mock_obs):
     assert _detect_statics_bump("monitoring", _NOW) == {}
-    mock_latest.assert_not_called()
+    mock_obs.assert_not_called()
 
 
 # ── enrich_alert: ctx.statics_bump заполняется в ns-fallback ветке ─────────
 
 @patch("app.services.alert_enrichment.cluster_deploy_activity", return_value={})
 @patch("app.services.alert_enrichment.recent_deploys_for_namespaces", return_value=[])
-@patch("app.services.alert_enrichment.get_latest_statics_version")
-def test_enrich_populates_statics_bump(mock_latest, _mock_ns, _mock_cluster):
-    mock_latest.return_value = _info(_NOW - timedelta(minutes=8))
+@patch("app.services.alert_enrichment.observe_statics_version")
+def test_enrich_populates_statics_bump(mock_obs, _mock_ns, _mock_cluster):
+    mock_obs.return_value = _state(8)
     inc = _make_incident("ProdRestartsSpike", "prod-shared")
     ctx = enrich_alert(MagicMock(), inc)
     assert ctx.deploy_scope == "namespace"
@@ -138,8 +212,8 @@ def test_enrich_populates_statics_bump(mock_latest, _mock_ns, _mock_cluster):
 
 @patch("app.services.alert_enrichment.cluster_deploy_activity", return_value={})
 @patch("app.services.alert_enrichment.recent_deploys_for_namespaces", return_value=[])
-@patch("app.services.alert_enrichment.get_latest_statics_version", return_value=None)
-def test_enrich_no_bump_leaves_empty(_mock_latest, _mock_ns, _mock_cluster):
+@patch("app.services.alert_enrichment.observe_statics_version", return_value=None)
+def test_enrich_no_bump_leaves_empty(_mock_obs, _mock_ns, _mock_cluster):
     inc = _make_incident("ProdRestartsSpike", "prod-shared")
     ctx = enrich_alert(MagicMock(), inc)
     assert ctx.statics_bump == {}
@@ -162,6 +236,11 @@ _CLUSTER_ACT = {
             "triggered_by": "ybobryashov", "minutes_before_incident": 7,
         },
     ],
+}
+
+_BUMP = {
+    "version": 10401, "prev_version": 10400, "env": "prod",
+    "first_observed_at": (_NOW - timedelta(minutes=8)).isoformat(), "minutes_before": 8,
 }
 
 
@@ -197,12 +276,6 @@ def _build_payload(contexts):
 def _dep_field(payload):
     fields = {f["name"]: f["value"] for f in payload["embeds"][0].get("fields", [])}
     return next((v for k, v in fields.items() if k.startswith("Deploy-связь")), None)
-
-
-_BUMP = {
-    "version": 10401, "prev_version": 10400, "env": "prod",
-    "created_at": (_NOW - timedelta(minutes=8)).isoformat(), "minutes_before": 8,
-}
 
 
 def test_statics_verdict_replaces_collateral():

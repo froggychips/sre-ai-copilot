@@ -553,10 +553,18 @@ class Settings(BaseSettings):
     # cross-namespace collateral соседних ns. Перед выдачей collateral-вердикта
     # проверяем: не было ли недавнего bump'а статики для env алерта. Если был —
     # вердикт «накат статики → ожидаемый self-restart wave», collateral подавлен.
-    # kill-switch. Источник версии — statics-Postgres (см. statics_service).
+    # kill-switch. Момент bump'а — version-delta через Redis (копайлот наблюдает
+    # номер версии env из statics-Postgres: beat + on-demand — и фиксирует
+    # first_observed_at при смене номера). Работает без правок statics-Postgres.
+    # См. statics_service.observe_statics_version.
     STATICS_RESTART_ATTRIB_ENABLED: bool = Field(True, description="Attribute prod restart/critical waves to a recent statics bump instead of cross-ns collateral")
     # Bump статики в пределах этого окна (мин) ДО fired_at алерта ⇒ statics-вердикт.
     STATICS_RESTART_WINDOW_MIN: int = Field(30, description="Statics bump within this many minutes before the alert ⇒ statics verdict")
+    # Env'ы, номер версии которых beat `kg_statics_versions_sync` наблюдает
+    # каждые ~5 мин (CSV) — держим «до»-снимок в Redis, чтобы первый инцидент
+    # после наката уже видел prev_version. Дефолт — группа «нового кластера»,
+    # где и возникает ложный collateral.
+    STATICS_TRACK_ENVS: str = Field("prod,preprod,preupdate,squad-gd", description="Statics envs whose version the beat observes for delta tracking (CSV)")
 
     # Executor stage (PR #2 executor track). Если False — стадия пропускается,
     # пайплайн остаётся чисто advisory. Включать осознанно после merge PR #2
