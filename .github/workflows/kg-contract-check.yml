@@ -34,6 +34,12 @@ jobs:
     continue-on-error: true
     env:
       DATABASE_URL: ${{ secrets.KG_READER_DATABASE_URL }}
+      # quality_report --check грузит app.config.Settings, а тот требует
+      # ANTHROPIC_API_KEY при LLM_BACKEND=anthropic (дефолт) → падал на
+      # инстанцировании ДО KG-проверки. Здесь LLM не вызывается вовсе
+      # (чистый data-quality-скан), поэтому claude_cli снимает требование
+      # ключа и не тянет реальный бэкенд.
+      LLM_BACKEND: claude_cli
       KG_CHECK_MAX_ORPHAN_PCT: "20"
       KG_CHECK_MIN_OWNER_PCT: "50"
       KG_CHECK_MAX_STALE_NULL_PCT: "10"
@@ -53,6 +59,13 @@ jobs:
       - name: Run quality_report --check (markdown)
         id: check
         run: |
+          # Секрет KG_READER_DATABASE_URL ещё не провижнен → нет источника
+          # данных для drift-скана. Чисто скипаем (а не падаем на connect),
+          # пока reader-роль не заведена. Убрать guard после установки секрета.
+          if [ -z "$DATABASE_URL" ]; then
+            echo "::warning::KG_READER_DATABASE_URL not set — skipping KG drift check"
+            exit 0
+          fi
           .venv/bin/python -m app.scripts.quality_report --check \
             --output kg-check.md \
           || echo "CHECK_FAILED=true" >> $GITHUB_ENV
@@ -60,6 +73,10 @@ jobs:
 
       - name: Run quality_report --check (json для programmatic anti-drift)
         run: |
+          if [ -z "$DATABASE_URL" ]; then
+            echo "KG_READER_DATABASE_URL not set — skipping json check"
+            exit 0
+          fi
           .venv/bin/python -m app.scripts.quality_report --check --json \
             --output kg-check.json \
           || true
