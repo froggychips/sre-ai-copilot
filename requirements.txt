@@ -22,7 +22,7 @@ cryptography==49.0.0
 distro==1.9.0
 docstring-parser==0.18.0
 durationpy==0.10
-fastapi==0.138.1
+fastapi==0.139.0
 frozenlist==1.8.0
 googleapis-common-protos==1.75.0
 greenlet==3.5.0
