@@ -138,11 +138,20 @@ def tc_get(path):
 
 
 def fetch_oneservice():
-    """Оконный скан OneService -> {squad: {last_build, last_deployer}}."""
+    """Оконный скан OneService -> {squad: {last_build, last_deployer}}.
+
+    TC недоступен / 401 / таймаут — НЕ роняем весь дашборд: возвращаем {},
+    колонка «Последняя сборка» покажет idle, а живость доски (владелец/задача из
+    ns-лейблов, KG-здоровье, CH-активность) от TC-токена больше не зависит.
+    """
     path = (f"/app/rest/builds?locator=buildType:{ONE},count:{WINDOW},branch:default:any"
             f"&fields=build(number,status,startDate,triggered(user(username)),"
             f"resultingProperties(property(name,value)))")
-    builds = tc_get(path).get("build", [])
+    try:
+        builds = tc_get(path).get("build", [])
+    except requests.RequestException as e:
+        log(f"  oneservice: TC недоступен ({e}) → колонка сборки idle, дашборд продолжаем")
+        return {}
     per = {}
     for b in builds:
         props = {p["name"]: p.get("value") for p in
