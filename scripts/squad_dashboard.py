@@ -35,7 +35,20 @@ CH_PORT = os.environ.get("CH_PORT", "8123")
 CH_DB = os.environ.get("CH_DB", "WOAnalytics")
 CH_HOST_TEMPLATE = os.environ.get("CH_HOST_TEMPLATE",
                                   "clickhouse.{squad}-shared.svc.cluster.local")
-SQUAD_NUMS = [int(x) for x in SQUADS.split()] if SQUADS else list(range(1, 40))
+SQUAD_NUMS = [int(x) for x in SQUADS.split()] if SQUADS else list(range(1, 54))
+
+# Резервирование новых дедик-нод под разработчиков (WO-12485): squad -> TC-логин.
+# Зеркало services/squad-mapping.yaml (wo-k8s) — держать в синхроне вручную.
+# Показывается в колонке «Reserved for»; сами сквады создаются позже (InstallSquadEnv).
+RESERVED = {
+    "squad-40": "kemyashev",   "squad-41": "kemyashev",
+    "squad-42": "elebedev",    "squad-43": "elebedev",
+    "squad-44": "apleshkov",   "squad-45": "apleshkov",
+    "squad-46": "dgrin",       "squad-47": "dgrin",
+    "squad-48": "ddosta",      "squad-49": "ddosta",
+    "squad-50": "ncherkashin", "squad-51": "ncherkashin",
+    "squad-52": "kkuzmin",     "squad-53": "kkuzmin",
+}
 DRY_RUN = os.environ.get("DRY_RUN", "") not in ("", "0", "false", "False")
 
 TC_URL = os.environ["TC_URL"].rstrip("/")
@@ -234,6 +247,7 @@ def build_rows():
             ev24h=k.get("ev24h"), bo7=k.get("backoff7d"), ev7=k.get("evict7d"),
             un7=k.get("unhlth7d"), al=k.get("alerts"),
             owner=owner, task=lbl.get("task"), branch=lbl.get("branch"),
+            reserved=RESERVED.get(s),
             lb=lb, inst=inst, act=act))
     return rows
 
@@ -471,7 +485,7 @@ def render(rows, gen_date, jira_statuses=None, today=None):
     today = today or datetime.datetime.utcnow()
     # (заголовок, ширина px). Цифровые колонки — узкие, текстовые — широкие.
     cols = [
-        ("Статус", 78), ("Squad", 78), ("Занявший", 100), ("Задача", 110),
+        ("Статус", 78), ("Squad", 78), ("Занявший", 100), ("Reserved for", 96), ("Задача", 110),
         ("Ветка", 140), ("Активность", 110), ("Последняя сборка (OneService)", 240),
         ("Установка / Rebuild", 165), ("Возраст, дн", 68), ("NS", 45),
         ("Svc", 50), ("Health", 62), ("Краши 7д", 145), ("Ev 24ч", 60),
@@ -488,6 +502,7 @@ def render(rows, gen_date, jira_statuses=None, today=None):
         status = loz(status_txt, status_col)
         task = f'<a href="{jira}{esc(r["task"])}">{esc(r["task"])}</a>' if r["task"] else ""
         owner = esc(r["owner"]) if r["owner"] else loz("нет лейбла")
+        reserved = loz(esc(r["reserved"]), "Blue") if r.get("reserved") else ""
         age = esc(r["age"]) if r["age"] is not None else loz("нет в KG")
         alerts = loz(str(r["al"]), "Red") if r["al"] else (esc(r["al"]) if r["al"] is not None else "")
         ev24 = (loz(str(r["ev24h"]), "Yellow") if (r["ev24h"] and r["ev24h"] > 20)
@@ -496,7 +511,7 @@ def render(rows, gen_date, jira_statuses=None, today=None):
             "<tr>"
             + td(status)
             + td_hl(f'<strong>{esc(r["squad"])}</strong>', sq_bg)
-            + td(owner) + td(task) + td(esc(r["branch"]))
+            + td(owner) + td(reserved) + td(task) + td(esc(r["branch"]))
             + td(activity_cell(r.get("act"), today))
             + td(build_cell(r["lb"])) + td(inst_cell(r["inst"])) + td(str(age))
             + td(esc(r["ns"]) if r["ns"] is not None else "")
@@ -526,6 +541,9 @@ def render(rows, gen_date, jira_statuses=None, today=None):
         f'(Нет данных о деплое/активности — «не знаю», оставляем «занят».) '
         f'Ячейка <strong>Squad</strong> подсвечена тем же цветом.</li>'
         f'<li><strong>Занявший</strong> — кто задеплоил (лейбл namespace <code>deployed-by</code> = TC-логин).</li>'
+        f'<li><strong>Reserved for</strong> — за кем закреплён сквад на выделенной 128GB-ноде (WO-12485). '
+        f'Резерв (squad→разработчик) — из карты в генераторе, зеркало <code>services/squad-mapping.yaml</code> (wo-k8s). '
+        f'Пусто = сквад не зарезервирован под дедик-ноду. Для squad-40..53 сквад может ещё не быть создан.</li>'
         f'<li><strong>Задача</strong> — WO-тикет из ветки деплоя; пусто при preprod/default.</li>'
         f'<li><strong>Ветка</strong> — <code>deployed-branch</code> из лейбла namespace.</li>'
         f'<li><strong>Активность</strong> — живые игровые логины из ClickHouse сквада '
