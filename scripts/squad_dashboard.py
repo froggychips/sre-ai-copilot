@@ -35,7 +35,7 @@ CH_PORT = os.environ.get("CH_PORT", "8123")
 CH_DB = os.environ.get("CH_DB", "WOAnalytics")
 CH_HOST_TEMPLATE = os.environ.get("CH_HOST_TEMPLATE",
                                   "clickhouse.{squad}-shared.svc.cluster.local")
-SQUAD_NUMS = [int(x) for x in SQUADS.split()] if SQUADS else list(range(1, 54))
+SQUAD_NUMS = [int(x) for x in SQUADS.split()] if SQUADS else list(range(1, 60))
 
 # Резервирование новых дедик-нод под разработчиков (WO-12485): squad -> TC-логин.
 # Зеркало services/squad-mapping.yaml (wo-k8s) — держать в синхроне вручную.
@@ -48,6 +48,9 @@ RESERVED = {
     "squad-48": "foxtrot",      "squad-49": "foxtrot",
     "squad-50": "oscar", "squad-51": "oscar",
     "squad-52": "mike",     "squad-53": "mike",
+    "squad-54": "india",      "squad-55": "india",
+    "squad-56": "quebec",   "squad-57": "quebec",
+    "squad-58": "sierra",    "squad-59": "sierra",
 }
 DRY_RUN = os.environ.get("DRY_RUN", "") not in ("", "0", "false", "False")
 
