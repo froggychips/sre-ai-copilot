@@ -35,22 +35,23 @@ CH_PORT = os.environ.get("CH_PORT", "8123")
 CH_DB = os.environ.get("CH_DB", "WOAnalytics")
 CH_HOST_TEMPLATE = os.environ.get("CH_HOST_TEMPLATE",
                                   "clickhouse.{squad}-shared.svc.cluster.local")
-SQUAD_NUMS = [int(x) for x in SQUADS.split()] if SQUADS else list(range(1, 60))
+SQUAD_NUMS = [int(x) for x in SQUADS.split()] if SQUADS else list(range(1, 62))
 
-# Резервирование новых дедик-нод под разработчиков (WO-12485): squad -> TC-логин.
+# Резервирование новых дедик-нод под разработчиков (WO-12485): squad -> «TC-логин · нода».
 # Зеркало services/squad-mapping.yaml (wo-k8s) — держать в синхроне вручную.
 # Показывается в колонке «Reserved for»; сами сквады создаются позже (InstallSquadEnv).
 RESERVED = {
-    "squad-40": "lima",   "squad-41": "lima",
-    "squad-42": "juliet",    "squad-43": "juliet",
-    "squad-44": "bravo",   "squad-45": "bravo",
-    "squad-46": "golf",       "squad-47": "golf",
-    "squad-48": "foxtrot",      "squad-49": "foxtrot",
-    "squad-50": "oscar", "squad-51": "oscar",
-    "squad-52": "mike",     "squad-53": "mike",
-    "squad-54": "india",      "squad-55": "india",
-    "squad-56": "quebec",   "squad-57": "quebec",
-    "squad-58": "sierra",    "squad-59": "sierra",
+    "squad-40": "lima · dev-28",   "squad-41": "lima · dev-28",
+    "squad-42": "juliet · dev-29",    "squad-43": "juliet · dev-29",
+    "squad-44": "bravo · dev-30",   "squad-45": "bravo · dev-30",
+    "squad-46": "golf · dev-31",       "squad-47": "golf · dev-31",
+    "squad-48": "foxtrot · dev-32",      "squad-49": "foxtrot · dev-32",
+    "squad-50": "oscar · dev-33", "squad-51": "oscar · dev-33",
+    "squad-52": "mike · dev-34",     "squad-53": "mike · dev-34",
+    "squad-54": "india · dev-35",      "squad-55": "india · dev-35",
+    "squad-56": "quebec · dev-36",   "squad-57": "quebec · dev-36",
+    "squad-58": "sierra · dev-37",    "squad-59": "sierra · dev-37",
+    "squad-60": "zulu · dev-38",   "squad-61": "zulu · dev-38",
 }
 DRY_RUN = os.environ.get("DRY_RUN", "") not in ("", "0", "false", "False")
 
@@ -544,9 +545,10 @@ def render(rows, gen_date, jira_statuses=None, today=None):
         f'(Нет данных о деплое/активности — «не знаю», оставляем «занят».) '
         f'Ячейка <strong>Squad</strong> подсвечена тем же цветом.</li>'
         f'<li><strong>Занявший</strong> — кто задеплоил (лейбл namespace <code>deployed-by</code> = TC-логин).</li>'
-        f'<li><strong>Reserved for</strong> — за кем закреплён сквад на выделенной 128GB-ноде (WO-12485). '
-        f'Резерв (squad→разработчик) — из карты в генераторе, зеркало <code>services/squad-mapping.yaml</code> (wo-k8s). '
-        f'Пусто = сквад не зарезервирован под дедик-ноду. Для squad-40..53 сквад может ещё не быть создан.</li>'
+        f'<li><strong>Reserved for</strong> — за кем закреплён сквад и на какой выделенной 128GB-ноде (WO-12485), '
+        f'формат «логин · нода»; по 2 сквада на разработчика, оба на одной ноде (co-location из-за local-path PVC). '
+        f'Резерв (squad→разработчик→нода) — из карты в генераторе, зеркало <code>services/squad-mapping.yaml</code> (wo-k8s). '
+        f'Пусто = сквад не зарезервирован под дедик-ноду. Для squad-40..53 и squad-60..61 сквад может ещё не быть создан.</li>'
         f'<li><strong>Задача</strong> — WO-тикет из ветки деплоя; пусто при preprod/default.</li>'
         f'<li><strong>Ветка</strong> — <code>deployed-branch</code> из лейбла namespace.</li>'
         f'<li><strong>Активность</strong> — живые игровые логины из ClickHouse сквада '
