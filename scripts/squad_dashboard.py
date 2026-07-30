@@ -35,7 +35,7 @@ CH_PORT = os.environ.get("CH_PORT", "8123")
 CH_DB = os.environ.get("CH_DB", "WOAnalytics")
 CH_HOST_TEMPLATE = os.environ.get("CH_HOST_TEMPLATE",
                                   "clickhouse.{squad}-shared.svc.cluster.local")
-SQUAD_NUMS = [int(x) for x in SQUADS.split()] if SQUADS else list(range(1, 62))
+SQUAD_NUMS = [int(x) for x in SQUADS.split()] if SQUADS else list(range(1, 70))
 
 # Резервирование новых дедик-нод под разработчиков (WO-12485): squad -> «TC-логин · нода».
 # Зеркало services/squad-mapping.yaml (wo-k8s) — держать в синхроне вручную.
@@ -52,6 +52,10 @@ RESERVED = {
     "squad-56": "schabanov · dev-36",   "squad-57": "schabanov · dev-36",
     "squad-58": "tkolosov · dev-37",    "squad-59": "tkolosov · dev-37",
     "squad-60": "askuratov · dev-38",   "squad-61": "askuratov · dev-38",
+    "squad-62": "aoganisyan · dev-39",  "squad-63": "aoganisyan · dev-39",
+    "squad-64": "vdudnik · dev-40",     "squad-65": "vdudnik · dev-40",
+    "squad-66": "vivanov · dev-41",     "squad-67": "vivanov · dev-41",
+    "squad-68": "igoncharov · dev-42",  "squad-69": "igoncharov · dev-42",
 }
 DRY_RUN = os.environ.get("DRY_RUN", "") not in ("", "0", "false", "False")
 
@@ -548,7 +552,7 @@ def render(rows, gen_date, jira_statuses=None, today=None):
         f'<li><strong>Reserved for</strong> — за кем закреплён сквад и на какой выделенной 128GB-ноде (WO-12485), '
         f'формат «логин · нода»; по 2 сквада на разработчика, оба на одной ноде (co-location из-за local-path PVC). '
         f'Резерв (squad→разработчик→нода) — из карты в генераторе, зеркало <code>services/squad-mapping.yaml</code> (wo-k8s). '
-        f'Пусто = сквад не зарезервирован под дедик-ноду. Для squad-40..53 и squad-60..61 сквад может ещё не быть создан.</li>'
+        f'Пусто = сквад не зарезервирован под дедик-ноду. Для squad-40..53 и squad-60..69 сквад может ещё не быть создан.</li>'
         f'<li><strong>Задача</strong> — WO-тикет из ветки деплоя; пусто при preprod/default.</li>'
         f'<li><strong>Ветка</strong> — <code>deployed-branch</code> из лейбла namespace.</li>'
         f'<li><strong>Активность</strong> — живые игровые логины из ClickHouse сквада '
