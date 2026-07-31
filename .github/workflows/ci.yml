@@ -26,15 +26,35 @@ jobs:
       - name: Show Python version
         run: /opt/homebrew/bin/python3.12 --version
 
+      # Версии инструментов запинены. Без пинов они ставились «последние», а
+      # стабильность держалась случайно: .venv переиспользуется между прогонами
+      # (clean: false), pip видел «Requirement already satisfied» и не обновлял.
+      # 2026-07-31 venv пересоздался, приехала ruff 0.16.1 с расширенными
+      # дефолтами — 0 → 2659 ошибок на неизменившемся коде, CI встал колом.
+      # Версии ниже — ровно те, что отработали на последнем зелёном прогоне
+      # (28643628696, 2026-07-03). Обновлять осознанно, отдельным PR.
+      # NB: пины здесь dependabot не отслеживает (это не requirements-файл) —
+      # при переезде на requirements-dev.txt он начнёт слать PR-ы на них.
       - name: Create venv and install dependencies
         run: |
           /opt/homebrew/bin/python3.12 -m venv .venv
           .venv/bin/pip install --upgrade pip
-          .venv/bin/pip install ruff mypy pytest pytest-cov pytest-asyncio pytest-mock bandit pip-audit
+          .venv/bin/pip install \
+            ruff==0.15.20 \
+            mypy==2.1.0 \
+            pytest==9.1.1 \
+            pytest-cov==7.1.0 \
+            pytest-asyncio==1.4.0 \
+            pytest-mock==3.15.1 \
+            bandit==1.9.4 \
+            pip-audit==2.10.1
           if [ -f requirements.txt ]; then .venv/bin/pip install -r requirements.txt; fi
 
       # Ruff — blocking. Долг расчищен (2026-05-13).
       # Любая новая ruff-ошибка должна быть исправлена в PR, не накапливаться.
+      # Набор правил задан явно в ruff.toml (2026-07-31) — раньше конфига не
+      # было и объём проверки менялся сам, от релиза ruff. Расширять select
+      # там же, отдельным PR.
       - name: Run Ruff (Linting)
         run: .venv/bin/ruff check .
 
