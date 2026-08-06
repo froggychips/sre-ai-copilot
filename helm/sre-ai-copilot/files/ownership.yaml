@@ -183,6 +183,12 @@
 - ns_pattern: "default"
   owner: "@platform"
   reason: "kube default (kubernetes API service) — platform/system"
+- ns_pattern: "kube-system"
+  owner: "@platform"
+  reason: "control-plane аддоны (coredns/kube-proxy/calico/metrics-server) — platform"
+- ns_pattern: "metallb-system"
+  owner: "@platform"
+  reason: "MetalLB speaker/controller (L2-анонс VIP) — platform/network"
 
 # AI / ML / data-science стек → @data
 - ns_pattern: "ai-platform"

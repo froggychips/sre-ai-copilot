@@ -128,11 +128,32 @@ def _get_ns_to_team_map(db: Session) -> Dict[str, str]:
     Один namespace может иметь несколько team_owner-ов (synthetic NATS-узлы
     помечаются `platform`, реальные сервисы — `kingdom1`/`shared`/etc.).
     Группируем `MIN()` с фильтром: предпочитаем не-`platform`.
+
+    Fallback на `platform` (06.08.2026). Раньше условие
+    `team_owner != 'platform'` стояло в WHERE, поэтому namespace, у которого
+    ВСЕ сервисы принадлежат platform, выпадал из карты целиком и навсегда
+    оседал в секции «🔎 Unowned namespaces — нужны owner». На снимке это
+    10 namespace-ов, из них с горящими сериями `kube-system` (12 svc),
+    `sre-ai` (4), `metallb-system` (1).
+
+    Заполнением `config/ownership.yaml` это не лечилось в принципе: у
+    `sre-ai` правило `@platform` там лежит с самого начала, а namespace всё
+    равно числился unowned — фильтр выкидывал его до того, как манифест
+    вообще спрашивали. Ownership-манифест влияет на per-service inference
+    (и на @mention в роутинге алертов), но не на эту карту.
+
+    Теперь `!= 'platform'` переехало из WHERE в FILTER: приоритет
+    business-team сохранён (он выигрывает всегда, когда есть), а
+    platform-only namespace получает честного владельца вместо «нет owner».
     """
     rows = db.execute(text("""
-        SELECT namespace, MIN(team_owner) AS team
+        SELECT namespace,
+               COALESCE(
+                   MIN(team_owner) FILTER (WHERE team_owner != 'platform'),
+                   MIN(team_owner)
+               ) AS team
         FROM kg_services
-        WHERE team_owner IS NOT NULL AND team_owner != 'platform'
+        WHERE team_owner IS NOT NULL
         GROUP BY namespace
     """)).fetchall()
     return {ns: team for ns, team in rows}
