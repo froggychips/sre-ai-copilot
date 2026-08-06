@@ -1,4 +1,4 @@
 {
-  "alerts_section": "**🚨 Firing alerts by squad** (последние 5 минут)\n  `@kingdom1` 3 series, `@shared` 2 series, `@kingdom2` 1 series",
+  "alerts_section": "**🚨 Firing alerts by squad** (последние 5 минут)\n  `@kingdom1` 3 series, `@shared` 2 series, `@kingdom2` 1 series\n  Хуже всего (namespace): `prod-kingdom1` 3, `monitoring` 3, `prod-shared` 2",
   "unowned_section": "**🔎 Unowned namespaces** — нужны owner\n  • `monitoring` — 3 series · suggest: `@platform`\n  • `ingress-nginx` — 1 series · suggest: `@platform`"
 }

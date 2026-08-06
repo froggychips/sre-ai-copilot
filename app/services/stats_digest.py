@@ -339,6 +339,40 @@ def _fmt_delta_int(today: Optional[float], yesterday: Optional[float]) -> str:
     return f"{sign}{delta:.0f}"
 
 
+# Откуда физически берётся каждая метрика снапшота — чтобы в предупреждении о
+# неполном снапшоте было написано, ЧТО чинить, а не абстрактное «нет данных».
+# Обе метрики в get_cluster_health() запрашиваются из kube_*, т.е. из KSM:
+#   nodes_ready = count(kube_node_status_condition{condition="Ready",...})
+#   crashloops  = sum(kube_pod_container_status_waiting_reason{reason="CrashLoopBackOff"})
+_SNAPSHOT_METRIC_SOURCES = {
+    "nodes_ready": "kube-state-metrics",
+    "crashloops": "kube-state-metrics",
+}
+
+
+def _fmt_snapshot_metric(value: Any) -> str:
+    """Значение метрики снапшота, где None = «нет данных», а НЕ ноль.
+
+    `VMClient.query_instant` намеренно различает 0.0 и None (см. его контракт),
+    а `get_cluster_health` кладёт None в metrics и выставляет
+    data_available=False / health_status="unknown". Раньше секция брала
+    `d.get("crashloops", "?")` — но дефолт `"?"` не срабатывает, когда ключ
+    ЕСТЬ со значением None, и в дайджест уходило литеральное
+    `Crashloops: None`. Читается как «крашлупов нет», означает ровно
+    обратное — метрику не получили.
+
+    Прецедент 06.08.2026: KSM переросла vmagent-овый maxScrapeSize, все
+    kube_* исчезли из VM → снапшот отрисовал `Crashloops: None` рядом с
+    trend-строкой `crashloops avg 40→35` из kg_cluster_observations, то есть
+    дайджест противоречил сам себе в двух соседних строках.
+    """
+    if value is None:
+        return "?"
+    if isinstance(value, float):
+        return f"{value:.0f}"
+    return str(value)
+
+
 def _cluster_trend_24h(db: Session) -> Optional[Dict[str, Any]]:
     """Trend по kg_cluster_observations: today (24h) vs yesterday (24-48h).
 
@@ -406,11 +440,17 @@ async def cluster_health_section(
     Используется для дельты `Firing series: 673 (+47 vs вчера, +7.5%)`.
     None → метим `(new baseline)`.
     """
+    missing_snapshot: List[str] = []
     try:
         ch = await vm.get_cluster_health()
         d = ch.to_dict() if hasattr(ch, "to_dict") else {}
-        nodes = d.get("nodes_ready", "?")
-        crash = d.get("crashloops", "?")
+        nodes = _fmt_snapshot_metric(d.get("nodes_ready"))
+        crash = _fmt_snapshot_metric(d.get("crashloops"))
+        missing_snapshot = [
+            _SNAPSHOT_METRIC_SOURCES[k]
+            for k in ("nodes_ready", "crashloops")
+            if d.get(k) is None
+        ]
     except Exception as e:
         log.warning("stats_digest.cluster_health_failed", error=str(e))
         nodes, crash = "?", "?"
@@ -421,6 +461,12 @@ async def cluster_health_section(
         f"  Nodes ready: `{nodes}` · Crashloops: `{crash}` · "
         f"Firing series: `{firing_today}`{firing_trend}"
     )
+    if missing_snapshot:
+        srcs = ", ".join(sorted(set(missing_snapshot)))
+        snapshot_line += (
+            f"\n  ⚠️ snapshot неполный — нет данных от {srcs}; "
+            f"`?` значит «не знаем», а НЕ «ноль»"
+        )
 
     trend = _cluster_trend_24h(db) if db is not None else None
     if trend is None:
@@ -461,6 +507,8 @@ async def cluster_health_section(
 def firing_alerts_section(
     fired_series: List[dict],
     ns_to_team: Dict[str, str],
+    *,
+    top_n_ns: int = 3,
 ) -> Tuple[str, Counter, defaultdict, defaultdict]:
     """2. Firing-series, grouped by squad (через KG namespace→team).
 
@@ -499,6 +547,23 @@ def firing_alerts_section(
         if sorted_teams:
             parts = ", ".join(f"`@{t}` {team_alerts[t]} series" for t in sorted_teams)
             lines.append(f"  {parts}")
+        # Агрегация только по team скрывает главное: ОДНО мёртвое окружение
+        # растворяется в сумме команды. Прецедент 06.08.2026 — squad-8 лежал
+        # 43 часа в ImagePullBackOff и дал 66 из 77 серий двух топовых типов
+        # алертов, но в дайджесте это выглядело как `@external 469 series`
+        # плюс безымянные `KubePodNotReady × 40` в «Top alert types».
+        # Ни та, ни другая строка не показывала, ГДЕ горит.
+        # Строка намеренно не начинается с `@ — тест
+        # test_firing_alerts_squads_render_inline_single_line считает body-строки
+        # именно по этому префиксу.
+        top_ns = sorted(
+            ns_alerts.items(), key=lambda kv: -sum(kv[1].values())
+        )[:top_n_ns]
+        if len(ns_alerts) > 1 and top_ns:
+            ns_parts = ", ".join(
+                f"`{ns}` {sum(cnt.values())}" for ns, cnt in top_ns
+            )
+            lines.append(f"  Хуже всего (namespace): {ns_parts}")
     return "\n".join(lines), unique_alerts, team_alerts, unowned
 
 
@@ -2190,7 +2255,15 @@ def deploy_incident_correlation_section(db: Session, hours: int = 24) -> str:
                       AND a.last_notified_at BETWEEN recent_deploys.started_at - INTERVAL '5 minutes'
                                                  AND COALESCE(recent_deploys.finished_at, recent_deploys.started_at) + INTERVAL '60 minutes'
                 )) AS attributed,
-                count(*) FILTER (WHERE status = 'SUCCESS') AS successes
+                count(*) FILTER (WHERE status = 'SUCCESS') AS successes,
+                -- Одна строка kg_deployments = один СЕРВИС, раскатанный сборкой,
+                -- а не «один деплой» в человеческом смысле: одна TC-сборка
+                -- («Migrate and update service #96») пишет по строке на каждый
+                -- задетый сервис. 06.08.2026 это давало «1060 deploys» за сутки
+                -- при 4 реальных сборках в секции Recent deploys — читатель
+                -- видел два несовместимых числа про одно и то же.
+                count(DISTINCT service_id) AS svcs,
+                count(DISTINCT (buildtype_id, build_number)) AS builds
             FROM recent_deploys
         """), {"hours": str(hours)}).fetchone()
     except Exception as e:
@@ -2204,6 +2277,10 @@ def deploy_incident_correlation_section(db: Session, hours: int = 24) -> str:
         return ""
     attributed = int(overall[1] or 0)
     successes = int(overall[2] or 0)
+    # Колонки svcs/builds добавлены 06.08.2026. Читаем защитно: существующие
+    # тесты (и любой старый мок) отдают 3-элементный row.
+    svcs = int(overall[3] or 0) if len(overall) > 3 else 0
+    builds = int(overall[4] or 0) if len(overall) > 4 else 0
 
     try:
         worst = db.execute(text("""
@@ -2227,8 +2304,19 @@ def deploy_incident_correlation_section(db: Session, hours: int = 24) -> str:
     attributed_pct = (attributed / total * 100) if total else 0.0
 
     lines = [f"**🚀 Deploy → incident correlation ({hours}h)**"]
+    # «deploys» без уточнения читалось как число деплоев, которые сделали люди.
+    # Единица здесь — service-rollout (строка на сервис), поэтому пишем её явно
+    # и рядом даём число сборок: `795 service-rollouts (265 svc · 12 сборок)`.
+    scope = ""
+    if svcs or builds:
+        bits = []
+        if svcs:
+            bits.append(f"`{svcs}` svc")
+        if builds:
+            bits.append(f"`{builds}` сборок")
+        scope = " (" + " · ".join(bits) + ")"
     lines.append(
-        f"  `{total}` deploys · `{attributed}` attributed alerts "
+        f"  `{total}` service-rollouts{scope} · `{attributed}` attributed alerts "
         f"({attributed_pct:.0f}%) · success rate `{success_pct:.0f}%`"
     )
 
@@ -2239,7 +2327,18 @@ def deploy_incident_correlation_section(db: Session, hours: int = 24) -> str:
     if attributed == 0 and total >= 10:
         diag = _deploy_correlation_diagnostics(db, hours=hours)
         linked_ok = diag["deploys_linked_pct"] >= 80 and diag["alerts_linked_pct"] >= 80
-        if linked_ok and diag["overlap"] == 0:
+        # Три РАЗНЫХ причины attributed=0, и раньше две из них печатались одним
+        # и тем же «⚠️ Likely linkage gap»: ветка выбиралась по `overlap == 0`,
+        # поэтому при 100% привязки с обеих сторон и overlap=1 (ровно случай
+        # 06.08.2026) диагностика утверждала, что привязка сломана — хотя сама
+        # же показывала 100%/100%. Разводим по linked_ok, а overlap уточняет.
+        if not linked_ok:
+            lines.append(
+                f"  ⚠️ Likely linkage gap: `{diag['deploys_linked_pct']:.0f}%` deploys "
+                f"linked, `{diag['alerts_linked_pct']:.0f}%` alerts linked, overlap "
+                f"`{diag['overlap']}` svc"
+            )
+        elif diag["overlap"] == 0:
             # service_id есть с обеих сторон, но множества не пересекаются —
             # это НЕ баг привязки, а просто «деплои и алерты на разных сервисах».
             lines.append(
@@ -2248,10 +2347,14 @@ def deploy_incident_correlation_section(db: Session, hours: int = 24) -> str:
                 f"сервисах, что горят (не linkage-баг)"
             )
         else:
+            # Привязка целая И множества пересекаются, но ни один алерт не попал
+            # в окно [-5m, finished+60m]. Значит горит не от деплоя (хроника,
+            # которая тлеет между окнами) либо окно слишком узкое.
             lines.append(
-                f"  ⚠️ Likely linkage gap: `{diag['deploys_linked_pct']:.0f}%` deploys "
-                f"linked, `{diag['alerts_linked_pct']:.0f}%` alerts linked, overlap "
-                f"`{diag['overlap']}` svc"
+                f"  ℹ️ Привязка целая (`{diag['deploys_linked_pct']:.0f}%`/"
+                f"`{diag['alerts_linked_pct']:.0f}%`), общих svc `{diag['overlap']}`, "
+                f"но ни один алерт не попал в окно деплоя — горит не от раскаток "
+                f"(хроника между окнами), а не «нет корреляции»"
             )
 
     if worst and int(worst[2] or 0) >= 2:
