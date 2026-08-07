@@ -37,7 +37,7 @@ Discord-dedup — на уровне beat-задачи (см. tasks.py).
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Sequence
 
 import structlog
@@ -528,9 +528,66 @@ def check_graph_integrity(db: Session) -> CheckResult:
 
 # ── Orchestrator ──────────────────────────────────────────────────────────
 
+def check_digest_delivery(db: Session) -> CheckResult:
+    """Deadman на сам дайджест: доехал ли он до Discord за последние сутки.
+
+    Мотивация 07.08.2026: дайджест не отправился, и единственным способом
+    это заметить был взгляд человека в канал — «сообщения нет» неотличимо от
+    «ещё не пришло». Здесь опорой служит copilot_task_runs.last_success_at,
+    который пишется ПОСЛЕ фактической отправки в Discord.
+
+    Порог: расписание суточное (STATS_DIGEST_HOUR_UTC), поэтому норма — до
+    ~24ч. Больше 26ч (сутки + 2ч на очередь воркера, дайджест реально
+    стартует с задержкой 5-10 минут и считается ещё ~10) → пропуск дня, fail.
+    Отсутствие успехов вообще — warn, а не fail: свежеподнятый инстанс или
+    выключенный флаг не должны выглядеть как поломка.
+    """
+    from app.services.stats_digest import DIGEST_DELIVERY_TASK, _get_beat_last_run
+
+    if not getattr(settings, "STATS_DIGEST_ENABLED", False):
+        return CheckResult(
+            name="digest_delivery",
+            status="ok",
+            detail={"skipped": "STATS_DIGEST_ENABLED=false"},
+        )
+
+    last = _get_beat_last_run(DIGEST_DELIVERY_TASK)
+    age_min: Optional[float] = None
+    if last is not None:
+        # В redis heartbeat лежит tz-aware ISO (datetime.now(timezone.utc)),
+        # а _now() в этом модуле — naive UTC, как и DateTime-колонки проекта.
+        # Без нормализации вычитание падает с "can't subtract offset-naive
+        # and offset-aware datetimes".
+        if last.tzinfo is not None:
+            last = last.astimezone(timezone.utc).replace(tzinfo=None)
+        age_min = (_now() - last).total_seconds() / 60.0
+    if age_min is None:
+        return CheckResult(
+            name="digest_delivery",
+            status="warn",
+            detail={
+                "reason": "нет маркера доставки в redis "
+                          f"({DIGEST_DELIVERY_TASK}) — дайджест ещё не отправлялся "
+                          "или redis перезапускался",
+            },
+        )
+
+    threshold_min = 26 * 60
+    status = "fail" if age_min > threshold_min else "ok"
+    return CheckResult(
+        name="digest_delivery",
+        status=status,
+        detail={
+            "last_success_age_minutes": round(age_min, 1),
+            "threshold_minutes": threshold_min,
+        },
+    )
+
+
 _ALL_CHECKS = (
     check_materialization_zero_rate,
     check_sync_lag,
+    check_digest_delivery,
     check_anomaly_signal_health,
     check_alerts_resolve_freshness,
     check_pod_events_link_rate,

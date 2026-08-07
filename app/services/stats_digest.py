@@ -126,6 +126,18 @@ _TC_URL_PREFIX_DEFAULT = "https://wo-teamcity.lastoasisgame.com"
 # явной строкой в самом дайджесте.
 _section_failures: ContextVar[List[str]] = ContextVar("digest_section_failures")
 
+# Отдельный heartbeat-ключ «дайджест ДОЕХАЛ до Discord».
+#
+# Почему не обычный beat-heartbeat задачи: тот пишется из celery-сигнала
+# task_postrun, т.е. фиксирует лишь завершение задачи. Дайджест может
+# завершиться со skipped/skipped_noop или упасть на отправке — для deadman'а
+# это не успех. Пишем отдельный маркер строго после send_stats_report,
+# переиспользуя существующий redis-механизм (_record_task_heartbeat /
+# _get_beat_last_run) — тот же префикс, TTL и формат времени.
+#
+# На него смотрит self_health.check_digest_delivery.
+DIGEST_DELIVERY_TASK = "daily_stats_digest:delivered"
+
 
 def _reset_section_failures() -> None:
     """Начать новую сборку дайджеста с чистым списком сбоев."""
@@ -2966,4 +2978,7 @@ async def send_daily_digest(db: Session) -> Dict[str, Any]:
     # Импорт locally чтобы избежать circular-import на старте модуля.
     from app.services.discord_service import discord_service
     await discord_service.send_stats_report(content)
+    # Heartbeat пишем ПОСЛЕ фактической отправки — иначе deadman считал бы
+    # успехом сборку, которая до Discord так и не доехала.
+    _record_task_heartbeat(DIGEST_DELIVERY_TASK)
     return {"status": "sent", "content_len": len(content)}
