@@ -33,7 +33,7 @@ from app.knowledge_graph.queries import (blast_radius_for,
                                          recent_deploys_for,
                                          recent_deploys_for_namespaces,
                                          recent_pod_events_for, upstream_of)
-from app.knowledge_graph.schema import Service, ServiceEdge
+from app.knowledge_graph.schema import NODE_KIND_SERVICE, Service, ServiceEdge
 from app.models.incident import Incident
 from app.services.statics_service import (observe_statics_version,
                                           statics_env_from_namespace)
@@ -366,7 +366,11 @@ def _downstream_count_by_kind(db: Session, namespace: str, service_name: str) ->
     """
     svc = (
         db.query(Service)
-        .filter(Service.namespace == namespace, Service.name == service_name)
+        .filter(
+            Service.namespace == namespace,
+            Service.name == service_name,
+            Service.node_kind == NODE_KIND_SERVICE,
+        )
         .one_or_none()
     )
     if svc is None:
@@ -381,7 +385,11 @@ def _downstream_count_by_kind(db: Session, namespace: str, service_name: str) ->
 def _kg_data_age(db: Session, namespace: str, service_name: str) -> Optional[int]:
     svc = (
         db.query(Service)
-        .filter(Service.namespace == namespace, Service.name == service_name)
+        .filter(
+            Service.namespace == namespace,
+            Service.name == service_name,
+            Service.node_kind == NODE_KIND_SERVICE,
+        )
         .one_or_none()
     )
     if svc is None or svc.updated_at is None:
@@ -969,7 +977,9 @@ def enrich_alert(db: Session, incident: Incident) -> EnrichedContext:
     # реальный target deployment.
     try:
         q = db.query(Service).filter(
-            Service.namespace == namespace, Service.name == service
+            Service.namespace == namespace,
+            Service.name == service,
+            Service.node_kind == NODE_KIND_SERVICE,
         )
         svc = q.filter(Service.synthetic == False).first()  # noqa: E712
         if svc is None:

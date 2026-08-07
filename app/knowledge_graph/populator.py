@@ -18,8 +18,9 @@ from typing import Any, Dict, Optional
 import structlog
 from sqlalchemy.orm import Session
 
-from app.knowledge_graph.schema import (AlertEvent, Deployment, PodEvent,
-                                        Service, ServiceEdge)
+from app.knowledge_graph.schema import (NODE_KIND_SERVICE, AlertEvent,
+                                        Deployment, PodEvent, Service,
+                                        ServiceEdge)
 
 logger = structlog.get_logger()
 
@@ -35,16 +36,26 @@ def upsert_service(
     team_owner: Optional[str] = None,
     metadata: Optional[Dict[str, Any]] = None,
     synthetic: Optional[bool] = None,
+    node_kind: str = NODE_KIND_SERVICE,
 ) -> Service:
-    """Idempotent upsert.
+    """Idempotent upsert узла графа.
+
+    `node_kind` различает k8s Service, workload (Deployment/StatefulSet/
+    DaemonSet) и synthetic ingress-узлы. Дефолт 'service' — так все прежние
+    вызовы сохраняют поведение, а узлы workload заводятся только там, где
+    это явно нужно (синк топологии).
 
     На PostgreSQL использует INSERT ON CONFLICT DO UPDATE — атомарно, без
     race condition при параллельных worker'ах.
     На других диалектах (SQLite в тестах) — старый SELECT+INSERT.
     """
     if _is_postgresql(db):
-        return _upsert_service_pg(db, namespace, name, team_owner, metadata, synthetic)
-    return _upsert_service_fallback(db, namespace, name, team_owner, metadata, synthetic)
+        return _upsert_service_pg(
+            db, namespace, name, team_owner, metadata, synthetic, node_kind,
+        )
+    return _upsert_service_fallback(
+        db, namespace, name, team_owner, metadata, synthetic, node_kind,
+    )
 
 
 def _upsert_service_pg(
@@ -54,6 +65,7 @@ def _upsert_service_pg(
     team_owner: Optional[str],
     metadata: Optional[Dict[str, Any]],
     synthetic: Optional[bool],
+    node_kind: str = NODE_KIND_SERVICE,
 ) -> Service:
     from sqlalchemy.dialects.postgresql import insert as pg_insert
 
@@ -61,6 +73,7 @@ def _upsert_service_pg(
     values: Dict[str, Any] = {
         "namespace": namespace,
         "name": name,
+        "node_kind": node_kind,
         "team_owner": team_owner,
         "metadata_json": metadata,
         "synthetic": bool(synthetic) if synthetic is not None else False,
@@ -79,15 +92,17 @@ def _upsert_service_pg(
         pg_insert(Service.__table__)
         .values(**values)
         .on_conflict_do_update(
-            constraint="uq_kg_service_ns_name",
+            constraint="uq_kg_service_ns_name_kind",
             set_=set_clause,
         )
         .returning(Service.__table__.c.id)
     )
     db.execute(stmt)
     db.flush()
-    logger.info("kg.service_upserted", namespace=namespace, name=name)
-    return db.query(Service).filter_by(namespace=namespace, name=name).one()
+    logger.info("kg.service_upserted", namespace=namespace, name=name, node_kind=node_kind)
+    return db.query(Service).filter_by(
+        namespace=namespace, name=name, node_kind=node_kind,
+    ).one()
 
 
 def _upsert_service_fallback(
@@ -97,16 +112,22 @@ def _upsert_service_fallback(
     team_owner: Optional[str],
     metadata: Optional[Dict[str, Any]],
     synthetic: Optional[bool],
+    node_kind: str = NODE_KIND_SERVICE,
 ) -> Service:
     svc = (
         db.query(Service)
-        .filter(Service.namespace == namespace, Service.name == name)
+        .filter(
+            Service.namespace == namespace,
+            Service.name == name,
+            Service.node_kind == node_kind,
+        )
         .one_or_none()
     )
     if svc is None:
         svc = Service(
             namespace=namespace,
             name=name,
+            node_kind=node_kind,
             team_owner=team_owner,
             metadata_json=metadata,
             synthetic=bool(synthetic) if synthetic is not None else False,

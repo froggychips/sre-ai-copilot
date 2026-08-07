@@ -14,9 +14,10 @@ from sqlalchemy.orm import Session
 
 from app.knowledge_graph.confidence import (confidence_label,
                                             confidence_score)
-from app.knowledge_graph.schema import (AlertEvent, Deployment,
-                                        IngressObservation, LogObservation,
-                                        PodEvent, Service, ServiceEdge)
+from app.knowledge_graph.schema import (NODE_KIND_SERVICE, AlertEvent,
+                                        Deployment, IngressObservation,
+                                        LogObservation, PodEvent, Service,
+                                        ServiceEdge)
 
 
 def _ensure_aware(dt: datetime) -> datetime:
@@ -28,7 +29,13 @@ def _service_by_namespace_name(
 ) -> Optional[Service]:
     return (
         db.query(Service)
-        .filter(Service.namespace == namespace, Service.name == name)
+        .filter(
+            Service.namespace == namespace,
+            Service.name == name,
+            # без node_kind запрос стал бы неоднозначным: одноимённый
+            # workload-узел даёт MultipleResultsFound на .one_or_none()
+            Service.node_kind == NODE_KIND_SERVICE,
+        )
         .one_or_none()
     )
 

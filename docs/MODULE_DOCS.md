@@ -60,7 +60,7 @@
 - `IngressObservation` (`kg_ingress_observations`) — per-endpoint (host/path) HTTP snapshots: `p95_latency_ms` / `p99_latency_ms` / `rps` / `error_5xx_rate` / `error_4xx_rate`, `service_id` FK to backend; `UNIQUE (ingress_name, host, path, ts)`. Populated since 2026-06-10 (see Ingress observations sync).
 
 ### Schema / quality contract (`app/knowledge_graph/contract.py`)
-- `KG_SCHEMA_VERSION` — текущая версия (`2.3`, после orphan → app-scope 2026-06-06). Bump rules — `docs/KG_SCHEMA_CONTRACT.md` §8.
+- `KG_SCHEMA_VERSION` — текущая версия (`2.4`, после `kg_services.node_kind` 2026-08-07: k8s Service и workload — разные типы узлов). Bump rules — `docs/KG_SCHEMA_CONTRACT.md` §8.
 - `EDGE_KINDS` — реестр всех edge kinds + spec (`semantic` / `src_kinds` / `dst_kinds` / `source` / `status` / `table`). `table` = где edge живёт: `kg_service_edges` / `kg_volume_edges` / `fk_only` (через FK) / `metadata_only` (через owner_service_id).
 - `OWNER_SOURCES` / `OWNER_SOURCE_ALIASES` — canonical источники owner-а + маппинг коротких имён из `ownership_suggester` (`prefix`→`namespace_prefix`, `labels`→`k8s_labels` и т.д.).
 - `STALE_CLASS_VALUES` — enum значений `kg_services.stale_class`. Re-export'ится в `stale_classifier` для backward-compat.
@@ -321,7 +321,7 @@ Read-side API used by enrichment + MCP tools:
 ### KG schema/quality contract (`app/knowledge_graph/contract.py`)
 - **Единственный источник истины** о том, что в KG считается service /
   orphan / synthetic / owner-known, и какие edge kinds допустимы.
-- `KG_SCHEMA_VERSION: str = "2.3"` — current contract version. Bump rules
+- `KG_SCHEMA_VERSION: str = "2.4"` — current contract version. Bump rules
   в `docs/KG_SCHEMA_CONTRACT.md` §8 (major = breaking, minor = additive).
 - `EDGE_KINDS: Dict[str, EdgeKindSpec]` — реестр всех edge kinds. Каждый
   spec содержит: `semantic`, `src_kinds`, `dst_kinds`, `source`, `status`

@@ -47,7 +47,7 @@ from typing import Any, Dict, List, Optional, Tuple, cast
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from app.knowledge_graph.schema import K8sJob, Service
+from app.knowledge_graph.schema import NODE_KIND_SERVICE, K8sJob, Service
 
 logger = logging.getLogger(__name__)
 
@@ -165,7 +165,7 @@ def _resolve_owner_via_name_pattern(
         return None
     svc = (
         db.query(Service)
-        .filter_by(namespace=namespace, name=candidate)
+        .filter_by(namespace=namespace, name=candidate, node_kind=NODE_KIND_SERVICE)
         .one_or_none()
     )
     if svc is None:
@@ -621,7 +621,7 @@ def sync_all_cronjobs(db: Session) -> Dict[str, int]:
         else:
             owner_svc = (
                 db.query(Service)
-                .filter_by(namespace=ns, name=owner_name)
+                .filter_by(namespace=ns, name=owner_name, node_kind=NODE_KIND_SERVICE)
                 .one_or_none()
             )
             owner_svc_id = (

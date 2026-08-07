@@ -243,3 +243,19 @@ def test_stale_class_migration_uses_string_column():
     assert "sa.Enum" not in code and "ENUM(" not in code, (
         "stale_class должен быть String, не PG enum — потеряем sqlite-compat"
     )
+
+
+def test_node_kinds_match_between_schema_and_contract():
+    """`node_kind`-константы в схеме и контракте — одно и то же множество.
+
+    Схема пишет значения в БД, контракт описывает семантику и на него смотрят
+    метрики качества. Разъехавшись, они дадут узлы с типом, который метрики
+    не считают ни за что.
+    """
+    from app.knowledge_graph import contract as c
+    from app.knowledge_graph import schema as sch
+
+    assert set(sch.NODE_KINDS) == set(c.NODE_KINDS)
+    assert sch.NODE_KIND_SERVICE == c.NODE_KIND_SERVICE
+    assert sch.NODE_KIND_WORKLOAD == c.NODE_KIND_WORKLOAD
+    assert sch.NODE_KIND_INGRESS == c.NODE_KIND_INGRESS

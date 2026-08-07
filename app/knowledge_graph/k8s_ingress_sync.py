@@ -29,7 +29,7 @@ from typing import Any, Dict, List
 from sqlalchemy.orm import Session
 
 from app.knowledge_graph.populator import upsert_edge, upsert_service
-from app.knowledge_graph.schema import Service
+from app.knowledge_graph.schema import NODE_KIND_SERVICE, Service
 
 log = logging.getLogger(__name__)
 
@@ -114,7 +114,9 @@ def sync_all_ingresses(db: Session) -> Dict[str, int]:
             # Backend должен существовать в KG (kg_topology_sync уже видел его
             # как Deployment). Если нет — пропускаем (избегаем фейк-узлов).
             backend = (
-                db.query(Service).filter_by(namespace=ns, name=backend_name).one_or_none()
+                db.query(Service).filter_by(
+                    namespace=ns, name=backend_name, node_kind=NODE_KIND_SERVICE,
+                ).one_or_none()
             )
             if backend is None:
                 stats["skipped_no_backend_match"] += 1

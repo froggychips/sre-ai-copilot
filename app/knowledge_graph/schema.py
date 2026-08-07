@@ -14,11 +14,30 @@ from sqlalchemy.orm import relationship
 from app.database import Base
 
 
+# ── Типы узлов графа ────────────────────────────────────────────────────────
+#
+# До 07.08.2026 таблица kg_services хранила ВСЁ одним типом, и k8s Service
+# схлопывался с k8s Deployment по (namespace, name): `auth-service` — один
+# узел. Из-за этого ребро serves_traffic (Service → backing workload) было
+# невозможно построить в принципе — оно всегда получалось self-loop.
+# Замер на живом графе: 2092 self-loop и 2231 no_match отбрасывались каждый
+# тик, а рёбер serves_traffic оставалось ровно 3.
+#
+# Слово «deployment» в этой кодовой базе уже занято: класс Deployment ниже —
+# это rollout/build из TeamCity (kg_deployments), а не k8s-объект. Поэтому
+# исполняемая сущность называется workload — заодно покрывает StatefulSet и
+# DaemonSet, которые тоже стоят за Service.
+NODE_KIND_SERVICE = "service"    # k8s Service / логическая точка входа
+NODE_KIND_WORKLOAD = "workload"  # k8s Deployment / StatefulSet / DaemonSet
+NODE_KIND_INGRESS = "ingress"    # synthetic-узел ingress:<name>
+NODE_KINDS = (NODE_KIND_SERVICE, NODE_KIND_WORKLOAD, NODE_KIND_INGRESS)
+
+
 class Service(Base):
-    """Узел графа: микросервис / deployment в k8s.
+    """Узел графа: сервис, workload или ingress — см. `node_kind`.
 
     `name` — стабильный slug (например, `town-service`), уникален в
-    пределах namespace. Сервис может присутствовать в нескольких
+    пределах namespace И типа узла. Сервис может присутствовать в нескольких
     namespace (squad-1, squad-2) — это разные строки.
     """
     __tablename__ = "kg_services"
@@ -26,6 +45,13 @@ class Service(Base):
     id = Column(Integer, primary_key=True, index=True)
     name = Column(String, nullable=False, index=True)
     namespace = Column(String, nullable=False, index=True)
+    # Тип узла. Существующие строки мигрированы в 'service' — то есть смысл
+    # старых данных не меняется, а k8s-workload'ы теперь заводятся отдельными
+    # узлами и перестают конфликтовать с одноимённым Service.
+    node_kind = Column(
+        String, nullable=False, index=True,
+        default=NODE_KIND_SERVICE, server_default=NODE_KIND_SERVICE,
+    )
     team_owner = Column(String, nullable=True)   # squad, например `squad-gd`
     metadata_json = Column(JSON, nullable=True)  # labels, репо, runbook URL...
     # Synthetic = по дизайну никогда не имеет edges (cron-backups, nats-tools,
@@ -51,7 +77,11 @@ class Service(Base):
     stale_class = Column(String, nullable=True, index=True)
 
     __table_args__ = (
-        UniqueConstraint("namespace", "name", name="uq_kg_service_ns_name"),
+        # node_kind в ключе: Service и workload с одинаковым именем — это
+        # РАЗНЫЕ узлы, иначе serves_traffic снова схлопнется в self-loop.
+        UniqueConstraint(
+            "namespace", "name", "node_kind", name="uq_kg_service_ns_name_kind",
+        ),
     )
 
 

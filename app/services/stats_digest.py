@@ -1044,6 +1044,7 @@ def fragile_services_section(db: Session, ns_to_team: Dict[str, str]) -> str:
             FROM kg_services s
             LEFT JOIN kg_service_edges e ON e.dst_id = s.id
             WHERE NOT s.synthetic
+              AND s.node_kind = 'service'
               AND (s.team_owner IS NULL OR s.team_owner != 'platform')
               AND s.name !~ '(-metrics|-backup|-exporter|-postgresql-metrics)$'
             GROUP BY s.id, s.name, s.namespace, s.health_score
@@ -1699,7 +1700,12 @@ def kg_quality_section(db: Session) -> str:
     ниже — оптимизированная SQL-агрегация, эквивалентная сумме per-service
     `is_orphan(s, edges)` из contract.py.
     """
-    services_total = db.execute(text("SELECT count(*) FROM kg_services")).scalar() or 0
+    # node_kind='service': workload-узлы (backing Deployment, contract 2.4)
+    # живут в той же таблице, но это не «ещё 2000 сервисов» — иначе строка
+    # Services: удваивается за один тик синка и читается как рост топологии.
+    services_total = db.execute(text(
+        "SELECT count(*) FROM kg_services WHERE node_kind = 'service'"
+    )).scalar() or 0
     if services_total == 0:
         return "**🧬 KG quality**\n  _KG пустой — kg_topology_sync ещё не выполнялся_"
 
@@ -1712,7 +1718,8 @@ def kg_quality_section(db: Session) -> str:
         ).fetchall()
     }
     synthetic = db.execute(
-        text("SELECT count(*) FROM kg_services WHERE synthetic = true")
+        text("SELECT count(*) FROM kg_services "
+             "WHERE synthetic = true AND node_kind = 'service'")
     ).scalar() or 0
     # Orphan — единый источник `contract.compute_orphan_stats` (app-scope:
     # real-сервисы без ЛЮБОГО edge, знаменатель без expected_stale-инфры).
@@ -1849,7 +1856,8 @@ def _count_real_services(db: Session) -> Optional[int]:
     """
     try:
         return int(db.execute(text(
-            "SELECT count(*) FROM kg_services WHERE NOT synthetic"
+            "SELECT count(*) FROM kg_services "
+            "WHERE NOT synthetic AND node_kind = 'service'"
         )).scalar() or 0)
     except Exception as e:  # noqa: BLE001
         _tx_clean(db)
@@ -1994,6 +2002,7 @@ def _unowned_action_items(db: Session) -> int:
         return int(db.execute(text("""
             SELECT count(*) FROM kg_services
             WHERE NOT synthetic
+              AND node_kind = 'service'
               AND (team_owner IS NULL OR team_owner = '')
         """)).scalar() or 0)
     except Exception:
@@ -2009,6 +2018,7 @@ def _suspicious_stale_action_items(db: Session, days: int = 60) -> int:
         cnt = db.execute(text("""
             SELECT count(*) FROM kg_services s
             WHERE NOT synthetic
+              AND node_kind = 'service'
               AND s.stale_class = 'suspicious_stale'
               AND NOT EXISTS (
                   SELECT 1 FROM kg_deployments d
@@ -2039,6 +2049,7 @@ def _suspicious_in_prod_with_alerts(
             SELECT s.name
             FROM kg_services s
             WHERE NOT s.synthetic
+              AND s.node_kind = 'service'
               AND s.stale_class = 'suspicious_stale'
               AND s.namespace LIKE 'prod%'
               AND NOT EXISTS (
@@ -2074,6 +2085,7 @@ def _suspicious_with_callers(db: Session, days: int = 60) -> int:
         cnt = db.execute(text("""
             SELECT count(*) FROM kg_services s
             WHERE NOT s.synthetic
+              AND s.node_kind = 'service'
               AND s.stale_class = 'suspicious_stale'
               AND NOT EXISTS (
                   SELECT 1 FROM kg_deployments d
@@ -2101,6 +2113,7 @@ def _suspicious_in_external_or_mcp(db: Session, days: int = 60) -> int:
         cnt = db.execute(text("""
             SELECT count(*) FROM kg_services s
             WHERE NOT s.synthetic
+              AND s.node_kind = 'service'
               AND s.stale_class = 'suspicious_stale'
               AND NOT EXISTS (
                   SELECT 1 FROM kg_deployments d
