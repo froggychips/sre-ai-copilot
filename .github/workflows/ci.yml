@@ -78,26 +78,37 @@ jobs:
       - name: Start Postgres for integration tests
         run: |
           set -e
-          # $HOME берём в shell, а не через ${{ env.HOME }}: контекст env в
-          # GHA содержит только переменные workflow/job/step, системного HOME
-          # там нет — подстановка дала бы unix:///.rd/docker.sock.
+          # $HOME берём в shell, а не через env-контекст GHA: системного HOME
+          # там нет, подстановка дала бы unix:///.rd/docker.sock.
           export DOCKER_HOST="unix://$HOME/.rd/docker.sock"
           docker rm -f copilot-ci-pg >/dev/null 2>&1 || true
-          # Порт назначает docker (-p 0:5432), а не мы: раннер self-hosted,
-          # на той же машине могут крутиться чужие контейнеры и локальная
-          # отладка. Фиксированный 55432 уже дал "port is already allocated"
-          # и уронил прогон.
+          # Порт назначает docker (-p 0:5432), а не мы: раннер self-hosted, на
+          # той же машине бывают чужие контейнеры и локальная отладка —
+          # фиксированный 55432 уже дал "port is already allocated".
+          # Готовность ждём по healthcheck контейнера, а не самодельным
+          # циклом с pg_isready: первый вариант выходил из цикла раньше, чем
+          # база начинала принимать соединения ("rejecting connections").
           docker run -d --name copilot-ci-pg \
             -e POSTGRES_USER=ci -e POSTGRES_PASSWORD=ci -e POSTGRES_DB=ci \
+            --health-cmd="pg_isready -U ci -d ci" \
+            --health-interval=2s --health-timeout=3s --health-retries=30 \
             -p 0:5432 postgres:16-alpine
-          for i in $(seq 1 30); do
-            docker exec copilot-ci-pg pg_isready -U ci >/dev/null 2>&1 && break
+          # имя не status: в zsh это read-only спецпеременная, а шаг могут
+          # запускать и не в bash при отладке
+          pg_health=starting
+          for _ in $(seq 1 45); do
+            pg_health=$(docker inspect -f '{{.State.Health.Status}}' copilot-ci-pg 2>/dev/null || echo starting)
+            [ "$pg_health" = "healthy" ] && break
             sleep 2
           done
-          docker exec copilot-ci-pg pg_isready -U ci
+          if [ "$pg_health" != "healthy" ]; then
+            echo "::error::postgres не поднялся (health=$pg_health), логи контейнера:"
+            docker logs copilot-ci-pg 2>&1 | tail -30
+            exit 1
+          fi
           PG_PORT=$(docker port copilot-ci-pg 5432/tcp | head -1 | sed 's/.*://')
           echo "PG_PORT=$PG_PORT" >> "$GITHUB_ENV"
-          echo "postgres слушает на 127.0.0.1:$PG_PORT"
+          echo "postgres healthy, слушает 127.0.0.1:$PG_PORT"
 
       # Гоняем ТОЛЬКО интеграционные наборы, а не весь pytest с DATABASE_URL.
       # Причина: при живой базе включаются ещё ~30 тестов, которые никогда не
