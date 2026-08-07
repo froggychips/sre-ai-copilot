@@ -69,6 +69,66 @@ jobs:
       - name: Run Pytest with Coverage
         run: .venv/bin/pytest --cov=app --cov-report=xml --cov-fail-under=55
 
+      # Postgres для интеграционных тестов. Без него всё, что помечено
+      # requires_postgres, СКИПАЕТСЯ — именно поэтому 07.08.2026 в master
+      # уехала регрессия с несуществующей колонкой: 1765 юнит-тестов зелёные,
+      # а SQL до базы не доходил вообще (секции мокают db.execute).
+      # Docker на self-hosted раннере — от Rancher Desktop, сокет в ~/.rd
+      # (тот же путь, что в джобе build-and-push).
+      - name: Start Postgres for integration tests
+        run: |
+          set -e
+          # $HOME берём в shell, а не через env-контекст GHA: системного HOME
+          # там нет, подстановка дала бы unix:///.rd/docker.sock.
+          export DOCKER_HOST="unix://$HOME/.rd/docker.sock"
+          docker rm -f copilot-ci-pg >/dev/null 2>&1 || true
+          # Порт назначает docker (-p 0:5432), а не мы: раннер self-hosted, на
+          # той же машине бывают чужие контейнеры и локальная отладка —
+          # фиксированный 55432 уже дал "port is already allocated".
+          # Готовность ждём по healthcheck контейнера, а не самодельным
+          # циклом с pg_isready: первый вариант выходил из цикла раньше, чем
+          # база начинала принимать соединения ("rejecting connections").
+          docker run -d --name copilot-ci-pg \
+            -e POSTGRES_USER=ci -e POSTGRES_PASSWORD=ci -e POSTGRES_DB=ci \
+            --health-cmd="pg_isready -U ci -d ci" \
+            --health-interval=2s --health-timeout=3s --health-retries=30 \
+            -p 0:5432 postgres:16-alpine
+          # имя не status: в zsh это read-only спецпеременная, а шаг могут
+          # запускать и не в bash при отладке
+          pg_health=starting
+          for _ in $(seq 1 45); do
+            pg_health=$(docker inspect -f '{{.State.Health.Status}}' copilot-ci-pg 2>/dev/null || echo starting)
+            [ "$pg_health" = "healthy" ] && break
+            sleep 2
+          done
+          if [ "$pg_health" != "healthy" ]; then
+            echo "::error::postgres не поднялся (health=$pg_health), логи контейнера:"
+            docker logs copilot-ci-pg 2>&1 | tail -30
+            exit 1
+          fi
+          PG_PORT=$(docker port copilot-ci-pg 5432/tcp | head -1 | sed 's/.*://')
+          echo "PG_PORT=$PG_PORT" >> "$GITHUB_ENV"
+          echo "postgres healthy, слушает 127.0.0.1:$PG_PORT"
+
+      # Гоняем ТОЛЬКО интеграционные наборы, а не весь pytest с DATABASE_URL.
+      # Причина: при живой базе включаются ещё ~30 тестов, которые никогда не
+      # исполнялись и сейчас падают (отдельный долг, чинится своим PR). Пока
+      # они красные, включать их в обязательный прогон — значит вернуться к
+      # практике merge через --admin bypass.
+      - name: Integration tests against real Postgres schema
+        env:
+          DATABASE_URL: postgresql://ci:ci@127.0.0.1:${{ env.PG_PORT }}/ci
+        run: |
+          .venv/bin/pytest -q \
+            tests/test_digest_sections_against_schema.py \
+            tests/test_stats_digest_sql_schema.py
+
+      - name: Stop Postgres
+        if: always()
+        run: |
+          export DOCKER_HOST="unix://$HOME/.rd/docker.sock"
+          docker rm -f copilot-ci-pg >/dev/null 2>&1 || true
+
       # bandit — статический security-скан кода. Игнорируем low/info,
       # фейлим только на medium+. Известные исключения добавлять в
       # .bandit/.bandit.yml, а не понижать порог.
