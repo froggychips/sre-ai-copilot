@@ -113,6 +113,33 @@ class ChangeReport:
 _TC_URL_PREFIX_DEFAULT = "https://wo-teamcity.lastoasisgame.com"
 
 
+def _tx_clean(db: Optional[Session]) -> None:
+    """Вернуть сессию в рабочее состояние после упавшего запроса.
+
+    `db` допускает None: часть секций принимает Optional[Session] для
+    backwards-compat с тестами, которые вызывают их без базы.
+
+    Секции дайджеста ловят свои исключения и возвращают "" — дайджест не
+    должен падать целиком из-за одного блока. Но Postgres после ошибки
+    держит транзакцию в aborted-состоянии, и КАЖДЫЙ следующий запрос в той
+    же сессии отвечает InFailedSqlTransaction. То есть без rollback первая
+    же сломанная секция глушит все последующие.
+
+    Прецедент 07.08.2026: `deploy_incident_correlation_section` упала на
+    несуществующей колонке, и вслед за ней молча умерла
+    `beat_heartbeats_footer` — один сломанный SQL съел два блока.
+
+    Сам rollback обёрнут в try: если сессия уже мертва (например, оборван
+    коннект), диагностику секции это ломать не должно.
+    """
+    if db is None:
+        return
+    try:
+        db.rollback()
+    except Exception as e:  # noqa: BLE001 — best-effort очистка
+        log.warning("stats_digest.tx_rollback_failed", error=str(e))
+
+
 def _tc_url_prefix() -> str:
     """Resolve URL prefix для TC build link. Settings → default."""
     return (
@@ -473,6 +500,7 @@ async def cluster_health_section(
             if d.get(k) is None
         ]
     except Exception as e:
+        _tx_clean(db)
         log.warning("stats_digest.cluster_health_failed", error=str(e))
         nodes, crash = "?", "?"
 
@@ -788,6 +816,7 @@ def _alert_type_metadata(
         resurfaced: Dict[str, int] = {name: cnt for name, cnt in resurf_rows}
 
     except Exception as e:
+        _tx_clean(db)
         log.warning("stats_digest.alert_type_metadata_failed", error=str(e))
         # M3: откатываем aborted-транзакцию, иначе последующие секции дайджеста
         # (общий Session) упадут каскадом на InFailedSqlTransaction.
@@ -950,6 +979,7 @@ def fragile_services_section(db: Session, ns_to_team: Dict[str, str]) -> str:
             ORDER BY callers DESC
         """)).fetchall()
     except Exception as e:
+        _tx_clean(db)
         log.warning("stats_digest.fragile_query_failed", error=str(e))
         rows = []
 
@@ -1367,6 +1397,7 @@ def _metrics_sync_lag_minutes(db: Session) -> Optional[float]:
             return None
         return float(lag)
     except Exception as e:
+        _tx_clean(db)
         log.warning("stats_digest.metrics_sync_lag_failed", error=str(e))
         return None
 
@@ -1441,6 +1472,7 @@ def anomaly_summary_section(db: Session) -> str:
             """)).fetchall()
         }
     except Exception as e:
+        _tx_clean(db)
         log.warning("stats_digest.anomaly_by_severity_failed", error=str(e))
         _safe_rollback(db)
         by_severity = {}
@@ -1458,6 +1490,7 @@ def anomaly_summary_section(db: Session) -> str:
             LIMIT 5
         """)).fetchall()
     except Exception as e:
+        _tx_clean(db)
         log.warning("stats_digest.anomaly_top_services_failed", error=str(e))
         _safe_rollback(db)
         top_services = []
@@ -1471,6 +1504,7 @@ def anomaly_summary_section(db: Session) -> str:
             ORDER BY count(*) DESC
         """)).fetchall()
     except Exception as e:
+        _tx_clean(db)
         log.warning("stats_digest.anomaly_by_metric_failed", error=str(e))
         _safe_rollback(db)
         by_metric = []
@@ -1688,6 +1722,7 @@ def _count_alerts_in_window(db: Session, hours: int) -> Tuple[int, int]:
         """), {"hours": str(hours)}).scalar() or 0
         return int(fired), int(resolved)
     except Exception as e:
+        _tx_clean(db)
         log.warning("stats_digest.count_alerts_failed", error=str(e))
         # M3: rollback — не оставляем aborted-транзакцию следующим секциям.
         _safe_rollback(db)
@@ -1709,6 +1744,7 @@ def _count_chronic_in_window(db: Session, hours: int, min_fires: int = 5) -> int
         """), {"hours": str(hours), "min_fires": min_fires}).scalar() or 0
         return int(cnt)
     except Exception as e:
+        _tx_clean(db)
         log.warning("stats_digest.chronic_count_failed", error=str(e))
         return 0
 
@@ -1847,6 +1883,7 @@ def _chronic_action_items(db: Session, threshold: int = 10) -> List[Dict[str, An
             for r in rows
         ]
     except Exception as e:
+        _tx_clean(db)
         log.warning("stats_digest.chronic_action_items_failed", error=str(e))
         return []
 
@@ -1884,6 +1921,7 @@ def _suspicious_stale_action_items(db: Session, days: int = 60) -> int:
         """), {"days": str(days)}).scalar() or 0
         return int(cnt)
     except Exception as e:
+        _tx_clean(db)
         log.warning("stats_digest.suspicious_stale_failed", error=str(e))
         return 0
 
@@ -1952,6 +1990,7 @@ def _suspicious_with_callers(db: Session, days: int = 60) -> int:
         """), {"days": str(days)}).scalar() or 0
         return int(cnt)
     except Exception as e:
+        _tx_clean(db)
         log.warning("stats_digest.suspicious_with_callers_failed", error=str(e))
         _safe_rollback(db)
         return 0
@@ -2264,7 +2303,8 @@ def deploy_incident_correlation_section(db: Session, hours: int = 24) -> str:
         # Сначала overall: сколько deploys, сколько attributed (≥1 alert в окне).
         overall = db.execute(text("""
             WITH recent_deploys AS (
-                SELECT id, service_id, started_at, finished_at, status, build_number, triggered_by, extras
+                SELECT id, service_id, started_at, finished_at, status,
+                       buildtype_id, build_number, triggered_by, extras
                 FROM kg_deployments
                 WHERE started_at > NOW() - (:hours || ' hours')::interval
             )
@@ -2288,6 +2328,7 @@ def deploy_incident_correlation_section(db: Session, hours: int = 24) -> str:
             FROM recent_deploys
         """), {"hours": str(hours)}).fetchone()
     except Exception as e:
+        _tx_clean(db)
         log.warning("stats_digest.deploy_incident_failed", error=str(e))
         return ""
 
@@ -2541,6 +2582,7 @@ def pipeline_health_section(db: Session, stale_minutes: Optional[int] = None) ->
         result = check_sync_lag(db)
         per_task = result.detail.get("per_task", {})
     except Exception as e:
+        _tx_clean(db)
         log.warning("stats_digest.pipeline_health_failed", error=str(e))
         return ""
 
@@ -2626,6 +2668,7 @@ def beat_heartbeats_footer(db: Session) -> str:
         result = check_sync_lag(db)
         per_task = result.detail.get("per_task", {})
     except Exception as e:
+        _tx_clean(db)
         log.warning("stats_digest.beat_heartbeats_failed", error=str(e))
         return ""
 
@@ -2699,6 +2742,7 @@ async def _build_digest_with_meta(db: Session) -> Tuple[str, Dict[str, Any]]:
                 step="30s",
             )
         except Exception as e:
+            _tx_clean(db)
             log.warning("stats_digest.vm_query_failed", error=str(e))
 
     # Item #3: trend для Firing series vs последнего daily snapshot.
