@@ -479,15 +479,47 @@ def _decay_color(default_color: int, decayed_severity: str) -> int:
 # B4: Similar past incident lookup
 # ---------------------------------------------------------------------------
 
-# In-process кэш (alertname, service_id) -> (ts_cached, payload). Используем
-# как fallback когда Redis недоступен. Module-level чтобы переживать между
-# вызовами в одном процессе. TTL — 1 час.
+# In-process кэш key -> (ts_cached, payload|None). Используем как fallback
+# когда Redis недоступен. Module-level чтобы переживать между вызовами в
+# одном процессе. TTL — 1 час; размер ограничен (см. _local_cache_put) —
+# без капа dict рос неограниченно на разнообразных (alertname, service).
 _SIMILAR_PAST_TTL_SEC = 3600
 _SIMILAR_PAST_LOCAL_CACHE: Dict[str, Tuple[float, Optional[Dict[str, Any]]]] = {}
+_SIMILAR_PAST_LOCAL_CACHE_MAX = 512
 
 
-def _similar_past_cache_key(alertname: str, service_id: int) -> str:
-    return f"discord:similar_past:{alertname}:{service_id}"
+def _similar_past_cache_key(alertname: str, service_name: str, namespace: str) -> str:
+    # Ключ строится из полей, известных ДО похода в БД — иначе кэш нельзя
+    # прочитать перед запросом (старый ключ включал service_id, который сам
+    # требовал DB lookup → кэш был write-only). Namespace-alias может дать
+    # два ключа на один сервис — это лишь дублирование записи, не ошибка.
+    return f"discord:similar_past:{alertname}:{namespace}:{service_name}"
+
+
+def _similar_past_local_get(key: str, now_ts: float) -> Tuple[bool, Optional[Dict[str, Any]]]:
+    """(hit, payload) из in-process fallback-кэша с проверкой TTL."""
+    entry = _SIMILAR_PAST_LOCAL_CACHE.get(key)
+    if entry is None:
+        return False, None
+    ts_cached, payload = entry
+    if now_ts - ts_cached > _SIMILAR_PAST_TTL_SEC:
+        _SIMILAR_PAST_LOCAL_CACHE.pop(key, None)
+        return False, None
+    return True, payload
+
+
+def _similar_past_local_put(key: str, payload: Optional[Dict[str, Any]], now_ts: float) -> None:
+    """Записать в fallback-кэш с эвикцией: сперва протухшие, затем старейшие."""
+    stale = [
+        k for k, (ts, _) in _SIMILAR_PAST_LOCAL_CACHE.items()
+        if now_ts - ts > _SIMILAR_PAST_TTL_SEC
+    ]
+    for k in stale:
+        _SIMILAR_PAST_LOCAL_CACHE.pop(k, None)
+    while len(_SIMILAR_PAST_LOCAL_CACHE) >= _SIMILAR_PAST_LOCAL_CACHE_MAX:
+        oldest = min(_SIMILAR_PAST_LOCAL_CACHE, key=lambda k: _SIMILAR_PAST_LOCAL_CACHE[k][0])
+        _SIMILAR_PAST_LOCAL_CACHE.pop(oldest, None)
+    _SIMILAR_PAST_LOCAL_CACHE[key] = (now_ts, payload)
 
 
 def _lookup_similar_past_incident(
@@ -606,10 +638,10 @@ async def _lookup_similar_past_incident_cached(
 ) -> Optional[Dict[str, Any]]:
     """Async-обёртка над `_lookup_similar_past_incident` с Redis-TTL=1h.
 
-    Cache-key: `discord:similar_past:{alertname}:{service_id}`. Так как
-    service_id неизвестен до DB lookup, сначала резолвим svc.id, потом
-    проверяем Redis. Если Redis недоступен — fallback на in-process dict
-    с тем же TTL.
+    Cache-key: `discord:similar_past:{alertname}:{namespace}:{service_name}` —
+    строится ДО похода в БД, поэтому кэш действительно ЧИТАЕТСЯ перед
+    запросом (раньше он был write-only: ключ требовал service_id из БД).
+    Если Redis недоступен — fallback на bounded in-process dict с тем же TTL.
 
     Negative results тоже кэшируем (как пустой JSON `{}`) — иначе каждый
     embed бьёт по БД, бесполезно для большинства алертов которые впервые.
@@ -617,9 +649,30 @@ async def _lookup_similar_past_incident_cached(
     if not alertname or not service_name or not namespace:
         return None
 
-    # Сразу резолвим service_id+row (это OK — без service_id мы не сможем
-    # построить cache_key, а кэш per (alertname, ns, service) дал бы
-    # дубли при namespace-aliases).
+    import json
+    import time
+
+    cache_key = _similar_past_cache_key(alertname, service_name, namespace)
+    now_ts = time.time()
+
+    # ── Read-path: Redis, затем in-process fallback ─────────────────────
+    redis_ok = False
+    try:
+        from app.celery_worker import redis_client
+
+        raw = await redis_client.get(cache_key)
+        redis_ok = True
+        if raw is not None:
+            cached = json.loads(raw)
+            # "{}" = закэшированный negative result.
+            return cached or None
+    except Exception as e:
+        _log.debug("similar_past_redis_unavailable", error=type(e).__name__)
+        hit, local_payload = _similar_past_local_get(cache_key, now_ts)
+        if hit:
+            return local_payload
+
+    # ── Miss: полноценный DB lookup ─────────────────────────────────────
     payload = _lookup_similar_past_incident(
         alertname=alertname,
         service_name=service_name,
@@ -627,29 +680,26 @@ async def _lookup_similar_past_incident_cached(
         lookback_days=lookback_days,
         now=now,
     )
-    if payload is None:
-        return None
 
-    cache_key = _similar_past_cache_key(alertname, int(payload["service_id"]))
-    # Попытка положить в Redis. Без него — local fallback.
+    # ── Write-path: Redis; при недоступном — bounded local fallback ────
+    # Сериализуем — datetime → isoformat. Best-effort, выкидываем dict-only.
+    serializable = {
+        k: (v.isoformat() if isinstance(v, datetime) else v)
+        for k, v in (payload or {}).items()
+    }
     try:
+        if not redis_ok:
+            raise RuntimeError("redis unavailable on read")
         from app.celery_worker import redis_client
-        import json
-        # Сериализуем — datetime → isoformat. Best-effort, выкидываем dict-only.
-        serializable = {
-            k: (v.isoformat() if isinstance(v, datetime) else v)
-            for k, v in payload.items()
-        }
+
         await redis_client.set(
             cache_key,
             json.dumps(serializable),
             ex=_SIMILAR_PAST_TTL_SEC,
         )
     except Exception as e:
-        # Fallback на in-process cache.
-        _log.debug("similar_past_redis_unavailable", error=type(e).__name__)
-        import time
-        _SIMILAR_PAST_LOCAL_CACHE[cache_key] = (time.time(), payload)
+        _log.debug("similar_past_redis_write_skipped", error=type(e).__name__)
+        _similar_past_local_put(cache_key, payload, now_ts)
     return payload
 
 

@@ -5,6 +5,9 @@
 склейки слоёв (router → state machine → trace → repository), а не качество
 синтеза LLM.
 """
+import hashlib
+import hmac
+import json
 import uuid
 from unittest.mock import patch
 
@@ -12,12 +15,47 @@ import pytest
 
 from tests.conftest import requires_postgres
 
+# Вебхук теперь fail-closed: без валидной подписи запрос отклоняется в любом
+# ENV. Smoke-тест ходит через РЕАЛЬНЫЙ аутентифицированный путь, а не в обход —
+# иначе он перестал бы покрывать связку auth → router → pipeline.
+_E2E_SECRET = "e2e-smoke-secret"
+
 # E2E smoke использует реальный `engine` из app.database через
 # `Base.metadata.create_all(engine)` + чтение IncidentRecord. На
 # self-hosted CI runner'е postgres не запущен (services: блок GitHub
 # Actions работает только на ubuntu-latest). Conditional skip — см.
 # conftest._has_live_postgres / requires_postgres marker.
 pytestmark = requires_postgres
+
+
+@pytest.fixture(autouse=True)
+def _hmac_secret(monkeypatch):
+    """Секрет для подписи + чистка anti-replay кэша между тестами."""
+    from app.config import settings
+    from app.security.replay import alertmanager_signature_cache
+
+    monkeypatch.setattr(settings, "ALERTMANAGER_WEBHOOK_SECRET", _E2E_SECRET)
+    alertmanager_signature_cache.clear()
+    yield
+    alertmanager_signature_cache.clear()
+
+
+def _post_signed(client, url: str, payload: dict):
+    """POST с корректной HMAC-подписью тела.
+
+    Сериализуем сами: подпись обязана считаться над ТЕМИ ЖЕ байтами, что уйдут
+    по сети (повторный json.dumps внутри клиента дал бы другие байты).
+    """
+    body = json.dumps(payload).encode()
+    sig = hmac.new(_E2E_SECRET.encode(), body, hashlib.sha256).hexdigest()
+    return client.post(
+        url,
+        content=body,
+        headers={
+            "Content-Type": "application/json",
+            "X-Alertmanager-Signature": sig,
+        },
+    )
 
 
 @pytest.fixture(scope="module")
@@ -119,7 +157,7 @@ def test_webhook_creates_incident_record(app_client, mock_llm, mock_k8s_context,
             }
         ],
     }
-    resp = app_client.post("/webhooks/alertmanager", json=payload)
+    resp = _post_signed(app_client, "/webhooks/alertmanager", payload)
     assert resp.status_code == 202, resp.text
     body = resp.json()
     assert body["status"] == "accepted"

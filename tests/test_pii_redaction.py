@@ -253,6 +253,28 @@ def test_pem_body_not_partially_leaked():
     assert out == "<private-key>"
 
 
+def test_redact_truncated_pem_without_end_marker():
+    # Log line cut mid-key: BEGIN present, END lost. The paired pattern
+    # requires a matching END, so the body used to sail through.
+    truncated = (
+        "loading key\n"
+        "-----BEGIN RSA PRIVATE KEY-----\n"
+        "MIIEpAIBAAKCAQEA1234567890abcdefABCDEF/+xyz\n"
+        "Zm9vYmFyYmF6cXV4"
+    )
+    out = redact_pii(truncated)
+    assert "<private-key>" in out
+    assert "MIIEpAIBAAKCAQEA" not in out
+    assert "Zm9vYmFy" not in out
+    assert "loading key" in out
+
+
+def test_truncated_pem_idempotent():
+    truncated = "-----BEGIN PRIVATE KEY-----\nc2VjcmV0a2V5"
+    once = redact_pii(truncated)
+    assert once == redact_pii(once) == "<private-key>"
+
+
 # ---------------------------------------------------------------------------
 # UUID
 # ---------------------------------------------------------------------------
@@ -329,6 +351,57 @@ def test_redact_case_insensitive_keys():
     assert "bar" not in out
     assert "baz" not in out
     assert "qux" not in out
+
+
+# ---------------------------------------------------------------------------
+# Underscore-prefixed secret keys (regression: `\b` can't match after `_`)
+# ---------------------------------------------------------------------------
+
+def test_redact_aws_secret_access_key():
+    # The AWS secret half is base64-alphabet (not hex), so _LONG_HEX never
+    # catches it — the kv-rule is the only line of defence.
+    out = redact_pii("aws_secret_access_key=wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY")
+    assert "wJalrXUtnFEMI" not in out
+    assert "aws_secret_access_key=<redacted>" in out
+
+
+def test_redact_secret_access_key():
+    out = redact_pii("secret_access_key=wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY end")
+    assert "wJalrXUtnFEMI" not in out
+    assert "secret_access_key=<redacted>" in out
+    assert "end" in out
+
+
+def test_redact_api_secret():
+    out = redact_pii("api_secret=sk_live_abcdef123456 sent")
+    assert "sk_live_abcdef123456" not in out
+    assert "api_secret=<redacted>" in out
+
+
+def test_redact_client_secret_colon_form():
+    out = redact_pii("oauth client_secret: GOCSPX-abc123def456 loaded")
+    assert "GOCSPX-abc123def456" not in out
+    assert "client_secret" in out
+    assert "<redacted>" in out
+
+
+def test_redact_refresh_token():
+    out = redact_pii("refresh_token=1//0eXyZzy-refresh-value done")
+    assert "0eXyZzy-refresh-value" not in out
+    assert "refresh_token=<redacted>" in out
+
+
+def test_redact_underscore_keys_uppercase():
+    out = redact_pii("AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMIK7MDENGbPxRfiCYEXAMPLEKEY")
+    assert "wJalrXUtnFEMIK7MDENG" not in out
+    assert "<redacted>" in out
+
+
+def test_kv_rule_does_not_eat_max_tokens():
+    # Keyword must sit at the END of the key: `max_tokens=` is a plain
+    # config knob, not a secret.
+    out = redact_pii("llm call max_tokens=1024 ok")
+    assert "max_tokens=1024" in out
 
 
 # ---------------------------------------------------------------------------

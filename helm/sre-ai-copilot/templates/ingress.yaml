@@ -29,4 +29,41 @@ spec:
             name: {{ include "sre-ai-copilot.fullname" . }}-api
             port:
               number: {{ .Values.service.port }}
+---
+# Отдельный Ingress БЕЗ oauth2-аннотаций для /discord.
+#
+# Discord шлёт POST /discord/interactions от своих серверов БЕЗ cookie/JWT.
+# oauth2-proxy auth-url на path:/ отвечал бы этим POST-ам 302 на login —
+# Discord пометил бы endpoint мёртвым, и все approve/apply-кнопки тихо
+# перестали бы работать. Аутентичность запросов проверяет само приложение:
+# Ed25519-подпись Discord (app/api/discord_interactions.py), поэтому bypass
+# oauth2 здесь безопасен by design.
+# nginx-ingress мёржит оба Ingress по host; более специфичный path /discord
+# получает location без auth_request.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: {{ include "sre-ai-copilot.fullname" . }}-ingress-discord
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "sre-ai-copilot.labels" . | nindent 4 }}
+  annotations:
+    cert-manager.io/cluster-issuer: letsencrypt-prod
+spec:
+  ingressClassName: nginx
+  tls:
+  - hosts:
+    - {{ .Values.ingress.host | quote }}
+    secretName: {{ .Values.ingress.tls.secretName | quote }}
+  rules:
+  - host: {{ .Values.ingress.host | quote }}
+    http:
+      paths:
+      - path: /discord
+        pathType: Prefix
+        backend:
+          service:
+            name: {{ include "sre-ai-copilot.fullname" . }}-api
+            port:
+              number: {{ .Values.service.port }}
 {{- end }}

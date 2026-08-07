@@ -330,17 +330,13 @@ def test_persist_creates_separate_edges_per_namespace(db):
 
 
 def test_persist_separate_edges_for_pub_and_sub(db):
-    """Pub и sub — отдельные edges (different `kind`? нет, разный extras.direction).
+    """Pub и sub — ОТДЕЛЬНЫЕ edges: direction — часть идентичности ребра.
 
-    Currently у нас один kind=`uses_nats` с extras.direction. UNIQUE по
-    (src, dst, kind) — значит pub+sub перезапишет direction друг друга.
-    Это accepted trade-off (см. docstring nats_subjects_sync.py): мы
-    предпочитаем плоский граф direction-агностичный, а direction только
-    в extras как hint. Если же сервис И публикует И слушает один subject
-    (echo-pattern, чат-команды) — последний из них перезаписывает direction.
-
-    Этот тест документирует поведение, чтобы будущие изменения были
-    осознанными.
+    Раньше UNIQUE был по (src, dst, kind), direction жил только в extras —
+    pub+sub схлопывались в одно ребро, и direction флипфлопил между тиками
+    (nats_impact_for показывал произвольное направление). Теперь UNIQUE
+    включает direction: echo-pattern (сервис И публикует, И слушает один
+    subject) даёт два стабильных ребра.
     """
     upsert_service(db, "squad-1", "echo-service")
     db.commit()
@@ -350,8 +346,27 @@ def test_persist_separate_edges_for_pub_and_sub(db):
         SubjectUsage("echo-service", "ping", "sub", "Y.cs"),
     ])
     edges = db.query(ServiceEdge).filter_by(kind="uses_nats").all()
-    assert len(edges) == 1
-    # последний direction = sub (порядок не гарантирован, но в этом случае
-    # порядок ввода детерминированный через grouped dict-обход → проверяем
-    # что direction ∈ {pub, sub}).
-    assert edges[0].extras["direction"] in {"pub", "sub"}
+    assert len(edges) == 2
+    assert {e.direction for e in edges} == {"pub", "sub"}
+    # extras.direction дублируется для legacy-консьюмеров и совпадает
+    # с колонкой (не флипфлопит).
+    for e in edges:
+        assert e.extras["direction"] == e.direction
+
+
+def test_persist_pub_sub_direction_stable_between_ticks(db):
+    """Повторный sync не меняет направление рёбер (регрессия flip-flop)."""
+    upsert_service(db, "squad-1", "echo-service")
+    db.commit()
+
+    usages = [
+        SubjectUsage("echo-service", "ping", "pub", "X.cs"),
+        SubjectUsage("echo-service", "ping", "sub", "Y.cs"),
+    ]
+    persist_to_kg(db, usages)
+    persist_to_kg(db, list(reversed(usages)))  # другой порядок обхода
+
+    edges = db.query(ServiceEdge).filter_by(kind="uses_nats").all()
+    assert len(edges) == 2
+    for e in edges:
+        assert e.extras["direction"] == e.direction

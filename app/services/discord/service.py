@@ -596,11 +596,18 @@ class DiscordService:
             })
 
         # Approve/Decline кнопки для proposed action (PR #12 executor track).
-        # Появляются ТОЛЬКО когда у нас есть execution_intent. Шлём через
-        # bot API; на webhook-пути buttons не работают (Discord ограничение),
-        # поэтому второй row добавляется только когда _can_send_via_bot()==True.
+        # Появляются ТОЛЬКО при EXECUTOR_APPROVAL_ENABLED (prod opt-in на
+        # реальный write — как у ⚙️ Apply выше; approve-кнопка ведёт к тому же
+        # apply_intent и не должна обходить флаг) и когда есть execution_intent.
+        # Шлём через bot API; на webhook-пути buttons не работают (Discord
+        # ограничение), поэтому второй row добавляется только когда
+        # _can_send_via_bot()==True.
         approve_row: Optional[list] = None
-        if execution_intent is not None and self._can_send_via_bot():
+        if (
+            settings.EXECUTOR_APPROVAL_ENABLED
+            and execution_intent is not None
+            and self._can_send_via_bot()
+        ):
             sig = intent_sig
             approve_row = [
                 {
@@ -743,11 +750,26 @@ class DiscordService:
         pg_key = _incident_dedup_key(key_full)
 
         # #1: PATCH сообщения если content-key (или fallback) уже в store.
-        # get_fresh ходит в Postgres (fallback на in-memory при недоступном PG):
+        # claim() ходит в Postgres (fallback на in-memory при недоступном PG):
         # per-process dict ломался на 2 репликах api — каждый под промахивался
         # мимо чужого кэша и дублировал critical-POST с mention.
-        existing_full = dedup_store.get_fresh(pg_key, ttl_sec=_DEDUP_TTL_SEC, now=now)
-        if existing_full is not None and (now - existing_full.get("first_ts", 0)) <= _DEDUP_TTL_SEC:
+        # Атомарный claim-before-post: раньше get_fresh → POST → save давал
+        # TOCTOU-окно, в котором обе реплики промахивались и обе постили
+        # (дубль-@here). Теперь ключ клеймится ДО POST-а (INSERT-конфликт по
+        # PK); проигравший видит запись и PATCH-ит либо молча выходит.
+        existing_full = dedup_store.claim(
+            pg_key, ttl_sec=_DEDUP_TTL_SEC, now=now,
+            alertname=alertname, namespace=namespace,
+            service=service, severity=severity,
+        )
+        if existing_full is not None:
+            if not existing_full.get("msg_id"):
+                # Placeholder другой реплики (mid-post) либо legacy-POST без
+                # msg_id — PATCH-ить нечего, дубль не шлём.
+                logging.info(
+                    "discord_incident_dedup_claimed_elsewhere key=%s", key_full,
+                )
+                return
             self._audit_dedup_event(
                 "DEDUP_HIT_CONTENT" if dedup_mode == "content"
                 else "DEDUP_HIT_FINGERPRINT",
@@ -774,13 +796,17 @@ class DiscordService:
             and (now - existing_alert.get("first_ts", 0)) <= _LINKED_WINDOW_SEC
             and existing_alert.get("count", 1) >= _LINKED_MIN_COUNT - 1
         ):
+            # Идём linked-PATCH-веткой (pg-store она не использует) —
+            # отпускаем claim, чтобы не глушить последующие content-key hits.
+            dedup_store.release(pg_key)
             await self._patch_recurrence(
                 url, embed, key_full, key_alert, namespace, pod,
                 mode="linked", now=now,
             )
             return
 
-        # Иначе — новый POST. wait=true чтобы получить msg_id для будущего edit.
+        # Иначе — новый POST (claim наш). wait=true чтобы получить msg_id
+        # для будущего edit.
         post_url = _ensure_wait_param(url)
         msg_id: Optional[str] = None
         try:
@@ -793,6 +819,9 @@ class DiscordService:
                         "discord_incident_report_failed",
                         extra={"status": r.status_code, "body": r.text[:200]},
                     )
+                    # POST не случился — отпускаем claim, иначе ключ молча
+                    # глушит алерты до конца TTL-окна.
+                    dedup_store.release(pg_key)
                     return
                 # wait=true → 200 OK + JSON message. wait=false → 204 No Content.
                 if r.status_code == 200:
@@ -802,12 +831,15 @@ class DiscordService:
                         msg_id = None
         except Exception as e:
             logging.error("discord_incident_report_exception", extra={"error": str(e)})
+            dedup_store.release(pg_key)
             return
 
         if not msg_id:
-            # Без msg_id мы не сможем PATCH-ить. Store не пополняем —
-            # следующий incident-того-же-pod пойдёт как новый POST. Это OK
-            # для legacy webhook-конфигов где wait=false.
+            # Без msg_id мы не сможем PATCH-ить (legacy webhook, wait=false) —
+            # контракт прежний: dedup-state не пополняем, следующий incident
+            # того же ключа пойдёт новым POST-ом. Claim отпускаем, иначе
+            # placeholder глушил бы его до конца TTL-окна.
+            dedup_store.release(pg_key)
             return
 
         # Cross-replica: фиксируем POST в PG-store (UPSERT по pg_key).
@@ -1898,16 +1930,28 @@ class DiscordService:
         # Cross-replica store (PG, fallback на in-memory при недоступном PG):
         # per-process dict ломался на 2 репликах api — каждый под промахивался
         # мимо чужого кэша и дублировал POST с mention.
-        existing = dedup_store.get_fresh(key, ttl_sec=ttl, now=now)
+        # Атомарный claim-before-post (см. _post_or_edit_incident): закрывает
+        # TOCTOU-окно get_fresh → POST → save между репликами.
+        existing = dedup_store.claim(
+            key, ttl_sec=ttl, now=now,
+            alertname=alertname, namespace=namespace,
+            service=service, severity=severity,
+        )
 
-        if existing is not None and (now - existing.get("first_ts", 0)) <= ttl:
+        if existing is not None:
+            if not existing.get("msg_id"):
+                # Placeholder другой реплики (mid-post) — дубль не шлём.
+                logging.info(
+                    "discord_enriched_dedup_claimed_elsewhere key=%s", key,
+                )
+                return
             await self._patch_enriched_recurrence(
                 url=url, embed=embed, key=key,
                 ttl_sec=ttl, now=now,
             )
             return
 
-        # Новый POST. wait=true чтобы получить msg_id.
+        # Новый POST (claim наш). wait=true чтобы получить msg_id.
         post_url = _ensure_wait_param(url)
         msg_id: Optional[str] = None
         try:
@@ -1920,6 +1964,8 @@ class DiscordService:
                         "discord_enriched_alert_failed",
                         extra={"status": r.status_code, "body": r.text[:200]},
                     )
+                    # POST не случился — отпускаем claim.
+                    dedup_store.release(key)
                     return
                 if r.status_code == 200:
                     try:
@@ -1928,11 +1974,14 @@ class DiscordService:
                         msg_id = None
         except Exception as e:
             logging.error("discord_enriched_alert_exception", extra={"error": str(e)})
+            dedup_store.release(key)
             return
 
         if not msg_id:
             # Legacy webhook без wait=true → нечего PATCH-ить, dedup-кэш
-            # не пополняем. Это симметрично с `_post_or_edit_incident`.
+            # не пополняем (контракт прежний: следующий firing = новый POST).
+            # Claim отпускаем — это симметрично с `_post_or_edit_incident`.
+            dedup_store.release(key)
             return
 
         dedup_store.save(

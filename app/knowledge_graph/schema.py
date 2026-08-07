@@ -109,6 +109,16 @@ class Deployment(Base):
 
     __table_args__ = (
         Index("ix_kg_deploy_service_time", "service_id", "started_at"),
+        # Один build (service + buildtype + build_number) — одна строка.
+        # Раньше дедуп был только check-then-insert в record_deployment,
+        # и конкурентные вызовы (beat task + incident pipeline) плодили
+        # дубли, раздувая deploy_count / deploy_failure_pct. NULL-значения
+        # buildtype/build_number в PG считаются различными — деплои без
+        # build-инфо (только started_at) констрейнт не ограничивает.
+        UniqueConstraint(
+            "service_id", "buildtype_id", "build_number",
+            name="uq_kg_deploy_service_build",
+        ),
     )
 
 
@@ -376,9 +386,18 @@ class LogObservation(Base):
     подряд — значит это chronic-pattern. `sample_message` — текстовый
     пример топа.
 
-    Идемпотентность: UNIQUE(service_id, ts, level, source); повторный
+    Идемпотентность: UNIQUE(ts, level, source, app_name); повторный
     beat-tick в том же окне делает ON CONFLICT DO UPDATE count=excluded.count
     в `seq_logs_sync.py`.
+
+    История ключа: раньше ключ был (service_id, ts, level, source), но
+    service_id NULLABLE — в PG NULL-ы различны, и для несматченных сервисов
+    конфликт НЕ срабатывал вовсе (каждый retry/tick плодил дубли). Плюс два
+    разных Seq `App`-а, резолвящихся в один сервис, коллизили в одну строку
+    и затирали count друг друга. Теперь идентичность строки — сырое имя
+    приложения из Seq (`app_name`, NOT NULL), а service_id — деривированная
+    атрибуция. Один App → одна строка на окно; два App-а одного сервиса —
+    две строки, суммирование делают консьюмеры (SUM(count) в queries).
     """
     __tablename__ = "kg_log_observations"
 
@@ -395,14 +414,19 @@ class LogObservation(Base):
     # Имя Seq-инстанса: prod / preprod / preupdate / wo-api3-prod / ...
     source = Column(String, nullable=True)
     namespace = Column(String, nullable=True)
+    # Сырой `App`-тэг из Seq — детерминированная NOT NULL часть UNIQUE-ключа
+    # (вместо NULLABLE service_id, см. docstring). Legacy-строки бэкфиллятся
+    # суррогатами `legacy-svc:<service_id>` / `legacy:<id>` в миграции
+    # 20260807_0200 — без потери данных.
+    app_name = Column(String, nullable=False, default="", server_default="")
     created_at = Column(DateTime, default=datetime.utcnow)
 
     service = relationship("Service")
 
     __table_args__ = (
         UniqueConstraint(
-            "service_id", "ts", "level", "source",
-            name="uq_kg_log_obs_service_ts_level_source",
+            "ts", "level", "source", "app_name",
+            name="uq_kg_log_obs_ts_level_source_app",
         ),
         Index("ix_kg_log_obs_service_ts", "service_id", "ts"),
         Index("ix_kg_log_obs_level_ts", "level", "ts"),
@@ -540,6 +564,12 @@ class ServiceEdge(Base):
     src_id = Column(Integer, ForeignKey("kg_services.id"), nullable=False, index=True)
     dst_id = Column(Integer, ForeignKey("kg_services.id"), nullable=False, index=True)
     kind = Column(String, nullable=False)
+    # Направление для kind'ов где оно различает РАЗНЫЕ рёбра (uses_nats:
+    # `pub` / `sub`). Для остальных kinds — пустая строка (NOT NULL, чтобы
+    # UNIQUE-конфликт срабатывал: NULL-ы в PG различны). Раньше direction
+    # жил только в extras и pub+sub схлопывались в одно ребро с
+    # flip-flop'ом направления между тиками.
+    direction = Column(String, nullable=False, default="", server_default="")
     weight = Column(Integer, default=1)          # «жирность» edge: % трафика, важность
     discovered_by = Column(String, nullable=True)  # populator/method, для отладки
     extras = Column(JSON, nullable=True)
@@ -554,7 +584,10 @@ class ServiceEdge(Base):
     dst = relationship("Service", foreign_keys=[dst_id])
 
     __table_args__ = (
-        UniqueConstraint("src_id", "dst_id", "kind", name="uq_kg_edge_src_dst_kind"),
+        UniqueConstraint(
+            "src_id", "dst_id", "kind", "direction",
+            name="uq_kg_edge_src_dst_kind_direction",
+        ),
     )
 
 

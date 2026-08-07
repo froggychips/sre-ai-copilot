@@ -51,6 +51,11 @@ class StateMachine:
         },
         IncidentState.FACTS_COLLECTED: {
             IncidentState.HYPOTHESIS_GENERATED,
+            # Short-circuit для suppressed rollout-noise: факты собраны,
+            # alert признан шумом — LLM-стадии (hypothesis/critic/fix/risk/
+            # synthesis) пропускаются, инцидент закрывается сразу
+            # (resolution_quality="suppressed", см. pipeline._finalize_suppressed).
+            IncidentState.RESOLVED,
             IncidentState.FAILED,
         },
         IncidentState.HYPOTHESIS_GENERATED: {

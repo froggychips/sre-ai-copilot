@@ -8,9 +8,10 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
+from app.auth import User, get_current_user
 from app.config import settings
 from app.core.state_machine import IncidentState
-from app.security.replay import is_timestamp_fresh
+from app.security.replay import alertmanager_signature_cache, is_timestamp_fresh
 from app.database import IncidentRecord, get_db
 from app.ingestion.raw_collector import raw_collector
 from app.metrics import ALERTS_SUPPRESSED
@@ -100,17 +101,30 @@ def _filter_suppressed(
 async def verify_alertmanager_signature(request: Request):
     """Verify HMAC-SHA256 signature on AlertManager webhook.
 
-    В prod settings гарантирует наличие ALERTMANAGER_WEBHOOK_SECRET (см.
-    Settings._enforce_prod_invariants). В dev без секрета вызов пропускается
-    с предупреждением — чтобы локальный e2e не требовал ключа, но шумел в логах.
+    Fail-closed: без настроенного ALERTMANAGER_WEBHOOK_SECRET все запросы
+    отклоняются с 401 в ЛЮБОМ окружении. Раньше отсутствие секрета молча
+    отключало проверку везде, кроме буквального ENV == "production" —
+    `prod`/`staging`/`Production` принимали неаутентифицированные вебхуки.
+    Для локального e2e без ключа есть ЯВНЫЙ opt-out —
+    ALERTMANAGER_ALLOW_UNAUTHENTICATED=true (шумит warning-ом в логах).
     """
     if not settings.ALERTMANAGER_WEBHOOK_SECRET:
-        log.warning(
-            "alertmanager.webhook_unauthenticated",
+        if getattr(settings, "ALERTMANAGER_ALLOW_UNAUTHENTICATED", False):
+            log.warning(
+                "alertmanager.webhook_unauthenticated",
+                env=settings.ENV,
+                reason="explicit ALERTMANAGER_ALLOW_UNAUTHENTICATED opt-in",
+            )
+            return
+        log.error(
+            "alertmanager.webhook_rejected_no_secret",
             env=settings.ENV,
-            reason="ALERTMANAGER_WEBHOOK_SECRET not set",
+            reason="ALERTMANAGER_WEBHOOK_SECRET not set (fail-closed)",
         )
-        return
+        raise HTTPException(
+            status_code=401,
+            detail="AlertManager webhook authentication is not configured",
+        )
 
     signature = request.headers.get("X-Alertmanager-Signature")
     if not signature:
@@ -143,8 +157,23 @@ async def verify_alertmanager_signature(request: Request):
         settings.ALERTMANAGER_WEBHOOK_SECRET.encode(), signed_payload, hashlib.sha256
     ).hexdigest()
 
-    if not hmac.compare_digest(signature, expected_signature):
+    # Сравниваем БАЙТЫ, не str: Starlette декодирует заголовки как latin-1,
+    # и не-ASCII символ в подписи ронял compare_digest(str, str) TypeError-ом
+    # → 500 вместо 401. encode() тут не падает (все code points < 256).
+    if not hmac.compare_digest(
+        signature.encode("utf-8"), expected_signature.encode("ascii")
+    ):
         raise HTTPException(status_code=401, detail="Invalid AlertManager signature")
+
+    # Anti-replay без signing-proxy: валидно подписанный запрос принимаем
+    # только один раз за окно свежести (AM повторяет уведомления не чаще
+    # repeat_interval — часы, легитимные повторы в окно не попадают).
+    # Покрывает и body-only путь (реальный AM), и timestamp-путь — там окно
+    # свежести само по себе оставляло replay-дыру шириной в MAX_AGE_SECONDS.
+    ttl = settings.ALERTMANAGER_WEBHOOK_MAX_AGE_SECONDS
+    if ttl > 0 and alertmanager_signature_cache.seen_recently(signature, ttl):
+        log.warning("alertmanager.webhook_replayed_signature")
+        raise HTTPException(status_code=401, detail="Replayed AlertManager request")
 
 
 def _resolved_duration_minutes(starts_at: str, ends_at: Optional[str]) -> Optional[int]:
@@ -178,6 +207,16 @@ def validate_alert_labels(alert):
     instance = labels.get("instance", "")
     if instance and not re.match(r"^[a-zA-Z0-9._:/-]+$", instance):
         raise HTTPException(status_code=400, detail="Invalid instance format")
+
+    # service/app — уходят verbatim в JQL (`summary ~ "{service}"` в
+    # jira_client) и в KG-атрибуцию. Консервативный charset против
+    # JQL/поисковых инъекций (вторая линия — экранирование в _jql_quote).
+    for label_name in ("service", "app"):
+        value = labels.get(label_name, "")
+        if value and not re.match(r"^[a-zA-Z0-9._-]{1,253}$", value):
+            raise HTTPException(
+                status_code=400, detail=f"Invalid {label_name} format"
+            )
 
 
 def _claim_refire(
@@ -253,7 +292,14 @@ async def alertmanager_webhook(
 
     accepted = []
     for alert in payload_alerts:
-        validate_alert_labels(alert)
+        try:
+            validate_alert_labels(alert)
+        except HTTPException:
+            # Один битый alert не должен ронять весь batch (паттерн /store):
+            # иначе уже принятые alerts закоммичены, остальные дропнуты, а
+            # AM-retry вечно бьётся в тот же битый alert.
+            log.warning("webhook.skipped_invalid_alert", labels=alert.labels)
+            continue
         incident = Incident.from_alertmanager(alert)
 
         existing = (
@@ -668,6 +714,8 @@ async def alertmanager_webhook_enrich_and_forward(
 
 
 @router.get("/status/{task_id}")
-async def get_task_status(task_id: str):
+async def get_task_status(task_id: str, user: User = Depends(get_current_user)):
+    # Auth как у /jobs/{task_id} в main.py: без него это был анонимный
+    # probe статусов Celery-задач (enumeration + утечка прогресса пайплайна).
     res = celery_app.AsyncResult(task_id)
     return {"task_id": task_id, "status": res.status}

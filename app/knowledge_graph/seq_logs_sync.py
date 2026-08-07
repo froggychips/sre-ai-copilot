@@ -7,12 +7,16 @@ Beat-task `kg_seq_logs_sync` каждые ~10 мин:
 3. Пытается сматчить каждую группу против `kg_services.name + namespace`
    (если namespace известен из конфигурации инстанса). Не сматчилось —
    пишем строку с `service_id=NULL` (контекст не теряем).
-4. Per (service, level, source) пишет одну строку с count, sample
+4. Per (app, level, source) пишет одну строку с count, sample
    message и md5 hash самого частого MessageTemplate.
 
-Идемпотентность: UNIQUE(service_id, ts, level, source) +
+Идемпотентность: UNIQUE(ts, level, source, app_name) +
 `ON CONFLICT DO UPDATE count=excluded.count` — повторный tick в том
-же окне переписывает count, не плодит дубли.
+же окне переписывает count, не плодит дубли. Ключ — сырое имя `App`
+из Seq (NOT NULL), а не NULLABLE service_id: в PG NULL-ы различны, и
+старый ключ (service_id, ts, level, source) для несматченных сервисов
+не конфликтовал вовсе (каждый retry плодил дубли). Два разных App-а
+одного сервиса теперь — две строки; суммируют консьюмеры (SUM(count)).
 
 Конфигурация:
     SEQ_INSTANCES — JSON список `[{"name", "url", "token", "namespace?"}]`
@@ -28,7 +32,7 @@ import hashlib
 import json
 import logging
 import re
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, cast
 
 from sqlalchemy.dialects.postgresql import insert as pg_insert
@@ -165,6 +169,21 @@ def _msg_hash(msg: str) -> str:
     return hashlib.md5(msg.encode("utf-8", errors="replace"), usedforsecurity=False).hexdigest()  # nosec B324 — content fingerprint, не security
 
 
+def _window_bucket(until: datetime, window_minutes: int) -> datetime:
+    """Начало окна, содержащего `until` (floor по epoch-времени).
+
+    Раньше бакет считался от `since` через `replace(minute=...)` — строки
+    помечались НА ОКНО РАНЬШЕ, а для window_minutes, не делящих 60,
+    границы бакетов прыгали на стыке часов. Epoch-выравнивание работает
+    для любого окна и стабильно между тиками.
+    """
+    bucket_seconds = max(int(window_minutes), 1) * 60
+    epoch_s = int(until.replace(tzinfo=timezone.utc).timestamp())
+    return datetime.fromtimestamp(
+        (epoch_s // bucket_seconds) * bucket_seconds, tz=timezone.utc,
+    ).replace(tzinfo=None)
+
+
 def _upsert_log_obs(
     db: Session,
     *,
@@ -176,12 +195,26 @@ def _upsert_log_obs(
     sample_message: Optional[str],
     source: str,
     namespace: Optional[str],
+    app_name: str,
 ) -> None:
-    """INSERT ... ON CONFLICT (service_id, ts, level, source) DO UPDATE count.
+    """INSERT ... ON CONFLICT (ts, level, source, app_name) DO UPDATE count.
 
-    Идемпотентно по уникальному ключу. Пишет также sample/hash на UPDATE —
-    повторный tick в том же окне даёт более полную картину.
+    Идемпотентно по уникальному ключу (app_name NOT NULL — конфликт
+    срабатывает и для несматченных сервисов, в отличие от старого ключа с
+    NULLABLE service_id). Пишет также sample/hash/service_id на UPDATE —
+    повторный tick в том же окне даёт более полную картину, а сервис,
+    появившийся в KG между тиками, до-атрибуцируется.
     """
+    set_clause = {
+        "count": count,
+        "top_message_hash": top_message_hash,
+        "sample_message": sample_message,
+        "namespace": namespace,
+    }
+    # Дозревшая атрибуция: сервис появился в KG между тиками → проставляем.
+    # None существующую атрибуцию не затирает.
+    if service_id is not None:
+        set_clause["service_id"] = service_id
     stmt = (
         pg_insert(LogObservation.__table__)
         .values(
@@ -193,16 +226,12 @@ def _upsert_log_obs(
             sample_message=sample_message,
             source=source,
             namespace=namespace,
+            app_name=app_name,
             created_at=datetime.utcnow(),
         )
         .on_conflict_do_update(
-            constraint="uq_kg_log_obs_service_ts_level_source",
-            set_={
-                "count": count,
-                "top_message_hash": top_message_hash,
-                "sample_message": sample_message,
-                "namespace": namespace,
-            },
+            constraint="uq_kg_log_obs_ts_level_source_app",
+            set_=set_clause,
         )
     )
     # SAVEPOINT на строку: при DataError/IntegrityError одна битая строка
@@ -288,6 +317,7 @@ async def _sync_instance(
                     sample_message=sample_redacted,
                     source=name,
                     namespace=ns_for_row,
+                    app_name=app_name or "",
                 )
                 stats["rows"] += 1
             except Exception as e:
@@ -310,10 +340,9 @@ async def _sync_seq_logs_async(
 
     until = datetime.utcnow()
     since = until - timedelta(minutes=window_minutes)
-    # Бакет ts — округлённый до начала окна, чтобы повторные tick'и в
-    # пределах окна писали в ту же строку через ON CONFLICT.
-    bucket_minutes = (since.minute // window_minutes) * window_minutes
-    ts_bucket = since.replace(minute=bucket_minutes, second=0, microsecond=0)
+    # Бакет ts — начало ТЕКУЩЕГО окна (floor от `until`), чтобы повторные
+    # tick'и в пределах окна писали в ту же строку через ON CONFLICT.
+    ts_bucket = _window_bucket(until, window_minutes)
 
     totals = {"instances": len(instances), "rows": 0, "matched": 0, "unmatched": 0}
     for inst in instances:

@@ -83,8 +83,11 @@ def _upsert_service_pg(
     set_clause: Dict[str, Any] = {"updated_at": now}
     if team_owner:
         set_clause["team_owner"] = team_owner
-    if metadata is not None:
-        set_clause["metadata_json"] = metadata
+    # metadata_json НЕ кладём в set_clause: полный overwrite стирал ключи
+    # других источников (auto_populator пишет app/component/version,
+    # drift_cleanup — drift_marked_at, topology-sync — k8s_service).
+    # Merge делаем в Python после upsert-а (см. ниже) — каждый источник
+    # владеет своими ключами, чужие не трогает.
     if synthetic is not None:
         set_clause["synthetic"] = bool(synthetic)
 
@@ -100,9 +103,24 @@ def _upsert_service_pg(
     db.execute(stmt)
     db.flush()
     logger.info("kg.service_upserted", namespace=namespace, name=name, node_kind=node_kind)
-    return db.query(Service).filter_by(
-        namespace=namespace, name=name, node_kind=node_kind,
-    ).one()
+    # populate_existing(): upsert шёл через Core — identity-map мог держать
+    # stale-инстанс, перечитываем поверх (та же история что в record_alert_event).
+    svc = (
+        db.query(Service)
+        .filter_by(namespace=namespace, name=name, node_kind=node_kind)
+        .populate_existing()
+        .one()
+    )
+    if metadata is not None:
+        existing_meta: Dict[str, Any] = (
+            svc.metadata_json if isinstance(svc.metadata_json, dict) else {}
+        )
+        merged = dict(existing_meta)
+        merged.update(metadata)
+        if merged != existing_meta:
+            svc.metadata_json = merged
+            db.flush()
+    return svc
 
 
 def _upsert_service_fallback(
@@ -141,8 +159,16 @@ def _upsert_service_fallback(
             svc.team_owner = team_owner
             changed = True
         if metadata is not None:
-            svc.metadata_json = metadata
-            changed = True
+            # Merge, не overwrite — сохраняем ключи других источников
+            # (зеркалит PG-путь).
+            existing_meta: Dict[str, Any] = (
+                svc.metadata_json if isinstance(svc.metadata_json, dict) else {}
+            )
+            merged = dict(existing_meta)
+            merged.update(metadata)
+            if merged != existing_meta:
+                svc.metadata_json = merged
+                changed = True
         if synthetic is not None and svc.synthetic != synthetic:
             svc.synthetic = synthetic
             changed = True
@@ -159,15 +185,24 @@ def upsert_edge(
     weight: int = 1,
     discovered_by: Optional[str] = None,
     extras: Optional[Dict[str, Any]] = None,
+    direction: str = "",
 ) -> ServiceEdge:
-    """Idempotent upsert по (src_id, dst_id, kind).
+    """Idempotent upsert по (src_id, dst_id, kind, direction).
 
     На PostgreSQL — INSERT ON CONFLICT, исключает race condition.
     `extras` (JSON): discovery_sources и confidence — merge, не overwrite.
+
+    `direction` — часть идентичности ребра для kinds где направление
+    различает РАЗНЫЕ рёбра (uses_nats: `pub` / `sub` сосуществуют).
+    Для остальных kinds — оставить дефолт "" (поведение как раньше).
     """
     if _is_postgresql(db):
-        return _upsert_edge_pg(db, src, dst, kind, weight, discovered_by, extras)
-    return _upsert_edge_fallback(db, src, dst, kind, weight, discovered_by, extras)
+        return _upsert_edge_pg(
+            db, src, dst, kind, weight, discovered_by, extras, direction,
+        )
+    return _upsert_edge_fallback(
+        db, src, dst, kind, weight, discovered_by, extras, direction,
+    )
 
 
 def _upsert_edge_pg(
@@ -178,6 +213,7 @@ def _upsert_edge_pg(
     weight: int,
     discovered_by: Optional[str],
     extras: Optional[Dict[str, Any]],
+    direction: str = "",
 ) -> ServiceEdge:
     from sqlalchemy import func
     from sqlalchemy.dialects.postgresql import insert as pg_insert
@@ -190,7 +226,7 @@ def _upsert_edge_pg(
     stmt = (
         pg_insert(ServiceEdge.__table__)
         .values(
-            src_id=src.id, dst_id=dst.id, kind=kind,
+            src_id=src.id, dst_id=dst.id, kind=kind, direction=direction or "",
             weight=weight, discovered_by=discovered_by,
             extras=initial_extras or None, last_seen_at=now,
         )
@@ -200,7 +236,7 @@ def _upsert_edge_pg(
     # «жирность» (доля трафика, важность), следующий env-sync затёр бы её в 1.
     # GREATEST(existing, excluded) — монотонный апдейт: weight только растёт.
     stmt = stmt.on_conflict_do_update(
-        constraint="uq_kg_edge_src_dst_kind",
+        constraint="uq_kg_edge_src_dst_kind_direction",
         set_={
             "last_seen_at": now,
             "weight": func.greatest(
@@ -212,7 +248,17 @@ def _upsert_edge_pg(
     db.execute(stmt)
     db.flush()
 
-    edge = db.query(ServiceEdge).filter_by(src_id=src.id, dst_id=dst.id, kind=kind).one()
+    # populate_existing(): upsert шёл через Core — identity-map мог держать
+    # stale-инстанс (weight/last_seen_at с прошлого вызова). Перечитываем
+    # строку поверх него (та же починка, что в record_alert_event).
+    edge = (
+        db.query(ServiceEdge)
+        .filter_by(
+            src_id=src.id, dst_id=dst.id, kind=kind, direction=direction or "",
+        )
+        .populate_existing()
+        .one()
+    )
     # C3: merge extras + discovery_sources в Python (JSONB merge в SQL сложнее).
     merged = dict(edge.extras or {})
     changed = False
@@ -239,11 +285,13 @@ def _upsert_edge_fallback(
     weight: int,
     discovered_by: Optional[str],
     extras: Optional[Dict[str, Any]],
+    direction: str = "",
 ) -> ServiceEdge:
     edge = (
         db.query(ServiceEdge)
         .filter(ServiceEdge.src_id == src.id, ServiceEdge.dst_id == dst.id,
-                ServiceEdge.kind == kind)
+                ServiceEdge.kind == kind,
+                ServiceEdge.direction == (direction or ""))
         .one_or_none()
     )
     now = datetime.utcnow()
@@ -254,6 +302,7 @@ def _upsert_edge_fallback(
     if edge is None:
         edge = ServiceEdge(
             src_id=src.id, dst_id=dst.id, kind=kind, weight=weight,
+            direction=direction or "",
             discovered_by=discovered_by, extras=initial_extras or None,
             last_seen_at=now,
         )
@@ -294,22 +343,48 @@ def record_deployment(
     extras: Optional[Dict[str, Any]] = None,
 ) -> Deployment:
     # Dedup: один build (buildtype_id + build_number) не должен дублироваться
-    # если появляется в нескольких инцидентах.
+    # если появляется в нескольких инцидентах. Раньше был check-then-insert —
+    # конкурентные вызовы (beat task tc_deploys_to_kg + incident pipeline)
+    # проскакивали между SELECT и INSERT и плодили дубли, раздувая
+    # deploy_count / deploy_failure_pct в signal_aggregates. Теперь —
+    # атомарный INSERT ON CONFLICT по uq_kg_deploy_service_build.
     if buildtype_id and build_number:
-        existing = (
+        from sqlalchemy import func
+        from sqlalchemy.dialects.postgresql import insert as pg_insert
+
+        tbl = Deployment.__table__
+        stmt = pg_insert(tbl).values(
+            service_id=service.id,
+            started_at=started_at,
+            finished_at=finished_at,
+            sha=sha,
+            repo=repo,
+            buildtype_id=buildtype_id,
+            build_number=build_number,
+            status=status,
+            triggered_by=triggered_by,
+            extras=extras,
+        )
+        # На конфликт — прежняя семантика dedup-а: существующая строка
+        # остаётся как есть, только sha бэкфиллится если раньше был NULL.
+        stmt = stmt.on_conflict_do_update(
+            index_elements=["service_id", "buildtype_id", "build_number"],
+            set_={"sha": func.coalesce(tbl.c.sha, stmt.excluded.sha)},
+        )
+        db.execute(stmt)
+        db.flush()
+        # populate_existing() — та же защита от stale identity-map, что и
+        # в record_alert_event / _upsert_edge_pg.
+        return (
             db.query(Deployment)
             .filter(
                 Deployment.service_id == service.id,
                 Deployment.buildtype_id == buildtype_id,
                 Deployment.build_number == build_number,
             )
-            .one_or_none()
+            .populate_existing()
+            .one()
         )
-        if existing is not None:
-            if sha and not existing.sha:
-                existing.sha = sha
-                db.flush()
-            return existing
 
     dep = Deployment(
         service_id=service.id,
@@ -342,7 +417,16 @@ def record_alert_event(
     нескольких репликах воркера (раньше check-then-insert ловил гонку, а с
     восстановленным UNIQUE(fingerprint) — ещё и IntegrityError). На конфликт:
     severity/raw обновляются только если переданы (COALESCE), last_notified_at
-    всегда; service_id/fired_at/incident_id/resolved_at не трогаем.
+    всегда; service_id/incident_id не трогаем.
+
+    Re-fire закрытого алерта: если существующая строка уже resolved
+    (resolved_at NOT NULL), повторный fire с тем же fingerprint — это НОВЫЙ
+    инцидент того же источника (external_probe шлёт стабильный
+    `external_probe:{host}`). Тогда resolved_at сбрасывается в NULL, fired_at
+    обновляется на новый. Раньше строка навсегда оставалась «resolved» —
+    health_score / stuck_alerts / RCA не видели открытый алерт, а
+    resolve-путь не находил что закрывать. Дедуп ЕЩЁ ОТКРЫТОГО алерта
+    (resolved_at IS NULL) не ломаем: fired_at оригинала сохраняется.
 
     Без fingerprint идемпотентность невозможна — обычный insert.
     """
@@ -362,18 +446,10 @@ def record_alert_event(
         db.flush()
         return ev
 
+    from sqlalchemy import case, null
     from sqlalchemy.dialects.postgresql import insert as pg_insert
 
     tbl = AlertEvent.__table__
-    # На конфликт обновляем только переданные поля (как было до upsert):
-    # severity/raw трогаем лишь если непустые, last_notified_at — всегда.
-    # COALESCE здесь не годится: JSON-колонка сериализует None как JSON
-    # `null` (не SQL NULL), и COALESCE(EXCLUDED.raw, ...) затёр бы raw.
-    set_clause: Dict[str, Any] = {"last_notified_at": now}
-    if severity:
-        set_clause["severity"] = severity
-    if raw is not None:
-        set_clause["raw"] = raw
     stmt = pg_insert(tbl).values(
         service_id=service.id if service else None,
         alertname=alertname,
@@ -383,7 +459,33 @@ def record_alert_event(
         last_notified_at=now,
         incident_id=incident_id,
         raw=raw,
-    ).on_conflict_do_update(
+    )
+    # На конфликт обновляем только переданные поля (как было до upsert):
+    # severity/raw трогаем лишь если непустые, last_notified_at — всегда.
+    # COALESCE здесь не годится: JSON-колонка сериализует None как JSON
+    # `null` (не SQL NULL), и COALESCE(EXCLUDED.raw, ...) затёр бы raw.
+    #
+    # fired_at / resolved_at — CASE по состоянию существующей строки:
+    #   * строка resolved (resolved_at NOT NULL) → genuine re-fire: fired_at
+    #     берём новый (EXCLUDED), resolved_at сбрасываем в NULL;
+    #   * строка ещё открыта → дедуп ongoing-алерта: оба поля не трогаем
+    #     (fired_at оригинала сохраняется).
+    set_clause: Dict[str, Any] = {
+        "last_notified_at": now,
+        "fired_at": case(
+            (tbl.c.resolved_at.isnot(None), stmt.excluded.fired_at),
+            else_=tbl.c.fired_at,
+        ),
+        "resolved_at": case(
+            (tbl.c.resolved_at.isnot(None), null()),
+            else_=tbl.c.resolved_at,
+        ),
+    }
+    if severity:
+        set_clause["severity"] = severity
+    if raw is not None:
+        set_clause["raw"] = raw
+    stmt = stmt.on_conflict_do_update(
         index_elements=["fingerprint"],
         set_=set_clause,
     )

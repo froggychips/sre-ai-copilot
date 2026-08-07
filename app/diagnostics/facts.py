@@ -48,10 +48,23 @@ class FactKind:
 
 # Пары взаимоисключающих фактов.
 # exit 137 (SIGKILL/OOM) и exit 139+ (SIGSEGV и др.) физически не могут быть
-# одновременно причиной одного краша — если оба observed=True, данные противоречивы.
+# одновременно причиной ОДНОГО краша — если оба observed=True ДЛЯ ОДНОГО
+# subject-а, данные противоречивы. Разные поды (OOM у одного, segfault у
+# другого) — не конфликт, а два независимых наблюдения (см. _same_subject).
 MUTUALLY_EXCLUSIVE_PAIRS: List[FrozenSet[str]] = [
     frozenset({FactKind.OOM_KILLED, FactKind.PROCESS_CRASH}),
 ]
+
+
+def _same_subject(a: Optional[str], b: Optional[str]) -> bool:
+    """Конфликт осмыслен только про один subject.
+
+    None = subject неизвестен — консервативно считаем совпадением (лучше
+    ложное предупреждение о противоречии, чем скрытое противоречие).
+    """
+    if a is None or b is None:
+        return True
+    return a == b
 
 
 class FactStore:
@@ -84,7 +97,12 @@ class FactStore:
         return any(f.observed for f in self.by_kind(kind))
 
     def conflicts(self) -> List[Tuple[Fact, Fact]]:
-        """Пары фактов, оба observed=True и взаимоисключающих друг друга."""
+        """Пары фактов: оба observed=True, взаимоисключающие И про один subject.
+
+        Subject-aware: oom_killed(pod-a) × process_crash(pod-b) для разных
+        подов — НЕ конфликт (раньше такая пара давала ложное «data is
+        contradictory» и резала обе confidence до 0.60).
+        """
         result: List[Tuple[Fact, Fact]] = []
         for pair in MUTUALLY_EXCLUSIVE_PAIRS:
             kinds = list(pair)
@@ -92,7 +110,8 @@ class FactStore:
             b_facts = [f for f in self._facts if f.kind == kinds[1] and f.observed]
             for a in a_facts:
                 for b in b_facts:
-                    result.append((a, b))
+                    if _same_subject(a.subject, b.subject):
+                        result.append((a, b))
         return result
 
     def to_dict(self) -> Dict[str, Any]:

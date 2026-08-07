@@ -7,6 +7,9 @@
   валидной подписи; протухший ts → False (подпись валидна, но stale).
 - AlertManager verify_alertmanager_signature: body-only (backward-compat),
   timestamp-режим fresh/stale, REQUIRE_SIGNED_TIMESTAMP.
+- Fail-closed без секрета + явный opt-out ALERTMANAGER_ALLOW_UNAUTHENTICATED.
+- Seen-signature cache: повтор валидно подписанного запроса в окне → 401.
+- Не-ASCII подпись → 401, а не TypeError/500.
 """
 from __future__ import annotations
 
@@ -14,6 +17,7 @@ import hashlib
 import hmac
 import json
 import time
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -21,7 +25,19 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from fastapi import HTTPException
 
 from app.api import discord_interactions, webhooks
-from app.security.replay import is_timestamp_fresh
+from app.security.replay import (
+    SeenSignatureCache,
+    alertmanager_signature_cache,
+    is_timestamp_fresh,
+)
+
+
+@pytest.fixture(autouse=True)
+def _clean_replay_cache():
+    """Seen-signature cache — process-global; изолируем тесты друг от друга."""
+    alertmanager_signature_cache.clear()
+    yield
+    alertmanager_signature_cache.clear()
 
 
 # ── unit: is_timestamp_fresh ────────────────────────────────────────────
@@ -140,3 +156,127 @@ async def test_am_require_timestamp_rejects_body_only(monkeypatch):
         await webhooks.verify_alertmanager_signature(req)
     assert exc.value.status_code == 401
     assert "Missing AlertManager timestamp" in exc.value.detail
+
+
+# ── fail-closed без секрета (фикс: auth больше не «fail-open вне production») ─
+
+
+@pytest.mark.asyncio
+async def test_am_no_secret_fails_closed(monkeypatch):
+    """Без ALERTMANAGER_WEBHOOK_SECRET → 401 в любом ENV, а не молчаливый пропуск."""
+    monkeypatch.setattr(webhooks.settings, "ALERTMANAGER_WEBHOOK_SECRET", None)
+    body = json.dumps({"alerts": []}).encode()
+    req = _am_request(body, "irrelevant")
+    with pytest.raises(HTTPException) as exc:
+        await webhooks.verify_alertmanager_signature(req)
+    assert exc.value.status_code == 401
+
+
+@pytest.mark.asyncio
+async def test_am_no_secret_explicit_opt_out_allows(monkeypatch):
+    """ALERTMANAGER_ALLOW_UNAUTHENTICATED=true — единственный способ жить без ключа.
+
+    Поле добавляется в Settings централизованно; здесь подменяем модульный
+    settings объектом-двойником (setattr несуществующего поля на pydantic-модели
+    кидает ValueError).
+    """
+    fake_settings = SimpleNamespace(
+        ALERTMANAGER_WEBHOOK_SECRET=None,
+        ALERTMANAGER_ALLOW_UNAUTHENTICATED=True,
+        ENV="development",
+    )
+    monkeypatch.setattr(webhooks, "settings", fake_settings)
+    body = json.dumps({"alerts": []}).encode()
+    req = _am_request(body, "irrelevant")
+    assert await webhooks.verify_alertmanager_signature(req) is None
+
+
+# ── seen-signature cache (anti-replay без signing-proxy) ─────────────────
+
+
+@pytest.mark.asyncio
+async def test_am_body_only_replay_rejected(monkeypatch):
+    """Повтор того же валидно подписанного запроса в окне свежести → 401."""
+    monkeypatch.setattr(webhooks.settings, "ALERTMANAGER_WEBHOOK_SECRET", _SECRET)
+    monkeypatch.setattr(webhooks.settings, "ALERTMANAGER_REQUIRE_SIGNED_TIMESTAMP", False)
+    body = json.dumps({"alerts": [{"replayed": True}]}).encode()
+    sig = _hmac(body)
+
+    assert await webhooks.verify_alertmanager_signature(_am_request(body, sig)) is None
+    with pytest.raises(HTTPException) as exc:
+        await webhooks.verify_alertmanager_signature(_am_request(body, sig))
+    assert exc.value.status_code == 401
+    assert "Replayed" in exc.value.detail
+
+
+@pytest.mark.asyncio
+async def test_am_timestamp_mode_replay_rejected(monkeypatch):
+    """Timestamp-режим: окно свежести само по себе оставляло replay-дыру."""
+    monkeypatch.setattr(webhooks.settings, "ALERTMANAGER_WEBHOOK_SECRET", _SECRET)
+    body = json.dumps({"alerts": []}).encode()
+    ts = str(int(time.time()))
+    sig = _hmac(ts.encode() + b"." + body)
+
+    assert await webhooks.verify_alertmanager_signature(
+        _am_request(body, sig, timestamp=ts)
+    ) is None
+    with pytest.raises(HTTPException) as exc:
+        await webhooks.verify_alertmanager_signature(_am_request(body, sig, timestamp=ts))
+    assert exc.value.status_code == 401
+
+
+@pytest.mark.asyncio
+async def test_am_different_bodies_not_flagged_as_replay(monkeypatch):
+    """Два разных batch-а подряд — оба проходят (кэш ключуется подписью)."""
+    monkeypatch.setattr(webhooks.settings, "ALERTMANAGER_WEBHOOK_SECRET", _SECRET)
+    body1 = json.dumps({"alerts": [1]}).encode()
+    body2 = json.dumps({"alerts": [2]}).encode()
+    assert await webhooks.verify_alertmanager_signature(
+        _am_request(body1, _hmac(body1))
+    ) is None
+    assert await webhooks.verify_alertmanager_signature(
+        _am_request(body2, _hmac(body2))
+    ) is None
+
+
+@pytest.mark.asyncio
+async def test_am_replay_check_disabled_by_zero_window(monkeypatch):
+    """MAX_AGE_SECONDS <= 0 — escape hatch, replay-проверка выключена."""
+    monkeypatch.setattr(webhooks.settings, "ALERTMANAGER_WEBHOOK_SECRET", _SECRET)
+    monkeypatch.setattr(
+        webhooks.settings, "ALERTMANAGER_WEBHOOK_MAX_AGE_SECONDS", 0
+    )
+    body = json.dumps({"alerts": []}).encode()
+    sig = _hmac(body)
+    assert await webhooks.verify_alertmanager_signature(_am_request(body, sig)) is None
+    assert await webhooks.verify_alertmanager_signature(_am_request(body, sig)) is None
+
+
+def test_seen_signature_cache_ttl_and_eviction():
+    """Unit на кэш: TTL-протухание и bounded-eviction старейших записей."""
+    cache = SeenSignatureCache(max_entries=2)
+    now = 1_000_000.0
+    assert cache.seen_recently("a", 300, now=now) is False
+    assert cache.seen_recently("a", 300, now=now + 1) is True  # replay в окне
+    assert cache.seen_recently("a", 300, now=now + 301) is False  # протух
+
+    cache.clear()
+    assert cache.seen_recently("s1", 300, now=now) is False
+    assert cache.seen_recently("s2", 300, now=now) is False
+    assert cache.seen_recently("s3", 300, now=now) is False  # вытесняет s1
+    assert cache.seen_recently("s1", 300, now=now + 1) is False  # s1 забыт (bounded)
+    assert cache.seen_recently("s3", 300, now=now + 1) is True
+
+
+# ── не-ASCII подпись: 401, а не TypeError → 500 ──────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_am_non_ascii_signature_rejected_401(monkeypatch):
+    """Starlette декодирует заголовки latin-1; 0xFF байт ронял compare_digest."""
+    monkeypatch.setattr(webhooks.settings, "ALERTMANAGER_WEBHOOK_SECRET", _SECRET)
+    body = json.dumps({"alerts": []}).encode()
+    req = _am_request(body, "\xff" * 16)
+    with pytest.raises(HTTPException) as exc:
+        await webhooks.verify_alertmanager_signature(req)
+    assert exc.value.status_code == 401

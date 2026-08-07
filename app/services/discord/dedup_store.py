@@ -20,6 +20,7 @@ from datetime import datetime, timezone
 from typing import Any, Dict, Optional, cast
 
 from sqlalchemy import Column, DateTime, Integer, String, JSON
+from sqlalchemy.exc import IntegrityError
 
 from app.database import Base
 from . import dedup as _dedup_state
@@ -115,6 +116,124 @@ def get_fresh(key: str, ttl_sec: int, now: Optional[float] = None) -> Optional[D
             if rec is None or (now - rec.get("first_ts", 0)) > ttl_sec:
                 return None
             return dict(rec)
+
+
+def claim(
+    key: str,
+    ttl_sec: int,
+    now: Optional[float] = None,
+    *,
+    alertname: Optional[str] = None,
+    namespace: Optional[str] = None,
+    service: Optional[str] = None,
+    severity: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
+    """Атомарно заклеймить ключ ПЕРЕД POST-ом (закрывает TOCTOU двух реплик).
+
+    Старый цикл get_fresh → POST → save оставлял окно на длину HTTP-roundtrip:
+    обе реплики промахивались и обе постили (дубль-@here). Здесь ключ
+    резервируется placeholder-строкой (msg_id="") ДО POST-а; атомарность даёт
+    PK-конфликт INSERT-а.
+
+    Возвращает:
+      - None — claim наш: caller делает POST, затем save() (финализация с
+        реальным msg_id) либо release() при неудаче POST-а;
+      - dict с непустым msg_id — сообщение уже есть: caller PATCH-ит;
+      - dict с пустым msg_id — другая реплика mid-post (или legacy-POST без
+        msg_id): caller молча пропускает дубль.
+    """
+    now = now or time.time()
+    # Быстрый путь: свежая запись уже есть (и это же — совместимость с
+    # тестами, подменяющими get_fresh).
+    existing = get_fresh(key, ttl_sec=ttl_sec, now=now)
+    if existing is not None:
+        return existing
+    try:
+        with _pg_session() as db:
+            row = DiscordDedupEntry(
+                key=key,
+                msg_id="",           # placeholder до финализации save()
+                webhook_url="",
+                embed=None,
+                first_ts=_to_dt(now),
+                last_ts=_to_dt(now),
+                count=1,
+                alertname=alertname,
+                namespace=namespace,
+                service=service,
+                severity=severity,
+            )
+            db.add(row)
+            try:
+                db.commit()
+                return None  # claim наш
+            except IntegrityError:
+                # Проиграли гонку INSERT-а либо лежит stale-строка.
+                db.rollback()
+                locked = db.get(DiscordDedupEntry, key, with_for_update=True)
+                if locked is None:
+                    # Строку выпилил janitor между конфликтом и SELECT —
+                    # окно микроскопическое; ведём себя как при свободном
+                    # ключе (старое поведение = POST).
+                    return None
+                if _to_ts(cast(datetime, locked.first_ts)) >= now - ttl_sec:
+                    return _row_to_dict(locked)
+                # Stale-строка: переклеймливаем окно под себя.
+                locked.msg_id = ""
+                locked.webhook_url = ""
+                locked.embed = None
+                locked.first_ts = _to_dt(now)
+                locked.last_ts = _to_dt(now)
+                locked.count = 1
+                locked.alertname = alertname
+                locked.namespace = namespace
+                locked.service = service
+                locked.severity = severity
+                db.commit()
+                return None
+    except Exception as e:
+        _fallback(e)
+        with _dedup_lock:
+            rec = _dedup_state._recent_enriched.get(key)
+            if rec is not None and (now - rec.get("first_ts", 0)) <= ttl_sec:
+                return dict(rec)
+            # Свободно/протухло — клеймим placeholder-ом (под локом = атомарно
+            # в рамках процесса; cross-replica гарантии без PG нет, как и
+            # раньше у fallback-пути).
+            _dedup_state._recent_enriched[key] = {
+                "msg_id": "",
+                "first_ts": now,
+                "last_ts": now,
+                "count": 1,
+                "webhook_url": "",
+                "embed": None,
+                "alertname": alertname,
+                "namespace": namespace,
+                "service": service,
+                "severity": severity,
+            }
+            return None
+
+
+def release(key: str) -> None:
+    """Снять незавершённый claim (POST упал) — освободить ключ.
+
+    Удаляет ТОЛЬКО placeholder (msg_id="") — финализированную запись с
+    реальным msg_id не трогаем.
+    """
+    try:
+        with _pg_session() as db:
+            row = db.get(DiscordDedupEntry, key, with_for_update=True)
+            if row is not None and not row.msg_id:
+                db.delete(row)
+                db.commit()
+            return
+    except Exception as e:
+        _fallback(e)
+        with _dedup_lock:
+            rec = _dedup_state._recent_enriched.get(key)
+            if rec is not None and not rec.get("msg_id"):
+                del _dedup_state._recent_enriched[key]
 
 
 def purge_stale(ttl_sec: int, now: Optional[float] = None) -> int:

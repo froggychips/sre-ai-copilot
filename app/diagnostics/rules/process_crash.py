@@ -25,7 +25,7 @@ import re
 from typing import Any, Dict, List, Optional, Tuple
 
 from app.diagnostics.facts import Fact, FactKind
-from app.diagnostics.rules.base import Rule
+from app.diagnostics.rules.base import Rule, same_workload
 
 # exit_code → (signal_name, confidence)
 _CRASH_EXIT_CODES: Dict[int, Tuple[str, float]] = {
@@ -114,14 +114,22 @@ class ProcessCrashRule(Rule):
     def _check_pod_state(
         self, pod_state: Dict[str, Any], pod: Optional[str]
     ) -> Optional[Fact]:
-        """Проверяем terminated state для target-пода, затем для всех остальных."""
+        """Проверяем terminated state target-пода, затем подов его workload-а.
+
+        Скоуп как в OOMKilledRule: пересозданный под того же workload-а
+        (другой rs-hash) матчится через same_workload, а краш НЕсвязанного
+        сервиса в том же namespace этому инциденту не приписывается.
+        Если target неизвестен — сканируем всё (скоупить не по чему).
+        """
         candidates = []
         if pod and pod in pod_state:
             candidates.append((pod, pod_state[pod]))
-        # Проверяем все поды namespace — вдруг target уже пересоздан
         for pod_name, info in pod_state.items():
-            if pod_name != pod:
-                candidates.append((pod_name, info))
+            if pod_name == pod:
+                continue
+            if pod and not same_workload(pod_name, pod):
+                continue
+            candidates.append((pod_name, info))
 
         for pod_name, info in candidates:
             exit_code = info.get("exit_code")

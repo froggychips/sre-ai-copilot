@@ -23,3 +23,13 @@ opentelemetry-exporter-otlp
 prometheus-client
 psycopg2-binary
 tenacity
+# Прямые зависимости, раньше жившие только транзитивно (реген лока или
+# обновление родителя молча их дропнет — тот же класс граблей, что pyjwt/
+# cryptography выше):
+#   httpx    — ~11 модулей (Seq/VM/AM/Discord-клиенты и др.)
+#   pyyaml   — app/services/ownership_suggester.py (import yaml)
+#   requests — scripts/squad_dashboard.py (гоняется из образа CronJob-ом
+#              squad-dashboard; psycopg2 оттуда же покрыт psycopg2-binary)
+httpx
+pyyaml
+requests

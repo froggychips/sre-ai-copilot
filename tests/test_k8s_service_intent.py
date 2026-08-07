@@ -56,6 +56,33 @@ def test_intent_to_operation_describe_uses_intent_resource_type():
     assert op.resource == "services"
 
 
+def test_intent_to_operation_pluralizes_ingress_correctly():
+    """Наивное `+ "s"` давало "ingresss" → guard молча блокировал describe ingress."""
+    intent = ExecutionIntent(
+        action=ActionType.DESCRIBE_RESOURCE,
+        resource_type="ingress",
+        resource_name="town-ingress",
+        namespace="squad-2",
+    )
+    op = _intent_to_operation(intent)
+    assert op.resource == "ingresses"
+
+
+def test_describe_ingress_passes_guard():
+    """Полный путь: describe ingress не должен падать на resource-allowlist."""
+    svc = K8sService()
+    intent = ExecutionIntent(
+        action=ActionType.DESCRIBE_RESOURCE,
+        resource_type="ingress",
+        resource_name="town-ingress",
+        namespace="squad-2",
+    )
+    fake_proc = MagicMock(returncode=0, stdout="ok", stderr="")
+    with patch("app.services.k8s_service.subprocess.run", return_value=fake_proc):
+        result = svc.execute_intent(intent, dry_run=True)
+    assert result["success"] is True
+
+
 def test_execute_intent_dry_run_passes_through_guard_and_subprocess():
     """dry_run=True → нет SAFE_MODE-блокировки, kubectl вызывается."""
     svc = K8sService()

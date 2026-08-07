@@ -366,6 +366,36 @@ def _beat_heartbeat_key(task_name: str) -> str:
     return f"{_BEAT_HEARTBEAT_REDIS_PREFIX}:{task_name}"
 
 
+# Module-level sync Redis-клиент для heartbeat-ключей. Раньше КАЖДЫЙ вызов
+# _record_task_heartbeat/_get_beat_last_run строил новый redis.Redis.from_url
+# и никогда его не закрывал — постоянный connection churn (heartbeat пишется
+# task_postrun-сигналом каждого beat-таска). redis-py клиент внутри держит
+# connection pool: он потокобезопасен, переживает fork (pool сбрасывается по
+# pid-check) и сам переподключается — один клиент на процесс достаточен.
+#
+# Кэш ключуется ИДЕНТИЧНОСТЬЮ модуля `redis`: тесты подменяют его через
+# sys.modules (см. test_stats_topology_pipeline_fixes), и клиент от прежнего
+# (фейкового/реального) модуля не должен пережить подмену. В проде модуль
+# один → кэш стабильный.
+_beat_redis_cache: Optional[Tuple[Any, Any]] = None  # (redis-модуль, клиент)
+
+
+def _get_beat_redis():
+    """Переиспользуемый sync-клиент для heartbeat-ключей.
+
+    Может бросить (Redis недоступен на этапе конструирования) — вызывающие
+    оборачивают в свой try/except (fail-open). Неудачная инициализация НЕ
+    кэшируется.
+    """
+    global _beat_redis_cache
+    import redis
+    if _beat_redis_cache is not None and _beat_redis_cache[0] is redis:
+        return _beat_redis_cache[1]
+    client = redis.Redis.from_url(settings.REDIS_URL, decode_responses=True)
+    _beat_redis_cache = (redis, client)
+    return client
+
+
 def _record_task_heartbeat(task_name: str, ts: Optional[datetime] = None) -> None:
     """Зафиксировать факт успешного завершения beat-task'а.
 
@@ -380,9 +410,8 @@ def _record_task_heartbeat(task_name: str, ts: Optional[datetime] = None) -> Non
     if ts is None:
         ts = datetime.now(timezone.utc)
     try:
-        import redis
-        client = redis.Redis.from_url(settings.REDIS_URL, decode_responses=True)
-        client.set(  # type: ignore[attr-defined]
+        client = _get_beat_redis()
+        client.set(
             _beat_heartbeat_key(task_name),
             ts.isoformat(),
             ex=_BEAT_HEARTBEAT_REDIS_TTL,
@@ -402,9 +431,8 @@ def _get_beat_last_run(task_name: str) -> Optional[datetime]:
     (task ещё не отработал ни разу после переразвёртывания copilot'а).
     """
     try:
-        import redis
-        client = redis.Redis.from_url(settings.REDIS_URL, decode_responses=True)
-        raw = client.get(_beat_heartbeat_key(task_name))  # type: ignore[attr-defined]
+        client = _get_beat_redis()
+        raw = client.get(_beat_heartbeat_key(task_name))
         if raw is None:
             return None
         # decode_responses=True уже даёт str.

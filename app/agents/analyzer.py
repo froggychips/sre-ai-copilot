@@ -1,3 +1,6 @@
+import json
+from typing import Any, Dict, Union
+
 from app.agents.base import BaseAgent
 from app.models.incident import Incident
 from app.services.telemetry_utils import trace_agent
@@ -11,9 +14,18 @@ class AnalyzerAgent(BaseAgent):
         )
 
     @trace_agent("Analyzer")
-    async def analyze(self, incident: Incident) -> str:
+    async def analyze(self, incident: Union[Incident, Dict[str, Any]]) -> str:
+        # Incident-pipeline передаёт Incident-модель; /copilot- и replay-путь
+        # (celery_worker.generate_reply) — enriched dict. Раньше dict падал на
+        # .model_dump_json() с AttributeError — сериализуем оба варианта.
+        if isinstance(incident, Incident):
+            user_context = incident.model_dump_json(indent=2)
+        else:
+            user_context = json.dumps(
+                incident, indent=2, ensure_ascii=False, default=str
+            )
         return await self.ask(
-            user_context=incident.model_dump_json(indent=2),
+            user_context=user_context,
             instruction=(
                 "Analyze this incident from AlertManager. Summarize what is happening technically. "
                 "If `teamcity_context.recent_builds` is present, explicitly correlate the alert with "

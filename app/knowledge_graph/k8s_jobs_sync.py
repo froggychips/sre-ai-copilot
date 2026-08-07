@@ -41,7 +41,7 @@ import logging
 import re
 import subprocess
 import sys
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Tuple, cast
 
 from sqlalchemy.exc import IntegrityError
@@ -52,6 +52,16 @@ from app.knowledge_graph.schema import NODE_KIND_SERVICE, K8sJob, Service
 logger = logging.getLogger(__name__)
 
 _KUBECTL_TIMEOUT_S = 30
+
+# Bounded cleanup для kg_k8s_jobs: строки, не подтверждённые sync-ом дольше
+# N часов (default ниже, конфигурируется KG_K8S_JOBS_STALE_HOURS) — удалённые
+# из кластера Job/CronJob. Без чистки удалённый one-off migration-Job с
+# failed_count>0 жил вечно и продолжал попадать в RCA-корреляции, а
+# _link_jobs_to_cronjob_owners гонял все накопленные строки каждые 30 мин.
+_STALE_JOBS_MAX_AGE_HOURS_DEFAULT = 48
+# Threshold-cap (та же дисциплина, что drift_cleanup / edge-decay): удаление
+# > этого % строк kind-а — симптом сбоя kubectl, а не реальной убыли.
+_STALE_JOBS_MAX_DELETE_PCT = 25.0
 
 # Edge "runs_as_job" реализован не через kg_service_edges (там оба конца —
 # Service-узлы), а через `owner_service_id` в metadata_json у CronJob/Job
@@ -467,6 +477,67 @@ def _upsert_k8s_job(
 # ── sync logic ──────────────────────────────────────────────────────────────
 
 
+def _sync_one_job(db: Session, job: Dict[str, Any], stats: Dict[str, int]) -> None:
+    """Обработать один Job. Вызывается под per-item SAVEPOINT-ом."""
+    meta = job.get("metadata") or {}
+    ns = meta.get("namespace") or "default"
+    name = meta.get("name")
+    if not name:
+        return
+
+    status_fields = _extract_job_status(job)
+
+    # Resolve exit-code только когда failed_count > 0 — для succeeded
+    # job-а exit=0 уже implied и читать pod зря. Также экономит
+    # kubectl-вызовы на 100% success cluster-ах.
+    exit_code: Optional[int] = None
+    if status_fields["failed_count"] > 0:
+        exit_code = _kubectl_get_pod_exit_code(ns, name)
+        if exit_code is not None:
+            stats["exit_codes_resolved"] += 1
+
+    obj_labels = meta.get("labels") or {}
+    pod_labels = _extract_pod_template_labels(job, "job")
+    owner_name, owner_id, resolved_via = _resolve_owner(
+        db, namespace=ns, name=name,
+        obj_labels=obj_labels, pod_labels=pod_labels,
+    )
+
+    metadata_json: Dict[str, Any] = {
+        "labels": obj_labels,
+        "owner_label": owner_name,
+        "owner_resolved_via": resolved_via,
+        # Job чаще всего создаётся CronJob-ом, ownerReferences даёт parent.
+        "owner_references": [
+            {"kind": r.get("kind"), "name": r.get("name")}
+            for r in (meta.get("ownerReferences") or [])
+        ],
+    }
+    # name_pattern уже дал нам service_id — кладём сразу, не ждём
+    # transitive линка через CronJob (Job может быть orphan: ad-hoc
+    # `kubectl apply` без parent).
+    if owner_id is not None:
+        metadata_json["owner_service_id"] = owner_id
+        stats["linked_via_name_pattern"] = (
+            stats.get("linked_via_name_pattern", 0)
+            + (1 if resolved_via == _RESOLVED_VIA_NAME_PATTERN else 0)
+        )
+
+    fields = dict(status_fields)
+    fields["last_pod_exit_code"] = exit_code
+    fields["owner_service_name"] = owner_name
+
+    _upsert_k8s_job(
+        db,
+        namespace=ns,
+        name=name,
+        kind="job",
+        fields=fields,
+        metadata=metadata_json,
+    )
+    stats["nodes_upserted"] += 1
+
+
 def sync_all_jobs(db: Session) -> Dict[str, int]:
     """Sync все Job-ы cluster-wide.
 
@@ -476,6 +547,7 @@ def sync_all_jobs(db: Session) -> Dict[str, int]:
         exit_codes_resolved      — сколько Failed Job-ов получили exit_code
         linked_via_name_pattern  — сколько Job-ов получили owner через
                                    name-pattern fallback (без labels)
+        errors                   — Job-ы, откатившиеся per-item savepoint-ом
     """
     jobs = _kubectl_get_all("jobs")
     stats = {
@@ -483,73 +555,103 @@ def sync_all_jobs(db: Session) -> Dict[str, int]:
         "nodes_upserted": 0,
         "exit_codes_resolved": 0,
         "linked_via_name_pattern": 0,
+        "errors": 0,
     }
 
     for job in jobs:
-        meta = job.get("metadata") or {}
-        ns = meta.get("namespace") or "default"
-        name = meta.get("name")
-        if not name:
-            continue
-
-        status_fields = _extract_job_status(job)
-
-        # Resolve exit-code только когда failed_count > 0 — для succeeded
-        # job-а exit=0 уже implied и читать pod зря. Также экономит
-        # kubectl-вызовы на 100% success cluster-ах.
-        exit_code: Optional[int] = None
-        if status_fields["failed_count"] > 0:
-            exit_code = _kubectl_get_pod_exit_code(ns, name)
-            if exit_code is not None:
-                stats["exit_codes_resolved"] += 1
-
-        obj_labels = meta.get("labels") or {}
-        pod_labels = _extract_pod_template_labels(job, "job")
-        owner_name, owner_id, resolved_via = _resolve_owner(
-            db, namespace=ns, name=name,
-            obj_labels=obj_labels, pod_labels=pod_labels,
-        )
-
-        metadata_json: Dict[str, Any] = {
-            "labels": obj_labels,
-            "owner_label": owner_name,
-            "owner_resolved_via": resolved_via,
-            # Job чаще всего создаётся CronJob-ом, ownerReferences даёт parent.
-            "owner_references": [
-                {"kind": r.get("kind"), "name": r.get("name")}
-                for r in (meta.get("ownerReferences") or [])
-            ],
-        }
-        # name_pattern уже дал нам service_id — кладём сразу, не ждём
-        # transitive линка через CronJob (Job может быть orphan: ad-hoc
-        # `kubectl apply` без parent).
-        if owner_id is not None:
-            metadata_json["owner_service_id"] = owner_id
-            stats["linked_via_name_pattern"] = (
-                stats.get("linked_via_name_pattern", 0)
-                + (1 if resolved_via == _RESOLVED_VIA_NAME_PATTERN else 0)
+        try:
+            # SAVEPOINT на item: одна битая запись (DataError и т.п.) не
+            # переводит Session в aborted-состояние и не роняет весь tick.
+            # Зеркалит per-item SAVEPOINT из k8s_events_sync.
+            with db.begin_nested():
+                _sync_one_job(db, job, stats)
+        except Exception as e:
+            stats["errors"] += 1
+            logger.warning(
+                "k8s_jobs_sync.job_failed ns=%s name=%s err=%s",
+                (job.get("metadata") or {}).get("namespace"),
+                (job.get("metadata") or {}).get("name"), e,
             )
-
-        fields = dict(status_fields)
-        fields["last_pod_exit_code"] = exit_code
-        fields["owner_service_name"] = owner_name
-
-        _upsert_k8s_job(
-            db,
-            namespace=ns,
-            name=name,
-            kind="job",
-            fields=fields,
-            metadata=metadata_json,
-        )
-        stats["nodes_upserted"] += 1
 
     db.commit()
     logger.info(
-        "k8s_jobs_sync.jobs_done fetched=%d nodes=%d exit_codes=%d",
-        stats["jobs_fetched"], stats["nodes_upserted"], stats["exit_codes_resolved"],
+        "k8s_jobs_sync.jobs_done fetched=%d nodes=%d exit_codes=%d errors=%d",
+        stats["jobs_fetched"], stats["nodes_upserted"],
+        stats["exit_codes_resolved"], stats["errors"],
     )
     return stats
+
+
+def _sync_one_cronjob(db: Session, cj: Dict[str, Any], stats: Dict[str, int]) -> None:
+    """Обработать один CronJob. Вызывается под per-item SAVEPOINT-ом."""
+    meta = cj.get("metadata") or {}
+    ns = meta.get("namespace") or "default"
+    name = meta.get("name")
+    if not name:
+        return
+
+    cron_fields = _extract_cronjob_status(cj)
+    obj_labels = meta.get("labels") or {}
+    pod_labels = _extract_pod_template_labels(cj, "cronjob")
+    owner_name, owner_id_from_resolver, resolved_via = _resolve_owner(
+        db, namespace=ns, name=name,
+        obj_labels=obj_labels, pod_labels=pod_labels,
+    )
+
+    metadata_json: Dict[str, Any] = {
+        "labels": obj_labels,
+        "owner_label": owner_name,
+        "owner_resolved_via": resolved_via,
+        "concurrency_policy": (cj.get("spec") or {}).get("concurrencyPolicy"),
+    }
+
+    fields = dict(cron_fields)
+    fields["owner_service_name"] = owner_name
+
+    cj_node = _upsert_k8s_job(
+        db,
+        namespace=ns,
+        name=name,
+        kind="cronjob",
+        fields=fields,
+        metadata=metadata_json,
+    )
+    stats["nodes_upserted"] += 1
+
+    # Edge runs_as_job: CronJob → owner Service из kg_services.
+    # Используем отдельный edge-механизм: store в metadata_json.
+    if not owner_name:
+        stats["skipped_no_owner_label"] += 1
+        return
+
+    # Если resolver дал нам owner_id (name_pattern path), используем его
+    # сразу. Иначе — ищем по label.
+    if owner_id_from_resolver is not None:
+        owner_svc_id: Optional[int] = owner_id_from_resolver
+    else:
+        owner_svc = (
+            db.query(Service)
+            .filter_by(namespace=ns, name=owner_name, node_kind=NODE_KIND_SERVICE)
+            .one_or_none()
+        )
+        owner_svc_id = (
+            cast(int, owner_svc.id) if owner_svc is not None else None
+        )
+
+    if owner_svc_id is None:
+        stats["skipped_no_owner_match"] += 1
+        return
+
+    # Связь от owner Service → CronJob node храним в metadata_json
+    # CronJob-а (owner_service_id). Это semantic «runs_as_job»: owner
+    # Service _имеет_ CronJob как побочный workflow.
+    meta_with_link: Dict[str, Any] = dict(cj_node.metadata_json or {})
+    meta_with_link["owner_service_id"] = owner_svc_id
+    cj_node.metadata_json = cast(Any, meta_with_link)
+    db.flush()
+    stats["edges_runs_as_job"] += 1
+    if resolved_via == _RESOLVED_VIA_NAME_PATTERN:
+        stats["linked_via_name_pattern"] += 1
 
 
 def sync_all_cronjobs(db: Session) -> Dict[str, int]:
@@ -562,6 +664,7 @@ def sync_all_cronjobs(db: Session) -> Dict[str, int]:
         skipped_no_owner_label   — owner не резолвится (ни label, ни name pattern)
         skipped_no_owner_match   — label есть, но в kg_services нет matching service
         linked_via_name_pattern  — из них сматчено name-pattern fallback'ом
+        errors                   — CronJob-ы, откатившиеся per-item savepoint-ом
     """
     cronjobs = _kubectl_get_all("cronjobs")
     stats = {
@@ -571,85 +674,30 @@ def sync_all_cronjobs(db: Session) -> Dict[str, int]:
         "skipped_no_owner_label": 0,
         "skipped_no_owner_match": 0,
         "linked_via_name_pattern": 0,
+        "errors": 0,
     }
 
     for cj in cronjobs:
-        meta = cj.get("metadata") or {}
-        ns = meta.get("namespace") or "default"
-        name = meta.get("name")
-        if not name:
-            continue
-
-        cron_fields = _extract_cronjob_status(cj)
-        obj_labels = meta.get("labels") or {}
-        pod_labels = _extract_pod_template_labels(cj, "cronjob")
-        owner_name, owner_id_from_resolver, resolved_via = _resolve_owner(
-            db, namespace=ns, name=name,
-            obj_labels=obj_labels, pod_labels=pod_labels,
-        )
-
-        metadata_json: Dict[str, Any] = {
-            "labels": obj_labels,
-            "owner_label": owner_name,
-            "owner_resolved_via": resolved_via,
-            "concurrency_policy": (cj.get("spec") or {}).get("concurrencyPolicy"),
-        }
-
-        fields = dict(cron_fields)
-        fields["owner_service_name"] = owner_name
-
-        cj_node = _upsert_k8s_job(
-            db,
-            namespace=ns,
-            name=name,
-            kind="cronjob",
-            fields=fields,
-            metadata=metadata_json,
-        )
-        stats["nodes_upserted"] += 1
-
-        # Edge runs_as_job: CronJob → owner Service из kg_services.
-        # Используем отдельный edge-механизм: store в metadata_json.
-        if not owner_name:
-            stats["skipped_no_owner_label"] += 1
-            continue
-
-        # Если resolver дал нам owner_id (name_pattern path), используем его
-        # сразу. Иначе — ищем по label.
-        if owner_id_from_resolver is not None:
-            owner_svc_id: Optional[int] = owner_id_from_resolver
-        else:
-            owner_svc = (
-                db.query(Service)
-                .filter_by(namespace=ns, name=owner_name, node_kind=NODE_KIND_SERVICE)
-                .one_or_none()
+        try:
+            # SAVEPOINT на item — см. sync_all_jobs / k8s_events_sync.
+            with db.begin_nested():
+                _sync_one_cronjob(db, cj, stats)
+        except Exception as e:
+            stats["errors"] += 1
+            logger.warning(
+                "k8s_jobs_sync.cronjob_failed ns=%s name=%s err=%s",
+                (cj.get("metadata") or {}).get("namespace"),
+                (cj.get("metadata") or {}).get("name"), e,
             )
-            owner_svc_id = (
-                cast(int, owner_svc.id) if owner_svc is not None else None
-            )
-
-        if owner_svc_id is None:
-            stats["skipped_no_owner_match"] += 1
-            continue
-
-        # Связь от owner Service → CronJob node храним в metadata_json
-        # CronJob-а (owner_service_id). Это semantic «runs_as_job»: owner
-        # Service _имеет_ CronJob как побочный workflow.
-        meta_with_link: Dict[str, Any] = dict(cj_node.metadata_json or {})
-        meta_with_link["owner_service_id"] = owner_svc_id
-        cj_node.metadata_json = cast(Any, meta_with_link)
-        db.flush()
-        stats["edges_runs_as_job"] += 1
-        if resolved_via == _RESOLVED_VIA_NAME_PATTERN:
-            stats["linked_via_name_pattern"] += 1
 
     db.commit()
     logger.info(
         "k8s_jobs_sync.cronjobs_done fetched=%d nodes=%d edges=%d "
-        "skipped_no_label=%d skipped_no_match=%d",
+        "skipped_no_label=%d skipped_no_match=%d errors=%d",
         stats["cronjobs_fetched"], stats["nodes_upserted"],
         stats["edges_runs_as_job"],
         stats["skipped_no_owner_label"], stats["skipped_no_owner_match"],
+        stats["errors"],
     )
     return stats
 
@@ -701,8 +749,91 @@ def _link_jobs_to_cronjob_owners(db: Session) -> int:
     return linked
 
 
+def cleanup_stale_jobs(
+    db: Session,
+    *,
+    kind: str,
+    fetch_count: int,
+    now: Optional[datetime] = None,
+) -> Dict[str, Any]:
+    """Bounded cleanup: удалить kg_k8s_jobs строки kind-а, не виденные
+    sync-ом дольше N часов (Job/CronJob удалён из кластера).
+
+    Fail-safe дисциплина (как drift_cleanup / edge-decay):
+      * `fetch_count <= 0` → SKIP: `_kubectl_get_all` возвращает [] и при
+        реальном сбое kubectl — пустой fetch неотличим от пустого кластера,
+        чистить по нему нельзя (last_seen_at не обновился из-за сбоя);
+      * удаление > _STALE_JOBS_MAX_DELETE_PCT% строк kind-а → SKIP
+        (массовая «пропажа» — симптом сбоя, не реальной убыли);
+      * удалённое логируется (sample имён).
+
+    Порог возраста: settings.KG_K8S_JOBS_STALE_HOURS (default 48ч; sync
+    ходит каждые 15 мин, так что 48ч — это ~192 пропущенных подтверждения).
+    """
+    from app.config import settings
+
+    now = now or datetime.utcnow()
+    max_age_hours = int(getattr(
+        settings, "KG_K8S_JOBS_STALE_HOURS", _STALE_JOBS_MAX_AGE_HOURS_DEFAULT,
+    ))
+    stats: Dict[str, Any] = {"deleted": 0, "skipped": False, "reason": ""}
+
+    if fetch_count <= 0:
+        stats["skipped"] = True
+        stats["reason"] = "empty_fetch"
+        logger.warning(
+            "k8s_jobs_sync.stale_cleanup_skipped kind=%s reason=empty_fetch — "
+            "kubectl вернул 0 объектов (сбой неотличим от пустого кластера), "
+            "чистка пропущена",
+            kind,
+        )
+        return stats
+
+    cutoff = now - timedelta(hours=max_age_hours)
+    total = int(db.query(K8sJob).filter(K8sJob.kind == kind).count() or 0)
+    if total == 0:
+        return stats
+
+    candidates = (
+        db.query(K8sJob)
+        .filter(
+            K8sJob.kind == kind,
+            # last_seen_at NULL у legacy-строк — судим по created_at.
+            (
+                (K8sJob.last_seen_at.isnot(None) & (K8sJob.last_seen_at < cutoff))
+                | (K8sJob.last_seen_at.is_(None) & (K8sJob.created_at < cutoff))
+            ),
+        )
+        .all()
+    )
+    if not candidates:
+        return stats
+
+    delete_pct = 100.0 * len(candidates) / total
+    if delete_pct > _STALE_JOBS_MAX_DELETE_PCT:
+        stats["skipped"] = True
+        stats["reason"] = f"delete_pct={delete_pct:.1f}>max={_STALE_JOBS_MAX_DELETE_PCT:.1f}"
+        logger.warning(
+            "k8s_jobs_sync.stale_cleanup_skipped kind=%s reason=%s total=%d "
+            "would_delete=%d — похоже на сбой источника, не чистим",
+            kind, stats["reason"], total, len(candidates),
+        )
+        return stats
+
+    sample = [f"{c.namespace}/{c.name}" for c in candidates[:20]]
+    ids = [c.id for c in candidates]
+    db.query(K8sJob).filter(K8sJob.id.in_(ids)).delete(synchronize_session=False)
+    stats["deleted"] = len(candidates)
+    logger.info(
+        "k8s_jobs_sync.stale_cleanup kind=%s deleted=%d older_than_hours=%d "
+        "sample=%s",
+        kind, len(candidates), max_age_hours, sample,
+    )
+    return stats
+
+
 def sync_k8s_jobs(db: Session) -> Dict[str, Any]:
-    """Main entry: fetch + upsert обе resource-категории.
+    """Main entry: fetch + upsert обе resource-категории + чистка удалённых.
 
     CronJob-ы первыми чтобы Job-ы могли проследовать линк через
     ownerReferences→CronJob.owner_service_id (transitive linkage).
@@ -710,10 +841,22 @@ def sync_k8s_jobs(db: Session) -> Dict[str, Any]:
     cj_stats = sync_all_cronjobs(db)
     job_stats = sync_all_jobs(db)
     transitive_linked = _link_jobs_to_cronjob_owners(db)
+    # Cleanup после upsert-ов: живые строки только что получили свежий
+    # last_seen_at, кандидаты в удаление — только реально исчезнувшие.
+    stale_cleanup = {
+        "cronjobs": cleanup_stale_jobs(
+            db, kind="cronjob", fetch_count=cj_stats["cronjobs_fetched"],
+        ),
+        "jobs": cleanup_stale_jobs(
+            db, kind="job", fetch_count=job_stats["jobs_fetched"],
+        ),
+    }
+    db.commit()
     return {
         "cronjobs": cj_stats,
         "jobs": job_stats,
         "transitive_linked": transitive_linked,
+        "stale_cleanup": stale_cleanup,
     }
 
 
