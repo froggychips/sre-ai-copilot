@@ -2264,7 +2264,8 @@ def deploy_incident_correlation_section(db: Session, hours: int = 24) -> str:
         # Сначала overall: сколько deploys, сколько attributed (≥1 alert в окне).
         overall = db.execute(text("""
             WITH recent_deploys AS (
-                SELECT id, service_id, started_at, finished_at, status, build_number, triggered_by, extras
+                SELECT id, service_id, started_at, finished_at, status,
+                       buildtype_id, build_number, triggered_by, extras
                 FROM kg_deployments
                 WHERE started_at > NOW() - (:hours || ' hours')::interval
             )
@@ -2288,6 +2289,11 @@ def deploy_incident_correlation_section(db: Session, hours: int = 24) -> str:
             FROM recent_deploys
         """), {"hours": str(hours)}).fetchone()
     except Exception as e:
+        # rollback обязателен: без него Postgres оставляет транзакцию в
+        # aborted-состоянии, и КАЖДАЯ следующая секция дайджеста падает с
+        # InFailedSqlTransaction. 07.08.2026 из-за этого вслед за deploy→incident
+        # молча умерла beat_heartbeats — один сломанный SQL съел два блока.
+        db.rollback()
         log.warning("stats_digest.deploy_incident_failed", error=str(e))
         return ""
 
