@@ -77,3 +77,45 @@ def enable_llm_pipeline_for_tests(monkeypatch):
     from app.config import settings
     monkeypatch.setattr(settings, "LLM_PIPELINE_ENABLED", True)
     yield
+
+
+@pytest.fixture(autouse=True)
+def isolate_discord_dedup_state():
+    """Сбросить dedup-состояние Discord перед каждым тестом.
+
+    Тесты эмбедов чистили только in-memory `_recent_enriched`, но с
+    10.06.2026 dedup стал cross-replica и живёт в таблице `discord_dedup`.
+    При живом DATABASE_URL запись переживала и тест, и весь прогон: сервис
+    видел «это сообщение уже отправлено», уходил в PATCH вместо POST
+    (`discord_enriched_patch_no_endpoint`), и тест падал на `KeyError:
+    'payload'` — POST'а не было. Так 45 тестов были красными ровно из-за
+    того, что БД сохраняет состояние, а in-memory кэш — нет.
+
+    Без DATABASE_URL таблицы нет — тогда чистим только память.
+    """
+    def _clear() -> None:
+        try:
+            from app.services.discord import dedup as dedup_mod
+            with dedup_mod._dedup_lock:
+                dedup_mod._recent_enriched.clear()
+        except Exception:
+            pass
+        if not _has_live_postgres():
+            return
+        try:
+            from app.services.discord.dedup_store import DiscordDedupEntry
+            from app.database import SessionLocal
+            session = SessionLocal()
+            try:
+                session.query(DiscordDedupEntry).delete()
+                session.commit()
+            finally:
+                session.close()
+        except Exception:
+            # Таблицы может не быть (миграции не прогнаны) — это не повод
+            # валить тест, который до dedup даже не доходит.
+            pass
+
+    _clear()
+    yield
+    _clear()
