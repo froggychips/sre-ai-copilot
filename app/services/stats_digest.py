@@ -113,8 +113,11 @@ class ChangeReport:
 _TC_URL_PREFIX_DEFAULT = "https://wo-teamcity.lastoasisgame.com"
 
 
-def _tx_clean(db: Session) -> None:
+def _tx_clean(db: Optional[Session]) -> None:
     """Вернуть сессию в рабочее состояние после упавшего запроса.
+
+    `db` допускает None: часть секций принимает Optional[Session] для
+    backwards-compat с тестами, которые вызывают их без базы.
 
     Секции дайджеста ловят свои исключения и возвращают "" — дайджест не
     должен падать целиком из-за одного блока. Но Postgres после ошибки
@@ -129,6 +132,8 @@ def _tx_clean(db: Session) -> None:
     Сам rollback обёрнут в try: если сессия уже мертва (например, оборван
     коннект), диагностику секции это ломать не должно.
     """
+    if db is None:
+        return
     try:
         db.rollback()
     except Exception as e:  # noqa: BLE001 — best-effort очистка
