@@ -130,3 +130,38 @@ def test_digest_delivery_registered_in_all_checks():
     from app.knowledge_graph import self_health
 
     assert self_health.check_digest_delivery in self_health._ALL_CHECKS
+
+
+# ── «не посчитали» ≠ «ноль» ─────────────────────────────────────────────────
+
+
+def test_counters_return_none_on_error():
+    """Счётчики графа отдают None при ошибке, а не 0.
+
+    Ноль означал бы «граф пуст» — 07.08.2026 именно так дайджест сообщил о
+    массовом исчезновении сущностей, которого не было.
+    """
+    class BrokenSession:
+        def execute(self, *a, **kw):
+            raise RuntimeError("relation does not exist")
+
+        def rollback(self):
+            pass
+
+    broken = BrokenSession()
+    assert sd._count_edges(broken) is None
+    assert sd._count_real_services(broken) is None
+
+
+def test_changes_section_hides_delta_when_today_unknown():
+    """Неизвестная сегодняшняя величина не превращается в отрицательную дельту."""
+    report = sd.ChangeReport(
+        new_baseline=False,
+        new_alerts_24h=1,
+        resolved_alerts_24h=2,
+        kg_edges_today=None,
+        kg_edges_yesterday=4773,
+    )
+    text_out = sd.changes_section(report)
+    assert "-4773" not in text_out
+    assert "KG edges `?`" in text_out

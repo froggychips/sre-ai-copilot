@@ -143,6 +143,30 @@
   owner: "@platform"
   reason: "Default prod-shared infra → platform"
 
+# ── QA-стенды (WO-10986) ─────────────────────────────────────────────────────
+# preprod-qa-* / preupdate-qa-* — полные копии соответствующих окружений на
+# выделенных нодах. Состав сервисов идентичен эталону, поэтому и владельцы те
+# же: алерт по town-service в preprod-qa должен идти туда же, куда по
+# town-service в preprod. Отдельный @qa-handle не заводим — маршрутизация
+# алертов в системе построена на kingdomN/shared/platform.
+#
+# Правила явные (по одному на ns), потому что owner нельзя вывести
+# подстановкой: номер kingdom-а из ns_pattern в owner не переносится, а
+# prefix-эвристика на этих namespace не срабатывает — они и остались
+# единственными unowned после backfill 07.08.2026 (112 из 115).
+- ns_pattern: "preprod-qa-shared"
+  owner: "@shared"
+  reason: "QA-копия preprod-shared → тот же владелец, что у эталона"
+- ns_pattern: "preupdate-qa-shared"
+  owner: "@shared"
+  reason: "QA-копия preupdate-shared → тот же владелец, что у эталона"
+- ns_pattern: "preprod-qa-kingdom2"
+  owner: "@kingdom2"
+  reason: "QA-копия preprod-kingdom2 → тот же владелец, что у эталона"
+- ns_pattern: "preupdate-qa-kingdom5"
+  owner: "@kingdom5"
+  reason: "QA-копия preupdate-kingdom5 → тот же владелец, что у эталона"
+
 # ── Non-shared инфра/система/AI-ML namespaces (KG snapshot 2026-06-06) ────────
 # 61 unowned-сервисов жили вне *-shared (предыдущий скоуп манифеста). Эти ns
 # целиком инфраструктурные/системные (нет game-app сервисов), поэтому ns-level
