@@ -134,8 +134,24 @@ def test_webhook_creates_incident_record(app_client, mock_llm, mock_k8s_context,
             .filter(IncidentRecord.incident_id == fingerprint)
             .one()
         )
-        assert rec.status in {"RESOLVED", "FIX_PROPOSED", "FAILED", "HYPOTHESIS_GENERATED"}, (
-            f"unexpected terminal status: {rec.status}"
+        # Допустимые статусы берём из state machine, а не списком литералов:
+        # терминальные (переходов дальше нет) плюс два промежуточных, на
+        # которых прогон может застать пайплайн. Хардкод пропускал
+        # TRIAGE_REQUIRED — штатный терминал «кандидата на фикс нет», и
+        # ровно в него уходит прогон без доступного LLM.
+        from app.core.state_machine import IncidentState, StateMachine
+
+        terminal = {
+            s.value
+            for s, nxt in StateMachine.TRANSITIONS.items()
+            if not nxt
+        }
+        acceptable = terminal | {
+            IncidentState.HYPOTHESIS_GENERATED.value,
+            IncidentState.FIX_PROPOSED.value,
+        }
+        assert rec.status in acceptable, (
+            f"unexpected terminal status: {rec.status} (ожидались {sorted(acceptable)})"
         )
         # trace может быть None если pipeline упал на ранней стадии — но в
         # тестовом mock-е все 6 стадий проходят, проверяем что что-то есть.

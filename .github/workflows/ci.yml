@@ -110,18 +110,26 @@ jobs:
           echo "PG_PORT=$PG_PORT" >> "$GITHUB_ENV"
           echo "postgres healthy, слушает 127.0.0.1:$PG_PORT"
 
-      # Гоняем ТОЛЬКО интеграционные наборы, а не весь pytest с DATABASE_URL.
-      # Причина: при живой базе включаются ещё ~30 тестов, которые никогда не
-      # исполнялись и сейчас падают (отдельный долг, чинится своим PR). Пока
-      # они красные, включать их в обязательный прогон — значит вернуться к
-      # практике merge через --admin bypass.
-      - name: Integration tests against real Postgres schema
+      # Весь набор с живой базой. Раньше здесь гонялись только два
+      # интеграционных файла: при DATABASE_URL включались ещё 45 тестов,
+      # которые никогда не исполнялись и падали. Долг закрыт — два корня:
+      #   1) dedup стал cross-replica (таблица discord_dedup, 10.06.2026), а
+      #      тесты чистили только in-memory кэш → сервис уходил в PATCH
+      #      вместо POST и падал на KeyError 'payload' (40 тестов);
+      #   2) снапшоты эмбедов и e2e-статус зависели от состояния БД.
+      # Схему готовим alembic-ом, а не create_all: так проверяется ещё и
+      # применимость миграций к пустой базе.
+      - name: Run alembic migrations
         env:
           DATABASE_URL: postgresql://ci:ci@127.0.0.1:${{ env.PG_PORT }}/ci
-        run: |
-          .venv/bin/pytest -q \
-            tests/test_digest_sections_against_schema.py \
-            tests/test_stats_digest_sql_schema.py
+          LLM_BACKEND: claude_cli
+        run: .venv/bin/alembic upgrade head
+
+      - name: Full test suite against real Postgres
+        env:
+          DATABASE_URL: postgresql://ci:ci@127.0.0.1:${{ env.PG_PORT }}/ci
+          LLM_BACKEND: claude_cli
+        run: .venv/bin/pytest -q
 
       - name: Stop Postgres
         if: always()
