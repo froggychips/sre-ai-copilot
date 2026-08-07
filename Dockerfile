@@ -28,10 +28,12 @@ RUN set -eux; \
     rm -f /tmp/kubectl /tmp/kubectl.sha256
 
 # Тяжёлые бинарные пакеты — отдельный слой, чтобы не превышать лимит
-# TCP-upload за один раз (grpcio ~100MB).
+# TCP-upload за один раз (grpcio ~100MB). Версии ОБЯЗАНЫ совпадать с
+# requirements.txt, иначе слой мёртвый груз: pip следующим шагом молча
+# переустановит пакет нужной версии (так уже было с cryptography 48.0.1
+# против 50.0.0 в lock-е — слой только путал и раздувал образ).
 RUN pip install --no-cache-dir \
     grpcio==1.80.0 \
-    cryptography==48.0.1 \
     psycopg2-binary==2.9.12 \
     pydantic-core==2.46.4
 

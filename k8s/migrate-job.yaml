@@ -8,6 +8,11 @@ spec:
   backoffLimit: 3
   ttlSecondsAfterFinished: 3600
   template:
+    metadata:
+      labels:
+        # Лейбл на POD-е (не только на Job) — иначе NetworkPolicy
+        # (k8s/networkpolicy.yaml) не выпустит миграции к Postgres.
+        app: sre-ai-migrate
     spec:
       serviceAccountName: sre-ai
       securityContext:
@@ -19,7 +24,10 @@ spec:
       restartPolicy: OnFailure
       containers:
       - name: migrate
-        image: ghcr.io/froggychips/sre-ai-copilot:latest
+        # IMAGE_TAG_PLACEHOLDER подставляет deploy.sh (IMAGE_TAG=<git-sha>).
+        # CI публикует ТОЛЬКО :<git-sha> — тега :latest не существует.
+        image: ghcr.io/froggychips/sre-ai-copilot:IMAGE_TAG_PLACEHOLDER
+        imagePullPolicy: IfNotPresent
         command:
         - alembic
         - upgrade

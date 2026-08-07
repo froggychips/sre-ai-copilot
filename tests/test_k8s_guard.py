@@ -22,6 +22,22 @@ def test_write_in_prod_blocked():
         k8s_guard.validate(op("create", "preprod"))
 
 
+def test_write_in_prod_prefixed_ns_blocked_as_read_only():
+    """Реальные ns называются prod-kingdom5/preupdate-shared — точный матч
+    по "prod"/"preprod"/"preupdate" их не ловил, и read-only ветка была
+    мёртвой. Теперь префикс-матч даёт именно read-only-tier отказ."""
+    for ns in ("prod-kingdom5", "preprod-shared", "preupdate-shared",
+               "prod-isolated", "preprod-qa-1"):
+        with pytest.raises(PermissionError, match="read-only tier"):
+            k8s_guard.validate(op("patch", ns))
+
+
+def test_read_in_prod_prefixed_ns_allowed():
+    """Read-only tier ограничивает только запись — get/list в prod-* можно."""
+    assert k8s_guard.validate(op("get", "prod-kingdom5"))
+    assert k8s_guard.validate(op("list", "preupdate-shared"))
+
+
 def test_write_in_squad_allowed():
     assert k8s_guard.validate(op("patch", "squad-3"))
     assert k8s_guard.validate(op("create", "squad-gd"))

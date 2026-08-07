@@ -200,6 +200,117 @@ def test_edge_decay_runs_below_threshold(db, monkeypatch):
     assert db.query(ServiceEdge).count() == 9  # старое ребро удалено
 
 
+# ── #2 (c) kind/source-aware decay: сломанный источник не даёт стирать ──────
+#
+# Реальный инцидент: `kubectl get services -A` (42МБ) таймаутил каждый тик,
+# k8s_topology_resources_sync возвращал [] и НЕ raise-ил → serves_traffic
+# тихо старели, а decay в kg_sync (видевший только СВОИ fetch-ошибки)
+# стирал целые классы топологии. Теперь ребро decay-ится только если его
+# источник свежести освежал хоть что-то за окно KG_EDGE_SOURCE_FRESH_HOURS.
+
+
+def _mk_edge(db, src, dst_name, kind, discovered_by, age_days):
+    dst = upsert_service(db, "squad-1", dst_name)
+    e = upsert_edge(db, src, dst, kind=kind, discovered_by=discovered_by)
+    if age_days:
+        e.last_seen_at = datetime.utcnow() - timedelta(days=age_days)
+    return e
+
+
+def test_decay_skips_kinds_whose_source_is_dead(db, monkeypatch):
+    """Источник serves_traffic мёртв (ни одного свежего ребра) → его рёбра
+    НЕ удаляются и НЕ помечаются inactive; здоровый kind decay-ится."""
+    src = upsert_service(db, "squad-1", "src")
+    # calls (kg_sync-семейство): 3 свежих + 1 старое (40д) → источник жив.
+    for i in range(3):
+        _mk_edge(db, src, f"c-fresh-{i}", "calls", "kg_sync/env_vars", 0)
+    _mk_edge(db, src, "c-old", "calls", "kg_sync/env_vars", 40)
+    # serves_traffic: ВСЕ рёбра старые → источник считается мёртвым.
+    _mk_edge(db, src, "st-old", "serves_traffic",
+             "k8s_topology_resources/service", 40)
+    _mk_edge(db, src, "st-mid", "serves_traffic",
+             "k8s_topology_resources/service", 10)
+    db.commit()
+
+    monkeypatch.setattr(kg_sync, "_kubectl_get_deployments", lambda ns: [])
+    total = sync_topology(db, namespaces=["squad-1"])
+
+    assert total["errors"] == 0
+    assert total["edge_decay_skipped"] is False
+    # Удалено только старое calls-ребро (его источник жив).
+    assert total["edges_deleted"] == 1
+    remaining = {
+        (e.kind, e.dst.name) for e in db.query(ServiceEdge).all()
+    }
+    assert ("serves_traffic", "st-old") in remaining     # НЕ удалено
+    assert ("serves_traffic", "st-mid") in remaining
+    assert ("calls", "c-old") not in remaining            # удалено
+    # st-mid (10д) НЕ помечен inactive — источник мёртв.
+    st_mid = (
+        db.query(ServiceEdge)
+        .filter(ServiceEdge.kind == "serves_traffic")
+        .all()
+    )
+    for e in st_mid:
+        assert not (e.extras or {}).get("inactive")
+    # Источник назван в отчёте.
+    assert "k8s_topology_resources_sync" in total["edge_decay_stale_sources"]
+    assert total["edge_decay_blocked_by_source"] == 2
+
+
+def test_decay_runs_for_kind_with_healthy_source(db, monkeypatch):
+    """Контроль: у serves_traffic есть свежее ребро (источник жив) →
+    старое удаляется, среднее помечается inactive, как и раньше."""
+    src = upsert_service(db, "squad-1", "src")
+    for i in range(3):
+        _mk_edge(db, src, f"c-fresh-{i}", "calls", "kg_sync/env_vars", 0)
+    _mk_edge(db, src, "st-fresh", "serves_traffic",
+             "k8s_topology_resources/service", 0)
+    _mk_edge(db, src, "st-old", "serves_traffic",
+             "k8s_topology_resources/service", 40)
+    _mk_edge(db, src, "st-mid", "serves_traffic",
+             "k8s_topology_resources/service", 10)
+    db.commit()
+
+    monkeypatch.setattr(kg_sync, "_kubectl_get_deployments", lambda ns: [])
+    total = sync_topology(db, namespaces=["squad-1"])
+
+    assert total["edge_decay_skipped"] is False
+    assert total["edges_deleted"] == 1
+    assert total["edges_marked_inactive"] == 1
+    names = {e.dst.name for e in db.query(ServiceEdge).all()}
+    assert "st-old" not in names
+    st_mid = (
+        db.query(ServiceEdge)
+        .join(kg_sync.Service, ServiceEdge.dst_id == kg_sync.Service.id)
+        .filter(kg_sync.Service.name == "st-mid")
+        .one()
+    )
+    assert (st_mid.extras or {}).get("inactive") is True
+    assert total["edge_decay_stale_sources"] == []
+
+
+def test_decay_source_health_is_per_discovered_by_family(db, monkeypatch):
+    """`calls` из env (kg_sync) и `calls` из ingress-синка — РАЗНЫЕ источники
+    свежести: живой env-scan не легализует удаление ingress-рёбер, чей
+    синк молчит."""
+    src = upsert_service(db, "squad-1", "src")
+    for i in range(3):
+        _mk_edge(db, src, f"env-fresh-{i}", "calls", "kg_sync/env_vars", 0)
+    _mk_edge(db, src, "env-old", "calls", "kg_sync/env_vars", 40)
+    # ingress-calls: единственное ребро, старое → источник мёртв.
+    _mk_edge(db, src, "ing-old", "calls", "kg_sync/ingress", 40)
+    db.commit()
+
+    monkeypatch.setattr(kg_sync, "_kubectl_get_deployments", lambda ns: [])
+    total = sync_topology(db, namespaces=["squad-1"])
+
+    names = {e.dst.name for e in db.query(ServiceEdge).all()}
+    assert "env-old" not in names        # kg_sync жив → удалено
+    assert "ing-old" in names            # k8s_ingress_sync мёртв → защищено
+    assert "k8s_ingress_sync" in total["edge_decay_stale_sources"]
+
+
 # ── #4 session poisoning: namespace-isolation через savepoint ───────────────
 
 
@@ -229,6 +340,47 @@ def test_pass1_namespace_isolation_via_savepoint(db, monkeypatch):
     # svc-squad-2 откатан savepoint'ом; соседи закоммичены (до фикса
     # PendingRollbackError потерял бы весь проход или сохранил бы svc-squad-2).
     assert names == {"svc-squad-1", "svc-squad-3"}
+
+
+def test_pass2_namespace_isolation_via_savepoint(db, monkeypatch):
+    """Pass 2 (extended env-scan) изолирован savepoint-ом так же, как Pass 1.
+
+    Реальный триггер: конкурентный phantom_db_cleanup удаляет db:%-узел, к
+    которому Pass 2 цепляет ребро → flush-ошибка. Без savepoint Session
+    уходила в aborted-состояние: соседние ns падали PendingRollbackError,
+    терминальный db.commit() убивал task, Pass 3 (revive/decay) не бежал.
+    """
+    # Существующий сервис — заготовка для IntegrityError на дубле.
+    upsert_service(db, "squad-2", "dup")
+    db.commit()
+
+    monkeypatch.setattr(
+        kg_sync, "_kubectl_get_deployments",
+        lambda ns: [{"metadata": {"name": f"svc-{ns}"}}],
+    )
+
+    def fake_enrich(db_, ns, deploys, known_index):
+        # Частичная запись + flush-ошибка на squad-2 (дубль UNIQUE-ключа —
+        # реальный IntegrityError, переводящий Session в aborted).
+        db_.add(Service(namespace=ns, name=f"p2-{ns}", synthetic=False))
+        db_.flush()
+        if ns == "squad-2":
+            db_.add(Service(namespace="squad-2", name="dup", synthetic=False))
+            db_.flush()  # IntegrityError (uq_kg_service_ns_name)
+        return 0
+
+    monkeypatch.setattr(kg_sync, "_enrich_calls_edges_for_ns", fake_enrich)
+
+    total = sync_topology(db, namespaces=["squad-1", "squad-2", "squad-3"])
+
+    # Ошибка squad-2 посчитана, но task дожил до конца (Pass 3 отработал).
+    assert total["errors"] == 1
+    assert "edge_decay_skipped" in total
+    names = {s.name for s in db.query(Service).all()}
+    # Частичная запись squad-2 откатана savepoint-ом, соседи закоммичены.
+    assert "p2-squad-1" in names
+    assert "p2-squad-3" in names
+    assert "p2-squad-2" not in names
 
 
 # ── #3 upsert races: recover from IntegrityError ────────────────────────────

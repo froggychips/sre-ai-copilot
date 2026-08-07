@@ -1,7 +1,16 @@
 """Адаптер Incident + analyzer-output → ctx для DiagnosticEngine.
 
-Один источник правды о том, какие поля попадают в правила. Если правило
-полагается на «k8s_summary», смотри здесь — оно собирается из analyzer-вывода.
+Один источник правды о том, какие поля попадают в правила.
+
+ВАЖНО (circular fact contamination): вывод AnalyzerAgent — LLM-проза, а не
+наблюдение. Раньше он клался в `k8s_summary` и попадал в Rule.text_haystack:
+спекуляция анализатора «this may be OOMKilled» превращалась в
+Fact(oom_killed, observed=True, conf=0.95), на который затем якорились
+hypothesis-агенты и который проходил critic — «детерминированный» слой
+фабриковал факты из текста модели. Теперь analyzer-вывод доступен правилам
+только как `analyzer_summary` (НЕ входит в text_haystack), а `k8s_summary` /
+`logs_summary` зарезервированы под наблюдаемые источники (K8sFacts, логи,
+events) — их заполняет pipeline после enrichment-а.
 """
 from __future__ import annotations
 
@@ -72,8 +81,9 @@ def build_diagnostics_ctx(
 
     Args:
         incident: исходный alert, уже сматченный с TeamCity context.
-        analyzer_summary: вывод AnalyzerAgent — кладём в k8s_summary, чтобы
-            правила могли regex-сканировать.
+        analyzer_summary: вывод AnalyzerAgent — кладём ТОЛЬКО в
+            `analyzer_summary` (вне Rule.text_haystack): LLM-проза не должна
+            фабриковать «наблюдаемые» факты через regex-сканы правил.
         kg_session: опциональная сессия БД. Если передана, попытаемся
             подтянуть nearby_alerts из knowledge_graph для UpstreamDegradedRule.
             Без неё `upstream_alerts` остаётся None и правило сигналит
@@ -81,8 +91,8 @@ def build_diagnostics_ctx(
 
     Returns:
         dict с полями: incident, namespace, service, pod, alertname,
-        description, k8s_summary, recent_deployments, metrics_summary,
-        upstream_alerts, incident_starts_at.
+        description, analyzer_summary, k8s_summary, recent_deployments,
+        metrics_summary, upstream_alerts, incident_starts_at.
     """
     labels = incident.labels or {}
     annotations = incident.annotations or {}
@@ -111,8 +121,12 @@ def build_diagnostics_ctx(
         "pod": labels.get("pod"),
         "alertname": labels.get("alertname", ""),
         "description": annotations.get("description") or incident.description or "",
-        "k8s_summary": analyzer_summary,
-        "logs_summary": None,  # TODO: брать из ContextBuilder если будет интегрирован
+        # LLM-вывод — ВНЕ text_haystack: правила его не сканируют.
+        "analyzer_summary": analyzer_summary,
+        # Наблюдаемые текстовые источники. Заполняются pipeline-ом после
+        # enrichment-а: k8s_summary/logs_summary ← K8sFacts.collect_snapshot().
+        "k8s_summary": None,
+        "logs_summary": None,
         "recent_deployments": _extract_deploys_from_tc(incident.teamcity_context),
         "metrics_summary": None,  # TODO: brать из ContextBuilder.metrics
         "upstream_alerts": upstream_alerts,

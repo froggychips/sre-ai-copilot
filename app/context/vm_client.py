@@ -225,22 +225,35 @@ class VMClient:
         _ACT_CRIT = _ACT.replace("warning|critical", "critical")
         _ACT_WARN = _ACT.replace("warning|critical", "warning")
 
+        # `or vector(0)`: count()/sum() над ПУСТЫМ instant-вектором в PromQL
+        # возвращает пустой результат, который query_instant мапит в None.
+        # Для метрик, где «селектор ничего не сматчил» — это ЛЕГИТИМНЫЙ ноль
+        # (ноль firing-алертов, ноль crashloop-ов, ноль failed-подов), без
+        # fallback-а снимок никогда не мог стать "healthy": alerts_critical==0
+        # был математически недостижим, и здоровый кластер уходил в LLM как
+        # "UNKNOWN (VictoriaMetrics unavailable)". Транспортный сбой (HTTP
+        # error/timeout) по-прежнему даёт None — vector(0) вычисляется на
+        # стороне VM и до клиента при сбое не доезжает.
+        #
+        # НЕ добавляем fallback к nodes_total (гейт data_available: пустой
+        # ответ = мёртвый kube-state-metrics, а не «0 нод») и к node-exporter
+        # агрегатам cpu/mem/disk (пусто = сломан скрейп, не 0%).
         queries = {
             "nodes_total":    'count(kube_node_info)',
-            "nodes_ready":    'count(kube_node_status_condition{condition="Ready",status="true"})',
-            "pods_running":   'sum(kube_pod_status_phase{phase="Running"})',
-            "pods_pending":   'sum(kube_pod_status_phase{phase="Pending"})',
-            "pods_failed":    'sum(kube_pod_status_phase{phase="Failed"})',
-            "crashloops":     'sum(kube_pod_container_status_waiting_reason{reason="CrashLoopBackOff"})',
-            "deploy_mismatch":'count(kube_deployment_status_replicas_available != kube_deployment_spec_replicas)',
+            "nodes_ready":    'count(kube_node_status_condition{condition="Ready",status="true"}) or vector(0)',
+            "pods_running":   'sum(kube_pod_status_phase{phase="Running"}) or vector(0)',
+            "pods_pending":   'sum(kube_pod_status_phase{phase="Pending"}) or vector(0)',
+            "pods_failed":    'sum(kube_pod_status_phase{phase="Failed"}) or vector(0)',
+            "crashloops":     'sum(kube_pod_container_status_waiting_reason{reason="CrashLoopBackOff"}) or vector(0)',
+            "deploy_mismatch":'count(kube_deployment_status_replicas_available != kube_deployment_spec_replicas) or vector(0)',
             "cpu_pct":        'avg(100 - rate(node_cpu_seconds_total{mode="idle"}[5m]) * 100)',
             "mem_pct":        '100 * (1 - sum(node_memory_MemAvailable_bytes) / sum(node_memory_MemTotal_bytes))',
             "disk_peak_pct":  'max(100 * (1 - node_filesystem_avail_bytes{mountpoint="/"} / node_filesystem_size_bytes{mountpoint="/"}))',
-            "alerts_critical": f'count(ALERTS{{{_ACT_CRIT}}})',
-            "alerts_warning":  f'count(ALERTS{{{_ACT_WARN}}})',
+            "alerts_critical": f'count(ALERTS{{{_ACT_CRIT}}}) or vector(0)',
+            "alerts_warning":  f'count(ALERTS{{{_ACT_WARN}}}) or vector(0)',
             "alerts_prod":    (
                 f'count(ALERTS{{{_ACT},instance=~"prod-.+"}} or '
-                f'ALERTS{{{_ACT},namespace=~"prod-.+"}})'
+                f'ALERTS{{{_ACT},namespace=~"prod-.+"}}) or vector(0)'
             ),
         }
 

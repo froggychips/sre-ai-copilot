@@ -16,13 +16,14 @@ Discord отправляет POST на этот endpoint при любом вз�
 """
 from __future__ import annotations
 
+import asyncio
 import binascii
 import json
 import logging
 import threading
 import time
 from collections import deque
-from typing import Any, Deque, Dict, Set, Tuple
+from typing import Any, Coroutine, Deque, Dict, Set, Tuple
 
 from datetime import datetime, timezone
 
@@ -166,6 +167,61 @@ def _deny_apply_if_unauthorized(payload: dict, user_id: str, incident_id: str):
         )
         return _ephemeral("Rate limit exceeded — too many apply clicks in the last hour.")
     return None
+
+
+def _deny_feedback_if_unauthorized(payload: dict, user_id: str, incident_id: str):
+    """Authz-gate для feedback-кнопок (👍/👎) — тот же fail-closed whitelist.
+
+    Возвращает _ephemeral-Response при отказе, иначе None. Раньше feedback-
+    ветки не проверяли ничего — любой участник гильдии мог портить
+    accuracy-статистику (is_accepted) от чужого имени.
+    """
+    allowed, reason = _is_authorized_approver(payload)
+    if not allowed:
+        audit_service.log_event(
+            "DISCORD_FEEDBACK_DENIED_UNAUTHORIZED",
+            {"incident_id": incident_id, "discord_user_id": user_id, "reason": reason},
+        )
+        return _ephemeral("You are not authorized to leave feedback for this incident.")
+    return None
+
+
+# ─── Background-task registry (GC + observability) ──────────────────────────
+# asyncio.create_task без сохранённой ссылки может быть собран GC до
+# завершения, а исключение внутри таски терялось молча — оператор видел
+# «✅ Executor launched» даже когда apply_intent упал. Держим strong-ref в
+# module-level set и логируем/аудируем исключения в done-callback.
+_BACKGROUND_TASKS: Set[Any] = set()
+
+
+def _spawn_background_task(
+    coro: Coroutine[Any, Any, Any], *, context: Dict[str, Any]
+) -> "asyncio.Task[Any]":
+    """create_task + strong-ref + done-callback с логом/аудитом исключений."""
+    task: "asyncio.Task[Any]" = asyncio.create_task(coro)
+    _BACKGROUND_TASKS.add(task)
+
+    def _on_done(t: Any) -> None:
+        _BACKGROUND_TASKS.discard(t)
+        try:
+            if t.cancelled():
+                logger.warning("discord_background_task_cancelled context=%s", context)
+                return
+            exc = t.exception()
+        except Exception:
+            return
+        if exc is not None:
+            logger.error(
+                "discord_background_task_failed context=%s error=%s",
+                context, repr(exc),
+            )
+            audit_service.log_event(
+                "DISCORD_BACKGROUND_TASK_FAILED",
+                {**context, "error": type(exc).__name__},
+            )
+
+    task.add_done_callback(_on_done)
+    return task
 
 
 def _verify_signature(public_key_hex: str, signature_hex: str, timestamp: str, body: bytes) -> bool:
@@ -324,10 +380,14 @@ _APPLY_REFUSAL_MESSAGES = {
     "incident_not_found": "❌ Инцидент `{incident_id}` не найден.",
     "no_intent":          "❌ Нет ExecutionIntent для применения — пайплайн не выдал структурный фикс.",
     "already_applied":    "ℹ️ Уже применено ранее — действие идемпотентно.",
+    "apply_in_flight":    "ℹ️ Apply уже выполняется (или завершился без записи результата) — повтор заблокирован до истечения claim-TTL.",
     "dry_run_not_ok":     "❌ dry-run не прошёл — реальный запуск заблокирован.",
     "signature_required": "❌ Подпись действия отсутствует — apply не запущен.",
     "signature_mismatch": "❌ Действие изменилось с момента подтверждения (signature mismatch) — повтори триаж.",
     "not_approved":       "❌ Нет записи об одобрении (kg_action_approvals) — apply заблокирован.",
+    "approval_stale":     "❌ Одобрение протухло (старше допустимого окна) — нужен свежий approve.",
+    "namespace_unbound":  "❌ У инцидента нет namespace — сверка intent ↔ инцидент невозможна, apply заблокирован.",
+    "namespace_mismatch": "❌ Namespace действия не совпадает с namespace инцидента — apply заблокирован.",
 }
 
 
@@ -502,8 +562,14 @@ async def discord_interactions(
     )
 
     # ── 👍 Позитивный фидбек — сохраняем сразу ──────────────────────────────
+    # Authz как у apply/approve-путей (fail-closed whitelist): фидбек пишет
+    # is_accepted/user_feedback в БД и кормит accuracy-статистику — без гейта
+    # любой участник гильдии мог её отравить.
     if custom_id.startswith("feedback_pos_"):
         incident_id = custom_id[len("feedback_pos_"):]
+        denied = _deny_feedback_if_unauthorized(payload, user_id, incident_id)
+        if denied is not None:
+            return denied
         found = _store_feedback(incident_id, "positive", user_id)
         if not found:
             return _ephemeral(f"Инцидент `{incident_id}` не найден в БД.")
@@ -512,6 +578,9 @@ async def discord_interactions(
     # ── 👎 Шаг 1: запрашиваем подтверждение, ничего не сохраняем ────────────
     if custom_id.startswith("feedback_neg_") and not custom_id.startswith("feedback_neg_confirm_") and not custom_id.startswith("feedback_neg_cancel_"):
         incident_id = custom_id[len("feedback_neg_"):]
+        denied = _deny_feedback_if_unauthorized(payload, user_id, incident_id)
+        if denied is not None:
+            return denied
         return _ephemeral(
             "⚠️ Подтверди: **выводы модели были ошибочными**?\n"
             "-# (не сам алерт, а анализ причины и рекомендации)",
@@ -521,6 +590,9 @@ async def discord_interactions(
     # ── 👎 Шаг 2: подтверждение — сохраняем негативный фидбек ───────────────
     if custom_id.startswith("feedback_neg_confirm_"):
         incident_id = custom_id[len("feedback_neg_confirm_"):]
+        denied = _deny_feedback_if_unauthorized(payload, user_id, incident_id)
+        if denied is not None:
+            return denied
         found = _store_feedback(incident_id, "negative", user_id)
         if not found:
             return _ephemeral(f"Инцидент `{incident_id}` не найден в БД.")
@@ -586,9 +658,11 @@ async def discord_interactions(
         # Сразу возвращаем "thinking..." (type=5), apply работает в background-task.
         # Discord даёт 15 минут на followup через PATCH @original — этого хватит
         # даже для большого rollout restart с тяжёлыми initContainers.
-        import asyncio
-        asyncio.create_task(
-            _apply_in_background(incident_id, user_id, intent_sig, interaction_token)
+        # Strong-ref + done-callback: см. _spawn_background_task.
+        _spawn_background_task(
+            _apply_in_background(incident_id, user_id, intent_sig, interaction_token),
+            context={"kind": "apply_confirm", "incident_id": incident_id,
+                     "discord_user_id": user_id},
         )
         return _deferred_ephemeral()
 
@@ -680,15 +754,17 @@ async def discord_interactions(
         # Edit оригинального сообщения: убрать buttons + дописать footer.
         # Не блокируем основной response — Discord ждёт ≤3s.
         if message_id and channel_id:
-            import asyncio
-            asyncio.create_task(_edit_message_after_decision(
-                channel_id=channel_id,
-                message_id=message_id,
-                verdict=verdict,
-                user_name=user_name,
-                decided_at=decision["decided_at"],
-                original_message=message,
-            ))
+            _spawn_background_task(
+                _edit_message_after_decision(
+                    channel_id=channel_id,
+                    message_id=message_id,
+                    verdict=verdict,
+                    user_name=user_name,
+                    decided_at=decision["decided_at"],
+                    original_message=message,
+                ),
+                context={"kind": "edit_after_decision", "incident_id": incident_id},
+            )
 
         audit_service.log_event(
             "INCIDENT_ACTION_APPROVED" if verdict == "approved" else "INCIDENT_ACTION_DECLINED",
@@ -703,24 +779,40 @@ async def discord_interactions(
         if verdict == "declined":
             return _ephemeral(f"❌ Declined. Recorded as decided by @{user_name}.")
 
-        # Approved — если EXECUTOR_ENABLED, fire-and-forget executor task.
-        if settings.EXECUTOR_ENABLED:
+        # Approved — dispatch реального write ТОЛЬКО при обоих opt-in флагах.
+        # EXECUTOR_ENABLED по README = dry-run-only валидация; prod opt-in на
+        # реальный kubectl — EXECUTOR_APPROVAL_ENABLED. Раньше approve-кнопка
+        # запускала apply_intent на одном EXECUTOR_ENABLED — реальный write был
+        # достижим через флаг, задокументированный как dry-run-only.
+        if settings.EXECUTOR_ENABLED and settings.EXECUTOR_APPROVAL_ENABLED:
             try:
                 from app.services.executor_apply import apply_intent
-                import asyncio
                 # intent_sig из custom_id → integrity-сверка в apply_intent (TOCTOU).
-                asyncio.create_task(
-                    asyncio.to_thread(apply_intent, incident_id, user_name, intent_sig)
+                # Strong-ref + done-callback: упавший apply_intent логируется и
+                # аудируется, а не исчезает молча.
+                _spawn_background_task(
+                    asyncio.to_thread(apply_intent, incident_id, user_name, intent_sig),
+                    context={"kind": "approve_apply", "incident_id": incident_id,
+                             "intent_signature": intent_sig,
+                             "approved_by": user_name},
                 )
                 return _ephemeral(
-                    f"✅ Approved by @{user_name}. Executor launched (fire-and-forget). "
-                    "Audit-trail: INCIDENT_ACTION_APPROVED."
+                    f"✅ Approved by @{user_name}. Executor launched в фоне — "
+                    "итог (включая отказ) смотри в audit-trail "
+                    "(EXECUTOR_APPLIED / EXECUTOR_APPLY_REFUSED)."
                 )
             except Exception as e:
                 logger.error("approved_executor_dispatch_failed error=%s", str(e))
                 return _ephemeral(
                     f"✅ Approved by @{user_name}, но launch executor упал: {e}"
                 )
+        if settings.EXECUTOR_ENABLED:
+            # Fail-closed зеркально apply:/apply_confirm: — решение записано,
+            # но реальный write без EXECUTOR_APPROVAL_ENABLED не запускается.
+            return _ephemeral(
+                f"✅ Approved by @{user_name} (записано), но "
+                "EXECUTOR_APPROVAL_ENABLED=false — реальный запуск отключён."
+            )
         return _ephemeral(
             f"✅ Approved by @{user_name}. Will execute when executor goes live "
             "(EXECUTOR_ENABLED=false right now)."

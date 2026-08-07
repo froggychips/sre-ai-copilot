@@ -20,7 +20,7 @@ from __future__ import annotations
 
 import logging
 from collections import Counter
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
@@ -39,9 +39,13 @@ _SEQ_LEVELS = {
 
 
 def _iso(ts: datetime) -> str:
-    """ISO 8601 без timezone — Seq принимает naive UTC."""
+    """ISO 8601 без timezone — Seq принимает naive UTC.
+
+    Именно UTC: `astimezone(tz=None)` конвертировал бы в ЛОКАЛЬНУЮ зону
+    хоста — на не-UTC машине окно запроса уезжало на смещение зоны.
+    """
     if ts.tzinfo is not None:
-        ts = ts.astimezone(tz=None).replace(tzinfo=None)
+        ts = ts.astimezone(timezone.utc).replace(tzinfo=None)
     return ts.isoformat(timespec="seconds")
 
 

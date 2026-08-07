@@ -2,6 +2,17 @@
 .gitignore
 .claude
 .github
+# Секреты и локальные БД НЕ должны попадать в build context: Dockerfile
+# делает `COPY . .`, а pydantic-settings автоматически читает .env —
+# локальный образ иначе запёк бы ANTHROPIC_API_KEY/DATABASE_URL в слой,
+# который из образа уже не вырезать.
+.env
+.env.*
+secrets.local.yaml
+**/secrets.local.yaml
+e2e-local.db
+sre_copilot.db
+*.db
 **/__pycache__
 *.pyc
 *.pyo

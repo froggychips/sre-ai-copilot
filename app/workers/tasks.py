@@ -296,12 +296,13 @@ RETRIABLE_EXC = (
     name="process_incident",
     bind=True,
     max_retries=3,
-    # NB: НЕ включаем голый TimeoutError. На Python 3.11+ asyncio.TimeoutError —
-    # его alias, а per-stage asyncio.wait_for в pipeline.run() (_staged) кидает
-    # именно его как НАМЕРЕННЫЙ терминальный stage-cap. Ретрай TimeoutError
-    # перезапускал бы весь инцидент 3× и пережигал LLM-бюджет (ломая и контракт
-    # «timeout→FAILED», и смысл transient-only retry). Сетевые таймауты покрыты
-    # httpx.TimeoutException / OSError.
+    # NB про stage-cap: на Python 3.11+ builtin TimeoutError — сабкласс OSError,
+    # т.е. голый TimeoutError попадал бы в RETRIABLE_EXC через OSError. Поэтому
+    # per-stage cap в pipeline.run() (_staged) НЕ выпускает TimeoutError наружу,
+    # а конвертирует его в PipelineStageTimeout (не входит в RETRIABLE_EXC) —
+    # намеренный терминальный таймаут стадии не ретраится и не пережигает
+    # LLM-бюджет, контракт «stage-cap → FAILED» сохраняется. Сетевые таймауты
+    # (httpx.TimeoutException / OSError) остаются ретраибельными.
     autoretry_for=RETRIABLE_EXC,
     retry_backoff=True,
     retry_backoff_max=600,
@@ -1296,6 +1297,11 @@ def _record_beat_heartbeat(sender=None, task_id=None, task=None, state=None, **k
     pipeline gauge в заблуждение. RETRY тоже игнорируем (Celery сделает
     новый postrun при успехе).
 
+    Большинство kg_*-тасков глотают исключения и возвращают {"error": ...} —
+    Celery считает такой прогон SUCCESS. Heartbeat за него писать НЕЛЬЗЯ:
+    иначе digest.pipeline_health неделями рапортует «healthy» для синка,
+    который каждый tick падает. Проверяем retval на error-маркеры.
+
     Fail-open: любая ошибка тут не должна валить task. Импорт ленивый,
     чтобы избежать circular на старте модуля.
     """
@@ -1304,6 +1310,11 @@ def _record_beat_heartbeat(sender=None, task_id=None, task=None, state=None, **k
         if task_name not in _BEAT_HEARTBEAT_TASKS:
             return
         if state != "SUCCESS":
+            return
+        retval = kwargs.get("retval")
+        if isinstance(retval, dict) and (
+            retval.get("error") is not None or retval.get("status") == "error"
+        ):
             return
         # Lazy import — stats_digest тяжеловат на boot.
         from app.services.stats_digest import _record_task_heartbeat

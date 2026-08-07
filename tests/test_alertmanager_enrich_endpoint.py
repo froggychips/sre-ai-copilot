@@ -7,7 +7,13 @@
     несколько ns сворачиваются в один embed.
   - Rollout-noise heuristic выставляет ROLLOUT-NORMAL tag.
   - Builder корректно работает при пустом KG (in_kg=False fallback).
+
+Auth теперь fail-closed (без секрета → 401), поэтому запросы подписываем
+реальным HMAC через _post_signed.
 """
+import hashlib
+import hmac
+import json
 import uuid
 from unittest.mock import AsyncMock, patch
 
@@ -21,6 +27,8 @@ from tests.conftest import requires_postgres
 # обоснования conditional skip).
 pytestmark = requires_postgres
 
+_SECRET = "enrich-endpoint-test-secret"
+
 
 @pytest.fixture(scope="module")
 def app_client():
@@ -31,6 +39,33 @@ def app_client():
 
     Base.metadata.create_all(engine)
     yield TestClient(app)
+
+
+@pytest.fixture(autouse=True)
+def _hmac_secret(monkeypatch):
+    """Auth fail-closed: выставляем секрет и чистим anti-replay кэш."""
+    from app.config import settings
+    from app.security.replay import alertmanager_signature_cache
+
+    monkeypatch.setattr(settings, "ALERTMANAGER_WEBHOOK_SECRET", _SECRET)
+    alertmanager_signature_cache.clear()
+    yield
+    alertmanager_signature_cache.clear()
+
+
+def _post_signed(client, url: str, payload: dict):
+    """POST с корректной HMAC-подписью тела (сериализуем сами — подпись
+    должна считаться над теми же байтами, что уйдут по сети)."""
+    body = json.dumps(payload).encode()
+    sig = hmac.new(_SECRET.encode(), body, hashlib.sha256).hexdigest()
+    return client.post(
+        url,
+        content=body,
+        headers={
+            "Content-Type": "application/json",
+            "X-Alertmanager-Signature": sig,
+        },
+    )
 
 
 def _alert_payload(
@@ -87,7 +122,7 @@ def test_enrich_endpoint_stores_to_kg_and_skips_pipeline(app_client):
         # DISCORD_ENRICH_ENABLED по умолчанию False → embed не уходит.
         from app.config import settings
         with patch.object(settings, "DISCORD_ENRICH_ENABLED", False):
-            resp = app_client.post("/webhooks/alertmanager/enrich-and-forward", json=payload)
+            resp = _post_signed(app_client, "/webhooks/alertmanager/enrich-and-forward", payload)
 
         assert resp.status_code == 202, resp.text
         body = resp.json()
@@ -112,7 +147,7 @@ def test_enrich_endpoint_sends_one_embed_per_group(app_client):
     with patch("app.services.discord_service.DiscordService.send_enriched_alert",
                new_callable=AsyncMock) as mock_send, \
          patch.object(settings, "DISCORD_ENRICH_ENABLED", True):
-        resp = app_client.post("/webhooks/alertmanager/enrich-and-forward", json=payload)
+        resp = _post_signed(app_client, "/webhooks/alertmanager/enrich-and-forward", payload)
 
     assert resp.status_code == 202, resp.text
     body = resp.json()
@@ -136,7 +171,7 @@ def test_enrich_endpoint_groups_by_alertname_severity(app_client):
     with patch("app.services.discord_service.DiscordService.send_enriched_alert",
                new_callable=AsyncMock) as mock_send, \
          patch.object(settings, "DISCORD_ENRICH_ENABLED", True):
-        resp = app_client.post("/webhooks/alertmanager/enrich-and-forward", json=payload)
+        resp = _post_signed(app_client, "/webhooks/alertmanager/enrich-and-forward", payload)
 
     assert resp.status_code == 202
     body = resp.json()
@@ -157,7 +192,7 @@ def test_enrich_endpoint_suppresses_chronic(app_client):
          patch("app.services.discord_service.DiscordService.send_enriched_alert",
                new_callable=AsyncMock) as mock_send, \
          patch.object(settings, "DISCORD_ENRICH_ENABLED", True):
-        resp = app_client.post("/webhooks/alertmanager/enrich-and-forward", json=payload)
+        resp = _post_signed(app_client, "/webhooks/alertmanager/enrich-and-forward", payload)
     assert resp.status_code == 202
     body = resp.json()
     assert body["suppressed_chronic"] == 1
@@ -182,7 +217,7 @@ def test_enrich_endpoint_suppresses_rollout(app_client):
          patch("app.services.discord_service.DiscordService.send_enriched_alert",
                new_callable=AsyncMock) as mock_send, \
          patch.object(settings, "DISCORD_ENRICH_ENABLED", True):
-        resp = app_client.post("/webhooks/alertmanager/enrich-and-forward", json=payload)
+        resp = _post_signed(app_client, "/webhooks/alertmanager/enrich-and-forward", payload)
     assert resp.status_code == 202
     body = resp.json()
     assert body["suppressed_rollout"] == 1
@@ -203,7 +238,7 @@ def test_enrich_endpoint_resurfaced_flag(app_client):
          patch("app.services.discord_service.DiscordService.send_enriched_alert",
                new_callable=AsyncMock) as mock_send, \
          patch.object(settings, "DISCORD_ENRICH_ENABLED", True):
-        resp = app_client.post("/webhooks/alertmanager/enrich-and-forward", json=payload)
+        resp = _post_signed(app_client, "/webhooks/alertmanager/enrich-and-forward", payload)
     assert resp.status_code == 202
     assert resp.json()["enriched_groups"] == 1
     assert mock_send.await_count == 1
@@ -224,7 +259,7 @@ def test_enrich_endpoint_resolved_critical_posts_notice(app_client):
          patch("app.services.discord_service.DiscordService.send_resolved_notice",
                new_callable=AsyncMock) as mock_notice, \
          patch.object(settings, "DISCORD_ENRICH_ENABLED", True):
-        resp = app_client.post("/webhooks/alertmanager/enrich-and-forward", json=payload)
+        resp = _post_signed(app_client, "/webhooks/alertmanager/enrich-and-forward", payload)
 
     assert resp.status_code == 202
     body = resp.json()
@@ -250,7 +285,7 @@ def test_enrich_endpoint_resolved_warning_stays_silent(app_client):
     with patch("app.services.discord_service.DiscordService.send_resolved_notice",
                new_callable=AsyncMock) as mock_notice, \
          patch.object(settings, "DISCORD_ENRICH_ENABLED", True):
-        resp = app_client.post("/webhooks/alertmanager/enrich-and-forward", json=payload)
+        resp = _post_signed(app_client, "/webhooks/alertmanager/enrich-and-forward", payload)
 
     assert resp.status_code == 202
     body = resp.json()

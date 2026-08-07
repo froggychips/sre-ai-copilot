@@ -45,6 +45,90 @@ EDGE_DECAY_INACTIVE_AFTER_DAYS = 7
 # топологии. Вместе с fetch-errors guard это защита от wipe графа.
 EDGE_DECAY_MAX_DELETE_PCT = 25.0
 
+# ── Per-source freshness guard для edge-decay ───────────────────────────────
+#
+# last_seen_at рёбер освежают РАЗНЫЕ модули: kg_sync (calls/uses_db/uses_nats
+# из env), k8s_topology_resources_sync (serves_traffic/routes_to),
+# k8s_ingress_sync (ingress-calls), nats_subjects_sync (subject-edges). Все
+# кроме kg_sync — отдельные beat-таски, и они намеренно глотают свои сбои
+# (kubectl timeout → return []). Отсюда реальный инцидент: `kubectl get
+# services -A` (42МБ JSON) таймаутил каждый тик, serves_traffic тихо
+# старели, и decay (видевший только СВОИ fetch-ошибки) стирал целые классы
+# топологии без единого алерта. 25%-cap не спасал: рёбра стареют постепенно.
+#
+# Сигнал «источник свежести жив» выводим из самих данных: если модуль
+# последние KG_EDGE_SOURCE_FRESH_HOURS часов не освежил НИ ОДНОГО своего
+# ребра (max(last_seen_at) по группе старше окна) — источник считается
+# сломанным (упал или рапортует zero fetches), и decay для его рёбер
+# пропускается с громким warning. Окно должно быть больше максимального
+# интервала beat-тасков (nats_subjects — 6ч), default 24ч.
+_EDGE_SOURCE_FRESH_HOURS_DEFAULT = 24
+
+# discovered_by → источник свежести (какой sync-модуль обновляет
+# last_seen_at этих рёбер). Неизвестный/пустой discovered_by группируется
+# fallback-ом по kind (см. _edge_freshness_source) — kind-aware защита
+# работает и для legacy-рёбер.
+_EDGE_FRESHNESS_SOURCE_BY_DISCOVERED_BY = {
+    "kg_sync/env_vars": "kg_sync",
+    "kg_sync/env_url_v2": "kg_sync",
+    "kg_sync/nats_env": "kg_sync",
+    "kg_sync/dsn_env": "kg_sync",
+    "kg_sync/secret_hint": "kg_sync",
+    "kg_sync/ingress": "k8s_ingress_sync",
+    "kg_sync/nats_subjects_parser": "nats_subjects_sync",
+    "k8s_topology_resources/service": "k8s_topology_resources_sync",
+    "k8s_topology_resources/ingress": "k8s_topology_resources_sync",
+}
+
+
+def _edge_freshness_source(kind: Optional[str], discovered_by: Optional[str]) -> str:
+    """Источник свежести ребра: по discovered_by, fallback — по kind."""
+    src = _EDGE_FRESHNESS_SOURCE_BY_DISCOVERED_BY.get(discovered_by or "")
+    if src:
+        return src
+    return f"kind:{kind or 'unknown'}"
+
+
+def _stale_freshness_sources(db: Session, now: datetime) -> set[str]:
+    """Множество источников, не освеживших ни одного ребра за окно.
+
+    Для каждой группы (kind, discovered_by) берём max(last_seen_at),
+    сворачиваем в источники через `_edge_freshness_source`. Источник со
+    свежим максимумом — жив (он успешно прошёлся и обновил то, что видит);
+    источник, у которого ВСЕ рёбра старые — сломан или рапортует zero
+    fetches → его рёбра decay-ить нельзя (их возраст — артефакт сбоя).
+    """
+    from sqlalchemy import func
+
+    from app.config import settings
+
+    fresh_hours = int(getattr(
+        settings, "KG_EDGE_SOURCE_FRESH_HOURS", _EDGE_SOURCE_FRESH_HOURS_DEFAULT,
+    ))
+    cutoff = now - timedelta(hours=fresh_hours)
+
+    rows = (
+        db.query(
+            ServiceEdge.kind,
+            ServiceEdge.discovered_by,
+            func.max(ServiceEdge.last_seen_at),
+        )
+        .group_by(ServiceEdge.kind, ServiceEdge.discovered_by)
+        .all()
+    )
+    latest: Dict[str, Optional[datetime]] = {}
+    for kind, dby, max_seen in rows:
+        src = _edge_freshness_source(kind, dby)
+        cur = latest.get(src)
+        if src not in latest or (
+            max_seen is not None and (cur is None or max_seen > cur)
+        ):
+            latest[src] = max_seen
+    return {
+        src for src, seen in latest.items()
+        if seen is None or seen < cutoff
+    }
+
 # URL-паттерн: http(s)://service-name(.namespace)?(.svc.cluster.local)?(:port)?
 _SVC_URL_RE = re.compile(
     r"https?://([a-z0-9][a-z0-9-]*)(?:\.([a-z0-9][a-z0-9-]*))?(?:\.svc\.cluster\.local)?(?::\d+)?/?$",
@@ -744,8 +828,9 @@ def _upsert_service_pg(
     }
     if team_owner is not None:
         set_clause["team_owner"] = team_owner
-    if metadata is not None:
-        set_clause["metadata_json"] = metadata
+    # metadata_json НЕ в set_clause: полный overwrite стирал ключи других
+    # источников (auto_populator, drift_cleanup, topology-sync). Merge —
+    # ниже в Python, зеркалит populator._upsert_service_pg.
     # synthetic: апдейтим только если новое значение False (стал реальным).
     if synthetic is False:
         set_clause["synthetic"] = False
@@ -764,9 +849,22 @@ def _upsert_service_pg(
     result = db.execute(stmt)
     row = result.first()
     # ORM-объект нужен для downstream upsert_edge (использует svc.id).
-    svc = db.query(Service).filter_by(
-        namespace=namespace, name=name, node_kind=NODE_KIND_SERVICE,
-    ).one()
+    # populate_existing — identity-map мог держать stale-инстанс после
+    # Core-upsert-а.
+    svc = (
+        db.query(Service)
+        .filter_by(namespace=namespace, name=name, node_kind=NODE_KIND_SERVICE)
+        .populate_existing()
+        .one()
+    )
+    if metadata is not None:
+        existing_meta: Dict[str, Any] = (
+            svc.metadata_json if isinstance(svc.metadata_json, dict) else {}
+        )
+        merged = dict(existing_meta)
+        merged.update(metadata)
+        if merged != existing_meta:
+            svc.metadata_json = cast(Any, merged)
     if row is not None:
         # flush чтобы downstream видели обновления в этой транзакции.
         db.flush()
@@ -1094,7 +1192,14 @@ def _decay_stale_edges(
     удаляем и не помечаем. Защита от wipe графа при kubectl-failure (зеркалит
     drift_cleanup threshold-abort).
 
-    Возвращает stats: {marked_inactive, deleted, skipped_decay}.
+    Kind/source-aware guard: рёбра, чей источник свежести (см.
+    `_stale_freshness_sources`) не освежил ни одного своего ребра за окно,
+    из decay ИСКЛЮЧАЮТСЯ — и из DELETE, и из soft-mark inactive. Их возраст
+    — артефакт сбоя источника (kubectl timeout / упавший beat-task), а не
+    реальная убыль топологии. Пропуск логируется громко (warning).
+
+    Возвращает stats: {marked_inactive, deleted, skipped_decay,
+    stale_sources, blocked_by_source}.
     Revived здесь не считаем — это делает основной проход (см. PR в
     upsert_edge: unset inactive при апдейте last_seen_at).
     """
@@ -1102,40 +1207,63 @@ def _decay_stale_edges(
     inactive_cutoff = now - timedelta(days=inactive_after_days)
     delete_cutoff = now - timedelta(days=delete_after_days)
 
-    stats = {"marked_inactive": 0, "deleted": 0, "skipped_decay": 0}
+    stats: Dict[str, Any] = {
+        "marked_inactive": 0, "deleted": 0, "skipped_decay": 0,
+        "stale_sources": [], "blocked_by_source": 0,
+    }
 
     # Deadman: считаем объём ПЕРЕД любой мутацией, чтобы решить безопасно ли
     # применять decay. `int(... or 0)` — count() всегда int в реальной БД,
     # обёртка лишь защищает от None экзотических бэкендов.
     total_edges = int(db.query(ServiceEdge).count() or 0)
-    to_delete = int(
+
+    # Per-source health: источники, молчащие дольше окна свежести.
+    stale_sources = _stale_freshness_sources(db, now)
+    stats["stale_sources"] = sorted(stale_sources)
+
+    delete_candidates = (
         db.query(ServiceEdge)
         .filter(ServiceEdge.last_seen_at < delete_cutoff)
-        .count()
-        or 0
+        .all()
     )
-    skip, reason = _edge_decay_should_skip(total_edges, to_delete, has_fetch_errors)
+    eligible_delete: List[ServiceEdge] = []
+    blocked_kinds_by_source: Dict[str, set] = {}
+    for edge in delete_candidates:
+        src_name = _edge_freshness_source(
+            cast(Optional[str], edge.kind),
+            cast(Optional[str], edge.discovered_by),
+        )
+        if src_name in stale_sources:
+            blocked_kinds_by_source.setdefault(src_name, set()).add(edge.kind)
+            stats["blocked_by_source"] += 1
+        else:
+            eligible_delete.append(edge)
+
+    skip, reason = _edge_decay_should_skip(
+        total_edges, len(eligible_delete), has_fetch_errors,
+    )
     if skip:
         stats["skipped_decay"] = 1
         logger.warning(
             "kg_sync.edge_decay_skipped reason=%s total_edges=%d would_delete=%d",
-            reason, total_edges, to_delete,
+            reason, total_edges, len(eligible_delete),
         )
         return stats
 
-    # 1) DELETE старых (>= delete_after_days). Делаем первым чтобы не
-    #    помечать как inactive то, что сейчас удалим.
-    deleted = (
-        db.query(ServiceEdge)
-        .filter(ServiceEdge.last_seen_at < delete_cutoff)
-        .delete(synchronize_session=False)
-    )
-    stats["deleted"] = int(deleted or 0)
+    # 1) DELETE старых (>= delete_after_days) с живым источником. Делаем
+    #    первым чтобы не помечать как inactive то, что сейчас удалим.
+    if eligible_delete:
+        ids = [e.id for e in eligible_delete]
+        db.query(ServiceEdge).filter(ServiceEdge.id.in_(ids)).delete(
+            synchronize_session=False,
+        )
+    stats["deleted"] = len(eligible_delete)
 
     # 2) Soft-mark inactive (между inactive_after_days и delete_after_days).
     #    Берём edges без `inactive=true` в extras чтобы не перетирать
     #    inactivated_at при каждом проходе. JSON-merge: сохраняем
     #    существующие ключи (discovery_sources / confidence / semantics).
+    #    Тот же source-guard: рёбра сломанного источника не помечаем.
     candidates = (
         db.query(ServiceEdge)
         .filter(
@@ -1144,7 +1272,16 @@ def _decay_stale_edges(
         )
         .all()
     )
+    marked_any = False
     for edge in candidates:
+        src_name = _edge_freshness_source(
+            cast(Optional[str], edge.kind),
+            cast(Optional[str], edge.discovered_by),
+        )
+        if src_name in stale_sources:
+            blocked_kinds_by_source.setdefault(src_name, set()).add(edge.kind)
+            stats["blocked_by_source"] += 1
+            continue
         ex: Dict[str, Any] = dict(edge.extras or {})
         if ex.get("inactive") is True:
             continue  # уже помечен в предыдущем decay-проходе
@@ -1152,8 +1289,29 @@ def _decay_stale_edges(
         ex["inactivated_at"] = now.isoformat()
         edge.extras = cast(Any, ex)
         stats["marked_inactive"] += 1
-    if candidates:
+        marked_any = True
+    if marked_any:
         db.flush()
+
+    # Громкий лог: какие источники молчат и какие kinds из-за этого
+    # защищены от decay. Это ЗАМЕТНЫЙ симптом сломанного синка — раньше
+    # эрозия шла молча.
+    if blocked_kinds_by_source:
+        for src_name, kinds in sorted(blocked_kinds_by_source.items()):
+            logger.warning(
+                "kg_sync.edge_decay_source_stale source=%s kinds=%s "
+                "blocked_edges=%d — источник не освежал рёбра дольше окна "
+                "свежести, decay для этих kind'ов пропущен (защита от "
+                "молчаливой эрозии графа)",
+                src_name, sorted(kinds),
+                sum(
+                    1 for e in delete_candidates + candidates
+                    if _edge_freshness_source(
+                        cast(Optional[str], e.kind),
+                        cast(Optional[str], e.discovered_by),
+                    ) == src_name
+                ),
+            )
     return stats
 
 
@@ -1248,7 +1406,14 @@ def sync_topology(
     known_index = _build_known_index(db)
     for ns, deploys in deploys_cache.items():
         try:
-            extra = _enrich_calls_edges_for_ns(db, ns, deploys, known_index)
+            # SAVEPOINT на namespace — как в Pass 1. Без него flush-ошибка
+            # (например, конкурентный phantom_db_cleanup удалил db:%-узел,
+            # к которому мы цепляем ребро) оставляла Session в aborted-
+            # состоянии: последующие ns падали с PendingRollbackError,
+            # терминальный db.commit() убивал task, и Pass 3 (revive/decay)
+            # не запускался вовсе.
+            with db.begin_nested():
+                extra = _enrich_calls_edges_for_ns(db, ns, deploys, known_index)
             total["edges_extended"] += extra
             total["edges"] += extra
             if extra > 0:
@@ -1270,6 +1435,10 @@ def sync_topology(
         total["edges_marked_inactive"] = decay_stats["marked_inactive"]
         total["edges_deleted"] = decay_stats["deleted"]
         total["edge_decay_skipped"] = bool(decay_stats.get("skipped_decay"))
+        total["edge_decay_stale_sources"] = decay_stats.get("stale_sources", [])
+        total["edge_decay_blocked_by_source"] = decay_stats.get(
+            "blocked_by_source", 0,
+        )
         if decay_stats.get("skipped_decay"):
             logger.warning(
                 "kg_sync.edge_decay_deadman errors=%d — decay пропущен (граф не тронут)",

@@ -10,6 +10,7 @@ app.diagnostics.rules — БЕЗ LLM-вызовов. Используется в
 """
 from __future__ import annotations
 
+import asyncio
 import re
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -693,8 +694,31 @@ def _detect_gen_mismatch_noise(
     return ready >= 1 and ready == desired
 
 
+async def enrich_alert_async(db: Session, incident: Incident) -> EnrichedContext:
+    """Async-безопасная обёртка над enrich_alert для вызова из event loop.
+
+    enrich_alert — ЦЕЛИКОМ синхронный и тяжёлый: 10+ sync SQL-запросов,
+    sync Jira HTTP (search_by_service_sync), live k8s API до 3s
+    (fetch_live_replicas) и statics-Postgres через observe_statics_version,
+    чей sync-retry спит time.sleep-ом. Худший случай — ~15-17 секунд
+    БЛОКИРОВКИ. Прямой вызов из async-эндпоинта
+    (/webhooks/alertmanager/enrich-and-forward) на alert-storm-е стопорил
+    весь API-процесс, включая health-пробы.
+
+    asyncio.to_thread уводит всю эту работу в thread pool — loop остаётся
+    свободен. ВАЖНО: SQLAlchemy Session не потокобезопасна — не вызывать
+    эту обёртку КОНКУРЕНТНО (gather) с одной и той же `db`; последовательные
+    await-ы (as in `[await enrich_alert_async(db, inc) for inc in incs]`)
+    безопасны: сессией в каждый момент владеет один поток.
+    """
+    return await asyncio.to_thread(enrich_alert, db, incident)
+
+
 def enrich_alert(db: Session, incident: Incident) -> EnrichedContext:
     """Главная точка — синхронный, без LLM, ~5 SQL-запросов.
+
+    Из async-кода вызывать ТОЛЬКО через enrich_alert_async (см. выше) —
+    прямой вызов блокирует event loop до ~15s worst-case.
 
     Безопасно при пустом KG — каждое поле fallback в пустое значение.
     """

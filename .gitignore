@@ -12,3 +12,6 @@ build/
 e2e-local.db
 sre_copilot.db
 docs/kg-presentation.html
+# k8s/base/secrets.yaml прямо инструктирует создать secrets.local.yaml с
+# боевыми ключами и обещает, что он в .gitignore — выполняем обещание.
+secrets.local.yaml

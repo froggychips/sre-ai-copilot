@@ -21,7 +21,7 @@ import re
 from typing import Any, Dict, List, Optional, Tuple
 
 from app.diagnostics.facts import Fact, FactKind
-from app.diagnostics.rules.base import Rule
+from app.diagnostics.rules.base import Rule, same_workload
 
 # Сильные индикаторы — high-confidence.
 _HARD_PATTERN = re.compile(
@@ -113,13 +113,23 @@ class OOMKilledRule(Rule):
         Fact — если нашли OOM в structured данных.
         target_exit_code — exit code target-пода (для блокировки text-fallback),
             None если target-под отсутствует в pod_state или exit_code не задан.
+
+        Скоуп: pod_state содержит ВСЕ unhealthy-поды namespace-а. Учитываем
+        только target-под и поды того же workload-а (пересозданный под с
+        другим rs-hash) — OOM НЕсвязанного сервиса в том же namespace не
+        должен приписываться этому инциденту (раньше первый попавшийся сосед
+        давал false anchor с conf 0.98). Если target неизвестен вовсе —
+        скоупить не по чему, сканируем всё (старое поведение).
         """
         candidates = []
         if pod and pod in pod_state:
             candidates.append((pod, pod_state[pod]))
         for pod_name, info in pod_state.items():
-            if pod_name != pod:
-                candidates.append((pod_name, info))
+            if pod_name == pod:
+                continue
+            if pod and not same_workload(pod_name, pod):
+                continue
+            candidates.append((pod_name, info))
 
         target_exit: Optional[int] = None
         if pod and pod in pod_state:

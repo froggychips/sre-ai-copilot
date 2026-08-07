@@ -399,92 +399,118 @@ def sync_all_services(
         "skipped_no_selector": 0,
         "skipped_no_match": 0,
         "skipped_self_loop": 0,
+        # Services, откатившиеся per-item savepoint-ом: раньше один DataError
+        # ронял весь tick, теперь считаем и продолжаем.
+        "errors": 0,
     }
 
     for svc in services:
-        meta = svc.get("metadata") or {}
-        ns = meta.get("namespace") or "default"
-        name = meta.get("name")
-        if not name:
-            continue
-
-        meta_json = _extract_service_meta(svc)
-        # upsert Service node. team_owner мы НЕ заполняем здесь — это
-        # делает kg_sync на основе ns-pattern (squad-N → squad). Если
-        # upsert_service видит существующий узел — он сохранит уже
-        # выставленный team_owner и просто обновит metadata_json.
-        svc_node = upsert_service(
-            db,
-            namespace=ns,
-            name=name,
-            metadata={"k8s_service": meta_json},
-        )
-        stats["nodes_upserted"] += 1
-
-        selector = meta_json["selector"] or {}
-        if not selector:
-            stats["skipped_no_selector"] += 1
-            continue
-
-        matches = _find_matching_deployment_objects(selector, ns, deployments_index)
-        if not matches:
-            stats["skipped_no_match"] += 1
-            continue
-
-        for dep in matches:
-            dep_name = str((dep.get("metadata") or {}).get("name") or "")
-            if not dep_name:
-                continue
-            # Workload-узел заводим сами. Раньше здесь искался УЖЕ
-            # существующий узел по (ns, name) — и для типового случая
-            # «Service foo бэкает Deployment foo» находился сам же Service:
-            # один тип узла на два разных объекта. Ребро выходило self-loop и
-            # выбрасывалось (2092 за тик), а весь serves_traffic держался на
-            # трёх экзотических парах с несовпадающими именами.
-            dep_node = upsert_service(
-                db,
-                namespace=ns,
-                name=dep_name,
-                # Владелец наследуется от Service: workload принадлежит той же
-                # команде. Без этого 2000+ новых узлов приехали бы без
-                # team_owner и обвалили owner-coverage графа (99.97% → ~50%),
-                # причём как «регрессия качества данных», которой нет.
-                team_owner=str(svc_node.team_owner) if svc_node.team_owner else None,
-                node_kind=NODE_KIND_WORKLOAD,
-                metadata={"k8s_workload": _extract_workload_meta(dep)},
+        try:
+            # SAVEPOINT на item: один DataError не переводит Session в
+            # aborted-состояние (PendingRollbackError на соседях и финальном
+            # commit) и не роняет весь tick. Зеркалит k8s_events_sync.
+            with db.begin_nested():
+                _sync_one_service(db, svc, deployments_index, stats)
+        except Exception as e:
+            stats["errors"] += 1
+            logger.warning(
+                "k8s_topology_resources.service_failed ns=%s name=%s err=%s",
+                (svc.get("metadata") or {}).get("namespace"),
+                (svc.get("metadata") or {}).get("name"), e,
             )
-            stats["workload_nodes_upserted"] += 1
-            if dep_node.id == svc_node.id:
-                # Не должно случаться: разный node_kind → разные узлы. Оставлен
-                # как страховка от регрессии в уникальном ключе kg_services.
-                stats["skipped_self_loop"] += 1
-                continue
-            upsert_edge(
-                db,
-                src=svc_node,
-                dst=dep_node,
-                kind=EDGE_SERVES_TRAFFIC,
-                discovered_by=DISCOVERED_BY_SVC,
-                extras={
-                    "confidence": "declared_k8s",
-                    "semantics": "sync",
-                    "selector": selector,
-                    "service_type": meta_json.get("service_type"),
-                },
-            )
-            stats["edges_serves_traffic"] += 1
 
     db.commit()
     logger.info(
         "k8s_topology_resources.services_done fetched=%d nodes=%d workloads=%d "
-        "edges=%d skipped_no_selector=%d skipped_no_match=%d skipped_self_loop=%d",
+        "edges=%d skipped_no_selector=%d skipped_no_match=%d skipped_self_loop=%d "
+        "errors=%d",
         stats["services_fetched"], stats["nodes_upserted"],
         stats["workload_nodes_upserted"],
         stats["edges_serves_traffic"],
         stats["skipped_no_selector"], stats["skipped_no_match"],
-        stats["skipped_self_loop"],
+        stats["skipped_self_loop"], stats["errors"],
     )
     return stats
+
+
+def _sync_one_service(
+    db: Session,
+    svc: Dict[str, Any],
+    deployments_index: Dict[str, Any],
+    stats: Dict[str, int],
+) -> None:
+    """Тело обработки одного Service — вынесено ради per-item SAVEPOINT."""
+    meta = svc.get("metadata") or {}
+    ns = meta.get("namespace") or "default"
+    name = meta.get("name")
+    if not name:
+        return
+
+    meta_json = _extract_service_meta(svc)
+    # upsert Service node. team_owner мы НЕ заполняем здесь — это
+    # делает kg_sync на основе ns-pattern (squad-N → squad). Если
+    # upsert_service видит существующий узел — он сохранит уже
+    # выставленный team_owner и просто обновит metadata_json.
+    svc_node = upsert_service(
+        db,
+        namespace=ns,
+        name=name,
+        metadata={"k8s_service": meta_json},
+    )
+    stats["nodes_upserted"] += 1
+
+    selector = meta_json["selector"] or {}
+    if not selector:
+        stats["skipped_no_selector"] += 1
+        return
+
+    matches = _find_matching_deployment_objects(selector, ns, deployments_index)
+    if not matches:
+        stats["skipped_no_match"] += 1
+        return
+
+    for dep in matches:
+        dep_name = str((dep.get("metadata") or {}).get("name") or "")
+        if not dep_name:
+            continue
+        # Workload-узел заводим сами. Раньше здесь искался УЖЕ
+        # существующий узел по (ns, name) — и для типового случая
+        # «Service foo бэкает Deployment foo» находился сам же Service:
+        # один тип узла на два разных объекта. Ребро выходило self-loop и
+        # выбрасывалось (2092 за тик), а весь serves_traffic держался на
+        # трёх экзотических парах с несовпадающими именами.
+        dep_node = upsert_service(
+            db,
+            namespace=ns,
+            name=dep_name,
+            # Владелец наследуется от Service: workload принадлежит той же
+            # команде. Без этого 2000+ новых узлов приехали бы без
+            # team_owner и обвалили owner-coverage графа (99.97% → ~50%),
+            # причём как «регрессия качества данных», которой нет.
+            team_owner=str(svc_node.team_owner) if svc_node.team_owner else None,
+            node_kind=NODE_KIND_WORKLOAD,
+            metadata={"k8s_workload": _extract_workload_meta(dep)},
+        )
+        stats["workload_nodes_upserted"] += 1
+        if dep_node.id == svc_node.id:
+            # Не должно случаться: разный node_kind → разные узлы. Оставлен
+            # как страховка от регрессии в уникальном ключе kg_services.
+            stats["skipped_self_loop"] += 1
+            continue
+        upsert_edge(
+            db,
+            src=svc_node,
+            dst=dep_node,
+            kind=EDGE_SERVES_TRAFFIC,
+            discovered_by=DISCOVERED_BY_SVC,
+            extras={
+                "confidence": "declared_k8s",
+                "semantics": "sync",
+                "selector": selector,
+                "service_type": meta_json.get("service_type"),
+            },
+        )
+        stats["edges_serves_traffic"] += 1
 
 
 # ── ingress sync ────────────────────────────────────────────────────────────
@@ -510,71 +536,91 @@ def sync_all_ingresses_declarative(db: Session) -> Dict[str, int]:
         "nodes_created": 0,
         "edges_created": 0,
         "skipped_no_backend_match": 0,
+        # Ingress-ы, откатившиеся per-item savepoint-ом.
+        "errors": 0,
     }
 
     for ing in ingresses:
-        meta = ing.get("metadata") or {}
-        ns = meta.get("namespace") or "default"
-        ing_name = meta.get("name")
-        if not ing_name:
-            continue
-
-        routes = _extract_ingress_routes(ing)
-        if not routes:
-            continue
-
-        ing_node_name = f"ingress:{ing_name}"
-        ing_node = upsert_service(
-            db,
-            namespace=ns,
-            name=ing_node_name,
-            team_owner="external",
-            synthetic=True,
-            metadata={
-                "k8s_ingress": {
-                    "ingress_name": ing_name,
-                    "ingress_class": (ing.get("spec") or {}).get("ingressClassName"),
-                    "hosts": sorted({h for h, _, _ in routes if h}),
-                },
-            },
-        )
-        stats["nodes_created"] += 1
-
-        for host, path, backend_name in routes:
-            stats["routes_seen"] += 1
-            backend = (
-                db.query(Service)
-                .filter_by(
-                    namespace=ns, name=backend_name, node_kind=NODE_KIND_SERVICE,
-                )
-                .one_or_none()
+        try:
+            # SAVEPOINT на Ingress — см. sync_all_services / k8s_events_sync.
+            with db.begin_nested():
+                _sync_one_ingress(db, ing, stats)
+        except Exception as e:
+            stats["errors"] += 1
+            logger.warning(
+                "k8s_topology_resources.ingress_failed ns=%s name=%s err=%s",
+                (ing.get("metadata") or {}).get("namespace"),
+                (ing.get("metadata") or {}).get("name"), e,
             )
-            if backend is None:
-                stats["skipped_no_backend_match"] += 1
-                continue
-            upsert_edge(
-                db,
-                src=ing_node,
-                dst=backend,
-                kind=EDGE_ROUTES_TO,
-                discovered_by=DISCOVERED_BY_INGRESS,
-                extras={
-                    "host": host or "*",
-                    "path": path,
-                    "confidence": "declared_k8s",
-                    "semantics": "sync",
-                },
-            )
-            stats["edges_created"] += 1
 
     db.commit()
     logger.info(
         "k8s_topology_resources.ingresses_done fetched=%d routes=%d edges=%d "
-        "skipped=%d",
+        "skipped=%d errors=%d",
         stats["ingresses_fetched"], stats["routes_seen"],
         stats["edges_created"], stats["skipped_no_backend_match"],
+        stats["errors"],
     )
     return stats
+
+
+def _sync_one_ingress(
+    db: Session, ing: Dict[str, Any], stats: Dict[str, int],
+) -> None:
+    """Тело обработки одного Ingress — вынесено ради per-item SAVEPOINT."""
+    meta = ing.get("metadata") or {}
+    ns = meta.get("namespace") or "default"
+    ing_name = meta.get("name")
+    if not ing_name:
+        return
+
+    routes = _extract_ingress_routes(ing)
+    if not routes:
+        return
+
+    ing_node_name = f"ingress:{ing_name}"
+    ing_node = upsert_service(
+        db,
+        namespace=ns,
+        name=ing_node_name,
+        team_owner="external",
+        synthetic=True,
+        metadata={
+            "k8s_ingress": {
+                "ingress_name": ing_name,
+                "ingress_class": (ing.get("spec") or {}).get("ingressClassName"),
+                "hosts": sorted({h for h, _, _ in routes if h}),
+            },
+        },
+    )
+    stats["nodes_created"] += 1
+
+    for host, path, backend_name in routes:
+        stats["routes_seen"] += 1
+        backend = (
+            db.query(Service)
+            .filter_by(
+                namespace=ns, name=backend_name, node_kind=NODE_KIND_SERVICE,
+            )
+            .one_or_none()
+        )
+        if backend is None:
+            stats["skipped_no_backend_match"] += 1
+            continue
+        upsert_edge(
+            db,
+            src=ing_node,
+            dst=backend,
+            kind=EDGE_ROUTES_TO,
+            discovered_by=DISCOVERED_BY_INGRESS,
+            extras={
+                "host": host or "*",
+                "path": path,
+                "confidence": "declared_k8s",
+                "semantics": "sync",
+            },
+        )
+        stats["edges_created"] += 1
 
 
 # ── orchestrator ────────────────────────────────────────────────────────────

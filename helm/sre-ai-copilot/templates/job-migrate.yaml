@@ -1,0 +1,60 @@
+# Alembic-миграции. До 2026-08-07 шаблона не было: chart-install поднимал
+# приложение на непромигрированной БД (первый же INSERT — UndefinedColumn).
+#
+# Job НЕ helm-hook сознательно: pre-install-hook стартовал бы ДО создания
+# Secret-а с DATABASE_URL (hook-ресурсы применяются раньше обычных) и завис.
+# Вместо этого — обычный Job с revision-суффиксом в имени:
+#   * имя уникально на каждый `helm upgrade` → не упираемся в иммутабельность
+#     spec.template у Job;
+#   * старые Job-ы прибирает ttlSecondsAfterFinished;
+#   * пока миграции не доехали, api-pod-ы просто не проходят readiness
+#     (startupProbe даёт 60с) и добираются сами — self-healing порядок.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ include "sre-ai-copilot.fullname" . }}-migrate-r{{ .Release.Revision }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "sre-ai-copilot.labels" . | nindent 4 }}
+    app.kubernetes.io/component: migrate
+spec:
+  backoffLimit: 3
+  ttlSecondsAfterFinished: 86400
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: {{ include "sre-ai-copilot.name" . }}
+        app.kubernetes.io/instance: {{ .Release.Name }}
+        app.kubernetes.io/component: migrate
+    spec:
+      serviceAccountName: {{ include "sre-ai-copilot.serviceAccountName" . }}
+      restartPolicy: OnFailure
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        {{- include "sre-ai-copilot.podSecurityContext" . | nindent 8 }}
+      containers:
+      - name: migrate
+        image: "{{ .Values.image.repository }}:{{ required "image.tag обязателен (CI публикует только :<git-sha>, тега :latest нет)" .Values.image.tag }}"
+        imagePullPolicy: {{ .Values.image.pullPolicy }}
+        command:
+        - alembic
+        - upgrade
+        - head
+        securityContext:
+          {{- include "sre-ai-copilot.containerSecurityContext" . | nindent 10 }}
+        envFrom:
+        - secretRef:
+            name: {{ include "sre-ai-copilot.secretName" . }}
+        env:
+        - name: ENV
+          value: {{ .Values.env.appEnv | quote }}
+        resources:
+          limits:
+            cpu: 200m
+            memory: 256Mi
+          requests:
+            cpu: 100m
+            memory: 128Mi

@@ -27,7 +27,10 @@ services:
   worker:
     build: .
     container_name: sre-ai-worker
-    command: python -m app.queue.worker
+    # Боевой Celery-worker (как в k8s/worker.yaml). Старый `python -m
+    # app.queue.worker` тянул rq, которого нет в requirements → мгновенный
+    # ModuleNotFoundError (сам app/queue/ выпиливается).
+    command: celery -A app.workers.tasks.celery_app worker --loglevel=info
     env_file: .env
     environment:
       - OTLP_EXPORTER_ENDPOINT=http://otelcollector:4317
@@ -40,6 +43,9 @@ services:
   redis:
     image: redis:7-alpine
     container_name: sre-ai-redis
+    # ⚠️ DEV-ONLY: Redis без auth опубликован на хост (6379) — любой процесс
+    # на машине (и сеть, если docker слушает не только localhost) имеет
+    # полный доступ к брокеру. Ни в коем случае не воспроизводить в prod.
     ports:
       - "6379:6379"
 
@@ -82,6 +88,8 @@ services:
     container_name: sre-ai-grafana
     ports:
       - "3000:3000"
+    # ⚠️ DEV-ONLY: анонимный Admin без формы логина — кто открыл :3000, тот
+    # админ Grafana. Допустимо только на локальной машине разработчика.
     environment:
       - GF_AUTH_ANONYMOUS_ENABLED=true
       - GF_AUTH_ANONYMOUS_ORG_ROLE=Admin

@@ -31,7 +31,7 @@ spec:
       containers:
       - name: api
         # Pin по digest в CI: image: ghcr.io/froggychips/sre-ai-copilot@sha256:<digest>
-        image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+        image: "{{ .Values.image.repository }}:{{ required "image.tag обязателен (CI публикует только :<git-sha>, тега :latest нет)" .Values.image.tag }}"
         imagePullPolicy: {{ .Values.image.pullPolicy }}
         ports:
         - containerPort: 8000

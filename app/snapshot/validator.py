@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-from datetime import datetime
+from datetime import datetime, timezone
 from hashlib import sha256
 from typing import Any, Dict, List
 
@@ -27,6 +27,13 @@ def _parse_iso(ts: str) -> datetime | None:
         return None
 
 
+def _as_utc(dt: datetime) -> datetime:
+    """Naive datetime трактуем как UTC — иначе aware/naive несравнимы."""
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
 def validate_snapshot(snapshot: Dict[str, Any]) -> Dict[str, Any]:
     errors: List[str] = []
     warnings: List[str] = []
@@ -40,14 +47,30 @@ def validate_snapshot(snapshot: Dict[str, Any]) -> Dict[str, Any]:
         errors.append("source_event_ids must not be empty")
 
     timestamps = snapshot.get("timestamps") or {}
-    ts_values = [v for v in timestamps.values() if isinstance(v, str) and v]
-    parsed = [_parse_iso(v) for v in ts_values]
-    parsed_valid = [p for p in parsed if p is not None]
-    if parsed_valid and len(parsed_valid) >= 2:
-        if min(parsed_valid) > max(parsed_valid):
-            errors.append("timestamps.min > timestamps.max")
-        if parsed_valid != sorted(parsed_valid):
-            warnings.append("non-monotonic timestamps detected")
+    # Проверка согласованности только для СЕМАНТИЧЕСКИ упорядоченной пары:
+    # incident_ts (момент инцидента) не может быть позже captured_at (момент
+    # снятия снапшота). Раньше «монотоничность» проверялась по dict в порядке
+    # вставки {"captured_at": now, "incident_ts": <прошлое>} — captured_at
+    # всегда позже incident_ts, КАЖДЫЙ снапшот получал ложный warning и уходил
+    # в DEGRADED/low-fidelity, сигнал был бесполезен. Мёртвая ветка
+    # `min(...) > max(...)` (невозможна по определению min/max) удалена.
+    incident_raw = timestamps.get("incident_ts")
+    captured_raw = timestamps.get("captured_at")
+    incident_dt = (
+        _parse_iso(incident_raw)
+        if isinstance(incident_raw, str) and incident_raw
+        else None
+    )
+    captured_dt = (
+        _parse_iso(captured_raw)
+        if isinstance(captured_raw, str) and captured_raw
+        else None
+    )
+    if incident_dt is not None and captured_dt is not None:
+        if _as_utc(incident_dt) > _as_utc(captured_dt):
+            warnings.append(
+                "incident_ts is after captured_at — clock skew or bad source timestamp"
+            )
 
     payload = snapshot.get("payload") or {}
     expected_metric_hash = sha256(

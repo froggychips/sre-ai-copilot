@@ -32,6 +32,20 @@ from app.services.intent_signature import compute_signature
 # Fixtures: in-memory SQLite + Base.metadata.create_all
 # ---------------------------------------------------------------------------
 
+@pytest.fixture(autouse=True)
+def _reset_dedup_state():
+    """Чистим in-memory dedup-кэш (fallback dedup_store) между тестами —
+    claim-placeholder от одного send_incident_report глушит POST следующего."""
+    from app.services.discord import dedup as _dedup_state
+    _dedup_state._recent_enriched.clear()
+    _dedup_state._recent_incidents.clear()
+    _dedup_state._recent_by_alertname.clear()
+    yield
+    _dedup_state._recent_enriched.clear()
+    _dedup_state._recent_incidents.clear()
+    _dedup_state._recent_by_alertname.clear()
+
+
 @pytest.fixture
 def isolated_db(monkeypatch):
     """In-memory SQLite + create_all для ActionApproval. Подменяет SessionLocal."""
@@ -217,7 +231,7 @@ async def test_double_click_returns_already_decided(isolated_db):
 
 @pytest.mark.asyncio
 async def test_approve_executor_enabled_dispatches_task(isolated_db):
-    """EXECUTOR_ENABLED=true → fire-and-forget executor task."""
+    """EXECUTOR_ENABLED + EXECUTOR_APPROVAL_ENABLED → fire-and-forget executor task."""
     intent_sig = compute_signature(_intent())
     payload = _make_payload(f"approve:inc-X:{intent_sig}", user_name="user")
 
@@ -236,6 +250,7 @@ async def test_approve_executor_enabled_dispatches_task(isolated_db):
     with patch.object(discord_interactions, "_verify_signature", return_value=True), \
          patch.object(discord_interactions.settings, "DISCORD_PUBLIC_KEY", "deadbeef"), \
          patch.object(discord_interactions.settings, "EXECUTOR_ENABLED", True), \
+         patch.object(discord_interactions.settings, "EXECUTOR_APPROVAL_ENABLED", True), \
          patch.object(discord_interactions.settings, "DISCORD_APPROVERS_USER_IDS", "u-1"), \
          patch.object(discord_interactions.audit_service, "log_event"), \
          patch("asyncio.create_task", side_effect=spy):
@@ -246,9 +261,78 @@ async def test_approve_executor_enabled_dispatches_task(isolated_db):
         )
 
     # Минимум 1 create_task — для edit_message_after_decision;
-    # при EXECUTOR_ENABLED=true ещё один — apply_intent fire-and-forget.
+    # при обоих executor-флагах ещё один — apply_intent fire-and-forget.
     assert len(created_tasks) >= 2
     assert "Executor launched" in resp["data"]["content"]
+
+
+@pytest.mark.asyncio
+async def test_approve_without_approval_flag_never_dispatches_executor(isolated_db):
+    """CRITICAL-гейт: EXECUTOR_ENABLED=true, но EXECUTOR_APPROVAL_ENABLED=false
+    → apply_intent НЕ диспатчится. README документирует EXECUTOR_ENABLED как
+    dry-run-only; реальный write требует отдельного opt-in."""
+    intent_sig = compute_signature(_intent())
+    payload = _make_payload(f"approve:inc-gate:{intent_sig}", user_name="user")
+
+    created_coros: list = []
+
+    def spy(coro):
+        created_coros.append(coro)
+        if hasattr(coro, "close"):
+            coro.close()
+        import asyncio
+        loop = asyncio.get_running_loop()
+        f = loop.create_future()
+        f.set_result(None)
+        return f
+
+    with patch.object(discord_interactions, "_verify_signature", return_value=True), \
+         patch.object(discord_interactions.settings, "DISCORD_PUBLIC_KEY", "deadbeef"), \
+         patch.object(discord_interactions.settings, "EXECUTOR_ENABLED", True), \
+         patch.object(discord_interactions.settings, "EXECUTOR_APPROVAL_ENABLED", False), \
+         patch.object(discord_interactions.settings, "DISCORD_APPROVERS_USER_IDS", "u-1"), \
+         patch.object(discord_interactions.audit_service, "log_event"), \
+         patch("app.services.executor_apply.apply_intent") as mock_apply, \
+         patch("asyncio.create_task", side_effect=spy):
+        request = MagicMock()
+        request.body = AsyncMock(return_value=json.dumps(payload).encode())
+        resp = await discord_interactions.discord_interactions(
+            request, x_signature_ed25519="00" * 64, x_signature_timestamp="0",
+        )
+
+    mock_apply.assert_not_called()
+    # Только edit-message-task; executor-таски нет.
+    assert len(created_coros) == 1
+    assert "EXECUTOR_APPROVAL_ENABLED=false" in resp["data"]["content"]
+    assert "Executor launched" not in resp["data"]["content"]
+
+
+@pytest.mark.asyncio
+async def test_decline_still_works_without_approval_flag(isolated_db):
+    """Decline — чистая запись решения; флаг executor-а её не блокирует."""
+    intent_sig = compute_signature(_intent())
+    payload = _make_payload(f"decline:inc-dnf:{intent_sig}", user_name="zakhar")
+
+    with patch.object(discord_interactions, "_verify_signature", return_value=True), \
+         patch.object(discord_interactions.settings, "DISCORD_PUBLIC_KEY", "deadbeef"), \
+         patch.object(discord_interactions.settings, "EXECUTOR_ENABLED", True), \
+         patch.object(discord_interactions.settings, "EXECUTOR_APPROVAL_ENABLED", False), \
+         patch.object(discord_interactions.settings, "DISCORD_APPROVERS_USER_IDS", "u-1"), \
+         patch.object(discord_interactions.audit_service, "log_event"), \
+         patch("asyncio.create_task"):
+        request = MagicMock()
+        request.body = AsyncMock(return_value=json.dumps(payload).encode())
+        resp = await discord_interactions.discord_interactions(
+            request, x_signature_ed25519="00" * 64, x_signature_timestamp="0",
+        )
+
+    assert "Declined" in resp["data"]["content"]
+
+    from app.knowledge_graph.schema import ActionApproval
+    with isolated_db() as session:
+        rows = session.query(ActionApproval).all()
+        assert len(rows) == 1
+        assert rows[0].status == "declined"
 
 
 @pytest.mark.asyncio
@@ -323,14 +407,15 @@ async def test_send_incident_report_skips_approve_row_when_bot_not_configured(mo
 
 @pytest.mark.asyncio
 async def test_send_incident_report_uses_bot_api_when_configured(monkeypatch):
-    """При bot-config + intent — шлём через bot API с approve/decline кнопками."""
+    """При bot-config + intent + EXECUTOR_APPROVAL_ENABLED — шлём через bot API
+    с approve/decline кнопками (render-гейт на флаге, как у ⚙️ Apply)."""
     from app.services.discord_service import DiscordService
 
     monkeypatch.setattr("app.config.settings.DISCORD_DRY_RUN", False)
     monkeypatch.setattr("app.config.settings.DISCORD_BOT_TOKEN", "test-bot-token")
     monkeypatch.setattr("app.config.settings.DISCORD_INCIDENT_CHANNEL_ID", "1501861363880824943")
     monkeypatch.setattr("app.config.settings.DISCORD_WEBHOOK_URL", "https://example/test")
-    monkeypatch.setattr("app.config.settings.EXECUTOR_APPROVAL_ENABLED", False)
+    monkeypatch.setattr("app.config.settings.EXECUTOR_APPROVAL_ENABLED", True)
 
     captured = []
 
@@ -377,6 +462,63 @@ async def test_send_incident_report_uses_bot_api_when_configured(monkeypatch):
     expected_sig = compute_signature(_intent())
     assert f"approve:inc-1:{expected_sig}" in custom_ids
     assert f"decline:inc-1:{expected_sig}" in custom_ids
+
+
+@pytest.mark.asyncio
+async def test_send_incident_report_no_approve_row_when_approval_disabled(monkeypatch):
+    """CRITICAL-гейт: bot сконфигурирован, но EXECUTOR_APPROVAL_ENABLED=false —
+    approve/decline row НЕ рендерится (кнопка «Approve & Run» вела к реальному
+    kubectl мимо prod opt-in флага)."""
+    from app.services.discord_service import DiscordService
+
+    monkeypatch.setattr("app.config.settings.DISCORD_DRY_RUN", False)
+    monkeypatch.setattr("app.config.settings.DISCORD_BOT_TOKEN", "test-bot-token")
+    monkeypatch.setattr("app.config.settings.DISCORD_INCIDENT_CHANNEL_ID", "1501861363880824943")
+    monkeypatch.setattr("app.config.settings.DISCORD_WEBHOOK_URL", "https://example/test")
+    monkeypatch.setattr("app.config.settings.EXECUTOR_APPROVAL_ENABLED", False)
+
+    captured = []
+
+    class FakeClient:
+        def __init__(self, **kw):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        async def post(self, url, json=None, headers=None):
+            captured.append({"url": url, "json": json, "headers": headers})
+            r = MagicMock()
+            r.status_code = 200
+            return r
+
+    svc = DiscordService()
+    with patch("httpx.AsyncClient", FakeClient):
+        await svc.send_incident_report(
+            incident_id="inc-1",
+            alertname="TestAlert",
+            namespace="squad-1",
+            pod=None, service="town-service", node=None,
+            severity="warning",
+            cause="test",
+            resolution_quality="unresolved",
+            synthesis="something",
+            execution_intent=_intent(),
+            executor_result={"status": "dry_run_ok"},
+        )
+
+    assert len(captured) == 1
+    all_custom_ids = {
+        c["custom_id"]
+        for row in captured[0]["json"]["components"]
+        for c in row["components"]
+    }
+    # Ни approve/decline, ни apply — реальный write недостижим ни с одной кнопки.
+    assert all(not cid.startswith(("approve:", "decline:", "apply:"))
+               for cid in all_custom_ids)
 
 
 # ---------------------------------------------------------------------------

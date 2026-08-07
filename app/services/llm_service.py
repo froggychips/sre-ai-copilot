@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import weakref
 from typing import Any, Dict, Optional
 
 from anthropic import AsyncAnthropic
@@ -10,23 +11,35 @@ from app.services.resilience import LLMCircuitOpen, llm_retry_strategy
 
 _LLM_PROVIDER = "anthropic"
 
+# Отдельный именованный logger для circuit-диагностики: не смешиваем с
+# root-`logging.warning` (его патчат тесты вокруг truncation-warning-а), и
+# в агрегаторе логов деградацию брейкера видно по своему префиксу.
+_circuit_log = logging.getLogger(__name__ + ".circuit")
+
 
 def _get_resilience():
     """Лениво достаём LLMResilienceManager-синглтон из celery_worker.
 
     Ленивый импорт рвёт цикл llm_service↔celery_worker.
-    Любая ошибка → None: circuit breaker — best-effort и НИКОГДА не должен
-    ронять сам LLM-вызов.
+    Ошибка ИМПОРТА → None: circuit breaker — best-effort и НИКОГДА не должен
+    ронять сам LLM-вызов; но деградацию логируем — молчаливый no-op брейкера
+    уже приводил к тому, что fan-out storm шёл в лежащий провайдер.
     """
     try:
         from app.celery_worker import resilience
         return resilience
-    except Exception:
+    except Exception as e:
+        _circuit_log.warning("llm_resilience_unavailable: %s", e)
         return None
 
 
 async def _report_provider(resilience, *, success: bool) -> None:
-    """report_success/report_failure, проглатывая любые ошибки резильенса."""
+    """report_success/report_failure; ошибки резильенса не роняют вызов.
+
+    Не роняют — но и не глотаются молча: если report_* стабильно падает
+    (Redis умер, клиент от чужого loop-а), брейкер слеп и это надо видеть
+    в логах, а не постфактум по счетам за токены.
+    """
     if resilience is None:
         return
     try:
@@ -34,8 +47,11 @@ async def _report_provider(resilience, *, success: bool) -> None:
             await resilience.report_success(_LLM_PROVIDER)
         else:
             await resilience.report_failure(_LLM_PROVIDER)
-    except Exception:
-        pass
+    except Exception as e:
+        _circuit_log.warning(
+            "llm_circuit_report_failed (success=%s): %s: %s",
+            success, type(e).__name__, e,
+        )
 
 
 class LLMService:
@@ -60,7 +76,18 @@ class LLMService:
         self.backend = (settings.LLM_BACKEND or "anthropic").lower()
         self.model = settings.MODEL_NAME
         self.cli: Optional[ClaudeCliService] = None
+        # `client` — ЯВНЫЙ override (тесты ставят svc.client = MagicMock()).
+        # В проде остаётся None: реальный AsyncAnthropic берётся per-event-loop
+        # из _loop_clients (см. _anthropic_client). Модульный singleton
+        # llm_client живёт через МНОГО `asyncio.run(...)` Celery-задач
+        # (worker_max_tasks_per_child=50), а AsyncAnthropic держит httpx-pool
+        # и asyncio-локи, привязанные к loop-у создания — общий клиент давал
+        # "Event loop is closed"/"attached to a different loop" со второй
+        # задачи в каждом child-процессе.
         self.client: Optional[AsyncAnthropic] = None
+        self._loop_clients: "weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, AsyncAnthropic]" = (
+            weakref.WeakKeyDictionary()
+        )
         if self.backend == "claude_cli":
             self.cli = ClaudeCliService(
                 model=settings.MODEL_NAME or None,
@@ -68,19 +95,37 @@ class LLMService:
                     getattr(settings, "CLAUDE_CLI_TIMEOUT_SECONDS", 180.0)
                 ),
             )
-        else:
-            # max_retries=0 — НЕ полагаемся на встроенные ретраи SDK (по дефолту 2).
-            # Иначе SDK-ретраи (2) × наш llm_retry_strategy (3) = до 9 HTTP на один
-            # agent-вызов (retry-storm + сжигание токенов). Единственный слой
-            # ретраев — наш декоратор; предикат там сужен до транзиентных ошибок.
-            # timeout на уровне клиента — реальная отмена httpx-запроса по дедлайну
-            # (внешний asyncio.wait_for НЕ обрывает уже улетевший HTTP → «зомби»-
-            # запрос жжёт токены в фоне). LLM_TIMEOUT_SECONDS из settings.
-            self.client = AsyncAnthropic(
-                api_key=settings.ANTHROPIC_API_KEY,
-                max_retries=0,
-                timeout=float(getattr(settings, "LLM_TIMEOUT_SECONDS", 30.0)),
-            )
+
+    def _build_anthropic_client(self) -> AsyncAnthropic:
+        # max_retries=0 — НЕ полагаемся на встроенные ретраи SDK (по дефолту 2).
+        # Иначе SDK-ретраи (2) × наш llm_retry_strategy (3) = до 9 HTTP на один
+        # agent-вызов (retry-storm + сжигание токенов). Единственный слой
+        # ретраев — наш декоратор; предикат там сужен до транзиентных ошибок.
+        # timeout на уровне клиента — реальная отмена httpx-запроса по дедлайну
+        # (внешний asyncio.wait_for НЕ обрывает уже улетевший HTTP → «зомби»-
+        # запрос жжёт токены в фоне). LLM_TIMEOUT_SECONDS из settings.
+        return AsyncAnthropic(
+            api_key=settings.ANTHROPIC_API_KEY,
+            max_retries=0,
+            timeout=float(getattr(settings, "LLM_TIMEOUT_SECONDS", 30.0)),
+        )
+
+    def _anthropic_client(self) -> AsyncAnthropic:
+        """AsyncAnthropic, привязанный к ТЕКУЩЕМУ event loop.
+
+        Явный override self.client (тесты / кастомный клиент) имеет приоритет.
+        Иначе — клиент из per-loop кэша: каждый `asyncio.run` получает свой
+        httpx-pool, клиенты умерших loop-ов уходят вместе с loop-ом
+        (WeakKeyDictionary → GC).
+        """
+        if self.client is not None:
+            return self.client
+        loop = asyncio.get_running_loop()
+        client = self._loop_clients.get(loop)
+        if client is None:
+            client = self._build_anthropic_client()
+            self._loop_clients[loop] = client
+        return client
 
     @llm_retry_strategy
     async def generate_full(self, prompt: str) -> Dict[str, Any]:
@@ -115,14 +160,21 @@ class LLMService:
                     "stop_reason": None,
                     "truncated": False,
                 }
-            assert self.client is not None
+            client = self._anthropic_client()
             # Circuit breaker (resilience.py): fail fast, если anthropic уже
-            # сыпет ошибками — не долбим лежащий провайдер. Fail-open: любая
-            # ошибка резильенса/redis → считаем circuit закрытым, идём дальше.
+            # сыпет ошибками — не долбим лежащий провайдер. Fail-open: ошибка
+            # самого резильенса/Redis → считаем circuit закрытым и идём дальше
+            # (иначе сбой Redis глушил бы ВСЕ LLM-вызовы), но деградацию
+            # логируем громко — молчаливое `except: circuit_open = False`
+            # уже превращало брейкер в no-op незаметно для всех.
             if resilience is not None:
                 try:
                     circuit_open = await resilience.is_circuit_open(_LLM_PROVIDER)
-                except Exception:
+                except Exception as e:
+                    _circuit_log.warning(
+                        "llm_circuit_check_failed (fail-open): %s: %s",
+                        type(e).__name__, e,
+                    )
                     circuit_open = False
                 if circuit_open:
                     raise LLMCircuitOpen(
@@ -152,7 +204,7 @@ class LLMService:
             #     Он НЕ отменяет сетевой сокет сам по себе — поэтому слой (1)
             #     обязателен, а wait_for оставлен лишь как hard-ceiling.
             response = await asyncio.wait_for(
-                self.client.messages.create(
+                client.messages.create(
                     model=self.model,
                     max_tokens=settings.MAX_TOKENS,
                     messages=[{"role": "user", "content": prompt}],

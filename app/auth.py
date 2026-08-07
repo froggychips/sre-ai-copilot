@@ -15,6 +15,17 @@ logger = structlog.get_logger()
 # Security scheme for Swagger UI
 security = HTTPBearer()
 
+# Закрытый список АСИММЕТРИЧНЫХ алгоритмов подписи. JWT_PUBLIC_KEY — публичный
+# ключ; если через env просочится симметричный JWT_ALGORITHM=HS256, PyJWT
+# использует этот ПУБЛИЧНЫЙ ключ как HMAC-секрет — и любой, кто его видел,
+# сможет чеканить валидные токены. Поэтому алгоритм пиним, а не доверяем env.
+_ASYMMETRIC_JWT_ALGORITHMS = frozenset({
+    "RS256", "RS384", "RS512",
+    "PS256", "PS384", "PS512",
+    "ES256", "ES256K", "ES384", "ES512",
+    "EdDSA",
+})
+
 
 class User(BaseModel):
     """
@@ -37,15 +48,34 @@ async def get_current_user(
     token = credentials.credentials
     log = logger.bind(auth_event="jwt_validation")
 
+    # Пин на асимметричное семейство (см. _ASYMMETRIC_JWT_ALGORITHMS):
+    # мисконфиг — это отказ в аутентификации, а не повод пропустить токен.
+    algorithm = settings.JWT_ALGORITHM
+    if algorithm not in _ASYMMETRIC_JWT_ALGORITHMS:
+        log.error("auth_misconfigured_algorithm", algorithm=algorithm)
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Could not validate credentials",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    # iss ОБЯЗАТЕЛЕН всегда (иначе токен другого сервиса того же IdP-ключа
+    # аутентифицируется здесь); значение сверяется, когда задан JWT_ISSUER.
+    # aud требуется и сверяется, когда задан JWT_AUDIENCE.
+    expected_issuer = getattr(settings, "JWT_ISSUER", None)
+    required_claims = ["exp", "sub", "iss"]
+    if settings.JWT_AUDIENCE:
+        required_claims.append("aud")
+
     try:
         # Decode and validate the token
-        # aud проверяется только когда задан JWT_AUDIENCE (иначе не требуем).
         payload = jwt.decode(
             token,
             settings.JWT_PUBLIC_KEY,  # RSA Public Key string from ENV
-            algorithms=[settings.JWT_ALGORITHM],
+            algorithms=[algorithm],
             audience=settings.JWT_AUDIENCE,
-            options={"require": ["exp", "sub"]},
+            issuer=expected_issuer,
+            options={"require": required_claims},
         )
 
         # sub обязателен — пустую строку всё равно отсекаем дальше через InvalidTokenError.
@@ -69,10 +99,14 @@ async def get_current_user(
             headers={"WWW-Authenticate": "Bearer"},
         )
     except Exception as e:
+        # Fail-closed 401, не 500: PyJWT кидает InvalidKeyError (НЕ подкласс
+        # InvalidTokenError) на пустой/битый JWT_PUBLIC_KEY — раньше это
+        # утекало 500-кой. Любая неожиданная ошибка валидации = отказ в auth.
         log.error("auth_unexpected_error", error=str(e))
         raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Internal auth error",
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Could not validate credentials",
+            headers={"WWW-Authenticate": "Bearer"},
         )
 
 

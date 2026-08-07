@@ -18,6 +18,14 @@ class Settings(BaseSettings):
         description="PostgreSQL connection string",
     )
 
+    # Пул считается ПОФАЙЛОВО на процесс, а процессов много: 2 реплики api +
+    # 2 пода worker × (1 родитель + N prefork) + beat + миграции/cron. При
+    # 20+20 теоретический потолок уходит за дефолтные max_connections=100
+    # у postgres. Держим консервативно и выносим в env, чтобы api и worker
+    # можно было сайзить раздельно.
+    DB_POOL_SIZE: int = Field(10, description="SQLAlchemy pool_size на процесс")
+    DB_MAX_OVERFLOW: int = Field(20, description="SQLAlchemy max_overflow на процесс")
+
     REDIS_URL: str = Field(
         "redis://localhost:6379/0",
         description="Redis connection URL for Celery broker and backend",
@@ -54,6 +62,23 @@ class Settings(BaseSettings):
     #   - Budget cap в Anthropic console установлен
     #   - severity-фильтр сужен до critical + prod-*
     LLM_PIPELINE_ENABLED: bool = False
+
+    # Потолок на стадию пайплайна. Это НАМЕРЕННО терминальный cap: истёкший
+    # таймаут стадии не должен ретраиться (перезапуск всего инцидента ×3 жжёт
+    # LLM-бюджет). См. RETRIABLE_EXC в app/workers/tasks.py.
+    PIPELINE_STAGE_TIMEOUT_SECONDS: float = Field(
+        240.0, description="Таймаут одной стадии пайплайна (сек)"
+    )
+    # Алерт, распознанный как шум, демотится по severity, но раньше всё равно
+    # прогонял все стадии (hypothesis fan-out, critic, fix, risk, synthesis).
+    # Короткое замыкание экономит бюджет на заведомо шумных срабатываниях.
+    SUPPRESSED_ALERT_SHORT_CIRCUIT: bool = Field(
+        True, description="Не гонять полный LLM-пайплайн для подавленных алертов"
+    )
+    # rpush без LTRIM растил историю сессии неограниченно в пределах TTL.
+    SESSION_HISTORY_MAX_MESSAGES: int = Field(
+        200, description="Максимум сообщений в истории сессии (LTRIM)"
+    )
 
     # KG schema/quality contract drift guard. При FastAPI startup сверяет
     # реальное состояние БД с `app.knowledge_graph.contract.EDGE_KINDS` и
@@ -434,6 +459,10 @@ class Settings(BaseSettings):
     OIDC_WELL_KNOWN_URL: Optional[str] = None
     JWT_ALGORITHM: str = "RS256"
     JWT_AUDIENCE: Optional[str] = None
+    # Ожидаемый issuer токена. Без сверки `iss` любой токен, подписанный тем же
+    # ключом IdP (даже выданный для другого сервиса), проходит аутентификацию,
+    # а его claim `roles` открывает /replay и /approvals.
+    JWT_ISSUER: Optional[str] = None
 
     # Адрес bind для Prometheus-сервера метрик (:8001). Default "0.0.0.0" —
     # in-cluster scraping не должен сломаться. В PROD порт ограничивать
@@ -457,6 +486,18 @@ class Settings(BaseSettings):
         False,
         description="Требовать X-Alertmanager-Timestamp (отклонять body-only подпись)",
     )
+    # Fail-open раньше был неявным: при незаданном секрете проверка подписи
+    # молча пропускалась, а обязательность секрета висела на точном литерале
+    # ENV == "production". ENV=prod / staging / Production принимали
+    # неаутентифицированные вебхуки. Теперь пропуск требует ЯВНОГО опт-аута.
+    ALERTMANAGER_ALLOW_UNAUTHENTICATED: bool = Field(
+        False,
+        description="Явно разрешить вебхук без подписи (только локальная разработка)",
+    )
+    # Заголовок с реальным IP клиента за ingress/прокси для ключа rate-limit.
+    # None = доверять только request.client.host. Включать ТОЛЬКО когда перед
+    # сервисом стоит прокси, который этот заголовок перезаписывает.
+    TRUSTED_PROXY_HEADER: Optional[str] = None
     # Точка роста #2 (Phase 2): AlertManager API URL для resolve-sync.
     # Сейчас kg_alerts держит `firing` записи без resolved_at годами (видим
     # etcd alerts от 10 апреля). Beat task kg_alerts_resolve_sync периодически
@@ -674,6 +715,20 @@ class Settings(BaseSettings):
     #   4. execution_intent.risk in {"low", "medium"} (high — manual only)
     # Default False — нужен явный опт-ин на проде.
     EXECUTOR_APPROVAL_ENABLED: bool = Field(False, description="Show Apply button on Discord embed")
+
+    # Запись об одобрении в kg_action_approvals не имела привязки ко времени:
+    # approval четырёхчасовой давности продолжал авторизовывать реальный write
+    # (особенно после re-fire алерта). Ограничиваем срок годности одобрения.
+    EXECUTOR_APPROVAL_MAX_AGE_SECONDS: int = Field(
+        3600, description="Максимальный возраст (сек) записи APPROVED для apply"
+    )
+    # Двухфазный claim: маркер in_flight пишется и коммитится ДО kubectl.
+    # Если воркер умрёт между запуском команды и записью результата, кластер
+    # окажется изменён, а маркер — нет; claim закрывает это окно. TTL нужен,
+    # чтобы зависший claim не блокировал apply навсегда.
+    EXECUTOR_IN_FLIGHT_TTL_SECONDS: int = Field(
+        600, description="TTL (сек) для незавершённого in_flight claim в executor"
+    )
 
     # Approve/Decline whitelist (PR #12 executor track, security hardening).
     # CSV строки с Discord IDs. Минимум ОДИН из двух должен быть непуст,

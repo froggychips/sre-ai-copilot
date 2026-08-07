@@ -229,7 +229,8 @@ async def run_alerts_resolve_sync(db: Session) -> Dict[str, Any]:
     except Exception as e:
         fetch_error = str(e)
         log.warning(
-            "alerts_resolve_sync.fetch_failed error=%s — продолжаем age-fallback",
+            "alerts_resolve_sync.fetch_failed error=%s — AM-снимка нет, оба "
+            "прохода (recent + age-fallback) пропущены, ничего не резолвим",
             e,
         )
 

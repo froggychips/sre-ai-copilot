@@ -39,6 +39,17 @@ _ACTION_OP_MAP: Dict[ActionType, Tuple[str, str]] = {
 }
 
 
+# resource_type (singular, из pydantic-схемы) → множественное имя ресурса для
+# guard-а. Наивное `+ "s"` давало "ingresss" для ingress — такого имени нет в
+# ALLOWED_RESOURCES, и весь describe-путь для ingress был молча заблокирован.
+_RESOURCE_PLURAL: Dict[str, str] = {
+    "deployment": "deployments",
+    "pod":        "pods",
+    "service":    "services",
+    "ingress":    "ingresses",
+}
+
+
 def _intent_to_operation(intent: ExecutionIntent) -> K8sOperation:
     """Преобразовать структурный ExecutionIntent в K8sOperation для guard-а."""
     if intent.action not in _ACTION_OP_MAP:
@@ -46,8 +57,12 @@ def _intent_to_operation(intent: ExecutionIntent) -> K8sOperation:
     verb, default_resource = _ACTION_OP_MAP[intent.action]
     # DESCRIBE_RESOURCE может покрывать pod/deployment/service/ingress —
     # берём resource_type из intent (уже валидирован pydantic-схемой:
-    # ^(deployment|pod|service|ingress)$).
-    resource = (default_resource or intent.resource_type.lower() + "s")
+    # ^(deployment|pod|service|ingress)$). Неизвестный тип → "" → guard
+    # отклонит как resource-not-allowed (fail-closed).
+    resource = (
+        default_resource
+        or _RESOURCE_PLURAL.get(intent.resource_type.lower(), "")
+    )
     return K8sOperation(
         verb=verb,
         resource=resource,

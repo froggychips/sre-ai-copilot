@@ -1,8 +1,11 @@
 import asyncio
 import json
+from typing import TYPE_CHECKING, cast
 
 import structlog
-from redis.asyncio import from_url
+
+if TYPE_CHECKING:
+    from redis.asyncio import Redis
 
 from app.agents.analyzer import AnalyzerAgent
 from app.config import settings
@@ -11,7 +14,7 @@ from app.core.state_machine import IncidentState, StateMachine
 from app.database import SessionLocal
 from app.models import Conversation
 from app.replay.contract import assert_replay_isolated_runtime
-from app.services.resilience import LLMResilienceManager
+from app.services.resilience import LLMResilienceManager, LoopLocalRedis
 from app.services.session_manager import SessionManager
 
 # Единое Celery-приложение. Раньше здесь жил отдельный Celery("worker") без
@@ -27,9 +30,22 @@ from app.workers.tasks import celery_app
 
 # Initialize services
 logger = structlog.get_logger()
-redis_client = from_url(settings.REDIS_URL)
-resilience = LLMResilienceManager(redis_client)
-session_manager = SessionManager(redis_client)
+# LoopLocalRedis вместо голого from_url: Celery-таски выполняются через
+# `asyncio.run(...)` (новый event loop на задачу), а процесс живёт до 50 задач
+# (worker_max_tasks_per_child). Модульный клиент с одним connection pool
+# привязывал коннекты к loop-у ПЕРВОЙ задачи — все последующие получали
+# "Event loop is closed"/"attached to a different loop", из-за чего circuit
+# breaker и session-хранилище молча деградировали в no-op. Прокси выдаёт
+# отдельный клиент per-loop (и общий fallback для sync-контекста); публичное
+# имя `redis_client` сохранено — его импортируют app/api/approvals.py и
+# app/services/discord/embed_builder.py.
+redis_client = LoopLocalRedis(settings.REDIS_URL)
+# LoopLocalRedis — прозрачный прокси: любой атрибут делегируется реальному
+# redis.asyncio.Redis, выбранному под текущий event loop. Для потребителей это
+# неотличимо от Redis, но статически это разные типы — сужаем на границе.
+_redis: "Redis" = cast("Redis", redis_client)
+resilience = LLMResilienceManager(_redis)
+session_manager = SessionManager(_redis)
 
 
 async def _generate_reply_logic(

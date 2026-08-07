@@ -3,7 +3,12 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from app.context.jira_client import JiraClient, _jira_status, build_jira_context
+from app.context.jira_client import (
+    JiraClient,
+    _jira_status,
+    _jql_quote,
+    build_jira_context,
+)
 
 
 # ---------- _jira_status --------------------------------------------------
@@ -63,6 +68,83 @@ def test_build_jira_context_mixed():
     assert ctx["has_open"] is True
     assert ctx["has_resolved"] is True
     assert ctx["total"] == 2
+
+
+# ---------- _jql_quote (JQL-инъекция через alert-label) ------------------
+
+def test_jql_quote_plain_value_untouched():
+    assert _jql_quote("town-service") == "town-service"
+
+
+def test_jql_quote_escapes_double_quotes():
+    assert _jql_quote('x" OR project = "FINANCE') == 'x\\" OR project = \\"FINANCE'
+
+
+def test_jql_quote_escapes_backslash_before_quote():
+    # Бэкслеш экранируется ПЕРВЫМ, иначе `\"` в инпуте разэкранировал бы кавычку.
+    assert _jql_quote('a\\" OR x') == 'a\\\\\\" OR x'
+
+
+def test_jql_quote_strips_control_chars():
+    assert _jql_quote("svc\n\x00\tname") == "svcname"
+
+
+def test_jql_quote_empty_and_none():
+    assert _jql_quote("") == ""
+    assert _jql_quote(None) == ""  # type: ignore[arg-type]
+
+
+@pytest.mark.asyncio
+async def test_search_by_service_escapes_injection_in_jql():
+    """Label `service` с кавычкой не разрывает конъюнкцию project/labels."""
+    mock_resp = MagicMock()
+    mock_resp.json.return_value = {"issues": []}
+    mock_resp.raise_for_status = MagicMock()
+
+    with patch("httpx.AsyncClient") as mock_client_cls:
+        mock_client = AsyncMock()
+        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+        mock_client.__aexit__ = AsyncMock(return_value=False)
+        mock_client.post = AsyncMock(return_value=mock_resp)
+        mock_client_cls.return_value = mock_client
+
+        client = JiraClient(
+            base_url="https://juicybuttons.atlassian.net",
+            email="test@test.com",
+            api_token="token123",
+        )
+        await client.search_by_service('x" OR project = "FINANCE')
+
+    jql = mock_client.post.await_args.kwargs["json"]["jql"]
+    # Внутри строки все кавычки инъекции экранированы…
+    assert 'summary ~ "x\\" OR project = \\"FINANCE"' in jql
+    # …и неэкранированного разрыва `..." OR project = "...` в JQL нет.
+    assert '~ "x" OR' not in jql
+
+
+def test_search_by_service_sync_escapes_injection_in_jql():
+    """Sync-вариант обязан использовать тот же хелпер (одна точка экранирования)."""
+    mock_resp = MagicMock()
+    mock_resp.json.return_value = {"issues": []}
+    mock_resp.raise_for_status = MagicMock()
+
+    with patch("httpx.Client") as mock_client_cls:
+        mock_client = MagicMock()
+        mock_client.__enter__ = MagicMock(return_value=mock_client)
+        mock_client.__exit__ = MagicMock(return_value=False)
+        mock_client.post = MagicMock(return_value=mock_resp)
+        mock_client_cls.return_value = mock_client
+
+        client = JiraClient(
+            base_url="https://juicybuttons.atlassian.net",
+            email="test@test.com",
+            api_token="token123",
+        )
+        client.search_by_service_sync('y" OR labels = "prod-secrets')
+
+    jql = mock_client.post.call_args.kwargs["json"]["jql"]
+    assert 'summary ~ "y\\" OR labels = \\"prod-secrets"' in jql
+    assert '~ "y" OR' not in jql
 
 
 # ---------- JiraClient.search_by_service (mocked HTTP) -------------------

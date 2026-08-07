@@ -488,9 +488,11 @@ def nats_impact_for(
         return []
 
     # Собираем subject-node IDs за один батч, чтобы посчитать ко-консьюмеров
-    # одним SQL-запросом, а не N.
+    # одним SQL-запросом, а не N. Ключ — (subject_id, direction): после
+    # фикса pub/sub-схлопывания сервис может иметь ДВА uses_nats-ребра на
+    # один subject (pub и sub) — обе строки выводим отдельно.
     subject_ids: List[int] = []
-    by_subject_id: Dict[int, Dict[str, Any]] = {}
+    by_subject_dir: Dict[tuple, Dict[str, Any]] = {}
     for edge in out_edges:
         if edge.dst is None:
             continue
@@ -498,9 +500,13 @@ def nats_impact_for(
         extras: Dict[str, Any] = (
             edge.extras if isinstance(edge.extras, dict) else {}
         )
-        direction = (extras.get("direction") or "?").lower()
+        # direction: сначала колонка (новая идентичность), fallback extras
+        # для legacy-рёбер, записанных до миграции.
+        direction = (
+            getattr(edge, "direction", "") or extras.get("direction") or "?"
+        ).lower()
         subject_ids.append(sid)
-        by_subject_id[sid] = {
+        by_subject_dir[(sid, direction)] = {
             "subject": edge.dst.name,
             "direction": direction,
             "impact_count": 0,
@@ -517,23 +523,29 @@ def nats_impact_for(
             )
             .all()
         )
+        # Ко-сервис с pub И sub рёбрами считаем один раз per subject
+        # (как до фикса, когда ребро было одно).
+        seen_co: set = set()
         for r in co_rows:
             if r.src is None:
                 continue
-            entry = by_subject_id.get(r.dst_id)
-            if entry is None:
+            if (r.dst_id, r.src_id) in seen_co:
                 continue
-            entry["impact_count"] += 1
-            if len(entry["impact_others"]) < 3:
-                r_extras: Dict[str, Any] = (
-                    r.extras if isinstance(r.extras, dict) else {}
-                )
-                entry["impact_others"].append((
-                    r.src.name,
-                    (r_extras.get("direction") or "?").lower(),
-                ))
+            seen_co.add((r.dst_id, r.src_id))
+            r_extras: Dict[str, Any] = (
+                r.extras if isinstance(r.extras, dict) else {}
+            )
+            r_dir = (
+                getattr(r, "direction", "") or r_extras.get("direction") or "?"
+            ).lower()
+            for (sid, _dir), entry in by_subject_dir.items():
+                if sid != r.dst_id:
+                    continue
+                entry["impact_count"] += 1
+                if len(entry["impact_others"]) < 3:
+                    entry["impact_others"].append((r.src.name, r_dir))
 
-    result = list(by_subject_id.values())
+    result = list(by_subject_dir.values())
     result.sort(key=lambda x: x["impact_count"], reverse=True)
     return result[:top_n]
 

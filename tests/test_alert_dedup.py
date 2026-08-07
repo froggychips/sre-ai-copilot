@@ -12,7 +12,6 @@ L4 — rollout-noise <10min silent:
   - mismatch alert + предыдущий длился >10m → проходит к L2
   - non-mismatch alertname → L4 не триггерится
 """
-import json
 from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -23,15 +22,28 @@ from app.services.alert_dedup import (Decision, decide_send)
 
 @pytest.fixture
 def fake_redis():
-    """In-memory mock того же интерфейса что aioredis (get/set/delete)."""
+    """In-memory mock интерфейса aioredis (get/set/incr/delete).
+
+    set поддерживает nx (SET NX — создать только если ключа нет), incr —
+    атомарный счётчик: новый L2-state хранится в двух ключах (`*:cnt`
+    counter + `*:last` unix-ts), см. app/services/alert_dedup.py.
+    """
     store: dict[str, str] = {}
 
     class FakeRedis:
         async def get(self, key):
             return store.get(key)
 
-        async def set(self, key, value, ex=None):
-            store[key] = value
+        async def set(self, key, value, ex=None, nx=False):
+            if nx and key in store:
+                return None
+            store[key] = str(value)
+            return True
+
+        async def incr(self, key):
+            new = int(store.get(key, "0")) + 1
+            store[key] = str(new)
+            return new
 
         async def delete(self, key):
             store.pop(key, None)
@@ -80,23 +92,20 @@ async def test_chronic_suppress_after_third_fire(fake_redis):
 async def test_quiet_reset_resurfaced(fake_redis):
     db = MagicMock()
     base = datetime.now(timezone.utc)
-    # Записываем фейковый state как-будто было 5 fires час назад,
-    # но last_fire >2h назад.
+    # Записываем фейковый state как-будто было 8 fires, но last_fire >2h назад.
     _, store = fake_redis
-    key = "enrich:lastsent:KubePodCrashLooping:bot-service"
+    key_cnt = "enrich:lastsent:KubePodCrashLooping:bot-service:cnt"
+    key_last = "enrich:lastsent:KubePodCrashLooping:bot-service:last"
     old_last = base - timedelta(hours=3)
-    store[key] = json.dumps({
-        "first": int((base - timedelta(hours=4)).timestamp()),
-        "last": int(old_last.timestamp()),
-        "count": 8,
-    })
+    store[key_cnt] = "8"
+    store[key_last] = str(int(old_last.timestamp()))
     d = await decide_send(
         "KubePodCrashLooping", "ns", "bot-service", "warning", db, fire_at=base,
     )
     assert d == Decision.SEND_RESURFACED
-    # State сброшен: count=1
-    new_state = json.loads(store[key])
-    assert new_state["count"] == 1
+    # State сброшен: count=1, last = текущий fire
+    assert store[key_cnt] == "1"
+    assert store[key_last] == str(int(base.timestamp()))
 
 
 @pytest.mark.asyncio
@@ -178,6 +187,7 @@ async def test_rollout_silent_not_triggered_for_crashloop():
     fake = MagicMock()
     fake.get = AsyncMock(return_value=None)
     fake.set = AsyncMock()
+    fake.incr = AsyncMock(return_value=1)
     with patch("app.services.alert_dedup._get_client", return_value=fake):
         d = await decide_send(
             "KubePodCrashLooping",

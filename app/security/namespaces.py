@@ -17,7 +17,13 @@ FORBIDDEN_NAMESPACES: Set[str] = {
 }
 
 # Production-tier namespaces — только read-only (никакого scale/delete/patch).
-READ_ONLY_NAMESPACES: Set[str] = {"prod", "preprod", "preupdate"}
+# Реальные ns называются `prod-kingdom5` / `preupdate-shared` / `preprod-qa-1`
+# и т.п. — точный `in`-матч по базовым именам их НЕ ловил, ветка была мёртвой.
+# Матчим точное имя ИЛИ префикс `<env>-` (см. is_read_only ниже).
+READ_ONLY_NAMESPACES: Set[str] = {"prod", "preprod", "preupdate", "production"}
+READ_ONLY_NAMESPACE_PREFIXES: tuple[str, ...] = tuple(
+    f"{env}-" for env in sorted(READ_ONLY_NAMESPACES)
+)
 
 # Где разрешена запись (после approval).
 WRITE_NAMESPACE_PATTERNS: list[Pattern[str]] = [
@@ -44,4 +50,8 @@ def is_forbidden(ns: str) -> bool:
 
 
 def is_read_only(ns: str) -> bool:
-    return _normalize(ns) in READ_ONLY_NAMESPACES
+    # Точное имя ("prod") или префикс ("prod-kingdom5", "preupdate-shared").
+    # ВАЖНО: это дополнительный запрет — allowlist записи
+    # (WRITE_NAMESPACE_PATTERNS) не ослабляется.
+    n = _normalize(ns)
+    return n in READ_ONLY_NAMESPACES or n.startswith(READ_ONLY_NAMESPACE_PREFIXES)

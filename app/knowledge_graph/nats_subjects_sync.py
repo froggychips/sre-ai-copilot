@@ -16,7 +16,12 @@
   переиспользовать существующие `kg_services`/`kg_service_edges` без новых
   таблиц и миграций.
 - **Edge** kind=`uses_nats`, src=сервис, dst=subject-узел.
-  `extras.direction` = `pub` / `sub`. weight = кол-во call-site-ов.
+  `direction` (= `pub` / `sub`) — часть ИДЕНТИЧНОСТИ ребра (колонка +
+  UNIQUE(src,dst,kind,direction)): сервис, который И публикует, И читает
+  один subject, имеет ДВА ребра. Раньше direction жил только в extras,
+  pub+sub схлопывались в одно ребро и направление флипфлопило между
+  тиками. `extras.direction` дублируется для обратной совместимости
+  консьюмеров. weight = кол-во call-site-ов.
 
 Источник данных
 ===============
@@ -504,6 +509,11 @@ def persist_to_kg(
                 kind="uses_nats",
                 weight=len(sources),
                 discovered_by="kg_sync/nats_subjects_parser",
+                # direction — часть идентичности ребра: pub и sub одного
+                # subject сосуществуют как ДВА ребра (не перезаписывают
+                # друг друга). В extras дублируем для консьюмеров,
+                # читающих старый формат.
+                direction=direction,
                 extras={
                     "direction": direction,
                     "subject": subj,

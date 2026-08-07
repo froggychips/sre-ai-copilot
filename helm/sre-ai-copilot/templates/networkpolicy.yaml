@@ -51,7 +51,18 @@ spec:
     ports:
     - protocol: TCP
       port: 6443
-  # External HTTPS (LLM API, Discord, Alertmanager, Jira, etc.)
+  # VictoriaMetrics (:8428, metrics_sync/enrichment) и AlertManager
+  # (:9093, resolve-sync) — in-cluster сервисы в ДРУГОМ namespace
+  # (monitoring), внешним HTTPS-правилом не покрываются: оно исключает
+  # приватные CIDR. Без этих портов enrichment и resolve-sync глохнут.
+  - to:
+    - namespaceSelector: {}
+    ports:
+    - protocol: TCP
+      port: 8428
+    - protocol: TCP
+      port: 9093
+  # External HTTPS (LLM API, Discord, Jira, etc.)
   - to:
     - ipBlock:
         cidr: 0.0.0.0/0
@@ -69,7 +80,8 @@ spec:
     - protocol: TCP
       port: 53
 ---
-# NetworkPolicy for Worker pods
+# NetworkPolicy for Worker / Beat / Migrate pods (все нуждаются в одинаковом
+# egress: Postgres, Redis, k8s API, VM/AM, внешний HTTPS, DNS).
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
@@ -83,7 +95,10 @@ spec:
     matchLabels:
       app.kubernetes.io/name: {{ include "sre-ai-copilot.name" . }}
       app.kubernetes.io/instance: {{ .Release.Name }}
-      app.kubernetes.io/component: worker
+    matchExpressions:
+    - key: app.kubernetes.io/component
+      operator: In
+      values: ["worker", "beat", "migrate"]
   policyTypes:
   - Egress
   egress:
@@ -112,7 +127,17 @@ spec:
     ports:
     - protocol: TCP
       port: 6443
-  # External HTTPS (LLM API, Discord, Alertmanager, Jira, etc.)
+  # VictoriaMetrics (:8428) / AlertManager (:9093) в ns monitoring —
+  # kg_metrics_sync, kg_alerts_resolve_sync, enrichment. Старый netpol эти
+  # порты резал, и все VM/AM-задачи worker-а глохли под политикой.
+  - to:
+    - namespaceSelector: {}
+    ports:
+    - protocol: TCP
+      port: 8428
+    - protocol: TCP
+      port: 9093
+  # External HTTPS (LLM API, Discord, Jira, etc.)
   - to:
     - ipBlock:
         cidr: 0.0.0.0/0

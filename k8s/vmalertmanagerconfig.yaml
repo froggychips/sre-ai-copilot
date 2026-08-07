@@ -1,3 +1,29 @@
+# Маршрутизация алертов AlertManager → sre-ai-api.
+#
+# ПУТЬ ВЕБХУКА. Роутер смонтирован с prefix=/webhooks (app/main.py), реальные
+# endpoint-ы (app/api/webhooks.py):
+#   /webhooks/alertmanager                    — полный LLM-pipeline (отключён
+#                                               до E2E-прогонов и budget-cap'ов)
+#   /webhooks/alertmanager/store              — только KG event-store, без Discord
+#   /webhooks/alertmanager/enrich-and-forward — KG store + enriched Discord embed
+#                                               (текущий боевой режим, без LLM)
+# Старый url /webhook/alert НЕ СУЩЕСТВОВАЛ — 100% алертов получали 404 и
+# молча терялись (алерта на «отсутствие алертов» нет).
+#
+# ⚠️ HMAC. В prod (ENV=production) app/config.py требует
+# ALERTMANAGER_WEBHOOK_SECRET, и verify_alertmanager_signature ждёт заголовок
+# X-Alertmanager-Signature: sha256=<hmac-sha256(body)> (опционально
+# X-Alertmanager-Timestamp, тогда HMAC считается над `ts.body`).
+# Стоковый AlertManager / VMAlertmanager НЕ УМЕЕТ подписывать body — значит,
+# этот конфиг сам по себе в prod получит 401. Рабочие варианты:
+#   1. Sidecar/Deployment «signing proxy» рядом с alertmanager: принимает POST,
+#      досчитывает HMAC от тела запроса, проставляет заголовок и проксирует на
+#      sre-ai-api (nginx+lua / 20-строчный FastAPI). url ниже тогда указывает
+#      на proxy.
+#   2. Изолировать трафик NetworkPolicy (см. k8s/networkpolicy.yaml) и
+#      сознательно НЕ задавать ALERTMANAGER_WEBHOOK_SECRET вне prod —
+#      verify_alertmanager_signature в dev пропускает без подписи (с warning).
+# Без одного из этих шагов конфиг неработоспособен в prod as-is.
 apiVersion: operator.victoriametrics.com/v1beta1
 kind: VMAlertmanagerConfig
 metadata:
@@ -7,17 +33,17 @@ spec:
   receivers:
   - name: sre-ai-prod
     webhook_configs:
-    - url: http://sre-ai-api.sre-ai.svc.cluster.local:8000/webhook/alert
+    - url: http://sre-ai-api.sre-ai.svc.cluster.local:8000/webhooks/alertmanager/enrich-and-forward
       send_resolved: true
       max_alerts: 10
   - name: sre-ai-preprod
     webhook_configs:
-    - url: http://sre-ai-api.sre-ai.svc.cluster.local:8000/webhook/alert
+    - url: http://sre-ai-api.sre-ai.svc.cluster.local:8000/webhooks/alertmanager/enrich-and-forward
       send_resolved: true
       max_alerts: 10
   - name: sre-ai-preupdate
     webhook_configs:
-    - url: http://sre-ai-api.sre-ai.svc.cluster.local:8000/webhook/alert
+    - url: http://sre-ai-api.sre-ai.svc.cluster.local:8000/webhooks/alertmanager/enrich-and-forward
       send_resolved: true
       max_alerts: 10
   route:

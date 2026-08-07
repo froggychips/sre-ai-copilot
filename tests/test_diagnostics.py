@@ -114,9 +114,28 @@ def test_crashloop_rule_detects_phrase():
     assert facts[0].confidence >= 0.85
 
 
-def test_crashloop_rule_detects_high_restart_count():
+def test_crashloop_rule_restart_count_alone_is_not_active_crashloop():
+    """Кумулятивный restart_count — это история пода, а не активный crashloop.
+
+    `restart_count` в k8s считается за всю жизнь пода: под с 12 рестартами за
+    месяцы работы сейчас может быть полностью здоров. Раньше счётчик сам по
+    себе давал observed=True (conf 0.7) и якорил гипотезы про crashloop.
+    Счётчик остаётся в evidence — для отладки он полезен.
+    """
     facts = CrashLoopBackOffRule().evaluate({
         "k8s_summary": "Container restart count: 12",
+    })
+    assert facts[0].observed is False
+    assert facts[0].evidence["max_restart_count"] == 12
+
+
+def test_crashloop_rule_detects_recent_backoff_event():
+    """Свежий BackOff-event — признак именно активного restart-цикла."""
+    facts = CrashLoopBackOffRule().evaluate({
+        "k8s_summary": "Container restart count: 12",
+        "k8s_events": [
+            {"reason": "BackOff", "message": "Back-off restarting failed container"},
+        ],
     })
     assert facts[0].observed is True
     assert facts[0].evidence["max_restart_count"] == 12

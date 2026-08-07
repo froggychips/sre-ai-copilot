@@ -49,6 +49,16 @@ _PEM_PRIVATE_KEY: Pattern[str] = re.compile(
     re.DOTALL,
 )
 
+# Log line truncated mid-key: BEGIN marker present, END marker lost. Without
+# this rule the armoured body sailed through (the paired pattern above needs a
+# matching END), shipping half a private key to Discord / kg_log_observations.
+# Applied AFTER the paired pattern, so it only sees unpaired leftovers; matches
+# to end-of-text (everything after a dangling BEGIN is key material anyway).
+_PEM_PRIVATE_KEY_TRUNCATED: Pattern[str] = re.compile(
+    r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----.*$",
+    re.DOTALL,
+)
+
 # AWS Access Key ID. `AKIA` = long-term IAM key, `ASIA` = temporary/STS key.
 # Always exactly the 4-char prefix + 16 uppercase-alnum chars. NOT hex, so the
 # long-hex catch-all never sees it — must be an explicit pattern. Placed before
@@ -92,8 +102,17 @@ _UUID: Pattern[str] = re.compile(
 # whitespace, ampersand, semicolon, comma, or quote. Case-insensitive name.
 # Note: applied AFTER bearer so `Authorization: Bearer <x>` is handled by
 # _BEARER first.
+#
+# The key may carry a word-char prefix (`aws_secret_access_key`, `api_secret`,
+# `client_secret`, `refresh_token`, ...) — a bare `\b` before the keyword can
+# never match after `_` (it's a word char), which silently skipped every
+# underscore-prefixed secret key. The keyword must sit at the END of the key,
+# right before the separator, so `max_tokens=1024` stays untouched.
 _KV_SECRET: Pattern[str] = re.compile(
-    r"\b(password|passwd|pwd|token|secret|api[_\-]?key|access[_\-]?key|auth[_\-]?token)"
+    r"(?<![A-Za-z0-9])"
+    r"([A-Za-z0-9_\-]*"
+    r"(?:password|passwd|pwd|token|secret|api[_\-]?key|access[_\-]?key|auth[_\-]?token)"
+    r")"
     r"\s*[:=]\s*"
     r"(['\"]?)([^\s&;,'\"]+)\2",
     re.IGNORECASE,
@@ -145,14 +164,18 @@ def redact_pii(text: str) -> str:
     inputs return empty string.
 
     Order of operations:
-        1.  PEM key      → `<private-key>` (whole armoured block, DOTALL)
+        1.  PEM key      → `<private-key>` (whole armoured block, DOTALL;
+                           then a dangling BEGIN-without-END tail — a log
+                           line truncated mid-key must not leak the body)
         2.  Emails       → `<email>`
         3.  JWT          → `<jwt>`
         4.  AWS key id   → `<aws-key-id>` (AKIA.../ASIA...)
         5.  Bearer ...   → `Bearer <token>`
         6.  Basic ...    → `Basic <credentials>`
         7.  UUIDs        → `<uuid>`
-        8.  key=value    → `key=<redacted>` (password/token/secret/api_key/...)
+        8.  key=value    → `key=<redacted>` (password/token/secret/api_key/...
+                           incl. underscore-prefixed keys like
+                           aws_secret_access_key / client_secret / refresh_token)
         9.  Long hex     → `<hex:N>`
         10. IPv6         → `<ip>`
         11. IPv4         → `<ip>`
@@ -172,6 +195,7 @@ def redact_pii(text: str) -> str:
     out = text
 
     out = _PEM_PRIVATE_KEY.sub("<private-key>", out)
+    out = _PEM_PRIVATE_KEY_TRUNCATED.sub("<private-key>", out)
     out = _EMAIL.sub("<email>", out)
     out = _JWT.sub("<jwt>", out)
     out = _AWS_ACCESS_KEY_ID.sub("<aws-key-id>", out)

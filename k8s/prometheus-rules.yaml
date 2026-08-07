@@ -153,3 +153,47 @@ spec:
         summary: "Pod {{ $labels.pod }} рестартится"
         description: |
           Контейнер падает с ненулевой регулярностью.
+
+  # Бэкапы Postgres (k8s/postgres-backup.yaml). До 2026-08-07 CronJob падал
+  # на первой команде (apk при readOnlyRootFilesystem) МОЛЧА — алертов не
+  # было, «RPO 24ч» существовал только в комментарии. Оба правила ниже
+  # закрывают тихую смерть: fail-алерт + deadman на отсутствие успеха.
+  - name: sre-ai-copilot.backup
+    interval: 60s
+    rules:
+    - alert: SREAICopilotPostgresBackupFailed
+      # Требует kube-state-metrics. job_name у CronJob-детей:
+      # postgres-backup-<schedule-hash>.
+      expr: |
+        kube_job_status_failed{job_name=~"postgres-backup-.+"} > 0
+      for: 5m
+      labels:
+        severity: critical
+        team: sre
+      annotations:
+        summary: "Бэкап Postgres (postgres-backup) упал"
+        description: |
+          Job {{ $labels.job_name }} завершился с ошибкой. Дампа за сегодня
+          нет — RPO ползёт. kubectl logs job/{{ $labels.job_name }}
+          (initContainer pg-dump / container s3-upload).
+        runbook_url: "https://github.com/froggychips/sre-ai-copilot/blob/master/docs/DR.md"
+
+    - alert: SREAICopilotPostgresBackupMissing
+      # Deadman: успешного прогона не было > 26ч (расписание 24ч + 2ч grace).
+      # Ловит и «CronJob удалён/suspend», и «джобы падают так, что Failed
+      # серии уже проэкспарились». kube_cronjob_status_last_successful_time —
+      # kube-state-metrics >= 2.5.
+      expr: |
+        time() - max(kube_cronjob_status_last_successful_time{cronjob="postgres-backup"}) > 93600
+        or absent(kube_cronjob_status_last_successful_time{cronjob="postgres-backup"}) == 1
+      for: 30m
+      labels:
+        severity: critical
+        team: sre
+      annotations:
+        summary: "Нет успешного бэкапа Postgres > 26ч"
+        description: |
+          Последний успешный прогон postgres-backup старше 26 часов либо
+          CronJob вообще не виден в метриках. Задокументированный RPO 24ч
+          нарушен.
+        runbook_url: "https://github.com/froggychips/sre-ai-copilot/blob/master/docs/DR.md"

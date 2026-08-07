@@ -21,10 +21,22 @@ _pool_kwargs: dict = {}
 if not _is_sqlite:
     # Под нагрузкой sync-сессии гоняются через run_in_threadpool (Starlette,
     # до ~40 потоков) + Celery beat-задачи + dedup_store. Дефолтный QueuePool
-    # (pool_size=5/max_overflow=10 → потолок 15) → `QueuePool limit ... timed
-    # out`. Поднимаем потолок до 40 одновременных коннектов.
+    # (pool_size=5/max_overflow=10 → потолок 15) давал `QueuePool limit ...
+    # timed out` на api.
+    #
+    # ВАЖНО про потолок: engine создаётся В КАЖДОМ процессе. Процессов ~13:
+    # 2 api-pod-а + 2 worker-pod-а × (parent + 4 prefork-детей) + beat +
+    # migrate/cron. Прежние 20+20=40 на процесс давали теоретический потолок
+    # 13×40=520 коннектов при дефолтном max_connections=100 у Postgres —
+    # шторм «FATAL: sorry, too many clients already» на ровном месте.
+    # 10+20=30 держит api-burst (threadpool ~40 редко весь в БД одновременно,
+    # pool_timeout=30 сглаживает пики), а worker-дети реально держат 1-2
+    # коннекта. Требование к серверу: Postgres max_connections >= 200
+    # (см. k8s/postgres.yaml) либо pgbouncer перед БД.
+    # TODO(config): вынести pool_size/max_overflow в app/config.py, чтобы
+    # api и worker можно было сайзить раздельно (у config.py другой владелец).
     _pool_kwargs = {
-        "pool_size": 20,
+        "pool_size": 10,
         "max_overflow": 20,
         "pool_timeout": 30,
         # Профилактически пересоздаём коннекты раз в 30 мин — k8s LB/PG
@@ -49,6 +61,22 @@ SessionLocal = sessionmaker(
     expire_on_commit=False,
 )
 Base = declarative_base()
+
+
+# Celery prefork: ребёнок наследует engine родителя вместе с уже открытыми
+# сокетами Postgres. Два процесса, пишущие в один сокет, дают «weird errors»
+# класса lost synchronization with server / SSL decryption failed.
+# Рекомендация SQLAlchemy для fork: в каждом ребёнке сразу выбросить
+# унаследованный пул (close=False — сокеты родителя из ребёнка НЕ закрываем,
+# ими продолжает пользоваться родитель) и дать ребёнку набрать свои коннекты.
+try:
+    from celery.signals import worker_process_init
+
+    @worker_process_init.connect
+    def _dispose_engine_after_fork(**_kwargs) -> None:
+        engine.dispose(close=False)
+except ImportError:  # окружение без celery (например, часть скриптов)
+    pass
 
 
 class IncidentRecord(Base):

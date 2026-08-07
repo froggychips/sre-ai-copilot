@@ -3,7 +3,13 @@
 В отличие от полного `/webhooks/alertmanager`, store-endpoint НЕ
 запускает pipeline (никаких LLM-вызовов). Только записывает в kg_alerts
 через populate_from_incident.
+
+Auth теперь fail-closed (без секрета → 401), поэтому запросы подписываем
+реальным HMAC через _post_signed.
 """
+import hashlib
+import hmac
+import json
 import uuid
 from unittest.mock import patch
 
@@ -17,6 +23,8 @@ from tests.conftest import requires_postgres
 # с psycopg2.OperationalError (см. conftest для обоснования conditional skip).
 pytestmark = requires_postgres
 
+_SECRET = "store-endpoint-test-secret"
+
 
 @pytest.fixture(scope="module")
 def app_client():
@@ -28,6 +36,33 @@ def app_client():
 
     Base.metadata.create_all(engine)
     yield TestClient(app)
+
+
+@pytest.fixture(autouse=True)
+def _hmac_secret(monkeypatch):
+    """Auth fail-closed: выставляем секрет и чистим anti-replay кэш."""
+    from app.config import settings
+    from app.security.replay import alertmanager_signature_cache
+
+    monkeypatch.setattr(settings, "ALERTMANAGER_WEBHOOK_SECRET", _SECRET)
+    alertmanager_signature_cache.clear()
+    yield
+    alertmanager_signature_cache.clear()
+
+
+def _post_signed(client, url: str, payload: dict):
+    """POST с корректной HMAC-подписью тела (сериализуем сами — подпись
+    должна считаться над теми же байтами, что уйдут по сети)."""
+    body = json.dumps(payload).encode()
+    sig = hmac.new(_SECRET.encode(), body, hashlib.sha256).hexdigest()
+    return client.post(
+        url,
+        content=body,
+        headers={
+            "Content-Type": "application/json",
+            "X-Alertmanager-Signature": sig,
+        },
+    )
 
 
 def test_store_endpoint_writes_kg_alert_but_not_calls_pipeline(app_client):
@@ -63,7 +98,7 @@ def test_store_endpoint_writes_kg_alert_but_not_calls_pipeline(app_client):
 
     with patch("app.workers.tasks.process_incident_task.delay") as mock_delay, \
          patch("app.workers.tasks.async_process_incident") as mock_async_proc:
-        resp = app_client.post("/webhooks/alertmanager/store", json=payload)
+        resp = _post_signed(app_client, "/webhooks/alertmanager/store", payload)
         assert resp.status_code == 202, resp.text
         body = resp.json()
         assert body["status"] == "stored"
@@ -102,7 +137,7 @@ def test_store_endpoint_skips_resolved_alerts(app_client):
             }
         ],
     }
-    resp = app_client.post("/webhooks/alertmanager/store", json=payload)
+    resp = _post_signed(app_client, "/webhooks/alertmanager/store", payload)
     assert resp.status_code == 202
     body = resp.json()
     assert body["alerts"][0]["result"] == "resolved-skipped"
@@ -132,9 +167,28 @@ def test_store_endpoint_handles_invalid_alert_gracefully(app_client):
             }
         ],
     }
-    resp = app_client.post("/webhooks/alertmanager/store", json=payload)
+    resp = _post_signed(app_client, "/webhooks/alertmanager/store", payload)
     # Endpoint ловит invalid alerts на per-alert basis, не возвращает 400.
     assert resp.status_code == 202
     body = resp.json()
     # invalid alert просто пропущен — в результате его нет.
     assert body["alerts"] == []
+
+
+def test_store_endpoint_rejects_unsigned_request(app_client):
+    """Fail-closed на HTTP-уровне: без подписи → 401 (секрет настроен)."""
+    resp = app_client.post(
+        "/webhooks/alertmanager/store",
+        json={
+            "version": "4",
+            "groupKey": "unsigned",
+            "status": "firing",
+            "receiver": "sre-copilot",
+            "groupLabels": {},
+            "commonLabels": {},
+            "commonAnnotations": {},
+            "externalURL": "https://alertmanager.local",
+            "alerts": [],
+        },
+    )
+    assert resp.status_code == 401

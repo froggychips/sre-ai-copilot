@@ -10,8 +10,13 @@ class PromptGuard:
     # Паттерны атак: "ignore previous instructions", "jailbreak", "override".
     # Это ЕДИНСТВЕННЫЙ блокирующий сигнал — настоящие попытки перехвата
     # инструкций модели.
+    # Между глаголом и «(previous|...)» допускаем НЕСКОЛЬКО артиклей/
+    # квантификаторов («ignore the previous...», «forget all of the prior...»):
+    # жёсткое `(all\s+)?` пропускало тривиальные перефразировки.
     INJECTION_PATTERNS = [
-        r"(ignore|disregard|forget)\s+(all\s+)?(previous|prior|initial)\s+(instructions|prompts)",
+        r"(ignore|disregard|forget)\s+(?:(?:all|any|the|your|these|those|of)\s+)*"
+        r"(previous|prior|initial|earlier|above|preceding|system)\s+"
+        r"(instructions|prompts|rules|directives|messages|context)",
         r"you\s+are\s+now\s+a\s+(developer|hacker|unrestricted\s+ai)",
         r"new\s+rule:",
         r"set\s+your\s+output\s+format\s+to",
@@ -35,8 +40,11 @@ class PromptGuard:
         инциденты с большим teamcity_context / логами). Вместо отказа длинный
         ввод обрезается до PROMPT_INPUT_MAX_CHARS с маркером.
         """
-        # Предотвращаем закрытие XML тегов пользователем
+        # Предотвращаем закрытие И открытие XML-тегов пользователем: раньше
+        # экранировался только `</user_context>`, а открывающий тег позволял
+        # вклинить фальшивый вложенный контекст.
         sanitized = user_input.replace("</user_context>", "[TAG_ESCAPE]")
+        sanitized = sanitized.replace("<user_context>", "[TAG_ESCAPE]")
         sanitized = sanitized.replace("]]>", "[CDATA_ESCAPE]")
         sanitized = sanitized.strip()
 

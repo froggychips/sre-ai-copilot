@@ -1,24 +1,31 @@
+# Celery beat — планировщик периодических задач (kg_topology_sync, дайджесты,
+# resolve-sync и все прочие beat_schedule-задачи из app/workers/tasks.py).
+# До 2026-08-07 этого шаблона в чарте НЕ БЫЛО — chart-install поднимал api и
+# worker, но ни одна периодическая задача не запускалась (KG молча протухал).
+# ВСЕГДА replicas: 1 — несколько beat-инстансов дублируют задачи.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: {{ include "sre-ai-copilot.fullname" . }}-worker
+  name: {{ include "sre-ai-copilot.fullname" . }}-beat
   namespace: {{ .Release.Namespace }}
   labels:
     {{- include "sre-ai-copilot.labels" . | nindent 4 }}
-    app.kubernetes.io/component: worker
+    app.kubernetes.io/component: beat
 spec:
-  replicas: {{ .Values.replicaCount.worker }}
+  replicas: 1
+  strategy:
+    type: Recreate   # при обновлении убиваем старый до старта нового — дубли недопустимы
   selector:
     matchLabels:
       app.kubernetes.io/name: {{ include "sre-ai-copilot.name" . }}
       app.kubernetes.io/instance: {{ .Release.Name }}
-      app.kubernetes.io/component: worker
+      app.kubernetes.io/component: beat
   template:
     metadata:
       labels:
         app.kubernetes.io/name: {{ include "sre-ai-copilot.name" . }}
         app.kubernetes.io/instance: {{ .Release.Name }}
-        app.kubernetes.io/component: worker
+        app.kubernetes.io/component: beat
     spec:
       serviceAccountName: {{ include "sre-ai-copilot.serviceAccountName" . }}
       automountServiceAccountToken: true
@@ -29,20 +36,20 @@ spec:
       securityContext:
         {{- include "sre-ai-copilot.podSecurityContext" . | nindent 8 }}
       containers:
-      - name: worker
-        # Pin по digest в CI: image: ghcr.io/froggychips/sre-ai-copilot@sha256:<digest>
+      - name: beat
         image: "{{ .Values.image.repository }}:{{ required "image.tag обязателен (CI публикует только :<git-sha>, тега :latest нет)" .Values.image.tag }}"
         imagePullPolicy: {{ .Values.image.pullPolicy }}
         command:
         - celery
         - -A
-        # app.workers.tasks — боевое Celery-приложение (все kg_*-syncs,
-        # дайджесты, pipeline; то же, что в k8s/worker.yaml).
-        # Ранее стоял app.celery_worker (одна task generate_reply) — chart-
-        # worker не обрабатывал НИ ОДНОЙ инцидентной задачи.
         - app.workers.tasks.celery_app
-        - worker
+        - beat
         - --loglevel=info
+        - --scheduler=celery.beat:PersistentScheduler
+        # /tmp writable только благодаря emptyDir ниже: при
+        # readOnlyRootFilesystem=true без volume beat крашлупит на старте,
+        # не сумев создать schedule-файл (та же мина была в k8s/worker.yaml).
+        - --schedule=/tmp/celerybeat-schedule
         securityContext:
           {{- include "sre-ai-copilot.containerSecurityContext" . | nindent 10 }}
         envFrom:
@@ -57,10 +64,6 @@ spec:
           value: {{ .Values.env.safeMode | quote }}
         - name: ENV
           value: {{ .Values.env.appEnv | quote }}
-        - name: EXECUTOR_ENABLED
-          value: {{ .Values.env.executorEnabled | default "false" | quote }}
-        - name: EXECUTOR_APPROVAL_ENABLED
-          value: {{ .Values.env.executorApprovalEnabled | default "false" | quote }}
         - name: STATS_DIGEST_ENABLED
           value: {{ .Values.env.statsDigestEnabled | default "false" | quote }}
         - name: STATS_DIGEST_HOUR_UTC
@@ -69,30 +72,22 @@ spec:
           value: {{ .Values.env.statsDigestStaleDays | default "14" | quote }}
         - name: EXTERNAL_PROBE_ENABLED
           value: {{ .Values.env.externalProbeEnabled | default "false" | quote }}
-        - name: EXTERNAL_PROBE_FAIL_THRESHOLD
-          value: {{ .Values.env.externalProbeFailThreshold | default "3" | quote }}
-        - name: EXTERNAL_PROBE_TIMEOUT_SECONDS
-          value: {{ .Values.env.externalProbeTimeoutSeconds | default "5" | quote }}
         - name: OWNERSHIP_BACKFILL_ENABLED
           value: {{ .Values.env.ownershipBackfillEnabled | default "false" | quote }}
-        - name: OWNERSHIP_BACKFILL_THRESHOLD
-          value: {{ .Values.env.ownershipBackfillThreshold | default "0.7" | quote }}
-        {{- if .Values.ownershipManifest.enabled }}
-        - name: OWNERSHIP_MANIFEST_PATH
-          value: {{ .Values.env.ownershipManifestPath | default "/config/ownership.yaml" | quote }}
-        {{- end }}
         resources:
-          {{- toYaml .Values.resources.worker | nindent 10 }}
-        {{- if .Values.ownershipManifest.enabled }}
+          limits:
+            cpu: 100m
+            # 256Mi: import-футпринт стека (kubernetes-client + otel +
+            # sqlalchemy + anthropic + celery) не влезает в 128Mi —
+            # см. историю OOM в k8s/worker.yaml.
+            memory: 256Mi
+          requests:
+            cpu: 50m
+            memory: 128Mi
         volumeMounts:
-        - name: ownership-manifest
-          mountPath: {{ .Values.env.ownershipManifestPath | default "/config/ownership.yaml" | quote }}
-          subPath: ownership.yaml
-          readOnly: true
-        {{- end }}
-      {{- if .Values.ownershipManifest.enabled }}
+        - name: tmp
+          mountPath: /tmp
       volumes:
-      - name: ownership-manifest
-        configMap:
-          name: {{ include "sre-ai-copilot.fullname" . }}-ownership
-      {{- end }}
+      - name: tmp
+        emptyDir:
+          sizeLimit: 64Mi

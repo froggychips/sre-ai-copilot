@@ -429,7 +429,7 @@ def test_sync_all_services_empty_when_kubectl_fails(db):
         "workload_nodes_upserted": 0,
         "edges_serves_traffic": 0,
         "skipped_no_selector": 0, "skipped_no_match": 0,
-        "skipped_self_loop": 0,
+        "skipped_self_loop": 0, "errors": 0,
     }
 
 

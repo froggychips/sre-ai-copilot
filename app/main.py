@@ -122,20 +122,50 @@ app.add_middleware(RequestIDMiddleware)
 # JSON-массив (pydantic умеет парсить):
 #   ALLOWED_ORIGINS=["https://grafana.example.com","https://app.example.com"]
 # Default settings.ALLOWED_ORIGINS = ["*"] — допустимо только для dev.
+#
+# Гвард по ЧЛЕНСТВУ "*", не по равенству списка: Starlette включает
+# wildcard-режим через `"*" in allow_origins`, так что `["*", "https://x"]`
+# проходил бы equality-гвард И включал wildcard.
 allowed_origins = settings.ALLOWED_ORIGINS
-if settings.ENV == "production" and allowed_origins == ["*"]:
+wildcard_origins = "*" in allowed_origins
+if settings.ENV == "production" and wildcard_origins:
     raise RuntimeError(
-        "ALLOWED_ORIGINS=['*'] is forbidden in production. "
+        "Wildcard '*' in ALLOWED_ORIGINS is forbidden in production. "
         "Set a concrete origin list in env/secrets."
     )
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=allowed_origins,
-    allow_credentials=True,
+    # Wildcard + credentials несовместимы: в этой комбинации Starlette
+    # эхом возвращает ЛЮБОЙ Origin атакующего вместе с
+    # Access-Control-Allow-Credentials: true. При wildcard гасим credentials.
+    allow_credentials=not wildcard_origins,
     allow_methods=["GET", "POST", "PUT", "DELETE"],
     allow_headers=["Authorization", "Content-Type"],
 )
+
+
+def _rate_limit_client_ip(request: Request) -> str:
+    """Ключ rate-limit-бакета: реальный клиентский IP.
+
+    uvicorn работает без --proxy-headers, поэтому за ingress'ом
+    request.client.host — это IP прокси: ВЕСЬ трафик делил один бакет
+    (10 req/min на кластер — alert-шторм сам себя рейт-лимитил). Если
+    оператор ЯВНО задал TRUSTED_PROXY_HEADER (например "X-Forwarded-For"),
+    берём IP оттуда — ПОСЛЕДНИЙ элемент списка (его дописал ближайший
+    доверенный прокси; левые элементы клиент может подделать). Без явной
+    конфигурации заголовкам не доверяем — fallback на client.host.
+    """
+    header_name = getattr(settings, "TRUSTED_PROXY_HEADER", None)
+    if header_name:
+        raw = request.headers.get(header_name, "")
+        if raw:
+            candidate = raw.split(",")[-1].strip()
+            if candidate:
+                return candidate
+    return request.client.host if request.client else ""
+
 
 @app.middleware("http")
 async def rate_limit_middleware(request: Request, call_next):
@@ -143,7 +173,7 @@ async def rate_limit_middleware(request: Request, call_next):
     # См. app/api/rate_limit.py. Fail-open: при недоступности Redis запрос
     # пропускается с warning-логом (auth остаётся на HMAC-подписи).
     if request.url.path.startswith("/webhooks/alertmanager"):
-        client_ip = request.client.host if request.client else ""
+        client_ip = _rate_limit_client_ip(request)
         if not await rate_limit.check_alertmanager(client_ip):
             return Response(status_code=429, content="Rate limit exceeded")
     return await call_next(request)

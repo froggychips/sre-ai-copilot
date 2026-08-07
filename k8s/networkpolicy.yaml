@@ -1,23 +1,50 @@
+# NetworkPolicy для всех pod-ов sre-ai-copilot.
+#
+# ИСТОРИЯ: до 2026-08-07 селектор был `app: sre-ai-copilot`, которого нет ни
+# на одном pod-е (реальные лейблы: app=sre-ai-api / copilot-worker /
+# copilot-beat / sre-ai-migrate) — политика не выбирала НИЧЕГО и была no-op,
+# а метрики на 0.0.0.0:8001 (app/main.py прямо пишет «ограничено через
+# NetworkPolicy») стояли открытыми.
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
   name: copilot-network-policy
 spec:
   podSelector:
-    matchLabels:
-      app: sre-ai-copilot
+    matchExpressions:
+    - key: app
+      operator: In
+      values: ["sre-ai-api", "copilot-worker", "copilot-beat", "sre-ai-migrate"]
   policyTypes:
   - Ingress
   - Egress
   ingress:
+  # 8000 (API): ingress-nginx живёт в другом namespace, плюс vmalertmanager
+  # (ns monitoring) постит вебхуки напрямую в Service — поэтому пускаем
+  # in-cluster трафик на 8000 из любого namespace. Голый podSelector (как
+  # раньше) матчится ТОЛЬКО в своём namespace и молча резал бы оба источника.
   - from:
-    - podSelector:
-        matchLabels:
-          app.kubernetes.io/name: ingress-nginx
+    - namespaceSelector: {}
     ports:
     - protocol: TCP
       port: 8000
+  # 8001 (Prometheus-метрики): только scraper-ы из ns monitoring
+  # (vmagent kube-prometheus-stack). При другом имени ns — поправить.
+  - from:
+    - namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: monitoring
+    ports:
+    - protocol: TCP
+      port: 8001
   egress:
+  # DNS — без него не резолвится ни postgres, ни api.anthropic.com.
+  - ports:
+    - protocol: UDP
+      port: 53
+    - protocol: TCP
+      port: 53
+  # Postgres (тот же namespace).
   - to:
     - podSelector:
         matchLabels:
@@ -25,6 +52,7 @@ spec:
     ports:
     - protocol: TCP
       port: 5432
+  # Redis (broker/backend Celery).
   - to:
     - podSelector:
         matchLabels:
@@ -32,6 +60,24 @@ spec:
     ports:
     - protocol: TCP
       port: 6379
+  # Kubernetes API server (diagnostics/remediation, kg_*_sync).
+  - to:
+    - ipBlock:
+        cidr: 0.0.0.0/0
+    ports:
+    - protocol: TCP
+      port: 6443
+  # VictoriaMetrics (vmsingle...monitoring:8428) — metrics_sync, enrichment.
+  # AlertManager   (vmalertmanager...monitoring:9093) — resolve-sync.
+  # Дефолтные URL: app/config.py (VICTORIA_METRICS_URL / ALERTMANAGER_URL).
+  - to:
+    - namespaceSelector: {}
+    ports:
+    - protocol: TCP
+      port: 8428
+    - protocol: TCP
+      port: 9093
+  # Внешний HTTPS (Anthropic API, Discord, Jira, ghcr) — только публичные IP.
   - to:
     - ipBlock:
         cidr: 0.0.0.0/0

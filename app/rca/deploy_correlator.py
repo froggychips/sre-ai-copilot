@@ -11,6 +11,14 @@ confidence в [0..1] и выдаём verdict-градацию:
     0.2 <= conf < 0.4        → weak       (слабый сигнал)
     conf < 0.2               → unlikely   (фоновое движение)
 
+Тарировка времени: time_factor = FLOOR + (1-FLOOR)·exp(-Δt/τ), τ=60 мин,
+FLOOR=0.35. Пол гарантирует, что metric evidence может вытянуть вердикт в
+пределах ВСЕГО заявленного lookback-а (2h): раньше чистый exp(-Δt/30)
+множился на evidence, и даже идеальный сигнал не мог подняться выше weak
+при Δt > ~27 мин — вердикт вырождался в датчик близости по времени. Сам
+вердикт остаётся evidence-gated: без спайков/z confidence ≈ 0 на любом Δt,
+likely по-прежнему требует сильного сигнала И близкого deploy.
+
 Используется RCA-пайплайном как дополнительный сигнал «релиз сломал прод».
 Read-only: только select-ы, никаких commit-ов.
 """
@@ -55,9 +63,14 @@ _VERDICT_LIKELY = 0.7
 _VERDICT_SUSPECT = 0.4
 _VERDICT_WEAK = 0.2
 
-# Time-proximity decay: confidence × exp(-Δt_min / TAU). TAU=30min даёт
-# 0 мин → 1.0, 60 мин → ~0.14, 120 мин → ~0.02.
-_TIME_DECAY_TAU_MIN = 30.0
+# Time-proximity decay: сырой exp(-Δt_min / TAU). TAU=60min даёт
+# 0 мин → 1.0, 30 мин → ~0.61, 60 мин → ~0.37, 120 мин → ~0.14.
+_TIME_DECAY_TAU_MIN = 60.0
+
+# Пол time-factor внутри lookback-окна: time_factor = FLOOR + (1-FLOOR)·decay.
+# Не даёт времени обнулить сильное metric evidence на дальнем краю окна
+# (Δt=120 мин → time_factor ≈ 0.44, а не ≈ 0.02 как у чистого exp при τ=30).
+_TIME_FLOOR = 0.35
 
 # Если у всех метрик baseline-stddev ≈ 0 (flat-line, low-traffic dev-сервис),
 # z-score не информативен — рубим confidence до 30% от исходной.
@@ -256,6 +269,9 @@ def correlate_deploy_to_incident(
     # по фильтру, но на всякий случай) и не-числа.
     delta_minutes = max(0.0, delta_minutes)
     time_proximity = math.exp(-delta_minutes / _TIME_DECAY_TAU_MIN)
+    # Пол внутри lookback: metric evidence должно мочь вытянуть вердикт на
+    # всём заявленном окне, время лишь ослабляет сигнал, а не зануляет его.
+    time_factor = _TIME_FLOOR + (1.0 - _TIME_FLOOR) * time_proximity
 
     # --- Deploy-status factor ---------------------------------------------
     status = (deploy.status or "").upper()
@@ -278,7 +294,9 @@ def correlate_deploy_to_incident(
     # 50/50 вес между «сколько метрик спайкнули» и «насколько сильно худшая».
     spike_component = 0.5 * n_spike_factor + 0.5 * z_factor
 
-    raw = time_proximity * status_factor * spike_component
+    # Evidence-gated: без спайков/z confidence ≈ 0 независимо от близости.
+    # time_factor (с полом _TIME_FLOOR) ослабляет, но не зануляет сигнал.
+    raw = time_factor * status_factor * spike_component
     confidence = min(1.0, max(0.0, raw)) * flat_penalty
     # Финальный clip — flat_penalty может только ронять, не растить.
     confidence = max(0.0, min(1.0, confidence))
@@ -311,6 +329,7 @@ def correlate_deploy_to_incident(
         "time_proximity_minutes": int(delta_minutes),
         "scoring": {
             "time_proximity": round(time_proximity, 4),
+            "time_factor": round(time_factor, 4),
             "status_factor": status_factor,
             "n_spike_factor": round(n_spike_factor, 4),
             "z_factor": round(z_factor, 4),

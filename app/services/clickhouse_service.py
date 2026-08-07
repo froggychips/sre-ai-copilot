@@ -61,7 +61,14 @@ class ClickHouseClient:
         self._auth = (user, password)
         self._timeout = timeout
 
-    @with_external_retry(max_attempts=3, initial_delay=0.5, name="clickhouse.query")
+    @with_external_retry(
+        max_attempts=3, initial_delay=0.5, name="clickhouse.query",
+        # Только транспортные ошибки httpx (connect/read timeout, обрыв
+        # коннекта). httpx.HTTPStatusError сюда НЕ входит: CH отвечает
+        # 400/401/5xx и на битый SQL, и на неверные креды — это
+        # детерминированные ошибки, их повтор 3× лишь жёг время.
+        retry_on=(httpx.TransportError,),
+    )
     async def query(self, sql: str) -> List[Dict[str, Any]]:
         """Выполнить SELECT, вернуть список dicts (column→value)."""
         params = {
