@@ -24,7 +24,9 @@ import pytest
 
 from tests.conftest import requires_postgres
 
-pytestmark = requires_postgres
+# Маркер вешаем на конкретные тесты, а не на модуль: проверка _tx_clean
+# работает на фейковой сессии и живой postgres ей не нужен — под
+# module-level pytestmark она бы молча скипалась вместе с остальными.
 
 
 @pytest.fixture(scope="module")
@@ -37,6 +39,7 @@ def db_session():
     session.close()
 
 
+@requires_postgres
 def test_deploy_incident_correlation_sql_executes(db_session, caplog):
     """SQL секции валиден против реальной схемы kg_deployments/kg_alerts.
 
@@ -52,6 +55,7 @@ def test_deploy_incident_correlation_sql_executes(db_session, caplog):
     assert not failures, f"SQL секции не исполнился: {[r.getMessage() for r in failures]}"
 
 
+@requires_postgres
 def test_sections_after_failure_still_work(db_session):
     """Упавшая секция не должна оставлять транзакцию в aborted-состоянии.
 
@@ -70,3 +74,18 @@ def test_sections_after_failure_still_work(db_session):
 
     # Не должно бросить InFailedSqlTransaction.
     beat_heartbeats_footer(db_session)
+
+
+def test_tx_clean_survives_dead_session():
+    """_tx_clean не бросает, даже если сессия уже мертва.
+
+    Иначе очистка после упавшего запроса сама стала бы источником падения
+    секции — ровно то, от чего она защищает.
+    """
+    from app.services.stats_digest import _tx_clean
+
+    class DeadSession:
+        def rollback(self):
+            raise RuntimeError("connection already closed")
+
+    _tx_clean(DeadSession())  # не должно бросить
