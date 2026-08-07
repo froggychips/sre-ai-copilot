@@ -47,7 +47,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.config import settings
-from app.knowledge_graph.schema import Service, StorageVolume, VolumeEdge
+from app.knowledge_graph.schema import NODE_KIND_SERVICE, Service, StorageVolume, VolumeEdge
 
 logger = logging.getLogger(__name__)
 
@@ -621,7 +621,7 @@ def sync_pod_pvc_edges(db: Session) -> Dict[str, int]:
 
         svc = (
             db.query(Service)
-            .filter_by(namespace=ns, name=workload_name)
+            .filter_by(namespace=ns, name=workload_name, node_kind=NODE_KIND_SERVICE)
             .one_or_none()
         )
         if svc is None:

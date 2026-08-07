@@ -28,7 +28,9 @@ from app.knowledge_graph.k8s_topology_resources_sync import (
     sync_all_ingresses_declarative, sync_all_services,
     sync_topology_resources)
 from app.knowledge_graph.populator import upsert_service
-from app.knowledge_graph.schema import Service, ServiceEdge  # noqa: F401
+from app.knowledge_graph.schema import (NODE_KIND_SERVICE,
+                                        NODE_KIND_WORKLOAD, Service,
+                                        ServiceEdge)  # noqa: F401
 
 
 # ── fixtures ────────────────────────────────────────────────────────────────
@@ -264,10 +266,14 @@ def test_sync_all_services_creates_node_and_edge(db):
     assert (e.extras or {}).get("confidence") == "declared_k8s"
 
 
-def test_sync_all_services_skips_self_loop_same_name(db):
-    """Service и его Deployment одноимённы (Service `auth` бэкает Deployment
-    `auth`) → один и тот же kg_services-узел (ключ name+namespace). edge
-    serves_traffic сам-на-себя бессмыслен (засоряет blast-radius) → пропускаем."""
+def test_sync_all_services_same_name_gives_real_edge_not_self_loop(db):
+    """Типовой случай: Service `auth` бэкает Deployment `auth`.
+
+    Это регрессионный тест на главный дефект онтологии: пока node_kind не
+    было, оба объекта схлопывались в ОДИН узел kg_services (ключ был
+    namespace+name), ребро выходило self-loop и выбрасывалось. На живом
+    графе так терялось 2092 ребра за тик, а serves_traffic стоял на 3.
+    Теперь это два разных узла: service `auth` → workload `auth`."""
     upsert_service(db, "prod-shared", "auth", team_owner="auth-team")
     db.flush()
 
@@ -282,12 +288,45 @@ def test_sync_all_services_skips_self_loop_same_name(db):
         stats = sync_all_services(db, deployments_index=deps_idx)
 
     assert stats["nodes_upserted"] == 1
-    assert stats["skipped_self_loop"] == 1
-    assert stats["edges_serves_traffic"] == 0
-    # Ни одного self-loop-ребра в БД
+    assert stats["workload_nodes_upserted"] == 1
+    assert stats["skipped_self_loop"] == 0
+    assert stats["edges_serves_traffic"] == 1
+
     assert db.query(ServiceEdge).filter(
         ServiceEdge.src_id == ServiceEdge.dst_id).count() == 0
-    assert db.query(ServiceEdge).filter_by(kind=EDGE_SERVES_TRAFFIC).count() == 0
+    edge = db.query(ServiceEdge).filter_by(kind=EDGE_SERVES_TRAFFIC).one()
+    assert edge.src.name == "auth" and edge.src.node_kind == NODE_KIND_SERVICE
+    assert edge.dst.name == "auth" and edge.dst.node_kind == NODE_KIND_WORKLOAD
+    # team_owner Service-узла не затёрт созданием workload-а
+    assert edge.src.team_owner == "auth-team"
+
+
+def test_sync_all_services_matches_statefulset_backing(db):
+    """Service, за которым стоит StatefulSet, тоже получает serves_traffic.
+
+    Раньше матчились только Deployment'ы, и 2231 Service за тик уходил в
+    skipped_no_match — это все *-db / *-postgresql / clickhouse, то есть
+    ровно те узлы, ради которых blast-radius и смотрят.
+    """
+    sts = _mk_deployment("town-db-postgresql", "prod-shared",
+                         pod_labels={"app": "town-db"})
+    sts["kind"] = "StatefulSet"
+    services = [_mk_service("town-db", "prod-shared", selector={"app": "town-db"})]
+
+    with patch(
+        "app.knowledge_graph.k8s_topology_resources_sync._kubectl_get_all",
+        return_value=services,
+    ):
+        stats = sync_all_services(
+            db, deployments_index=_index_deployments_by_ns([sts]),
+        )
+
+    assert stats["skipped_no_match"] == 0
+    assert stats["edges_serves_traffic"] == 1
+    workload = db.query(Service).filter_by(
+        name="town-db-postgresql", node_kind=NODE_KIND_WORKLOAD,
+    ).one()
+    assert (workload.metadata_json or {})["k8s_workload"]["workload_kind"] == "StatefulSet"
 
 
 def test_sync_all_services_no_selector_creates_node_only(db):
@@ -329,11 +368,12 @@ def test_sync_all_services_skipped_no_match_when_no_deployment(db):
     assert names == {"auth"}
 
 
-def test_sync_all_services_no_edge_when_deployment_has_different_name(db):
-    """Selector матчит k8s Deployment с ОТЛИЧАЮЩИМСЯ именем от Service.
-    Service-name 'auth-svc', Deployment-name 'auth-app', match по
-    label app=auth. Deployment-узла 'auth-app' нет в KG (kg_topology_sync
-    ещё не прошёл) → edge не создаётся, фантом не плодим."""
+def test_sync_all_services_creates_workload_node_when_absent(db):
+    """Selector матчит Deployment, которого ещё нет в KG.
+
+    Раньше ребро в этом случае терялось («не плодим фантомы» — ждали, пока
+    Deployment заведёт kg_topology_sync). Но Deployment мы ВИДИМ в k8s прямо
+    сейчас, это не догадка, — заводим workload-узел сами."""
     services = [_mk_service("auth-svc", "prod-shared", selector={"app": "auth"})]
     deps = [_mk_deployment("auth-app", "prod-shared", pod_labels={"app": "auth"})]
 
@@ -345,16 +385,16 @@ def test_sync_all_services_no_edge_when_deployment_has_different_name(db):
             db, deployments_index=_index_deployments_by_ns(deps),
         )
 
-    # Service-node 'auth-svc' создан (upsert).
     assert stats["nodes_upserted"] == 1
-    # Selector сматчил Deployment 'auth-app', но узла 'auth-app' нет в KG
-    # — edge не создаём, фантом не плодим. kg_topology_sync на следующем
-    # часовом тике создаст 'auth-app', потом этот таск свяжет.
-    assert stats["edges_serves_traffic"] == 0
-    assert db.query(ServiceEdge).count() == 0
-    # Только сам Service-узел в kg_services
-    names = {s.name for s in db.query(Service).all()}
-    assert names == {"auth-svc"}
+    assert stats["workload_nodes_upserted"] == 1
+    assert stats["edges_serves_traffic"] == 1
+
+    workload = db.query(Service).filter_by(
+        name="auth-app", node_kind=NODE_KIND_WORKLOAD,
+    ).one()
+    assert (workload.metadata_json or {}).get("k8s_workload", {}).get(
+        "workload_kind") == "Deployment"
+    assert {s.name for s in db.query(Service).all()} == {"auth-svc", "auth-app"}
 
 
 def test_sync_all_services_idempotent_second_run(db):
@@ -386,6 +426,7 @@ def test_sync_all_services_empty_when_kubectl_fails(db):
         stats = sync_all_services(db, deployments_index={})
     assert stats == {
         "services_fetched": 0, "nodes_upserted": 0,
+        "workload_nodes_upserted": 0,
         "edges_serves_traffic": 0,
         "skipped_no_selector": 0, "skipped_no_match": 0,
         "skipped_self_loop": 0,

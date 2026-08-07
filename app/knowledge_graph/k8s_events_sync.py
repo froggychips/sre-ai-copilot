@@ -27,7 +27,7 @@ from sqlalchemy.orm import Session
 
 from app.config import settings
 from app.knowledge_graph.populator import record_pod_event
-from app.knowledge_graph.schema import Service
+from app.knowledge_graph.schema import NODE_KIND_SERVICE, Service
 
 logger = logging.getLogger(__name__)
 
@@ -292,8 +292,14 @@ def sync_namespace_events(
 
     # Pre-load deployment-name → service_id map для этого ns (одним запросом
     # вместо N лукапов).
+    # node_kind='service': в kg_services теперь два типа узлов, и без фильтра
+    # одноимённый workload-узел перетирал бы Service в этом dict-comprehension
+    # (какой победит — зависело бы от порядка строк).
     svc_map: Dict[str, Service] = {
-        s.name: s for s in db.query(Service).filter_by(namespace=namespace).all()
+        s.name: s
+        for s in db.query(Service).filter_by(
+            namespace=namespace, node_kind=NODE_KIND_SERVICE,
+        ).all()
     }
 
     # Lazy owner-ref map: дёргаем `kubectl get pods` только если standard +

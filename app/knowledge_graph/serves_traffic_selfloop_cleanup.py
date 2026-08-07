@@ -2,9 +2,14 @@
 
 До guard в `k8s_topology_resources_sync` билдер `serves_traffic` (Service →
 backing Deployment) плодил ребро сам-на-себя для КАЖДОГО сервиса, чьё имя
-Service совпадает с именем Deployment в том же namespace: граф ключует узлы по
+Service совпадает с именем Deployment в том же namespace: граф ключевал узлы по
 `(name, namespace)` без разделителя типа, поэтому Service `foo` и Deployment
-`foo` — это ОДИН `kg_services`-узел, а ребро между ними — self-loop.
+`foo` были ОДНИМ `kg_services`-узлом, а ребро между ними — self-loop.
+
+С contract 2.4 корень устранён: у узла есть `node_kind`, Service и workload —
+разные строки, и билдер строит нормальное cross-node ребро. Guard там остался
+только страховкой. Этот модуль по-прежнему нужен для уже накопленных данных —
+новых self-loop он не увидит.
 
 Эти рёбра засоряют blast-radius (`queries.get_blast_radius`): сервис попадает в
 собственный список «кто пострадает» (serves_traffic IN-edges). Guard остановил

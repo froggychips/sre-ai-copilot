@@ -23,7 +23,7 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.orm import Session
 
 from app.knowledge_graph.populator import upsert_edge
-from app.knowledge_graph.schema import Deployment, Service, ServiceEdge
+from app.knowledge_graph.schema import NODE_KIND_SERVICE, Deployment, Service, ServiceEdge
 from app.knowledge_graph.stale_classifier import (
     classify_stale_with_deploys,
 )
@@ -764,7 +764,9 @@ def _upsert_service_pg(
     result = db.execute(stmt)
     row = result.first()
     # ORM-объект нужен для downstream upsert_edge (использует svc.id).
-    svc = db.query(Service).filter_by(namespace=namespace, name=name).one()
+    svc = db.query(Service).filter_by(
+        namespace=namespace, name=name, node_kind=NODE_KIND_SERVICE,
+    ).one()
     if row is not None:
         # flush чтобы downstream видели обновления в этой транзакции.
         db.flush()
@@ -1021,11 +1023,15 @@ def _enrich_calls_edges_for_ns(
         name = deploy.get("metadata", {}).get("name", "")
         if not name:
             continue
-        src = db.query(Service).filter_by(namespace=namespace, name=name).one_or_none()
+        src = db.query(Service).filter_by(
+            namespace=namespace, name=name, node_kind=NODE_KIND_SERVICE,
+        ).one_or_none()
         if src is None:
             continue
         for up_svc, up_ns in _extract_upstreams_extended(deploy, namespace, known_index):
-            dst = db.query(Service).filter_by(namespace=up_ns, name=up_svc).one_or_none()
+            dst = db.query(Service).filter_by(
+                namespace=up_ns, name=up_svc, node_kind=NODE_KIND_SERVICE,
+            ).one_or_none()
             if dst is None:
                 continue
             upsert_edge(

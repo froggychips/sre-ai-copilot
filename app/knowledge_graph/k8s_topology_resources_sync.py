@@ -12,9 +12,13 @@
   - НЕ создаёт synthetic — если Service торчит без матчей на Deployment,
     его всё равно полезно иметь как node (downstream может на него
     routesить ingress).
-  - edge `serves_traffic`: Service → backing Deployment (через selector
-    match на pod template labels). Это «декларативная замена» Endpoint
-    runtime-resolve — мы матчим на статичный deploy спек, не на pods.
+  - edge `serves_traffic`: Service → backing workload (Deployment /
+    StatefulSet / DaemonSet, через selector match на pod template labels).
+    Это «декларативная замена» Endpoint runtime-resolve — мы матчим на
+    статичный спек workload'а, не на pods. Workload — отдельный тип узла
+    (`node_kind='workload'`, contract 2.4): пока тип был один, Service `auth`
+    и Deployment `auth` были одной строкой kg_services, и ребро между ними
+    физически не могло существовать (всегда self-loop).
 
 * **Ingress** resources (`networking.k8s.io/v1`):
   - edge `routes_to`: Ingress (synthetic node `ingress:<name>` если ещё
@@ -43,7 +47,8 @@ from typing import Any, Dict, List, Optional, Tuple
 from sqlalchemy.orm import Session
 
 from app.knowledge_graph.populator import upsert_edge, upsert_service
-from app.knowledge_graph.schema import Service
+from app.knowledge_graph.schema import (NODE_KIND_SERVICE, NODE_KIND_WORKLOAD,
+                                        Service)
 
 logger = logging.getLogger(__name__)
 
@@ -69,7 +74,7 @@ _KUBECTL_TIMEOUT_NS_S = 20
 # Edge kinds, которые этот модуль использует. ServiceEdge.kind — свободная
 # строка, валидация на app-уровне. Эти константы — единственная sсемантика.
 # Источник истины — `app.knowledge_graph.contract.EDGE_KINDS` (status='active').
-EDGE_SERVES_TRAFFIC = "serves_traffic"   # Service → backing Deployment
+EDGE_SERVES_TRAFFIC = "serves_traffic"   # Service → backing workload
 EDGE_ROUTES_TO = "routes_to"             # Ingress → Service
 
 DISCOVERED_BY_SVC = "k8s_topology_resources/service"
@@ -185,12 +190,38 @@ def _kubectl_get_all(resource: str) -> List[Dict[str, Any]]:
     return items if isinstance(items, list) else []
 
 
+#: Типы workload'ов, которые может бэкать Service. Ограничиваться
+#: Deployment'ами было мало: на этом кластере selector 2231 Service'а за тик
+#: не матчился ни на что просто потому, что за ним стоял StatefulSet
+#: (все *-db / *-postgresql / clickhouse) или DaemonSet. Это уходило в
+#: skipped_no_match и читалось как «топология неизвестна».
+_WORKLOAD_RESOURCES = ("deployments", "statefulsets", "daemonsets")
+
+#: kubectl-ресурс → значение workload_kind в metadata узла.
+_WORKLOAD_KIND_BY_RESOURCE = {
+    "deployments": "Deployment",
+    "statefulsets": "StatefulSet",
+    "daemonsets": "DaemonSet",
+}
+
+
 def _kubectl_get_deployments_all() -> List[Dict[str, Any]]:
-    """Все deployments cluster-wide. Нужны чтобы по selector сматчить Service →
-    backing Deployment. Кэшируем результат в течение одного tick'а (передаётся
-    в sync_all_services как аргумент).
+    """Все workload'ы cluster-wide (Deployment + StatefulSet + DaemonSet).
+
+    Нужны чтобы по selector сматчить Service → backing workload. Кэшируем
+    результат в течение одного tick'а (передаётся в sync_all_services как
+    аргумент). Имя функции историческое — читается как «то, что матчим».
+
+    `kind` в ответе kubectl для списка не заполнен per-item, поэтому
+    проставляем его сами: без него все workload-узлы получили бы
+    workload_kind='Deployment', включая базы.
     """
-    return _kubectl_get_all("deployments")
+    items: List[Dict[str, Any]] = []
+    for resource in _WORKLOAD_RESOURCES:
+        for obj in _kubectl_get_all(resource):
+            obj.setdefault("kind", _WORKLOAD_KIND_BY_RESOURCE[resource])
+            items.append(obj)
+    return items
 
 
 # ── pure helpers ────────────────────────────────────────────────────────────
@@ -244,19 +275,56 @@ def _find_matching_deployments(
     `deployments_index` — map ns → list of deployments (предсобран caller'ом
     чтобы за tick дёрнуть kubectl один раз, не N).
     """
+    return [
+        (dep.get("metadata") or {}).get("name") or ""
+        for dep in _find_matching_deployment_objects(
+            selector, namespace, deployments_index,
+        )
+    ]
+
+
+def _find_matching_deployment_objects(
+    selector: Dict[str, str],
+    namespace: str,
+    deployments_index: Dict[str, List[Dict[str, Any]]],
+) -> List[Dict[str, Any]]:
+    """То же, что `_find_matching_deployments`, но отдаёт сами объекты.
+
+    Нужно с тех пор, как Service → workload перестало быть поиском уже
+    существующего узла по имени: workload-узел мы теперь заводим сами, а для
+    этого нужен весь Deployment (replicas, images, labels), а не только имя.
+    """
     if not selector:
         return []
-    matches: List[str] = []
+    matches: List[Dict[str, Any]] = []
     for dep in deployments_index.get(namespace, []):
-        meta = dep.get("metadata") or {}
         pod_labels = (
             ((dep.get("spec") or {}).get("template") or {}).get("metadata") or {}
         ).get("labels") or {}
-        if _selector_matches_labels(selector, pod_labels):
-            dep_name = meta.get("name")
-            if dep_name:
-                matches.append(dep_name)
+        if not _selector_matches_labels(selector, pod_labels):
+            continue
+        if not (dep.get("metadata") or {}).get("name"):
+            continue
+        matches.append(dep)
     return matches
+
+
+def _extract_workload_meta(dep: Dict[str, Any]) -> Dict[str, Any]:
+    """Из Deployment JSON собрать metadata_json subset для workload-узла.
+
+    Держим только declarative-часть (как и для Service): status.replicas —
+    runtime, он живёт в метриках, а не в графе.
+    """
+    spec = dep.get("spec") or {}
+    containers = ((spec.get("template") or {}).get("spec") or {}).get("containers") or []
+    return {
+        "workload_kind": dep.get("kind") or "Deployment",
+        "replicas": spec.get("replicas"),
+        "images": [c.get("image") for c in containers if c.get("image")],
+        "pod_labels": (
+            ((spec.get("template") or {}).get("metadata") or {}).get("labels") or {}
+        ),
+    }
 
 
 def _index_deployments_by_ns(
@@ -311,11 +379,13 @@ def sync_all_services(
 
     Возвращает stats:
         services_fetched      — сколько Service объектов получено из kubectl
-        nodes_upserted        — сколько kg_services touched (create/update)
+        nodes_upserted        — сколько Service-узлов touched (create/update)
+        workload_nodes_upserted — сколько workload-узлов (backing Deployment)
         edges_serves_traffic  — сколько Service→Deployment edges
         skipped_no_selector   — Services без selector (headless/ExternalName)
         skipped_no_match      — selector не сматчил ни одного Deployment
-        skipped_self_loop     — Service≡Deployment одноимённый узел (self-edge)
+        skipped_self_loop     — страховка: Service и workload схлопнулись в
+                                один узел (при исправной схеме всегда 0)
     """
     services = _kubectl_get_all("services")
     if deployments_index is None:
@@ -324,6 +394,7 @@ def sync_all_services(
     stats = {
         "services_fetched": len(services),
         "nodes_upserted": 0,
+        "workload_nodes_upserted": 0,
         "edges_serves_traffic": 0,
         "skipped_no_selector": 0,
         "skipped_no_match": 0,
@@ -355,28 +426,37 @@ def sync_all_services(
             stats["skipped_no_selector"] += 1
             continue
 
-        matches = _find_matching_deployments(selector, ns, deployments_index)
+        matches = _find_matching_deployment_objects(selector, ns, deployments_index)
         if not matches:
             stats["skipped_no_match"] += 1
             continue
 
-        for dep_name in matches:
-            dep_node = (
-                db.query(Service)
-                .filter_by(namespace=ns, name=dep_name)
-                .one_or_none()
-            )
-            if dep_node is None:
-                # Deployment видим в k8s, но в KG ещё нет — kg_topology_sync
-                # подхватит его на следующем ежечасном тике. Не создаём
-                # фантом-узлы здесь — это путь к bloat'у.
+        for dep in matches:
+            dep_name = str((dep.get("metadata") or {}).get("name") or "")
+            if not dep_name:
                 continue
+            # Workload-узел заводим сами. Раньше здесь искался УЖЕ
+            # существующий узел по (ns, name) — и для типового случая
+            # «Service foo бэкает Deployment foo» находился сам же Service:
+            # один тип узла на два разных объекта. Ребро выходило self-loop и
+            # выбрасывалось (2092 за тик), а весь serves_traffic держался на
+            # трёх экзотических парах с несовпадающими именами.
+            dep_node = upsert_service(
+                db,
+                namespace=ns,
+                name=dep_name,
+                # Владелец наследуется от Service: workload принадлежит той же
+                # команде. Без этого 2000+ новых узлов приехали бы без
+                # team_owner и обвалили owner-coverage графа (99.97% → ~50%),
+                # причём как «регрессия качества данных», которой нет.
+                team_owner=str(svc_node.team_owner) if svc_node.team_owner else None,
+                node_kind=NODE_KIND_WORKLOAD,
+                metadata={"k8s_workload": _extract_workload_meta(dep)},
+            )
+            stats["workload_nodes_upserted"] += 1
             if dep_node.id == svc_node.id:
-                # Service и его Deployment одноимённы (Service `foo` бэкает
-                # Deployment `foo`) → это ОДИН и тот же kg_services-узел (граф
-                # ключует по name+namespace без разделителя типа). serves_traffic
-                # сам-на-себя бессмыслен и засоряет blast-radius (сервис
-                # показывает сам себя в IN-edges «кто пострадает»). Пропускаем.
+                # Не должно случаться: разный node_kind → разные узлы. Оставлен
+                # как страховка от регрессии в уникальном ключе kg_services.
                 stats["skipped_self_loop"] += 1
                 continue
             upsert_edge(
@@ -396,9 +476,10 @@ def sync_all_services(
 
     db.commit()
     logger.info(
-        "k8s_topology_resources.services_done fetched=%d nodes=%d edges=%d "
-        "skipped_no_selector=%d skipped_no_match=%d skipped_self_loop=%d",
+        "k8s_topology_resources.services_done fetched=%d nodes=%d workloads=%d "
+        "edges=%d skipped_no_selector=%d skipped_no_match=%d skipped_self_loop=%d",
         stats["services_fetched"], stats["nodes_upserted"],
+        stats["workload_nodes_upserted"],
         stats["edges_serves_traffic"],
         stats["skipped_no_selector"], stats["skipped_no_match"],
         stats["skipped_self_loop"],
@@ -463,7 +544,9 @@ def sync_all_ingresses_declarative(db: Session) -> Dict[str, int]:
             stats["routes_seen"] += 1
             backend = (
                 db.query(Service)
-                .filter_by(namespace=ns, name=backend_name)
+                .filter_by(
+                    namespace=ns, name=backend_name, node_kind=NODE_KIND_SERVICE,
+                )
                 .one_or_none()
             )
             if backend is None:

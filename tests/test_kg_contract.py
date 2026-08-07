@@ -14,6 +14,7 @@ from app.knowledge_graph.contract import (
     ALL_NODE_KINDS,
     EDGE_KINDS,
     KG_SCHEMA_VERSION,
+    NODE_KIND_WORKLOAD,
     OWNER_SOURCES,
     QUALITY_THRESHOLDS,
     REAL_SERVICE_KINDS,
@@ -353,6 +354,54 @@ def test_compute_orphan_stats_self_loop_is_orphan(db):
     assert stats["app_scope"] == 1
     assert stats["orphan"] == 1  # self-loop НЕ спасает от orphan
     assert stats["orphan_pct"] == 100.0
+
+
+def test_compute_orphan_stats_ignores_workload_nodes(db):
+    """workload-узлы вне scope orphan-метрики (contract 2.4).
+
+    У workload-узла ребро serves_traffic от его Service есть всегда, поэтому
+    включение их в знаменатель занизило бы orphan_pct вдвое — «граф стал
+    вдвое связнее» без единого реально связанного сервиса.
+
+    Seed: 1 orphan-service + Service/workload-пара со связью.
+    app_scope = {orphan-svc, web} = 2 (workload вне scope), orphan = 1 → 50%.
+    """
+    orphan_svc = Service(name="orphan-svc", namespace="ns", team_owner="t")
+    orphan_svc.synthetic = False
+    web = Service(name="web", namespace="ns", team_owner="t")
+    web.synthetic = False
+    web_workload = Service(name="web", namespace="ns", team_owner="t",
+                           node_kind=NODE_KIND_WORKLOAD)
+    web_workload.synthetic = False
+    db.add_all([orphan_svc, web, web_workload])
+    db.flush()
+    db.add(ServiceEdge(src_id=web.id, dst_id=web_workload.id,
+                       kind="serves_traffic", weight=1))
+    db.commit()
+
+    stats = compute_orphan_stats(db)
+    assert stats["app_scope"] == 2
+    assert stats["orphan"] == 1
+    assert stats["orphan_pct"] == 50.0
+
+
+def test_startup_contract_check_owner_pct_ignores_workload_nodes(db):
+    """owner-coverage считается по service-узлам (contract 2.4).
+
+    Регрессия, от которой защищаемся: workload-узлы попадают в знаменатель и
+    coverage падает с ~100% до ~50% как «деградация качества данных», хотя
+    ничего не сломалось — просто в графе появился второй тип узла.
+    """
+    owned = Service(name="a", namespace="ns", team_owner="t")
+    owned.synthetic = False
+    # workload БЕЗ owner — если он попадёт в знаменатель, owner_pct = 50%
+    workload = Service(name="a", namespace="ns", node_kind=NODE_KIND_WORKLOAD)
+    workload.synthetic = False
+    db.add_all([owned, workload])
+    db.commit()
+
+    report = STARTUP_CONTRACT_CHECK(db)
+    assert report["owner_pct"] == 100.0
 
 
 def test_compute_orphan_stats_empty_db_pct_none(db):

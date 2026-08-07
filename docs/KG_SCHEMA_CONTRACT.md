@@ -22,7 +22,7 @@
 ## 1. Версия
 
 ```
-KG_SCHEMA_VERSION = "2.3"
+KG_SCHEMA_VERSION = "2.4"
 ```
 
 `major.minor`:
@@ -32,6 +32,31 @@ KG_SCHEMA_VERSION = "2.3"
   semantic существующего kind перевёрнут. Требует миграции consumer'ов.
 * **minor** — additive: новый edge kind, новый synthetic prefix, новые
   поля QUALITY_THRESHOLDS, перевод planned → active.
+
+### 1.1. Что изменилось в 2.4 — `node_kind`
+
+У `kg_services` появилась колонка `node_kind` (`service` / `workload` /
+`ingress`). До неё один тип узла означал две разные сущности: k8s Service
+`auth` и Deployment `auth` были ОДНОЙ строкой (уникальный ключ —
+`namespace + name`). Из этого следовало, что ребро `serves_traffic`
+(Service → backing workload) не могло существовать в принципе: оно всегда
+получалось self-loop и выбрасывалось. Замер на живом графе 07.08.2026 —
+2092 отброшенных self-loop за один тик синка при 3 рёбрах `serves_traffic`
+в графе; выглядело как «мёртвое ребро», хотя источник данных был исправен.
+
+* `node_kind='service'` — k8s Service, логическая точка входа. Все строки,
+  существовавшие до миграции, получают именно его.
+* `node_kind='workload'` — Deployment / StatefulSet / DaemonSet. Заводится
+  синком топологии, `team_owner` наследует от своего Service.
+* `node_kind='ingress'` — synthetic-узлы `ingress:<name>` / `ingress:<host>`.
+
+Уникальный ключ: `(namespace, name, node_kind)` — `uq_kg_service_ns_name_kind`.
+
+**Правило для consumer'ов**: поиск узла по `(namespace, name)` без
+`node_kind` теперь неоднозначен. Метрики качества графа (`orphan_pct`,
+owner-coverage, «сервисов всего») считаются только по `node_kind='service'`:
+у workload-узла ребро `serves_traffic` есть всегда, и включение его в scope
+занизило бы orphan вдвое без единого реально связанного сервиса.
 
 История:
 

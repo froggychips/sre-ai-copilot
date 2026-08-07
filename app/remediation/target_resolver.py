@@ -141,7 +141,7 @@ def _enrich_from_kg(ref: TargetRef, kg_session: Any) -> None:
     # Lazy import — позволяет тестам подсовывать mock без перетаскивания
     # всего KG schema.
     try:
-        from app.knowledge_graph.schema import K8sJob, PodEvent, Service
+        from app.knowledge_graph.schema import NODE_KIND_SERVICE, K8sJob, PodEvent, Service
     except Exception:  # pragma: no cover - safety net
         return
 
@@ -202,7 +202,11 @@ def _enrich_from_kg(ref: TargetRef, kg_session: Any) -> None:
     if ref.name and ref.kind in ("Deployment", "StatefulSet"):
         svc = (
             kg_session.query(Service)
-            .filter(Service.namespace == ref.namespace, Service.name == ref.name)
+            .filter(
+                Service.namespace == ref.namespace,
+                Service.name == ref.name,
+                Service.node_kind == NODE_KIND_SERVICE,
+            )
             .first()
         )
         if svc is not None:

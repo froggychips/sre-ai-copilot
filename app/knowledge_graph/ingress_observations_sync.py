@@ -26,7 +26,7 @@ from app.config import settings
 from app.context.vm_client import VMClient
 from app.knowledge_graph.k8s_ingress_sync import (_extract_routes,
                                                   _kubectl_get_ingresses_all)
-from app.knowledge_graph.schema import IngressObservation, Service
+from app.knowledge_graph.schema import NODE_KIND_SERVICE, IngressObservation, Service
 
 log = logging.getLogger(__name__)
 
@@ -166,7 +166,7 @@ async def _sync_ingress_observations_async(db: Session) -> Dict[str, Any]:
 
             backend = (
                 db.query(Service)
-                .filter_by(namespace=ns, name=backend_name)
+                .filter_by(namespace=ns, name=backend_name, node_kind=NODE_KIND_SERVICE)
                 .one_or_none()
             )
             service_id: Optional[int] = cast(int, backend.id) if backend else None

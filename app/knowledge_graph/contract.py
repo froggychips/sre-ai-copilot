@@ -39,11 +39,15 @@ log = logging.getLogger(__name__)
 #: 2.1 = после Wave 7 (PodEvent corr / Service+Ingress topology / NATS subjects).
 #: 2.2 = после PR #82 (k8s_jobs_sync), #84 (k8s_storage_sync) и #86
 #: (kg_services.stale_class column + multi-signal owner inference).
+#: 2.4 = `kg_services.node_kind`: узел графа перестал означать одновременно
+#: k8s Service и workload. serves_traffic снова строится (было 3 ребра на весь
+#: граф), метрики качества (orphan/owner/сервисов всего) считаются по
+#: node_kind='service'. Additive: старые строки получают 'service' миграцией.
 #: 2.3 = orphan-метрика переведена на app-scope (знаменатель — real-сервисы
 #: без expected_stale-инфры) + единый источник `compute_orphan_stats`; все
 #: consumer'ы (STARTUP_CONTRACT_CHECK, quality_report, stats_digest) считают
 #: orphan через него. EDGE_KINDS не менялись.
-KG_SCHEMA_VERSION: str = "2.3"
+KG_SCHEMA_VERSION: str = "2.4"
 
 
 # ---------------------------------------------------------------------------
@@ -71,6 +75,25 @@ SYNTHETIC_KINDS: Set[str] = {
 #: Полный набор kinds которые могут быть у Service. Используется
 #: контрактом для валидации новых типов.
 SERVICE_KINDS: Set[str] = REAL_SERVICE_KINDS | SYNTHETIC_KINDS
+
+
+#: Роль узла в графе (`kg_services.node_kind`). НЕ то же, что `kind`: `kind`
+#: описывает k8s-тип ресурса (deployment/statefulset/ingress), а `node_kind`
+#: отвечает на вопрос «что этот узел означает».
+#:
+#: Разделение введено потому, что один тип узла означал сразу две сущности:
+#: k8s Service `auth` и Deployment `auth` схлопывались в одну строку
+#: kg_services (ключ был namespace+name). Следствие — ребро serves_traffic
+#: (Service → backing workload) физически не могло существовать: оно всегда
+#: получалось self-loop. На живом графе 07.08.2026 так терялось 2092 ребра за
+#: тик, а в графе оставалось 3 ребра serves_traffic.
+#:
+#: Метрики качества графа (orphan, owner-coverage, «сервисов всего») считаются
+#: ТОЛЬКО по node_kind='service' — иначе workload-узлы удваивают знаменатель.
+NODE_KIND_SERVICE: str = "service"
+NODE_KIND_WORKLOAD: str = "workload"
+NODE_KIND_INGRESS: str = "ingress"
+NODE_KINDS: Set[str] = {NODE_KIND_SERVICE, NODE_KIND_WORKLOAD, NODE_KIND_INGRESS}
 
 #: Node kinds для `kg_volume_edges` (PR #84, k8s_storage_sync). Это
 #: heterogeneous-граф: src/dst могут быть из `kg_services` ИЛИ из
@@ -352,8 +375,11 @@ def compute_orphan_stats(db: "Session") -> OrphanStats:
 
     Считает в SQL то же, что per-service сумма `is_orphan(...)`:
 
-      * `app_scope` = count real (NOT synthetic) сервисов с
-        `coalesce(stale_class,'') <> 'expected_stale'`.
+      * `app_scope` = count real (NOT synthetic) **service**-узлов с
+        `coalesce(stale_class,'') <> 'expected_stale'`. workload-узлы в
+        знаменатель не входят: у них ребро serves_traffic есть всегда, и
+        включение их в scope занизило бы orphan_pct вдвое без единого
+        реально починенного сервиса.
       * `orphan` = из них те, чей id НЕ встречается ни как src, ни как dst
         ни в одной edge ЛЮБОГО kind (`kg_service_edges`). **Self-loop'ы
         (src_id == dst_id) НЕ считаются связностью**: сервис, соединённый
@@ -371,14 +397,17 @@ def compute_orphan_stats(db: "Session") -> OrphanStats:
     # Значение expected_stale — bound param (:exp), не конкатенация в SQL
     # (Bandit B608 + чистая практика; значение и так доверенная константа).
     params = {"exp": STALE_CLASS_EXPECTED_STALE}
+    params["svc_kind"] = NODE_KIND_SERVICE
     app_scope = db.execute(text(
         "SELECT count(*) FROM kg_services s "
         "WHERE NOT s.synthetic "
+        "  AND s.node_kind = :svc_kind "
         "  AND coalesce(s.stale_class, '') <> :exp"
     ), params).scalar() or 0
     orphan = db.execute(text(
         "SELECT count(*) FROM kg_services s "
         "WHERE NOT s.synthetic "
+        "  AND s.node_kind = :svc_kind "
         "  AND coalesce(s.stale_class, '') <> :exp "
         "  AND s.id NOT IN ("
         "      SELECT src_id FROM kg_service_edges WHERE src_id <> dst_id "
@@ -491,13 +520,19 @@ def STARTUP_CONTRACT_CHECK(db: "Session") -> Dict[str, object]:
         return report
 
     try:
+        # Только service-узлы: owner-coverage — метрика про логические
+        # сервисы, workload-узлы наследуют owner от своего Service и лишь
+        # разбавили бы и числитель, и знаменатель.
+        kind_params = {"svc_kind": NODE_KIND_SERVICE}
         services_total = db.execute(
-            text("SELECT count(*) FROM kg_services")
+            text("SELECT count(*) FROM kg_services WHERE node_kind = :svc_kind"),
+            kind_params,
         ).scalar() or 0
         with_owner = db.execute(text(
             "SELECT count(*) FROM kg_services "
-            "WHERE team_owner IS NOT NULL AND team_owner <> ''"
-        )).scalar() or 0
+            "WHERE node_kind = :svc_kind "
+            "  AND team_owner IS NOT NULL AND team_owner <> ''"
+        ), kind_params).scalar() or 0
         # orphan_pct — единый источник (app-scope, excl expected_stale).
         report["orphan_pct"] = compute_orphan_stats(db)["orphan_pct"]
         if services_total > 0:

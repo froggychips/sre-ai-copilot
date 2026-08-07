@@ -161,3 +161,44 @@ def test_all_db_sections_are_covered():
         f"секции без интеграционного теста: {sorted(missing)} — "
         "добавь их в _SYNC_SECTIONS или в async-тесты"
     )
+
+
+def test_kg_quality_counts_only_service_nodes(db_session):
+    """workload-узлы не должны попадать в счётчики дайджеста (contract 2.4).
+
+    Регрессия, которую ловим: узлы обоих типов лежат в одной таблице
+    kg_services, и запросы без фильтра по node_kind считают их вместе. В день
+    включения синка топологии это выглядит как «+2000 сервисов за сутки» и
+    одновременно как обвал owner-coverage — при том что топология не менялась,
+    просто у Deployment'ов появился свой тип узла.
+    """
+    from app.knowledge_graph.schema import (NODE_KIND_SERVICE,
+                                            NODE_KIND_WORKLOAD, Service)
+    from app.services import stats_digest as sd
+
+    ns = "__nodekind_probe__"
+    db_session.query(Service).filter_by(namespace=ns).delete()
+    db_session.commit()
+
+    before = sd._count_real_services(db_session)
+    assert before is not None, "_count_real_services вернул None — SQL не исполнился"
+
+    svc = Service(name="probe", namespace=ns, team_owner="t",
+                  node_kind=NODE_KIND_SERVICE, synthetic=False)
+    workload = Service(name="probe", namespace=ns, team_owner="t",
+                       node_kind=NODE_KIND_WORKLOAD, synthetic=False)
+    db_session.add_all([svc, workload])
+    db_session.commit()
+    try:
+        after = sd._count_real_services(db_session)
+        assert after == before + 1, (
+            f"workload-узел посчитан как сервис: {before} → {after}"
+        )
+        # секция целиком тоже обязана исполниться на живой схеме
+        failures = _run_and_collect_failures(
+            lambda: sd.kg_quality_section(db=db_session),
+        )
+        assert not failures, f"kg_quality_section сообщила о сбое → {failures}"
+    finally:
+        db_session.query(Service).filter_by(namespace=ns).delete()
+        db_session.commit()

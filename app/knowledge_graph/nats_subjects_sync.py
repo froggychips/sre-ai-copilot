@@ -71,7 +71,7 @@ from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 from sqlalchemy.orm import Session
 
 from app.knowledge_graph.populator import upsert_edge, upsert_service
-from app.knowledge_graph.schema import Service
+from app.knowledge_graph.schema import NODE_KIND_SERVICE, Service
 
 logger = logging.getLogger(__name__)
 
@@ -476,7 +476,11 @@ def persist_to_kg(
         if services is None:
             services = (
                 db.query(Service)
-                .filter(Service.name == svc_name, Service.synthetic.is_(False))
+                .filter(
+                    Service.name == svc_name,
+                    Service.synthetic.is_(False),
+                    Service.node_kind == NODE_KIND_SERVICE,
+                )
                 .all()
             )
             svc_lookup_cache[svc_name] = services
