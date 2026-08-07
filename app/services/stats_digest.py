@@ -43,7 +43,9 @@ from __future__ import annotations
 
 import json
 import subprocess
+import sys
 from collections import Counter, defaultdict
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
@@ -113,8 +115,58 @@ class ChangeReport:
 _TC_URL_PREFIX_DEFAULT = "https://wo-teamcity.lastoasisgame.com"
 
 
+# Имена секций, упавших в текущей сборке дайджеста. ContextVar, а не
+# модульный список: воркер может собирать дайджест конкурентно с другими
+# задачами, и глобальный список утёк бы между ними.
+#
+# Зачем вообще: секция, поймавшая исключение, возвращает "" — и пустая
+# секция становится неотличима от «нет данных». 07.08.2026 из дайджеста так
+# молча пропали два блока (deploy→incident и beat_heartbeats), причём
+# заметили это глазами, а не мониторингом. Теперь падения перечисляются
+# явной строкой в самом дайджесте.
+_section_failures: ContextVar[List[str]] = ContextVar("digest_section_failures")
+
+
+def _reset_section_failures() -> None:
+    """Начать новую сборку дайджеста с чистым списком сбоев."""
+    _section_failures.set([])
+
+
+def _note_section_failure(section: str) -> None:
+    """Запомнить, что секция не смогла отработать."""
+    try:
+        failures = _section_failures.get()
+    except LookupError:
+        failures = []
+        _section_failures.set(failures)
+    if section not in failures:
+        failures.append(section)
+
+
+def section_failures_line() -> str:
+    """Строка для дайджеста со списком недоступных секций (или "").
+
+    Рендерится в самом конце: читатель должен видеть, что часть картины
+    отсутствует, иначе он примет неполный дайджест за полный.
+    """
+    try:
+        failures = _section_failures.get()
+    except LookupError:
+        return ""
+    if not failures:
+        return ""
+    listed = ", ".join(f"`{f}`" for f in sorted(failures))
+    return (
+        f"⚠️ **Секции недоступны ({len(failures)}):** {listed} — данные ниже "
+        "неполные, смотреть логи воркера по `stats_digest.*_failed`"
+    )
+
+
 def _tx_clean(db: Optional[Session]) -> None:
     """Вернуть сессию в рабочее состояние после упавшего запроса.
+
+    Попутно регистрирует сбой секции (имя вызывающей функции) — чтобы
+    дайджест мог сказать о себе, что часть блоков не собралась.
 
     `db` допускает None: часть секций принимает Optional[Session] для
     backwards-compat с тестами, которые вызывают их без базы.
@@ -132,6 +184,12 @@ def _tx_clean(db: Optional[Session]) -> None:
     Сам rollback обёрнут в try: если сессия уже мертва (например, оборван
     коннект), диагностику секции это ломать не должно.
     """
+    try:
+        caller = sys._getframe(1).f_code.co_name
+    except Exception:  # noqa: BLE001 — диагностика не должна ломать очистку
+        caller = "unknown"
+    _note_section_failure(caller)
+
     if db is None:
         return
     try:
@@ -2728,7 +2786,9 @@ async def _build_digest_with_meta(db: Session) -> Tuple[str, Dict[str, Any]]:
       - sections_with_content: int — сколько не-пустых секций (помимо
         cluster_health и pipeline_health которые рисуются всегда).
       - change_report: ChangeReport (для тестов).
+      - failed_sections: List[str] — секции, не собравшиеся из-за ошибки.
     """
+    _reset_section_failures()
     ns_to_team = _get_ns_to_team_map(db)
     fired_series: List[dict] = []
 
@@ -2847,13 +2907,24 @@ async def _build_digest_with_meta(db: Session) -> Tuple[str, Dict[str, Any]]:
         stale_text,
         kg_text,
         heartbeats_text,
+        # Последней строкой — жалоба дайджеста на самого себя: какие секции
+        # не собрались. Считается ПОСЛЕ всех секций, поэтому и в конце списка.
+        section_failures_line(),
     ]
     content = "\n\n".join(s for s in sections if s)
+
+    try:
+        failed_sections = list(_section_failures.get())
+    except LookupError:
+        failed_sections = []
+    if failed_sections:
+        log.warning("stats_digest.sections_failed", sections=failed_sections)
 
     return content, {
         "sections_with_content": sections_with_content,
         "change_report": change_report,
         "fired_series_count": len(fired_series),
+        "failed_sections": failed_sections,
     }
 
 
