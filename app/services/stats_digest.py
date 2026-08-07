@@ -103,9 +103,11 @@ class ChangeReport:
     new_alerts_24h: int = 0
     resolved_alerts_24h: int = 0
     chronic_in_new: int = 0
-    kg_edges_today: int = 0
+    # None = «не смогли посчитать в этом прогоне», НЕ ноль. Отличать
+    # обязательно: ноль в этих полях означал бы, что граф пуст.
+    kg_edges_today: Optional[int] = None
     kg_edges_yesterday: Optional[int] = None
-    kg_services_today: int = 0
+    kg_services_today: Optional[int] = None
     kg_services_yesterday: Optional[int] = None
     nats_subjects_new: List[str] = field(default_factory=list)
 
@@ -1819,20 +1821,40 @@ def _count_chronic_in_window(db: Session, hours: int, min_fires: int = 5) -> int
         return 0
 
 
-def _count_edges(db: Session) -> int:
+def _count_edges(db: Session) -> Optional[int]:
+    """Число рёбер графа. None — «не смогли посчитать», НЕ ноль.
+
+    Раньше при ошибке возвращался 0, и это давало ложь в дайджесте:
+    07.08.2026 счётчики упали на aborted-транзакции (каскад от соседней
+    секции), в snapshot записались нули, и Topology growth показал
+    «-5584 services · -4773 edges» — ровно вчерашние значения со знаком
+    минус. Читатель видел массовое исчезновение графа, которого не было:
+    удаления узлов в коде нет вовсе, а real-сервисы за те же сутки выросли
+    5577 → 5799.
+    """
     try:
         return int(db.execute(text("SELECT count(*) FROM kg_service_edges")).scalar() or 0)
-    except Exception:
-        return 0
+    except Exception as e:  # noqa: BLE001
+        _tx_clean(db)
+        log.warning("stats_digest.count_edges_failed", error=str(e))
+        return None
 
 
-def _count_real_services(db: Session) -> int:
+def _count_real_services(db: Session) -> Optional[int]:
+    """Число НЕ-synthetic сервисов. None — «не смогли посчитать», не ноль.
+
+    NB: это не то же, что `Services:` в секции KG quality — там count(*) по
+    всей таблице, включая synthetic. Две строки дайджеста говорят про разные
+    множества, и раньше это выглядело как противоречие в цифрах.
+    """
     try:
         return int(db.execute(text(
             "SELECT count(*) FROM kg_services WHERE NOT synthetic"
         )).scalar() or 0)
-    except Exception:
-        return 0
+    except Exception as e:  # noqa: BLE001
+        _tx_clean(db)
+        log.warning("stats_digest.count_real_services_failed", error=str(e))
+        return None
 
 
 def _nats_subjects(db: Session) -> List[str]:
@@ -1923,10 +1945,15 @@ def changes_section(report: ChangeReport) -> str:
     )
     parts.append(f"`-{report.resolved_alerts_24h}` resolved")
 
-    if report.kg_edges_yesterday is not None:
+    # Дельта только когда известны ОБЕ величины. Если сегодняшнюю посчитать
+    # не удалось, честнее промолчать, чем показать «-4773 KG edges» из-за
+    # того, что None превратился в ноль (инцидент 07.08.2026).
+    if report.kg_edges_yesterday is not None and report.kg_edges_today is not None:
         delta_e = report.kg_edges_today - report.kg_edges_yesterday
         sign = "+" if delta_e >= 0 else ""
         parts.append(f"`{sign}{delta_e}` KG edges")
+    elif report.kg_edges_today is None:
+        parts.append("KG edges `?`")
 
     return "**📈 Changes since yesterday**\n  " + " · ".join(parts)
 
@@ -2581,7 +2608,23 @@ async def topology_growth_section(db: Session) -> str:
     subjects_now = _nats_subjects(db)
 
     prev = await _read_topology_snapshot()
-    # Запишем сегодняшний snapshot в любом случае (включая first-run).
+
+    # Снапшот пишем ТОЛЬКО если посчитали обе величины. Иначе на следующий
+    # день сравнение пойдёт с испорченной базой: 07.08.2026 счётчики упали
+    # (aborted-транзакция от соседней секции), записались нули, и дайджест
+    # показал «-5584 services · -4773 edges» — вчерашние значения со знаком
+    # минус, будто граф исчез. Плюс это отравляло бы и следующий день:
+    # завтрашняя дельта от нуля дала бы такой же ложный скачок вверх.
+    if services_now is None or edges_now is None:
+        log.warning(
+            "stats_digest.topology_snapshot_skipped",
+            services=services_now, edges=edges_now,
+        )
+        return (
+            "**🧬 Topology growth (24h)**\n"
+            "  _не посчитано: счётчики графа недоступны в этом прогоне_"
+        )
+
     await _write_topology_snapshot({
         "services": services_now,
         "edges": edges_now,
