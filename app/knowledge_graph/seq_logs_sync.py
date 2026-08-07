@@ -36,7 +36,7 @@ from sqlalchemy.orm import Session
 
 from app.config import settings
 from app.context.seq_client import SeqClient
-from app.knowledge_graph.schema import LogObservation, Service
+from app.knowledge_graph.schema import NODE_KIND_SERVICE, LogObservation, Service
 from app.services.pii_redaction import redact_pii
 
 log = logging.getLogger(__name__)
@@ -135,7 +135,11 @@ def _match_service(
         if namespace_hint:
             svc = (
                 db.query(Service)
-                .filter(Service.namespace == namespace_hint, Service.name == cand)
+                .filter(
+                    Service.namespace == namespace_hint,
+                    Service.name == cand,
+                    Service.node_kind == NODE_KIND_SERVICE,
+                )
                 .one_or_none()
             )
             if svc is not None:
@@ -143,7 +147,13 @@ def _match_service(
 
         candidates = (
             db.query(Service)
-            .filter(Service.name == cand, Service.synthetic.is_(False))
+            .filter(
+                Service.name == cand,
+                Service.synthetic.is_(False),
+                # иначе одноимённый workload ломает проверку len==1 ниже:
+                # уникальный матч выглядел бы как неоднозначный
+                Service.node_kind == NODE_KIND_SERVICE,
+            )
             .all()
         )
         if len(candidates) == 1:

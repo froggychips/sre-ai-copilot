@@ -43,7 +43,7 @@ from app.diagnostics import default_engine as diag_engine
 from app.diagnostics.facts import FactStore
 from app.diagnostics.incident_ctx import build_diagnostics_ctx
 from app.knowledge_graph.auto_populator import populate_from_incident
-from app.knowledge_graph.schema import Deployment, Service
+from app.knowledge_graph.schema import NODE_KIND_SERVICE, Deployment, Service
 from app.models.incident import Incident
 from app.rca.deploy_correlator import correlate_deploy_to_incident
 from app.observability.ai_metrics import (
@@ -315,6 +315,7 @@ class IncidentPipeline:
                 .filter(
                     Service.namespace == self.incident.namespace,
                     Service.name == service_name,
+                    Service.node_kind == NODE_KIND_SERVICE,
                 )
                 .one_or_none()
             )
@@ -391,7 +392,11 @@ class IncidentPipeline:
         try:
             svc = (
                 self.db.query(Service)
-                .filter(Service.namespace == namespace, Service.name == service_name)
+                .filter(
+                    Service.namespace == namespace,
+                    Service.name == service_name,
+                    Service.node_kind == NODE_KIND_SERVICE,
+                )
                 .one_or_none()
             )
             if svc is None:
@@ -957,6 +962,7 @@ class IncidentPipeline:
                 .filter(
                     Service.namespace == self.incident.namespace,
                     Service.name == service_name,
+                    Service.node_kind == NODE_KIND_SERVICE,
                 )
                 .one_or_none()
             )

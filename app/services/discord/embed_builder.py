@@ -171,7 +171,7 @@ def _build_log_error_rate_field(
         # Локальные импорты — чтобы не утягивать SQLAlchemy в чистые dry-run
         # пути (тесты, которые мокают DB).
         from app.database import SessionLocal
-        from app.knowledge_graph.schema import LogObservation, Service
+        from app.knowledge_graph.schema import NODE_KIND_SERVICE, LogObservation, Service
 
         # incident_ts может быть aware — kg_log_observations.ts naive UTC.
         ts_naive = incident_ts
@@ -184,7 +184,11 @@ def _build_log_error_rate_field(
         try:
             svc = (
                 db.query(Service)
-                .filter(Service.namespace == namespace, Service.name == service)
+                .filter(
+                    Service.namespace == namespace,
+                    Service.name == service,
+                    Service.node_kind == NODE_KIND_SERVICE,
+                )
                 .one_or_none()
             )
             if svc is None:
@@ -520,7 +524,8 @@ def _lookup_similar_past_incident(
 
     try:
         from app.database import SessionLocal
-        from app.knowledge_graph.schema import AlertEvent, Service
+        from app.knowledge_graph.schema import (NODE_KIND_SERVICE,
+                                                AlertEvent, Service)
     except Exception as e:  # модули недоступны → skip
         _log.debug("similar_past_import_failed", error=type(e).__name__)
         return None
@@ -530,7 +535,11 @@ def _lookup_similar_past_incident(
         db = SessionLocal()
         svc = (
             db.query(Service)
-            .filter(Service.namespace == namespace, Service.name == service_name)
+            .filter(
+                Service.namespace == namespace,
+                Service.name == service_name,
+                Service.node_kind == NODE_KIND_SERVICE,
+            )
             .one_or_none()
         )
         if svc is None:
