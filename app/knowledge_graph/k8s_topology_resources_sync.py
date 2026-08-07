@@ -47,9 +47,24 @@ from app.knowledge_graph.schema import Service
 
 logger = logging.getLogger(__name__)
 
-# Default kubectl timeout — Services/Ingresses cluster-wide могут быть
-# на 60+ ns × сотни объектов, но обычно дёргаются как один лист.
-_KUBECTL_TIMEOUT_S = 30
+# Default kubectl timeout. 30с не хватало: на этом кластере
+# `kubectl get deployments -A -o json` — это 2318 объектов и ~42 МБ
+# pretty-JSON, и внутри пода воркера (занятого kg_*-синками) запрос не
+# укладывался. Итог: services_fetched=0 КАЖДЫЙ тик, реальные Service-узлы
+# в граф не попадали вовсе → serves_traffic замер на 3 рёбрах, а routes_to
+# терял backend-матчи (`skipped_no_backend_match`), т.е. новые окружения
+# висели в KG как «topology unknown».
+_KUBECTL_TIMEOUT_S = 180
+
+# Пагинация листа: apiserver отдаёт по _KUBECTL_CHUNK объектов за запрос,
+# kubectl склеивает. Пиковая стоимость одного round-trip падает на порядок,
+# и большой лист больше не упирается в один таймаут.
+_KUBECTL_CHUNK = 500
+
+# Фоллбэк, когда даже чанкованный cluster-wide лист не успел: обходим
+# namespace по одному (замер: 0.55с и ~480КБ на namespace против 42МБ на
+# весь кластер). Медленнее по сумме, зато сбой одного ns не обнуляет тик.
+_KUBECTL_TIMEOUT_NS_S = 20
 
 # Edge kinds, которые этот модуль использует. ServiceEdge.kind — свободная
 # строка, валидация на app-уровне. Эти константы — единственная sсемантика.
@@ -64,21 +79,85 @@ DISCOVERED_BY_INGRESS = "k8s_topology_resources/ingress"
 # ── kubectl wrappers ────────────────────────────────────────────────────────
 
 
+def _kubectl_namespaces() -> List[str]:
+    """Список namespace'ов кластера (или [] при ошибке)."""
+    try:
+        out = subprocess.run(
+            ["kubectl", "get", "namespaces", "-o",
+             "jsonpath={range .items[*]}{.metadata.name}{'\\n'}{end}"],
+            capture_output=True, text=True, check=False,
+            timeout=_KUBECTL_TIMEOUT_NS_S,
+        )
+    except Exception as e:
+        logger.warning("k8s_topology_resources.ns_list_failed err=%s", e)
+        return []
+    if out.returncode != 0:
+        logger.warning(
+            "k8s_topology_resources.ns_list_failed rc=%d stderr=%s",
+            out.returncode, (out.stderr or "").strip()[:200],
+        )
+        return []
+    return [ns for ns in (out.stdout or "").split("\n") if ns.strip()]
+
+
+def _kubectl_get_per_namespace(resource: str) -> List[Dict[str, Any]]:
+    """Фоллбэк: собрать `resource` обходом namespace по одному.
+
+    Дороже по сумме round-trip'ов, но каждый запрос мелкий (замер на этом
+    кластере: 0.55с / ~480КБ против 42МБ на весь кластер), поэтому лист
+    целиком не проваливается из-за одного таймаута. Сбойный namespace
+    пропускаем — частичные данные лучше пустого тика.
+    """
+    namespaces = _kubectl_namespaces()
+    if not namespaces:
+        return []
+    items: List[Dict[str, Any]] = []
+    failed = 0
+    for ns in namespaces:
+        try:
+            out = subprocess.run(
+                ["kubectl", "get", resource, "-n", ns, "-o", "json",
+                 f"--chunk-size={_KUBECTL_CHUNK}"],
+                capture_output=True, text=True, check=False,
+                timeout=_KUBECTL_TIMEOUT_NS_S,
+            )
+            if out.returncode != 0:
+                failed += 1
+                continue
+            items.extend((json.loads(out.stdout or "{}") or {}).get("items") or [])
+        except Exception:
+            failed += 1
+            continue
+    logger.info(
+        "k8s_topology_resources.per_namespace_fallback resource=%s ns=%d items=%d failed_ns=%d",
+        resource, len(namespaces), len(items), failed,
+    )
+    return items
+
+
 def _kubectl_get_all(resource: str) -> List[Dict[str, Any]]:
     """`kubectl get <resource> -A -o json` → items list (или [] при ошибке).
 
     Не raise: failure в одном tick'е не должна валить beat-loop. Логируем
     warning со stderr-фрагментом и идём дальше.
+
+    Лист запрашивается чанками (`--chunk-size`), а при таймауте всего листа
+    подхватывает per-namespace фоллбэк — иначе один медленный ответ
+    apiserver'а обнулял весь тик (см. комментарий к _KUBECTL_TIMEOUT_S).
     """
     try:
         out = subprocess.run(
-            ["kubectl", "get", resource, "-A", "-o", "json"],
+            ["kubectl", "get", resource, "-A", "-o", "json",
+             f"--chunk-size={_KUBECTL_CHUNK}"],
             capture_output=True, text=True, check=False,
             timeout=_KUBECTL_TIMEOUT_S,
         )
     except subprocess.TimeoutExpired:
-        logger.warning("k8s_topology_resources.kubectl_timeout resource=%s", resource)
-        return []
+        logger.warning(
+            "k8s_topology_resources.kubectl_timeout resource=%s → per-namespace fallback",
+            resource,
+        )
+        return _kubectl_get_per_namespace(resource)
     except Exception as e:
         logger.warning(
             "k8s_topology_resources.kubectl_exception resource=%s err=%s",

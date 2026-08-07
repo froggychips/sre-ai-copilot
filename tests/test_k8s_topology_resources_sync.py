@@ -11,6 +11,8 @@
   edge cases не плодят фейк-узлы
 - kubectl failure → пустой результат, не raise
 """
+import json
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
@@ -571,3 +573,67 @@ def test_kubectl_get_all_returns_empty_on_timeout():
 
     with patch("subprocess.run", side_effect=_raise):
         assert _kubectl_get_all("services") == []
+
+
+# ── таймаут cluster-wide листа → per-namespace фоллбэк ──────────────────────
+#
+# 07.08.2026: `kubectl get deployments -A -o json` (2318 объектов, ~42МБ
+# pretty-JSON) не укладывался в таймаут внутри пода воркера, и каждый тик
+# заканчивался services_fetched=0. Реальные Service-узлы не попадали в граф
+# вовсе → serves_traffic замер на 3 рёбрах, routes_to терял backend-матчи,
+# новые окружения висели как «topology unknown». Фоллбэк собирает тот же
+# лист по namespace (мелкими запросами), поэтому тик больше не обнуляется.
+
+
+def test_kubectl_timeout_falls_back_to_per_namespace():
+    """Таймаут на `-A` не обнуляет результат: собираем по namespace."""
+    import subprocess
+
+    from app.knowledge_graph import k8s_topology_resources_sync as mod
+
+    calls = []
+
+    def fake_run(cmd, **kwargs):
+        calls.append(cmd)
+        if "-A" in cmd:
+            raise subprocess.TimeoutExpired(cmd=cmd, timeout=1)
+        if "namespaces" in cmd:
+            return SimpleNamespace(returncode=0, stdout="ns-a\nns-b\n", stderr="")
+        ns = cmd[cmd.index("-n") + 1]
+        return SimpleNamespace(
+            returncode=0,
+            stdout=json.dumps({"items": [{"metadata": {"name": f"dep-{ns}"}}]}),
+            stderr="",
+        )
+
+    with patch.object(mod.subprocess, "run", side_effect=fake_run):
+        items = mod._kubectl_get_all("deployments")
+
+    assert [i["metadata"]["name"] for i in items] == ["dep-ns-a", "dep-ns-b"]
+    assert any("-A" in c for c in calls), "cluster-wide попытка должна быть первой"
+
+
+def test_per_namespace_fallback_skips_broken_namespace():
+    """Сбойный namespace не роняет весь сбор — берём что доступно."""
+    import subprocess
+
+    from app.knowledge_graph import k8s_topology_resources_sync as mod
+
+    def fake_run(cmd, **kwargs):
+        if "-A" in cmd:
+            raise subprocess.TimeoutExpired(cmd=cmd, timeout=1)
+        if "namespaces" in cmd:
+            return SimpleNamespace(returncode=0, stdout="good\nbad\n", stderr="")
+        ns = cmd[cmd.index("-n") + 1]
+        if ns == "bad":
+            return SimpleNamespace(returncode=1, stdout="", stderr="forbidden")
+        return SimpleNamespace(
+            returncode=0,
+            stdout=json.dumps({"items": [{"metadata": {"name": "dep-good"}}]}),
+            stderr="",
+        )
+
+    with patch.object(mod.subprocess, "run", side_effect=fake_run):
+        items = mod._kubectl_get_all("services")
+
+    assert [i["metadata"]["name"] for i in items] == ["dep-good"]
