@@ -7,6 +7,9 @@
 - snapshot_uri allowlist (SSRF defense-in-depth): s3:// / file:// проходят,
   http(s)/ftp/произвольный хост/мусор/пусто → ValueError. На уровне
   by-snapshot ручки чужой хост → 400.
+- JWT-валидация (get_current_user): пин асимметричного алгоритма
+  (HS256-downgrade → 401), обязательный iss (+ сверка при JWT_ISSUER),
+  aud при JWT_AUDIENCE, пустой JWT_PUBLIC_KEY → 401, а не 500.
 
 snapshot_uri сейчас — чистый echo (assert_replay_inputs + return), по uri
 никто не ходит. Валидация добавлена как defense-in-depth на будущего
@@ -14,10 +17,17 @@ snapshot_uri сейчас — чистый echo (assert_replay_inputs + return),
 """
 from __future__ import annotations
 
+import time
+from types import SimpleNamespace
+
+import jwt as pyjwt
 import pytest
-from fastapi import Depends, FastAPI
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric import rsa
+from fastapi import Depends, FastAPI, HTTPException
 from fastapi.testclient import TestClient
 
+import app.auth as auth_module
 from app.api import replay
 from app.auth import User, get_current_user, require_role
 from app.replay.contract import (
@@ -185,3 +195,157 @@ def test_allowed_schemes_are_non_network():
     """Smoke: в allowlist нет http(s)/ftp."""
     for bad in ("http", "https", "ftp", "gopher"):
         assert bad not in ALLOWED_SNAPSHOT_URI_SCHEMES
+
+
+# ── JWT-валидация: issuer / audience / algorithm pinning / fail-closed ───
+
+
+@pytest.fixture(scope="module")
+def rsa_keys():
+    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    priv_pem = key.private_bytes(
+        serialization.Encoding.PEM,
+        serialization.PrivateFormat.PKCS8,
+        serialization.NoEncryption(),
+    ).decode()
+    pub_pem = key.public_key().public_bytes(
+        serialization.Encoding.PEM,
+        serialization.PublicFormat.SubjectPublicKeyInfo,
+    ).decode()
+    return priv_pem, pub_pem
+
+
+_ISSUER = "https://idp.example.com"
+
+
+def _auth_settings(pub_pem: str, **overrides):
+    """Двойник settings для app.auth (JWT_ISSUER добавляется централизованно;
+    setattr несуществующего поля на pydantic-модели кидает ValueError)."""
+    base = dict(
+        JWT_PUBLIC_KEY=pub_pem,
+        JWT_ALGORITHM="RS256",
+        JWT_AUDIENCE=None,
+        JWT_ISSUER=_ISSUER,
+    )
+    base.update(overrides)
+    return SimpleNamespace(**base)
+
+
+def _claims(**overrides):
+    claims = {
+        "sub": "u1",
+        "email": "u@example.com",
+        "roles": ["approver"],
+        "iss": _ISSUER,
+        "exp": int(time.time()) + 600,
+    }
+    claims.update(overrides)
+    return claims
+
+
+async def _get_user(token: str) -> User:
+    return await get_current_user(SimpleNamespace(credentials=token))
+
+
+@pytest.mark.asyncio
+async def test_jwt_valid_rs256_with_issuer_accepted(monkeypatch, rsa_keys):
+    priv, pub = rsa_keys
+    monkeypatch.setattr(auth_module, "settings", _auth_settings(pub))
+    token = pyjwt.encode(_claims(), priv, algorithm="RS256")
+    user = await _get_user(token)
+    assert user.sub == "u1"
+    assert "approver" in user.roles
+
+
+@pytest.mark.asyncio
+async def test_jwt_missing_iss_rejected(monkeypatch, rsa_keys):
+    """iss обязателен всегда — токен «того же IdP, но для другого сервиса»
+    без iss не аутентифицируется."""
+    priv, pub = rsa_keys
+    monkeypatch.setattr(auth_module, "settings", _auth_settings(pub))
+    claims = _claims()
+    del claims["iss"]
+    token = pyjwt.encode(claims, priv, algorithm="RS256")
+    with pytest.raises(HTTPException) as exc:
+        await _get_user(token)
+    assert exc.value.status_code == 401
+
+
+@pytest.mark.asyncio
+async def test_jwt_wrong_issuer_rejected(monkeypatch, rsa_keys):
+    priv, pub = rsa_keys
+    monkeypatch.setattr(auth_module, "settings", _auth_settings(pub))
+    token = pyjwt.encode(
+        _claims(iss="https://other-service.example.com"), priv, algorithm="RS256"
+    )
+    with pytest.raises(HTTPException) as exc:
+        await _get_user(token)
+    assert exc.value.status_code == 401
+
+
+@pytest.mark.asyncio
+async def test_jwt_missing_aud_rejected_when_audience_configured(monkeypatch, rsa_keys):
+    priv, pub = rsa_keys
+    monkeypatch.setattr(
+        auth_module, "settings", _auth_settings(pub, JWT_AUDIENCE="sre-copilot")
+    )
+    token = pyjwt.encode(_claims(), priv, algorithm="RS256")  # без aud
+    with pytest.raises(HTTPException) as exc:
+        await _get_user(token)
+    assert exc.value.status_code == 401
+
+
+@pytest.mark.asyncio
+async def test_jwt_correct_audience_accepted(monkeypatch, rsa_keys):
+    priv, pub = rsa_keys
+    monkeypatch.setattr(
+        auth_module, "settings", _auth_settings(pub, JWT_AUDIENCE="sre-copilot")
+    )
+    token = pyjwt.encode(_claims(aud="sre-copilot"), priv, algorithm="RS256")
+    user = await _get_user(token)
+    assert user.sub == "u1"
+
+
+def _forge_hs256(claims: dict, secret: bytes) -> str:
+    """Ручная чеканка HS256-токена: PyJWT сам отказывается encode-ить
+    PEM-подобный ключ как HMAC-секрет, а атакующему это не мешает."""
+    import base64
+    import hashlib
+    import hmac as hmac_mod
+    import json
+
+    def b64url(data: bytes) -> bytes:
+        return base64.urlsafe_b64encode(data).rstrip(b"=")
+
+    header = b64url(json.dumps({"alg": "HS256", "typ": "JWT"}).encode())
+    payload = b64url(json.dumps(claims).encode())
+    signing_input = header + b"." + payload
+    sig = b64url(hmac_mod.new(secret, signing_input, hashlib.sha256).digest())
+    return (signing_input + b"." + sig).decode()
+
+
+@pytest.mark.asyncio
+async def test_jwt_hs256_downgrade_rejected(monkeypatch, rsa_keys):
+    """JWT_ALGORITHM=HS256 (мисконфиг) не превращает ПУБЛИЧНЫЙ ключ в
+    HMAC-секрет: алгоритм запинен на асимметричное семейство → 401."""
+    _, pub = rsa_keys
+    monkeypatch.setattr(
+        auth_module, "settings", _auth_settings(pub, JWT_ALGORITHM="HS256")
+    )
+    # Атакующий знает публичный ключ и чеканит HS256-токен, подписанный им.
+    forged = _forge_hs256(_claims(), pub.encode())
+    with pytest.raises(HTTPException) as exc:
+        await _get_user(forged)
+    assert exc.value.status_code == 401
+
+
+@pytest.mark.asyncio
+async def test_jwt_empty_public_key_returns_401_not_500(monkeypatch, rsa_keys):
+    """Пустой JWT_PUBLIC_KEY: PyJWT кидает InvalidKeyError (не подкласс
+    InvalidTokenError) — раньше это утекало 500-кой, теперь fail-closed 401."""
+    priv, _ = rsa_keys
+    monkeypatch.setattr(auth_module, "settings", _auth_settings(""))
+    token = pyjwt.encode(_claims(), priv, algorithm="RS256")
+    with pytest.raises(HTTPException) as exc:
+        await _get_user(token)
+    assert exc.value.status_code == 401

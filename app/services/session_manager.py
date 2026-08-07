@@ -5,13 +5,29 @@ from typing import Any, Dict, List, Optional
 import structlog
 from redis.asyncio import Redis
 
+from app.config import settings
+
 logger = structlog.get_logger()
 
 
 class SessionManager:
-    def __init__(self, redis_client: Redis, ttl: int = 86400):
+    def __init__(
+        self,
+        redis_client: Redis,
+        ttl: int = 86400,
+        history_max: Optional[int] = None,
+    ):
         self.redis = redis_client
         self.ttl = ttl
+        # Кап длины истории (LTRIM). Без него rpush рос неограниченно в
+        # пределах 24h TTL — болтливая сессия раздувала Redis. get_context
+        # всё равно читает только последние ~15 сообщений, хвост длиннее
+        # капа не нужен никому. Настройка: SESSION_HISTORY_MAX_MESSAGES.
+        self.history_max = (
+            history_max
+            if history_max is not None
+            else int(getattr(settings, "SESSION_HISTORY_MAX_MESSAGES", 200))
+        )
         # Префиксы для организации пространства ключей
         self.PRE_HISTORY = "sre:session:history:"
         self.PRE_STATE = "sre:session:state:"
@@ -30,12 +46,17 @@ class SessionManager:
         return session_id
 
     async def add_message(self, session_id: str, role: str, content: str):
-        """Добавляет сообщение в историю (Redis List) с продлением TTL."""
+        """Добавляет сообщение в историю (Redis List) с продлением TTL.
+
+        LTRIM держит только последние history_max сообщений — история не
+        растёт неограниченно в пределах TTL.
+        """
         key = self._get_key(self.PRE_HISTORY, session_id)
         message = json.dumps({"role": role, "content": content})
 
         async with self.redis.pipeline(transaction=True) as pipe:
             await pipe.rpush(key, message)
+            await pipe.ltrim(key, -self.history_max, -1)
             await pipe.expire(key, self.ttl)
             await pipe.execute()
 

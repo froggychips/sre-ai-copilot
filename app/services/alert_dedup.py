@@ -15,7 +15,6 @@ Fail-open: при недоступности Redis возвращаем SEND (к
 """
 from __future__ import annotations
 
-import json
 from datetime import datetime, timedelta, timezone
 from enum import Enum
 from typing import Optional
@@ -45,8 +44,21 @@ def _get_client() -> aioredis.Redis:
     return _redis
 
 
-def _key(alertname: str, service: str) -> str:
-    return f"enrich:lastsent:{alertname}:{service}"
+# L2-state — ДВА ключа вместо прежнего JSON-blob-а:
+#   *:cnt  — атомарный счётчик fires в окне. Создаётся через SET NX EX
+#            (TTL ставится атомарно при создании и БОЛЬШЕ НЕ ОБНОВЛЯЕТСЯ —
+#            окно якорится на первом fire), наращивается INCR-ом.
+#            Прежний GET→modify→SET терял инкременты при конкурентных
+#            batch-ах, а `SET ... ex=WINDOW` на каждом апдейте сдвигал TTL —
+#            хроник, стреляющий чаще раза в 6h, не истекал НИКОГДА.
+#   *:last — unix-ts последнего fire (для quiet-reset >2h). Его TTL можно
+#            обновлять: он трекает именно «последний раз видели».
+def _count_key(alertname: str, service: str) -> str:
+    return f"enrich:lastsent:{alertname}:{service}:cnt"
+
+
+def _last_key(alertname: str, service: str) -> str:
+    return f"enrich:lastsent:{alertname}:{service}:last"
 
 
 class Decision(str, Enum):
@@ -115,48 +127,44 @@ async def decide_send(
     # ── L2: chronic suppress через Redis state ─────────────────────────
     try:
         client = _get_client()
-        key = _key(alertname, service)
-        raw = await client.get(key)
+        key_cnt = _count_key(alertname, service)
+        key_last = _last_key(alertname, service)
         now_unix = int(fire_at.timestamp())
 
-        if raw is None:
-            # Первый fire в окне — записываем state и шлём.
-            state = {
-                "first": now_unix,
-                "last": now_unix,
-                "count": 1,
-            }
-            await client.set(key, json.dumps(state), ex=CHRONIC_WINDOW_SECONDS)
-            return Decision.SEND
+        raw_last = await client.get(key_last)
+        last: Optional[int] = None
+        if raw_last is not None:
+            try:
+                last = int(raw_last)
+            except (TypeError, ValueError):
+                # Битый state — чистим и считаем первым fire-ом.
+                await client.delete(key_last)
+                await client.delete(key_cnt)
 
-        try:
-            state = json.loads(raw)
-        except json.JSONDecodeError:
-            await client.delete(key)
-            return Decision.SEND
+        if last is not None:
+            delta = now_unix - last
+            if delta > CHRONIC_QUIET_RESET_SECONDS:
+                # >2h тишины — это resurface, сбрасываем counter и якорим
+                # новое окно на текущем fire.
+                await client.set(key_cnt, 1, ex=CHRONIC_WINDOW_SECONDS)
+                await client.set(key_last, now_unix, ex=CHRONIC_WINDOW_SECONDS)
+                log.info(
+                    "dedup.resurfaced",
+                    alertname=alertname, service=service,
+                    quiet_seconds=delta,
+                )
+                return Decision.SEND_RESURFACED
+        else:
+            delta = 0
 
-        last = int(state.get("last") or 0)
-        count = int(state.get("count") or 0)
-        delta = now_unix - last
-
-        if delta > CHRONIC_QUIET_RESET_SECONDS:
-            # >2h тишины — это resurface, сбрасываем counter.
-            state = {"first": now_unix, "last": now_unix, "count": 1}
-            await client.set(key, json.dumps(state), ex=CHRONIC_WINDOW_SECONDS)
-            log.info(
-                "dedup.resurfaced",
-                alertname=alertname, service=service,
-                quiet_seconds=delta,
-            )
-            return Decision.SEND_RESURFACED
-
-        # В окне <2h — увеличиваем counter.
-        new_count = count + 1
-        state["last"] = now_unix
-        state["count"] = new_count
-        # TTL не обновляем — sliding window управляется first; ключ сам
-        # уйдёт через CHRONIC_WINDOW_SECONDS от первого fire-а.
-        await client.set(key, json.dumps(state), ex=CHRONIC_WINDOW_SECONDS)
+        # Fire в окне (или первый). SET NX EX создаёт счётчик С TTL атомарно
+        # (якорь = первый fire), INCR наращивает атомарно — конкурентные
+        # batch-ы больше не теряют инкременты. TTL счётчика дальше НЕ
+        # трогаем: через CHRONIC_WINDOW_SECONDS от первого fire ключ истечёт
+        # и хроник всплывёт снова (документированное sliding-window поведение).
+        await client.set(key_cnt, 0, ex=CHRONIC_WINDOW_SECONDS, nx=True)
+        new_count = int(await client.incr(key_cnt))
+        await client.set(key_last, now_unix, ex=CHRONIC_WINDOW_SECONDS)
 
         if new_count >= CHRONIC_MIN_COUNT:
             log.info(

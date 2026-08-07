@@ -136,3 +136,82 @@ def test_purge_stale_noop_when_all_fresh():
     removed = dedup_store.purge_stale(ttl_sec=1800, now=1100.0)
     assert removed == 0
     assert "k1" in _dedup_state._recent_enriched
+
+
+# ---------------------------------------------------------------------------
+# claim/release: атомарный claim-before-post (#9, TOCTOU двух реплик)
+# ---------------------------------------------------------------------------
+
+def test_claim_free_key_acquires_and_writes_placeholder():
+    """Свободный ключ: claim возвращает None (наш) и ставит placeholder."""
+    assert dedup_store.claim("k1", ttl_sec=1800, now=1000.0) is None
+    rec = _dedup_state._recent_enriched["k1"]
+    assert rec["msg_id"] == ""  # placeholder до финализации save()
+
+
+def test_claim_mid_post_placeholder_returns_empty_msg_id():
+    """Вторая реплика во время POST первой: получает placeholder → skip."""
+    assert dedup_store.claim("k1", ttl_sec=1800, now=1000.0) is None
+    second = dedup_store.claim("k1", ttl_sec=1800, now=1001.0)
+    assert second is not None
+    assert second["msg_id"] == ""
+
+
+def test_claim_after_save_returns_record_for_patch():
+    """Финализированная запись: claim отдаёт её с msg_id → PATCH-путь."""
+    assert dedup_store.claim("k1", ttl_sec=1800, now=1000.0) is None
+    dedup_store.save("k1", msg_id="m1", webhook_url="https://w", embed=None, now=1000.0)
+    rec = dedup_store.claim("k1", ttl_sec=1800, now=1100.0)
+    assert rec is not None
+    assert rec["msg_id"] == "m1"
+
+
+def test_claim_stale_record_reacquires():
+    """Протухшая запись — новое окно: claim снова наш."""
+    dedup_store.save("k1", msg_id="m1", webhook_url="https://w", embed=None, now=1000.0)
+    assert dedup_store.claim("k1", ttl_sec=60, now=2000.0) is None
+    assert _dedup_state._recent_enriched["k1"]["msg_id"] == ""
+
+
+def test_release_removes_placeholder_only():
+    """release снимает незавершённый claim, но не финализированную запись."""
+    assert dedup_store.claim("k1", ttl_sec=1800, now=1000.0) is None
+    dedup_store.release("k1")
+    assert "k1" not in _dedup_state._recent_enriched
+
+    dedup_store.save("k2", msg_id="m2", webhook_url="https://w", embed=None, now=1000.0)
+    dedup_store.release("k2")
+    assert _dedup_state._recent_enriched["k2"]["msg_id"] == "m2"
+
+
+def test_claim_pg_path_insert_conflict_is_atomic(monkeypatch):
+    """PG-путь: INSERT-конфликт по PK — проигравший видит запись победителя.
+
+    Реальный sqlite-движок (та же семантика UNIQUE PK, что и в PG):
+    первый claim INSERT-ит placeholder, конкурент ловит IntegrityError и
+    получает строку вместо второго POST-а.
+    """
+    from sqlalchemy import create_engine
+    from sqlalchemy.orm import sessionmaker
+
+    from app.database import Base
+
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    TestSession = sessionmaker(bind=engine, autocommit=False, autoflush=False)
+    monkeypatch.setattr(dedup_store, "_pg_session", TestSession)
+
+    # Победитель клеймит.
+    assert dedup_store.claim("kX", ttl_sec=1800, now=1000.0) is None
+    # Конкурент: свежий placeholder → dict с пустым msg_id (skip).
+    second = dedup_store.claim("kX", ttl_sec=1800, now=1001.0)
+    assert second is not None
+    assert second["msg_id"] == ""
+    # Победитель финализирует; третий вызов получает msg_id для PATCH.
+    dedup_store.save("kX", msg_id="m-pg", webhook_url="https://w", embed=None, now=1002.0)
+    third = dedup_store.claim("kX", ttl_sec=1800, now=1003.0)
+    assert third is not None
+    assert third["msg_id"] == "m-pg"
+    # In-memory fallback не задействован — всё жило в «PG».
+    assert "kX" not in _dedup_state._recent_enriched
+    engine.dispose()

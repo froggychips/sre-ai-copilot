@@ -71,6 +71,28 @@ async def test_apply_step1_blocked_when_approval_disabled():
 
 
 @pytest.mark.asyncio
+async def test_apply_confirm_blocked_when_approval_disabled():
+    """EXECUTOR_APPROVAL_ENABLED=false → шаг 2 тоже fail-closed: ни записи
+    approval, ни background-task (кнопка могла остаться в старом сообщении)."""
+    payload = _make_request_body(f"apply_confirm:inc-off:{_SIG}")
+
+    with patch.object(discord_interactions, "_verify_signature", return_value=True), \
+         patch.object(discord_interactions.settings, "DISCORD_PUBLIC_KEY", "deadbeef"), \
+         patch.object(discord_interactions.settings, "EXECUTOR_APPROVAL_ENABLED", False), \
+         patch.object(discord_interactions, "_record_decision") as mock_record, \
+         patch("asyncio.create_task") as mock_task:
+        request = MagicMock()
+        request.body = AsyncMock(return_value=__import__("json").dumps(payload).encode())
+        resp = await discord_interactions.discord_interactions(
+            request, x_signature_ed25519="00" * 64, x_signature_timestamp="0"
+        )
+
+    assert "EXECUTOR_APPROVAL_ENABLED=false" in resp["data"]["content"]
+    mock_record.assert_not_called()
+    mock_task.assert_not_called()
+
+
+@pytest.mark.asyncio
 async def test_apply_confirm_records_approval_and_returns_deferred():
     """apply_confirm → пишет ActionApproval(approved), СРАЗУ type=5; apply в background."""
     payload = _make_request_body(f"apply_confirm:inc-2:{_SIG}", user_id="user-42")

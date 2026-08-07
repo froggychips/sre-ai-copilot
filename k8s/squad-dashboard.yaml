@@ -68,7 +68,9 @@ spec:
               type: RuntimeDefault
           containers:
           - name: squad-dashboard
-            image: ghcr.io/froggychips/sre-ai-copilot:latest
+            # IMAGE_TAG_PLACEHOLDER подставляет deploy.sh (IMAGE_TAG=<git-sha>).
+            # CI публикует ТОЛЬКО :<git-sha> — тега :latest не существует.
+            image: ghcr.io/froggychips/sre-ai-copilot:IMAGE_TAG_PLACEHOLDER
             imagePullPolicy: IfNotPresent
             command: ["python3", "/scripts/squad_dashboard.py"]
             securityContext:

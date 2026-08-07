@@ -5,8 +5,12 @@ services. Это первый источник, который раскрыва�
 вне cluster-internal env-scan.
 
 Модель:
-- synthetic-узел `ingress:<host>` (team_owner="external") создаётся
-  per host. Может быть в любом ns Ingress'а — мы кладём в его ns.
+- synthetic-узел `ingress:<host>` (team_owner="external") — ОДИН на
+  hostname, независимо от namespace. Если узел с этим именем уже есть
+  где-то в KG — переиспользуем канонический (лексикографически минимальный
+  ns, детерминизм как у db:-узлов в kg_sync); иначе создаём в ns Ingress-а.
+  Раньше узел плодился per-namespace: один host в N ns давал N узлов,
+  деливших один external_probe:{host}-fingerprint.
 - Edge `ingress:<host>` → `<backend_svc>` (тот же ns у Ingress), kind=`calls`,
   discovered_by=`kg_sync/ingress`.
 
@@ -84,12 +88,81 @@ def _extract_routes(ing: Dict[str, Any]) -> List[Dict[str, str]]:
     return out
 
 
+def _canonical_host_node_ns(db: Session, host: str, fallback_ns: str) -> str:
+    """Namespace для `ingress:<host>`-узла: host — глобальное имя, узел один.
+
+    Если узел(ы) с этим именем уже есть — берём лексикографически
+    минимальный namespace (детерминизм; тот же приём, что у db:-узлов в
+    `kg_sync._known_db_node_namespaces`). Иначе — ns текущего Ingress-а.
+    Так один host в N namespace-ах перестаёт плодить N узлов, деливших
+    единственный `external_probe:{host}`-fingerprint.
+    """
+    rows = (
+        db.query(Service.namespace)
+        .filter(Service.name == f"ingress:{host}")
+        .all()
+    )
+    if rows:
+        return min(ns for (ns,) in rows)
+    return fallback_ns
+
+
+def _sync_one_route(
+    db: Session,
+    *,
+    ns: str,
+    ing_name: str,
+    route: Dict[str, str],
+    stats: Dict[str, int],
+) -> None:
+    """Обработать один route. Вызывается под per-item SAVEPOINT-ом."""
+    host = route["host"]
+    backend_name = route["backend"]
+
+    # Backend должен существовать в KG (kg_topology_sync уже видел его
+    # как Deployment). Если нет — пропускаем (избегаем фейк-узлов).
+    backend = (
+        db.query(Service)
+        .filter_by(namespace=ns, name=backend_name, node_kind=NODE_KIND_SERVICE)
+        .one_or_none()
+    )
+    if backend is None:
+        stats["skipped_no_backend_match"] += 1
+        return
+
+    # synthetic-узел внешнего entrypoint — один на hostname (см.
+    # _canonical_host_node_ns), не per-namespace.
+    external_node_name = f"ingress:{host}"
+    node_ns = _canonical_host_node_ns(db, host, ns)
+    ext = upsert_service(
+        db,
+        namespace=node_ns,
+        name=external_node_name,
+        team_owner="external",
+        synthetic=True,
+    )
+    stats["nodes_created"] += 1  # idempotent: upsert не дубль; считаем "touched"
+
+    upsert_edge(
+        db, src=ext, dst=backend, kind="calls",
+        discovered_by="kg_sync/ingress",
+        extras={
+            "ingress_name": ing_name,
+            "path": route["path"],
+            "confidence": "declared_k8s",  # сильнее чем inferred_env
+            "semantics": "sync",
+        },
+    )
+    stats["edges_created"] += 1
+
+
 def sync_all_ingresses(db: Session) -> Dict[str, int]:
     """Sync — главная entry point.
 
     Возвращает stats:
       ingresses_fetched / routes_seen / nodes_created / edges_created
       / skipped_no_backend_match (backend service не существует в KG yet)
+      / errors (routes, откатившиеся per-item savepoint-ом)
     """
     ingresses = _kubectl_get_ingresses_all()
     stats = {
@@ -98,6 +171,7 @@ def sync_all_ingresses(db: Session) -> Dict[str, int]:
         "nodes_created": 0,
         "edges_created": 0,
         "skipped_no_backend_match": 0,
+        "errors": 0,
     }
 
     for ing in ingresses:
@@ -108,48 +182,27 @@ def sync_all_ingresses(db: Session) -> Dict[str, int]:
         routes = _extract_routes(ing)
         for r in routes:
             stats["routes_seen"] += 1
-            host = r["host"]
-            backend_name = r["backend"]
-
-            # Backend должен существовать в KG (kg_topology_sync уже видел его
-            # как Deployment). Если нет — пропускаем (избегаем фейк-узлов).
-            backend = (
-                db.query(Service).filter_by(
-                    namespace=ns, name=backend_name, node_kind=NODE_KIND_SERVICE,
-                ).one_or_none()
-            )
-            if backend is None:
-                stats["skipped_no_backend_match"] += 1
-                continue
-
-            # synthetic-узел внешнего entrypoint
-            external_node_name = f"ingress:{host}"
-            ext = upsert_service(
-                db,
-                namespace=ns,
-                name=external_node_name,
-                team_owner="external",
-                synthetic=True,
-            )
-            stats["nodes_created"] += 1  # idempotent: upsert не дубль; считаем "touched"
-
-            upsert_edge(
-                db, src=ext, dst=backend, kind="calls",
-                discovered_by="kg_sync/ingress",
-                extras={
-                    "ingress_name": ing_name,
-                    "path": r["path"],
-                    "confidence": "declared_k8s",  # сильнее чем inferred_env
-                    "semantics": "sync",
-                },
-            )
-            stats["edges_created"] += 1
+            try:
+                # SAVEPOINT на route: один DataError не переводит Session в
+                # aborted-состояние и не роняет весь tick (зеркалит
+                # per-item SAVEPOINT из k8s_events_sync).
+                with db.begin_nested():
+                    _sync_one_route(
+                        db, ns=ns, ing_name=ing_name, route=r, stats=stats,
+                    )
+            except Exception as e:
+                stats["errors"] += 1
+                log.warning(
+                    "ingress_sync.route_failed ns=%s ingress=%s host=%s err=%s",
+                    ns, ing_name, r.get("host"), e,
+                )
 
     db.commit()
     log.info(
-        "ingress_sync.done ingresses=%d routes=%d edges=%d skipped=%d",
+        "ingress_sync.done ingresses=%d routes=%d edges=%d skipped=%d errors=%d",
         stats["ingresses_fetched"], stats["routes_seen"],
         stats["edges_created"], stats["skipped_no_backend_match"],
+        stats["errors"],
     )
     return stats
 

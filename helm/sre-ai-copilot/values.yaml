@@ -3,8 +3,14 @@ replicaCount:
   worker: 2
 
 image:
-  repository: froggychips/sre-ai-copilot
-  tag: "latest"
+  # CI публикует ТОЛЬКО ghcr.io/froggychips/sre-ai-copilot:<git-sha>
+  # (см. .github/workflows/ci.yml) — тега :latest НЕ СУЩЕСТВУЕТ.
+  # tag обязателен: --set image.tag=<git-sha>; шаблоны падают через
+  # `required`, если не задан. Раньше здесь стояли repository без ghcr.io
+  # (docker hub!) и tag latest — свежий install гарантированно получал
+  # ImagePullBackOff.
+  repository: ghcr.io/froggychips/sre-ai-copilot
+  tag: ""
   pullPolicy: IfNotPresent
 
 imagePullSecrets: []

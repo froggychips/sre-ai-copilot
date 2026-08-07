@@ -39,8 +39,9 @@ from app.core.intelligence.similar_incidents import SimilarIncidentEngine
 from app.core.state_machine import IncidentState, StateMachine
 from app.core.tracing import StageTimer
 from app.database import IncidentRecord
+from app.agents.models.hypothesis import Hypothesis, HypothesisSet
 from app.diagnostics import default_engine as diag_engine
-from app.diagnostics.facts import FactStore
+from app.diagnostics.facts import Fact, FactStore
 from app.diagnostics.incident_ctx import build_diagnostics_ctx
 from app.knowledge_graph.auto_populator import populate_from_incident
 from app.knowledge_graph.schema import NODE_KIND_SERVICE, Deployment, Service
@@ -68,15 +69,48 @@ from app.services.teamcity_service import incident_teamcity_context, teamcity_co
 logger = structlog.get_logger()
 
 # Per-stage timeout: каждая LLM/enrichment-стадия оборачивается в
-# asyncio.wait_for(..., timeout=_STAGE_TIMEOUT). При TimeoutError исключение
-# пробрасывается наверх — вызывающий код переводит инцидент в FAILED.
+# asyncio.wait_for(..., timeout=_STAGE_TIMEOUT). При таймауте наверх уходит
+# PipelineStageTimeout — вызывающий код переводит инцидент в FAILED.
 # getattr с дефолтом, чтобы не трогать config.py (отдельный batch/миграция).
 _STAGE_TIMEOUT = float(getattr(settings, "PIPELINE_STAGE_TIMEOUT_SECONDS", 240.0))
 
 
-async def _staged(coro):
-    """Обернуть стадию в per-stage timeout. TimeoutError НЕ глушим."""
-    return await asyncio.wait_for(coro, timeout=_STAGE_TIMEOUT)
+class PipelineStageTimeout(Exception):
+    """Терминальный per-stage cap (`asyncio.wait_for` в `_staged`).
+
+    НАМЕРЕННО не наследует TimeoutError: на Python 3.11+ builtin TimeoutError —
+    сабкласс OSError, который входит в RETRIABLE_EXC (app/workers/tasks.py),
+    и Celery ретраил бы намеренно завершённую по cap-у стадию 3× подряд,
+    пережигая LLM-бюджет. Отдельный класс гарантирует контракт
+    «stage-cap → FAILED без ретрая», при этом сетевые таймауты
+    (httpx.TimeoutException) остаются ретраибельными.
+    """
+
+
+class IncidentResolvedExternally(Exception):
+    """Инцидент переведён в терминал (resolve-webhook) пока pipeline в полёте.
+
+    Control-flow сигнал, не ошибка: run() ловит его, останавливается чисто и
+    фиксирует resolved_early-маркер вместо мусорного «Invalid state transition»
+    в analysis.failed.
+    """
+
+
+async def _staged(coro, stage: str = ""):
+    """Обернуть стадию в per-stage timeout.
+
+    Стадийный cap конвертируется в PipelineStageTimeout (не-ретраибельный),
+    чтобы transient-политика Celery не перезапускала весь инцидент из-за
+    намеренного лимита (builtin TimeoutError — сабкласс OSError, т.е. был бы
+    ретраибельным). Оригинальный TimeoutError сохраняется в __cause__.
+    """
+    try:
+        return await asyncio.wait_for(coro, timeout=_STAGE_TIMEOUT)
+    except (TimeoutError, asyncio.TimeoutError) as e:
+        raise PipelineStageTimeout(
+            f"pipeline stage {stage or getattr(coro, '__qualname__', '?')!s} "
+            f"exceeded {_STAGE_TIMEOUT:.0f}s cap"
+        ) from e
 
 _LEGACY_STATUS_ALIAS: dict[str, IncidentState] = {
     "PENDING": IncidentState.OPEN,
@@ -101,6 +135,28 @@ ROLLOUT_NOISE_NEVER_SUPPRESS = frozenset({
     "KubePodNotReady",
 })
 
+# ── Checkpoint / resume (Celery-ретрай transient-сбоя) ──────────────────────
+# Ключ в record.analysis, под которым лежит прогресс уже отработавших стадий.
+# Позволяет авторетраю продолжить с текущего состояния строки БЕЗ повторного
+# прожига завершённых LLM-стадий (раньше retry всегда начинал с stage_analyze
+# и умирал на невалидном FACTS_COLLECTED→INVESTIGATING переходе). Ключ
+# зачищается в _persist по успешному завершению прогона.
+_CHECKPOINT_KEY = "pipeline_checkpoint"
+
+# Какие стадии уже завершены для данного состояния строки. Стадия считается
+# завершённой ровно тогда, когда её state-transition закоммичен.
+_COMPLETED_BY_STATE: Dict[IncidentState, frozenset] = {
+    IncidentState.OPEN: frozenset(),
+    IncidentState.INVESTIGATING: frozenset({"analyze"}),
+    IncidentState.FACTS_COLLECTED: frozenset({"analyze", "diagnose"}),
+    IncidentState.HYPOTHESIS_GENERATED: frozenset(
+        {"analyze", "diagnose", "hypothesize", "critique"}
+    ),
+    IncidentState.FIX_PROPOSED: frozenset(
+        {"analyze", "diagnose", "hypothesize", "critique", "jira", "fix"}
+    ),
+}
+
 
 def _current_state(record) -> IncidentState:
     raw = record.status or ""
@@ -110,8 +166,34 @@ def _current_state(record) -> IncidentState:
         return _LEGACY_STATUS_ALIAS.get(raw, IncidentState.OPEN)
 
 
+# Линейный порядок «конвейерных» состояний — для re-entry-толерантности
+# transition_to. Celery-ретрай после transient-сбоя может повторно проходить
+# стадию, чей переход уже был закоммичен предыдущей попыткой (resume-fallback,
+# см. run()): вход в уже пройденное состояние — no-op, а не ValueError.
+# Терминальные и approval-состояния (RESOLVED/TRIAGE_REQUIRED/FAILED/
+# APPROVAL_PENDING/EXECUTING) в порядок намеренно НЕ входят — для них
+# правила StateMachine прежние, строгие.
+_PIPELINE_STATE_ORDER: Dict[IncidentState, int] = {
+    IncidentState.OPEN: 0,
+    IncidentState.INVESTIGATING: 1,
+    IncidentState.FACTS_COLLECTED: 2,
+    IncidentState.HYPOTHESIS_GENERATED: 3,
+    IncidentState.FIX_PROPOSED: 4,
+}
+
+
 def transition_to(record, new_state: IncidentState, db) -> None:
     current = _current_state(record)
+    if current == new_state:
+        # Идемпотентный re-entry: переход уже применён предыдущей попыткой.
+        return
+    cur_order = _PIPELINE_STATE_ORDER.get(current)
+    new_order = _PIPELINE_STATE_ORDER.get(new_state)
+    if cur_order is not None and new_order is not None and new_order < cur_order:
+        # Resume после Celery-ретрая: состояние строки уже уехало вперёд, а
+        # стадия перезапускается заново. Откатывать статус назад нельзя
+        # (backward-переходов в StateMachine нет намеренно) — no-op.
+        return
     if not StateMachine.validate_transition(current, new_state):
         raise ValueError(
             f"Invalid state transition: {current.value} → {new_state.value}"
@@ -195,9 +277,159 @@ class IncidentPipeline:
     def _safe_transition(self, new_state: IncidentState, stage_trace: Optional[dict] = None) -> None:
         if self.record is None:
             return
+        current = _current_state(self.record)
+        if (
+            current in (IncidentState.RESOLVED, IncidentState.TRIAGE_REQUIRED)
+            and current != new_state
+        ):
+            # Resolve-webhook перевёл строку в терминал, пока pipeline был в
+            # полёте. Не давимся невалидным переходом — сигналим run()-у
+            # остановиться чисто (см. IncidentResolvedExternally).
+            raise IncidentResolvedExternally(
+                f"incident {self.incident_id} is already {current.value}; "
+                f"refusing transition to {new_state.value}"
+            )
+        if new_state in _PIPELINE_STATE_ORDER:
+            # Checkpoint пишется в той же транзакции, что и state-transition:
+            # состояние строки и сохранённый прогресс не могут разъехаться.
+            self._save_checkpoint()
         transition_to(self.record, new_state, self.db)
         if stage_trace is not None:
             stage_trace["state_after"] = new_state.value
+
+    # ------------------------------------------------------------------
+    # Checkpoint: сохранение/восстановление прогресса для Celery-ретрая
+    # ------------------------------------------------------------------
+
+    def _save_checkpoint(self) -> None:
+        """Сложить in-memory прогресс стадий в record.analysis[_CHECKPOINT_KEY].
+
+        Best-effort: сбой сериализации не должен валить pipeline. Commit
+        не делаем — его выполняет transition_to сразу после вызова.
+        """
+        if self.record is None:
+            return
+        try:
+            cp: Dict[str, Any] = {
+                "summary": self.analysis,
+                "teamcity_context": (
+                    self.incident.teamcity_context if self.incident else None
+                ),
+                "cluster_health_context": self.cluster_health_context,
+                "gitlab_context": self.gitlab_context,
+                "blast_radius_context": self.blast_radius_context,
+                "statics_check_context": self.statics_check_context,
+                "deploy_correlation": self.deploy_correlation,
+                "team_owner": self.team_owner,
+                "facts": (
+                    self.fact_store.to_dict()["facts"]
+                    if self.fact_store is not None
+                    else None
+                ),
+                "similar_past": self.similar_past,
+                "is_recurrence": self.is_recurrence,
+                "hypotheses_text": self.hypotheses_text,
+                "final_cause": self.final_cause,
+                "critiqued": (
+                    [h.model_dump() for h in self.critiqued.items]
+                    if self.critiqued is not None
+                    else None
+                ),
+                "best": self.best.model_dump() if self.best is not None else None,
+                "jira_context": self.jira_context,
+                "fix_suggestion": self.fix_suggestion,
+                "execution_intent": (
+                    self.execution_intent.model_dump(mode="json")
+                    if self.execution_intent is not None
+                    else None
+                ),
+                "traces": self.traces,
+            }
+            self.record.analysis = {
+                **(self.record.analysis or {}),
+                _CHECKPOINT_KEY: cp,
+            }
+        except Exception as e:
+            logger.warning(
+                "pipeline.checkpoint_save_failed",
+                incident_id=self.incident_id,
+                error=str(e),
+            )
+
+    def _restore_checkpoint(self, completed: frozenset) -> bool:
+        """Восстановить прогресс из checkpoint-а для resume после ретрая.
+
+        Возвращает False если checkpoint отсутствует/непригоден для стадий из
+        `completed` — тогда run() деградирует в полный перезапуск (transition_to
+        толерантен к re-entry, так что повторные стадии не падают).
+        """
+        if self.record is None:
+            return False
+        analysis = self.record.analysis
+        cp = analysis.get(_CHECKPOINT_KEY) if isinstance(analysis, dict) else None
+        if not isinstance(cp, dict):
+            return False
+        try:
+            if "analyze" in completed:
+                if cp.get("summary") is None:
+                    return False
+                self.analysis = cp["summary"]
+            if "diagnose" in completed:
+                facts_raw = cp.get("facts")
+                if facts_raw is None:
+                    return False
+                self.fact_store = FactStore([Fact(**f) for f in facts_raw])
+                self.cluster_health_context = cp.get("cluster_health_context")
+                self.gitlab_context = cp.get("gitlab_context")
+                self.blast_radius_context = cp.get("blast_radius_context")
+                self.statics_check_context = cp.get("statics_check_context")
+                self.deploy_correlation = cp.get("deploy_correlation")
+                self.team_owner = cp.get("team_owner")
+                if self.incident is not None and self.incident.teamcity_context is None:
+                    self.incident.teamcity_context = cp.get("teamcity_context")
+            if "critique" in completed:
+                crit_raw = cp.get("critiqued")
+                if crit_raw is None or not cp.get("final_cause"):
+                    return False
+                self.critiqued = HypothesisSet(
+                    items=[Hypothesis.model_validate(h) for h in crit_raw]
+                )
+                self._hypothesis_set = self.critiqued
+                best_raw = cp.get("best")
+                self.best = (
+                    Hypothesis.model_validate(best_raw) if best_raw else None
+                )
+                self.final_cause = cp.get("final_cause") or ""
+                self.hypotheses_text = cp.get("hypotheses_text") or ""
+                self.similar_past = cp.get("similar_past") or []
+                self.is_recurrence = bool(cp.get("is_recurrence"))
+            if "fix" in completed:
+                self.jira_context = cp.get("jira_context")
+                self.fix_suggestion = cp.get("fix_suggestion")
+                intent_raw = cp.get("execution_intent")
+                self.execution_intent = (
+                    ExecutionIntent.model_validate(intent_raw)
+                    if intent_raw
+                    else None
+                )
+            prior_traces = cp.get("traces")
+            if isinstance(prior_traces, list):
+                self.traces = list(prior_traces)
+            audit_service.log_event(
+                "PIPELINE_RESUMED_FROM_CHECKPOINT",
+                {
+                    "incident_id": self.incident_id,
+                    "completed_stages": sorted(completed),
+                },
+            )
+            return True
+        except Exception as e:
+            logger.warning(
+                "pipeline.checkpoint_restore_failed",
+                incident_id=self.incident_id,
+                error=str(e),
+            )
+            return False
 
     # ------------------------------------------------------------------
     # Stage 0 — Knowledge Graph population (best-effort)
@@ -645,8 +877,9 @@ class IncidentPipeline:
 
         if self.traces:
             self.traces[-1]["state_after"] = IncidentState.HYPOTHESIS_GENERATED.value
-        if self.record is not None:
-            transition_to(self.record, IncidentState.HYPOTHESIS_GENERATED, self.db)
+        # _safe_transition (а не голый transition_to): ловит внешний resolve
+        # и пишет checkpoint в той же транзакции.
+        self._safe_transition(IncidentState.HYPOTHESIS_GENERATED)
 
     # ------------------------------------------------------------------
     # Stage 5 — Jira enrichment (best-effort)
@@ -765,7 +998,9 @@ class IncidentPipeline:
                     "stderr": (result.get("stderr") or "")[:2048],
                     "exit_code": None if "exit_code" not in result else int(result.get("exit_code") or 0),
                 }
-                if result.get("error", "").startswith("GUARDRAIL_BLOCK"):
+                # `error` может присутствовать со значением None —
+                # get(..., "") в этом случае вернул бы None и уронил startswith.
+                if (result.get("error") or "").startswith("GUARDRAIL_BLOCK"):
                     self.executor_result["status"] = "guardrail_blocked"
                     self.executor_result["reason"] = result["error"]
             except Exception as e:
@@ -820,7 +1055,12 @@ class IncidentPipeline:
                 track_fact_conflict(a.kind, b.kind)
 
         if record:
-            record.analysis = {
+            # МЕРЖ, а не замена: analysis-блоб хранит и данные ВНЕ этого прогона
+            # — в первую очередь executor_applied (единственный guard от
+            # повторного реального kubectl в executor_apply.py). Полная замена
+            # блоба при re-fire стирала маркер, и старая Discord-кнопка могла
+            # прогнать вторую реальную мутацию.
+            fresh_analysis = {
                 "summary": self.analysis,
                 "hypotheses": self.hypotheses_text,
                 "cause": self.best.cause if self.best else None,
@@ -853,6 +1093,12 @@ class IncidentPipeline:
                 ),
                 "executor_result": self.executor_result,
             }
+            merged_analysis = {**(record.analysis or {}), **fresh_analysis}
+            # Служебные ключи прошлых попыток зачищаем: прогон завершён.
+            # executor_applied и прочая apply-provenance переживают мерж.
+            for stale_key in (_CHECKPOINT_KEY, "failed", "resolved_early"):
+                merged_analysis.pop(stale_key, None)
+            record.analysis = merged_analysis
             # Если ни одна гипотеза не пережила critique (self.best is None,
             # resolution_quality=="unresolved") — инцидент НЕ разрешён, уводим
             # его в TRIAGE_REQUIRED вместо RESOLVED. Это прекращает помечать
@@ -913,8 +1159,12 @@ class IncidentPipeline:
         """Wave 3 #13: посчитать сколько раз alertname сработал за 24h/7d.
 
         Берём из kg_alerts: fired_at в окне OR resolved_at в окне (alert мог
-        начаться раньше, разрешиться внутри). Best-effort: при любой ошибке
-        оставляем 0.
+        начаться раньше, разрешиться внутри). Счёт скоупится к namespace
+        (и сервису, если известен) ЭТОГО инцидента — иначе «×N in 24h» для
+        cluster-wide алёртов типа KubePodCrashLooping суммировал каждый
+        сервис кластера. Node-алёрты без namespace остаются cluster-wide
+        (для них это и есть корректный скоуп). Best-effort: при любой
+        ошибке оставляем 0.
         """
         try:
             from datetime import datetime as _dt, timedelta as _td
@@ -927,6 +1177,16 @@ class IncidentPipeline:
             cutoff_24h = now - _td(hours=24)
             cutoff_7d = now - _td(days=7)
             base = self.db.query(AlertEvent).filter(AlertEvent.alertname == alertname)
+            namespace = self.incident.namespace if self.incident else None
+            labels = (self.incident.labels or {}) if self.incident else {}
+            service_name = labels.get("service") or labels.get("app")
+            if namespace:
+                # kg_alerts не хранит namespace напрямую — джойним kg_services.
+                base = base.join(
+                    Service, AlertEvent.service_id == Service.id
+                ).filter(Service.namespace == namespace)
+                if service_name:
+                    base = base.filter(Service.name == service_name)
             cnt_24h = base.filter(
                 or_(
                     AlertEvent.fired_at >= cutoff_24h,
@@ -973,21 +1233,156 @@ class IncidentPipeline:
             return
 
     # ------------------------------------------------------------------
+    # Suppressed-noise short-circuit + resolved-externally handling
+    # ------------------------------------------------------------------
+
+    def _noise_suppressed(self) -> bool:
+        """True если alert был подавлен как rollout-noise в stage_diagnose."""
+        if not getattr(settings, "SUPPRESSED_ALERT_SHORT_CIRCUIT", True):
+            return False
+        if self.incident is None:
+            return False
+        return (self.incident.labels or {}).get("suppress_reason") == "active_rollout"
+
+    async def _finalize_suppressed(self) -> None:
+        """Дешёвое завершение для suppressed-alert-а.
+
+        Без hypothesis fan-out, per-hypothesis critic, fix/risk/synthesis и
+        Discord: этот класс шума (например KubeDeploymentGenerationMismatch,
+        131×/неделю) уже признан noise, но раньше всё равно прожигал полный
+        LLM-бюджет. Инцидент фиксируется как RESOLVED с
+        resolution_quality="suppressed" — данные остаются для digest/аналитики.
+        """
+        labels = (self.incident.labels or {}) if self.incident else {}
+        audit_service.log_event(
+            "PIPELINE_SUPPRESSED_SHORT_CIRCUIT",
+            {
+                "incident_id": self.incident_id,
+                "alertname": labels.get("alertname", ""),
+                "suppress_reason": labels.get("suppress_reason"),
+                "original_severity": labels.get("original_severity"),
+            },
+        )
+        self.root_span.set_attribute("sre.incident.suppressed_noise", True)
+        track_resolution_quality("suppressed")
+        if self.record is None:
+            return
+        merged = {
+            **(self.record.analysis or {}),
+            "summary": self.analysis,
+            "resolution_quality": "suppressed",
+            "suppressed": {
+                "reason": labels.get("suppress_reason"),
+                "original_severity": labels.get("original_severity"),
+                "alertname": labels.get("alertname", ""),
+            },
+            "facts": (
+                self.fact_store.to_dict()["facts"]
+                if self.fact_store is not None
+                else []
+            ),
+        }
+        merged.pop(_CHECKPOINT_KEY, None)
+        self.record.analysis = merged
+        self.record.trace = self.traces
+        # FACTS_COLLECTED → RESOLVED — легальный short-circuit-переход
+        # (см. state_machine.py).
+        self._safe_transition(IncidentState.RESOLVED)
+        self.db.commit()
+
+    def _record_resolved_early(self, reason: str, state: IncidentState) -> None:
+        """Инцидент закрыли извне (resolve-webhook), пока pipeline был в полёте.
+
+        Останавливаемся чисто: фиксируем resolved_early-маркер в analysis
+        вместо мусорного «Invalid state transition» в analysis.failed и
+        не трогаем терминальный статус строки.
+        """
+        audit_service.log_event(
+            "PIPELINE_HALTED_RESOLVED_EXTERNALLY",
+            {
+                "incident_id": self.incident_id,
+                "state": state.value,
+                "reason": reason,
+            },
+        )
+        if self.record is None:
+            return
+        try:
+            merged = {**(self.record.analysis or {})}
+            merged.pop(_CHECKPOINT_KEY, None)
+            merged["resolved_early"] = {
+                "reason": reason,
+                "state": state.value,
+                "note": (
+                    "alert resolved while pipeline was in flight; "
+                    "analysis stopped cleanly"
+                ),
+            }
+            self.record.analysis = merged
+            self.record.trace = self.traces
+            self.db.commit()
+        except Exception:
+            self.db.rollback()
+
+    # ------------------------------------------------------------------
     # Orchestrator
     # ------------------------------------------------------------------
 
     async def run(self) -> None:
         self.incident = Incident(**self.incident_data)
-        # _populate_kg — best-effort, оставляем без timeout-обёртки.
-        await self._populate_kg()
-        # LLM/enrichment-стадии — под per-stage timeout (_STAGE_TIMEOUT).
-        # TimeoutError пробрасывается → вызывающий код переводит в FAILED.
-        await _staged(self.stage_analyze())
-        await _staged(self.stage_diagnose())
-        await _staged(self.stage_hypothesize())
-        await _staged(self.stage_critique())
-        await _staged(self.stage_jira_enrich())
-        await _staged(self.stage_fix())
-        await _staged(self.stage_risk())
-        await _staged(self.stage_executor())
-        await _staged(self.stage_synthesize())
+
+        start_state = (
+            _current_state(self.record)
+            if self.record is not None
+            else IncidentState.OPEN
+        )
+        if start_state in (IncidentState.RESOLVED, IncidentState.TRIAGE_REQUIRED):
+            # Resolve-webhook закрыл инцидент до старта pipeline-а.
+            self._record_resolved_early(
+                reason="terminal_before_start", state=start_state
+            )
+            return
+
+        # Resume после Celery-ретрая: строка уже в промежуточном состоянии,
+        # завершённые стадии пропускаем, их вывод берём из checkpoint-а —
+        # без повторного прожига LLM и без невалидных «backward»-переходов.
+        completed: frozenset = _COMPLETED_BY_STATE.get(start_state, frozenset())
+        if completed and not self._restore_checkpoint(completed):
+            # Checkpoint утерян/непригоден — деградируем в полный перезапуск.
+            # transition_to толерантен к re-entry (см. _PIPELINE_STATE_ORDER),
+            # так что повторные стадии не упадут на «Invalid transition».
+            completed = frozenset()
+
+        try:
+            if not completed:
+                # KG-population — только на первом прогоне: повторная запись
+                # на resume — лишний side effect. Best-effort, без timeout.
+                await self._populate_kg()
+            # LLM/enrichment-стадии — под per-stage timeout (_STAGE_TIMEOUT).
+            # PipelineStageTimeout пробрасывается → вызывающий код переводит
+            # инцидент в FAILED (без Celery-ретрая — cap намеренный).
+            if "analyze" not in completed:
+                await _staged(self.stage_analyze(), "analyze")
+            if "diagnose" not in completed:
+                await _staged(self.stage_diagnose(), "diagnose")
+            if self._noise_suppressed():
+                # Rollout-noise: severity уже демотирована в stage_diagnose —
+                # дальнейшие LLM-стадии не запускаем (short-circuit).
+                await self._finalize_suppressed()
+                return
+            if "hypothesize" not in completed:
+                await _staged(self.stage_hypothesize(), "hypothesize")
+            if "critique" not in completed:
+                await _staged(self.stage_critique(), "critique")
+            if "jira" not in completed:
+                await _staged(self.stage_jira_enrich(), "jira_enrich")
+            if "fix" not in completed:
+                await _staged(self.stage_fix(), "fix")
+            await _staged(self.stage_risk(), "risk")
+            await _staged(self.stage_executor(), "executor")
+            await _staged(self.stage_synthesize(), "synthesize")
+        except IncidentResolvedExternally:
+            self._record_resolved_early(
+                reason="resolved_mid_flight", state=IncidentState.RESOLVED
+            )
+            return

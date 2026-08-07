@@ -23,12 +23,15 @@ executor-пути для уже-утверждённого человеком п
 """
 from __future__ import annotations
 
+import re
+from dataclasses import replace
 from typing import Any, Dict
 
 from app.core.execution_dsl import ActionType, ExecutionIntent
 from app.remediation.playbook import Playbook
 from app.remediation.policy import PolicyDecision, PolicyMode, evaluate_policy
-from app.remediation.risk_axes import compute_risk_axes
+from app.remediation.risk_axes import (Confidence, DataPlane, Reversibility,
+                                       RiskAxes, compute_risk_axes)
 
 __all__ = ["evaluate_intent_gate", "PolicyDecision", "PolicyMode"]
 
@@ -75,12 +78,37 @@ _EXECUTOR_GATE_POLICY: Playbook = Playbook.model_validate(
 )
 
 
+# Маркеры data-plane-нагрузок в ИМЕНИ ресурса. У прямого ExecutionIntent нет
+# labels/owner-а (LLM их не выдаёт, TargetRef-резолва на apply-пути нет),
+# поэтому единственный доступный сигнал data-plane — само имя. Матч по
+# токенам (split по -._), startswith покрывает postgresql/mongodb/…
+_DATA_PLANE_NAME_MARKERS: tuple = (
+    "db", "postgres", "pg", "mysql", "mariadb", "mongo", "redis",
+    "clickhouse", "kafka", "rabbitmq", "nats", "minio", "elastic",
+    "etcd", "zookeeper", "cassandra", "seq",
+)
+
+_NAME_TOKEN_RE = re.compile(r"[-._]")
+
+
+def _looks_data_plane(name: str) -> bool:
+    """True если имя ресурса похоже на stateful/data-plane нагрузку."""
+    tokens = _NAME_TOKEN_RE.split((name or "").lower())
+    return any(
+        t == m or t.startswith(m)
+        for t in tokens if t
+        for m in _DATA_PLANE_NAME_MARKERS
+    )
+
+
 def _intent_to_target(intent: ExecutionIntent) -> Dict[str, Any]:
     """Спроецировать ExecutionIntent в target-dict для compute_risk_axes."""
     target: Dict[str, Any] = {
         "kind": intent.resource_type,
         "namespace": intent.namespace,
         "name": intent.resource_name,
+        # labels/owner_kind у intent-а недоступны — оси, которые от них
+        # зависят, ужесточаются fail-closed в _apply_fail_closed_axes ниже.
         "labels": {},
         "resolved_via": [],
     }
@@ -90,14 +118,61 @@ def _intent_to_target(intent: ExecutionIntent) -> Dict[str, Any]:
     return target
 
 
+def _apply_fail_closed_axes(axes: RiskAxes, intent: ExecutionIntent) -> RiskAxes:
+    """Ужесточить оси, для которых у прямого intent-а нет полного сигнала.
+
+    compute_risk_axes спроектирован под TargetRef c labels/owner_kind/
+    resolved_via; у ExecutionIntent их нет, и без коррекции оси data_plane/
+    reversibility/confidence вырождались в no/partial/medium — то есть
+    НИКОГДА не срабатывали в block.any (`kubectl scale deployment/postgres`
+    проходил как safe). Правило: неизвестный сигнал = риск, не «нет риска».
+    """
+    data_plane = axes.data_plane
+    reversibility = axes.reversibility
+    confidence = axes.confidence
+
+    # 1) data_plane: имя похоже на stateful-нагрузку → YES (block.any).
+    #    Иначе labels/owner недоступны → «не data-plane» недоказуемо → MAYBE
+    #    (риск учтён, но в dev/squad человек уже одобрил — approve допускает).
+    if _looks_data_plane(intent.resource_name):
+        data_plane = DataPlane.YES
+    elif data_plane == DataPlane.NO:
+        data_plane = DataPlane.MAYBE
+
+    # 2) reversibility: рестарт/скейл data-plane-нагрузки может терять данные
+    #    или кворум, а прежний replica-count нигде не записан → HARD.
+    if data_plane == DataPlane.YES:
+        reversibility = Reversibility.HARD
+
+    # 3) confidence: внутренне противоречивый intent (LLM перепутал поля) —
+    #    action оперирует deployment-ом, а resource_type другой; или scale
+    #    без валидного replicas. Такое = слабая уверенность → WEAK (block.any).
+    if intent.action in (ActionType.RESTART_DEPLOYMENT, ActionType.SCALE_DEPLOYMENT):
+        if intent.resource_type.lower() != "deployment":
+            confidence = Confidence.WEAK
+    if intent.action == ActionType.SCALE_DEPLOYMENT:
+        replicas = intent.params.get("replicas")
+        if isinstance(replicas, bool) or not isinstance(replicas, int):
+            confidence = Confidence.WEAK
+
+    return replace(
+        axes,
+        data_plane=data_plane,
+        reversibility=reversibility,
+        confidence=confidence,
+    )
+
+
 def evaluate_intent_gate(intent: ExecutionIntent) -> PolicyDecision:
     """Детерминированно оценить ExecutionIntent против executor safety-policy.
 
     Возвращает `PolicyDecision`; `mode == PolicyMode.BLOCK` → реальный apply
     запрещён. Не зависит от LLM-`risk` поля intent-а — namespace/kind/replicas
-    берутся из структурного intent-а.
+    берутся из структурного intent-а; недоступные сигналы трактуются
+    fail-closed (см. _apply_fail_closed_axes).
     """
     target = _intent_to_target(intent)
     hint = {"command_kind": _COMMAND_KIND.get(intent.action, "unknown")}
     axes = compute_risk_axes(target, classification_signals=None, playbook_hint=hint)
+    axes = _apply_fail_closed_axes(axes, intent)
     return evaluate_policy(_EXECUTOR_GATE_POLICY, axes, target=target)

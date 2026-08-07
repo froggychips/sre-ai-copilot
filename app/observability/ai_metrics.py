@@ -247,7 +247,11 @@ def track_fact_conflict(kind_a: str, kind_b: str) -> None:
 
 
 def track_resolution_quality(quality: str) -> None:
-    """quality ∈ {"resolved", "unresolved", "wrong_apply", "error"}."""
+    """quality ∈ {"resolved", "unresolved", "suppressed", "wrong_apply", "error"}.
+
+    "suppressed" — rollout-noise short-circuit: LLM-стадии пропущены,
+    инцидент закрыт как шум (см. pipeline._finalize_suppressed).
+    """
     PIPELINE_RESOLUTION_QUALITY.labels(quality=quality).inc()
 
 

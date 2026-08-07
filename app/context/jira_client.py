@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import base64
 import logging
+import re
 from typing import Any, Dict, List, Optional
 
 from app.services.resilience import with_external_retry
@@ -27,6 +28,23 @@ logger = logging.getLogger(__name__)
 # statusCategory.key → canonical open/resolved
 _STATUS_OPEN = {"new", "indeterminate"}
 _STATUS_RESOLVED = {"done"}
+
+# Управляющие символы (включая \n / \x00) в подставляемом значении — мусор
+# или попытка обфускации; вырезаем ДО экранирования.
+_JQL_CONTROL_CHARS = re.compile(r"[\x00-\x1f\x7f]")
+
+
+def _jql_quote(value: str) -> str:
+    """Экранирует значение для подстановки внутрь двойных кавычек JQL.
+
+    Без этого alert-label вида `x" OR project = "FINANCE` разрывал
+    конъюнкцию project/labels и утаскивал тикеты чужих Jira-проектов в
+    Discord-embed (JQL-инъекция через label `service`). Экранируем `\\`
+    и `"`, режем control-символы. Используется ОБОИМИ search-методами
+    (async и sync) — не собирать JQL мимо этого хелпера.
+    """
+    cleaned = _JQL_CONTROL_CHARS.sub("", value or "")
+    return cleaned.replace("\\", "\\\\").replace('"', '\\"')
 
 
 def _jira_status(status_category_key: str) -> str:
@@ -80,10 +98,10 @@ class JiraClient:
             created      str   — ISO datetime
         """
         jql_parts = [
-            f'project = "{self._project}"',
-            f'labels = "{self._label}"',
-            f'summary ~ "{service}"',
-            f'created >= "-{days}d"',
+            f'project = "{_jql_quote(self._project)}"',
+            f'labels = "{_jql_quote(self._label)}"',
+            f'summary ~ "{_jql_quote(service)}"',
+            f'created >= "-{int(days)}d"',
         ]
         jql = " AND ".join(jql_parts) + " ORDER BY created DESC"
 
@@ -135,10 +153,10 @@ class JiraClient:
         (синхронный SQLAlchemy context). Та же JQL что в async-методе.
         """
         jql_parts = [
-            f'project = "{self._project}"',
-            f'labels = "{self._label}"',
-            f'summary ~ "{service}"',
-            f'created >= "-{days}d"',
+            f'project = "{_jql_quote(self._project)}"',
+            f'labels = "{_jql_quote(self._label)}"',
+            f'summary ~ "{_jql_quote(service)}"',
+            f'created >= "-{int(days)}d"',
         ]
         jql = " AND ".join(jql_parts) + " ORDER BY created DESC"
         payload = {

@@ -15,18 +15,31 @@
   2. Проверяет eligibility:
        - запись существует
        - executor_applied отсутствует (идемпотентность)
+       - нет свежего executor_in_flight-клейма (двухфазный apply, см. ниже)
        - execution_intent распарсен
        - expected_signature ОБЯЗАТЕЛЕН и совпадает с compute_signature(intent)
          (TOCTOU: intent в БД == тому, что видел оператор)
        - в kg_action_approvals есть терминальный APPROVED для (incident_id,
          signature) — независимая проверка одобрения человеком (H1)
+       - approval СВЕЖИЙ: decided_at не старше EXECUTOR_APPROVAL_MAX_AGE_SECONDS
+         (часовой давности апрув не должен авторизовывать повторный kubectl
+         после re-fire, который стёр executor_applied)
+       - intent.namespace == namespace инцидента из record.data (server-side
+         binding: галлюцинированный/инжектированный intent не может действовать
+         в чужом namespace)
        - risk in {"low", "medium"} (advisory LLM-hint)
        - ДЕТЕРМИНИРОВАННЫЙ policy-gate (evaluate_intent_gate) != BLOCK —
          пересчёт риска из самого intent-а, не из LLM-`risk` (см. executor_gate)
        - executor_result.status == "dry_run_ok"
-  3. Вызывает k8s_service.execute_intent(intent, dry_run=False, post_approval=True).
-  4. Записывает результат в record.analysis.executor_applied с timestamp + user.
-  5. Audit-event EXECUTOR_APPLIED (или EXECUTOR_APPLY_REFUSED при отказе).
+  3. Двухфазный claim: ПЕРЕД kubectl пишет и КОММИТИТ analysis.executor_in_flight
+     (timestamp + user). Краш/таймаут между мутацией кластера и записью
+     executor_applied больше не оставляет живую кнопку: свежий claim = отказ
+     apply_in_flight; протухший (EXECUTOR_IN_FLIGHT_TTL_SECONDS) — можно
+     переклеймить.
+  4. Вызывает k8s_service.execute_intent(intent, dry_run=False, post_approval=True).
+  5. Записывает результат в record.analysis.executor_applied (claim снимается)
+     с timestamp + user.
+  6. Audit-event EXECUTOR_APPLIED (или EXECUTOR_APPLY_REFUSED при отказе).
 """
 from __future__ import annotations
 
@@ -36,6 +49,7 @@ from typing import Any, Dict, Optional
 import structlog
 from sqlalchemy.orm.attributes import flag_modified
 
+from app.config import settings
 from app.core.execution_dsl import ExecutionIntent
 from app.database import IncidentRecord, SessionLocal
 from app.observability.ai_metrics import track_executor_applied
@@ -45,6 +59,55 @@ from app.services.k8s_service import k8s_service
 log = structlog.get_logger()
 
 _ELIGIBLE_RISKS = {"low", "medium"}
+
+
+def _utcnow_naive() -> datetime:
+    """Naive-UTC now — тот же формат, что у ActionApproval.decided_at."""
+    return datetime.now(timezone.utc).replace(tzinfo=None)
+
+
+def _approval_is_stale(approval: Any, max_age_sec: int) -> bool:
+    """True если approve старше окна (или decided_at отсутствует/битый).
+
+    Fail-closed: недатированный approve не может авторизовать write.
+    """
+    decided_at = getattr(approval, "decided_at", None)
+    if not isinstance(decided_at, datetime):
+        return True
+    if decided_at.tzinfo is not None:
+        decided_at = decided_at.astimezone(timezone.utc).replace(tzinfo=None)
+    return (_utcnow_naive() - decided_at).total_seconds() > max_age_sec
+
+
+def _in_flight_is_fresh(entry: Dict[str, Any], ttl_sec: int) -> bool:
+    """True если executor_in_flight-клейм ещё живой (отказ apply).
+
+    Битый/непарсящийся claimed_at → считаем свежим (fail-closed): пока TTL
+    определить нельзя, повторный kubectl запрещён.
+    """
+    raw = entry.get("claimed_at")
+    try:
+        claimed_at = datetime.fromisoformat(str(raw))
+    except (TypeError, ValueError):
+        return True
+    if claimed_at.tzinfo is None:
+        claimed_at = claimed_at.replace(tzinfo=timezone.utc)
+    age = (datetime.now(timezone.utc) - claimed_at).total_seconds()
+    return age <= ttl_sec
+
+
+def _incident_namespace(record: Any) -> Optional[str]:
+    """Namespace инцидента из сохранённого alert-payload (record.data).
+
+    Основной источник — incident.namespace; fallback — labels.namespace.
+    """
+    data = record.data if isinstance(record.data, dict) else {}
+    ns = data.get("namespace")
+    if not ns:
+        labels = data.get("labels")
+        if isinstance(labels, dict):
+            ns = labels.get("namespace")
+    return str(ns).strip().lower() if ns else None
 
 
 def _refuse(incident_id: str, reason: str, applied_by: str) -> Dict[str, Any]:
@@ -107,6 +170,23 @@ def apply_intent(
             log.info("executor_apply.already_applied", incident_id=incident_id)
             return {"ok": False, "reason": "already_applied"}
 
+        # ── Двухфазный claim: apply уже стартовал (и мог мутировать кластер,
+        # не успев записать executor_applied — краш/таймаут в окне между
+        # kubectl и commit)? Свежий claim = отказ. Протухший (kubectl-таймаут
+        # 30s << TTL) — переклеймим ниже.
+        in_flight = analysis.get("executor_in_flight")
+        in_flight_ttl = int(
+            getattr(settings, "EXECUTOR_IN_FLIGHT_TTL_SECONDS", 600) or 600
+        )
+        if isinstance(in_flight, dict) and _in_flight_is_fresh(in_flight, in_flight_ttl):
+            return _refuse(incident_id, "apply_in_flight", applied_by)
+        if in_flight:
+            log.warning(
+                "executor_apply.stale_in_flight_reclaimed",
+                incident_id=incident_id,
+                stale_claim=in_flight,
+            )
+
         intent_data = analysis.get("execution_intent")
         if not intent_data:
             return _refuse(incident_id, "no_intent", applied_by)
@@ -135,6 +215,27 @@ def apply_intent(
         approval = _load_approval(db, incident_id, expected_signature)
         if approval is None or (approval.status or "").lower() != "approved":
             return _refuse(incident_id, "not_approved", applied_by)
+
+        # Freshness-binding: терминальный APPROVED без границы по возрасту +
+        # re-fire, стирающий executor_applied, = многочасовой approve
+        # авторизует ВТОРОЙ реальный kubectl. Окно настраивается;
+        # недатированный approve — отказ (см. _approval_is_stale).
+        approval_max_age = int(
+            getattr(settings, "EXECUTOR_APPROVAL_MAX_AGE_SECONDS", 3600) or 3600
+        )
+        if _approval_is_stale(approval, approval_max_age):
+            return _refuse(incident_id, "approval_stale", applied_by)
+
+        # ── Binding intent ↔ инцидент ──────────────────────────────────
+        # Intent генерирует LLM из обогащённого промпта (логи/алерты =
+        # untrusted input) — сверяем namespace intent-а с namespace самого
+        # инцидента из record.data. Легитимного cross-namespace кейса в
+        # кодовой базе нет → fail-closed.
+        incident_ns = _incident_namespace(record)
+        if not incident_ns:
+            return _refuse(incident_id, "namespace_unbound", applied_by)
+        if (intent.namespace or "").strip().lower() != incident_ns:
+            return _refuse(incident_id, "namespace_mismatch", applied_by)
 
         if intent.risk.lower() not in _ELIGIBLE_RISKS:
             return _refuse(incident_id, f"risk_too_high:{intent.risk}", applied_by)
@@ -172,10 +273,27 @@ def apply_intent(
             )
             return _refuse(incident_id, f"policy_block:{reason_code}", applied_by)
 
-        # ── Выполнение ─────────────────────────────────────────────────
+        # ── Фаза 1: claim ПЕРЕД kubectl ────────────────────────────────
+        # Мутация кластера и запись о ней раньше были в одной транзакции:
+        # краш/таймаут между execute_intent и commit оставлял кластер
+        # мутированным, а executor_applied — незаписанным → живая кнопка
+        # могла применить повторно. Коммитим claim ДО kubectl: любой
+        # конкурент/ретрай в окне выполнения видит свежий executor_in_flight
+        # и получает apply_in_flight. Commit также отпускает row-lock —
+        # дальше от гонок защищает сам claim.
+        analysis["executor_in_flight"] = {
+            "claimed_at": datetime.now(timezone.utc).isoformat(),
+            "claimed_by": applied_by,
+        }
+        record.analysis = analysis
+        # SQLAlchemy не видит in-place изменения внутри JSON Column без явного флага.
+        flag_modified(record, "analysis")
+        db.commit()
+
+        # ── Фаза 2: выполнение ─────────────────────────────────────────
         result = k8s_service.execute_intent(intent, dry_run=False, post_approval=True)
 
-        # ── Persist ────────────────────────────────────────────────────
+        # ── Финализация: persist результата, claim снимается ───────────
         applied_entry = {
             "applied_at": datetime.now(timezone.utc).isoformat(),
             "applied_by": applied_by,
@@ -190,8 +308,8 @@ def apply_intent(
             "policy_decision": gate_dict,
         }
         analysis["executor_applied"] = applied_entry
+        analysis.pop("executor_in_flight", None)
         record.analysis = analysis
-        # SQLAlchemy не видит in-place изменения внутри JSON Column без явного флага.
         flag_modified(record, "analysis")
         db.commit()
 
@@ -214,7 +332,10 @@ def apply_intent(
         )
         return {"ok": True, "result": result, "intent": intent_data}
     except Exception as e:
-        # Не должны падать наружу из апровал-хэндлера.
+        # Не должны падать наружу из апровал-хэндлера. NB: если исключение
+        # случилось ПОСЛЕ commit-а claim-а (фаза 2) — rollback его не снимает,
+        # это осознанно: состояние кластера неизвестно, повторный apply
+        # блокируется apply_in_flight до истечения EXECUTOR_IN_FLIGHT_TTL.
         log.error("executor_apply.exception", incident_id=incident_id, error=str(e))
         audit_service.log_event(
             "EXECUTOR_APPLY_EXCEPTION",

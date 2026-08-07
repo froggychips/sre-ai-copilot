@@ -182,7 +182,15 @@ def test_flat_baseline_penalty(db):
 
 
 def test_time_proximity_far_away(db):
-    """Δt=110min → time_proximity ≈ exp(-110/30) ≈ 0.025 → confidence ~0."""
+    """Δt=110min: время сильно ослабляет вердикт, но не обнуляет его.
+
+    Раньше τ=30 без пола давал exp(-110/30)≈0.025, и любой деплой дальше
+    ~10-27 минут не мог подняться выше `weak` даже при идеальных метриках —
+    вердикт вырождался в датчик близости по времени, хотя lookback заявлен 2ч.
+    Теперь τ=60 + пол 0.35: metric evidence доходит до вердикта на всём
+    lookback-е, но далёкий деплой всё ещё остаётся консервативным (`weak`)
+    и не дотягивает до suspect/likely.
+    """
     svc = _make_service(db)
     incident_ts = datetime(2026, 5, 23, 12, 0, 0)
     deploy_ts = incident_ts - timedelta(minutes=110)
@@ -197,11 +205,13 @@ def test_time_proximity_far_away(db):
     )
 
     res = correlate_deploy_to_incident(db, svc.id, incident_ts)
-    # time_proximity не выше 0.05.
-    assert res["scoring"]["time_proximity"] < 0.05
-    # confidence почти 0 → verdict unlikely.
-    assert res["confidence"] < 0.1
-    assert res["verdict"] == "unlikely"
+    # Время всё ещё заметно давит: сырой exp(-110/60) ≈ 0.16.
+    assert res["scoring"]["time_proximity"] < 0.25
+    # Но пол не даёт метрикам обнулиться — вклад времени остаётся ощутимым.
+    assert 0.35 <= res["scoring"]["time_factor"] < 0.55
+    # Итог остаётся консервативным: до suspect (0.4) далёкий деплой не дотягивает.
+    assert res["confidence"] < 0.4
+    assert res["verdict"] == "weak"
 
 
 def test_backward_compat_fields_present(db):

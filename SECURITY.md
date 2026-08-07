@@ -40,16 +40,18 @@ This is the highest-severity threat surface in this project.
 
 ## Sensitive Attack Surfaces
 
-### `POST /webhooks/alertmanager` — unauthenticated ingress
+### `POST /webhooks/alertmanager` — HMAC-authenticated ingress
 
-The alertmanager webhook endpoint accepts POST requests without authentication by default. Any party that can reach the endpoint can submit a synthetic alert payload with arbitrary labels and annotations.
+The alertmanager webhook endpoints (`/webhooks/alertmanager`, `/store`, `/enrich-and-forward`) require an HMAC-SHA256 signature (`X-Alertmanager-Signature`, keyed by `ALERTMANAGER_WEBHOOK_SECRET`) and **fail closed**: if no secret is configured, all requests are rejected with 401 in every environment. The only way to run without authentication is the explicit dev opt-out `ALERTMANAGER_ALLOW_UNAUTHENTICATED=true`, which logs a warning on every request. Never set it outside local development.
 
-Mitigations to consider:
-- Deploy behind a network policy or ingress that restricts the source to AlertManager only
-- Add HMAC signature verification matching AlertManager's webhook secret support
-- Validate that `labels.alertname` and `labels.namespace` match an allowlist before passing to the LLM
+Additional request validation:
+- Anti-replay: a valid signature is accepted once per `ALERTMANAGER_WEBHOOK_MAX_AGE_SECONDS` window (in-memory seen-signature cache). Optionally, a signing proxy can add `X-Alertmanager-Timestamp` (HMAC over `ts.body` + freshness window); `ALERTMANAGER_REQUIRE_SIGNED_TIMESTAMP=true` makes the timestamp mandatory.
+- Label validation: `alertname` is required; `namespace`, `instance`, `service`, and `app` are checked against conservative character sets before reaching JQL/KG/LLM paths.
+- Rate limiting: Redis-backed per-client-IP window (fail-open when Redis is down — authentication still applies).
 
-Current state: authentication is **not implemented** by default. This is the most critical gap.
+Known residual gaps (kept honest):
+- The seen-signature cache is per-process: with N api replicas, a captured request can be replayed once per replica within the freshness window. A shared Redis nonce store would close this fully.
+- HMAC authenticates the sender, not the alert content — a compromised AlertManager (or anyone holding the secret) can still submit synthetic labels/annotations. Network-level isolation (NetworkPolicy / ingress allowlist) remains a recommended defence-in-depth layer.
 
 ### `k8s_guard.py` — namespace tier enforcement
 
@@ -91,10 +93,11 @@ The database stores execution history and approval records. Exposure of `DATABAS
 
 ## Known Limitations
 
-- **Webhook is unauthenticated by default.** This is the most significant gap. Network-level isolation (K8s NetworkPolicy, ingress IP allowlist) is the primary compensating control until HMAC verification is added.
+- **Webhook HMAC protects transport, not content.** Signature verification is required by default (fail-closed; explicit `ALERTMANAGER_ALLOW_UNAUTHENTICATED=true` opt-out exists for local dev). Anyone holding the shared secret — including a compromised AlertManager — can still submit synthetic alert payloads. Network-level isolation (K8s NetworkPolicy, ingress IP allowlist) remains a recommended compensating control.
+- **Replay protection is per-replica.** The seen-signature cache is in-memory per process; a captured request replays at most once per api replica within the freshness window. Use the signed-timestamp mode (`ALERTMANAGER_REQUIRE_SIGNED_TIMESTAMP=true` behind a signing proxy) for stricter guarantees.
 - **Namespace guard is pattern-based.** Name-based classification can be fooled by creative naming. A defence-in-depth approach (e.g. namespace labels set by cluster-admin, not the namespace name) would be more robust.
 - **LLM output is not formally verified.** The `ExecutionIntent` schema validation catches structural errors but cannot prove the intent matches the operator's goal. Human approval is the last line of defence for destructive actions.
-- **No rate limiting on the webhook endpoint.** A flood of synthetic alerts could exhaust LLM API quota or create a backlog of pending approvals.
+- **Webhook rate limiting is fail-open.** The Redis-backed per-IP limiter passes requests through when Redis is unavailable (authentication still applies). A sustained flood from an authenticated source could still exhaust LLM API quota — `LLM_PIPELINE_ENABLED` and Celery rate limits are the backstop.
 
 ## Response SLA
 

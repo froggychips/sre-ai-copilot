@@ -32,8 +32,11 @@ spec:
           type: RuntimeDefault
       containers:
       - name: worker
+        # IMAGE_TAG_PLACEHOLDER подставляет deploy.sh (IMAGE_TAG=<git-sha>).
+        # CI публикует ТОЛЬКО :<git-sha> — тега :latest не существует.
         # Pin по digest в CI: image: ghcr.io/froggychips/sre-ai-copilot@sha256:<digest>
-        image: ghcr.io/froggychips/sre-ai-copilot:latest
+        image: ghcr.io/froggychips/sre-ai-copilot:IMAGE_TAG_PLACEHOLDER
+        imagePullPolicy: IfNotPresent
         command:
         - celery
         - -A
@@ -113,7 +116,10 @@ spec:
           type: RuntimeDefault
       containers:
       - name: beat
-        image: ghcr.io/froggychips/sre-ai-copilot:latest
+        # IMAGE_TAG_PLACEHOLDER подставляет deploy.sh (IMAGE_TAG=<git-sha>).
+        # CI публикует ТОЛЬКО :<git-sha> — тега :latest не существует.
+        image: ghcr.io/froggychips/sre-ai-copilot:IMAGE_TAG_PLACEHOLDER
+        imagePullPolicy: IfNotPresent
         command:
         - celery
         - -A
@@ -121,12 +127,18 @@ spec:
         - beat
         - --loglevel=info
         - --scheduler=celery.beat:PersistentScheduler
-        - --schedule=/tmp/celerybeat-schedule   # /tmp — единственный writable dir
+        # /tmp writable ТОЛЬКО потому, что ниже смонтирован emptyDir: при
+        # readOnlyRootFilesystem=true без volume beat падал на старте, не
+        # сумев создать schedule-файл (крашлуп вместо планировщика).
+        - --schedule=/tmp/celerybeat-schedule
         securityContext:
           readOnlyRootFilesystem: true
           allowPrivilegeEscalation: false
           capabilities:
             drop: ["ALL"]
+        volumeMounts:
+        - name: tmp
+          mountPath: /tmp
         envFrom:
         - secretRef:
             name: sre-ai-secrets
@@ -148,3 +160,8 @@ spec:
           requests:
             cpu: 50m
             memory: 128Mi
+      volumes:
+      # Writable /tmp под celerybeat-schedule (см. --schedule выше).
+      - name: tmp
+        emptyDir:
+          sizeLimit: 64Mi

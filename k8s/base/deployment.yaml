@@ -42,8 +42,13 @@ spec:
           type: RuntimeDefault
       containers:
       - name: api
+        # IMAGE_TAG_PLACEHOLDER подставляет deploy.sh (IMAGE_TAG=<git-sha>).
+        # CI публикует ТОЛЬКО :<git-sha> (см. .github/workflows/ci.yml) —
+        # тега :latest не существует, apply без подстановки = ImagePullBackOff.
         # Pin по digest в CI: image: ghcr.io/froggychips/sre-ai-copilot@sha256:<digest>
-        image: ghcr.io/froggychips/sre-ai-copilot:latest
+        image: ghcr.io/froggychips/sre-ai-copilot:IMAGE_TAG_PLACEHOLDER
+        # Теги immutable (git-sha) → IfNotPresent корректен и не дёргает registry.
+        imagePullPolicy: IfNotPresent
         ports:
         - containerPort: 8000
         securityContext:

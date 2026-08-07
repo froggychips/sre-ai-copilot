@@ -20,6 +20,7 @@ embed-структура — как `send_stats_report` (title + description + f
 """
 from __future__ import annotations
 
+import asyncio
 from collections import Counter
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
@@ -171,6 +172,8 @@ def _slo_burn_summary(
 
 def _top_stuck_alerts(
     db: Session, team_owner: str, limit: int = _TOP_STUCK,
+    *,
+    stuck_all: Optional[List[Dict[str, Any]]] = None,
 ) -> List[Dict[str, Any]]:
     """Top-N stuck alerts (firing >MIN_DURATION_HOURS) для команды.
 
@@ -178,10 +181,17 @@ def _top_stuck_alerts(
     тот же источник что hourly beat task, никакого double-source-of-truth.
     Сортировка — по hours_firing desc (свежий API из stuck_alerts
     возвращает поле напрямую).
+
+    `stuck_all` — уже загруженный ПОЛНЫЙ список stuck-alerts (все команды):
+    send_all_team_digests передаёт его, чтобы find_stuck_alerts (full scan
+    kg_alerts) выполнился ОДИН раз на весь beat-run, а не ~60 раз — по разу
+    на каждую команду. None → одиночный вызов сам делает запрос (прежнее
+    поведение для single-team пути и тестов).
     """
-    min_hours = settings.STUCK_ALERTS_MIN_DURATION_HOURS
-    stuck = find_stuck_alerts(db, min_duration_hours=min_hours)
-    filtered = [s for s in stuck if (s.get("team_owner") == team_owner)]
+    if stuck_all is None:
+        min_hours = settings.STUCK_ALERTS_MIN_DURATION_HOURS
+        stuck_all = find_stuck_alerts(db, min_duration_hours=min_hours)
+    filtered = [s for s in stuck_all if (s.get("team_owner") == team_owner)]
     filtered.sort(key=lambda s: s.get("hours_firing", 0.0), reverse=True)
     return filtered[:limit]
 
@@ -205,11 +215,16 @@ def _real_service_count(db: Session, team_owner: str) -> int:
 
 def build_team_digest(
     db: Session, team_owner: str, window_hours: int = 24,
+    *,
+    stuck_all: Optional[List[Dict[str, Any]]] = None,
 ) -> Dict[str, Any]:
     """Собирает все секции digest-а в плоский dict.
 
     Возвращаемый dict — стабильный контракт: используется и в
     `send_team_digest` (для рендера в Discord embed) и в тестах.
+
+    `stuck_all` — pre-fetched список stuck-alerts всех команд (см.
+    _top_stuck_alerts): устраняет N+1 full scan при обходе всех команд.
     """
     since_naive = (
         datetime.now(timezone.utc) - timedelta(hours=window_hours)
@@ -220,7 +235,7 @@ def build_team_digest(
     alerts = _alerts_breakdown(db, team_owner, since_naive)
     slo = _slo_burn_summary(db, team_owner, since_naive)
     svc_count = _real_service_count(db, team_owner)
-    stuck = _top_stuck_alerts(db, team_owner)
+    stuck = _top_stuck_alerts(db, team_owner, stuck_all=stuck_all)
 
     return {
         "team_owner": team_owner,
@@ -422,10 +437,72 @@ def _webhook_url_for_team(team_owner: str) -> Optional[str]:
     return settings.DISCORD_WEBHOOK_STATS_URL
 
 
+# Bounded-retry параметры для Discord 429 — те же значения, что у
+# rate-limit-aware пути в discord/service.py (_request_with_ratelimit):
+# максимум попыток + кап суммарного сна, чтобы злой Retry-After не подвесил
+# beat-task.
+_RATELIMIT_MAX_ATTEMPTS = 3
+_RATELIMIT_MAX_TOTAL_WAIT = 10.0
+_RATELIMIT_DEFAULT_WAIT = 1.0
+
+
+def _parse_retry_after(resp: httpx.Response) -> float:
+    """Сколько ждать до ретрая по Discord 429 (в секундах).
+
+    Приоритет: JSON body `retry_after` (Discord отдаёт float-секунды), затем
+    header `Retry-After`. При отсутствии/парс-ошибке — дефолт.
+    """
+    try:
+        body = resp.json()
+        if isinstance(body, dict) and body.get("retry_after") is not None:
+            val = float(body["retry_after"])
+            if val >= 0:
+                return val
+    except (ValueError, TypeError, AttributeError):
+        pass
+    try:
+        hdr = resp.headers.get("Retry-After")
+        if hdr is not None:
+            val = float(hdr)
+            if val >= 0:
+                return val
+    except (ValueError, TypeError, AttributeError):
+        pass
+    return _RATELIMIT_DEFAULT_WAIT
+
+
 async def _post_embed(url: str, embed: Dict[str, Any]) -> Tuple[bool, Optional[str]]:
+    """POST embed с bounded-retry на Discord 429.
+
+    Раньше любой status>=400 был терминальным: 429 в середине batch-рассылки
+    (60+ команд подряд в send_all_team_digests) молча ронял дайджесты всех
+    оставшихся команд — logged, never retried. Теперь на 429 читаем
+    Retry-After (JSON body / header), спим и повторяем тот же запрос; кап —
+    _RATELIMIT_MAX_ATTEMPTS попыток и _RATELIMIT_MAX_TOTAL_WAIT сек сна.
+    Прочие 4xx/5xx остаются терминальными (детерминированные ошибки).
+    """
     payload = {"embeds": [embed]}
     async with httpx.AsyncClient(timeout=10.0) as client:
         r = await client.post(url, json=payload)
+        attempts = 1
+        total_waited = 0.0
+        while (
+            r.status_code == 429
+            and attempts < _RATELIMIT_MAX_ATTEMPTS
+            and total_waited < _RATELIMIT_MAX_TOTAL_WAIT
+        ):
+            retry_after = _parse_retry_after(r)
+            wait = min(retry_after, _RATELIMIT_MAX_TOTAL_WAIT - total_waited)
+            if wait <= 0:
+                break
+            log.warning(
+                "team_digest.rate_limited",
+                retry_after=retry_after, attempt=attempts,
+            )
+            await asyncio.sleep(wait)
+            total_waited += wait
+            attempts += 1
+            r = await client.post(url, json=payload)
         if r.status_code >= 400:
             return False, f"status={r.status_code} body={r.text[:200]}"
         return True, None
@@ -435,10 +512,13 @@ async def send_team_digest(
     team_owner: str,
     window_hours: int = 24,
     db: Optional[Session] = None,
+    *,
+    stuck_all: Optional[List[Dict[str, Any]]] = None,
 ) -> Dict[str, Any]:
     """Собирает digest и шлёт в Discord. Возвращает status-dict.
 
     `db` — для DI в тестах. По умолчанию открываем SessionLocal и закрываем.
+    `stuck_all` — pre-fetched stuck-alerts всех команд (см. _top_stuck_alerts).
     """
     if not getattr(settings, "TEAM_DIGEST_ENABLED", False):
         return {"status": "skipped", "reason": "TEAM_DIGEST_ENABLED=false"}
@@ -448,7 +528,9 @@ async def send_team_digest(
         db = SessionLocal()
         owned_session = True
     try:
-        digest = build_team_digest(db, team_owner, window_hours=window_hours)
+        digest = build_team_digest(
+            db, team_owner, window_hours=window_hours, stuck_all=stuck_all,
+        )
     finally:
         if owned_session:
             db.close()
@@ -505,6 +587,20 @@ async def send_all_team_digests(window_hours: int = 24) -> Dict[str, Any]:
     db = SessionLocal()
     try:
         teams = _distinct_team_owners(db)
+        # N+1 fix: find_stuck_alerts — full scan kg_alerts. Раньше он
+        # выполнялся внутри build_team_digest ПО РАЗУ НА КОМАНДУ (~60
+        # одинаковых тяжёлых запросов за beat-run) и фильтровался в Python.
+        # Теперь один запрос на весь прогон; per-team фильтрация остаётся
+        # в _top_stuck_alerts. Best-effort: при ошибке идём с пустым списком
+        # (секция stuck просто скроется), не роняя всю рассылку.
+        try:
+            stuck_all = find_stuck_alerts(
+                db,
+                min_duration_hours=settings.STUCK_ALERTS_MIN_DURATION_HOURS,
+            )
+        except Exception as e:
+            log.warning("team_digest.stuck_prefetch_failed", error=str(e))
+            stuck_all = []
     finally:
         db.close()
 
@@ -520,7 +616,9 @@ async def send_all_team_digests(window_hours: int = 24) -> Dict[str, Any]:
         # держит lock на kg_services дольше чем нужно.
         db = SessionLocal()
         try:
-            res = await send_team_digest(team, window_hours=window_hours, db=db)
+            res = await send_team_digest(
+                team, window_hours=window_hours, db=db, stuck_all=stuck_all,
+            )
         except Exception as e:
             log.warning("team_digest.team_failed", team=team, error=str(e))
             stats["errors"] += 1

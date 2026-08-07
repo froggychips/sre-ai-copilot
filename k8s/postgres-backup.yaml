@@ -5,6 +5,15 @@
 #
 # Бакет / endpoint / credentials лежат в Secret `postgres-backup-s3`
 # (создать через ExternalSecret из общего secret store).
+#
+# УСТРОЙСТВО: дамп и загрузка разнесены по контейнерам, потому что
+# runAsUser=999 + readOnlyRootFilesystem=true исключают установку пакетов в
+# рантайме (старый вариант `apk add aws-cli` падал первой же командой — job
+# не отработал НИ РАЗУ, «RPO ≈ 24ч» был фикцией):
+#   initContainer  pg-dump   (postgres:15-alpine)  → дамп в emptyDir /backup
+#   container      s3-upload (amazon/aws-cli)      → aws s3 cp из /backup
+# Падение любого из них = Failed Job → алерт SREAICopilotPostgresBackup*
+# (см. k8s/prometheus-rules.yaml).
 
 apiVersion: v1
 kind: ServiceAccount
@@ -27,6 +36,9 @@ spec:
       backoffLimit: 2
       activeDeadlineSeconds: 3600
       template:
+        metadata:
+          labels:
+            app: postgres-backup
         spec:
           serviceAccountName: postgres-backup
           restartPolicy: OnFailure
@@ -34,7 +46,7 @@ spec:
             runAsNonRoot: true
             runAsUser: 999
             fsGroup: 999
-          containers:
+          initContainers:
           - name: pg-dump
             image: postgres:15-alpine
             securityContext:
@@ -62,6 +74,44 @@ spec:
                 secretKeyRef:
                   name: postgres-secret
                   key: POSTGRES_DB
+            command:
+            - /bin/sh
+            - -ec
+            - |
+              ts=$(date -u +%Y%m%dT%H%M%SZ)
+              dump_file="/backup/sre-ai-${PGDATABASE}-${ts}.sql.gz"
+              echo "Dumping ${PGDATABASE} -> ${dump_file}"
+              pg_dump --format=custom --no-owner --no-privileges \
+                  --compress=9 \
+                  --file="${dump_file%.gz}" "${PGDATABASE}"
+              gzip "${dump_file%.gz}"
+              # Имя файла для upload-контейнера (basename, без пути).
+              basename "${dump_file}" > /backup/LATEST
+              echo "Dump complete: $(basename "${dump_file}")"
+            resources:
+              limits:
+                cpu: 500m
+                memory: 512Mi
+              requests:
+                cpu: 100m
+                memory: 128Mi
+            volumeMounts:
+            - name: backup
+              mountPath: /backup
+          containers:
+          - name: s3-upload
+            # aws-cli уже внутри образа — НИКАКИХ установок в рантайме
+            # (readOnlyRootFilesystem это и не позволит).
+            image: amazon/aws-cli:2.17.52
+            securityContext:
+              readOnlyRootFilesystem: true
+              allowPrivilegeEscalation: false
+              capabilities:
+                drop: ["ALL"]
+            env:
+            # aws-cli пишет кэш/конфиг в $HOME — направляем во writable emptyDir.
+            - name: HOME
+              value: "/tmp"
             - name: S3_BUCKET
               valueFrom:
                 secretKeyRef:
@@ -86,17 +136,10 @@ spec:
             - /bin/sh
             - -ec
             - |
-              apk add --no-cache aws-cli
-              ts=$(date -u +%Y%m%dT%H%M%SZ)
-              dump_file="/tmp/sre-ai-${PGDATABASE}-${ts}.sql.gz"
-              echo "Dumping ${PGDATABASE} → ${dump_file}"
-              pg_dump --format=custom --no-owner --no-privileges \
-                  --compress=9 \
-                  --file="${dump_file%.gz}" "${PGDATABASE}"
-              gzip "${dump_file%.gz}"
-              echo "Uploading to s3://${S3_BUCKET}/postgres/"
-              aws s3 cp "${dump_file}" "s3://${S3_BUCKET}/postgres/$(basename ${dump_file})"
-              echo "Backup complete: $(basename ${dump_file})"
+              dump_name="$(cat /backup/LATEST)"
+              echo "Uploading /backup/${dump_name} -> s3://${S3_BUCKET}/postgres/"
+              aws s3 cp "/backup/${dump_name}" "s3://${S3_BUCKET}/postgres/${dump_name}"
+              echo "Backup complete: ${dump_name}"
             resources:
               limits:
                 cpu: 500m
@@ -105,9 +148,14 @@ spec:
                 cpu: 100m
                 memory: 128Mi
             volumeMounts:
+            - name: backup
+              mountPath: /backup
             - name: tmp
               mountPath: /tmp
           volumes:
-          - name: tmp
+          - name: backup
             emptyDir:
               sizeLimit: 5Gi
+          - name: tmp
+            emptyDir:
+              sizeLimit: 128Mi
