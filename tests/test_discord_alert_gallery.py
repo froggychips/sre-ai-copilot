@@ -143,6 +143,14 @@ async def _capture_enriched_embed(
              "app.services.discord_service.settings.DISCORD_WEBHOOK_URL",
              "https://discord.com/api/webhooks/test/hook",
          ), \
+         patch(
+             # Иначе футер эмбеда зависит от состояния БД: при живом
+             # DATABASE_URL туда дописывается "KG sync 2m ago · owner 0.00%",
+             # и снапшот, записанный без БД, не совпадает. Снапшот обязан
+             # проверять рендер, а не свежесть локального графа.
+             "app.services.discord.service._collect_self_health_summary",
+             return_value=None,
+         ), \
          patch("httpx.AsyncClient.post", new=fake_post):
         await DiscordService().send_enriched_alert(
             contexts, env=env, resurfaced=resurfaced,
