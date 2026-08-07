@@ -1,0 +1,50 @@
+# CodeQL на self-hosted раннере.
+#
+# Почему свой workflow, а не default setup: тот запускает джобы с
+# labels=[ubuntu-latest], а аккаунт froggychips заблокирован от
+# GitHub-hosted раннеров по биллингу — прогоны падали за 4 секунды
+# ("Analyze (actions)" / "Adjust Configuration", conclusion=failure) и
+# держали master красным, приучая игнорировать статус проверок.
+# Default setup при этом надо отключить: одновременно с advanced он не
+# работает (см. README раздела Security или
+# `gh api -X DELETE repos/OWNER/REPO/code-scanning/default-setup`).
+name: CodeQL
+
+on:
+  push:
+    branches: [ master ]
+  pull_request:
+    branches: [ master ]
+  schedule:
+    # Понедельник 04:00 UTC — вне рабочего окна, раннер один и его делят
+    # с CI, длинный security-скан не должен драться с прогонами PR.
+    - cron: '0 4 * * 1'
+
+jobs:
+  analyze:
+    name: Analyze
+    runs-on: [self-hosted, macOS, ARM64]
+    permissions:
+      security-events: write
+      contents: read
+      actions: read
+    strategy:
+      fail-fast: false
+      matrix:
+        # python — код приложения; actions — сами workflow-файлы
+        # (тот же набор, что пытался анализировать default setup).
+        language: [ python, actions ]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v3
+        with:
+          languages: ${{ matrix.language }}
+
+      - name: Analyze
+        uses: github/codeql-action/analyze@v3
+        with:
+          category: /language:${{ matrix.language }}
