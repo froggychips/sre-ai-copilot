@@ -83,14 +83,21 @@ jobs:
           # там нет — подстановка дала бы unix:///.rd/docker.sock.
           export DOCKER_HOST="unix://$HOME/.rd/docker.sock"
           docker rm -f copilot-ci-pg >/dev/null 2>&1 || true
+          # Порт назначает docker (-p 0:5432), а не мы: раннер self-hosted,
+          # на той же машине могут крутиться чужие контейнеры и локальная
+          # отладка. Фиксированный 55432 уже дал "port is already allocated"
+          # и уронил прогон.
           docker run -d --name copilot-ci-pg \
             -e POSTGRES_USER=ci -e POSTGRES_PASSWORD=ci -e POSTGRES_DB=ci \
-            -p 55432:5432 postgres:16-alpine
+            -p 0:5432 postgres:16-alpine
           for i in $(seq 1 30); do
             docker exec copilot-ci-pg pg_isready -U ci >/dev/null 2>&1 && break
             sleep 2
           done
           docker exec copilot-ci-pg pg_isready -U ci
+          PG_PORT=$(docker port copilot-ci-pg 5432/tcp | head -1 | sed 's/.*://')
+          echo "PG_PORT=$PG_PORT" >> "$GITHUB_ENV"
+          echo "postgres слушает на 127.0.0.1:$PG_PORT"
 
       # Гоняем ТОЛЬКО интеграционные наборы, а не весь pytest с DATABASE_URL.
       # Причина: при живой базе включаются ещё ~30 тестов, которые никогда не
@@ -99,7 +106,7 @@ jobs:
       # практике merge через --admin bypass.
       - name: Integration tests against real Postgres schema
         env:
-          DATABASE_URL: postgresql://ci:ci@127.0.0.1:55432/ci
+          DATABASE_URL: postgresql://ci:ci@127.0.0.1:${{ env.PG_PORT }}/ci
         run: |
           .venv/bin/pytest -q \
             tests/test_digest_sections_against_schema.py \
