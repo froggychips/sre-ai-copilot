@@ -79,6 +79,16 @@ _KUBECTL_TIMEOUT_NS_S = 20
 EDGE_SERVES_TRAFFIC = "serves_traffic"   # Service → backing workload
 EDGE_ROUTES_TO = "routes_to"             # Ingress → Service
 
+# Коммитим порциями, а не одной транзакцией на весь тик. Причина не в
+# производительности: транзакция держит ACCESS SHARE на kg_services всё время
+# своей жизни, а тут 4200+ сервисов — замер на проде 08.08.2026 дал
+# транзакции по 12-13 минут. Пока такая живёт, DDL не может взять
+# ACCESS EXCLUSIVE: миграция kg_services встала в очередь и заблокировала
+# читателей, приложение висело 6 минут. Простой тут ни при чём —
+# транзакция активно работает, поэтому idle_in_transaction_session_timeout
+# её не обрывает, и спасает только дробление на короткие.
+_COMMIT_BATCH = 200
+
 DISCOVERED_BY_SVC = "k8s_topology_resources/service"
 DISCOVERED_BY_INGRESS = "k8s_topology_resources/ingress"
 
@@ -406,7 +416,7 @@ def sync_all_services(
         "errors": 0,
     }
 
-    for svc in services:
+    for i, svc in enumerate(services, 1):
         try:
             # SAVEPOINT на item: один DataError не переводит Session в
             # aborted-состояние (PendingRollbackError на соседях и финальном
@@ -420,6 +430,13 @@ def sync_all_services(
                 (svc.get("metadata") or {}).get("namespace"),
                 (svc.get("metadata") or {}).get("name"), e,
             )
+        if i % _COMMIT_BATCH == 0:
+            # Короткая транзакция = локи отпускаются, DDL и соседние писатели
+            # не ждут конца всего тика. Тик перестаёт быть атомарным, и это
+            # осознанно: синк идемпотентен, повторный прогон восстановит
+            # недописанное, а вот блокировка на 12 минут не восстанавливает
+            # ничего.
+            db.commit()
 
     db.commit()
     logger.info(
@@ -546,7 +563,7 @@ def sync_all_ingresses_declarative(db: Session) -> Dict[str, int]:
         "errors": 0,
     }
 
-    for ing in ingresses:
+    for i, ing in enumerate(ingresses, 1):
         try:
             # SAVEPOINT на Ingress — см. sync_all_services / k8s_events_sync.
             with db.begin_nested():
@@ -558,6 +575,8 @@ def sync_all_ingresses_declarative(db: Session) -> Dict[str, int]:
                 (ing.get("metadata") or {}).get("namespace"),
                 (ing.get("metadata") or {}).get("name"), e,
             )
+        if i % _COMMIT_BATCH == 0:
+            db.commit()
 
     db.commit()
     logger.info(

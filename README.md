@@ -29,6 +29,25 @@
 
 ### What's new
 
+- **v1.0.0-rc.11 — KG node types, honest metrics, lock-safe migrations**:
+  `kg_services` gained `node_kind` (`service` / `workload` / `ingress`), so a
+  k8s Service and its backing Deployment are finally **different nodes**.
+  Until now they shared one row keyed by `(namespace, name)`, which meant the
+  `serves_traffic` edge could not exist at all — it always degenerated into a
+  self-loop and was dropped. On the live graph that was 2092 discarded edges
+  per sync tick against 3 surviving ones; after the change `serves_traffic`
+  holds 4234 edges and matching covers StatefulSet/DaemonSet (all `*-db`
+  nodes, previously invisible).
+  **Metrics stay honest:** `orphan_pct` deliberately does NOT count
+  `serves_traffic` as connectivity — that edge links a node to its own
+  implementation, and counting it dropped orphan from 72.5% to 42% without a
+  single new integration. `owner_pct` and `app_scope` count `service` nodes
+  only, so 2871 new workload nodes did not dilute them.
+  **Operations:** migrations run with `lock_timeout` (a queued DDL blocks
+  every reader behind it), periodic beat tasks now expire instead of piling up
+  (230 queued tasks starved the topology sync completely), and CI runs the
+  full suite against a live Postgres. Full write-up, including the mistakes
+  made along the way: [`docs/POSTMORTEM_2026_08_08.md`](docs/POSTMORTEM_2026_08_08.md).
 - **v1.0.0-rc.1 — Security & reliability hardening (release candidate)**: the
   largest hardening pass to date — closes the full CRITICAL/P0 tier from an
   internal deep review and makes the opt-in executor genuinely safe.
@@ -215,8 +234,15 @@ cloudflared tunnel --url http://localhost:8000
 ```bash
 helm install sre-ai-copilot helm/sre-ai-copilot/ \
   --set ingress.host=sre-ai.example.com \
-  --set image.tag=1.0.0-rc.1
+  --set image.tag=1.0.0-rc.11
 ```
+
+> **Note on the WO cluster:** the manifests and `deploy.sh` reference
+> `ghcr.io/froggychips/...` by git-sha, but that cluster actually pulls from
+> Nexus (`docker.lastoasisgame.com/wo/sre-ai-copilot:1.0.0-rc.N`) and has no
+> `imagePullSecrets` for ghcr. The real rollout procedure is in
+> [`docs/RUNBOOK.md`](docs/RUNBOOK.md#production-rollout-the-actual-procedure-2026-08-08);
+> the drift is tracked in [`docs/POSTMORTEM_2026_08_08.md`](docs/POSTMORTEM_2026_08_08.md).
 
 Fill secrets before installing — see `helm/sre-ai-copilot/templates/secret.yaml`.
 
@@ -316,6 +342,24 @@ See [docs/RUNBOOK.md → Executor incidents](docs/RUNBOOK.md#executor-incidents)
 
 ### Что нового
 
+- **v1.0.0-rc.11 — Типы узлов KG, честные метрики, безопасные миграции**:
+  у `kg_services` появился `node_kind` (`service` / `workload` / `ingress`) —
+  k8s Service и его backing Deployment наконец **разные узлы**. Раньше они
+  делили одну строку с ключом `(namespace, name)`, из-за чего ребро
+  `serves_traffic` не могло существовать в принципе: оно вырождалось в
+  self-loop и отбрасывалось. На живом графе это 2092 выброшенных ребра за тик
+  синка против 3 уцелевших; после правки `serves_traffic` — 4234 ребра, а
+  матчинг покрыл StatefulSet/DaemonSet (все `*-db`-узлы, прежде невидимые).
+  **Метрики остались честными:** `orphan_pct` намеренно НЕ засчитывает
+  `serves_traffic` как связность — это ребро на собственную реализацию узла, и
+  его учёт уронил orphan с 72.5% до 42% без единой новой интеграции.
+  `owner_pct` и `app_scope` считают только узлы `service`, поэтому 2871 новый
+  workload-узел их не разбавил.
+  **Эксплуатация:** миграции идут с `lock_timeout` (DDL в очереди блокирует
+  всех читателей за собой), периодические beat-задачи протухают вместо
+  накопления (230 задач в очереди полностью вытеснили синк топологии), CI
+  гоняет весь набор против живого Postgres. Подробный разбор, включая
+  допущенные промахи: [`docs/POSTMORTEM_2026_08_08.ru.md`](docs/POSTMORTEM_2026_08_08.ru.md).
 - **v1.0.0-rc.1 — Харднинг безопасности и надёжности (release candidate)**:
   крупнейший проход харднинга — закрыт весь CRITICAL/P0-тир внутреннего
   глубокого ревью, opt-in executor сделан реально безопасным.
@@ -490,8 +534,15 @@ cloudflared tunnel --url http://localhost:8000
 ```bash
 helm install sre-ai-copilot helm/sre-ai-copilot/ \
   --set ingress.host=sre-ai.example.com \
-  --set image.tag=1.0.0-rc.1
+  --set image.tag=1.0.0-rc.11
 ```
+
+> **Note on the WO cluster:** the manifests and `deploy.sh` reference
+> `ghcr.io/froggychips/...` by git-sha, but that cluster actually pulls from
+> Nexus (`docker.lastoasisgame.com/wo/sre-ai-copilot:1.0.0-rc.N`) and has no
+> `imagePullSecrets` for ghcr. The real rollout procedure is in
+> [`docs/RUNBOOK.md`](docs/RUNBOOK.md#production-rollout-the-actual-procedure-2026-08-08);
+> the drift is tracked in [`docs/POSTMORTEM_2026_08_08.md`](docs/POSTMORTEM_2026_08_08.md).
 
 Перед установкой заполнить секреты — см. `helm/sre-ai-copilot/templates/secret.yaml`.
 

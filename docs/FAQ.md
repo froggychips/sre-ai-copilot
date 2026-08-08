@@ -350,3 +350,50 @@ change. Baseline at v0.12.0: `docs/quality_report_baseline_2026_05_24.md`.
 ## Where do I report a bug?
 
 [GitHub Issues](https://github.com/froggychips/sre-ai-copilot/issues) or Telegram [@froggychips](https://t.me/froggychips).
+
+
+## Why are there two nodes with the same name in the graph?
+
+Since contract 2.4 a node carries `node_kind`: the k8s Service `auth` and the
+Deployment `auth` are **different nodes** (`service` and `workload`), linked by
+a `serves_traffic` edge.
+
+Before that they shared one row (keyed by `(namespace, name)`), which meant the
+edge between them could not physically exist — it always came out as a
+self-loop and was dropped. On the live graph that lost 2092 edges per sync
+tick, leaving 3 in the graph.
+
+Practical consequence: looking a node up by `(namespace, name)` is no longer
+enough — the query is ambiguous. You need `node_kind`, otherwise
+`.one_or_none()` raises `MultipleResultsFound`. The test
+`test_no_new_node_lookup_without_node_kind` guards this in code.
+
+## Why didn't orphan_pct drop once serves_traffic appeared?
+
+Because `serves_traffic` is deliberately not counted as connectivity.
+
+That edge links a Service to its own backing workload — a node to its own
+implementation. When it appeared at once for every service with a selector,
+orphan "improved" from 72.5% to 42.0% while inter-service connectivity did not
+change at all: all 1506 "cured" services gained exactly one edge, to their own
+workload.
+
+A metric must not improve because the storage schema changed, so
+`compute_orphan_stats` excludes `serves_traffic`. Details in `docs/METRICS.md` §6.
+
+## Beat dispatched a task but it never ran — why?
+
+Most likely it expired, and that is intended behaviour.
+
+Every periodic task has a lifetime of ≈90% of its interval. If workers are busy
+and the task sat in the queue longer, it is discarded: a `kg_external_probe`
+tick dispatched 90 minutes ago answers "how are things right now" and is
+useless.
+
+Before `expires` the queue piled up silently — 230 tasks, 94 of them
+`kg_external_probe`. Worse, `kg_topology_resources_sync` sat behind that tail
+and never ran at all.
+
+Check queue depth with `kubectl -n sre-ai exec redis-0 -- redis-cli LLEN celery`.
+If it grows steadily, the workers cannot keep up — a separate problem that
+`expires` merely masks.

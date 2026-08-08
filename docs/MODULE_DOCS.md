@@ -50,6 +50,7 @@
 
 ### Schema (`app/knowledge_graph/schema.py`)
 - `Service` — nodes (`kg_services`, unique `(namespace, name)`); `synthetic` flag hides infra/observability/drift nodes from KG queries; `team_owner` derived from namespace prefix; `stale_class` (PR #86): `active` / `expected_stale` / `suspicious_stale` (см. `stale_classifier`).
+- `Service.node_kind` — the node's role: `service` (k8s Service / logical entry point), `workload` (Deployment/StatefulSet/DaemonSet), `ingress` (synthetic). Unique key is `(namespace, name, node_kind)`. Looking a node up by `(namespace, name)` alone is ambiguous: `.one_or_none()` will raise `MultipleResultsFound`.
 - `ServiceEdge` — directed edges (`kg_service_edges`); `kind` ∈ `calls` / `uses_nats` / `uses_db` / `serves_traffic` / `routes_to`; `last_seen_at` for TTL/decay; `extras.discovery_sources` (list) tracks all source flows (multi-source = higher confidence).
 - `Deployment` — TC build history (`kg_deployments`); records `started_at` from TC API (not `finishDate`), `triggered_by`, status `SUCCESS`/`FAILURE`/etc.
 - `AlertEvent` — alerts from AM (`kg_alerts`); idempotent by `fingerprint`; `resolved_at` refreshed by `kg_alerts_resolve_sync`.
@@ -168,17 +169,27 @@ Read-side API used by enrichment + MCP tools:
   `kubectl get ingresses -A -o json`, upsert-ит `kg_services` с
   `metadata_json` (service_type, ports, selector), и пишет два новых вида edges.
 - **Edge `serves_traffic`** (`EDGE_SERVES_TRAFFIC`): Service → backing
-  Deployment. Алгоритм — selector-match Service.spec.selector на pod
-  template labels всех known Deployments в том же namespace. Если матч
-  есть — edge upsert с `discovered_by="k8s_topology_resources/service"`.
-  Если Service-резерв не имеет match'а на Deployment, он всё равно
-  регистрируется как node (downstream Ingress может на него routes-ить).
+  **workload**. Алгоритм — selector-match Service.spec.selector на pod
+  template labels workload'ов того же namespace; матчатся Deployment,
+  **StatefulSet и DaemonSet** (без двух последних 2231 Service за тик уходил
+  в `skipped_no_match` — это все `*-db` / `*-postgresql` / clickhouse).
+  Workload — отдельный узел `node_kind='workload'`, синк заводит его сам и
+  наследует `team_owner` от Service. До contract 2.4 Service и Deployment с
+  одним именем были ОДНОЙ строкой, и это ребро вырождалось в self-loop:
+  2092 отброшенных ребра за тик при 3 уцелевших в графе.
+  Если Service не имеет match'а, он всё равно регистрируется как node
+  (downstream Ingress может на него routes-ить).
+- **Коммит батчами** (`_COMMIT_BATCH = 200`): одна транзакция на 4200+
+  upsert-ов жила 12-13 минут и всё это время держала ACCESS SHARE, из-за
+  чего DDL-миграция вставала в очередь и блокировала читателей. Тик
+  перестал быть атомарным осознанно — синк идемпотентен.
 - **Edge `routes_to`** (`EDGE_ROUTES_TO`): Ingress (как ресурс) → backend
   Service. Synthetic-узел `ingress:<name>` создаётся, если в KG ещё нет.
   Параллельный slice к `k8s_ingress_sync` (который строит `ingress:<host>` →
   backend как `calls`) — Ingress-as-resource vs Ingress-as-host. Merge
   через `populator.upsert_edge` (`extras.discovery_sources`).
-- **Cluster-wide RBAC**: требует `services`, `ingresses` на verbs
+- **Cluster-wide RBAC**: требует `services`, `ingresses`, `deployments`,
+  `statefulsets`, `daemonsets` на verbs
   `get`/`list`/`watch` в ClusterRole (см. `k8s/base/rbac.yaml`,
   `helm/sre-ai-copilot/templates/rbac.yaml`).
 - **Без feature flag** — declarative, idempotent, нет внешних зависимостей
