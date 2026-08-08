@@ -1077,3 +1077,187 @@ side-by-side, or open `input.json` and re-render in isolation.
 
 Goal: every embed shape (severity × enrichment-state × digest-type)
 should have at least one case to detect regression.
+
+---
+
+## Production rollout (the actual procedure, 2026-08-08)
+
+> **Warning:** `deploy.sh` in the repository describes a process this cluster
+> does NOT use. The script deploys from `ghcr.io/froggychips/...` by git-sha,
+> while the pods pull from Nexus
+> (`docker.lastoasisgame.com/wo/sre-ai-copilot`) by the `1.0.0-rc.N` tag — and
+> there are no `imagePullSecrets` for ghcr in the manifests. Running
+> `deploy.sh` as-is will stall with ImagePullBackOff on the migration Job.
+> The drift is unresolved — see `docs/POSTMORTEM_2026_08_08.md` §4.3.
+
+### 1. Build and push the image
+
+`--platform linux/amd64` is mandatory: the nodes are amd64, and a build on an
+ARM machine without the flag produces an image that will not start.
+
+```bash
+export DOCKER_HOST="unix://$HOME/.rd/docker.sock"     # Rancher Desktop
+docker build --platform linux/amd64 \
+  -t docker.lastoasisgame.com/wo/sre-ai-copilot:1.0.0-rc.N .
+docker push docker.lastoasisgame.com/wo/sre-ai-copilot:1.0.0-rc.N
+```
+
+Before pushing, confirm the image contains what you expect:
+
+```bash
+docker run --rm --platform linux/amd64 -e LLM_BACKEND=claude_cli \
+  --entrypoint sh docker.lastoasisgame.com/wo/sre-ai-copilot:1.0.0-rc.N \
+  -c "ls alembic/versions/ | tail -3"
+```
+
+### 2. Migrations — a separate Job, and ONLY with `lock_timeout`
+
+`ALTER TABLE` needs ACCESS EXCLUSIVE. If the lock is held, the DDL queues up
+and **blocks everyone who arrives after it** — on 2026-08-08 seven
+`kg_services` readers hung this way and the application stalled for 6 minutes.
+
+Add to the Job manifest:
+
+```yaml
+        env:
+        - name: PGOPTIONS
+          value: "-c lock_timeout=15s"
+```
+
+No lock within 15 seconds — the Job fails, readers are unaffected, try again.
+Before running, check for long transactions:
+
+```bash
+kubectl -n sre-ai exec postgres-0 -- sh -c 'psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "
+SELECT (now()-xact_start)::text AS age, state,
+       left(regexp_replace(query,E'\''\\s+'\'','\'' '\'','\''g'\''),50)
+FROM pg_stat_activity WHERE datname=current_database() AND state<>'\''idle'\''
+ORDER BY xact_start LIMIT 5;"'
+```
+
+If transactions are older than a couple of minutes, silence the writers for
+the duration:
+
+```bash
+kubectl -n sre-ai scale deploy copilot-worker copilot-beat --replicas=0
+# ... migrations ...
+kubectl -n sre-ai scale deploy copilot-worker --replicas=2
+kubectl -n sre-ai scale deploy copilot-beat --replicas=1
+```
+
+### 3. Roll out the application
+
+```bash
+IMG=docker.lastoasisgame.com/wo/sre-ai-copilot:1.0.0-rc.N
+kubectl -n sre-ai set image deploy/sre-ai-api api=$IMG
+kubectl -n sre-ai set image deploy/copilot-worker worker=$IMG
+kubectl -n sre-ai set image deploy/copilot-beat beat=$IMG
+for d in sre-ai-api copilot-worker copilot-beat; do
+  kubectl -n sre-ai rollout status deploy/$d --timeout=300s
+done
+```
+
+### 4. Verify after rollout
+
+```bash
+# schema arrived
+kubectl -n sre-ai exec postgres-0 -- sh -c \
+  'psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -tAc "SELECT version_num FROM alembic_version"'
+
+# no restarts
+kubectl -n sre-ai get pods | grep -E "sre-ai-api|copilot"
+
+# queue is not growing
+kubectl -n sre-ai exec redis-0 -- redis-cli LLEN celery
+```
+
+---
+
+## Diagnosing PostgreSQL locks
+
+### Transaction age ≠ transaction idle time
+
+The two metrics answer different questions and are easy to confuse (on
+2026-08-08 this exact confusion produced a wrong diagnosis):
+
+| expression | meaning | when it matters |
+|---|---|---|
+| `now() - xact_start` | how long the transaction has lived | **locking**: the lock is held for the whole transaction |
+| `now() - state_change` | how long the connection has been idle right now | "forgotten" sessions |
+
+A transaction can live 13 minutes while idling 0.1s between statements — it is
+actively working. `idle_in_transaction_session_timeout` will **not** cut it,
+because it targets idle time. The cure is splitting into short transactions
+(batched commits), not a timeout.
+
+```bash
+kubectl -n sre-ai exec postgres-0 -- sh -c 'psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "
+SELECT (now()-xact_start)::text AS transaction_age,
+       (now()-state_change)::text AS idle_right_now, state
+FROM pg_stat_activity WHERE datname=current_database() AND state<>'\''idle'\''
+ORDER BY xact_start LIMIT 8;"'
+```
+
+### Who blocks whom
+
+```bash
+kubectl -n sre-ai exec postgres-0 -- sh -c 'psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "
+SELECT pid, pg_blocking_pids(pid) AS blocked_by, (now()-query_start)::text AS waiting,
+       left(regexp_replace(query,E'\''\\s+'\'','\'' '\'','\''g'\''),45)
+FROM pg_stat_activity WHERE datname=current_database() AND wait_event_type='\''Lock'\'';"'
+```
+
+Signature of a stuck DDL: one `ALTER TABLE` waiting on a lock, with a dozen
+`SELECT`s waiting on **it**. Clear the DDL, not the readers.
+
+### An orphaned connection
+
+A backend waiting on a lock never writes to its socket and never notices its
+client died: deleting the Job pod does not remove it. Clear it manually:
+
+```bash
+kubectl -n sre-ai exec postgres-0 -- sh -c \
+  'psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -tAc "SELECT pg_terminate_backend(<pid>)"'
+```
+
+---
+
+## Running a heavy beat task once
+
+`kubectl exec` into a worker pod is **not** suitable: it starts a second
+Python process on top of the running celery and hits the memory limit
+(`exit 137`).
+
+Use a separate Job with its own resources (base it on
+`k8s/migrate-job.yaml`, swapping `command`/`args` and limits):
+
+```yaml
+        command: ["python", "-c"]
+        args:
+        - |
+          from app.workers.tasks import kg_topology_resources_sync_task
+          import json
+          print(json.dumps(kg_topology_resources_sync_task(), default=str))
+        resources:
+          limits: { cpu: "1", memory: 2Gi }
+```
+
+Why you may need this: when the Celery queue is congested, a scheduled tick
+may never run at all — it sits behind the stale tail (see `expires` in
+`beat_schedule`).
+
+---
+
+## Checking RBAC before extending a sync
+
+A permission present in `k8s/base/rbac.yaml` does **not** mean it exists in
+the cluster: in this cluster the repository's `ClusterRole sre-ai-read` was
+never applied. Verify against reality only:
+
+```bash
+for r in deployments statefulsets daemonsets; do
+  echo -n "$r: "
+  kubectl auth can-i list $r.apps \
+    --as=system:serviceaccount:sre-ai:sre-ai --all-namespaces
+done
+```

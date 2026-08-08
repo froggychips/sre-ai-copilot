@@ -74,3 +74,55 @@ kubectl -n cattle-system get vmpodscrape
 kubectl -n cattle-system get ds -o yaml | grep -- --enable-metrics
 # expect: --enable-metrics=true on both controller DaemonSets
 ```
+
+---
+
+## 6. Graph quality metrics — what they do NOT count
+
+Updated: **2026-08-08**.
+
+Three metrics (`orphan_pct`, `owner_pct`, `app_scope`) are computed in
+`contract.compute_orphan_stats` / `STARTUP_CONTRACT_CHECK` and surface in the
+digest. All three have non-obvious exclusions — without them the numbers move
+when the schema changes, not when the infrastructure does.
+
+### Only `node_kind='service'` is counted
+
+Since contract 2.4 `kg_services` holds three node types. Quality metrics count
+**logical services only**. Workload nodes (backing
+Deployment/StatefulSet/DaemonSet) are excluded: there are 2871 of them against
+8669 services, and including them would double the denominator. In practice it
+would look like owner coverage collapsing from 99.5% to ~50% on rollout day —
+a regression that never happened.
+
+### `orphan` does not count `serves_traffic`
+
+That edge links a Service to its own backing workload — a node to its own
+implementation, not to another service. Before node types existed it
+degenerated into a self-loop and was discarded; with `node_kind` it became
+real and appeared at once for every service with a selector.
+
+Measured in production on 2026-08-08, right after rollout:
+
+| counting | orphan |
+|---|---|
+| any edge | 2072 / 4933 → 42.0% |
+| excluding `serves_traffic` (current) | 3578 / 4933 → **72.5%** |
+
+The second row matches the pre-rollout value: inter-service connectivity did
+not change at all. The first version of the metric would have reported a
+twofold improvement that never occurred.
+
+**Rule:** a quality metric must not improve because the storage schema
+changed. When adding a new node or edge type, re-examine every metric that
+counts "anything at all", not only the ones where you expect an effect.
+Locked down by `test_serves_traffic_alone_does_not_clear_orphan` and
+`test_compute_orphan_stats_ignores_workload_nodes`.
+
+### What the current value means
+
+`orphan_pct ≈ 72%` does NOT mean "the graph is broken". The denominator is
+real services minus `expected_stale` infrastructure across all environments,
+including dev/preprod where topology is knowingly incomplete. A missing edge
+means "the relationship is unknown", not "there is no relationship" (see §7 in
+`KG_SCHEMA_CONTRACT.md`).

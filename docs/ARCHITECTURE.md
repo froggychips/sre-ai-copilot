@@ -16,7 +16,7 @@ The application consists of: an HTTP API (FastAPI), background tasks (Celery), a
 - **FixAgent (`app.agents.fix`)**: generates a structured `ExecutionIntent`; recurrence-aware and Jira-enriched.
 - **SimilarIncidentEngine (`app.core.intelligence.similar_incidents`)**: KG-based recurrence detection (7-day window).
 - **JiraClient (`app.context.jira_client`)**: Atlassian REST API enrichment for FixAgent context.
-- **Knowledge Graph (`app.knowledge_graph.*`)**: auto-populating directed graph in Postgres. Core tables: `kg_services`, `kg_service_edges`, `kg_deployments`, `kg_alerts`, `kg_pod_events`. Storage subgraph (PR #84): `kg_storage_volumes` (PVC/PV) + `kg_volume_edges` (heterogeneous). Jobs (PR #82): `kg_k8s_jobs` (Job/CronJob с `owner_service_id`). 10+ sync sources (env-vars, NATS env, DSN-from-secret-key, k8s events, k8s ingresses-as-host, **k8s Services + Ingresses (Wave 7-X)**, **NATS subjects from monorepo source (Wave 7-Z)**, **runtime PodEvent co-occurrence (Wave 7-Y)**, **k8s Jobs/CronJobs (PR #82)**, **PVC/PV storage (PR #84)**). Schema/quality contract — `app/knowledge_graph/contract.py` (KG_SCHEMA_VERSION=2.2); confidence scoring with multi-source provenance.
+- **Knowledge Graph (`app.knowledge_graph.*`)**: auto-populating directed graph in Postgres. Core tables: `kg_services`, `kg_service_edges`, `kg_deployments`, `kg_alerts`, `kg_pod_events`. Storage subgraph (PR #84): `kg_storage_volumes` (PVC/PV) + `kg_volume_edges` (heterogeneous). Jobs (PR #82): `kg_k8s_jobs` (Job/CronJob с `owner_service_id`). 10+ sync sources (env-vars, NATS env, DSN-from-secret-key, k8s events, k8s ingresses-as-host, **k8s Services + Ingresses (Wave 7-X)**, **NATS subjects from monorepo source (Wave 7-Z)**, **runtime PodEvent co-occurrence (Wave 7-Y)**, **k8s Jobs/CronJobs (PR #82)**, **PVC/PV storage (PR #84)**). Schema/quality contract — `app/knowledge_graph/contract.py` (KG_SCHEMA_VERSION=2.5); confidence scoring with multi-source provenance. Since 2.4 a node carries `node_kind` (`service` / `workload` / `ingress`): a k8s Service and its backing Deployment are **different nodes**, so the `serves_traffic` edge between them can exist at all (see below).
 - **Alert enrichment (`app.services.alert_enrichment`)**: deterministic KG-based enrichment for `/webhooks/alertmanager/enrich-and-forward` — runs without LLM, ~5 SQL queries, builds `EnrichedContext` (recent_deploys, upstream_alerts, outgoing_deps, pod_events, jira_issues, primary_hypothesis, why_this_matters).
 - **Data layer (`app.database`, `app.repository`)**: SQLAlchemy models and CRUD operations.
 - **Integration layer (`app.services.mcp_client`)**: MCP client for k8s, TeamCity, and other external tools.
@@ -450,7 +450,9 @@ primary с fallback на legacy `_classify_stale` (старая инсталля
 
 `app/knowledge_graph/contract.py` — единственный источник истины:
 
-- `KG_SCHEMA_VERSION = "2.2"` (после Wave 7 → 2.1, после PR #82/#84/#86 → 2.2).
+- `KG_SCHEMA_VERSION = "2.5"` (Wave 7 → 2.1; PR #82/#84/#86 → 2.2; orphan на
+  app-scope → 2.3; `node_kind` → 2.4; orphan перестал считать `serves_traffic`
+  связностью → 2.5). История и мотивация каждого шага — `docs/KG_SCHEMA_CONTRACT.md` §1.
 - `EDGE_KINDS` — реестр всех edge kinds + spec (semantic / src_kinds /
   dst_kinds / source / status / table). Поле `table` различает где
   edge живёт: `kg_service_edges` / `kg_volume_edges` / `fk_only` (через
