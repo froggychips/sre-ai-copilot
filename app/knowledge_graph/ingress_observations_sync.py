@@ -17,7 +17,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from datetime import datetime
-from typing import Any, Dict, List, Optional, cast
+from typing import Any, Dict, List, Optional, Tuple
 
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
@@ -36,61 +36,73 @@ log = logging.getLogger(__name__)
 # Если у вас другой ingress controller (traefik / istio) — придётся править
 # имена метрик. Сейчас под WO — nginx.
 
-def _q_p95_latency_ms(host: str, path: str) -> str:
+# Запросы агрегируют СРАЗУ ПО ВСЕМ маршрутам: `by (host, path)` возвращает
+# все пары одним ответом. Раньше на каждый маршрут слался свой точечный
+# запрос — при 992 маршрутах это 992 × 5 = ~5000 HTTP-вызовов за тик. Воркер
+# уходил в них надолго и вытеснял остальные синки: замер 08.08.2026 показал
+# очередь из 230 задач, в которой kg_topology_resources_sync не выполнялся
+# вовсе. Теперь пять запросов на весь тик, независимо от числа маршрутов.
+
+def _q_p95_latency_ms() -> str:
     return (
-        f'1000 * histogram_quantile(0.95, sum by(le)('
-        f'rate(nginx_ingress_controller_request_duration_seconds_bucket'
-        f'{{host="{host}",path="{path}"}}[5m])'
-        f'))'
+        '1000 * histogram_quantile(0.95, sum by(host,path,le)('
+        'rate(nginx_ingress_controller_request_duration_seconds_bucket[5m])'
+        '))'
     )
 
 
-def _q_p99_latency_ms(host: str, path: str) -> str:
+def _q_p99_latency_ms() -> str:
     return (
-        f'1000 * histogram_quantile(0.99, sum by(le)('
-        f'rate(nginx_ingress_controller_request_duration_seconds_bucket'
-        f'{{host="{host}",path="{path}"}}[5m])'
-        f'))'
+        '1000 * histogram_quantile(0.99, sum by(host,path,le)('
+        'rate(nginx_ingress_controller_request_duration_seconds_bucket[5m])'
+        '))'
     )
 
 
-def _q_rps(host: str, path: str) -> str:
-    return (
-        f'sum(rate(nginx_ingress_controller_requests'
-        f'{{host="{host}",path="{path}"}}[5m]))'
-    )
+def _q_rps() -> str:
+    return 'sum by(host,path)(rate(nginx_ingress_controller_requests[5m]))'
 
 
-def _q_err_rate(host: str, path: str, status_class: str) -> str:
+def _q_err_rate(status_class: str) -> str:
     # status_class: "5" или "4". status — full code, regex по prefix.
     return (
-        f'sum(rate(nginx_ingress_controller_requests'
-        f'{{host="{host}",path="{path}",status=~"{status_class}.."}}[5m]))'
+        f'sum by(host,path)(rate(nginx_ingress_controller_requests'
+        f'{{status=~"{status_class}.."}}[5m]))'
     )
 
 
-async def _fetch_ingress_metrics(
-    vm: VMClient, host: str, path: str,
-) -> Dict[str, Optional[float]]:
+async def _fetch_all_ingress_metrics(
+    vm: VMClient,
+) -> Dict[Tuple[str, str], Dict[str, Optional[float]]]:
+    """Снять все пять метрик по всем маршрутам за пять запросов.
+
+    Возвращает `{(host, path): {metric: value}}`. Маршруты, по которым VM
+    ничего не отдала, в результате отсутствуют — вызывающий код трактует это
+    как «нет сигнала», ровно как раньше трактовал пустой точечный ответ.
+    """
     queries = {
-        "p95_latency_ms": _q_p95_latency_ms(host, path),
-        "p99_latency_ms": _q_p99_latency_ms(host, path),
-        "rps": _q_rps(host, path),
-        "error_5xx_rate": _q_err_rate(host, path, "5"),
-        "error_4xx_rate": _q_err_rate(host, path, "4"),
+        "p95_latency_ms": _q_p95_latency_ms(),
+        "p99_latency_ms": _q_p99_latency_ms(),
+        "rps": _q_rps(),
+        "error_5xx_rate": _q_err_rate("5"),
+        "error_4xx_rate": _q_err_rate("4"),
     }
     keys = list(queries.keys())
-    values = await asyncio.gather(
-        *[vm.query_instant(q) for q in queries.values()],
+    results = await asyncio.gather(
+        *[vm.query_instant_by_labels(q, ("host", "path")) for q in queries.values()],
         return_exceptions=True,
     )
-    out: Dict[str, Optional[float]] = {}
-    for k, v in zip(keys, values):
-        # query_instant теперь отдаёт None при «нет данных» (а не 0.0).
-        if isinstance(v, BaseException) or v is None:
-            out[k] = None
+
+    out: Dict[Tuple[str, str], Dict[str, Optional[float]]] = {}
+    for metric_name, res in zip(keys, results):
+        if isinstance(res, BaseException):
+            log.warning(
+                "ingress_observations_sync.bulk_query_failed metric=%s err=%s",
+                metric_name, res,
+            )
             continue
-        out[k] = float(v)
+        for (host, path), value in res.items():
+            out.setdefault((host, path), {})[metric_name] = value
     return out
 
 
@@ -138,8 +150,13 @@ async def _sync_ingress_observations_async(db: Session) -> Dict[str, Any]:
         log.info("ingress_observations_sync.no_ingresses")
         return {"ingresses": 0, "inserted": 0}
 
-    vm = VMClient(settings.VICTORIA_METRICS_URL, timeout=10.0)
+    vm = VMClient(settings.VICTORIA_METRICS_URL, timeout=30.0)
     ts = datetime.utcnow()
+
+    # Пять агрегирующих запросов на весь тик — ДО обхода маршрутов. Раньше
+    # запрос слался внутри цикла на каждый маршрут, и обход 992 маршрутов
+    # превращался в ~5000 последовательных HTTP-вызовов.
+    metrics_by_route = await _fetch_all_ingress_metrics(vm)
 
     stats = {
         "ingresses": len(ingresses),
@@ -150,6 +167,15 @@ async def _sync_ingress_observations_async(db: Session) -> Dict[str, Any]:
         "skipped_empty": 0,
         "skipped_dup": 0,
         "errors": 0,
+    }
+
+    # Резолв backend-сервисов одним запросом. Точечный lookup внутри цикла
+    # давал ещё 992 обращения к БД поверх HTTP-вызовов.
+    backend_ids: Dict[Tuple[str, str], int] = {
+        (str(ns), str(name)): int(sid)
+        for ns, name, sid in db.query(
+            Service.namespace, Service.name, Service.id,
+        ).filter(Service.node_kind == NODE_KIND_SERVICE).all()
     }
 
     for ing in ingresses:
@@ -164,23 +190,15 @@ async def _sync_ingress_observations_async(db: Session) -> Dict[str, Any]:
             path = r.get("path") or "/"
             backend_name = r["backend"]
 
-            backend = (
-                db.query(Service)
-                .filter_by(namespace=ns, name=backend_name, node_kind=NODE_KIND_SERVICE)
-                .one_or_none()
-            )
-            service_id: Optional[int] = cast(int, backend.id) if backend else None
+            service_id: Optional[int] = backend_ids.get((ns, backend_name))
 
-            try:
-                metrics = await _fetch_ingress_metrics(vm, host, path)
-                stats["fetched"] += 1
-            except Exception as e:
-                stats["errors"] += 1
-                log.warning(
-                    "ingress_observations_sync.fetch_failed host=%s path=%s err=%s",
-                    host, path, e,
-                )
+            metrics = metrics_by_route.get((host, path))
+            if metrics is None:
+                # VM не вернула ни одной серии по этой паре — маршрут есть в
+                # k8s, но трафика/метрик по нему нет.
+                stats["skipped_empty"] += 1
                 continue
+            stats["fetched"] += 1
 
             if not _has_any_signal(metrics):
                 stats["skipped_empty"] += 1
