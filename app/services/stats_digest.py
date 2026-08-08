@@ -2635,6 +2635,107 @@ def _deploy_correlation_diagnostics(
     }
 
 
+# Ключи MCP, за которыми стоит автоматика, а не человек. Список явный, а не
+# эвристика «в имени нет пробела»: у людей key_name — это «Имя Фамилия», но
+# полагаться на формат имени нельзя, а молча посчитать бота за человека хуже,
+# чем пропустить нового бота (его добавят, когда заметят перекос).
+#
+# Почему это вообще важно: замер 08.08.2026 за неделю — knowledge-generator
+# сделал 111 588 вызовов против ~1 500 у всех 47 человек вместе. Без фильтра
+# метрика показывала бы активность бота и не менялась бы от того, пользуются
+# инструментами люди или нет.
+_MCP_SERVICE_KEYS = frozenset({
+    "knowledge-generator",
+    "squad-medic-robot",
+    "discord-bot",
+    "mcp-preplanner",
+    "claude-ybobryashov-rot",
+})
+
+
+def _is_human_key(key_name: str) -> bool:
+    """Ключ принадлежит человеку, а не сервису."""
+    if not key_name or key_name in _MCP_SERVICE_KEYS:
+        return False
+    # Страховка на будущие боты, заведённые по общему шаблону.
+    return not (
+        key_name.endswith(("-bot", "-robot", "-rot"))
+        or key_name.startswith(("mcp-", "knowledge-", "squad-medic"))
+    )
+
+
+async def mcp_kg_usage_section(vm: VMClient) -> str:
+    """Сколько люди спрашивали Knowledge Graph через MCP за сутки.
+
+    Метрика отвечает на вопрос «граф вообще кому-то нужен»: рост числа
+    обращений и людей — единственный признак, что инструменты приносят пользу.
+    Технические счётчики (узлы, рёбра) растут сами по себе и об этом молчат.
+
+    Источник — `mcp_tool_calls_total{tool,key_name,status}` из tools-server.
+    Служебные ключи отфильтрованы (см. `_MCP_SERVICE_KEYS`), иначе цифру
+    полностью определял бы knowledge-generator.
+    """
+    try:
+        today = await vm.query_instant_by_labels(
+            'sum by (tool, key_name) (increase(mcp_tool_calls_total{tool=~"kg_.*"}[24h]))',
+            ("tool", "key_name"),
+        )
+        # Неделя, а не «вчера»: обращения людей подчиняются рабочему циклу, и
+        # сравнение субботы с пятницей всегда даёт «падение», а понедельника с
+        # воскресеньем — «рост». Замер 08.08.2026 (суббота): 3 активных
+        # человека против 13 в пятницу — при сравнении с вчера секция кричала
+        # бы о проблеме каждые выходные.
+        week = await vm.query_instant_by_labels(
+            'sum by (tool, key_name) ('
+            'increase(mcp_tool_calls_total{tool=~"kg_.*"}[7d]))',
+            ("tool", "key_name"),
+        )
+    except Exception as e:  # noqa: BLE001
+        log.warning("stats_digest.mcp_kg_usage_failed", error=str(e))
+        _note_section_failure("mcp_kg_usage_section")
+        return ""
+
+    def _human_total(data: dict) -> tuple[int, set, dict]:
+        total = 0
+        people: set = set()
+        by_tool: dict = {}
+        for (tool, key_name), value in data.items():
+            if not _is_human_key(key_name):
+                continue
+            calls = int(round(value))
+            if calls <= 0:
+                continue
+            total += calls
+            people.add(key_name)
+            by_tool[tool] = by_tool.get(tool, 0) + calls
+        return total, people, by_tool
+
+    calls, people, by_tool = _human_total(today)
+    week_calls, week_people, _ = _human_total(week)
+
+    if not calls and not week_calls:
+        # Ни сегодня, ни за неделю — метрики может не быть вовсе (tools-server
+        # не скрейпится). Молчим, а не рисуем «0 обращений» как факт.
+        return ""
+
+    top = sorted(by_tool.items(), key=lambda kv: -kv[1])[:3]
+    top_str = ", ".join(f"`{t}` {n}" for t, n in top) if top else "—"
+
+    lines = [
+        "**🔌 KG через MCP (люди)**",
+        f"  сегодня: {calls} обращений от {len(people)} чел.",
+    ]
+    if week_calls:
+        # За неделю — сколько всего и скольким людям граф пригодился хоть раз.
+        # Это и есть ответ на «инструментами пользуются или они лежат».
+        lines.append(
+            f"  за 7 дней: {week_calls} от {len(week_people)} чел. "
+            f"(в среднем {week_calls // 7}/день)",
+        )
+    lines.append(f"  Топ сегодня: {top_str}")
+    return "\n".join(lines)
+
+
 async def topology_growth_section(db: Session) -> str:
     """B8. Δ services / edges / new NATS subjects vs Redis snapshot.
 
@@ -2950,6 +3051,7 @@ async def _build_digest_with_meta(db: Session) -> Tuple[str, Dict[str, Any]]:
     mttr_text = mttr_section(db, days=7)
     deploy_corr_text = deploy_incident_correlation_section(db, hours=24)
     topology_text = await topology_growth_section(db)
+    mcp_usage_text = await mcp_kg_usage_section(vm)
     heartbeats_text = beat_heartbeats_footer(db)
 
     # Item #3: записать сегодняшний firing count для завтрашнего trend.
@@ -2995,6 +3097,7 @@ async def _build_digest_with_meta(db: Session) -> Tuple[str, Dict[str, Any]]:
         mttr_text,
         deploy_corr_text,
         topology_text,
+        mcp_usage_text,
         anomaly_summary_text,
         anomaly_top_text,
         log_errors_text,
