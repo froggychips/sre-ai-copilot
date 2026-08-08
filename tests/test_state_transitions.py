@@ -127,9 +127,11 @@ def test_transition_to_rejects_invalid_jump():
     rec = MagicMock()
     rec.status = IncidentState.OPEN.value
     db = MagicMock()
-    # OPEN → RESOLVED не в TRANSITIONS.
+    # OPEN → FIX_PROPOSED: перепрыгнуть расследование нельзя.
+    # (OPEN → RESOLVED теперь РАЗРЕШЁН намеренно — короткоживущий алерт,
+    # погасший до начала расследования; см. TRANSITIONS в state_machine.)
     with pytest.raises(ValueError, match="Invalid state transition"):
-        transition_to(rec, IncidentState.RESOLVED, db)
+        transition_to(rec, IncidentState.FIX_PROPOSED, db)
     assert rec.status == IncidentState.OPEN.value
     db.commit.assert_not_called()
 

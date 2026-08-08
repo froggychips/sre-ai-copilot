@@ -46,6 +46,8 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from sqlalchemy.orm import Session
 
+from app.knowledge_graph.edge_decay_guard import (
+    SOURCE_TOPOLOGY_INGRESSES, SOURCE_TOPOLOGY_SERVICES, record_source_run)
 from app.knowledge_graph.populator import upsert_edge, upsert_service
 from app.knowledge_graph.schema import (NODE_KIND_SERVICE, NODE_KIND_WORKLOAD,
                                         Service)
@@ -430,6 +432,10 @@ def sync_all_services(
         stats["skipped_no_selector"], stats["skipped_no_match"],
         stats["skipped_self_loop"], stats["errors"],
     )
+    # Отчёт для edge-decay guard: `serves_traffic` децаится только если этот
+    # срез реально отработал. Ровно здесь ломался прод — `kubectl get
+    # services -A` таймаутил, services_fetched=0, а decay об этом не знал.
+    record_source_run(SOURCE_TOPOLOGY_SERVICES, stats)
     return stats
 
 
@@ -561,6 +567,10 @@ def sync_all_ingresses_declarative(db: Session) -> Dict[str, int]:
         stats["edges_created"], stats["skipped_no_backend_match"],
         stats["errors"],
     )
+    # Отчёт для edge-decay guard: отвечает за свежесть `routes_to`. Срез
+    # отдельный от services — у него свой `kubectl get`, свой таймаут и свой
+    # режим отказа, поэтому и здоровье считается отдельно.
+    record_source_run(SOURCE_TOPOLOGY_INGRESSES, stats)
     return stats
 
 

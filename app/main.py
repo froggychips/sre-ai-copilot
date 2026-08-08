@@ -217,10 +217,23 @@ async def post_copilot(
     if not allowed:
         raise HTTPException(status_code=429, detail="Rate limit exceeded")
 
-    if not conversation_id:
-        conversation_id = await repository.create_conversation()
+    # Диалог принадлежит пользователю (JWT-claim `sub`). Раньше владельца не
+    # было вовсе и `conversation_id` из тела принимался как есть: любой
+    # аутентифицированный пользователь мог дописать сообщение в ЧУЖОЙ диалог,
+    # сдвинуть его state machine через generate_reply и забрать результат
+    # через /jobs/{task_id}.
+    #
+    # Чужой и несуществующий conversation_id дают ОДИНАКОВЫЙ 404 (не 403):
+    # иначе ручка становится оракулом «такой диалог существует» для перебора
+    # UUID-ов. Проверка живёт внутри add_message — в одной сессии с записью и
+    # ДО постановки задачи в Celery, так что при отказе задача не ставится.
+    if conversation_id is None:
+        conversation_id = await repository.create_conversation(owner_sub=user.sub)
     await repository.add_message(
-        conv_id=conversation_id, role=MessageRole.user, content=prompt
+        conv_id=conversation_id,
+        role=MessageRole.user,
+        content=prompt,
+        owner_sub=user.sub,
     )
     task = generate_reply.delay(str(conversation_id), prompt)
     response.headers["Location"] = f"/jobs/{task.id}"

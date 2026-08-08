@@ -1,7 +1,7 @@
 import enum
 import uuid
 from datetime import datetime
-from typing import List
+from typing import List, Optional
 
 from sqlalchemy import UUID, DateTime, Enum, ForeignKey, Integer, String, Text
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
@@ -21,6 +21,23 @@ class Conversation(Base):
 
     id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    # Владелец диалога — JWT-claim `sub` (см. app/auth.py: User.sub). До
+    # 08.08.2026 у Conversation владельца не было ВООБЩЕ, и /copilot принимал
+    # любой conversation_id от любого аутентифицированного пользователя: чужой
+    # диалог можно было дописать, сдвинуть его state machine и прочитать ответ
+    # через /jobs/{task_id} (горизонтальная запись, IDOR).
+    #
+    # nullable=True — у строк, созданных ДО миграции 20260808_0100, владельца
+    # нет и взять его неоткуда. Такие legacy-строки трактуются как ЧУЖИЕ
+    # (404), см. app/repository.py::_load_owned_conversation.
+    #
+    # index=True — по owner_sub фильтруются выборки диалогов пользователя
+    # (list_conversations). Имя индекса, которое SQLAlchemy выводит по
+    # умолчанию, — `ix_conversations_owner_sub`; ровно оно создаётся в
+    # миграции, чтобы не было дрейфа модель↔схема.
+    owner_sub: Mapped[Optional[str]] = mapped_column(
+        String, nullable=True, index=True
     )
     current_state: Mapped[str] = mapped_column(String, default="OPEN")
     retry_count: Mapped[int] = mapped_column(Integer, default=0)
