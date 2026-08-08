@@ -221,8 +221,15 @@ statefulsets.apps is forbidden: User "system:serviceaccount:sre-ai:sre-ai" canno
 `ghcr.io`, а `imagePullSecrets` там нет. Реальный выкат — ручной
 `kubectl set image` с образом из Nexus.
 
-**Не исправлено.** Требует решения: либо привести `deploy.sh` и манифесты к
-реальности, либо перевести кластер на процесс из репозитория.
+**Исправлено 08.08.2026.** `deploy.sh` больше не хардкодит registry
+(`IMAGE_REPO` + `IMAGE_TAG`, дефолт — Nexus), манифесты используют общий
+`IMAGE_PLACEHOLDER`, а `ClusterRole sre-ai-deployments-reader` в репозитории
+дополнена `statefulsets`/`daemonsets` — теперь совпадает с кластером.
+
+Заодно стало понятно, почему дрейф вообще возник: `sre-ai-read` в манифесте —
+namespace-scoped **Role**, а синки листят cluster-wide (`kubectl get -A`).
+Эта роль их потребности не покрывала никогда, поэтому cluster-wide права и
+собирали в кластере отдельно.
 
 ---
 

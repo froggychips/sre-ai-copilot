@@ -1082,13 +1082,22 @@ should have at least one case to detect regression.
 
 ## Production rollout (the actual procedure, 2026-08-08)
 
-> **Warning:** `deploy.sh` in the repository describes a process this cluster
-> does NOT use. The script deploys from `ghcr.io/froggychips/...` by git-sha,
-> while the pods pull from Nexus
-> (`docker.lastoasisgame.com/wo/sre-ai-copilot`) by the `1.0.0-rc.N` tag — and
-> there are no `imagePullSecrets` for ghcr in the manifests. Running
-> `deploy.sh` as-is will stall with ImagePullBackOff on the migration Job.
-> The drift is unresolved — see `docs/POSTMORTEM_2026_08_08.md` §4.3.
+> **About `deploy.sh`:** the registry is no longer hard-coded. By default the
+> script pulls from Nexus (`docker.lastoasisgame.com/wo/sre-ai-copilot`) — the
+> same place the pods actually pull from; for a CI image pass
+> `IMAGE_REPO=ghcr.io/froggychips/sre-ai-copilot`. Until 2026-08-08 the script
+> hard-coded ghcr and stalled with ImagePullBackOff in this cluster, which is
+> why rollouts bypassed it entirely.
+>
+> The script now warns about long transactions before migrations and verifies
+> RBAC for real (`kubectl auth can-i`). The steps below describe the manual
+> procedure — still valid, and useful when you want to control every step.
+
+```bash
+IMAGE_TAG=1.0.0-rc.N ./deploy.sh                       # Nexus (default)
+IMAGE_REPO=ghcr.io/froggychips/sre-ai-copilot \
+  IMAGE_TAG=<git-sha> ./deploy.sh                      # image from CI
+```
 
 ### 1. Build and push the image
 
