@@ -1073,3 +1073,184 @@ side-by-side, или открыть `input.json` и перерисовать в 
 
 Цель: каждая embed-форма (severity × enrichment-state × digest-type)
 должна иметь хотя бы один case, чтобы ловить регрессии.
+
+---
+
+## Выкат в прод (реальная процедура, 08.08.2026)
+
+> **Внимание:** `deploy.sh` в репозитории описывает НЕ тот процесс, которым
+> живёт этот кластер. Скрипт деплоит из `ghcr.io/froggychips/...` по git-sha,
+> а поды тянут образ из Nexus (`docker.lastoasisgame.com/wo/sre-ai-copilot`)
+> по тегу `1.0.0-rc.N`, причём `imagePullSecrets` для ghcr в манифестах нет.
+> Запуск `deploy.sh` как есть упрётся в ImagePullBackOff на Job-е миграций.
+> Дрейф не устранён — см. `docs/POSTMORTEM_2026_08_08.ru.md` §4.3.
+
+### 1. Собрать и запушить образ
+
+Обязательно `--platform linux/amd64`: ноды amd64, сборка на ARM-машине без
+флага даёт образ, который не запустится.
+
+```bash
+export DOCKER_HOST="unix://$HOME/.rd/docker.sock"     # Rancher Desktop
+docker build --platform linux/amd64 \
+  -t docker.lastoasisgame.com/wo/sre-ai-copilot:1.0.0-rc.N .
+docker push docker.lastoasisgame.com/wo/sre-ai-copilot:1.0.0-rc.N
+```
+
+Перед пушем полезно убедиться, что в образе то, что ожидаешь:
+
+```bash
+docker run --rm --platform linux/amd64 -e LLM_BACKEND=claude_cli \
+  --entrypoint sh docker.lastoasisgame.com/wo/sre-ai-copilot:1.0.0-rc.N \
+  -c "ls alembic/versions/ | tail -3"
+```
+
+### 2. Миграции — отдельным Job-ом и ТОЛЬКО с `lock_timeout`
+
+`ALTER TABLE` требует ACCESS EXCLUSIVE. Если лок занят, DDL встаёт в очередь
+и **блокирует всех, кто пришёл после него** — 08.08.2026 так зависли семь
+читателей `kg_services`, приложение стояло 6 минут.
+
+В манифест Job-а добавляется:
+
+```yaml
+        env:
+        - name: PGOPTIONS
+          value: "-c lock_timeout=15s"
+```
+
+Не получил лок за 15 секунд — Job упал, читатели не пострадали, пробуем
+снова. Перед запуском стоит посмотреть, есть ли долгие транзакции:
+
+```bash
+kubectl -n sre-ai exec postgres-0 -- sh -c 'psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "
+SELECT (now()-xact_start)::text AS возраст, state,
+       left(regexp_replace(query,E'\''\\s+'\'','\'' '\'','\''g'\''),50)
+FROM pg_stat_activity WHERE datname=current_database() AND state<>'\''idle'\''
+ORDER BY xact_start LIMIT 5;"'
+```
+
+Если транзакции старше пары минут — заглушить писателей на время наката:
+
+```bash
+kubectl -n sre-ai scale deploy copilot-worker copilot-beat --replicas=0
+# ... миграции ...
+kubectl -n sre-ai scale deploy copilot-worker --replicas=2
+kubectl -n sre-ai scale deploy copilot-beat --replicas=1
+```
+
+### 3. Выкатить приложение
+
+```bash
+IMG=docker.lastoasisgame.com/wo/sre-ai-copilot:1.0.0-rc.N
+kubectl -n sre-ai set image deploy/sre-ai-api api=$IMG
+kubectl -n sre-ai set image deploy/copilot-worker worker=$IMG
+kubectl -n sre-ai set image deploy/copilot-beat beat=$IMG
+for d in sre-ai-api copilot-worker copilot-beat; do
+  kubectl -n sre-ai rollout status deploy/$d --timeout=300s
+done
+```
+
+### 4. Проверить после выката
+
+```bash
+# схема доехала
+kubectl -n sre-ai exec postgres-0 -- sh -c \
+  'psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -tAc "SELECT version_num FROM alembic_version"'
+
+# рестартов нет
+kubectl -n sre-ai get pods | grep -E "sre-ai-api|copilot"
+
+# очередь не растёт
+kubectl -n sre-ai exec redis-0 -- redis-cli LLEN celery
+```
+
+---
+
+## Диагностика блокировок в PostgreSQL
+
+### Возраст транзакции ≠ простой транзакции
+
+Две метрики отвечают на разные вопросы, и их легко перепутать (08.08.2026
+именно на этом был поставлен неверный диагноз):
+
+| выражение | что означает | когда важно |
+|---|---|---|
+| `now() - xact_start` | сколько живёт транзакция | **блокировки**: лок держится всю транзакцию |
+| `now() - state_change` | сколько соединение простаивает сейчас | «забытые» сессии |
+
+Транзакция может жить 13 минут, простаивая по 0.1 секунды между запросами —
+она активно работает. `idle_in_transaction_session_timeout` такую **не
+оборвёт**, потому что бьёт по простою. Лечится дроблением на короткие
+транзакции (батчевый commit), а не таймаутом.
+
+```bash
+kubectl -n sre-ai exec postgres-0 -- sh -c 'psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "
+SELECT (now()-xact_start)::text AS возраст_транзакции,
+       (now()-state_change)::text AS простаивает_сейчас, state
+FROM pg_stat_activity WHERE datname=current_database() AND state<>'\''idle'\''
+ORDER BY xact_start LIMIT 8;"'
+```
+
+### Кто кого блокирует
+
+```bash
+kubectl -n sre-ai exec postgres-0 -- sh -c 'psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "
+SELECT pid, pg_blocking_pids(pid) AS ждёт_кого, (now()-query_start)::text AS ждёт,
+       left(regexp_replace(query,E'\''\\s+'\'','\'' '\'','\''g'\''),45)
+FROM pg_stat_activity WHERE datname=current_database() AND wait_event_type='\''Lock'\'';"'
+```
+
+Признак застрявшего DDL: один `ALTER TABLE` ждёт лока, а десяток `SELECT`
+ждут **его самого**. Лечится снятием DDL, а не читателей.
+
+### Осиротевшее соединение
+
+Бэкенд, ждущий лока, не пишет в сокет и не замечает смерти клиента: удаление
+пода Job-а его не убирает. Снимать вручную:
+
+```bash
+kubectl -n sre-ai exec postgres-0 -- sh -c \
+  'psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -tAc "SELECT pg_terminate_backend(<pid>)"'
+```
+
+---
+
+## Разовый запуск тяжёлой beat-задачи
+
+`kubectl exec` в под воркера для этого **не подходит**: он поднимает второй
+Python поверх работающего celery и упирается в лимит памяти (`exit 137`).
+
+Правильно — отдельный Job со своими ресурсами (за основу берётся
+`k8s/migrate-job.yaml`, меняются `command`/`args` и лимиты):
+
+```yaml
+        command: ["python", "-c"]
+        args:
+        - |
+          from app.workers.tasks import kg_topology_resources_sync_task
+          import json
+          print(json.dumps(kg_topology_resources_sync_task(), default=str))
+        resources:
+          limits: { cpu: "1", memory: 2Gi }
+```
+
+Зачем это может понадобиться: если очередь Celery забита, штатный тик задачи
+может не выполниться вовсе — он стоит за протухшим хвостом (см.
+`expires` в `beat_schedule`).
+
+---
+
+## Проверка RBAC перед расширением синка
+
+Наличие права в `k8s/base/rbac.yaml` **не означает**, что оно есть в
+кластере: в этом кластере `ClusterRole sre-ai-read` из репозитория не
+применялась вовсе. Проверять только фактически:
+
+```bash
+for r in deployments statefulsets daemonsets; do
+  echo -n "$r: "
+  kubectl auth can-i list $r.apps \
+    --as=system:serviceaccount:sre-ai:sre-ai --all-namespaces
+done
+```
