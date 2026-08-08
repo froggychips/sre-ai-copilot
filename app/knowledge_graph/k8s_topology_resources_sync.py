@@ -627,11 +627,21 @@ def _sync_one_ingress(
 
 
 def sync_topology_resources(db: Session) -> Dict[str, Any]:
-    """Main entry: один tick — fetch deployments один раз, потом services,
+    """Main entry: один tick — fetch workloads один раз, потом services,
     потом ingresses. Возвращает dict с обоими slice-ами stats для observability.
     """
+    # Транзакцию отпускаем ДО kubectl. Открытая транзакция здесь простаивала
+    # бы всё время внешнего вызова, держа ACCESS SHARE на прочитанных
+    # таблицах: DDL не смог бы взять свой лок, а писатели встали бы в
+    # очередь (замер на проде 08.08.2026 — транзакции до 25 минут).
+    # Окно широкое: _kubectl_get_deployments_all ходит за тремя ресурсами
+    # (Deployment/StatefulSet/DaemonSet), каждый со своим таймаутом.
+    db.rollback()
     deployments_index = _index_deployments_by_ns(_kubectl_get_deployments_all())
     svc_stats = sync_all_services(db, deployments_index=deployments_index)
+    # sync_all_services завершается commit-ом, но следующий шаг снова
+    # начинается с kubectl — на всякий случай не тащим транзакцию туда.
+    db.rollback()
     ing_stats = sync_all_ingresses_declarative(db)
     return {"services": svc_stats, "ingresses": ing_stats}
 
