@@ -42,11 +42,15 @@ spec:
           type: RuntimeDefault
       containers:
       - name: api
-        # IMAGE_TAG_PLACEHOLDER подставляет deploy.sh (IMAGE_TAG=<git-sha>).
+        # IMAGE_PLACEHOLDER подставляет deploy.sh целиком (registry+repo+tag).
+        # Registry задаётся через IMAGE_REPO — он разный по кластерам:
+        # CI публикует в ghcr по git-sha, а WO-кластер тянет из Nexus
+        # по тегу 1.0.0-rc.N. Хардкод ghcr здесь означал, что deploy.sh
+        # в WO-кластере молча упирался в ImagePullBackOff.
         # CI публикует ТОЛЬКО :<git-sha> (см. .github/workflows/ci.yml) —
         # тега :latest не существует, apply без подстановки = ImagePullBackOff.
         # Pin по digest в CI: image: ghcr.io/froggychips/sre-ai-copilot@sha256:<digest>
-        image: ghcr.io/froggychips/sre-ai-copilot:IMAGE_TAG_PLACEHOLDER
+        image: IMAGE_PLACEHOLDER
         # Теги immutable (git-sha) → IfNotPresent корректен и не дёргает registry.
         imagePullPolicy: IfNotPresent
         ports:
