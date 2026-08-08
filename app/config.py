@@ -106,6 +106,32 @@ class Settings(BaseSettings):
     CELERY_WORKER_MAX_TASKS_PER_CHILD: int = Field(50, description="Worker restart after N tasks (memory leak protection)")
     CELERY_TASK_TIME_LIMIT_SECONDS: int = Field(1800, description="Hard task timeout (30 min)")
     CELERY_TASK_SOFT_TIME_LIMIT_SECONDS: int = Field(1500, description="Soft task timeout (25 min)")
+    # Late ack: сообщение подтверждается ПОСЛЕ выполнения, поэтому задача,
+    # убитая вместе с воркером (OOMKill, эвикт, rollout), возвращается в
+    # очередь, а не теряется молча. Аварийный выключатель на случай
+    # poison-message-петли — но по умолчанию потерять инцидент хуже.
+    # NB: у Redis-брокера нет настоящего ack, роль ack-таймаута играет
+    # broker_transport_options.visibility_timeout — он ОБЯЗАН превышать
+    # CELERY_TASK_TIME_LIMIT_SECONDS, иначе тот же инцидент поедет вторым
+    # параллельным прогоном (см. app/workers/tasks.py).
+    CELERY_ACKS_LATE: bool = Field(
+        True, description="Подтверждать задачу после выполнения (не терять при смерти воркера)"
+    )
+    # Строки conversations, созданные ДО появления owner_sub, имеют NULL —
+    # то есть «неизвестно чей», а не «ничей», и по умолчанию отдают 404.
+    # Усыновление первым обратившимся — это тот же IDOR, только одноразовый
+    # (перебор UUID забирает историю быстрее настоящего владельца), поэтому
+    # дефолт fail-closed. Вентиль на миграционное окно, включать осознанно.
+    COPILOT_LEGACY_CONVERSATION_ADOPTION: bool = Field(
+        False, description="Разрешить усыновление legacy-диалогов без владельца"
+    )
+    # Окно свежести источника рёбер (и TTL отчёта синка) для kind-aware decay.
+    # Обязано быть БОЛЬШЕ самого редкого beat-интервала среди синков-источников
+    # (сейчас самый редкий — nats_subjects, 6ч), иначе живой источник будет
+    # выглядеть протухшим и decay встанет без причины.
+    KG_EDGE_SOURCE_FRESH_HOURS: int = Field(
+        24, description="Окно свежести источника рёбер для kind-aware edge-decay"
+    )
     CELERY_PROCESS_INCIDENT_RATE_LIMIT: str = Field(
         "30/m", description="Rate limit для process_incident — защита LLM-бюджета"
     )

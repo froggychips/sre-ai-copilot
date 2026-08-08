@@ -29,6 +29,83 @@ celery_app = Celery("sre_tasks", broker=settings.REDIS_URL, backend=settings.RED
 # PENDING. Не зависит от backpressure-блока ниже (тот gated на non-eager).
 celery_app.conf.task_track_started = True
 
+# ── Late acknowledgement (задача переживает смерть воркера) ─────────────────
+#
+# ПРОБЛЕМА, которую это чинит. По умолчанию Celery работает в acks_early:
+# брокер вычёркивает сообщение из очереди в момент ВЫДАЧИ воркеру, ещё до
+# первой строки таска. Если воркер умирает в середине обработки — OOMKill
+# (см. арифметику лимитов в k8s/worker.yaml), eviction по imagefs, rollout,
+# drain ноды — задача уже заacked. Она не будет переотправлена: инцидент
+# просто не обработан, ретрая не будет, следа в очереди не останется.
+# Для системы, чья работа — «не проспать инцидент», это худший класс отказа:
+# тихая потеря без единого сигнала.
+#
+# `task_acks_late=True` переносит ack на момент ПОСЛЕ выполнения, поэтому
+# смерть воркера возвращает сообщение в очередь, и его подхватывает живая
+# реплика (их 2, см. replicas в k8s/worker.yaml и helm values).
+#
+# `task_reject_on_worker_lost=True` — без него потеря воркера отдаёт задаче
+# WorkerLostError и она помечается FAILURE (то есть всё равно теряется,
+# просто с трейсом). True = сообщение реджектится с requeue.
+#
+# `task_acks_on_failure_or_timeout=True` (дефолт, но фиксируем явно, потому
+# что это единственная защита от poison-message-петли): обычный exception и
+# срабатывание soft/hard time limit'а задачу ПОДТВЕРЖДАЮТ, а не возвращают
+# в очередь. Иначе таск, который стабильно падает или стабильно упирается в
+# 30-минутный hard limit, крутился бы по кругу вечно, занимая слот. Ретраями
+# управляет `autoretry_for` (см. RETRIABLE_EXC ниже), а не брокер.
+#
+# ВЗАИМОДЕЙСТВИЕ С УЖЕ НАСТРОЕННЫМ BACKPRESSURE (смысл сохранён):
+#   * `worker_prefetch_multiplier=1` — штатная пара к acks_late: воркер держит
+#     ровно одно неподтверждённое сообщение на слот. Без этого при acks_late
+#     под воркером копилась бы пачка зарезервированных, но неподтверждённых
+#     задач, и его смерть возвращала бы их все разом.
+#   * `worker_max_tasks_per_child=50` — плановый recycle ребёнка происходит
+#     ПОСЛЕ завершения и ack'а задачи, это штатный выход, а не worker-lost;
+#     ложных переотправок не даёт.
+#   * time limit'ы не тронуты: 1500s soft / 1800s hard.
+#
+# КРИТИЧНО ДЛЯ REDIS-БРОКЕРА: у redis-транспорта нет настоящего ack —
+# «неподтверждённое» сообщение возвращается в очередь по `visibility_timeout`.
+# Если он окажется МЕНЬШЕ времени выполнения, redis отдаст сообщение второму
+# воркеру, пока первый ещё работает: два параллельных прогона одного инцидента.
+# Поэтому держим окно заведомо больше hard time limit'а (×2). Сейчас это
+# 3600s при hard limit 1800s — то же, что дефолт kombu, но теперь связь
+# зафиксирована: поднимут CELERY_TASK_TIME_LIMIT_SECONDS — окно поедет само.
+#
+# ИДЕМПОТЕНТНОСТЬ (почему повторный прогон безопасен). При acks_late задача
+# может выполниться ПОВТОРНО — воркер мог умереть уже после side-effect'а, но
+# до ack'а. Что защищает:
+#   * `process_incident` — checkpoint/resume в pipeline.py (`_CHECKPOINT_KEY`
+#     в record.analysis + `_COMPLETED_BY_STATE`): уже закоммиченные стадии
+#     пропускаются, их вывод берётся из checkpoint-а, повторного прожига LLM
+#     нет. `transition_to` толерантен к re-entry (`_PIPELINE_STATE_ORDER`) —
+#     повтор стадии не падает на «Invalid transition».
+#   * Реальный kubectl-write в этом таске НЕ живёт: apply идёт отдельным
+#     путём (app/services/executor_apply.py, кнопка на Discord-embed) и закрыт
+#     row-lock'ом + маркером `analysis.executor_applied` — повторный claim
+#     получает отказ already_applied, двойного apply быть не может.
+#   * kg_*-синки — upsert'ы по естественным ключам (event_uid, (service_id,
+#     ts), (service_id, buildtype_id, build_number), ON CONFLICT DO UPDATE):
+#     повторный прогон переписывает те же строки.
+#   * Discord — cross-replica PATCH-dedup в таблице `discord_dedup`
+#     (app/services/discord/dedup_store.py), не per-process: повторная
+#     доставка не даёт второй POST в пределах TTL-окна.
+# Тасков с незащищённым необратимым внешним write'ом здесь нет. Известный
+# остаток — дайджесты (daily_stats_digest / team_daily_digest /
+# chronic_alerts_digest) и in-memory dedup у kg_self_health_check /
+# kg_stuck_alerts_check: повторная доставка может продублировать сообщение в
+# канал. Это шум, а не повреждение данных; терять дайджест молча хуже.
+# Если какой-то таск всё же понадобится вернуть в acks_early — это делается
+# точечно: `@celery_app.task(..., acks_late=False)`, глобальную настройку
+# ломать не нужно.
+#
+# Аварийный выключатель читается через getattr: чтобы `CELERY_ACKS_LATE=false`
+# в env реально работал, поле нужно объявить в app/config.py (Settings стоит
+# на extra="ignore" — необъявленный env-var молча игнорируется). Пока поля
+# нет, значение всегда True.
+_ACKS_LATE: bool = bool(getattr(settings, "CELERY_ACKS_LATE", True))
+
 # Backpressure-настройки (см. config.py для пояснений).
 # Не применяются в eager-mode чтобы тесты не упирались в time-limit'ы.
 if not settings.CELERY_TASK_ALWAYS_EAGER:
@@ -39,6 +116,15 @@ if not settings.CELERY_TASK_ALWAYS_EAGER:
         task_soft_time_limit=settings.CELERY_TASK_SOFT_TIME_LIMIT_SECONDS,
         # Celery 6 deprecation — без этого warning на старте worker'а.
         broker_connection_retry_on_startup=True,
+        # См. блок «Late acknowledgement» выше.
+        task_acks_late=_ACKS_LATE,
+        task_reject_on_worker_lost=_ACKS_LATE,
+        task_acks_on_failure_or_timeout=True,
+        broker_transport_options={
+            "visibility_timeout": max(
+                3600, settings.CELERY_TASK_TIME_LIMIT_SECONDS * 2
+            ),
+        },
     )
 
 if settings.CELERY_TASK_ALWAYS_EAGER:

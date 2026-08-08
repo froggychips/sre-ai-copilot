@@ -10,7 +10,7 @@ from sqlalchemy.orm import Session
 
 from app.auth import User, get_current_user
 from app.config import settings
-from app.core.state_machine import IncidentState
+from app.core.state_machine import IncidentState, StateMachine
 from app.security.replay import alertmanager_signature_cache, is_timestamp_fresh
 from app.database import IncidentRecord, get_db
 from app.ingestion.raw_collector import raw_collector
@@ -256,6 +256,73 @@ def _claim_refire(
     return rows
 
 
+def _apply_resolve(
+    db: Session, existing: IncidentRecord, incident: Incident, prev_status: str
+) -> str:
+    """Применить resolve-вебхук к нетерминальной строке ЧЕРЕЗ state machine.
+
+    Раньше статус писался силой из ЛЮБОГО нетерминального состояния. Для
+    короткоживущего алерта (median TTR ~11 мин против многоминутного
+    пайплайна) это означало: строка уезжает в RESOLVED, пока пайплайн ещё
+    в полёте, и он умирает на следующем `_safe_transition` — отчёт не
+    отправляется, а в analysis остаётся `resolved_early`-огрызок вместо
+    нормального разбора.
+
+    Поведение теперь:
+
+    * переход `current → RESOLVED` ВАЛИДЕН по StateMachine
+      (FACTS_COLLECTED / FIX_PROPOSED / EXECUTING) — пишем RESOLVED, как и
+      раньше;
+    * переход НЕВАЛИДЕН (OPEN / INVESTIGATING / HYPOTHESIS_GENERATED /
+      APPROVAL_PENDING — пайплайн в середине работы) — статус НЕ трогаем.
+      Резолв не теряем: кладём маркер в `data` (по образцу `flap_count`,
+      который так же живёт в `data`) и логируем факт. Пайплайн доводит
+      инцидент до своего терминала штатно и отправляет отчёт, а маркер
+      остаётся следом для постмортема «алерт погас, пока мы его разбирали».
+
+    Возвращает строку для поля `task_id` в ответе: "resolved" (статус
+    записан) либо "resolve-deferred" (отложено до конца пайплайна).
+    """
+    try:
+        current_state = IncidentState(prev_status)
+    except ValueError:
+        # Незнакомый/legacy статус — вслепую в терминал не переводим.
+        current_state = None
+
+    if current_state is not None and StateMachine.validate_transition(
+        current_state, IncidentState.RESOLVED
+    ):
+        existing.status = IncidentState.RESOLVED.value
+        db.commit()
+        log.info(
+            "webhook.alert_resolved",
+            incident_id=incident.incident_id,
+            prev_status=prev_status,
+        )
+        return "resolved"
+
+    from datetime import datetime, timezone
+
+    # data — обычный JSON-столбец без MutableDict, in-place мутацию
+    # SQLAlchemy не заметит: пересобираем dict целиком. Статус в UPDATE не
+    # попадает (атрибут не менялся) — гонки с пайплайном, который пишет
+    # status из своей сессии, тут нет.
+    existing.data = {
+        **(existing.data or {}),
+        "resolve_pending": True,
+        "resolve_pending_from": prev_status,
+        "resolved_at": incident.ends_at or datetime.now(timezone.utc).isoformat(),
+    }
+    db.commit()
+    log.info(
+        "webhook.alert_resolve_deferred",
+        incident_id=incident.incident_id,
+        prev_status=prev_status,
+        reason="transition_invalid_pipeline_in_flight",
+    )
+    return "resolve-deferred"
+
+
 @router.post(
     "/alertmanager",
     status_code=202,
@@ -310,16 +377,22 @@ async def alertmanager_webhook(
 
         # ── RESOLVED webhook: update DB, no pipeline dispatch ──────────────
         if alert.status == "resolved":
+            resolve_result = "resolved"
             if existing is not None and existing.status not in {
                 IncidentState.RESOLVED.value,
                 IncidentState.TRIAGE_REQUIRED.value,
                 IncidentState.FAILED.value,
             }:
-                existing.status = IncidentState.RESOLVED.value
-                db.commit()
-                log.info("webhook.alert_resolved", incident_id=incident.incident_id,
-                         prev_status=existing.status)
-            accepted.append({"incident_id": incident.incident_id, "task_id": "resolved"})
+                # prev_status ЧИТАЕМ ДО присваивания. Раньше лог стоял ПОСЛЕ
+                # `existing.status = RESOLVED` и печатал уже НОВОЕ значение —
+                # всегда "RESOLVED". Постмортем терял единственный след того,
+                # из какого состояния инцидент был закрыт резолвом.
+                prev_status = str(existing.status)
+                resolve_result = _apply_resolve(db, existing, incident, prev_status)
+            accepted.append({
+                "incident_id": incident.incident_id,
+                "task_id": resolve_result,
+            })
             continue
 
         # ── FIRING: detect flapping (re-fire after RESOLVED/TRIAGE_REQUIRED) ─
@@ -514,7 +587,7 @@ async def alertmanager_webhook_enrich_and_forward(
     Если DISCORD_ENRICH_ENABLED=false — поведение идентично /store.
     """
     from app.knowledge_graph.auto_populator import populate_from_incident
-    from app.services.alert_enrichment import enrich_alert
+    from app.services.alert_enrichment import enrich_alert_async
     from app.services.discord_service import DiscordService
 
     raw_payload = payload.model_dump()
@@ -652,7 +725,16 @@ async def alertmanager_webhook_enrich_and_forward(
                     )
                     continue
 
-                ctxs = [enrich_alert(db, inc) for inc in incs]
+                # enrich_alert целиком синхронный и тяжёлый (10+ sync SQL,
+                # sync Jira HTTP, live k8s API до 3s, statics-Postgres с
+                # time.sleep-backoff — worst case ~15-17s). Прямой вызов
+                # блокировал event loop, и на alert-storm-е вставал весь
+                # API-процесс, включая health-пробы. Обёртка уводит работу
+                # в thread pool.
+                # Await-ы ПОСЛЕДОВАТЕЛЬНЫЕ (не gather): SQLAlchemy Session
+                # не потокобезопасна, конкурентные вызовы с одной и той же
+                # `db` рвут сессию.
+                ctxs = [await enrich_alert_async(db, inc) for inc in incs]
                 env_hint = _env_hint(incs[0].namespace)
                 resurfaced = (decision == Decision.SEND_RESURFACED)
                 await discord_service.send_enriched_alert(

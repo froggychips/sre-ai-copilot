@@ -12,6 +12,20 @@ TTL сравнением first_ts. Postgres недоступен / таблиц�
 
 Sync-вызовы из async-кода: каждый запрос — короткий single-row UPSERT по
 PK, на фоне HTTP-roundtrip'а к Discord это шум.
+
+СЕКРЕТОВ В ТАБЛИЦЕ НЕТ (2026-08-08). Раньше тут лежала колонка
+`webhook_url` с ПОЛНЫМ Discord webhook URL — а его хвост это токен, дающий
+право постить в канал от имени бота. Любой read-only доступ к БД (реплика,
+бэкап, дамп, сервис с грантом только на SELECT) превращался в право спама.
+Колонка снесена миграцией 20260808_0200; хранить её было незачем: URL
+резолвится ИСКЛЮЧИТЕЛЬНО из конфигурации — `settings.DISCORD_WEBHOOK_URL`
+для enriched-канала и `_pick_webhook_url(team_owner, severity)`
+(settings.DISCORD_TEAM_CHANNEL_MAP) для incident-канала, — снаружи он не
+приходит. Оба PATCH-хелпера в service.py и так получают этот url
+аргументом, а сохранённое значение использовали лишь как
+`rec.get("webhook_url") or url`, т.е. дубликат того, что уже в руках.
+Что остаётся в строке: msg_id (не секрет — сам по себе не даёт постить),
+embed и debug-метки алерта.
 """
 
 import logging
@@ -40,7 +54,8 @@ class DiscordDedupEntry(Base):
 
     key = Column(String(40), primary_key=True)  # sha1 hex от _compute_enriched_key
     msg_id = Column(String(32), nullable=False)
-    webhook_url = Column(String(512), nullable=False)
+    # webhook_url тут БЫЛ и снесён миграцией 20260808_0200 — см. докстринг
+    # модуля. Не возвращать: PATCH-URL резолвится из настроек в рантайме.
     embed = Column(JSON, nullable=True)
     first_ts = Column(DateTime, nullable=False, index=True)
     last_ts = Column(DateTime, nullable=False)
@@ -63,7 +78,6 @@ def _to_ts(dt: datetime) -> float:
 def _row_to_dict(row: DiscordDedupEntry) -> Dict[str, Any]:
     return {
         "msg_id": row.msg_id,
-        "webhook_url": row.webhook_url,
         "embed": row.embed,
         # cast: на инстансе ORM-атрибуты — datetime; стабы SQLAlchemy после
         # bump'а (kubernetes/starlette deps, 2026-06-16) стали инферить их
@@ -153,7 +167,6 @@ def claim(
             row = DiscordDedupEntry(
                 key=key,
                 msg_id="",           # placeholder до финализации save()
-                webhook_url="",
                 embed=None,
                 first_ts=_to_dt(now),
                 last_ts=_to_dt(now),
@@ -180,7 +193,6 @@ def claim(
                     return _row_to_dict(locked)
                 # Stale-строка: переклеймливаем окно под себя.
                 locked.msg_id = ""
-                locked.webhook_url = ""
                 locked.embed = None
                 locked.first_ts = _to_dt(now)
                 locked.last_ts = _to_dt(now)
@@ -205,7 +217,6 @@ def claim(
                 "first_ts": now,
                 "last_ts": now,
                 "count": 1,
-                "webhook_url": "",
                 "embed": None,
                 "alertname": alertname,
                 "namespace": namespace,
@@ -316,7 +327,6 @@ def save(
     key: str,
     *,
     msg_id: str,
-    webhook_url: str,
     embed: Optional[Dict[str, Any]],
     alertname: Optional[str] = None,
     namespace: Optional[str] = None,
@@ -325,7 +335,12 @@ def save(
     now: Optional[float] = None,
 ) -> None:
     """Зафиксировать свежий POST. UPSERT: stale-строка с тем же ключом
-    перезаписывается с count=1 (это новое окно, не recurrence)."""
+    перезаписывается с count=1 (это новое окно, не recurrence).
+
+    Параметра `webhook_url` НЕТ намеренно — сигнатура закрывает дорогу
+    обратно к хранению токена (см. докстринг модуля). Caller, которому нужен
+    PATCH-endpoint, резолвит URL из настроек в момент PATCH-а.
+    """
     now = now or time.time()
     try:
         with _pg_session() as db:
@@ -334,7 +349,6 @@ def save(
                 row = DiscordDedupEntry(key=key)
                 db.add(row)
             row.msg_id = msg_id
-            row.webhook_url = webhook_url
             row.embed = embed
             row.first_ts = _to_dt(now)
             row.last_ts = _to_dt(now)
@@ -353,7 +367,6 @@ def save(
                 "first_ts": now,
                 "last_ts": now,
                 "count": 1,
-                "webhook_url": webhook_url,
                 "embed": embed,
                 "alertname": alertname,
                 "namespace": namespace,

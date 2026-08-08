@@ -75,6 +75,8 @@ from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 
 from sqlalchemy.orm import Session
 
+from app.knowledge_graph.edge_decay_guard import (
+    SOURCE_NATS_SUBJECTS_SYNC, record_source_run)
 from app.knowledge_graph.populator import upsert_edge, upsert_service
 from app.knowledge_graph.schema import NODE_KIND_SERVICE, Service
 
@@ -555,15 +557,23 @@ def sync_nats_subjects(
     sparse_dirs_raw = os.environ.get("WO_MONOREPO_SPARSE_DIRS", "GR.Platform,GR.Platform.Features,GR.WO.*")
     sparse_dirs = [s.strip() for s in sparse_dirs_raw.split(",") if s.strip()]
 
+    # Каждый выход из функции (в т.ч. аварийный) отчитывается edge-decay
+    # guard'у: `uses_nats`-рёбра subject-парсера можно децаить ТОЛЬКО если
+    # этот синк реально отработал. Раньше сбой git/clone был не отличим от
+    # «в монорепе больше нет NATS-вызовов» и рёбра тихо старели.
+    def _report(result: Dict[str, Any]) -> Dict[str, Any]:
+        record_source_run(SOURCE_NATS_SUBJECTS_SYNC, result)
+        return result
+
     if not skip_fetch:
         try:
             _ensure_monorepo(monorepo_path, ssh_url, sparse_dirs)
         except subprocess.CalledProcessError as e:
             logger.error("nats_subjects.git_failed cmd=%s rc=%d", e.cmd, e.returncode)
-            return {"error": "git_failed", "files_scanned": 0}
+            return _report({"error": "git_failed", "files_scanned": 0})
         except subprocess.TimeoutExpired:
             logger.error("nats_subjects.git_timeout")
-            return {"error": "git_timeout", "files_scanned": 0}
+            return _report({"error": "git_timeout", "files_scanned": 0})
 
     # Sanity-check: достаточно ли C#-файлов?
     cs_count = sum(1 for _ in monorepo_path.glob("**/*.cs"))
@@ -572,7 +582,7 @@ def sync_nats_subjects(
             "nats_subjects.too_few_cs path=%s count=%d < %d — abort",
             monorepo_path, cs_count, _MIN_CS_FILES,
         )
-        return {"error": "too_few_cs_files", "files_scanned": cs_count}
+        return _report({"error": "too_few_cs_files", "files_scanned": cs_count})
 
     parsed = parse_monorepo(monorepo_path)
     logger.info(
@@ -593,7 +603,7 @@ def sync_nats_subjects(
         "unresolved_constants": len(parsed.unresolved_constants),
         "completed_at": datetime.utcnow().isoformat(),
     })
-    return persisted
+    return _report(persisted)
 
 
 # ---------------------------------------------------------------------------
