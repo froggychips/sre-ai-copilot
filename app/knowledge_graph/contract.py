@@ -39,6 +39,9 @@ log = logging.getLogger(__name__)
 #: 2.1 = после Wave 7 (PodEvent corr / Service+Ingress topology / NATS subjects).
 #: 2.2 = после PR #82 (k8s_jobs_sync), #84 (k8s_storage_sync) и #86
 #: (kg_services.stale_class column + multi-signal owner inference).
+#: 2.5 = orphan перестал засчитывать `serves_traffic` как связность: это
+#: ребро на собственный workload, оно появилось у всех разом вместе с
+#: node_kind и занизило orphan с 72.5% до 42% без единой новой интеграции.
 #: 2.4 = `kg_services.node_kind`: узел графа перестал означать одновременно
 #: k8s Service и workload. serves_traffic снова строится (было 3 ребра на весь
 #: граф), метрики качества (orphan/owner/сервисов всего) считаются по
@@ -47,7 +50,7 @@ log = logging.getLogger(__name__)
 #: без expected_stale-инфры) + единый источник `compute_orphan_stats`; все
 #: consumer'ы (STARTUP_CONTRACT_CHECK, quality_report, stats_digest) считают
 #: orphan через него. EDGE_KINDS не менялись.
-KG_SCHEMA_VERSION: str = "2.4"
+KG_SCHEMA_VERSION: str = "2.5"
 
 
 # ---------------------------------------------------------------------------
@@ -90,6 +93,10 @@ SERVICE_KINDS: Set[str] = REAL_SERVICE_KINDS | SYNTHETIC_KINDS
 #:
 #: Метрики качества графа (orphan, owner-coverage, «сервисов всего») считаются
 #: ТОЛЬКО по node_kind='service' — иначе workload-узлы удваивают знаменатель.
+#: Ребро Service → backing workload. Вынесено в константу, потому что
+#: orphan-метрика обязана его игнорировать (см. compute_orphan_stats).
+EDGE_SERVES_TRAFFIC: str = "serves_traffic"
+
 NODE_KIND_SERVICE: str = "service"
 NODE_KIND_WORKLOAD: str = "workload"
 NODE_KIND_INGRESS: str = "ingress"
@@ -381,11 +388,20 @@ def compute_orphan_stats(db: "Session") -> OrphanStats:
         включение их в scope занизило бы orphan_pct вдвое без единого
         реально починенного сервиса.
       * `orphan` = из них те, чей id НЕ встречается ни как src, ни как dst
-        ни в одной edge ЛЮБОГО kind (`kg_service_edges`). **Self-loop'ы
-        (src_id == dst_id) НЕ считаются связностью**: сервис, соединённый
-        только сам с собой, топологически изолирован = orphan. (До #190
-        serves_traffic-петли маскировали реальных orphan'ов как non-orphan;
-        этот guard не даёт маске вернуться при любом будущем self-loop.)
+        ни в одной edge (`kg_service_edges`), КРОМЕ `serves_traffic`.
+        **Self-loop'ы (src_id == dst_id) НЕ считаются связностью**: сервис,
+        соединённый только сам с собой, топологически изолирован = orphan.
+        (До #190 serves_traffic-петли маскировали реальных orphan'ов как
+        non-orphan; этот guard не даёт маске вернуться.)
+
+        Почему `serves_traffic` исключён (contract 2.5): это ребро Service →
+        его собственный backing workload, то есть связь узла со своей же
+        реализацией, а не с другим сервисом. Пока типа узла не было, такое
+        ребро вырождалось в self-loop и отбрасывалось; с node_kind оно стало
+        настоящим — и разом «вылечило» 1506 orphan'ов, ничего не изменив в
+        интеграциях. Замер 08.08.2026: 72.5% → 42.0% при неизменной
+        межсервисной связности (3578 orphan'ов и до, и после). Метрика не
+        должна улучшаться от того, что мы поменяли схему хранения.
       * `orphan_pct` = round(100*orphan/app_scope, 1), или None если
         app_scope == 0 (пустая БД — не показываем ложный 0%).
 
@@ -398,6 +414,7 @@ def compute_orphan_stats(db: "Session") -> OrphanStats:
     # (Bandit B608 + чистая практика; значение и так доверенная константа).
     params = {"exp": STALE_CLASS_EXPECTED_STALE}
     params["svc_kind"] = NODE_KIND_SERVICE
+    params["st"] = EDGE_SERVES_TRAFFIC
     app_scope = db.execute(text(
         "SELECT count(*) FROM kg_services s "
         "WHERE NOT s.synthetic "
@@ -410,8 +427,10 @@ def compute_orphan_stats(db: "Session") -> OrphanStats:
         "  AND s.node_kind = :svc_kind "
         "  AND coalesce(s.stale_class, '') <> :exp "
         "  AND s.id NOT IN ("
-        "      SELECT src_id FROM kg_service_edges WHERE src_id <> dst_id "
-        "      UNION SELECT dst_id FROM kg_service_edges WHERE src_id <> dst_id"
+        "      SELECT src_id FROM kg_service_edges "
+        "      WHERE src_id <> dst_id AND kind <> :st "
+        "      UNION SELECT dst_id FROM kg_service_edges "
+        "      WHERE src_id <> dst_id AND kind <> :st"
         "  )"
     ), params).scalar() or 0
     orphan_pct = round(100.0 * orphan / app_scope, 1) if app_scope > 0 else None

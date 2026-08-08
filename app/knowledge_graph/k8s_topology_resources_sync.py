@@ -637,9 +637,16 @@ def _sync_one_ingress(
 
 
 def sync_topology_resources(db: Session) -> Dict[str, Any]:
-    """Main entry: один tick — fetch deployments один раз, потом services,
+    """Main entry: один tick — fetch workloads один раз, потом services,
     потом ingresses. Возвращает dict с обоими slice-ами stats для observability.
     """
+    # Порядок важен для блокировок: оба kubectl-вызова идут ДО первого SQL,
+    # поэтому транзакция на время внешних вызовов не открыта. Первый — здесь,
+    # второй — в начале sync_all_ingresses_declarative, уже после commit-а
+    # из sync_all_services. Не переставляйте чтение k8s после запросов к БД:
+    # открытая транзакция простаивала бы всё время kubectl (три ресурса,
+    # каждый со своим таймаутом), держа ACCESS SHARE на kg_services — на
+    # проде 08.08.2026 такие простои заблокировали миграцию и положили API.
     deployments_index = _index_deployments_by_ns(_kubectl_get_deployments_all())
     svc_stats = sync_all_services(db, deployments_index=deployments_index)
     ing_stats = sync_all_ingresses_declarative(db)

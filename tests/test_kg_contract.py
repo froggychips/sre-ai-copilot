@@ -362,9 +362,6 @@ def test_compute_orphan_stats_ignores_workload_nodes(db):
     У workload-узла ребро serves_traffic от его Service есть всегда, поэтому
     включение их в знаменатель занизило бы orphan_pct вдвое — «граф стал
     вдвое связнее» без единого реально связанного сервиса.
-
-    Seed: 1 orphan-service + Service/workload-пара со связью.
-    app_scope = {orphan-svc, web} = 2 (workload вне scope), orphan = 1 → 50%.
     """
     orphan_svc = Service(name="orphan-svc", namespace="ns", team_owner="t")
     orphan_svc.synthetic = False
@@ -380,9 +377,42 @@ def test_compute_orphan_stats_ignores_workload_nodes(db):
     db.commit()
 
     stats = compute_orphan_stats(db)
+    # scope — только service-узлы: workload в знаменатель не попал
     assert stats["app_scope"] == 2
-    assert stats["orphan"] == 1
-    assert stats["orphan_pct"] == 50.0
+
+
+def test_serves_traffic_alone_does_not_clear_orphan(db):
+    """serves_traffic НЕ засчитывается как связность (contract 2.5).
+
+    Это ребро Service → его собственный backing workload, то есть связь узла
+    со своей же реализацией. Пока типа узла не было, оно вырождалось в
+    self-loop и отбрасывалось; с node_kind стало настоящим — и разом сняло
+    orphan с 1506 сервисов, не добавив ни одной интеграции (замер на проде
+    08.08.2026: 72.5% → 42.0% при неизменных 3578 orphan'ах по остальным
+    рёбрам). Метрика не должна улучшаться от смены схемы хранения.
+    """
+    lonely = Service(name="lonely", namespace="ns", team_owner="t")
+    lonely.synthetic = False
+    lonely_wl = Service(name="lonely", namespace="ns", team_owner="t",
+                        node_kind=NODE_KIND_WORKLOAD)
+    lonely_wl.synthetic = False
+    talker = Service(name="talker", namespace="ns", team_owner="t")
+    talker.synthetic = False
+    peer = Service(name="peer", namespace="ns", team_owner="t")
+    peer.synthetic = False
+    db.add_all([lonely, lonely_wl, talker, peer])
+    db.flush()
+    # lonely связан ТОЛЬКО со своим workload — этого мало
+    db.add(ServiceEdge(src_id=lonely.id, dst_id=lonely_wl.id,
+                       kind="serves_traffic", weight=1))
+    # talker реально зовёт другой сервис — вот это связность
+    db.add(ServiceEdge(src_id=talker.id, dst_id=peer.id, kind="calls", weight=1))
+    db.commit()
+
+    stats = compute_orphan_stats(db)
+    assert stats["app_scope"] == 3          # lonely, talker, peer
+    assert stats["orphan"] == 1             # только lonely
+    assert stats["orphan_pct"] == round(100 / 3, 1)
 
 
 def test_startup_contract_check_owner_pct_ignores_workload_nodes(db):
