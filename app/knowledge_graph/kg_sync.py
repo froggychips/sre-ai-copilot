@@ -90,7 +90,21 @@ _NATS_ENV_RE = re.compile(
 
 # Env-prefix к namespace для определения "shared"-кластера NATS.
 # prod-kingdom1 → prod-shared, preprod-kingdom2 → preprod-shared, etc.
-_NAMESPACE_ENV_PREFIX_RE = re.compile(r"^(prod|preprod|preupdate)(?:-|$)")
+#
+# Squad-стенды именуются иначе: `squad-<N>-shared` / `squad-<N>-kingdom<M>`, и
+# общий NATS у каждого стенда свой — `squad-14-shared`, а не «squad-shared».
+# Поэтому для них префикс включает номер. Пока squad не распознавался,
+# `_env_prefix` возвращал None, и в `_extract_nats_clusters` рёбра на
+# SHARED_NATS_* / NATS_FOR_*_* не создавались вовсе: у squad оставались только
+# kingdom-рёбра (им префикс не нужен). Замер 08.08.2026 — 112 рёбер uses_nats
+# на 4874 squad-сервиса против 280 на 292 prod-сервиса; из-за этого squad давал
+# 3154 orphan'а из 3578 по всему графу.
+# `-qa` — часть префикса, а не хвост: preprod-qa-kingdom2 живёт со своим
+# preprod-qa-shared. Без этого NATS-ребро QA-стенда уходило бы в чужой
+# preprod-shared, то есть в соседнее окружение.
+_NAMESPACE_ENV_PREFIX_RE = re.compile(
+    r"^((?:prod|preprod|preupdate|squad-\d+)(?:-qa)?)(?:-|$)",
+)
 
 # Synthetic-сервисы — по дизайну никогда не имеют edges (backup-cron'ы,
 # nats-tools, observability-exporters). Раньше засчитывались в Orphan %
