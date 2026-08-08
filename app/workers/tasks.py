@@ -137,12 +137,14 @@ celery_app.conf.beat_schedule = {
     "kg-topology-sync": {
         "task": "kg_topology_sync",
         "schedule": crontab(minute=0),  # каждый час
+        "options": {"expires": 3240},
     },
     # Daily stats digest (включается через STATS_DIGEST_ENABLED).
     # БЕЗ LLM-вызовов — pure aggregation, шлёт в DISCORD_WEBHOOK_STATS_URL.
     "daily-stats-digest": {
         "task": "daily_stats_digest",
         "schedule": crontab(hour=settings.STATS_DIGEST_HOUR_UTC, minute=0),
+        "options": {"expires": 21600},
     },
     # TC deploys → kg_deployments. БЕЗ LLM. Включает RecentDeployRule
     # на live deploys без incident-flow. Каждые 15 минут берёт recent
@@ -150,6 +152,7 @@ celery_app.conf.beat_schedule = {
     "tc-deploys-to-kg": {
         "task": "tc_deploys_to_kg",
         "schedule": crontab(minute="*/15"),
+        "options": {"expires": 810},
     },
     # L5 (alert-fatigue): chronic-alerts digest в канал #stats каждые 6h.
     # Гасит mute-эффект от suppress-chronic — даёт видимость сервисов
@@ -157,6 +160,7 @@ celery_app.conf.beat_schedule = {
     "chronic-alerts-digest": {
         "task": "chronic_alerts_digest",
         "schedule": crontab(minute=0, hour="*/6"),
+        "options": {"expires": 10800},
     },
     # A4: k8s pod-events → kg_pod_events. Каждые 10 мин тянем Warning-events
     # из всех ns с deployments в KG. Idempotent по event_uid. Источник
@@ -164,6 +168,7 @@ celery_app.conf.beat_schedule = {
     "k8s-pod-events-sync": {
         "task": "k8s_pod_events_sync",
         "schedule": crontab(minute="*/10"),
+        "options": {"expires": 540},
     },
     # D2-auto: drift cleanup. Раз в час пересинхронизирует kg_services со
     # списком существующих в k8s ns. Safety threshold 20% — защита от
@@ -171,6 +176,7 @@ celery_app.conf.beat_schedule = {
     "kg-drift-cleanup": {
         "task": "kg_drift_cleanup",
         "schedule": crontab(minute=17),  # ежечасно в 17 мин
+        "options": {"expires": 3240},
     },
     # Точка роста #2 (Phase 2): AlertEvent resolve sync. Каждые 15 мин
     # сравниваем kg_alerts.fingerprint с активными на AM, не-firing
@@ -179,6 +185,7 @@ celery_app.conf.beat_schedule = {
     "kg-alerts-resolve-sync": {
         "task": "kg_alerts_resolve_sync",
         "schedule": crontab(minute="*/15"),
+        "options": {"expires": 810},
     },
     # Phase 3-B: k8s Ingress → external entrypoint edges. Раз в час
     # синхронизирует Ingress resources cluster-wide. Создаёт synthetic-узлы
@@ -187,6 +194,7 @@ celery_app.conf.beat_schedule = {
     "kg-ingress-sync": {
         "task": "kg_ingress_sync",
         "schedule": crontab(minute=37),  # ежечасно в 37 мин (offset от других)
+        "options": {"expires": 3240},
     },
     # ChatGPT review #4.3: service health composite (open alerts × severity
     # + chronic pod events + recurrence). Раз в 20 мин — health моментальный
@@ -195,6 +203,7 @@ celery_app.conf.beat_schedule = {
     "kg-health-recompute": {
         "task": "kg_health_recompute",
         "schedule": crontab(minute="*/20"),
+        "options": {"expires": 1080},
     },
     # External probe: DNS+TCP+HTTPS на synthetic `ingress:<host>` узлы. Каждую
     # минуту проверяет публичные endpoint'ы (источник — k8s Ingress hosts из
@@ -205,6 +214,7 @@ celery_app.conf.beat_schedule = {
     "kg-external-probe": {
         "task": "kg_external_probe",
         "schedule": crontab(minute="*"),
+        "options": {"expires": 50},
     },
     # Метрические сигналы (2026-05-22, миграция 20260522_0100):
     # 4 новых таски материализуют time-series из VictoriaMetrics в KG.
@@ -227,18 +237,21 @@ celery_app.conf.beat_schedule = {
     "kg-cluster-health-sync": {
         "task": "kg_cluster_health_sync",
         "schedule": crontab(minute="*/5"),
+        "options": {"expires": 270},
     },
     # Per ingress endpoint observations (p95/p99/rps/4xx/5xx) из nginx-ingress
     # exporter. host/path берутся из k8s Ingress resources (kubectl get -A).
     "kg-ingress-observations-sync": {
         "task": "kg_ingress_observations_sync",
         "schedule": crontab(minute="*/10"),
+        "options": {"expires": 540},
     },
     # Pre-compute per-service агрегаты сигналов из САМОГО KG (deploys/alerts/
     # pod_events) за 24h окно. Hourly. Не ходит в VM — pure SQL.
     "kg-signal-aggregates-compute": {
         "task": "kg_signal_aggregates_compute",
         "schedule": crontab(minute=23),  # ежечасно в 23 мин (offset от drift/ingress)
+        "options": {"expires": 3240},
     },
     # Anomaly detection (2026-05-22, миграция 20260522_0200):
     # rolling z-score по kg_service_health для каждой из 5 метрик.
@@ -247,6 +260,7 @@ celery_app.conf.beat_schedule = {
     "kg-anomaly-detection-task": {
         "task": "kg_anomaly_detection_task",
         "schedule": crontab(minute="*/10"),
+        "options": {"expires": 540},
     },
     # Runtime correlation: подтверждает existing edges через co-occurrence
     # warning-событий (BackOff/Unhealthy/OOMKilled/...) у src+dst в окне 15 мин.
@@ -255,6 +269,7 @@ celery_app.conf.beat_schedule = {
     "kg-runtime-correlation-sync": {
         "task": "kg_runtime_correlation_sync",
         "schedule": crontab(minute="*/30"),
+        "options": {"expires": 1620},
     },
     # Per-team daily digest — один embed per team_owner (squad-N / infra /
     # monitoring). Зависит от kg_signal_aggregates (slo_burn_pct) и
@@ -263,6 +278,7 @@ celery_app.conf.beat_schedule = {
     "team-daily-digest": {
         "task": "team_daily_digest",
         "schedule": crontab(hour=settings.TEAM_DIGEST_HOUR_UTC, minute=0),
+        "options": {"expires": 21600},
     },
     # Error/Fatal логи из Seq → kg_log_observations. Тянет по настроенным
     # Seq-инстансам (prod/preprod/preupdate) count событий за окно ~10 мин,
@@ -271,6 +287,7 @@ celery_app.conf.beat_schedule = {
     "kg-seq-logs-sync-task": {
         "task": "kg_seq_logs_sync",
         "schedule": crontab(minute="*/10"),
+        "options": {"expires": 540},
     },
     # KG self-health canary (Wave 5 retrospective): «monitoring of the
     # monitoring». Ищет тихие деградации в наших же KG-таблицах
@@ -280,6 +297,7 @@ celery_app.conf.beat_schedule = {
     "kg-self-health-check": {
         "task": "kg_self_health_check",
         "schedule": crontab(minute="*/30"),
+        "options": {"expires": 1620},
     },
     # Stuck-alerts escalation (KG TTR-analytics, 2026-05-23): alerts firing
     # >24h без resolved_at теряются в потоке свежих firing-event'ов. Hourly
@@ -290,6 +308,7 @@ celery_app.conf.beat_schedule = {
     "kg-stuck-alerts-check": {
         "task": "kg_stuck_alerts_check",
         "schedule": crontab(minute=11),  # ежечасно в 11 мин (offset от drift=17/ingress=37)
+        "options": {"expires": 3240},
     },
     # Wave 7 / G1.3: declarative parser k8s Service + Ingress resources.
     # Каждые 15 мин получает все Services и Ingresses cluster-wide,
@@ -301,6 +320,7 @@ celery_app.conf.beat_schedule = {
     "kg-topology-resources-sync": {
         "task": "kg_topology_resources_sync",
         "schedule": crontab(minute="*/15"),
+        "options": {"expires": 810},
     },
     # KG Coverage #1: k8s Job + CronJob → kg_k8s_jobs. Каждые 15 мин
     # `kubectl get jobs,cronjobs -A` + upsert. Сигналы: last_successful_time
@@ -309,6 +329,7 @@ celery_app.conf.beat_schedule = {
     "kg-jobs-sync": {
         "task": "kg_jobs_sync",
         "schedule": crontab(minute="*/15"),
+        "options": {"expires": 810},
     },
     # KG Coverage #2: PVC/PV/storage signals → kg_storage_volumes + uses_volume/
     # bound_to edges. Каждые 30 мин: storage редко меняется (claim ~раз в неделю,
@@ -318,6 +339,7 @@ celery_app.conf.beat_schedule = {
     "kg-storage-sync": {
         "task": "kg_storage_sync",
         "schedule": crontab(minute="*/30"),
+        "options": {"expires": 1620},
     },
     # Wave 7-Z: парсер NATS subjects из исходников WO monorepo. Раз в 6h
     # делает git fetch shallow clone + grep `.cs` файлы на consumers/publish
@@ -327,6 +349,7 @@ celery_app.conf.beat_schedule = {
     "kg-nats-subjects-sync": {
         "task": "kg_nats_subjects_sync",
         "schedule": crontab(minute=43, hour="*/6"),  # 6h, offset от drift/ingress/stuck
+        "options": {"expires": 3240},
     },
     # Periodic ownership backfill (2026-05-24): закрывает gap multi-signal
     # owner inference, который интегрирован только в digest. Каждые 6 часов
@@ -337,6 +360,7 @@ celery_app.conf.beat_schedule = {
     "kg-ownership-backfill": {
         "task": "kg_ownership_backfill",
         "schedule": crontab(minute=17, hour="*/6"),
+        "options": {"expires": 3240},
     },
     # Janitor для discord_dedup: вынесенный из hot-path get_fresh purge
     # stale-строк (Infra H4). Раз в 10 мин — таблица всегда в пределах
@@ -345,6 +369,7 @@ celery_app.conf.beat_schedule = {
     "discord-dedup-purge": {
         "task": "discord_dedup_purge",
         "schedule": crontab(minute="29,59"),
+        "options": {"expires": 3240},
     },
     # Statics version delta tracking (инцидент 2026-07-02): каждые 5 мин
     # наблюдает номер версии статики для STATICS_TRACK_ENVS и держит «до»-снимок
@@ -354,6 +379,7 @@ celery_app.conf.beat_schedule = {
     "kg-statics-versions-sync": {
         "task": "kg_statics_versions_sync",
         "schedule": crontab(minute="*/5"),
+        "options": {"expires": 270},
     },
 }
 
