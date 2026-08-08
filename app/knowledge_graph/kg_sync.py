@@ -746,17 +746,18 @@ def _upsert_service_pg(
         реальным — был synthetic, перестал). Обратной деградации не делаем,
         чтобы случайное упущение в `_is_synthetic_service` не стёрло флаг.
 
-    Требует UNIQUE constraint `uq_kg_service_ns_name` на (namespace, name) —
-    он есть в schema.py (см. Service.__table_args__).
-    TODO: если констрейнта в БД нет (старая инсталляция без миграции) —
-    добавить через:
-        ALTER TABLE kg_services
-        ADD CONSTRAINT uq_kg_service_ns_name UNIQUE (namespace, name);
+    Требует UNIQUE constraint `uq_kg_service_ns_name_kind` на
+    (namespace, name, node_kind) — он есть в schema.py (см.
+    Service.__table_args__) и создаётся миграцией 20260807_0200.
     """
     now = datetime.utcnow()
     values = {
         "namespace": namespace,
         "name": name,
+        # Этот путь заводит ТОЛЬКО логические сервисы; workload-узлы создаёт
+        # k8s_topology_resources_sync. Указываем явно, а не полагаемся на
+        # server_default, чтобы ON CONFLICT работал по всем трём колонкам.
+        "node_kind": NODE_KIND_SERVICE,
         "team_owner": team_owner,
         "metadata_json": metadata,
         "synthetic": bool(synthetic) if synthetic is not None else False,
@@ -786,7 +787,13 @@ def _upsert_service_pg(
         pg_insert(Service.__table__)
         .values(**values)
         .on_conflict_do_update(
-            constraint="uq_kg_service_ns_name",
+            # Имя изменено миграцией 20260807_0200: ключ стал трёхколоночным
+            # (namespace, name, node_kind). Здесь ВТОРАЯ копия upsert-логики
+            # (первая — populator._upsert_service_pg), и при вводе node_kind
+            # её пропустили: ON CONFLICT ссылался на удалённый констрейнт, и
+            # kg_topology_sync падал на КАЖДОМ namespace — 79 ошибок за тик,
+            # services=0, граф по сервисам не обновлялся сутки.
+            constraint="uq_kg_service_ns_name_kind",
             set_=set_clause,
         )
         .returning(Service.__table__.c.id)
