@@ -2,6 +2,16 @@ replicaCount:
   api: 2
   worker: 2
 
+worker:
+  # Число prefork-детей celery-воркера (`--concurrency`). Должно меняться
+  # ТОЛЬКО вместе с resources.worker — см. арифметику там и в k8s/worker.yaml.
+  # Если не задать явно, celery берёт число ядер НОДЫ (на dev-ноде — 32),
+  # что не имеет ничего общего с cpu/memory-лимитом контейнера.
+  # 2 реплики × 2 = 4 параллельных слота; при worker_prefetch_multiplier=1
+  # этого хватает, чтобы длинный incident-pipeline (hard limit 30 мин) не
+  # заблокировал минутные beat-таски вроде kg-external-probe.
+  concurrency: 2
+
 image:
   # CI публикует ТОЛЬКО ghcr.io/froggychips/sre-ai-copilot:<git-sha>
   # (см. .github/workflows/ci.yml) — тега :latest НЕ СУЩЕСТВУЕТ.
@@ -47,13 +57,21 @@ resources:
     requests:
       cpu: 200m
       memory: 256Mi
+  # Синхронизировано с k8s/worker.yaml. Связано с worker.concurrency (см. выше):
+  # celery prefork = 1 родитель + concurrency детей, каждый процесс тянет весь
+  # стек (~166 MiB RSS только на импорт `app.workers.tasks`, замерено; тот же
+  # порядок подтверждён OOM-ом beat'а на 128Mi). При concurrency=2 это
+  # 3 × ~170Mi ≈ 510Mi baseline + рабочая куча + RSS kubectl-subprocess'ов,
+  # которые считаются в тот же cgroup → 768Mi. Было 256Mi при 4 (в helm —
+  # вообще без --concurrency, т.е. по числу ядер ноды) — OOM by design.
+  # requests == limits: Guaranteed QoS, воркер выселяется последним.
   worker:
     limits:
-      cpu: 200m
-      memory: 256Mi
+      cpu: 600m
+      memory: 768Mi
     requests:
-      cpu: 200m
-      memory: 256Mi
+      cpu: 600m
+      memory: 768Mi
   redis:
     limits:
       cpu: 500m

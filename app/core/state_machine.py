@@ -41,7 +41,26 @@ class StateMachine:
     # synthesis-отчёт) или в APPROVAL_PENDING (apply через approval flow).
     # FAILED достижим из любого non-terminal state.
     TRANSITIONS: Dict[IncidentState, Set[IncidentState]] = {
-        IncidentState.OPEN: {IncidentState.INVESTIGATING, IncidentState.FAILED},
+        IncidentState.OPEN: {
+            IncidentState.INVESTIGATING,
+            # Алерт погас ДО начала расследования — штатный и частый случай
+            # (короткоживущие алерты, медианный TTR сильно меньше времени
+            # пайплайна). OPEN означает «принят, работа не начиналась», так что
+            # это не нарушение инварианта.
+            #
+            # Без этого перехода resolve-webhook откладывал резолв (см.
+            # _apply_resolve в app/api/webhooks.py), и при
+            # LLM_PIPELINE_ENABLED=false — а это дефолт и продовый
+            # advisory-режим — строка ЗАВИСАЛА в OPEN навсегда: пайплайн
+            # выходит раньше любого перехода, поэтому OPEN не покидался
+            # никогда, а повторный fire дедуплицировался вместо flapping.
+            #
+            # Гонка «резолв пришёл, пока задача стартует» безопасна: первый же
+            # _safe_transition увидит терминал и поднимет
+            # IncidentResolvedExternally — пайплайн остановится чисто.
+            IncidentState.RESOLVED,
+            IncidentState.FAILED,
+        },
         IncidentState.INVESTIGATING: {
             IncidentState.FACTS_COLLECTED,
             # Legacy direct path сохраняется — без него старые pipeline-ы

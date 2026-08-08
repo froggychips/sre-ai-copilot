@@ -43,7 +43,8 @@ spec:
         - app.workers.tasks.celery_app
         - worker
         - --loglevel=info
-        - --concurrency=4
+        # concurrency=2, НЕ 4 — см. арифметику в resources ниже.
+        - --concurrency=2
         securityContext:
           readOnlyRootFilesystem: true
           allowPrivilegeEscalation: false
@@ -59,13 +60,47 @@ spec:
           value: "production"
         - name: SAFE_MODE
           value: "true"
+        # Лимиты приведены в соответствие с --concurrency (было: concurrency=4
+        # при 256Mi/200m — конфигурация, которая не могла не OOM-иться).
+        #
+        # АРИФМЕТИКА ПАМЯТИ. celery prefork = 1 родитель + N детей, каждый
+        # процесс тянет весь стек. Замер импорта `app.workers.tasks`:
+        # ~166 MiB RSS на процесс ЕЩЁ ДО первой задачи (kubernetes-client +
+        # sqlalchemy + anthropic sdk + opentelemetry + celery). Тот же порядок
+        # независимо подтверждён beat'ом: он OOM-ился каждые ~10-13 мин на
+        # 128Mi и поехал только на 256Mi (см. комментарий у copilot-beat ниже).
+        # Copy-on-write здесь не экономит: refcounting CPython трогает заголовок
+        # каждого объекта, и куча ребёнка расходится с родительской в первые
+        # секунды работы.
+        #   было:  concurrency=4 → 5 процессов × ~170Mi ≈ 850Mi baseline
+        #          против limit 256Mi → OOMKill гарантирован, ещё до нагрузки.
+        #   стало: concurrency=2 → 3 процесса × ~170Mi ≈ 510Mi baseline.
+        # Сверху рабочая куча (SQLAlchemy-выборки по ~370 сервисам KG,
+        # cluster-wide JSON от `kubectl get -A`) и сам kubectl — Go-бинарь,
+        # он запускается subprocess'ом ВНУТРИ этого же cgroup и его RSS тоже
+        # считается в лимит. 768Mi = 510Mi baseline + ~250Mi запаса.
+        #
+        # Почему не вариант «просто снизить concurrency»: он недостижим
+        # в 256Mi арифметически — даже concurrency=1 это 2 × ~170Mi ≈ 340Mi,
+        # а --pool=solo (один процесс) отдал бы весь воркер под один инцидент
+        # на 30 минут (hard time limit), заморозив beat-таски, среди которых
+        # kg-external-probe с тиком раз в минуту.
+        #
+        # CPU: было 200m на 5 процессов = 40m на процесс — throttling растягивал
+        # стадии и подгонял их к soft time limit 1500s. 600m на 3 процесса =
+        # 200m на процесс.
+        #
+        # requests == limits сохранены намеренно: Guaranteed QoS, воркер
+        # выселяется последним. При acks_late (см. app/workers/tasks.py) OOM
+        # больше не теряет задачу, но крутить OOM-петлю всё равно нельзя —
+        # переотправка вернёт ту же задачу тому же лимиту.
         resources:
           limits:
-            cpu: 200m
-            memory: 256Mi
+            cpu: 600m
+            memory: 768Mi
           requests:
-            cpu: 200m
-            memory: 256Mi
+            cpu: 600m
+            memory: 768Mi
 ---
 apiVersion: policy/v1
 kind: PodDisruptionBudget

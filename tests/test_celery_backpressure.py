@@ -31,6 +31,49 @@ def test_celery_backpressure_config_applied_in_prod_mode():
         assert conf.broker_connection_retry_on_startup is True
 
 
+def test_celery_acks_late_enabled_in_prod_mode():
+    """acks_late + reject_on_worker_lost — задача переживает смерть воркера.
+
+    При дефолтном acks_early брокер подтверждает сообщение в момент ВЫДАЧИ:
+    воркер, убитый в середине обработки (OOMKill / eviction / rollout),
+    уносит задачу с собой — инцидент не обработан, ретрая нет, следа нет.
+    Тест фиксирует настройку, чтобы её не потеряли молча при следующей
+    правке конфига.
+    """
+    import importlib
+
+    import app.workers.tasks as tasks_mod
+    with patch.object(tasks_mod.settings, "CELERY_TASK_ALWAYS_EAGER", False):
+        importlib.reload(tasks_mod)
+        conf = tasks_mod.celery_app.conf
+        assert conf.task_acks_late is True
+        # Без reject_on_worker_lost потерянная задача уходит в FAILURE,
+        # а не возвращается в очередь — то есть теряется всё равно.
+        assert conf.task_reject_on_worker_lost is True
+        # Обычный провал и срабатывание time limit'а задачу ПОДТВЕРЖДАЮТ:
+        # иначе стабильно падающий таск крутится в очереди вечно
+        # (poison message). Ретраями управляет autoretry_for, не брокер.
+        assert conf.task_acks_on_failure_or_timeout is True
+
+
+def test_redis_visibility_timeout_exceeds_hard_time_limit():
+    """visibility_timeout > hard time limit — иначе acks_late даёт ДУБЛЬ.
+
+    У redis-транспорта нет настоящего ack: неподтверждённое сообщение
+    возвращается в очередь по visibility_timeout. Если окно короче времени
+    выполнения, redis отдаёт задачу второму воркеру, пока первый ещё
+    работает — два параллельных прогона одного инцидента.
+    """
+    import importlib
+
+    import app.workers.tasks as tasks_mod
+    with patch.object(tasks_mod.settings, "CELERY_TASK_ALWAYS_EAGER", False):
+        importlib.reload(tasks_mod)
+        conf = tasks_mod.celery_app.conf
+        visibility = conf.broker_transport_options["visibility_timeout"]
+        assert visibility > conf.task_time_limit
+
+
 def test_process_incident_has_rate_limit():
     """process_incident task должен иметь rate_limit для защиты LLM-бюджета."""
     from app.workers.tasks import process_incident_task

@@ -25,6 +25,7 @@ from sqlalchemy.orm import sessionmaker
 
 import app.knowledge_graph.kg_sync as kg_sync
 from app.database import Base
+from app.knowledge_graph.edge_decay_guard import reset_source_reports
 from app.knowledge_graph.k8s_jobs_sync import _upsert_k8s_job
 from app.knowledge_graph.k8s_storage_sync import _upsert_volume
 from app.knowledge_graph.kg_sync import (
@@ -33,6 +34,15 @@ from app.knowledge_graph.kg_sync import (
 )
 from app.knowledge_graph.populator import upsert_edge, upsert_service
 from app.knowledge_graph.schema import K8sJob, Service, ServiceEdge, StorageVolume
+
+
+@pytest.fixture(autouse=True)
+def _clean_source_reports():
+    """Реестр stats-отчётов синков живёт на уровне модуля — чистим между
+    тестами, иначе отчёт из соседнего теста подменяет здоровье источника."""
+    reset_source_reports()
+    yield
+    reset_source_reports()
 
 
 @pytest.fixture
@@ -253,8 +263,13 @@ def test_decay_skips_kinds_whose_source_is_dead(db, monkeypatch):
     )
     for e in st_mid:
         assert not (e.extras or {}).get("inactive")
-    # Источник назван в отчёте.
-    assert "k8s_topology_resources_sync" in total["edge_decay_stale_sources"]
+    # Источник назван в отчёте. Гранулярность источника — срез fetch'а
+    # (`.../services` отдельно от `.../ingresses`): у них разные `kubectl
+    # get`, разные таймауты и разные режимы отказа.
+    assert any(
+        s.startswith("k8s_topology_resources_sync")
+        for s in total["edge_decay_stale_sources"]
+    )
     assert total["edge_decay_blocked_by_source"] == 2
 
 

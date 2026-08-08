@@ -843,10 +843,12 @@ class DiscordService:
             return
 
         # Cross-replica: фиксируем POST в PG-store (UPSERT по pg_key).
+        # webhook_url в store НЕ кладём — это токен на постинг в канал, а
+        # PATCH-у он и не нужен: `url` резолвится из настроек тем же
+        # _pick_webhook_url в момент PATCH-а.
         dedup_store.save(
             pg_key,
             msg_id=msg_id,
-            webhook_url=url,
             embed=embed,
             alertname=alertname,
             namespace=namespace,
@@ -867,7 +869,9 @@ class DiscordService:
                     "first_ts": now,
                     "last_ts": now,
                     "count": 1,
-                    "webhook_url": url,
+                    # webhook_url тут тоже не держим (симметрично с PG-store):
+                    # незачем размазывать токен по heap-у, PATCH резолвит его
+                    # из настроек.
                     "embed": embed,
                     "group_ns_pod": [f"{namespace}/{pod}"],
                 }
@@ -893,7 +897,10 @@ class DiscordService:
         cached_embed = rec.get("embed") or embed
         count = rec["count"]
         first_ts = rec["first_ts"]
-        webhook_url = rec.get("webhook_url") or url
+        # PATCH-endpoint собираем из `url` — того же, что резолвил
+        # _pick_webhook_url перед POST-ом. В store его больше нет (токен
+        # в БД = право спамить в канал с любого read-only доступа).
+        webhook_url = url
 
         patched_embed = dict(cached_embed)
         first_seen = datetime.fromtimestamp(first_ts, tz=timezone.utc).strftime("%H:%M")
@@ -964,7 +971,8 @@ class DiscordService:
             count = rec["count"]
             first_ts = rec["first_ts"]
             group = rec.get("group_ns_pod") or []
-            webhook_url = rec.get("webhook_url") or url
+            # Как и в exact-пути: URL берём из аргумента, а не из кэша.
+            webhook_url = url
 
         # Обновляем footer и (для linked) добавляем поле с группой ns/pod.
         patched_embed = dict(cached_embed)
@@ -1984,10 +1992,11 @@ class DiscordService:
             dedup_store.release(key)
             return
 
+        # Без webhook_url: enriched-канал всегда шлёт на
+        # settings.DISCORD_WEBHOOK_URL, PATCH перечитает его из настроек.
         dedup_store.save(
             key,
             msg_id=msg_id,
-            webhook_url=url,
             embed=embed,
             alertname=alertname,
             namespace=namespace,
@@ -2071,7 +2080,9 @@ class DiscordService:
         cached_embed = rec.get("embed") or embed
         count = rec["count"]
         first_ts = rec["first_ts"]
-        webhook_url = rec.get("webhook_url") or url
+        # `url` = settings.DISCORD_WEBHOOK_URL, прочитанный на входе в
+        # send_enriched_alert. В store токена больше нет.
+        webhook_url = url
 
         # Берём новый embed (с актуальными KG-данными — KG mог обновиться
         # за окно дедупа), но обновляем footer counter'ом.

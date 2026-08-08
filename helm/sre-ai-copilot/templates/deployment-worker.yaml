@@ -43,6 +43,13 @@ spec:
         - app.workers.tasks.celery_app
         - worker
         - --loglevel=info
+        # --concurrency ОБЯЗАТЕЛЕН явно. Без него celery берёт os.cpu_count()
+        # НОДЫ, а не cpu-лимит контейнера: на 32-ядерной dev-ноде это 33
+        # процесса × ~170Mi import-футпринта в лимите resources.worker.memory.
+        # Значение синхронизировано с k8s/worker.yaml — арифметика «сколько
+        # процессов × сколько памяти» расписана там же, в комментарии к
+        # resources. Менять concurrency и resources.worker только вместе.
+        - --concurrency={{ .Values.worker.concurrency }}
         securityContext:
           {{- include "sre-ai-copilot.containerSecurityContext" . | nindent 10 }}
         envFrom:

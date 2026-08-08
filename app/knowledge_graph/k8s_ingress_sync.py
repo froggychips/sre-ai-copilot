@@ -32,6 +32,8 @@ from typing import Any, Dict, List
 
 from sqlalchemy.orm import Session
 
+from app.knowledge_graph.edge_decay_guard import (
+    SOURCE_INGRESS_SYNC, record_source_run)
 from app.knowledge_graph.populator import upsert_edge, upsert_service
 from app.knowledge_graph.schema import NODE_KIND_SERVICE, Service
 
@@ -204,6 +206,10 @@ def sync_all_ingresses(db: Session) -> Dict[str, int]:
         stats["edges_created"], stats["skipped_no_backend_match"],
         stats["errors"],
     )
+    # Отчёт для edge-decay guard: этот синк — единственный, кто освежает
+    # ingress-овые `calls` (discovered_by='kg_sync/ingress'). Живой env-scan
+    # в kg_sync их свежести не подтверждает и легализовать удаление не может.
+    record_source_run(SOURCE_INGRESS_SYNC, stats)
     return stats
 
 

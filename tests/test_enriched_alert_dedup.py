@@ -296,3 +296,79 @@ async def test_no_msg_id_no_dedup(webhook_env):
     # Оба идут как POST (нет msg_id → нет dedup-state).
     assert mock_client.post.await_count == 2
     assert mock_client.patch.await_count == 0
+
+
+# ───────────────────────────────────────────────────────────────────
+# Секрет вебхука не хранится в БД (2026-08-08, миграция 20260808_0200).
+#
+# Раньше `discord_dedup.webhook_url` держал полный webhook URL, хвост
+# которого — токен на постинг в канал: read-only доступ к БД = право
+# спамить в #infra-error. Колонка снесена; PATCH-endpoint теперь
+# резолвится из settings в момент PATCH-а. Проверяем оба следствия:
+# дедуп жив end-to-end И токена в таблице нет.
+# ───────────────────────────────────────────────────────────────────
+
+_SECRET_WEBHOOK = "https://discord.com/api/webhooks/424242/S3CR3T-enr-token"
+_SECRET_TOKEN = "S3CR3T-enr-token"
+
+
+@pytest.mark.asyncio
+async def test_patch_dedup_alive_and_no_token_in_db(webhook_env, monkeypatch):
+    """1 POST + 1 PATCH при живой «БД», PATCH-URL собран из настроек.
+
+    dedup_store смотрит в реальный sqlite (вместо PG) — так видно сырые
+    строки. Проверяем:
+      * дедуп не сломан снятием колонки: второй firing = PATCH, не POST;
+      * PATCH ушёл на `<DISCORD_WEBHOOK_URL>/messages/<msg_id>`, т.е. URL
+        восстановлен из конфигурации, а не из строки дедупа;
+      * ни в одной колонке таблицы нет токена вебхука.
+    """
+    from sqlalchemy import create_engine
+    from sqlalchemy.orm import sessionmaker
+
+    from app.config import settings
+    from app.database import Base
+    from app.services.discord import dedup_store
+    from app.services.discord_service import DiscordService
+
+    monkeypatch.setattr(settings, "DISCORD_WEBHOOK_URL", _SECRET_WEBHOOK)
+
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    monkeypatch.setattr(
+        dedup_store, "_pg_session",
+        sessionmaker(bind=engine, autocommit=False, autoflush=False),
+    )
+
+    svc = DiscordService()
+    mock_client = _httpx_mock(msg_id="enr-secret-1")
+    try:
+        with patch("app.services.discord_service.httpx.AsyncClient",
+                   return_value=mock_client):
+            await svc.send_enriched_alert([_make_context()], env="preprod")
+            await svc.send_enriched_alert([_make_context()], env="preprod")
+
+        assert mock_client.post.await_count == 1, "второй firing обязан быть PATCH"
+        assert mock_client.patch.await_count == 1
+
+        # POST шёл на webhook из настроек (+wait=true ради msg_id).
+        post_url = mock_client.post.await_args_list[0].args[0]
+        assert post_url.startswith(_SECRET_WEBHOOK)
+
+        # PATCH-endpoint собран в рантайме из того же настроечного URL.
+        patch_url = mock_client.patch.await_args_list[0].args[0]
+        assert patch_url == f"{_SECRET_WEBHOOK}/messages/enr-secret-1"
+        footer = (
+            mock_client.patch.await_args_list[0].kwargs["json"]["embeds"][0]["footer"]["text"]
+        )
+        assert "×2" in footer
+
+        # А в БД токена нет ни в одной колонке.
+        with engine.connect() as conn:
+            rows = conn.exec_driver_sql("SELECT * FROM discord_dedup").fetchall()
+        assert rows, "запись дедупа должна была сохраниться"
+        dump = " ".join(str(value) for row in rows for value in row)
+        assert _SECRET_TOKEN not in dump
+        assert "/webhooks/" not in dump
+    finally:
+        engine.dispose()
