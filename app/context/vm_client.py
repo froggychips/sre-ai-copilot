@@ -15,7 +15,7 @@ import asyncio
 import logging
 import re
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional, Union, Tuple
 
 import httpx
 
@@ -212,6 +212,46 @@ class VMClient:
                     continue
         except Exception as e:
             logger.debug("vm_client.query_instant_by failed query=%r: %s", query, e)
+        return out
+
+    async def query_instant_by_labels(
+        self, query: str, by_labels: Tuple[str, ...],
+    ) -> Dict[Tuple[str, ...], float]:
+        """Instant query → {(label1, label2, ...): float} по НЕСКОЛЬКИМ меткам.
+
+        Тот же приём, что в `query_instant_by`, но ключ составной. Нужен там,
+        где сущность определяется парой меток: ingress-наблюдения ключуются
+        `(host, path)`, и точечный запрос на каждую пару давал 992 × 5 = ~5000
+        HTTP-вызовов за тик — воркер уходил в это на минуты и вытеснял
+        остальные синки из очереди. Один агрегирующий запрос
+        `sum by (host, path) (...)` возвращает всё разом.
+
+        Серии, где хотя бы одной метки нет, пропускаются: неполный ключ не
+        даёт понять, к какому маршруту относится значение.
+        """
+        out: Dict[Tuple[str, ...], float] = {}
+        params = {"query": query}
+        try:
+            async with httpx.AsyncClient(timeout=self._timeout) as client:
+                r = await client.get(f"{self._url}/api/v1/query", params=params)
+                r.raise_for_status()
+                data = r.json()
+            for series in data.get("data", {}).get("result", []):
+                metric = series.get("metric", {})
+                key = tuple(str(metric.get(lbl, "")) for lbl in by_labels)
+                if not all(key):
+                    continue
+                val = series.get("value", [None, None])[1]
+                if val in ("NaN", "Inf", "+Inf", "-Inf", None):
+                    continue
+                try:
+                    out[key] = float(val)
+                except (TypeError, ValueError):
+                    continue
+        except Exception as e:
+            logger.debug(
+                "vm_client.query_instant_by_labels failed query=%r: %s", query, e,
+            )
         return out
 
     @with_external_retry(max_attempts=3, initial_delay=0.5, name="vm.cluster_health")
