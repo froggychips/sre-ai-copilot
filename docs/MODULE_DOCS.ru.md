@@ -60,7 +60,7 @@
 - `IngressObservation` (`kg_ingress_observations`) — per-endpoint (host/path) HTTP-снапшоты: `p95_latency_ms` / `p99_latency_ms` / `rps` / `error_5xx_rate` / `error_4xx_rate`, `service_id` FK на backend-сервис; `UNIQUE (ingress_name, host, path, ts)`. Наполняется с 2026-06-10 (см. Ingress observations sync).
 
 ### Schema / quality contract (`app/knowledge_graph/contract.py`)
-- `KG_SCHEMA_VERSION` — текущая версия (`2.4`, после `kg_services.node_kind` 2026-08-07: k8s Service и workload — разные типы узлов). Bump rules — `docs/KG_SCHEMA_CONTRACT.md` §8.
+- `KG_SCHEMA_VERSION` — текущая версия (`2.5`, после 2026-08-08: orphan не засчитывает serves_traffic как связность). Bump rules — `docs/KG_SCHEMA_CONTRACT.md` §8.
 - `EDGE_KINDS` — реестр всех edge kinds + spec (`semantic` / `src_kinds` / `dst_kinds` / `source` / `status` / `table`). `table` = где edge живёт: `kg_service_edges` / `kg_volume_edges` / `fk_only` (через FK) / `metadata_only` (через owner_service_id).
 - `OWNER_SOURCES` / `OWNER_SOURCE_ALIASES` — canonical источники owner-а + маппинг коротких имён из `ownership_suggester`.
 - `STALE_CLASS_VALUES` — enum значений `kg_services.stale_class`.
