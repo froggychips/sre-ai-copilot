@@ -228,8 +228,15 @@ Found three times in a single day:
 deploys from `ghcr.io`, and no `imagePullSecrets` exist for it. The actual
 rollout is a manual `kubectl set image` with a Nexus image.
 
-**Not fixed.** Needs a decision: either bring `deploy.sh` and the manifests in
-line with reality, or move the cluster onto the repository's process.
+**Fixed on 2026-08-08.** `deploy.sh` no longer hard-codes the registry
+(`IMAGE_REPO` + `IMAGE_TAG`, defaulting to Nexus), manifests share a single
+`IMAGE_PLACEHOLDER`, and `ClusterRole sre-ai-deployments-reader` in the
+repository now includes `statefulsets`/`daemonsets`, matching the cluster.
+
+The root of the drift also became clear: `sre-ai-read` in the manifest is a
+namespace-scoped **Role**, while the syncs list cluster-wide
+(`kubectl get -A`). That role never covered their needs, which is why
+cluster-wide permissions were assembled separately in the cluster.
 
 ---
 

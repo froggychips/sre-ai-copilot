@@ -237,12 +237,12 @@ helm install sre-ai-copilot helm/sre-ai-copilot/ \
   --set image.tag=1.0.0-rc.11
 ```
 
-> **Note on the WO cluster:** the manifests and `deploy.sh` reference
-> `ghcr.io/froggychips/...` by git-sha, but that cluster actually pulls from
-> Nexus (`docker.lastoasisgame.com/wo/sre-ai-copilot:1.0.0-rc.N`) and has no
-> `imagePullSecrets` for ghcr. The real rollout procedure is in
-> [`docs/RUNBOOK.md`](docs/RUNBOOK.md#production-rollout-the-actual-procedure-2026-08-08);
-> the drift is tracked in [`docs/POSTMORTEM_2026_08_08.md`](docs/POSTMORTEM_2026_08_08.md).
+> **Registry is a parameter, not a constant.** `deploy.sh` defaults to Nexus
+> (`docker.lastoasisgame.com/wo/sre-ai-copilot`), which is where the WO cluster
+> actually pulls from; pass `IMAGE_REPO=ghcr.io/froggychips/sre-ai-copilot` for
+> a CI-built image. Until 2026-08-08 the script hard-coded ghcr and stalled
+> with ImagePullBackOff in that cluster — see
+> [`docs/RUNBOOK.md`](docs/RUNBOOK.md#production-rollout-the-actual-procedure-2026-08-08).
 
 Fill secrets before installing — see `helm/sre-ai-copilot/templates/secret.yaml`.
 

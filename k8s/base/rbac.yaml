@@ -104,7 +104,12 @@ metadata:
     app.kubernetes.io/part-of: sre-ai-copilot
 rules:
 - apiGroups: ["apps"]
-  resources: ["deployments"]
+  # statefulsets/daemonsets ОБЯЗАТЕЛЬНЫ для ребра serves_traffic: без них
+  # Service, за которым стоит БД, не матчится ни на один workload — замер
+  # 08.08.2026 дал 2231 промах за тик синка, и это ровно все *-db /
+  # *-postgresql / clickhouse. Права добавлены в кластер патчем в тот же день;
+  # здесь фиксируем, чтобы манифест не разъезжался с реальностью.
+  resources: ["deployments", "statefulsets", "daemonsets"]
   verbs: ["get", "list", "watch"]
 # `namespaces` cluster-wide list — auto-discovery non-system ns в
 # kg_sync.discover_namespaces() и drift_cleanup.fetch_live_namespaces().

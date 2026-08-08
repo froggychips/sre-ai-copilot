@@ -68,9 +68,13 @@ spec:
               type: RuntimeDefault
           containers:
           - name: squad-dashboard
-            # IMAGE_TAG_PLACEHOLDER подставляет deploy.sh (IMAGE_TAG=<git-sha>).
+            # IMAGE_PLACEHOLDER подставляет deploy.sh целиком (registry+repo+tag).
+        # Registry задаётся через IMAGE_REPO — он разный по кластерам:
+        # CI публикует в ghcr по git-sha, а WO-кластер тянет из Nexus
+        # по тегу 1.0.0-rc.N. Хардкод ghcr здесь означал, что deploy.sh
+        # в WO-кластере молча упирался в ImagePullBackOff.
             # CI публикует ТОЛЬКО :<git-sha> — тега :latest не существует.
-            image: ghcr.io/froggychips/sre-ai-copilot:IMAGE_TAG_PLACEHOLDER
+            image: IMAGE_PLACEHOLDER
             imagePullPolicy: IfNotPresent
             command: ["python3", "/scripts/squad_dashboard.py"]
             securityContext:
