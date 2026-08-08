@@ -10,8 +10,9 @@
   * запросы копились, event loop API не отвечал на liveness за 5с, kubelet
     убивал под: 103 рестарта за 14 часов.
 
-Здесь две проверки: engine выставляет серверный потолок на простой, а синк
-топологии не тащит открытую транзакцию через kubectl.
+Основная защита — серверный потолок на простой транзакции (engine). Плюс
+guard на порядок операций в синке топологии: пока kubectl идёт раньше
+первого SQL, транзакция во время внешних вызовов не открыта вовсе.
 """
 from __future__ import annotations
 
@@ -53,37 +54,38 @@ def test_timeout_targets_idle_only_not_active_queries():
     assert "statement_timeout" not in options
 
 
-def test_topology_sync_releases_transaction_before_kubectl():
-    """`sync_topology_resources` отпускает транзакцию до внешних вызовов.
+def test_topology_sync_reads_k8s_before_touching_db():
+    """В `sync_topology_resources` kubectl идёт РАНЬШЕ первого запроса к БД.
 
-    Регрессия, от которой защищаемся: между открытой транзакцией и записью
-    вклинивается kubectl по трём ресурсам (Deployment/StatefulSet/DaemonSet),
-    каждый со своим таймаутом, — окно простоя измеряется минутами.
+    Пока порядок такой, транзакция на время внешних вызовов не открыта и
+    ACCESS SHARE никого не держит. Если чтение k8s переедет за запросы к БД,
+    вернётся ровно тот простой, что 08.08.2026 заблокировал миграцию.
+
+    Намеренно НЕ проверяем rollback внутри функции: откатывать чужую
+    незакоммиченную работу библиотечный код не вправе — за простой отвечает
+    серверный idle_in_transaction_session_timeout (тесты выше).
     """
     from app.knowledge_graph import k8s_topology_resources_sync as tsync
 
-    calls: list[str] = []
+    order: list[str] = []
 
-    class _FakeSession:
-        def rollback(self):
-            calls.append("rollback")
+    class _TxSpySession:
+        """Любое обращение к сессии = потенциальное открытие транзакции."""
 
-    def _fake_workloads():
-        calls.append("kubectl")
-        return []
+        def __getattr__(self, name):
+            order.append(f"db.{name}")
+            return lambda *a, **kw: None
 
-    with patch.object(tsync, "_kubectl_get_deployments_all", _fake_workloads), \
+    with patch.object(tsync, "_kubectl_get_deployments_all",
+                      lambda: order.append("kubectl") or []), \
          patch.object(tsync, "sync_all_services",
-                      lambda db, deployments_index=None: calls.append("services") or {}), \
+                      lambda db, deployments_index=None: order.append("sql") or {}), \
          patch.object(tsync, "sync_all_ingresses_declarative",
-                      lambda db: calls.append("ingresses") or {}):
-        tsync.sync_topology_resources(_FakeSession())
+                      lambda db: order.append("sql") or {}):
+        tsync.sync_topology_resources(_TxSpySession())
 
-    assert calls[0] == "rollback", (
-        f"первым действием должен быть rollback, получили {calls[0]!r}: "
+    assert order[0] == "kubectl", (
+        f"первым должен быть внешний вызов, получили {order[0]!r} — "
         "транзакция уедет в kubectl открытой"
     )
-    # Перед вторым внешним вызовом транзакцию тоже отпускаем.
-    assert calls.index("rollback", 1) < calls.index("ingresses"), (
-        "перед sync_all_ingresses_declarative нет rollback"
-    )
+    assert "sql" in order and order.index("kubectl") < order.index("sql")
