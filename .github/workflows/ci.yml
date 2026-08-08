@@ -6,6 +6,14 @@ on:
   pull_request:
     branches: [ master, main ]
 
+# Дефолт для всех джоб. Без него `test` брала дефолтный GITHUB_TOKEN,
+# а он на push-событиях идёт с write-правами на содержимое репозитория
+# (CodeQL: actions/missing-workflow-permissions). Джобе нужен только
+# checkout. У `build-and-push` свой блок ниже — он перекрывает этот и
+# добавляет packages/id-token, необходимые для GHCR и OIDC-подписи.
+permissions:
+  contents: read
+
 jobs:
   test:
     name: Lint and Test

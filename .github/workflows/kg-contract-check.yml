@@ -26,6 +26,13 @@ on:
     - cron: '0 */6 * * *'
   workflow_dispatch:
 
+# Без явного блока джобы получают дефолтный GITHUB_TOKEN, а он на
+# push-событиях идёт с write-правами на содержимое репозитория
+# (CodeQL: actions/missing-workflow-permissions). Здесь нужен только
+# checkout, поэтому read.
+permissions:
+  contents: read
+
 jobs:
   contract-check:
     name: KG contract drift gate

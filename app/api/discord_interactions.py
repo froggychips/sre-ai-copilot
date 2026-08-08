@@ -802,9 +802,18 @@ async def discord_interactions(
                     "(EXECUTOR_APPLIED / EXECUTOR_APPLY_REFUSED)."
                 )
             except Exception as e:
-                logger.error("approved_executor_dispatch_failed error=%s", str(e))
+                # Наружу — только тип исключения. Текст может нести DSN,
+                # путь или кусок конфига, а ephemeral-ответ всё равно
+                # уходит в Discord (CodeQL: py/stack-trace-exposure).
+                # Полная диагностика остаётся в логе строкой ниже.
+                logger.error(
+                    "approved_executor_dispatch_failed error=%s", str(e),
+                    exc_info=True,
+                )
                 return _ephemeral(
-                    f"✅ Approved by @{user_name}, но launch executor упал: {e}"
+                    f"✅ Approved by @{user_name}, но launch executor упал "
+                    f"({type(e).__name__}). Подробности — в логе сервиса по "
+                    f"incident_id={incident_id}."
                 )
         if settings.EXECUTOR_ENABLED:
             # Fail-closed зеркально apply:/apply_confirm: — решение записано,
