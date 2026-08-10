@@ -174,6 +174,67 @@ class TestConfiguration:
                 DISCORD_WEBHOOK_URL="http://test",
             )
 
+    @pytest.mark.parametrize("env_value", ["prod", "Production", " PRODUCTION "])
+    def test_prod_env_aliases_enforce_invariants(self, env_value):
+        """ENV=prod / Production / регистр+пробелы — тоже прод.
+
+        Раньше инварианты висели на точном литерале ENV == "production":
+        деплой с ENV=prod тихо обходил и SAFE_MODE-запрет, и обязательный
+        JWT_PUBLIC_KEY (тот же класс fail-open, что чинили в вебхуке).
+        """
+        with pytest.raises(ValidationError, match="SAFE_MODE"):
+            Settings(
+                ENV=env_value,
+                SAFE_MODE=False,
+                ANTHROPIC_API_KEY="test-key",
+                ALERTMANAGER_WEBHOOK_SECRET="any-secret",
+            )
+
+    def test_prod_requires_jwt_issuer_and_audience(self):
+        """prod с JWT-ключом, но без iss/aud-пиннинга — фейл валидации.
+
+        Без сверки iss/aud токен, подписанный тем же IdP-ключом, но выданный
+        ДРУГОМУ сервису, аутентифицируется здесь с ролью approver
+        (горизонтальная эскалация).
+        """
+        with pytest.raises(ValidationError, match="JWT_ISSUER"):
+            Settings(
+                ENV="production",
+                SAFE_MODE=True,
+                ANTHROPIC_API_KEY="test-key",
+                ALERTMANAGER_WEBHOOK_SECRET="any-secret",
+                JWT_PUBLIC_KEY="-----BEGIN PUBLIC KEY-----\n...",
+                # JWT_ISSUER / JWT_AUDIENCE намеренно не заданы
+            )
+
+    def test_full_prod_config_validates(self):
+        """Полный прод-конфиг (все инварианты закрыты) проходит валидацию."""
+        settings = Settings(
+            ENV="production",
+            SAFE_MODE=True,
+            ANTHROPIC_API_KEY="test-key",
+            ALERTMANAGER_WEBHOOK_SECRET="any-secret",
+            JWT_PUBLIC_KEY="-----BEGIN PUBLIC KEY-----\n...",
+            JWT_ISSUER="https://idp.example.com/copilot",
+            JWT_AUDIENCE="sre-ai-copilot",
+            DATABASE_URL="postgresql://copilot:secret@db:5432/copilot",
+        )
+        assert settings.is_production is True
+
+    def test_is_production_excludes_non_prod_envs(self):
+        """staging/development — НЕ прод: инварианты не должны душить dev.
+
+        staging намеренно вне множества (см. _PROD_ENV_VALUES в app/config.py):
+        в деплой-конфигах репо его нет, а прод-требования сломали бы стейджинг.
+        """
+        for env_value in ("development", "dev", "staging", "test", ""):
+            settings = Settings(
+                ENV=env_value,
+                ANTHROPIC_API_KEY="test-key",
+                SAFE_MODE=False,  # вне прода допустимо
+            )
+            assert settings.is_production is False, env_value
+
 
 class TestIncidentPipeline:
     """Test incident processing pipeline"""

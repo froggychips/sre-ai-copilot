@@ -6,6 +6,7 @@ from uuid import UUID
 import structlog
 from celery.result import AsyncResult
 from fastapi import Body, Depends, FastAPI, HTTPException, Request, Response
+from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
 from prometheus_client import start_http_server
 from sqlalchemy import text
@@ -14,7 +15,7 @@ from app import repository
 from app.api import approvals, discord_interactions, rate_limit, replay, webhooks
 from app.evaluation import feedback
 from app.auth import User, get_current_user
-from app.celery_worker import celery_app, generate_reply, resilience
+from app.celery_worker import celery_app, generate_reply, redis_client, resilience
 from app.config import settings
 from app.database import SessionLocal, engine
 from app.knowledge_graph.contract import (
@@ -103,7 +104,10 @@ async def lifespan(app: FastAPI):
 
 
 # В production отключаем интерактивные docs/openapi: меньше surface для probing.
-if settings.ENV == "production":
+# Проверка через settings.is_production, а не литерал ENV == "production": деплой
+# с ENV=prod тихо обходил и этот гвард, и CORS-гвард ниже (тот же класс бага,
+# что чинили в fail-closed вебхуке — см. app/api/webhooks.py).
+if settings.is_production:
     app = FastAPI(
         title="SRE AI Copilot",
         version="1.0.0-rc.3",
@@ -128,7 +132,7 @@ app.add_middleware(RequestIDMiddleware)
 # проходил бы equality-гвард И включал wildcard.
 allowed_origins = settings.ALLOWED_ORIGINS
 wildcard_origins = "*" in allowed_origins
-if settings.ENV == "production" and wildcard_origins:
+if settings.is_production and wildcard_origins:
     raise RuntimeError(
         "Wildcard '*' in ALLOWED_ORIGINS is forbidden in production. "
         "Set a concrete origin list in env/secrets."
@@ -235,7 +239,15 @@ async def post_copilot(
         content=prompt,
         owner_sub=user.sub,
     )
-    task = generate_reply.delay(str(conversation_id), prompt)
+    # .delay() — синхронный publish в Redis-брокер (blocking socket I/O).
+    # В async-ручке такой вызов при деградации брокера морозит весь event
+    # loop (механика инцидента 08.08: liveness перестаёт отвечать → kubelet
+    # убивает api-поды) — уводим в threadpool.
+    task = await run_in_threadpool(generate_reply.delay, str(conversation_id), prompt)
+    # Владелец задачи — единственная связь «task_id → пользователь» (см. блок
+    # про /jobs ниже): без неё результат разбора отдавался любому
+    # аутентифицированному, кто увидел task_id в Location-заголовке или в логах.
+    await _remember_job_owner(task.id, user.sub)
     response.headers["Location"] = f"/jobs/{task.id}"
     return {"task_id": task.id, "conversation_id": conversation_id}
 
@@ -245,11 +257,21 @@ async def healthz():
     return {"status": "ok"}
 
 
+def _check_db_ready() -> None:
+    # engine — синхронный SQLAlchemy Engine: connect() при деградации PG
+    # блокируется до connect_timeout. Вызывается ТОЛЬКО через threadpool.
+    with engine.connect() as conn:
+        conn.execute(text("SELECT 1"))
+
+
 @app.get("/readyz")
 async def readyz():
     try:
-        with engine.connect() as conn:
-            conn.execute(text("SELECT 1"))
+        # Sync-пробу БД уводим в threadpool: инлайновый engine.connect()
+        # в async-ручке при зависшем PG морозил event loop целиком —
+        # /healthz переставал отвечать и kubelet убивал api-поды
+        # (механика инцидента 08.08).
+        await run_in_threadpool(_check_db_ready)
         return {"status": "ready"}
     except Exception as e:
         # Не светим детали исключения наружу — логируем server-side,
@@ -258,11 +280,81 @@ async def readyz():
         raise HTTPException(status_code=503, detail="database unavailable")
 
 
-@app.get("/jobs/{task_id}")
-async def get_job_status(
-    task_id: str,
-    user: User = Depends(get_current_user),
-):
+# ── /jobs: владелец задачи ───────────────────────────────────────────────
+#
+# Celery-задача сама по себе владельца не знает, а `/jobs/{task_id}` до этого
+# фикса отдавала РЕЗУЛЬТАТ любой задачи любому аутентифицированному
+# пользователю. Держалось это на том, что task_id — недогадываемый UUID, то
+# есть фактически capability-token. Но этот «токен» светится в
+# Location-заголовке ответа /copilot, в теле ответа, в access-логах ingress-а и
+# в логах приложения, а сам результат — LLM-разбор ЧУЖОГО диалога (тот же
+# класс IDOR, что чинили в /copilot через Conversation.owner_sub).
+#
+# Однозначной связи «celery task → пользователь» в данных нет: task_id
+# генерирует брокер, в Conversation он не пишется, а Celery-результат хранит
+# только payload задачи. Поэтому владелец фиксируется ЯВНО в момент постановки
+# задачи и сверяется при чтении.
+#
+# Хранилище — Redis (тот же, что celery result backend): запись обязана быть
+# видна ВСЕМ api-репликам, иначе поллинг сломается при 2 подах (поставил на
+# реплике A, спрашиваешь у B). TTL совпадает с дефолтным celery
+# `result_expires` (24ч) — дольше запись бессмысленна, результата уже нет.
+#
+# Fail-closed: нет записи о владельце (Redis недоступен/ключ протух/задача
+# поставлена ДРУГИМ путём) → 404, тот же ответ, что на несуществующий task_id.
+# Это анти-оракул (как 404 в /copilot и /approvals), но у этого есть цена:
+# `/jobs` обслуживает ТОЛЬКО copilot-задачи, что и записано в контракте
+# (docs/SEMANTIC_CONTRACT.md). Статус задач других путей (например
+# `POST /replay/{incident_id}`) смотрится через `GET /webhooks/status/{task_id}`.
+_JOB_OWNER_KEY_PREFIX = "job_owner:"
+_JOB_OWNER_TTL_SECONDS = 24 * 3600
+_JOB_NOT_FOUND = "Job not found"
+
+
+async def _remember_job_owner(task_id: str, owner_sub: str) -> None:
+    """Записать владельца свежепоставленной задачи. Best-effort.
+
+    NX — чтобы уже привязанную задачу нельзя было перепривязать на другого
+    владельца. Ошибку Redis не превращаем в ошибку постановки: задача уже в
+    брокере и будет выполнена, просто её результат нельзя будет прочитать
+    через /jobs (fail-closed, см. _job_owner_matches).
+    """
+    if not task_id or not owner_sub:
+        return
+    try:
+        await redis_client.set(
+            f"{_JOB_OWNER_KEY_PREFIX}{task_id}",
+            owner_sub,
+            ex=_JOB_OWNER_TTL_SECONDS,
+            nx=True,
+        )
+    except Exception as e:
+        log.warning("job_owner_not_recorded", task_id=task_id, error=str(e))
+
+
+async def _job_owner_matches(task_id: str, owner_sub: str) -> bool:
+    """True только если задача явно принадлежит `owner_sub`.
+
+    Всё остальное (нет записи, чужой владелец, Redis недоступен) — False:
+    отказ, неотличимый от «такой задачи нет».
+    """
+    if not owner_sub:
+        return False
+    try:
+        stored = await redis_client.get(f"{_JOB_OWNER_KEY_PREFIX}{task_id}")
+    except Exception as e:
+        log.warning("job_owner_lookup_failed", task_id=task_id, error=str(e))
+        return False
+    if isinstance(stored, bytes):
+        # decode_responses у клиента не задан централизованно — терпим оба вида.
+        stored = stored.decode("utf-8", "replace")
+    return bool(stored) and stored == owner_sub
+
+
+def _job_status_snapshot(task_id: str) -> dict:
+    # AsyncResult.status/.ready()/.result — синхронные обращения к Redis
+    # result-backend (blocking socket I/O). Вызывается ТОЛЬКО через
+    # threadpool, чтобы деградация Redis не морозила event loop.
     result = AsyncResult(task_id, app=celery_app)
     response_data = {"task_id": task_id, "status": result.status}
 
@@ -276,3 +368,21 @@ async def get_job_status(
             response_data["error"] = "task failed"
 
     return response_data
+
+
+@app.get("/jobs/{task_id}")
+async def get_job_status(
+    task_id: str,
+    user: User = Depends(get_current_user),
+):
+    # Ownership ДО обращения к result-backend: чужая/неизвестная задача не
+    # должна даже провоцировать запрос в Redis, а ответ обязан быть одинаковым
+    # в обоих случаях (иначе ручка — оракул «такой task_id существует»).
+    if not await _job_owner_matches(task_id, user.sub):
+        log.warning(
+            "job_access_denied",
+            task_id=task_id,
+            requested_by=user.sub,
+        )
+        raise HTTPException(status_code=404, detail=_JOB_NOT_FOUND)
+    return await run_in_threadpool(_job_status_snapshot, task_id)

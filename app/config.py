@@ -3,6 +3,23 @@ from typing import List, Optional
 from pydantic import Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+# Прод-подобные значения ENV (сравнение после strip().lower()).
+# Инварианты _enforce_prod_invariants раньше висели на точном литерале
+# ENV == "production": деплой с ENV=prod / Production тихо обходил и
+# обязательный JWT_PUBLIC_KEY, и запрет SAFE_MODE=false — тот же класс
+# fail-open-бага, что чинили в AlertManager-вебхуке (см. комментарий к
+# ALERTMANAGER_ALLOW_UNAUTHENTICATED).
+#
+# Выбор значений — по факту деплой-конфигов репо: k8s/worker.yaml,
+# k8s/base/deployment.yaml и helm values (env.appEnv) везде ставят
+# ровно "production"; docker-compose.yml и .env.example ENV не задают
+# (default development). "prod" включаем как каноничное сокращение /
+# опечатку ручного деплоя. "staging" НАМЕРЕННО не включаем: в конфигах
+# репо его нет, и распространять на него прод-требования (обязательный
+# HMAC-секрет, JWT-ключ) — значит сломать гипотетический стейджинг без
+# выигрыша в безопасности прода.
+_PROD_ENV_VALUES = frozenset({"production", "prod"})
+
 
 class Settings(BaseSettings):
     """
@@ -25,6 +42,11 @@ class Settings(BaseSettings):
     # можно было сайзить раздельно.
     DB_POOL_SIZE: int = Field(10, description="SQLAlchemy pool_size на процесс")
     DB_MAX_OVERFLOW: int = Field(20, description="SQLAlchemy max_overflow на процесс")
+    # libpq connect_timeout (сек) на УСТАНОВЛЕНИЕ соединения. Без него зависший
+    # Postgres (fsync-recovery, сеть) держит новый коннект до TCP-таймаута ОС
+    # (минуты) — усилитель инцидента 08.08.2026: /readyz ждал коннект, kubelet
+    # убивал под. 5с хватает in-cluster с запасом.
+    DB_CONNECT_TIMEOUT: int = Field(5, description="libpq connect_timeout (сек)")
 
     REDIS_URL: str = Field(
         "redis://localhost:6379/0",
@@ -624,6 +646,15 @@ class Settings(BaseSettings):
     CH_PROD_PORT: int = Field(8725, description="ClickHouse HTTP port")
     CH_PROD_USER: str = Field("", description="ClickHouse user")
     CH_PROD_PASSWORD: str = Field("", description="ClickHouse password")
+    # Схема HTTP-эндпоинта CH. Раньше в клиенте был хардкод `http://`, при
+    # том что .env.example предлагает CH_PROD_PORT=8443 (TLS) — на таком
+    # порту plain-HTTP запрос отваливается, и blast radius тихо выключался.
+    # 'auto' = https для TLS-портов (443/8443), иначе http; 'http'/'https'
+    # — явное переопределение для нестандартных портов.
+    CH_PROD_SCHEME: str = Field(
+        "auto",
+        description="ClickHouse HTTP scheme: auto|http|https ('auto' → https для портов 443/8443)",
+    )
     CH_BLAST_RADIUS_WINDOW_MINUTES: int = Field(15, description="Minutes before/after incident to check active players")
 
     # Statics Postgres — версии конфигов, проверка entity по ошибке DI.
@@ -748,6 +779,15 @@ class Settings(BaseSettings):
     EXECUTOR_APPROVAL_MAX_AGE_SECONDS: int = Field(
         3600, description="Максимальный возраст (сек) записи APPROVED для apply"
     )
+    # Свежесть самого intent-а. Approval-окно ограничивает только время от
+    # клика Approve, но НЕ возраст плана: kubectl, посчитанный по состоянию
+    # кластера недельной давности, мог применяться к совсем другому кластеру
+    # (оператор нажимает Apply на старом Discord-эмбеде). Возраст берётся из
+    # якоря времени прогона пайплайна (см. intent_signature.intent_recorded_at).
+    # 24h — консервативно: дольше живущий эмбед требует нового прогона.
+    EXECUTOR_INTENT_MAX_AGE_SECONDS: int = Field(
+        86400, description="Максимальный возраст (сек) execution_intent/dry-run для apply"
+    )
     # Двухфазный claim: маркер in_flight пишется и коммитится ДО kubectl.
     # Если воркер умрёт между запуском команды и записью результата, кластер
     # окажется изменён, а маркер — нет; claim закрывает это окно. TTL нужен,
@@ -840,6 +880,16 @@ class Settings(BaseSettings):
     JIRA_BACKEND_LABEL: str = Field("backend", description="Label marking backend/infra issues")
     JIRA_SEARCH_DAYS: int = Field(30, description="Look-back window for Jira issue search")
 
+    @property
+    def is_production(self) -> bool:
+        """Единственная каноничная проверка «мы в проде».
+
+        Все сравнения ENV с "production" обязаны идти через неё — точечные
+        литеральные сравнения уже дважды давали fail-open (вебхук, инварианты
+        ниже). Нормализация и множество значений — см. _PROD_ENV_VALUES.
+        """
+        return self.ENV.strip().lower() in _PROD_ENV_VALUES
+
     @model_validator(mode="after")
     def _enforce_prod_invariants(self) -> "Settings":
         if self.LLM_BACKEND == "anthropic" and not self.ANTHROPIC_API_KEY:
@@ -847,7 +897,7 @@ class Settings(BaseSettings):
                 "ANTHROPIC_API_KEY is required when LLM_BACKEND=anthropic. "
                 "For local dev without an API key, set LLM_BACKEND=claude_cli."
             )
-        if self.ENV == "production":
+        if self.is_production:
             if not self.SAFE_MODE:
                 raise ValueError(
                     "SAFE_MODE=false is forbidden in production. "
@@ -864,6 +914,18 @@ class Settings(BaseSettings):
                 raise RuntimeError(
                     "JWT_PUBLIC_KEY must be set in production "
                     "to validate JWT-protected endpoints."
+                )
+            # Одного ключа мало: без пиннинга iss/aud токен, подписанный тем же
+            # IdP-ключом, но выписанный ДРУГОМУ сервису, аутентифицируется
+            # здесь, а его claim roles открывает /replay и /approvals
+            # (горизонтальная эскалация; риск описан у JWT_ISSUER выше).
+            # auth.py сверяет iss/aud только когда они заданы — поэтому в
+            # проде оба обязаны быть заданы, той же логикой, что JWT_PUBLIC_KEY.
+            if not self.JWT_ISSUER or not self.JWT_AUDIENCE:
+                raise ValueError(
+                    "JWT_ISSUER and JWT_AUDIENCE must be set in production: "
+                    "without iss/aud pinning, a token signed by the same IdP "
+                    "key but issued for another service authenticates here."
                 )
             # Плейсхолдерный DATABASE_URL по умолчанию недопустим в проде —
             # это явный признак незаполненного конфига.
