@@ -1,11 +1,23 @@
 from __future__ import annotations
 
-import json
-from datetime import datetime, timezone
-from hashlib import sha256
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List
 
-from app.snapshot.schema import IncidentSnapshotV1
+from app.snapshot.schema import (
+    IncidentSnapshotV1,
+    compute_log_window_hash,
+    compute_metric_snapshot_hash,
+    compute_topology_hash,
+)
+
+# Допуск на рассинхрон часов между источником события (AlertManager пишет
+# incident_ts своими часами) и коллектором снапшота (captured_at — часы нашей
+# ноды). NTP-дрейф в пару секунд — норма, а строгое `incident_ts > captured_at`
+# из-за него отправляло КАЖДЫЙ такой снапшот в DEGRADED/MEDIUM (и включало
+# low_fidelity_mode в app/api/replay.py), т.е. сигнал снова обесценивался.
+# Реально «будущие» снапшоты (минуты вперёд = подмена/битый источник) всё ещё
+# ловятся: допуск сознательно меньше любого осмысленного окна инцидента.
+_CLOCK_SKEW_TOLERANCE = timedelta(seconds=5)
 
 REQUIRED_FIELDS = [
     "snapshot_id",
@@ -67,22 +79,25 @@ def validate_snapshot(snapshot: Dict[str, Any]) -> Dict[str, Any]:
         else None
     )
     if incident_dt is not None and captured_dt is not None:
-        if _as_utc(incident_dt) > _as_utc(captured_dt):
+        # Допуск _CLOCK_SKEW_TOLERANCE: секунды дрейфа часов — не сигнал.
+        if _as_utc(incident_dt) - _as_utc(captured_dt) > _CLOCK_SKEW_TOLERANCE:
             warnings.append(
-                "incident_ts is after captured_at — clock skew or bad source timestamp"
+                "incident_ts is after captured_at beyond clock-skew tolerance "
+                f"({int(_CLOCK_SKEW_TOLERANCE.total_seconds())}s) — "
+                "clock skew or bad source timestamp"
             )
 
     payload = snapshot.get("payload") or {}
-    expected_metric_hash = sha256(
-        json.dumps(payload.get("metrics", {}), sort_keys=True).encode("utf-8")
-    ).hexdigest()
-    expected_log_hash = sha256(
-        json.dumps(payload.get("logs", []), sort_keys=True).encode("utf-8")
-    ).hexdigest()
-
-    if snapshot.get("metric_snapshot_hash") != expected_metric_hash:
+    # Все три хэша пересчитываем по payload теми же формулами, что и при
+    # создании снапшота (app/snapshot/schema.py). topology_hash раньше НЕ
+    # перепроверялся, хотя материал (payload.targets + policy_name) лежит
+    # рядом — подменённая/разъехавшаяся топология в снапшоте проходила
+    # валидацию как PASS и уезжала в replay.
+    if snapshot.get("topology_hash") != compute_topology_hash(payload):
+        errors.append("topology_hash mismatch")
+    if snapshot.get("metric_snapshot_hash") != compute_metric_snapshot_hash(payload):
         errors.append("metric_snapshot_hash mismatch")
-    if snapshot.get("log_window_hash") != expected_log_hash:
+    if snapshot.get("log_window_hash") != compute_log_window_hash(payload):
         errors.append("log_window_hash mismatch")
 
     correlation_index = snapshot.get("correlation_index") or []
