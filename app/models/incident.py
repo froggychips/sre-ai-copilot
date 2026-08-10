@@ -35,25 +35,36 @@ class AlertManagerAlert(BaseModel):
         не сломался — приводим к string, исходный dict кладём в
         status_extra. Дополнительно — labels-based fallback (`silenced_by`/
         `inhibited_by` keys), который встречается у самописных AM-шлюзов.
+
+        Входной dict НЕ мутируем: при `mode="before"` сюда прилетает ровно тот
+        объект, что держит вызывающий (у нас — распарсенное тело AM-вебхука,
+        которое дальше уходит в `Incident.raw`, лог и retry). Перезапись
+        `data["status"]` на месте меняла payload под чужими руками: повторная
+        валидация того же dict-а уже не видела исходный объект-status, а
+        сохранённый «сырой» алерт врал про то, что реально пришло от AM.
+        Правки собираем в отдельный overlay и возвращаем копию.
         """
         if not isinstance(data, dict):
             return data
+        patch: Dict[str, Any] = {}
         status = data.get("status")
         if isinstance(status, dict):
             state = status.get("state")
-            data["status_extra"] = status
-            data["status"] = "resolved" if state == "resolved" else "firing"
+            patch["status_extra"] = status
+            patch["status"] = "resolved" if state == "resolved" else "firing"
         elif data.get("status_extra") is None:
             labels = data.get("labels") or {}
             sb = labels.get("silenced_by")
             ib = labels.get("inhibited_by")
             if sb or ib:
-                data["status_extra"] = {
+                patch["status_extra"] = {
                     "state": "suppressed",
                     "silencedBy": [sb] if sb else [],
                     "inhibitedBy": [ib] if ib else [],
                 }
-        return data
+        if not patch:
+            return data
+        return {**data, **patch}
 
 
 class AlertManagerWebhook(BaseModel):

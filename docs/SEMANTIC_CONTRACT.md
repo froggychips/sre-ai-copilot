@@ -95,3 +95,41 @@ Data received from external systems (e.g. commit messages from TeamCity, Jira is
 A replay scenario re-runs analysis of a historical incident and MUST:
 - not trigger external side effects (e.g. Discord alerts),
 - allow flexible state-machine transitions for retrospective runs.
+
+## 10. Time / Timezone Contract
+
+Every timestamp persisted by this service is **naive UTC**, and the database
+session is **pinned to UTC**. Both halves are load-bearing — one without the
+other silently shifts every time window.
+
+1. **Storage.** All `DateTime` columns are `TIMESTAMP WITHOUT TIME ZONE`
+   (`timezone=True` MUST NOT be used). Python-side defaults are
+   `datetime.utcnow()` — naive, valued in UTC. The column carries no offset,
+   so "which zone is this" is known only to the code.
+2. **Session.** `app/database.py` passes `-c timezone=UTC` in `connect_args`
+   for the Postgres path. This is what makes (1) self-consistent: dozens of
+   raw-SQL windows compare a naive column against `NOW()`, which is
+   `timestamptz` — e.g. `WHERE ts > NOW() - INTERVAL '24 hours'`
+   (`app/services/stats_digest.py`) and `SET resolved_at = NOW()`
+   (`app/knowledge_graph/alerts_resolve_sync.py`). Postgres coerces
+   `timestamptz` to `timestamp` **using the session TimeZone**. At UTC the
+   result matches what `utcnow()` wrote; at any other zone — and the server
+   default comes from outside the application (`postgresql.conf`,
+   `ALTER ROLE`, the pod's `PGTZ`) — every window slides by the offset. The
+   daily digest reports the wrong 24 hours, `alerts_resolve_sync` under-resolves
+   alerts, and nothing errors or alerts.
+3. **Boundaries.** Naive and aware datetimes MUST NOT be mixed: comparing them
+   in Python raises `TypeError`, and writing an aware value into a column
+   without a zone drops `tzinfo`, shifting the value. Code at the edge
+   (API/JSON payloads, external clients) converts explicitly before persisting:
+   `dt.astimezone(timezone.utc).replace(tzinfo=None)`.
+
+Guards: `tests/test_db_engine_pool_config.py` (session TimeZone pinned, model
+defaults naive UTC, no `timezone=True` column anywhere) and
+`tests/test_idle_transaction_guard.py` (the option survives on the real engine).
+
+> Note: the codebase still mixes `datetime.utcnow()` and
+> `datetime.now(timezone.utc)` at call sites. That is tolerable **only** under
+> this contract — values written to the DB must end up naive UTC. A migration
+> to aware-everywhere would have to flip the columns to `timestamptz` in the
+> same change; doing one half alone is a silent-offset bug.

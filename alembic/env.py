@@ -28,11 +28,21 @@ from app.config import settings
 
 # Guard от регрессии: если кто-то вынесет модели так, что side-effect-импорты
 # выше перестанут их регистрировать — падаем сразу, а не молча генерим drop'ы.
+#
+# Явный raise, а не assert: под `python -O` (и `PYTHONOPTIMIZE=1`, что легко
+# прилетает из образа/энва) assert вырезается компилятором, и guard исчезает
+# ровно там, где он нужнее всего — в проде.
 _visible = set(ModelsBase.metadata.tables) | set(DatabaseBase.metadata.tables)
-for _required in ("conversations", "kg_services", "kg_service_edges", "discord_dedup"):
-    assert _required in _visible, (
-        f"alembic/env.py: таблица {_required!r} не видна в target_metadata — "
-        "проверь side-effect-импорты моделей выше (риск ложных drop_table в autogenerate)"
+_missing = [
+    _t
+    for _t in ("conversations", "kg_services", "kg_service_edges", "discord_dedup")
+    if _t not in _visible
+]
+if _missing:
+    raise RuntimeError(
+        f"alembic/env.py: таблицы {_missing} не видны в target_metadata — "
+        "проверь side-effect-импорты моделей выше (риск ложных drop_table "
+        "в autogenerate)"
     )
 
 # This is the Alembic Config object, which provides access to the values within the .ini file in use.

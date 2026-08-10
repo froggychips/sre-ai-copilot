@@ -22,8 +22,17 @@ jobs:
     # issue. macOS arm64; we use the homebrew-installed Python 3.12 directly
     # instead of actions/setup-python — that action assumes GitHub-hosted
     # paths (/Users/runner) that don't exist on a self-hosted setup.
-    # Python 3.12 chosen because psycopg2-binary 2.9.9 has prebuilt wheels
-    # for macosx_11_0_arm64 starting from cp312.
+    #
+    # ВНИМАНИЕ: 3.12 здесь ≠ 3.11 в Dockerfile (рантайм прода). Тесты идут НЕ
+    # на версии прода — осознанный долг, а не проектное решение.
+    # Прежнее обоснование («psycopg2-binary имеет arm64-колёса только с cp312»)
+    # УСТАРЕЛО: проверено 2026-08-10 для запиненной 2.9.12 —
+    # psycopg2_binary-2.9.12-cp311-cp311-macosx_11_0_arm64.whl существует.
+    # Реальная причина сейчас одна: на раннере из homebrew стоят только
+    # 3.12/3.13/3.14, python@3.11 не установлен.
+    # Чтобы выровнять с продом: brew install python@3.11 на раннере, затем
+    # заменить пути ниже на /opt/homebrew/bin/python3.11 (ruff.toml и mypy.ini
+    # уже описывают 3.11 — см. комментарий в ruff.toml).
     runs-on: [self-hosted, macOS, ARM64]
     steps:
       - name: Checkout Code
