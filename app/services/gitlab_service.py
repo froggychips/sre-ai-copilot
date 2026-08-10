@@ -23,6 +23,16 @@ _MAX_SHAS = 10       # коммитов из TC берём не более N
 _MAX_MRS = 5         # MR из найденных — не более N (сортируем по merged_at desc)
 _MAX_FILES = 20      # файлов на MR
 
+# Пагинация списка MR. Одна страница per_page=25 теряла данные: GitLab
+# self-hosted не умеет order_by=merged_at, сортируем по updated_at — а
+# updated_at двигает ЛЮБАЯ активность (коммент, пайплайн, ре-таргет) в
+# посторонних MR. В активном backend-репо MR-ы, смёрженные в нужное окно,
+# выдавливались за границу первой страницы, и «какой MR вызвал проблему»
+# отвечалось неполно, но уверенно. Теперь идём страницами до капа; кап
+# логируем явно (не молчаливая обрезка).
+_MR_PAGE_SIZE = 100   # максимум GitLab API v4
+_MR_MAX_PAGES = 5     # ≤500 MR на окно — потолок стоимости обхода
+
 
 class GitLabClient:
     def __init__(self, base_url: str, token: str, timeout: float = 8.0) -> None:
@@ -67,29 +77,62 @@ class GitLabClient:
         """MR-ы смёрженные в target_branch в окне [since, until].
 
         GitLab self-hosted может не поддерживать order_by=merged_at и
-        параметры merged_after/merged_before — фильтруем на клиенте.
+        параметры merged_after/merged_before — фильтруем на клиенте, но
+        страницы обходим до _MR_MAX_PAGES (одна страница окно не покрывает,
+        см. комментарий у _MR_PAGE_SIZE).
         """
-        try:
-            all_mrs = await self._get(
-                f"/projects/{project_id}/merge_requests",
-                params={
-                    "state": "merged",
-                    "target_branch": target_branch,
-                    "order_by": "updated_at",
-                    "sort": "desc",
-                    "per_page": 25,  # берём с запасом, фильтруем на клиенте
-                },
-            )
-        except Exception as e:
-            logger.debug("gitlab.mrs_merged_in_window branch=%s: %s", target_branch, e)
-            return []
+        filtered: List[Dict[str, Any]] = []
+        scanned = 0
+        for page in range(1, _MR_MAX_PAGES + 1):
+            try:
+                batch = await self._get(
+                    f"/projects/{project_id}/merge_requests",
+                    params={
+                        "state": "merged",
+                        "target_branch": target_branch,
+                        "order_by": "updated_at",
+                        "sort": "desc",
+                        "per_page": _MR_PAGE_SIZE,
+                        "page": page,
+                    },
+                )
+            except Exception as e:
+                # Отдаём то, что успели собрать: частичный ответ полезнее
+                # пустого, и он не молчаливый — ошибка в логе.
+                logger.debug(
+                    "gitlab.mrs_merged_in_window branch=%s page=%d: %s",
+                    target_branch, page, e,
+                )
+                break
+            if not isinstance(batch, list) or not batch:
+                break
+            scanned += len(batch)
 
-        # Клиентская фильтрация по merged_at
-        filtered = []
-        for mr in all_mrs:
-            mat = mr.get("merged_at") or ""
-            if since <= mat <= until:
-                filtered.append(mr)
+            for mr in batch:
+                mat = mr.get("merged_at") or ""
+                if since <= mat <= until:
+                    filtered.append(mr)
+
+            # Ранний выход: сортировка updated_at DESC, а updated_at ≥ merged_at
+            # всегда — значит если вся страница обновлялась раньше `since`, то
+            # ниже по списку MR-ов из окна уже нет.
+            newest_updated = max((mr.get("updated_at") or "") for mr in batch)
+            if newest_updated and newest_updated < since:
+                break
+            if len(batch) < _MR_PAGE_SIZE:
+                break  # страница неполная → данные исчерпаны
+        else:
+            # Кап страниц исчерпан, а обход не завершился естественно —
+            # хвост окна не просмотрен. Логируем: «MR не найден» в такой
+            # ситуации != «MR не было».
+            logger.warning(
+                "gitlab.mrs_merged_in_window page cap reached branch=%s pages=%d scanned=%d matched=%d",
+                target_branch, _MR_MAX_PAGES, scanned, len(filtered),
+            )
+
+        # Сортируем по merged_at DESC: из широкого скана нужны MR-ы,
+        # смёрженные ближе всего к инциденту, а не первые по updated_at.
+        filtered.sort(key=lambda mr: mr.get("merged_at") or "", reverse=True)
         return filtered[:_MAX_MRS]
 
     async def mr_diff_files(self, project_id: int, mr_iid: int) -> List[str]:
