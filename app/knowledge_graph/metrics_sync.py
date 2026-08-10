@@ -264,6 +264,13 @@ async def _sync_service_health_async(db: Session) -> Dict[str, Any]:
     stats["namespaces"] = len(namespaces)
     stats["queries"] = len(namespaces) * 5
 
+    # Read-транзакция от db.query(Service) выше обязана закончиться ДО
+    # fetch-фазы: gather по VM занимает минуты, а PG убивает соединение,
+    # висящее idle-in-transaction дольше 120с (database.py). Без commit
+    # весь тик умирал в write-фазе с «server closed the connection
+    # unexpectedly» — kg_metrics_sync стоял с 09.08.
+    db.commit()
+
     # ── Fetch phase: по namespace, параллельно с semaphore-капом ───────────
     sem = asyncio.Semaphore(concurrency)
     t0 = time.monotonic()

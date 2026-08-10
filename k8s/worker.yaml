@@ -98,13 +98,19 @@ spec:
         # выселяется последним. При acks_late (см. app/workers/tasks.py) OOM
         # больше не теряет задачу, но крутить OOM-петлю всё равно нельзя —
         # переотправка вернёт ту же задачу тому же лимиту.
+        # Memory: 768Mi → 3Gi. На rc.13 (волна PR #228-#245) воркеры ловили
+        # OOMKilled каждые ~1.5-2ч при живом лимите 1536Mi — суммарно 44
+        # рестарта за 44ч на двух репликах (10.08.2026). Из-за OOM-петли ×
+        # acks_late × expires=21600 дайджест daily_stats_digest два дня молча
+        # протухал в очереди: воркер умирал, redis передоставлял через
+        # visibility_timeout=1ч, к 15:00 UTC задача revoke-алась.
         resources:
           limits:
             cpu: 600m
-            memory: 768Mi
+            memory: 3Gi
           requests:
             cpu: 600m
-            memory: 768Mi
+            memory: 3Gi
 ---
 apiVersion: policy/v1
 kind: PodDisruptionBudget

@@ -391,11 +391,26 @@ def recompute_all_health(db: Session) -> Dict[str, int]:
     Returns stats: {real_services, recomputed, low_health, perfect_health}.
     """
     now = datetime.utcnow()
-    services = db.query(Service).filter(Service.synthetic.is_(False)).all()
+    # ORDER BY id — детерминированный порядок UPDATE-ов при flush: блокировки
+    # берутся по возрастанию id, встречные проходы не могут схлопнуться в
+    # deadlock между собой.
+    services = (
+        db.query(Service)
+        .filter(Service.synthetic.is_(False))
+        .order_by(Service.id)
+        .all()
+    )
     low_health = 0
     perfect_health = 0
     recomputed = 0
-    for svc in services:
+    # Commit батчами. При autoflush=False единственный db.commit() в конце
+    # флашил ВСЕ ~9k UPDATE-ов одной транзакцией — десятки секунд накопления
+    # row-локов на kg_services, встречные upsert-ы синка топологии ловили
+    # deadlock (594/сутки на проде 09-10.08). Короткие транзакции отпускают
+    # локи каждые ~100 строк; пересчёт идемпотентен, частичный прогон
+    # безопасен.
+    _COMMIT_BATCH = 100
+    for i, svc in enumerate(services, 1):
         score, _ = compute_health_for_service(db, svc, now=now)
         svc.health_score = score
         svc.health_computed_at = now
@@ -404,6 +419,8 @@ def recompute_all_health(db: Session) -> Dict[str, int]:
             low_health += 1
         if score >= 0.99:
             perfect_health += 1
+        if i % _COMMIT_BATCH == 0:
+            db.commit()
     db.commit()
     log.info(
         "kg_health.recompute_done real=%d low_health=%d perfect=%d",
