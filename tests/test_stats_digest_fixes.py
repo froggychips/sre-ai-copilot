@@ -67,7 +67,7 @@ def test_anomaly_summary_subquery_failure_is_isolated():
     db.execute.side_effect = [
         MagicMock(fetchone=lambda: (47, 12)),          # total, distinct
         RuntimeError("severity query blew up"),        # by_severity падает
-        MagicMock(fetchall=lambda: [("mv-service", 12)]),  # top_services
+        MagicMock(fetchall=lambda: [("mv-service", "prod-shared", 12)]),  # top_services
         MagicMock(fetchall=lambda: [("p95_latency_ms", 20)]),  # by_metric
     ]
     with patch.object(stats_digest, "_metrics_sync_lag_minutes", return_value=None):
