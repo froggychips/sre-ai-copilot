@@ -2,11 +2,15 @@
 
 Три значения:
 
-* ``active`` — был deploy за последние ``ACTIVE_WINDOW_DAYS`` (default 30d).
+* ``active`` — был deploy **самого сервиса** за последние
+  ``ACTIVE_WINDOW_DAYS`` (default 30d). ns-broadcast (деплой любого сервиса
+  namespace, разосланный всем — см. ``is_ns_broadcast_deploy``) таким
+  доказательством НЕ является.
 * ``expected_stale`` — давно не катился, но это норма: backup/cron/system
   (`*-backup`, `*-cron`, ns `kube-system`, `monitoring`, …) либо infra/platform
   owner вне ``ACTIVE_WINDOW_DAYS``.
-* ``suspicious_stale`` — нет deploys за 30d, не expected_stale.
+* ``suspicious_stale`` — нет доказанных deploys сервиса за 30d, не
+  expected_stale.
 
 Используется в:
   * ``kg_sync.sync_namespace`` — переписывает ``kg_services.stale_class`` на
@@ -23,7 +27,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
-from typing import Optional
+from typing import Any, Mapping, Optional
 
 # ── Константы (вынесены из stats_digest.py) ──────────────────────────────────
 
@@ -117,6 +121,35 @@ def _ensure_naive(dt: datetime) -> datetime:
     return dt
 
 
+# ── Атрибуция деплоя: чей это деплой ────────────────────────────────────────
+#
+# `tc_deploys_to_kg` (app/workers/tasks.py) пишет ОДНУ И ТУ ЖЕ запись
+# kg_deployments всем non-synthetic узлам namespace и помечает её
+# `extras.namespace_scope = True` — это единственный признак в данных,
+# который отличает «в ns что-то каталось» от «катился ЭТОТ сервис». Записи
+# БЕЗ маркера (auto_populator по TC-контексту инцидента) привязаны к
+# конкретному сервису.
+#
+# Отсюда исходная беда: `max(started_at)` по kg_deployments сервиса — это
+# почти всегда ns-broadcast, поэтому в активно деплоящемся namespace ВСЕ
+# сервисы вечно `active`, и классификатор отвечал на вопрос «был ли деплой в
+# ns за 30d», а не «катился ли этот сервис». `suspicious_stale` при таком
+# входе физически не мог сработать.
+NS_BROADCAST_EXTRAS_KEY = "namespace_scope"
+
+
+def is_ns_broadcast_deploy(extras: Optional[Mapping[str, Any]]) -> bool:
+    """Запись kg_deployments — ns-broadcast, а не деплой ЭТОГО сервиса?
+
+    Чистая функция над `Deployment.extras` — чтобы вызывающий (тот, кто
+    считает `max(started_at)`) мог разделить доказательства и передать их
+    сюда двумя параметрами: `last_service_deploy_at` / `last_ns_deploy_at`.
+    """
+    if not isinstance(extras, Mapping):
+        return False
+    return bool(extras.get(NS_BROADCAST_EXTRAS_KEY))
+
+
 def classify_stale_with_deploys(
     name: str,
     namespace: str,
@@ -126,28 +159,80 @@ def classify_stale_with_deploys(
     now: Optional[datetime] = None,
     active_window_days: int = ACTIVE_WINDOW_DAYS,
     infra_expected_days: int = INFRA_EXPECTED_DAYS,
+    last_service_deploy_at: Optional[datetime] = None,
+    last_ns_deploy_at: Optional[datetime] = None,
 ) -> str:
     """3-классная классификация.
 
+    Доказательства деплоя приходят одним из двух способов:
+
+    * **разделённые** — ``last_service_deploy_at`` (max ``started_at`` по
+      записям БЕЗ ``extras.namespace_scope``, то есть привязанным к самому
+      сервису) и/или ``last_ns_deploy_at`` (ns-broadcast). Так надо, и так
+      классификатор отвечает именно на «катился ли ЭТОТ сервис»;
+    * **слитые** (legacy) — только ``last_deploy_at``: сырой
+      ``max(kg_deployments.started_at)`` по service_id, где ns-broadcast и
+      свой деплой неразличимы. Это вход, который сегодня даёт
+      ``kg_sync._refresh_stale_class_for_namespace`` и
+      ``scripts/backfill_ownership``.
+
     Решение:
 
-    1. ``last_deploy_at`` < ``active_window_days`` назад → ``active``.
+    1. ``last_service_deploy_at`` свежее ``active_window_days`` → ``active``.
+       Это ЕДИНСТВЕННОЕ доказательство «сервис катился».
     2. name/ns матчат legacy ``_classify_stale`` == ``expected`` → ``expected_stale``.
-    3. ``team_owner`` infra/platform/data **и** ``last_deploy_at`` свежее
-       ``infra_expected_days`` (или None — никогда не катился, но infra) →
+    3. ``team_owner`` infra/platform/data **и** последний известный deploy
+       (любой атрибуции) свежее ``infra_expected_days`` либо его нет вовсе →
        ``expected_stale``.
     4. иначе → ``suspicious_stale``.
 
-    Если ``last_deploy_at`` is None (нет ни одного deployment в KG) — fallback:
-    name/ns hint → expected_stale; иначе suspicious_stale.
+    ЯВНАЯ ДЕГРАДАЦИЯ (важно для чтения результата):
+
+    * ns-broadcast **сам по себе `active` не даёт** — он говорит только «в
+      namespace что-то каталось». Для сервиса с ns-broadcast'ом и без своих
+      записей ответ уходит в правила 2-4, то есть `suspicious_stale` здесь
+      читается как «нет ДОКАЗАННО своего деплоя», а не как «мёртв». Ложных
+      обвинений в дайджест это не приносит: все его секции
+      (``stats_digest._suspicious_stale_action_items`` и drill-down'ы)
+      дополнительно требуют ``NOT EXISTS kg_deployments`` за 60d, а
+      ns-broadcast-запись такому сервису эту проверку не пройдёт.
+    * Завести четвёртое значение (``unknown``) нельзя: enum зафиксирован в
+      ``contract.STALE_CLASS_VALUES`` + миграции колонки, а у соседей
+      ``expected_stale`` вырезает сервис из app-scope орфан-метрики
+      (``contract.compute_orphan_stats``) — «неизвестно» туда мапить нельзя,
+      это испортило бы метрику качества.
+    * Слитый (legacy) вход трактуется как раньше — свежий timestamp даёт
+      ``active``. Это осознанный компромисс: разделить доказательства может
+      только вызывающий (у него на руках ``Deployment.extras``, см.
+      ``is_ns_broadcast_deploy``), а молча объявить все сервисы активно
+      деплоящихся namespace подозрительными — обвинение на масштабе. Тот,
+      кто пишет колонку, обязан перейти на разделённые параметры.
     """
     now_dt = _ensure_naive(now) if now is not None else datetime.utcnow()
     active_cutoff = now_dt - timedelta(days=active_window_days)
     infra_cutoff = now_dt - timedelta(days=infra_expected_days)
 
-    last_naive = _ensure_naive(last_deploy_at) if last_deploy_at is not None else None
+    svc_naive = (
+        _ensure_naive(last_service_deploy_at)
+        if last_service_deploy_at is not None else None
+    )
+    ns_naive = (
+        _ensure_naive(last_ns_deploy_at) if last_ns_deploy_at is not None else None
+    )
+    merged_naive = (
+        _ensure_naive(last_deploy_at) if last_deploy_at is not None else None
+    )
+    # Caller разделил атрибуцию → сырому `last_deploy_at` больше не верим
+    # как доказательству «катился сервис».
+    attribution_known = svc_naive is not None or ns_naive is not None
 
-    if last_naive is not None and last_naive >= active_cutoff:
+    if svc_naive is not None and svc_naive >= active_cutoff:
+        return STALE_CLASS_ACTIVE
+    if (
+        not attribution_known
+        and merged_naive is not None
+        and merged_naive >= active_cutoff
+    ):
         return STALE_CLASS_ACTIVE
 
     name_class = _classify_stale(name, namespace)
@@ -156,8 +241,11 @@ def classify_stale_with_deploys(
 
     if team_owner and team_owner.lower() in _INFRA_OWNER_TOKENS:
         # infra-сервис: даже без свежего deploy в окне 30d — это норма,
-        # если есть какие-то deploys за infra_expected_days.
-        if last_naive is None or last_naive >= infra_cutoff:
+        # если есть какие-то deploys за infra_expected_days. Здесь годится
+        # доказательство любой атрибуции: правило и так о снисхождении.
+        known = [t for t in (svc_naive, ns_naive, merged_naive) if t is not None]
+        last_any = max(known) if known else None
+        if last_any is None or last_any >= infra_cutoff:
             return STALE_CLASS_EXPECTED
 
     return STALE_CLASS_SUSPICIOUS

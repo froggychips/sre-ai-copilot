@@ -35,7 +35,16 @@ log = logging.getLogger(__name__)
 
 
 def _round_to_hour(dt: datetime) -> datetime:
-    """Округление вниз до часа — стабильный window_end для idempotency."""
+    """Округление вниз до часа — стабильный window_end для idempotency.
+
+    ВАЖНО для потребителей: beat пишет агрегаты hourly в :23 (расписание
+    `kg-signal-aggregates-compute` в app/workers/tasks.py), а window_end при
+    этом = floor(hour), т.е. запись «рождается» уже 23-минутной, и к моменту
+    следующего прогона её возраст доходит до 1h23m. Любая проверка свежести
+    должна допускать НЕСКОЛЬКО периодов записи, иначе штраф на стороне
+    потребителя флапает внутри часа (health_score._SIGNAL_AGG_FRESHNESS_HOURS
+    — ровно эта грабля, review 2026-08).
+    """
     return dt.replace(minute=0, second=0, microsecond=0)
 
 

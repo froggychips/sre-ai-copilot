@@ -3,7 +3,8 @@
 `run_drift_cleanup(db, max_drift_pct=20.0, apply=True)` — основная функция:
 
 1. Через `kubectl get ns` собирает live-namespace set.
-2. Сравнивает с `kg_services.namespace` distinct.
+2. Сравнивает с `kg_services.namespace` distinct — БЕЗ синтетических ns
+   (см. `_SYNTHETIC_NAMESPACES`): их в кластере нет по построению.
 3. **Safety threshold**: если drift > max_drift_pct (default 20%) — no-op,
    возвращает skipped=True. Защита от kubectl-failure / временной недоступности
    API server, когда вернётся пустой set и все ns "drift".
@@ -21,9 +22,16 @@ from typing import Any, Dict, Set
 
 from sqlalchemy.orm import Session
 
+from app.knowledge_graph.nats_subjects_sync import NATS_SUBJECTS_NAMESPACE
 from app.knowledge_graph.schema import Service
 
 log = logging.getLogger(__name__)
+
+# Синтетические namespace: чисто KG-конструкции, в k8s их нет по определению
+# (`nats-subjects` держит subject-узлы из nats_subjects_sync). В сравнении
+# kg_ns vs live-ns они попадали в drift КАЖДЫЙ прогон: subject-узлы получали
+# `drift_reason`/`drift_marked_at`, а drift_pct был постоянно завышен.
+_SYNTHETIC_NAMESPACES = frozenset({NATS_SUBJECTS_NAMESPACE})
 
 
 class DriftCleanupSkipped(Exception):
@@ -76,7 +84,10 @@ def run_drift_cleanup(
         }
     """
     k8s_ns = _k8s_live_namespaces()
-    kg_ns = {ns for (ns,) in db.query(Service.namespace).distinct().all()}
+    kg_ns = {
+        ns for (ns,) in db.query(Service.namespace).distinct().all()
+        if ns not in _SYNTHETIC_NAMESPACES
+    }
     drift = sorted(kg_ns - k8s_ns)
 
     stats: Dict[str, Any] = {

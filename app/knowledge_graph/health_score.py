@@ -6,11 +6,13 @@ hierarchy «что в danger» требует composite сигнал.
 
 Score [0, 1], 1.0 = perfect health, 0.0 = down/broken. Деривируется
 из:
-  - active alerts на сервисе (critical / warning, recently fired)
-  - pod_events с высоким count (chronic crashloop)
+  - open alerts на сервисе (critical / warning, resolved_at IS NULL —
+    БЕЗ окна по fired_at, см. `_OPEN_ALERT_MAX_AGE_DAYS`)
+  - pod_events с высоким count (chronic crashloop) — окно по last_seen
   - recurrence_24h (повторяющиеся в окне 24h)
   - p95 latency drift (текущее окно vs baseline 7d) — penalty при +50%
-  - http_5xx_rate (текущий) — penalty при > 1%
+  - http_5xx_rate (текущий) — penalty при > 0.05 rps 5xx (единицы — rps,
+    НЕ доля; см. `_HTTP_5XX_TRIGGER_RPS`)
   - deploy_failure_pct из kg_signal_aggregates — penalty при > 20%
   - slo_burn_pct из kg_signal_aggregates — penalty при > 10%
 
@@ -22,8 +24,10 @@ Score [0, 1], 1.0 = perfect health, 0.0 = down/broken. Деривируется
 Каждый новый компонент капается отдельным penalty cap (`_PENALTY_CAP_PER_COMPONENT`),
 чтобы один сигнал не обнулял score целиком — нужно несколько параллельных
 проблем чтобы дойти до 0. Если данных по метрикам нет (< _MIN_POINTS_FOR_METRICS
-точек в окне) или нет свежей записи signal_aggregates (< 1h) — компонент
-просто скипается (graceful degradation, не penalty).
+точек в окне) или нет свежей записи signal_aggregates (см.
+`_SIGNAL_AGG_FRESHNESS_HOURS` — допуск привязан к расписанию ЗАПИСИ
+агрегатов, не к расписанию пересчёта) — компонент просто скипается
+(graceful degradation, не penalty).
 
 ⚠️ ОГРАНИЧЕНИЕ (частично закрыто 2026-06-10): `p95 latency` и `http_5xx_rate`
 в `kg_service_health` **всё ещё всегда 0** — app `/metrics` (Kestrel) закрыт
@@ -51,9 +55,11 @@ import logging
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Tuple, cast
 
+from sqlalchemy import and_, or_
 from sqlalchemy.orm import Session
 
 from app.knowledge_graph.schema import (
+    NODE_KIND_SERVICE,
     AlertEvent,
     IngressObservation,
     PodEvent,
@@ -76,13 +82,24 @@ _PENALTY_CAP_PER_COMPONENT = 0.25
 
 # Trigger-пороги для новых компонентов.
 _P95_DRIFT_TRIGGER_PCT = 50.0    # текущий p95 > baseline * 1.5
-_HTTP_5XX_TRIGGER = 0.01          # rate > 1%
+# http_5xx_rate из kg_service_health — это `sum(rate(http_requests_total
+# {status=~"5.."}))`, т.е. 5xx-ЗАПРОСОВ В СЕКУНДУ, а не доля от трафика
+# (metrics_sync._q_ns_5xx_by_service). Доли посчитать нечем: знаменателя
+# (общий rps) в kg_service_health нет вообще. Прежний порог 0.01 с
+# комментарием «rate > 1%» путал единицы: как только скрейп откроют
+# (WO-12483), штраф начинался бы с 0.01 rps (1 ошибка в 100 секунд) и
+# упирался в cap уже на 0.06 rps — то есть на любом ненулевом error-трафике.
+# Приводим к честным rps и к той же шкале, что у ingress-компонента
+# (_INGRESS_5XX_TRIGGER_RPS/_INGRESS_5XX_WEIGHT): один и тот же сигнал на
+# двух слоях должен штрафовать одинаково. 0.05 rps = 3 ошибки в минуту —
+# выше шума одиночных ретраев; cap 0.25 достигается на 0.30 rps.
+_HTTP_5XX_TRIGGER_RPS = 0.05
 _DEPLOY_FAILURE_TRIGGER_PCT = 20.0
 _SLO_BURN_TRIGGER_PCT = 10.0
 
 # Чувствительность penalty (penalty = min(cap, weight * over_threshold)):
 _P95_DRIFT_WEIGHT_PER_PCT = 0.005   # 100% drift = 0.5 нагруз, capped 0.25
-_HTTP_5XX_WEIGHT = 5.0              # 5% 5xx = 0.20 (5% * 5 - порог 0.01*5)
+_HTTP_5XX_WEIGHT_PER_RPS = 1.0      # 0.30 rps over → 0.30 → capped 0.25
 _DEPLOY_FAILURE_WEIGHT_PER_PCT = 0.005
 _SLO_BURN_WEIGHT_PER_PCT = 0.01
 
@@ -94,12 +111,37 @@ _INGRESS_5XX_TRIGGER_RPS = 0.05    # < 0.05 rps 5xx = шум, не штрафу�
 _INGRESS_5XX_WEIGHT = 1.0          # 0.30 rps over → 0.30 → capped 0.25
 
 # Окна:
-_OPEN_ALERT_LOOKBACK_HOURS = 24    # «активный alert» = fired за 24h без resolve
+# «Открытый alert» = resolved_at IS NULL, БЕЗ окна по fired_at. Раньше окно
+# было 24h и это делало health_score слепым ровно на хронические инциденты:
+# медиана TTR у KubeDeploymentReplicasMismatch 29h, p90 = 83h (TTR-аналитика
+# по kg_alerts, см. stuck_alerts.py), а record_alert_event для ongoing-алерта
+# СОХРАНЯЕТ исходный fired_at (populator.py: on-conflict не двигает fired_at
+# пока строка не resolved). Итог: critical, горящий вторые сутки, выпадал из
+# alert-penalty → score возвращался к ~1.0 в разгар многодневной аварии и
+# сервис исчезал из top_unhealthy.
+# Верхняя граница остаётся только как защита от «фантомов» сломанного
+# resolve-пути: 30д = то же окно, в котором kg_alerts_resolve_sync резолвит
+# по AM-снимку (alerts_resolve_sync.py), а их залипание — это сигнал
+# check_alerts_resolve_freshness, не health_score.
+_OPEN_ALERT_MAX_AGE_DAYS = 30
 _POD_EVENT_LOOKBACK_DAYS = 7
-_RECURRENCE_WINDOW_HOURS = 24
+_RECURRENCE_WINDOW_HOURS = 24      # окно ТОЛЬКО для recurrence-подсчётов
 _METRIC_RECENT_WINDOW_HOURS = 1    # «текущее» значение — последний час
 _METRIC_BASELINE_WINDOW_DAYS = 7   # baseline — последние 7д для p95
-_SIGNAL_AGG_FRESHNESS_HOURS = 1    # свежая запись = в пределах часа
+# Freshness агрегатов kg_signal_aggregates. Расписание beat (tasks.py):
+# `kg-signal-aggregates-compute` — hourly в :23, пишет window_end =
+# floor(hour), а `kg-health-recompute` бежит */20 (:00/:20/:40). Нормальный
+# возраст самой свежей записи гуляет от 37 мин до 1h23m: допуск в 1 час
+# выкидывал агрегат в прогонах :00/:20 и пропускал в :40 — deploy_failure/
+# slo_burn-штраф флапал каждые 20 минут, и что увидит дайджест/fragile-top
+# было лотереей. Держим допуск в 3 периода записи: переживает один
+# пропущенный hourly-прогон, а сама запись описывает окно window_hours=24,
+# так что 3-часовая давность её не обесценивает.
+_SIGNAL_AGG_WRITE_PERIOD_HOURS = 1
+_SIGNAL_AGG_FRESHNESS_PERIODS = 3
+_SIGNAL_AGG_FRESHNESS_HOURS = (
+    _SIGNAL_AGG_WRITE_PERIOD_HOURS * _SIGNAL_AGG_FRESHNESS_PERIODS
+)
 _MIN_POINTS_FOR_METRICS = 6        # < 6 точек за час — данных мало, скипаем
 _INGRESS_RECENT_WINDOW_MINUTES = 30  # окно для свежих ingress-наблюдений
 
@@ -204,9 +246,14 @@ def _latest_signal_aggregate(
     service_id: int,
     now: datetime,
 ) -> Optional[SignalAggregate]:
-    """Свежая (window_end >= now - 1h) запись из kg_signal_aggregates.
+    """Свежая (window_end >= now - _SIGNAL_AGG_FRESHNESS_HOURS) запись из
+    kg_signal_aggregates.
 
-    Если её нет — None (вызывающий скипает deploy_failure / slo_burn).
+    Допуск покрывает реальный интервал ЗАПИСИ агрегатов (hourly в :23), а не
+    интервал этого пересчёта (*/20) — иначе штраф deploy_failure/slo_burn
+    флапает внутри одного часа. См. _SIGNAL_AGG_FRESHNESS_HOURS.
+
+    Если записи нет — None (вызывающий скипает deploy_failure / slo_burn).
     """
     cutoff = now - timedelta(hours=_SIGNAL_AGG_FRESHNESS_HOURS)
     return (
@@ -249,17 +296,21 @@ def compute_health_for_service(
       clamp [0, 1]
     """
     now = now or datetime.utcnow()
-    cutoff_alerts = now - timedelta(hours=_OPEN_ALERT_LOOKBACK_HOURS)
+    cutoff_alerts = now - timedelta(days=_OPEN_ALERT_MAX_AGE_DAYS)
     cutoff_events = now - timedelta(days=_POD_EVENT_LOOKBACK_DAYS)
     cutoff_recur = now - timedelta(hours=_RECURRENCE_WINDOW_HOURS)
 
-    # Открытые alerts (firing without resolved_at в окне)
+    # Открытые alerts: «всё ещё открыт» = resolved_at IS NULL. Давность
+    # fired_at НЕ ограничиваем 24 часами — иначе многодневный инцидент
+    # (TTR p90 = 83h) перестаёт штрафовать именно тогда, когда он самый
+    # болезненный. Отсекаем только фантомы старше 30д (см.
+    # _OPEN_ALERT_MAX_AGE_DAYS).
     open_alerts = (
         db.query(AlertEvent)
         .filter(
             AlertEvent.service_id == service.id,
-            AlertEvent.fired_at >= cutoff_alerts,
             AlertEvent.resolved_at.is_(None),
+            AlertEvent.fired_at >= cutoff_alerts,
         )
         .all()
     )
@@ -267,13 +318,24 @@ def compute_health_for_service(
     open_warning = sum(1 for a in open_alerts if (a.severity or "").lower() == "warning")
 
     # Chronic pod_events (BackOff/Unhealthy с count > 1000 — несколько суток
-    # крашится; см. наш bot-service кейс с count=11789)
+    # крашится; см. наш bot-service кейс с count=11789).
+    # Окно считаем по last_seen, а НЕ по first_seen: k8s агрегирует повторы
+    # в ОДНО событие с растущим count, поэтому у живого BackOff с count=11789
+    # first_seen может быть недельной давности — фильтр по first_seen терял
+    # ровно самые хронические кейсы. first_seen остаётся fallback'ом:
+    # last_seen nullable (строки, записанные без dedup-апдейта).
     chronic_pod_events = (
         db.query(PodEvent)
         .filter(
             PodEvent.service_id == service.id,
-            PodEvent.first_seen >= cutoff_events,
             PodEvent.count > 1000,
+            or_(
+                PodEvent.last_seen >= cutoff_events,
+                and_(
+                    PodEvent.last_seen.is_(None),
+                    PodEvent.first_seen >= cutoff_events,
+                ),
+            ),
         )
         .count()
     )
@@ -305,11 +367,13 @@ def compute_health_for_service(
                 over = drift - _P95_DRIFT_TRIGGER_PCT
                 p95_drift_penalty = _capped(over * _P95_DRIFT_WEIGHT_PER_PCT)
 
-    # 5xx rate: penalty при > 1%
+    # 5xx: единицы — 5xx-запросов/сек (НЕ доля), порог 0.05 rps.
+    # Источник пока всегда 0 (app /metrics за JWT, WO-12483) — порог выставлен
+    # так, чтобы после раскатки скрейпа он не срабатывал на первой же ошибке.
     http_5xx_penalty = 0.0
-    if err_recent is not None and err_recent > _HTTP_5XX_TRIGGER:
-        over = err_recent - _HTTP_5XX_TRIGGER
-        http_5xx_penalty = _capped(over * _HTTP_5XX_WEIGHT)
+    if err_recent is not None and err_recent > _HTTP_5XX_TRIGGER_RPS:
+        over = err_recent - _HTTP_5XX_TRIGGER_RPS
+        http_5xx_penalty = _capped(over * _HTTP_5XX_WEIGHT_PER_RPS)
 
     # ingress-derived 5xx (живой источник nginx-ingress; per-service http_5xx
     # выше всегда 0 — app /metrics за JWT, WO-12483). Отдельный компонент:
@@ -394,9 +458,16 @@ def recompute_all_health(db: Session) -> Dict[str, int]:
     # ORDER BY id — детерминированный порядок UPDATE-ов при flush: блокировки
     # берутся по возрастанию id, встречные проходы не могут схлопнуться в
     # deadlock между собой.
+    # node_kind='service': с contract 2.4 у пары «Service foo + Deployment foo»
+    # два non-synthetic узла. Без фильтра пересчёт делал двойную работу
+    # (~9k UPDATE вместо ~4.5k — ровно те row-локи, что кормили deadlock'и
+    # 09-10.08) и давал два неразличимых ряда в top_unhealthy.
     services = (
         db.query(Service)
-        .filter(Service.synthetic.is_(False))
+        .filter(
+            Service.synthetic.is_(False),
+            Service.node_kind == NODE_KIND_SERVICE,
+        )
         .order_by(Service.id)
         .all()
     )
@@ -446,6 +517,11 @@ def top_unhealthy(
     """
     q = db.query(Service).filter(
         Service.synthetic.is_(False),
+        # node_kind: recompute_all_health больше не пишет score workload-узлам,
+        # но у legacy-строк (пересчитанных до фикса) health_score уже выставлен
+        # и никогда не чистится — без фильтра пара «Service + workload»
+        # давала бы два неразличимых ряда в топе.
+        Service.node_kind == NODE_KIND_SERVICE,
         Service.health_score.isnot(None),
     )
     if team:
