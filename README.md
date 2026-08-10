@@ -4,7 +4,7 @@
 [![Python](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/)
 [![Tests](https://img.shields.io/badge/tests-1622%20pass-brightgreen.svg)](tests)
 [![Checks](https://img.shields.io/badge/ruff%20%2B%20mypy-clean-brightgreen.svg)](.github/workflows)
-[![Release](https://img.shields.io/badge/release-v1.0.0--rc.3-blue)](CHANGELOG.md)
+[![Release](https://img.shields.io/badge/release-v1.0.0--rc.15-blue)](CHANGELOG.md)
 
 **Homepage:** [sre.froggychips.xyz](https://sre.froggychips.xyz) · **Stack:** FastAPI + Celery + Postgres-KG + LLM + MCP
 
@@ -29,6 +29,24 @@
 
 ### What's new
 
+- **v1.0.0-rc.14 / rc.15 — the two-day silent digest outage, dissected**:
+  after the rc.10–13 wave the daily digest silently vanished for two days.
+  Two independent killers: (1) workers OOM-looped every ~1.5–2h (1536Mi
+  limit + 98% CPU throttling at 200m) — with `acks_late` redis redelivered
+  the task hourly until `expires` quietly revoked it; (2) the digest builder
+  interleaves SQL with minutes of VM/Discord I/O, so its session idled in
+  transaction past the 120s kill limit introduced in rc.11. Fixes:
+  `recompute_all_health` commits in batches of 100 with `ORDER BY id`
+  (deadlocks on `kg_services`: 594/day → 0), `metrics_sync` closes its read
+  transaction before the fetch phase, digests run on a read-only
+  **AUTOCOMMIT session** (nothing left to idle, no ACCESS SHARE locks held
+  against DDL), worker gets 3Gi/600m (Guaranteed QoS).
+- **v1.0.0-rc.12 / rc.13 — deep-review wave tail**: ingress observations in
+  5 VM queries instead of ~5000 per tick; NATS edges for squad/QA stands
+  (the root of low graph connectivity); a "KG via MCP" digest section
+  (who actually uses the graph); repo ↔ cluster drift eliminated (registry,
+  RBAC, `lock_timeout`); `acks_late` + `reject_on_worker_lost` +
+  `prefetch=1`; hanging transactions and the renamed-constraint crash fixed.
 - **v1.0.0-rc.11 — KG node types, honest metrics, lock-safe migrations**:
   `kg_services` gained `node_kind` (`service` / `workload` / `ingress`), so a
   k8s Service and its backing Deployment are finally **different nodes**.
@@ -234,7 +252,7 @@ cloudflared tunnel --url http://localhost:8000
 ```bash
 helm install sre-ai-copilot helm/sre-ai-copilot/ \
   --set ingress.host=sre-ai.example.com \
-  --set image.tag=1.0.0-rc.11
+  --set image.tag=1.0.0-rc.15
 ```
 
 > **Registry is a parameter, not a constant.** `deploy.sh` defaults to Nexus
@@ -342,6 +360,25 @@ See [docs/RUNBOOK.md → Executor incidents](docs/RUNBOOK.md#executor-incidents)
 
 ### Что нового
 
+- **v1.0.0-rc.14 / rc.15 — разбор двухдневного молчания дайджеста**: после
+  волны rc.10–13 ежедневный дайджест два дня молча не приходил. Два
+  независимых убийцы: (1) воркеры OOM-петлились каждые ~1.5–2ч (лимит
+  1536Mi + CPU-троттлинг 98% на 200m) — при `acks_late` redis передоставлял
+  задачу ежечасно, пока `expires` тихо её не отзывал; (2) сборка дайджеста
+  перемежает SQL с минутами VM/Discord I/O, и сессия висела в
+  idle-in-transaction дольше 120с — лимита, введённого в rc.11. Фиксы:
+  `recompute_all_health` коммитит батчами по 100 с `ORDER BY id` (дедлоки на
+  `kg_services`: 594/сутки → 0), `metrics_sync` закрывает read-транзакцию до
+  fetch-фазы, дайджесты работают на read-only **AUTOCOMMIT-сессии** (висеть
+  нечему, ACCESS SHARE-локи не держатся против DDL), воркеру — 3Gi/600m
+  (Guaranteed QoS).
+- **v1.0.0-rc.12 / rc.13 — хвост волны глубокого ревью**: ingress-наблюдения
+  за 5 VM-запросов вместо ~5000 за тик; NATS-рёбра для squad/QA-стендов
+  (корень низкой связности графа); секция «KG через MCP» в дайджесте (кто
+  реально пользуется графом); устранён дрейф репозиторий ↔ кластер (registry,
+  RBAC, `lock_timeout`); `acks_late` + `reject_on_worker_lost` +
+  `prefetch=1`; починены висящие транзакции и падение синка на
+  переименованном constraint.
 - **v1.0.0-rc.11 — Типы узлов KG, честные метрики, безопасные миграции**:
   у `kg_services` появился `node_kind` (`service` / `workload` / `ingress`) —
   k8s Service и его backing Deployment наконец **разные узлы**. Раньше они
@@ -534,7 +571,7 @@ cloudflared tunnel --url http://localhost:8000
 ```bash
 helm install sre-ai-copilot helm/sre-ai-copilot/ \
   --set ingress.host=sre-ai.example.com \
-  --set image.tag=1.0.0-rc.11
+  --set image.tag=1.0.0-rc.15
 ```
 
 > **Note on the WO cluster:** the manifests and `deploy.sh` reference
