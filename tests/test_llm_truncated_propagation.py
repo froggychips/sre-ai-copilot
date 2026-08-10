@@ -38,6 +38,12 @@ from app.services.llm_service import LLMService, LLMTruncatedResponse
 
 def _svc_with_stop_reason(text: str, stop_reason: str) -> LLMService:
     svc = LLMService()
+    # Backend пинится ЯВНО: stop_reason (а значит и truncated) существует
+    # только у anthropic-SDK — claude_cli через `--print` его не отдаёт и
+    # всегда сообщает truncated=False. CI гоняет с LLM_BACKEND=claude_cli
+    # (см. .github/workflows/ci.yml), поэтому без этой строки мок SDK не
+    # участвовал и тест уходил в реальный subprocess.
+    svc.backend = "anthropic"
     svc.client = MagicMock()
     svc.client.messages.create = AsyncMock(
         return_value=MagicMock(
