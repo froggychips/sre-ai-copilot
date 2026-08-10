@@ -83,6 +83,22 @@ SessionLocal = sessionmaker(
     # перевычитывать. В Celery-task-ах это лишний roundtrip.
     expire_on_commit=False,
 )
+
+# Сессия для read-only аналитических тасков (дайджесты). Их SQL-чтения
+# перемежаются минутами внешнего I/O (сотни VM-запросов, Discord), и обычная
+# сессия всё это время висела бы в `idle in transaction` — PG убивает такие
+# соединения через 120с (см. _IDLE_TX_TIMEOUT_MS выше): daily_stats_digest
+# умирал на ~170-й секунде с «server closed the connection unexpectedly»
+# два дня подряд (08-10.08.2026). AUTOCOMMIT закрывает транзакцию после
+# каждого statement: висеть нечему, ACCESS SHARE-локи не копятся, DDL не
+# блокируется. Писать в PG через эту сессию нельзя — только чтение.
+ReadOnlyAutocommitSession = sessionmaker(
+    bind=engine.execution_options(isolation_level="AUTOCOMMIT"),
+    autocommit=False,
+    autoflush=False,
+    expire_on_commit=False,
+)
+
 Base = declarative_base()
 
 
