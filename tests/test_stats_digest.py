@@ -466,9 +466,9 @@ def test_anomaly_summary_renders_total_severity_top_metric():
         MagicMock(fetchone=lambda: (47, 12)),  # total, distinct_services
         MagicMock(fetchall=lambda: [("warning", 40), ("critical", 7)]),
         MagicMock(fetchall=lambda: [
-            ("mv-service", 12),
-            ("town-grainhost", 8),
-            ("auth-service", 5),
+            ("mv-service", "prod-shared", 12),
+            ("town-grainhost", "prod-kingdom1", 8),
+            ("auth-service", "prod-shared", 5),
         ]),
         MagicMock(fetchall=lambda: [
             ("p95_latency_ms", 20),
@@ -481,7 +481,9 @@ def test_anomaly_summary_renders_total_severity_top_metric():
     assert "12 svc" in text
     assert "warning: 40" in text
     assert "critical: 7" in text
-    assert "`mv-service` ×12" in text
+    # ns обязателен в строке: один сервис из N namespace-ов = N строк топа,
+    # без ns они неразличимы («map-coordinator ×28» четыре раза, 10.08.2026).
+    assert "`mv-service` prod-shared ×12" in text
     assert "p95×20" in text
     assert "5xx×15" in text
 
@@ -499,7 +501,7 @@ def test_anomaly_top_renders_persistent_pairs():
         db, ns_to_team={"prod-shared": "shared", "prod-kingdom1": "kingdom1"},
     )
     assert "Persistent anomalies" in text
-    assert "`mv-service`" in text
+    assert "`mv-service` prod-shared" in text
     assert "p95" in text
     assert "12 events" in text
     assert "z=4.2" in text
@@ -534,7 +536,7 @@ def test_log_errors_renders_top_3_with_sample():
         db, ns_to_team={"prod-shared": "shared", "prod-kingdom1": "kingdom1"},
     )
     assert "Log errors" in text
-    assert "`mv-service`" in text
+    assert "`mv-service` prod-shared" in text
     assert "234 errors" in text
     assert "connection refused" in text
     assert "@shared" in text

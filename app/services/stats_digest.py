@@ -1581,12 +1581,15 @@ def anomaly_summary_section(db: Session) -> str:
     critical_cnt = by_severity.get("critical", 0)
 
     try:
+        # s.namespace обязателен в выдаче: группировка идёт по s.id, поэтому
+        # один сервис из N namespace-ов — это N строк. Без ns в рендере они
+        # выглядели идентично («map-coordinator ×28» четыре раза, 10.08.2026).
         top_services = db.execute(text("""
-            SELECT s.name, count(a.id) AS cnt
+            SELECT s.name, s.namespace, count(a.id) AS cnt
             FROM kg_anomaly_observations a
             JOIN kg_services s ON s.id = a.service_id
             WHERE a.ts > NOW() - INTERVAL '24 hours'
-            GROUP BY s.id, s.name
+            GROUP BY s.id, s.name, s.namespace
             ORDER BY cnt DESC
             LIMIT 5
         """)).fetchall()
@@ -1618,7 +1621,9 @@ def anomaly_summary_section(db: Session) -> str:
         f"(warning: {warning_cnt}, critical: {critical_cnt})"
     )
     if top_services:
-        top_parts = ", ".join(f"`{name}` ×{cnt}" for name, cnt in top_services)
+        top_parts = ", ".join(
+            f"`{name}` {ns} ×{cnt}" for name, ns, cnt in top_services
+        )
         lines.append(f"  Top affected: {top_parts}")
     if by_metric:
         metric_parts = ", ".join(
@@ -1672,8 +1677,10 @@ def anomaly_top_section(db: Session, ns_to_team: Dict[str, str]) -> str:
         team = ns_to_team.get(ns, "(unowned)")
         metric_label = _METRIC_LABELS.get(metric, metric)
         z_str = f"z={float(latest_z):.1f}" if latest_z is not None else "z=?"
+        # ns в строке обязателен: один сервис из разных namespace-ов иначе
+        # неразличим (team не спасает — соседние ns часто у одной команды).
         lines.append(
-            f"  `{name}` {metric_label} — {events} events, latest {z_str} · @{team}"
+            f"  `{name}` {ns} {metric_label} — {events} events, latest {z_str} · @{team}"
         )
     return "\n".join(lines)
 
@@ -1714,7 +1721,7 @@ def log_errors_section(db: Session, ns_to_team: Dict[str, str]) -> str:
             sample_str = sample_str[:57] + "..."
         sample_suffix = f" (sample: {sample_str})" if sample_str else ""
         lines.append(
-            f"  `{name}` — {total} errors{sample_suffix} · @{team}"
+            f"  `{name}` {ns} — {total} errors{sample_suffix} · @{team}"
         )
     return "\n".join(lines)
 
