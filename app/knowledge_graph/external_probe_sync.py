@@ -319,9 +319,13 @@ async def _run_probe_cycle(db: Session) -> Dict[str, Any]:
             )
         }
         for svc_id, host, snapshot in probe_results:
-            svc = rows.get(svc_id)
-            if svc is None:
+            # Имя отличается от `svc` в фазе 1: там это переменная цикла по
+            # List[Service] (всегда Service), здесь — результат .get(), т.е.
+            # Optional. Переиспользование имени ломало бы вывод типов.
+            svc_row = rows.get(svc_id)
+            if svc_row is None:
                 continue  # узел удалён между фазами
+            svc = svc_row
             status = snapshot["status"]
 
             # State machine — читаем prev из metadata, обновляем

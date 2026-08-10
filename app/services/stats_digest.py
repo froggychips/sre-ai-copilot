@@ -1260,9 +1260,11 @@ def stale_deployments_section(
                 text("SELECT DISTINCT namespace FROM kg_services")
             ).fetchall()
         })
-    except Exception as e:  # noqa: BLE001 — одна секция выпадает, дайджест живёт
+    # `as exc`, а не `as e`: ниже в этой же функции `e` — переменная цикла по
+    # entries, а Python удаляет имя исключения на выходе из except-блока.
+    except Exception as exc:  # noqa: BLE001 — одна секция выпадает, дайджест живёт
         _tx_clean(db)
-        log.warning("stats_digest.stale_deployments_failed", error=str(e))
+        log.warning("stats_digest.stale_deployments_failed", error=str(exc))
         return ""
 
     # KG Coverage #4: primary source of truth — `kg_services.stale_class`.

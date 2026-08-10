@@ -1304,7 +1304,7 @@ class DiscordService:
         contexts: List["EnrichedContext"],
         env: Optional[str] = None,
         resurfaced: bool = False,
-    ) -> None:
+    ) -> bool:
         """Детерминированный embed с KG-контекстом, БЕЗ LLM.
 
         Принимает batch `EnrichedContext` (несколько алертов одного типа в
@@ -1313,9 +1313,18 @@ class DiscordService:
 
         Не вызывает модель. Latency бюджет — <500ms p95 синхронно
         в HTTP-handler'е /webhooks/alertmanager/enrich-and-forward.
+
+        Возвращает delivered — тот же контракт, что у send_incident_report /
+        send_stats_report: True когда embed в канале есть (POST 2xx,
+        PATCH-dedup, placeholder живой реплики, DISCORD_DRY_RUN), False когда
+        доставки не было (severity-gate, нет вебхука, HTTP>=400, исключение).
+        Наружу не бросает. Нужно вызывающей стороне в
+        /webhooks/alertmanager/enrich-and-forward: без явного False откат
+        tentative-инкремента chronic-счётчика срабатывал только на
+        исключениях, а HTTP>=400 молча оставлял счётчик наращённым.
         """
         if not contexts:
-            return
+            return False
         head = contexts[0]
         incident = head.incident
         labels = incident.labels
@@ -1328,7 +1337,7 @@ class DiscordService:
                 "incident.skipped_low_severity",
                 alertname=alertname, severity=severity, path="enriched",
             )
-            return
+            return False
 
         # Цвет + emoji. B-блок #11 — severity-tier visual codes
         # (red/yellow/green/orange, title prefix 🚨/⚠️/✅/🔁).
@@ -2013,11 +2022,13 @@ class DiscordService:
                 resurfaced=resurfaced,
                 rollout_noise=head.rollout_noise,
             )
-            return
+            # DRY_RUN — намеренное подавление доставки, не сбой: счётчик
+            # дедупа откатывать не нужно (как в send_stats_report).
+            return True
         url = settings.DISCORD_WEBHOOK_URL
         if not url:
             logging.warning("DISCORD_WEBHOOK_URL not set, skipping enriched alert")
-            return
+            return False
         # Compact-mode payload не содержит embeds — PATCH-dedup-канал не
         # применим (нет structured fields для merge). Просто POST один раз.
         if is_compact:
@@ -2031,19 +2042,21 @@ class DiscordService:
                             "discord_enriched_alert_compact_failed",
                             extra={"status": r.status_code, "body": r.text[:200]},
                         )
+                        return False
             except Exception as e:
                 logging.error(
                     "discord_enriched_alert_compact_exception",
                     extra={"error": str(e)},
                 )
-            return
+                return False
+            return True
 
         # Stage 2: PATCH-dedup. Раньше send_enriched_alert POSTил на каждую
         # (alertname, severity)-группу AM batch'а — без content-dedup,
         # 18 embed/сутки в preprod (group_interval=10m, repeat=4h).
         # Теперь — content-key (alertname,ns,service,severity)+30-мин окно
         # → 1 POST + N PATCH (counter в footer'е).
-        await self._post_or_patch_enriched(
+        return await self._post_or_patch_enriched(
             url=url,
             payload=payload,
             embed=payload["embeds"][0],
@@ -2065,7 +2078,7 @@ class DiscordService:
         namespace: Optional[str],
         service: Optional[str],
         severity: str,
-    ) -> None:
+    ) -> bool:
         """PATCH-dedup для enriched-канала. Аналог `_post_or_edit_incident`,
         но с собственным кэшем `_recent_enriched` и без burst-агрегации
         (#9 здесь не нужна — enriched уже схлопывает AM batch в один embed).
@@ -2089,8 +2102,7 @@ class DiscordService:
         )
         if key is None:
             # Без alertname или невалидный вход — POST без dedup.
-            await self._post_enriched_raw(url, payload)
-            return
+            return await self._post_enriched_raw(url, payload)
 
         # Cross-replica store (PG, fallback на in-memory при недоступном PG):
         # per-process dict ломался на 2 репликах api — каждый под промахивался
@@ -2109,12 +2121,13 @@ class DiscordService:
                 logging.info(
                     "discord_enriched_dedup_claimed_elsewhere key=%s", key,
                 )
-                return
+                # Placeholder живой реплики = embed в канале будет: не недоставка.
+                return True
             await self._patch_enriched_recurrence(
                 url=url, embed=embed, key=key,
                 ttl_sec=ttl, now=now,
             )
-            return
+            return True
 
         # Новый POST (claim наш). wait=true чтобы получить msg_id.
         post_url = _ensure_wait_param(url)
@@ -2131,7 +2144,7 @@ class DiscordService:
                     )
                     # POST не случился — отпускаем claim.
                     dedup_store.release(key)
-                    return
+                    return False
                 if r.status_code == 200:
                     try:
                         msg_id = str(r.json().get("id") or "") or None
@@ -2140,14 +2153,15 @@ class DiscordService:
         except Exception as e:
             logging.error("discord_enriched_alert_exception", extra={"error": str(e)})
             dedup_store.release(key)
-            return
+            return False
 
         if not msg_id:
             # Legacy webhook без wait=true → нечего PATCH-ить, dedup-кэш
             # не пополняем (контракт прежний: следующий firing = новый POST).
             # Claim отпускаем — это симметрично с `_post_or_edit_incident`.
             dedup_store.release(key)
-            return
+            # POST прошёл (2xx), просто нечего PATCH-ить — доставка состоялась.
+            return True
 
         # Без webhook_url: enriched-канал всегда шлёт на
         # settings.DISCORD_WEBHOOK_URL, PATCH перечитает его из настроек.
@@ -2161,6 +2175,7 @@ class DiscordService:
             severity=severity,
             now=now,
         )
+        return True
 
     async def send_resolved_notice(
         self,
@@ -2200,9 +2215,13 @@ class DiscordService:
             return
         await self._post_enriched_raw(url, payload)
 
-    async def _post_enriched_raw(self, url: str, payload: Dict[str, Any]) -> None:
+    async def _post_enriched_raw(self, url: str, payload: Dict[str, Any]) -> bool:
         """Fallback-POST когда _compute_enriched_key вернул None.
-        Без dedup — просто шлём embed."""
+
+        Без dedup — просто шлём embed. Возвращает delivered (см. контракт
+        send_enriched_alert): False на HTTP>=400, чтобы вызывающая сторона
+        могла откатить tentative-инкремент chronic-счётчика.
+        """
         async with httpx.AsyncClient() as client:
             r = await self._request_with_ratelimit(
                 client, "post", url, json=payload
@@ -2212,6 +2231,8 @@ class DiscordService:
                     "discord_enriched_alert_failed",
                     extra={"status": r.status_code, "body": r.text[:200]},
                 )
+                return False
+        return True
 
     async def _patch_enriched_recurrence(
         self,

@@ -565,3 +565,46 @@ async def test_handler_delivered_send_still_counts(
     assert res["enriched_groups"] == 0
     assert len(sent) == 2
     assert store["enrich:lastsent:KubePodCrashLooping:town-service:cnt"] == "3"
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# bool-контракт send_enriched_alert (CI mypy 10.08.2026)
+# ──────────────────────────────────────────────────────────────────────────
+# Метод возвращал None во всех ветках, поэтому откат tentative-инкремента
+# срабатывал ТОЛЬКО на исключении: HTTP>=400 логировался и молча оставлял
+# chronic-счётчик наращённым. Тест фиксирует, что теперь недоставка по
+# статусу тоже даёт False.
+@pytest.mark.asyncio
+async def test_enriched_raw_post_returns_false_on_http_error(monkeypatch):
+    from app.services.discord.service import DiscordService
+
+    svc = DiscordService()
+
+    class _Resp:
+        status_code = 400
+        text = "bad request"
+
+    async def _fake_request(client, method, url, **kw):
+        return _Resp()
+
+    monkeypatch.setattr(svc, "_request_with_ratelimit", _fake_request)
+    delivered = await svc._post_enriched_raw("https://example.com/wh", {"x": 1})
+    assert delivered is False
+
+
+@pytest.mark.asyncio
+async def test_enriched_raw_post_returns_true_on_2xx(monkeypatch):
+    from app.services.discord.service import DiscordService
+
+    svc = DiscordService()
+
+    class _Resp:
+        status_code = 204
+        text = ""
+
+    async def _fake_request(client, method, url, **kw):
+        return _Resp()
+
+    monkeypatch.setattr(svc, "_request_with_ratelimit", _fake_request)
+    delivered = await svc._post_enriched_raw("https://example.com/wh", {"x": 1})
+    assert delivered is True
