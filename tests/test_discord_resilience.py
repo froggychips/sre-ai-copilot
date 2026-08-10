@@ -346,3 +346,182 @@ async def test_send_enriched_alert_fits_over_6000_and_still_posts(
     assert any("Namespaces" in n for n in names)
     # Излишества дропнуты (доказательство что fit сработал на >6000 embed).
     assert not any("Pod trail" in n for n in names)
+
+
+# ---------------------------------------------------------------------------
+# FIX C: 429-retry для остальных send-путей (review-fix).
+# Раньше send_report / send_stats_report / send_external_probe_alert /
+# send_self_health_alert / send_stuck_alerts_escalation шли голым client.post
+# мимо _request_with_ratelimit — в alert-storm (когда они нужнее всего)
+# 429 = молчаливая потеря сообщения.
+# ---------------------------------------------------------------------------
+
+
+def _mk_retry_client(*responses) -> AsyncMock:
+    """Async-context httpx-client mock с последовательностью ответов POST."""
+    client = AsyncMock()
+    client.__aenter__.return_value = client
+    client.__aexit__.return_value = False
+    client.post = AsyncMock(side_effect=list(responses))
+    client.patch = AsyncMock()
+    return client
+
+
+@pytest.mark.asyncio
+async def test_send_report_retries_on_429(webhook_env):
+    from app.services.discord_service import DiscordService
+
+    client = _mk_retry_client(_mk_resp(429, retry_after=0.01), _mk_resp(204))
+    with patch(
+        "app.services.discord_service.httpx.AsyncClient", return_value=client
+    ), patch("app.services.discord_service.asyncio.sleep", new=AsyncMock()):
+        await DiscordService().send_report("plain report")
+    assert client.post.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_send_stats_report_retries_on_429_and_returns_true(monkeypatch):
+    from app.config import settings
+    from app.services.discord_service import DiscordService
+
+    monkeypatch.setattr(
+        settings, "DISCORD_WEBHOOK_STATS_URL",
+        "https://discord.com/api/webhooks/2/stats-token",
+    )
+    monkeypatch.setattr(settings, "DISCORD_DRY_RUN", False)
+    client = _mk_retry_client(_mk_resp(429, retry_after=0.01), _mk_resp(200))
+    with patch(
+        "app.services.discord_service.httpx.AsyncClient", return_value=client
+    ), patch("app.services.discord_service.asyncio.sleep", new=AsyncMock()):
+        delivered = await DiscordService().send_stats_report("Title\nbody")
+    assert delivered is True  # 429 пережит, доставка состоялась
+    assert client.post.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_send_external_probe_alert_retries_on_429(webhook_env):
+    from app.services.discord_service import DiscordService
+
+    client = _mk_retry_client(_mk_resp(429, retry_after=0.01), _mk_resp(204))
+    with patch(
+        "app.services.discord_service.httpx.AsyncClient", return_value=client
+    ), patch("app.services.discord_service.asyncio.sleep", new=AsyncMock()):
+        await DiscordService().send_external_probe_alert(
+            host="api.example.com",
+            status="down",
+            snapshot={"tcp_results": [], "http_result": {}, "consecutive_failures": 3},
+        )
+    assert client.post.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_send_self_health_alert_retries_on_429(monkeypatch):
+    from app.config import settings
+    from app.services.discord_service import DiscordService
+
+    monkeypatch.setattr(
+        settings, "DISCORD_WEBHOOK_SELF_HEALTH_URL",
+        "https://discord.com/api/webhooks/3/selfhealth-token",
+    )
+    monkeypatch.setattr(settings, "DISCORD_DRY_RUN", False)
+    client = _mk_retry_client(_mk_resp(429, retry_after=0.01), _mk_resp(204))
+    with patch(
+        "app.services.discord_service.httpx.AsyncClient", return_value=client
+    ), patch("app.services.discord_service.asyncio.sleep", new=AsyncMock()):
+        await DiscordService().send_self_health_alert(
+            failed_checks=[{"name": "sync_lag", "detail": {}}],
+        )
+    assert client.post.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_send_stuck_alerts_escalation_retries_on_429_and_fits_embed(monkeypatch):
+    """429 ретраится + embed >6000 (15 полей × ~1024) ужимается перед POST."""
+    from app.config import settings
+    from app.services.discord_service import DiscordService, _embed_total_len
+
+    monkeypatch.setattr(
+        settings, "DISCORD_WEBHOOK_STUCK_ALERTS_URL",
+        "https://discord.com/api/webhooks/4/stuck-token",
+    )
+    monkeypatch.setattr(settings, "DISCORD_DRY_RUN", False)
+
+    # 15 команд × 10 алертов с длинными именами → каждое поле упирается
+    # в свой 1024-cap → total заведомо >6000.
+    team_groups = [
+        {
+            "team_owner": f"team-{i}",
+            "alerts": [
+                {
+                    "alertname": "A" * 80,
+                    "service": "s" * 80,
+                    "hours_firing": 30.0,
+                    "recurrence_24h": 5,
+                }
+                for _ in range(10)
+            ],
+        }
+        for i in range(15)
+    ]
+
+    client = _mk_retry_client(_mk_resp(429, retry_after=0.01), _mk_resp(204))
+    with patch(
+        "app.services.discord_service.httpx.AsyncClient", return_value=client
+    ), patch("app.services.discord_service.asyncio.sleep", new=AsyncMock()):
+        await DiscordService().send_stuck_alerts_escalation(
+            team_groups=team_groups, total_count=150, min_duration_hours=24,
+        )
+    assert client.post.await_count == 2
+    posted = client.post.await_args.kwargs["json"]
+    embed = posted["embeds"][0]
+    assert _embed_total_len(embed) <= 6000, "embed обязан быть ужат перед POST"
+    assert embed["title"]  # title не потерян
+
+
+# ---------------------------------------------------------------------------
+# FIX D: webhook-токен не утекает в discord_rate_limited лог.
+# ---------------------------------------------------------------------------
+
+
+def test_redact_webhook_url_strips_token():
+    """url[:60] раньше захватывал первые ~8 символов токена — теперь маска."""
+    from app.services.discord.service import _redact_webhook_url
+
+    url = "https://discord.com/api/webhooks/123456789012345678/SeCrEtToKeN-abcdef?wait=true"
+    redacted = _redact_webhook_url(url)
+    assert "SeCrEt" not in redacted
+    assert "123456789012345678" in redacted  # id вебхука остаётся для атрибуции
+
+    # PATCH-endpoint: токен маскируется, суффикс /messages/{id} сохраняется.
+    patch_url = "https://discord.com/api/webhooks/1/tok-abc/messages/42"
+    redacted_patch = _redact_webhook_url(patch_url)
+    assert "tok-abc" not in redacted_patch
+    assert redacted_patch.endswith("/messages/42")
+
+    # Не-webhook URL и пустая строка не ломаются.
+    assert _redact_webhook_url("") == ""
+    assert _redact_webhook_url("https://x/y") == "https://x/y"
+
+
+@pytest.mark.asyncio
+async def test_rate_limited_log_has_no_token(caplog):
+    """discord_rate_limited лог на 429 не содержит webhook-токен."""
+    import logging as _logging
+
+    from app.services.discord_service import DiscordService
+
+    svc = DiscordService()
+    client = MagicMock()
+    client.post = AsyncMock(
+        side_effect=[_mk_resp(429, retry_after=0.01), _mk_resp(200, msg_id="ok")]
+    )
+    url = "https://discord.com/api/webhooks/987654321/TOPSECRETTOKEN123456"
+    with patch(
+        "app.services.discord_service.asyncio.sleep", new=AsyncMock()
+    ), caplog.at_level(_logging.WARNING):
+        await svc._request_with_ratelimit(client, "post", url, json={})
+    rl_records = [r for r in caplog.records if r.getMessage() == "discord_rate_limited"]
+    assert rl_records, "429 обязан логироваться"
+    logged_url = rl_records[0].url
+    assert "TOPSECRET" not in logged_url
+    assert "987654321" in logged_url
