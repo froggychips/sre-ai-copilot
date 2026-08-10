@@ -17,6 +17,28 @@ _LLM_PROVIDER = "anthropic"
 _circuit_log = logging.getLogger(__name__ + ".circuit")
 
 
+class LLMTruncatedResponse(Exception):
+    """Ответ LLM обрезан по max_tokens, а вызывающему нужен ПОЛНЫЙ ответ.
+
+    Поднимается НЕ здесь, а в BaseAgent.ask для JSON-агентов
+    (json_response=True: multi_hypothesis / fact_critic). Обрезанный JSON
+    их парсеры молча превращали в пустой список — неотличимо от честного
+    «гипотез/опровержений нет»: слабая гипотеза «переживала» критику с
+    полной confidence и уверенно-неверный вывод уходил людям (кодревью
+    2026-08; generate_full вычислял truncated=True, но флаг терялся).
+
+    Ретраи — СОЗНАТЕЛЬНО нигде:
+      * уровень LLM-вызова: исключение живёт ВЫШЕ llm_retry_strategy
+        (generate_full по-прежнему ВОЗВРАЩАЕТ truncated-флаг, а не raise),
+        поэтому retry-слой его в принципе не видит; повтор того же промпта
+        с тем же MAX_TOKENS обрежется детерминированно снова;
+      * уровень Celery: наследуемся от Exception (НЕ от OSError/
+        ConnectionError), т.е. не входим в RETRIABLE_EXC (app/workers/
+        tasks.py) — async_process_incident фиксирует терминальный фейл
+        стадии (post-mortem + FAILED) без пережигания LLM-бюджета.
+    """
+
+
 def _get_resilience():
     """Лениво достаём LLMResilienceManager-синглтон из celery_worker.
 
@@ -226,6 +248,10 @@ class LLMService:
             # пусто — неотличимо от честного пустого ответа. Делаем обрезку
             # ВИДИМОЙ: warning + признак truncated в dict (НЕ роняем вызов —
             # частичный ответ всё равно может быть полезен вызывающему).
+            # Довод до фейла — этажом выше: BaseAgent.ask для агентов с
+            # json_response=True поднимает LLMTruncatedResponse (raise здесь
+            # нельзя: он попал бы под llm_retry_strategy и сломал прозаические
+            # вызовы, которым огрызок текста полезен).
             stop_reason = getattr(response, "stop_reason", None)
             truncated = stop_reason == "max_tokens"
             if truncated:
