@@ -10,7 +10,7 @@ from sqlalchemy.orm.attributes import flag_modified
 
 from app.config import settings
 from app.core.state_machine import IncidentState
-from app.database import IncidentRecord, SessionLocal
+from app.database import IncidentRecord, ReadOnlyAutocommitSession, SessionLocal
 from app.services.audit_logger import audit_service
 from app.services.telemetry_utils import incident_span
 from app.telemetry import setup_telemetry
@@ -873,7 +873,9 @@ def chronic_alerts_digest_task():
     """
     from app.services.chronic_digest import send_chronic_digest
 
-    db = SessionLocal()
+    # Та же защита от idle-in-transaction, что у daily_stats_digest: SQL
+    # перемежается с Discord I/O, по PG таск read-only.
+    db = ReadOnlyAutocommitSession()
     try:
         result = asyncio.run(send_chronic_digest(db))
         logger.info("chronic_alerts_digest.done result=%s", result)
@@ -1008,7 +1010,10 @@ def daily_stats_digest_task():
     """
     from app.services.stats_digest import send_daily_digest
 
-    db = SessionLocal()
+    # AUTOCOMMIT-сессия: сборка дайджеста перемежает SQL с минутами VM/Discord
+    # I/O; обычная сессия висит idle-in-transaction и убивается PG через 120с
+    # (так дайджест молча пропадал 08-10.08.2026). По PG дайджест read-only.
+    db = ReadOnlyAutocommitSession()
     try:
         result = asyncio.run(send_daily_digest(db))
         logger.info("daily_stats_digest.done result=%s", result)
