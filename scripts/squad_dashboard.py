@@ -8,7 +8,8 @@
 
 Запуск: k8s CronJob на образе sre-ai-copilot, SA sre-ai (умеет list namespaces).
 Env: DATABASE_URL, TC_URL, TC_TOKEN, CONFLUENCE_BASE, CONFLUENCE_EMAIL, CONFLUENCE_TOKEN,
-     CONFLUENCE_PAGE_ID, CONFLUENCE_TITLE, [WINDOW=400], [SQUADS="1..24"], [DRY_RUN=1].
+     CONFLUENCE_PAGE_ID, CONFLUENCE_TITLE, [WINDOW=400], [SQUADS="1..24"], [DRY_RUN=1],
+     [NAME_OVERRIDES='{"логин":"Имя Фамилия"}' — для учёток вне TeamCity].
 DRY_RUN=1 — всё собрать и отрендерить, но НЕ писать в Confluence (печатает сводку).
 
 Источники логики: ref_kg_squad_dashboard_query (KG-SQL), ~/tc_squad_last_build.sh (TC REST).
@@ -186,11 +187,32 @@ def tc_names():
     return _TC_NAMES
 
 
+_OVERRIDES = None
+
+
+def name_overrides():
+    """Логин → имя для учёток, которых в TeamCity нет (удалена, лейбл проставлен руками).
+
+    Задаётся ТОЛЬКО через env NAME_OVERRIDES (JSON, ConfigMap squad-dashboard-env).
+    В репозитории карты нет и быть не должно: он публичный, а связка логин↔человек —
+    личные данные. Кривой JSON — не роняем прогон, просто остаются логины.
+    """
+    global _OVERRIDES
+    if _OVERRIDES is None:
+        raw = (os.environ.get("NAME_OVERRIDES") or "").strip()
+        try:
+            _OVERRIDES = json.loads(raw) if raw else {}
+        except ValueError as e:
+            log(f"  NAME_OVERRIDES: не разобрался как JSON ({e}) → игнорируем")
+            _OVERRIDES = {}
+    return _OVERRIDES
+
+
 def human(login):
-    """«Имя Фамилия» по TC-логину; неизвестный/служебный логин — как есть."""
+    """«Имя Фамилия»: профиль TeamCity, затем env-оверрайд; иначе логин как есть."""
     if not login:
         return login
-    return tc_names().get(login, login)
+    return tc_names().get(login) or name_overrides().get(login, login)
 
 
 def fetch_oneservice():
