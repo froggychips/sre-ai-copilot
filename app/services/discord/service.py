@@ -1595,6 +1595,22 @@ class DiscordService:
                 or b.get("minutes_before", 1_000_000) < statics_bump.get("minutes_before", 1_000_000)
             ):
                 statics_bump = b
+        # Здоровье источника деплоев (инцидент 2026-08-11). Если хоть один
+        # ns-scope контекст сообщил stale — вердикт «деплоя не было» запрещён:
+        # мы не знаем. Берём самый свежий (минимальный age) снимок, чтобы
+        # multi-ns embed не объявил поток мёртвым по одному отстающему ns.
+        deploy_stream: Dict[str, Any] = {}
+        for c in ns_scope_ctxs:
+            s = getattr(c, "deploy_stream", None) or {}
+            if not s:
+                continue
+            if not deploy_stream or (
+                (s.get("age_hours") if s.get("age_hours") is not None else 1e9)
+                < (deploy_stream.get("age_hours")
+                   if deploy_stream.get("age_hours") is not None else 1e9)
+            ):
+                deploy_stream = s
+        deploy_stream_stale = bool(deploy_stream.get("stale"))
         # Минуты до алерта у ближайшего ns-scope деплоя — вход для
         # mention-подавления ниже (deploy-related critical не пингует).
         ns_deploy_min_minutes: Optional[int] = None
@@ -1697,6 +1713,27 @@ class DiscordService:
                     )
                     if sample_lines:
                         value += "\n" + "\n".join(sample_lines)
+                elif deploy_stream_stale:
+                    # Инцидент 2026-08-11: поток деплоев стоял с 10.08, и на
+                    # ProdRestartsSpike через 20 секунд после прод-раскатки
+                    # embed написал «деплоев не было — вряд ли связано». Пустой
+                    # kg_deployments ≠ отсутствие деплоя: пока источник молчит,
+                    # честный ответ — «не знаю», иначе триаж уводится в сторону.
+                    last_at = deploy_stream.get("last_at")
+                    age_h = deploy_stream.get("age_hours")
+                    if last_at is not None:
+                        stale_part = (
+                            f"последняя запись — {last_at:%d.%m %H:%M} UTC"
+                            + (f" ({age_h}ч назад)" if age_h is not None else "")
+                        )
+                    else:
+                        stale_part = "в kg_deployments нет ни одной записи"
+                    value = (
+                        f"❔ _Данных о деплоях нет — источник пуст: {stale_part}. "
+                        f"Связь с деплоем НЕ проверена (не путать с «деплоя не "
+                        f"было»): пайплайн `tc_deploys_to_kg` не пополняет KG. "
+                        f"Проверь деплои в TeamCity вручную._"
+                    )
                 else:
                     value = (
                         f"_Деплоев в {ns_label} за {window_min}м до алерта "

@@ -233,6 +233,47 @@ def recent_deploys_for_namespaces(
     return out
 
 
+def deploy_stream_freshness(
+    db: Session,
+    *,
+    before: Optional[datetime] = None,
+    stale_after_hours: int = 6,
+) -> Dict[str, Any]:
+    """Жив ли поток деплоев вообще: `{last_at, age_hours, stale}`.
+
+    Отвечает на вопрос, который НЕ отвечает пустой `recent_deploys_for_namespaces`:
+    «в этом ns деплоя не было» и «мы уже сутки ничего не пишем в kg_deployments» —
+    это разные факты, а выглядели одинаково (пустой список).
+
+    Инцидент 2026-08-11: `tc_deploys_to_kg` перестал писать 10.08, и на алерте
+    ProdRestartsSpike, прилетевшем через 20 секунд после прод-раскатки, embed
+    уверенно сообщил «деплоев не было — вряд ли связано с деплоем». Триаж
+    получил ложноотрицательный вердикт в самый неудачный момент.
+
+    `stale=True` означает «источнику нельзя верить», а не «деплоя не было»:
+    вызывающий обязан выбрать честную формулировку. Глобально по таблице (без
+    ns-фильтра) — интересует здоровье пайплайна, а не активность конкретного ns.
+    Порог 6h умышленно щедрый: ночью деплоев штатно нет, ложный «stale» хуже
+    молчания.
+    """
+    before_aware = _ensure_aware(before or datetime.now(timezone.utc))
+    last_at = (
+        db.query(func.max(Deployment.started_at))
+        .filter(Deployment.started_at <= _ensure_naive(before_aware))
+        .scalar()
+    )
+    if last_at is None:
+        return {"last_at": None, "age_hours": None, "stale": True}
+    age_hours = (
+        before_aware - last_at.replace(tzinfo=timezone.utc)
+    ).total_seconds() / 3600.0
+    return {
+        "last_at": last_at,
+        "age_hours": round(age_hours, 1),
+        "stale": age_hours > stale_after_hours,
+    }
+
+
 def cluster_deploy_activity(
     db: Session,
     *,
