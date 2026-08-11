@@ -163,6 +163,47 @@ def test_freshness_stale_when_table_empty(db):
     assert out["last_at"] is None
 
 
+# ── атрибуция прод-джоб: окружение задаёт проект, а не ветка ────────────
+
+def test_prod_buildtype_detected_by_project_prefix():
+    from app.services.teamcity_service import is_prod_buildtype
+
+    assert is_prod_buildtype("Wo_Backend_K8sNewCluster_Prod_BackupAllDb")
+    assert is_prod_buildtype("Wo_StaticsNewCluster_Prod_DeployStatics")
+    assert is_prod_buildtype("Wo_Backend_K8sNewCluster_Prod")
+    # preprod-конфиги не должны утечь в prod-ветку атрибуции
+    assert not is_prod_buildtype("Wo_Backend_K8sNewCluster_BuildAndUpdate")
+    assert not is_prod_buildtype("Wo_StaticsNewCluster_Preprod_DeployStatics")
+    assert not is_prod_buildtype(None)
+
+
+def test_prod_build_on_preprod_branch_attributed_to_prod(db, monkeypatch):
+    """Prod_BackupAllDb #40 идёт с refs/heads/prepod — но это прод-деплой.
+
+    Инцидент 2026-08-11: бэкап прод-БД перед релизом осел на squad-gd-shared/*
+    (у squad-gd правило ветки — preprod, как и у самого билда), а prod-* остался
+    без deploy-истории. Чек должен считать такой билд prod-ветковым.
+    """
+    _mk_service(db, "town-service", "prod-kingdom1")
+    db.commit()
+    import app.services.teamcity_service as tc
+
+    async def _fake_recent(**_kw):
+        return [{
+            "buildtype_id": "Wo_Backend_K8sNewCluster_Prod_BackupAllDb",
+            "number": "40", "branch": "refs/heads/preprod",
+        }]
+
+    monkeypatch.setattr(tc, "recent_deploys", _fake_recent)
+    monkeypatch.setattr(
+        tc, "tc_sync_config_status", lambda: {"configured": True, "reason": ""},
+    )
+    r = check_deploy_stream_ingestion(db)
+    # Билд считается «должен быть в KG» для prod-ns, а его там нет → fail.
+    assert r.status == "fail"
+    assert r.detail["should_ingest"] == 1
+
+
 # ── рендер: формулировка при мёртвом источнике ──────────────────────────
 
 def _dep_field(fields: dict) -> str:

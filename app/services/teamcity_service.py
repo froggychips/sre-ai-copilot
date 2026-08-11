@@ -61,6 +61,20 @@ _BRANCH_RULES = [
 ]
 
 
+def is_prod_buildtype(buildtype_id: Optional[str]) -> bool:
+    """Конфиг из прод-проекта TC (`..._Prod_...` / `..._Prod`).
+
+    Окружение прод-джобы задаёт ПРОЕКТ, а не VCS-ветка: в WO прод-конфиги
+    (`Wo_Backend_K8sNewCluster_Prod_*`, `Wo_StaticsNewCluster_Prod_*`)
+    запускаются на ветке preprod — оттуда берётся только инструментарий
+    (скрипты wo-k8s), а деплой уходит в prod дочерним билдом с branchName=prod.
+    Наивная атрибуция по ветке относила их к preprod-* и squad-gd-*
+    (у squad-gd правило ветки — тоже preprod), оставляя prod-* без истории.
+    """
+    bt = buildtype_id or ""
+    return "_Prod_" in bt or bt.endswith("_Prod")
+
+
 def branch_for_namespace(namespace: Optional[str]) -> Optional[str]:
     if not namespace:
         return None

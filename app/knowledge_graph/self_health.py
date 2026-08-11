@@ -535,8 +535,14 @@ def check_deploy_stream_ingestion(db: Session) -> CheckResult:
     for b in builds:
         branch = (b.get("branch") or "").replace("refs/heads/", "")
         # Та же нормализация, что в tc_deploys_to_kg (_tc_deploys_to_kg_logic):
-        # '<default>' deploy-конфигов (не prod) == preprod.
-        if branch == "<default>" and "Prod_" not in (b.get("buildtype_id") or ""):
+        # прод-конфиг → prod независимо от ветки (запускается с preprod, где
+        # лежит только инструментарий); '<default>' у остальных == preprod.
+        # Расхождение с задачей недопустимо: чек сравнивает СВОЙ should_ingest
+        # с тем, что записала задача, и разная нормализация дала бы вечный fail.
+        from app.services.teamcity_service import is_prod_buildtype
+        if is_prod_buildtype(b.get("buildtype_id")):
+            branch = "prod"
+        elif branch == "<default>":
             branch = "preprod"
         if ns_by_branch.get(branch):
             should_ingest.append(b)
