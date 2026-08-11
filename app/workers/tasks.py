@@ -752,7 +752,9 @@ async def _tc_deploys_to_kg_logic() -> dict:
 
     from app.knowledge_graph.populator import record_deployment
     from app.knowledge_graph.schema import Service
-    from app.services.teamcity_service import branch_for_namespace, recent_deploys
+    from app.services.teamcity_service import (branch_for_namespace,
+                                               is_prod_buildtype as _is_prod_buildtype,
+                                               recent_deploys)
 
     # Берём builds за последние 24h. Cron каждые 15 мин — overkill по
     # window, но dedup защищает и cheaply tolerant к беатам-пропускам.
@@ -784,7 +786,18 @@ async def _tc_deploys_to_kg_logic() -> dict:
             # → deploy-stream протухал, как только переставали идти явно-preprod
             # билды (BuildAndUpdate). Prod-деплои несут ветку 'prod' явно, prod-
             # конфиги содержат 'Prod_' в id — их под '<default>' не подменяем.
-            if branch_full == "<default>" and "Prod_" not in (b.get("buildtype_id") or ""):
+            bt_id = b.get("buildtype_id") or ""
+            if _is_prod_buildtype(bt_id):
+                # Прод-джобы TC запускаются на ветке preprod: оттуда берётся
+                # ТОЛЬКО инструментарий (скрипты wo-k8s), а деплой идёт в prod
+                # дочерним билдом. Атрибуция по VCS-ветке приписывала такие
+                # билды к preprod-* и squad-gd-* (у squad-gd правило ветки —
+                # тоже preprod), а prod-* не получал ничего.
+                # Инцидент 2026-08-11: Prod_BackupAllDb #40 (бэкап прод-БД перед
+                # релизом) осел на squad-gd-shared/*. Для прод-конфигов ветка
+                # неинформативна — окружение задаёт проект.
+                branch_full = "prod"
+            elif branch_full == "<default>":
                 branch_full = "preprod"
             target_namespaces = ns_by_branch.get(branch_full, [])
             if not target_namespaces:

@@ -27,6 +27,7 @@ from app.diagnostics.rules.upstream_degraded import UpstreamDegradedRule
 from app.knowledge_graph.queries import (blast_radius_for,
                                          cluster_deploy_activity,
                                          current_replicas_from_kg,
+                                         deploy_stream_freshness,
                                          incidents_on, ingress_health_for,
                                          latest_pod_event_for,
                                          nats_impact_for, nearby_alerts,
@@ -209,6 +210,12 @@ class EnrichedContext:
     # ожидаемый self-restart wave» с ПРИОРИТЕТОМ над cross-ns collateral и
     # подавляет @mention. Структура — см. _detect_statics_bump.
     statics_bump: Dict[str, Any] = field(default_factory=dict)
+    # Здоровье самого источника деплоев (инцидент 2026-08-11). Пустой
+    # recent_deploys двусмыслен: «деплоя не было» или «kg_deployments не
+    # пополняется». Заполняется в NS-fallback ветке при пустом recent_deploys;
+    # если stale=True — рендер обязан сказать «данных нет», а НЕ «деплоев не
+    # было — вряд ли связано». Структура — см. queries.deploy_stream_freshness.
+    deploy_stream: Dict[str, Any] = field(default_factory=dict)
     upstream_alerts: List[Dict[str, Any]] = field(default_factory=list)
     recurrence_24h: List[Dict[str, Any]] = field(default_factory=list)
     # Inbound: сколько сервисов вызывают/зависят от этого. Раньше поле
@@ -792,7 +799,21 @@ def enrich_alert(db: Session, incident: Incident) -> EnrichedContext:
                 # соседних ns кластера (cross-namespace collateral).
                 # Иначе атрибуция врёт «не было — вряд ли связано».
                 if not ctx.recent_deploys:
-                    # Сначала — накат статики (инцидент 2026-07-02): при bump'е
+                    # Прежде любых гипотез — можно ли вообще верить пустоте.
+                    # Мёртвый поток деплоев (инцидент 2026-08-11) даёт тот же
+                    # пустой список, что и реальное отсутствие деплоя, и раньше
+                    # молча превращался в вердикт «вряд ли связано с деплоем».
+                    # Best-effort и отдельным try: сбой этой справки не должен
+                    # уносить с собой statics/collateral-гипотезы ниже.
+                    try:
+                        ctx.deploy_stream = deploy_stream_freshness(
+                            db, before=effective_at,
+                        )
+                    except Exception as e:
+                        log.warning(
+                            "enrich.deploy_stream_freshness_failed", error=str(e),
+                        )
+                    # Затем — накат статики (инцидент 2026-07-02): при bump'е
                     # статики сервисы сами рестартятся, k8s Deployment не менялся
                     # → «деплоя нет», но это НЕ collateral. Имеет приоритет.
                     ctx.statics_bump = _detect_statics_bump(namespace, effective_at)
