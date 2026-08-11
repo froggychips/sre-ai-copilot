@@ -61,6 +61,20 @@ _BRANCH_RULES = [
 ]
 
 
+def is_prod_buildtype(buildtype_id: Optional[str]) -> bool:
+    """Конфиг из прод-проекта TC (`..._Prod_...` / `..._Prod`).
+
+    Окружение прод-джобы задаёт ПРОЕКТ, а не VCS-ветка: в WO прод-конфиги
+    (`Wo_Backend_K8sNewCluster_Prod_*`, `Wo_StaticsNewCluster_Prod_*`)
+    запускаются на ветке preprod — оттуда берётся только инструментарий
+    (скрипты wo-k8s), а деплой уходит в prod дочерним билдом с branchName=prod.
+    Наивная атрибуция по ветке относила их к preprod-* и squad-gd-*
+    (у squad-gd правило ветки — тоже preprod), оставляя prod-* без истории.
+    """
+    bt = buildtype_id or ""
+    return "_Prod_" in bt or bt.endswith("_Prod")
+
+
 def branch_for_namespace(namespace: Optional[str]) -> Optional[str]:
     if not namespace:
         return None
@@ -569,15 +583,29 @@ async def recent_deploys(
     Каждый dict: id/number/status/branch/buildtype_id/buildtype_name/
     started_at/finished_at/triggered_by/triggered_type/url. Пустой
     список — если TC не настроен / direct client недоступен / ошибка.
+
+    ВАЖНО про пустой список: он неразличим для вызывающего («деплоев не
+    было» vs «источник ослеп»), поэтому КАЖДАЯ причина пустоты логируется
+    явно. Инцидент 2026-08-11: поток деплоев стоял с 10.08, а
+    `deploy_stream_ingestion` и Discord-атрибуция молча трактовали это как
+    «деплоев не было» — прод-релиз получил в алерте пометку «вряд ли
+    связано с деплоем» через 20 секунд после раскатки. Диагноз по логам
+    был невозможен: тихий `return []` не оставлял следа.
+    Машиночитаемый статус конфигурации — `tc_sync_config_status()`.
     """
-    if not (settings.TC_URL and settings.TC_TOKEN and _TC_CLIENT_AVAILABLE):
+    cfg = tc_sync_config_status()
+    if not cfg["configured"]:
+        logger.warning(
+            "teamcity.recent_deploys_not_configured",
+            reason=cfg["reason"],
+            client_source=_TC_CLIENT_SOURCE,
+        )
         return []
     projects = _tc_project_ids()
-    if not projects:
-        return []
     since = datetime.now(timezone.utc) - timedelta(hours=lookback_hours)
     loop = asyncio.get_event_loop()
     combined: list[dict[str, Any]] = []
+    failed: list[str] = []
     for pid in projects:
         try:
             project_builds = await loop.run_in_executor(
@@ -585,9 +613,51 @@ async def recent_deploys(
             )
             combined.extend(project_builds)
         except Exception as e:
+            failed.append(pid)
             logger.warning(
                 "teamcity.recent_deploys_failed project=%s error=%s",
                 pid, str(e),
             )
+    # Все проекты отвалились — это отказ источника, а не тихий период.
+    # Без отдельной ветки такой случай выглядел как «деплоев не было»:
+    # per-project warning тонул в логах воркера (там же metrics_sync).
+    if failed and not combined:
+        logger.error(
+            "teamcity.recent_deploys_all_projects_failed",
+            projects=projects,
+            failed=failed,
+            lookback_hours=lookback_hours,
+        )
+    elif not combined:
+        logger.info(
+            "teamcity.recent_deploys_empty",
+            projects=projects,
+            lookback_hours=lookback_hours,
+        )
     combined.sort(key=lambda x: x.get("finished_at") or "", reverse=True)
     return combined[:limit]
+
+
+def tc_sync_config_status() -> dict[str, Any]:
+    """Настроен ли pull деплоев из TC. `{configured: bool, reason: str}`.
+
+    Нужен, чтобы отличать «источник не настроен» (ожидаемая пустота, не
+    инцидент) от «настроен, но отдаёт 0» (ослепший синк — инцидент).
+    До этого обе ситуации давали одинаковый пустой список, и watchdog
+    `check_deploy_stream_ingestion` в обеих отвечал ok.
+    """
+    if not settings.TC_URL:
+        return {"configured": False, "reason": "TC_URL пуст"}
+    if not settings.TC_TOKEN:
+        return {"configured": False, "reason": "TC_TOKEN пуст"}
+    if not _TC_CLIENT_AVAILABLE:
+        return {
+            "configured": False,
+            "reason": f"TC-клиент не импортирован (source={_TC_CLIENT_SOURCE})",
+        }
+    if not _tc_project_ids():
+        return {
+            "configured": False,
+            "reason": "ни TC_PROJECT_IDS, ни TC_BACKEND_PROJECT_ID не заданы",
+        }
+    return {"configured": True, "reason": ""}

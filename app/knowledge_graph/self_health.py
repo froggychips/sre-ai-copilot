@@ -443,6 +443,35 @@ def check_edges_freshness(db: Session) -> CheckResult:
     )
 
 
+def _run_coro_blocking(coro):
+    """Выполнить корутину из СИНХРОННОГО чека, где бы он ни вызывался.
+
+    `run_self_health_checks` синхронный, но beat-таск оборачивает его в
+    `asyncio.run(_kg_self_health_logic())` — то есть event loop уже работает,
+    и обычный `asyncio.run()` внутри чека падает с RuntimeError
+    «cannot be called from a running event loop».
+
+    Инцидент 2026-08-11: из-за этого `deploy_stream_ingestion` не выполнялся
+    НИ РАЗУ — каждый прогон уходил в except и (по прежней fail-open логике)
+    докладывал ok со строкой «TC unavailable: RuntimeError: asyncio.run()...».
+    В логах при этом висело `RuntimeWarning: coroutine 'recent_deploys' was
+    never awaited`. Проверка, написанная ради ловли мёртвого ingestion, сама
+    была мертва — и пропустила сутки простоя.
+
+    Внутри loop считаем в отдельном потоке со своим loop: корутина ещё не
+    ожидалась, поэтому безопасно переносится.
+    """
+    import asyncio
+    from concurrent.futures import ThreadPoolExecutor
+
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return asyncio.run(coro)
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        return pool.submit(asyncio.run, coro).result()
+
+
 def check_deploy_stream_ingestion(db: Session) -> CheckResult:
     """TC отдаёт deploy-билды для известных KG-namespace'ов, а в kg_deployments
     их нет → ingestion сломан.
@@ -452,25 +481,47 @@ def check_deploy_stream_ingestion(db: Session) -> CheckResult:
     выходных ~60ч > 36ч-сбоя 2026-06-06 из-за веток '<default>'). Этот чек
     семантический и независим от каденса: если TC за 24h вернул N deploy-
     билдов для KG-веток, а в KG присутствует <50% — fail (>0% — warn). Если
-    «should-ingest» билдов 0 (тихо) — ok. TC недоступен → ok/skip (это вотчина
-    отдельного мониторинга, не наша).
-    """
-    try:
-        import asyncio
+    «should-ingest» билдов 0 (тихо) — ok.
 
+    ИСТОРИЯ FAIL-OPEN (инцидент 2026-08-11): раньше и «TC недоступен», и «TC
+    вернул 0 builds» давали status=ok — «это вотчина отдельного мониторинга».
+    Отдельного мониторинга не оказалось: поток деплоев стоял с 10.08 по 11.08,
+    чек всё это время докладывал ok, а Discord-атрибуция уверенно писала
+    «деплоев не было — вряд ли связано с деплоем» на алерте, прилетевшем через
+    20 секунд после прод-раскатки. Теперь молчание источника — сигнал:
+      * TC настроен, но упал/отдал 0  → fail (ослепший синк);
+      * TC не настроен (нет URL/токена/проектов) → warn с явной причиной,
+        чтобы не путать выключенную интеграцию с поломкой.
+    """
+    from app.services.teamcity_service import tc_sync_config_status
+    cfg = tc_sync_config_status()
+    try:
         from app.services.teamcity_service import (branch_for_namespace,
                                                    recent_deploys)
-        builds = asyncio.run(recent_deploys(lookback_hours=24, limit=200))
-    except Exception as e:  # TC не настроен / недоступен — не наш сигнал
+        builds = _run_coro_blocking(recent_deploys(lookback_hours=24, limit=200))
+    except Exception as e:
         return CheckResult(
             name="deploy_stream_ingestion",
-            status="ok",
-            detail={"skipped": f"TC unavailable: {type(e).__name__}: {str(e)[:120]}"},
+            status="fail" if cfg["configured"] else "warn",
+            detail={
+                "error": f"TC unavailable: {type(e).__name__}: {str(e)[:120]}",
+                "tc_configured": cfg["configured"],
+                "hint": "deploy-атрибуция инцидентов слепа, пока источник молчит",
+            },
         )
     if not builds:
+        if cfg["configured"]:
+            return CheckResult(
+                name="deploy_stream_ingestion", status="fail",
+                detail={
+                    "reason": "TC настроен, но вернул 0 deploy-builds за 24h",
+                    "hint": "ослепший синк: проверь TC_TOKEN (401 не отличим от "
+                            "пустоты), TC_PROJECT_IDS и фильтр _is_deploy_buildtype_name",
+                },
+            )
         return CheckResult(
-            name="deploy_stream_ingestion", status="ok",
-            detail={"reason": "TC вернул 0 builds (не настроен / тихо)"},
+            name="deploy_stream_ingestion", status="warn",
+            detail={"reason": f"pull деплоев не настроен: {cfg['reason']}"},
         )
 
     # branch → list[ns] (обратное к branch_for_namespace по distinct ns в KG)
@@ -484,8 +535,14 @@ def check_deploy_stream_ingestion(db: Session) -> CheckResult:
     for b in builds:
         branch = (b.get("branch") or "").replace("refs/heads/", "")
         # Та же нормализация, что в tc_deploys_to_kg (_tc_deploys_to_kg_logic):
-        # '<default>' deploy-конфигов (не prod) == preprod.
-        if branch == "<default>" and "Prod_" not in (b.get("buildtype_id") or ""):
+        # прод-конфиг → prod независимо от ветки (запускается с preprod, где
+        # лежит только инструментарий); '<default>' у остальных == preprod.
+        # Расхождение с задачей недопустимо: чек сравнивает СВОЙ should_ingest
+        # с тем, что записала задача, и разная нормализация дала бы вечный fail.
+        from app.services.teamcity_service import is_prod_buildtype
+        if is_prod_buildtype(b.get("buildtype_id")):
+            branch = "prod"
+        elif branch == "<default>":
             branch = "preprod"
         if ns_by_branch.get(branch):
             should_ingest.append(b)
