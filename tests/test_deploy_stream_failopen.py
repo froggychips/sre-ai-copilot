@@ -87,6 +87,34 @@ def test_ingestion_warns_when_tc_not_configured(db, monkeypatch):
     assert "TC_TOKEN пуст" in r.detail["reason"]
 
 
+def test_ingestion_works_inside_running_event_loop(db, monkeypatch):
+    """Чек вызывается из синхронного run_self_health_checks, а тот — изнутри
+    asyncio.run(_kg_self_health_logic()). Раньше внутренний asyncio.run падал
+    RuntimeError, чек уходил в except и рапортовал ok: проверка мёртвого
+    ingestion сама была мертва всё время своего существования.
+    """
+    import asyncio
+
+    svc = _mk_service(db)
+    db.add(Deployment(service_id=svc.id, buildtype_id="BT", build_number="100",
+                      started_at=datetime.now(timezone.utc).replace(tzinfo=None)))
+    db.commit()
+    _patch_tc(
+        monkeypatch,
+        [{"buildtype_id": "BT", "number": "100", "branch": "preprod"}],
+        configured=True,
+    )
+
+    async def _inside_loop():
+        return check_deploy_stream_ingestion(db)
+
+    r = asyncio.run(_inside_loop())
+    assert r.status == "ok"
+    assert r.detail["present_in_kg"] == 1
+    # Ключевое: не «TC unavailable: RuntimeError», а реальный вердикт.
+    assert "error" not in r.detail
+
+
 def test_ingestion_fails_when_tc_raises_and_configured(db, monkeypatch):
     """Протухший токен даёт 401 → исключение. Раньше это был ok/skip."""
     import app.services.teamcity_service as tc

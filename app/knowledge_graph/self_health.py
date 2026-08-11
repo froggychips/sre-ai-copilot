@@ -443,6 +443,35 @@ def check_edges_freshness(db: Session) -> CheckResult:
     )
 
 
+def _run_coro_blocking(coro):
+    """Выполнить корутину из СИНХРОННОГО чека, где бы он ни вызывался.
+
+    `run_self_health_checks` синхронный, но beat-таск оборачивает его в
+    `asyncio.run(_kg_self_health_logic())` — то есть event loop уже работает,
+    и обычный `asyncio.run()` внутри чека падает с RuntimeError
+    «cannot be called from a running event loop».
+
+    Инцидент 2026-08-11: из-за этого `deploy_stream_ingestion` не выполнялся
+    НИ РАЗУ — каждый прогон уходил в except и (по прежней fail-open логике)
+    докладывал ok со строкой «TC unavailable: RuntimeError: asyncio.run()...».
+    В логах при этом висело `RuntimeWarning: coroutine 'recent_deploys' was
+    never awaited`. Проверка, написанная ради ловли мёртвого ingestion, сама
+    была мертва — и пропустила сутки простоя.
+
+    Внутри loop считаем в отдельном потоке со своим loop: корутина ещё не
+    ожидалась, поэтому безопасно переносится.
+    """
+    import asyncio
+    from concurrent.futures import ThreadPoolExecutor
+
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return asyncio.run(coro)
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        return pool.submit(asyncio.run, coro).result()
+
+
 def check_deploy_stream_ingestion(db: Session) -> CheckResult:
     """TC отдаёт deploy-билды для известных KG-namespace'ов, а в kg_deployments
     их нет → ingestion сломан.
@@ -467,11 +496,9 @@ def check_deploy_stream_ingestion(db: Session) -> CheckResult:
     from app.services.teamcity_service import tc_sync_config_status
     cfg = tc_sync_config_status()
     try:
-        import asyncio
-
         from app.services.teamcity_service import (branch_for_namespace,
                                                    recent_deploys)
-        builds = asyncio.run(recent_deploys(lookback_hours=24, limit=200))
+        builds = _run_coro_blocking(recent_deploys(lookback_hours=24, limit=200))
     except Exception as e:
         return CheckResult(
             name="deploy_stream_ingestion",
