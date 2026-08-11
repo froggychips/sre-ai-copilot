@@ -8,11 +8,15 @@ Namespace → CH environment mapping:
   preprod-*   → preprod
   preupdate-* → preupdate
   squad-N-*   → squad-N
-  иначе       → prod (safe fallback)
+  иначе       → None (окружение не игровое / неизвестно)
+
+ВАЖНО (см. _PROD_ONLY_NOTE у get_blast_radius): цифры отдаём ТОЛЬКО для
+prod-namespace. Источник один — CH_PROD_HOST/WOAnalytics, per-env среза в нём нет.
 """
 from __future__ import annotations
 
 import logging
+import re
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
@@ -31,7 +35,13 @@ _NS_TO_ENV = {
 }
 
 
-def _ns_to_ch_env(namespace: str) -> str:
+def _ns_to_ch_env(namespace: str) -> Optional[str]:
+    """k8s-namespace → CH environment. None — namespace не игровой/неизвестный.
+
+    Прежний fallback возвращал 'prod' для ЛЮБОГО нераспознанного namespace
+    (monitoring, sre-ai, kube-system) — и такой инцидент получал прод-цифры
+    активных игроков как «свои». Теперь неизвестное окружение честно None.
+    """
     for prefix, env in _NS_TO_ENV.items():
         if namespace.startswith(prefix):
             return env
@@ -40,24 +50,58 @@ def _ns_to_ch_env(namespace: str) -> str:
         parts = namespace.split("-")
         if len(parts) >= 2:
             return f"squad-{parts[1]}"
-    return "prod"
-
-
-def _parse_ts(raw: str) -> Optional[datetime]:
-    for fmt in ("%Y-%m-%dT%H:%M:%SZ", "%Y-%m-%dT%H:%M:%S%z", "%Y-%m-%dT%H:%M:%S"):
-        try:
-            dt = datetime.strptime(raw.replace("Z", "+0000"), fmt)
-            if dt.tzinfo is None:
-                dt = dt.replace(tzinfo=timezone.utc)
-            return dt
-        except ValueError:
-            continue
     return None
 
 
+# Дробная часть секунд: AM/Prometheus шлют startsAt в RFC3339 с миллисекундами
+# ('2026-08-10T12:34:56.789Z'), Go-сериализация умеет и 9 знаков (наносекунды).
+# datetime.fromisoformat ест максимум 6 — лишнее обрезаем.
+_FRACTION_RE = re.compile(r"\.(\d+)")
+
+
+def _parse_ts(raw: str) -> Optional[datetime]:
+    """RFC3339/ISO-8601 → tz-aware datetime (naive считаем UTC).
+
+    Прежняя реализация перебирала strptime-форматы БЕЗ %f, поэтому реальный
+    Alertmanager-овский startsAt с миллисекундами не парсился вообще → None →
+    blast radius молча выключался почти на каждом алерте. Плюс первый формат
+    ('…%SZ') был мёртвой ветвью: `replace("Z", "+0000")` убирал Z до strptime.
+    """
+    if not raw:
+        return None
+    s = raw.strip()
+    # fromisoformat не ест 'Z' до 3.11 — нормализуем к смещению.
+    if s[-1:] in ("Z", "z"):
+        s = s[:-1] + "+00:00"
+    s = _FRACTION_RE.sub(lambda m: "." + m.group(1)[:6], s)
+    try:
+        dt = datetime.fromisoformat(s)
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt
+
+
+# Порты, на которых CH слушает HTTPS (8443 — то что стоит в .env.example).
+_CH_TLS_PORTS = {443, 8443}
+
+
+def _ch_scheme(port: int) -> str:
+    """Схема эндпоинта CH: настройка CH_PROD_SCHEME, 'auto' → по порту."""
+    configured = (getattr(settings, "CH_PROD_SCHEME", "") or "auto").strip().lower()
+    if configured in ("http", "https"):
+        return configured
+    return "https" if port in _CH_TLS_PORTS else "http"
+
+
 class ClickHouseClient:
-    def __init__(self, host: str, port: int, user: str, password: str, timeout: float = 8.0):
-        self._base = f"http://{host}:{port}"
+    def __init__(self, host: str, port: int, user: str, password: str, timeout: float = 8.0,
+                 scheme: Optional[str] = None):
+        # Схема больше не хардкод `http://`: с CH_PROD_PORT=8443 (см.
+        # .env.example) plain-HTTP запрос упирался в TLS-хендшейк и blast
+        # radius тихо отключался.
+        self._base = f"{scheme or _ch_scheme(port)}://{host}:{port}"
         self._auth = (user, password)
         self._timeout = timeout
 
@@ -97,20 +141,42 @@ async def get_blast_radius(
 ) -> Optional[str]:
     """Вернуть строку blast-radius для инжекта в LLM-промпт.
 
-    Запрашивает UserActivityMinuteFact для окружения namespace.
-    Сравнивает:
+    ТОЛЬКО для prod-namespace (см. _PROD_ONLY_NOTE ниже). Для preprod/
+    preupdate/squad-N и не-игровых namespace возвращает None — секция не
+    отдаётся вовсе.
+
+    Запрашивает UserActivityMinuteFact прод-аналитики. Сравнивает:
       - baseline: среднее за 10 минут ДО incident window
       - incident window: среднее за window_minutes минут вокруг starts_at
     """
     if not settings.CH_PROD_HOST or not settings.CH_PROD_PASSWORD:
         return None
 
+    env = _ns_to_ch_env(namespace)
+    # _PROD_ONLY_NOTE. Источник данных ровно один: CH_PROD_HOST, база
+    # WOAnalytics — прод-аналитика. Per-env среза в ней нет: в
+    # UserActivityMinuteFact колонки окружения не существует (гадать имя =
+    # 400 от CH → секция молча пропадает), а отдельного CH под preprod/
+    # preupdate/squad копайлоту не выдано. Раньше env использовался ТОЛЬКО в
+    # заголовке строки — инцидент в preprod/squad-N получал прод-цифры
+    # активных игроков, подписанные чужим окружением, и LLM строил гипотезу
+    # «затронуты десятки тысяч игроков» на данных другого кластера.
+    # Решение: не подписывать чужие данные — для не-prod окружений секции нет.
+    # Когда/если в WOAnalytics появится env-измерение (или отдельный CH на
+    # окружение), здесь добавляется WHERE Env = … и снимается этот гейт.
+    if env != "prod":
+        logger.debug(
+            "clickhouse.blast_radius_skipped ns=%s env=%s: prod-only data source",
+            namespace, env,
+        )
+        return None
+
     win = window_minutes or settings.CH_BLAST_RADIUS_WINDOW_MINUTES
     ts = _parse_ts(starts_at)
     if ts is None:
+        logger.debug("clickhouse.blast_radius_unparsed_ts ns=%s raw=%r", namespace, starts_at)
         return None
 
-    env = _ns_to_ch_env(namespace)
     half = timedelta(minutes=win // 2)
     baseline_end = ts - half
     baseline_start = baseline_end - timedelta(minutes=10)

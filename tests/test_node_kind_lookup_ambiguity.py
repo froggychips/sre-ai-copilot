@@ -22,7 +22,7 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
 from app.database import Base
-from app.knowledge_graph.populator import upsert_service
+from app.knowledge_graph.populator import upsert_edge, upsert_service
 from app.knowledge_graph.queries import _service_by_namespace_name
 from app.knowledge_graph.schema import (NODE_KIND_SERVICE, NODE_KIND_WORKLOAD,
                                         Service)
@@ -71,6 +71,89 @@ def test_blast_radius_survives_ambiguous_name(svc_and_workload, db):
 
     result = blast_radius_for(db, "prod-shared", "auth")
     assert set(result) >= {"services", "urls"}
+
+
+def test_blast_radius_finds_service_entrypoint_via_workload_edge(
+    svc_and_workload, db,
+):
+    """serves_traffic-ребро идёт src=Service-узел → dst=WORKLOAD-узел (так
+    его пишет producer, k8s_topology_resources_sync._sync_one_service) —
+    blast_radius обязан найти его и вернуть имя k8s Service.
+
+    Регрессия: старый фильтр `dst_id == svc.id` сравнивал с id
+    Service-узла (queries.py резолвит node_kind='service'), а producer в
+    dst НИКОГДА не пишет Service-узел → секция «🎯 Blast radius» в
+    critical-embed молча пустовала при живых рёбрах.
+    """
+    from app.knowledge_graph.queries import blast_radius_for
+
+    workload = (
+        db.query(Service)
+        .filter_by(
+            namespace="prod-shared", name="auth",
+            node_kind=NODE_KIND_WORKLOAD,
+        )
+        .one()
+    )
+    # Ребро — по образцу producer'а (k8s_topology_resources_sync:523-535).
+    upsert_edge(
+        db,
+        src=svc_and_workload,
+        dst=workload,
+        kind="serves_traffic",
+        discovered_by="k8s_topology_resources/service",
+        extras={
+            "confidence": "declared_k8s",
+            "semantics": "sync",
+            "selector": {"app": "auth"},
+            "service_type": "ClusterIP",
+        },
+    )
+    db.commit()
+
+    result = blast_radius_for(db, "prod-shared", "auth")
+    assert result["services"] == ["auth"], (
+        "blast_radius не нашёл Service-точку входа по serves_traffic-ребру "
+        "на workload-узел"
+    )
+    assert result["services_total"] == 1
+
+
+def test_ns_deploy_attribution_not_doubled_by_workload_node(svc_and_workload, db):
+    """Один TC-билд не двоится из-за одноимённого workload-узла.
+
+    `tc_deploys_to_kg` броадкастит билд на КАЖДЫЙ non-synthetic узел ns, то
+    есть и на Service `auth`, и на workload `auth`. Ns-level атрибуция
+    джойнила по namespace без `node_kind` — и один билд возвращался дважды
+    (а с K сервисами в ns — K×2 раза).
+    """
+    from datetime import datetime, timedelta, timezone
+
+    from app.knowledge_graph.queries import recent_deploys_for_namespaces
+    from app.knowledge_graph.schema import Deployment
+
+    before = datetime(2026, 8, 10, 12, 0, 0, tzinfo=timezone.utc)
+    workload = (
+        db.query(Service)
+        .filter_by(namespace="prod-shared", name="auth",
+                   node_kind=NODE_KIND_WORKLOAD)
+        .one()
+    )
+    for node in (svc_and_workload, workload):
+        db.add(Deployment(
+            service_id=node.id,
+            buildtype_id="Bt_BuildAndUpdate", build_number="728",
+            started_at=(before - timedelta(minutes=8)).replace(tzinfo=None),
+            status="SUCCESS",
+            extras={"namespace_scope": True},
+        ))
+    db.commit()
+
+    out = recent_deploys_for_namespaces(
+        db, ["prod-shared"], before=before, lookback_minutes=60, limit=5,
+    )
+    assert len(out) == 1, f"билд #728 вернулся {len(out)} раз"
+    assert out[0]["number"] == "728"
 
 
 # Формы поиска узла, которые обязаны нести node_kind. Ищем именно пару

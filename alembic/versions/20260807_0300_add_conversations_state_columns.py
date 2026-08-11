@@ -1,7 +1,7 @@
 """conversations: добираем current_state / retry_count (дрейф модель↔миграции)
 
 Revision ID: 20260807_0300
-Revises: 20260610_0100
+Revises: 20260807_0200
 Create Date: 2026-08-07 01:00:00.000000
 
 `app/models/__init__.py` объявляет у Conversation колонки `current_state`

@@ -323,3 +323,80 @@ def test_dedup_cycle_intact_without_webhook_url(monkeypatch):
         assert bumped["embed"] == {"v": 1}
     finally:
         engine.dispose()
+
+
+# ---------------------------------------------------------------------------
+# Осиротевший claim: процесс убит между claim() и save()
+#
+# release() при SIGKILL (OOM в sre-ai-api — задокументированная история)
+# выполнить невозможно. Placeholder с msg_id="" висел до конца ОСНОВНОГО
+# окна (30 мин), все реплики читали его как «кто-то уже постит» и молча
+# пропускали дубль → critical-алерт не уходил в канал вообще. Placeholder
+# теперь самоистекающий: свой короткий TTL, много меньше окна дедупа.
+# ---------------------------------------------------------------------------
+
+_CLAIM_TTL = dedup_store.CLAIM_PLACEHOLDER_TTL_SECONDS
+
+
+def test_claim_placeholder_ttl_is_shorter_than_dedup_window():
+    """Порог placeholder-а много меньше окна дедупа, но выше worst-case POST-а."""
+    assert 30 <= _CLAIM_TTL <= 300
+    assert _CLAIM_TTL < 1800, "иначе смерть процесса глушит алерт на всё окно"
+
+
+def test_fresh_placeholder_still_blocks_duplicate():
+    """В пределах claim-TTL поведение прежнее: чужой mid-post → skip."""
+    assert dedup_store.claim("k1", ttl_sec=1800, now=1000.0) is None
+    second = dedup_store.claim("k1", ttl_sec=1800, now=1000.0 + _CLAIM_TTL - 1)
+    assert second is not None and second["msg_id"] == ""
+
+
+def test_orphan_placeholder_is_reacquired_before_window_ends():
+    """Placeholder старше claim-TTL перезахватывается, не дожидаясь конца окна."""
+    assert dedup_store.claim("k1", ttl_sec=1800, now=1000.0) is None
+    # Основное окно (1800s) ещё не истекло, но процесс-владелец мёртв.
+    t_dead = 1000.0 + _CLAIM_TTL + 1
+    assert dedup_store.claim("k1", ttl_sec=1800, now=t_dead) is None, (
+        "осиротевший claim обязан переклеймиться — иначе critical не постится"
+    )
+    rec = _dedup_state._recent_enriched["k1"]
+    assert rec["msg_id"] == ""
+    assert rec["first_ts"] == t_dead, "окно якорится на новом claim-е"
+
+
+def test_finalized_record_ignores_claim_ttl():
+    """Реальный msg_id живёт полный ttl_sec: PATCH-путь не ломаем."""
+    assert dedup_store.claim("k1", ttl_sec=1800, now=1000.0) is None
+    dedup_store.save("k1", msg_id="m1", embed=None, now=1000.0)
+    rec = dedup_store.claim("k1", ttl_sec=1800, now=1000.0 + _CLAIM_TTL + 60)
+    assert rec is not None and rec["msg_id"] == "m1"
+
+
+def test_orphan_placeholder_reacquired_on_pg_path(monkeypatch):
+    """PG-путь (реальный sqlite): sirota перезахватывается через IntegrityError-ветку."""
+    from sqlalchemy import create_engine
+    from sqlalchemy.orm import sessionmaker
+
+    from app.database import Base
+
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    monkeypatch.setattr(
+        dedup_store, "_pg_session",
+        sessionmaker(bind=engine, autocommit=False, autoflush=False),
+    )
+    try:
+        assert dedup_store.claim("kOrphan", ttl_sec=1800, now=1000.0) is None
+        # Свежий placeholder — вторая реплика молчит.
+        mid = dedup_store.claim("kOrphan", ttl_sec=1800, now=1010.0)
+        assert mid is not None and mid["msg_id"] == ""
+        # Владелец умер (SIGKILL): placeholder протух раньше окна.
+        t_dead = 1000.0 + _CLAIM_TTL + 1
+        assert dedup_store.claim("kOrphan", ttl_sec=1800, now=t_dead) is None
+        # И новый владелец штатно финализирует POST.
+        dedup_store.save("kOrphan", msg_id="m-after-oom", embed=None, now=t_dead)
+        again = dedup_store.claim("kOrphan", ttl_sec=1800, now=t_dead + 5)
+        assert again is not None and again["msg_id"] == "m-after-oom"
+        assert "kOrphan" not in _dedup_state._recent_enriched
+    finally:
+        engine.dispose()

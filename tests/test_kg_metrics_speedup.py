@@ -29,7 +29,8 @@ from app.knowledge_graph.metrics_sync import (
     _map_pod_to_service,
     _sync_service_health_async,
 )
-from app.knowledge_graph.schema import Service, ServiceHealth
+from app.knowledge_graph.schema import (NODE_KIND_WORKLOAD, Service,
+                                        ServiceHealth)
 
 
 # ── fixtures ────────────────────────────────────────────────────────────────
@@ -284,6 +285,35 @@ async def test_sync_semaphore_caps_namespace_concurrency(db, monkeypatch):
     assert fake.peak_in_flight <= 2 * 5 + 1, (
         f"semaphore не ограничивает: peak={fake.peak_in_flight}"
     )
+
+
+@pytest.mark.asyncio
+async def test_sync_ignores_workload_twin_node(db, monkeypatch):
+    """Пара «k8s Service foo + workload foo» (contract 2.4) → ОДНА строка
+    kg_service_health, привязанная к Service-узлу.
+
+    Регрессия: без фильтра node_kind оба non-synthetic узла попадали в
+    выборку, метрики агрегируются по имени → две идентичные строки на пару
+    каждые 10 минут.
+    """
+    monkeypatch.setattr(settings, "VICTORIA_METRICS_URL", "http://vm:8428")
+    svc = Service(name="bot-service", namespace="prod-kingdom1", synthetic=False)
+    twin = Service(name="bot-service", namespace="prod-kingdom1",
+                   synthetic=False, node_kind=NODE_KIND_WORKLOAD)
+    db.add_all([svc, twin])
+    db.commit()
+    monkeypatch.setattr(
+        metrics_sync, "VMClient",
+        lambda *a, **kw: _FakeVM(
+            ns_pods={"prod-kingdom1": ["bot-service-aaa-bbb"]}, pod_value=0.3,
+        ),
+    )
+    result = await _sync_service_health_async(db)
+    assert result["real_services"] == 1
+    assert result["inserted"] == 1
+    rows = db.query(ServiceHealth).all()
+    assert len(rows) == 1
+    assert rows[0].service_id == svc.id
 
 
 @pytest.mark.asyncio

@@ -46,6 +46,26 @@ log = logging.getLogger(__name__)
 # при лежащем PG зальёт лог.
 _pg_warned = False
 
+# TTL «claim без msg_id» — СВОЙ, много короче основного dedup-окна (30 мин).
+# История: процесс, убитый SIGKILL-ом между claim() и save() (OOM в sre-ai-api
+# — задокументированный сценарий), release() выполнить НЕ МОЖЕТ. Placeholder
+# висел до конца основного окна, все реплики читали его как «кто-то уже
+# постит» и молча пропускали дубль → critical-алерт не уходил в канал ВООБЩЕ.
+# Теперь placeholder самоистекающий: старше этого порога = сирота, следующий
+# fire перезахватывает claim, не дожидаясь конца окна. Порог держим заметно
+# выше worst-case POST-а (Discord 429-retry: до 10s сна + сетевые таймауты),
+# иначе живой, но медленный POST породит второй embed.
+CLAIM_PLACEHOLDER_TTL_SECONDS = 120
+
+
+def _is_orphan_claim(msg_id: Optional[str], first_ts: float, now: float) -> bool:
+    """True — это placeholder (claim без msg_id), провисевший дольше своего TTL.
+
+    Финализированную запись (непустой msg_id) не трогает никогда: её окно
+    живёт полный ttl_sec, как и раньше.
+    """
+    return not msg_id and (now - first_ts) > CLAIM_PLACEHOLDER_TTL_SECONDS
+
 
 class DiscordDedupEntry(Base):
     """Строка PATCH-dedup: один Discord-message на content-key в TTL-окне."""
@@ -154,14 +174,21 @@ def claim(
         реальным msg_id) либо release() при неудаче POST-а;
       - dict с непустым msg_id — сообщение уже есть: caller PATCH-ит;
       - dict с пустым msg_id — другая реплика mid-post (или legacy-POST без
-        msg_id): caller молча пропускает дубль.
+        msg_id): caller молча пропускает дубль. Такой placeholder живёт
+        только CLAIM_PLACEHOLDER_TTL_SECONDS: если реплика умерла, не успев
+        ни save(), ни release() (SIGKILL/OOM), следующий fire перезахватит
+        ключ, а не будет ждать конца 30-минутного окна.
     """
     now = now or time.time()
     # Быстрый путь: свежая запись уже есть (и это же — совместимость с
     # тестами, подменяющими get_fresh).
     existing = get_fresh(key, ttl_sec=ttl_sec, now=now)
-    if existing is not None:
+    if existing is not None and not _is_orphan_claim(
+        existing.get("msg_id"), float(existing.get("first_ts") or 0.0), now
+    ):
         return existing
+    # Осиротевший placeholder проваливается ниже: INSERT упрётся в PK, и
+    # ветка IntegrityError переклеймит ключ под нас.
     try:
         with _pg_session() as db:
             row = DiscordDedupEntry(
@@ -189,9 +216,13 @@ def claim(
                     # окно микроскопическое; ведём себя как при свободном
                     # ключе (старое поведение = POST).
                     return None
-                if _to_ts(cast(datetime, locked.first_ts)) >= now - ttl_sec:
+                locked_first_ts = _to_ts(cast(datetime, locked.first_ts))
+                if locked_first_ts >= now - ttl_sec and not _is_orphan_claim(
+                    locked.msg_id, locked_first_ts, now
+                ):
                     return _row_to_dict(locked)
-                # Stale-строка: переклеймливаем окно под себя.
+                # Stale-строка ЛИБО осиротевший placeholder (реплика умерла
+                # между claim и save): переклеймливаем окно под себя.
                 locked.msg_id = ""
                 locked.embed = None
                 locked.first_ts = _to_dt(now)
@@ -207,7 +238,15 @@ def claim(
         _fallback(e)
         with _dedup_lock:
             rec = _dedup_state._recent_enriched.get(key)
-            if rec is not None and (now - rec.get("first_ts", 0)) <= ttl_sec:
+            if (
+                rec is not None
+                and (now - rec.get("first_ts", 0)) <= ttl_sec
+                # Осиротевший placeholder (процесс умер до save/release) —
+                # не «чужой mid-post», а мусор: перезахватываем.
+                and not _is_orphan_claim(
+                    rec.get("msg_id"), float(rec.get("first_ts") or 0.0), now
+                )
+            ):
                 return dict(rec)
             # Свободно/протухло — клеймим placeholder-ом (под локом = атомарно
             # в рамках процесса; cross-replica гарантии без PG нет, как и

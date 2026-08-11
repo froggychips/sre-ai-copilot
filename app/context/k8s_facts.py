@@ -9,7 +9,13 @@ import structlog
 from kubernetes import client
 from kubernetes import config as k8s_config
 
+from app.diagnostics.rules.base import same_workload
+from app.services.pii_redaction import redact_pii
+
 logger = structlog.get_logger()
+
+# Длина хвоста terminated.message в blob-е (как было до редакции).
+_TERMINATED_MSG_LEN = 200
 
 
 @dataclass
@@ -17,8 +23,18 @@ class K8sSnapshot:
     """Structured k8s data для diagnostic rules.
 
     text — человекочитаемый blob (идёт в logs_summary / LLM context).
+        Весь текст, взятый из вывода приложений (pod-логи, terminated.message),
+        прогнан через redact_pii: blob уезжает в LLM-промпт, а pod-логи
+        штатно содержат Bearer-токены, пароли в connection-string-ах,
+        email-ы юзеров и pod-IP.
+        Строки про terminated-контейнеры и сами логи скоупятся по
+        target-workload (см. _collect_sync): текст ЧУЖИХ подов namespace-а
+        не должен матчиться text-fallback-ами правил (OOMKilledRule и др.).
     container_terminated — pod_name → {reason, exit_code, message}
         из container_status.state.terminated или last_state.terminated.
+        Здесь остаются ВСЕ unhealthy-поды namespace-а: скоупинг по workload
+        делают сами правила (oom.py / process_crash.py через same_workload),
+        им нужен доступ и к пересозданным подам того же workload-а.
     pod_events — список k8s Events для target-пода, отсортированных
         по last_timestamp DESC. Каждый элемент: {type, reason, message, count}.
     core_dump_node — имя ноды, на которой найден core dump в /tmp/dump,
@@ -49,6 +65,17 @@ class K8sFacts:
 
     @staticmethod
     def _collect_sync(namespace: str, pod: Optional[str] = None) -> K8sSnapshot:
+        """namespace-снапшот; `pod` — target-workload для скоупинга текста.
+
+        `pod` — имя пода (или workload-а) из label-ов алерта. Всё, что уходит
+        в text blob из вывода ЧУЖИХ подов namespace-а, при известном target
+        либо не инлайнится, либо перечисляется только именами: этот blob
+        сканируют text-fallback-и правил, и «reason=OOMKilled» соседнего
+        сервиса раньше давал Fact(oom_killed, observed=True, conf=0.95) на
+        чужой инцидент. Если target неизвестен — скоупить не по чему, blob
+        собирается как раньше (attribution-деградацию в этом случае делает
+        сам OOMKilledRule).
+        """
         try:
             k8s_config.load_incluster_config()
         except Exception:
@@ -83,7 +110,13 @@ class K8sFacts:
                             container_terminated[p.metadata.name] = {
                                 "reason": terminated.reason or "",
                                 "exit_code": terminated.exit_code,
-                                "message": (terminated.message or "")[:200],
+                                # terminated.message = хвост stderr контейнера,
+                                # т.е. вывод приложения → редактируем до того,
+                                # как он уйдёт в blob и в LLM-контекст.
+                                "message": redact_pii(
+                                    terminated.message or "",
+                                    max_len=_TERMINATED_MSG_LEN,
+                                ),
                                 "container": cs.name,
                             }
 
@@ -97,14 +130,30 @@ class K8sFacts:
             )
 
             # Добавляем terminated reasons в text blob тоже — OOMKilledRule
-            # и другие regex-правила смогут их поймать.
+            # и другие regex-правила смогут их поймать. НО только по подам
+            # target-workload-а: reason ЧУЖОГО сервиса в тексте становился
+            # false anchor-ом (см. docstring _collect_sync). Чужие поды
+            # перечисляем именами, без reason/exit_code — контекст «в ns есть
+            # ещё падения» сохраняется, а regex-бейта в строке нет.
+            foreign_terminated: List[str] = []
             for pod_name, info in container_terminated.items():
-                if info.get("reason"):
-                    results.append(
-                        f"Container terminated: {pod_name}/{info['container']} "
-                        f"reason={info['reason']} exit_code={info['exit_code']}"
-                        + (f" — {info['message']}" if info.get("message") else "")
-                    )
+                if not info.get("reason"):
+                    continue
+                if pod and not same_workload(pod_name, pod):
+                    foreign_terminated.append(pod_name)
+                    continue
+                results.append(
+                    f"Container terminated: {pod_name}/{info['container']} "
+                    f"reason={info['reason']} exit_code={info['exit_code']}"
+                    + (f" — {info['message']}" if info.get("message") else "")
+                )
+            if foreign_terminated:
+                results.append(
+                    "Other pods in namespace with terminated containers "
+                    f"(different workload than {pod}, reasons deliberately not "
+                    "inlined — they are not evidence about this incident): "
+                    + ", ".join(sorted(foreign_terminated))
+                )
 
             # ── Peer namespace comparison ─────────────────────────────────
             peer = K8sFacts._peer_namespace(namespace)
@@ -134,7 +183,22 @@ class K8sFacts:
             # ── Pod logs (tail 200 for first 3 unhealthy) ────────────────
             # previous=True первым: содержит вывод упавшего контейнера
             # (stacktrace, exit reason), а не свежего restarted-а.
-            for pod_name, _, _ in unhealthy_pods[:3]:
+            #
+            # Скоуп: при известном target берём логи только его workload-а.
+            # Логи соседнего сервиса — тот же false-anchor-материал, что и
+            # чужие terminated-строки: "out of memory" из лога чужого пода
+            # матчился text-fallback-ом OOMKilledRule.
+            log_pods = [
+                (name, phase, restarts)
+                for name, phase, restarts in unhealthy_pods
+                if not pod or same_workload(name, pod)
+            ]
+            skipped_log_pods = [
+                name
+                for name, _, _ in unhealthy_pods
+                if pod and not same_workload(name, pod)
+            ]
+            for pod_name, _, _ in log_pods[:3]:
                 fetched = False
                 for prev in (True, False):
                     try:
@@ -143,8 +207,12 @@ class K8sFacts:
                         )
                         if logs and logs.strip():
                             label = "previous" if prev else "current"
+                            # redact_pii ДО попадания в blob: blob уезжает в
+                            # LLM-промпт. max_len=None — усечения нет, тут
+                            # нужен весь хвост логов (границу режет вызывающий).
+                            safe_logs = redact_pii(logs.strip(), max_len=None)
                             results.append(
-                                f"Logs {pod_name} ({label}, tail 200):\n{logs.strip()}"
+                                f"Logs {pod_name} ({label}, tail 200):\n{safe_logs}"
                             )
                             fetched = True
                             break
@@ -152,6 +220,12 @@ class K8sFacts:
                         continue
                 if not fetched:
                     logger.warning("k8s_facts_logs_unavailable", pod=pod_name)
+            if skipped_log_pods:
+                results.append(
+                    "Other unhealthy pods in namespace (logs not collected — "
+                    f"different workload than {pod}): "
+                    + ", ".join(sorted(skipped_log_pods))
+                )
 
             # ── Pod events ────────────────────────────────────────────────
             # Если указан конкретный pod — берём события только по нему,

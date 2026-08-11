@@ -214,6 +214,84 @@ def test_sync_lag_seq_30min_gap_fails(db):
     assert result2.status == "fail"
 
 
+def _patch_heartbeat(monkeypatch, minutes_ago=None):
+    """Подменить чтение redis-heartbeat'а в self_health.
+
+    minutes_ago=None → ключа нет (redis перезапускался / первый запуск).
+    """
+    import app.knowledge_graph.self_health as sh
+
+    ts = (
+        datetime.utcnow() - timedelta(minutes=minutes_ago)
+        if minutes_ago is not None else None
+    )
+    monkeypatch.setattr(sh, "_last_heartbeat", lambda task: ts)
+    return ts
+
+
+def test_sync_lag_anomaly_ok_on_quiet_period(db, monkeypatch):
+    """Ложный fail (review 2026-08): задача ходит каждые 10 мин, но за час не
+    нашла ни одной аномалии — это НОРМА (noise-floor + volume guard), а не
+    поломка. Раньше max(AnomalyObservation.ts) отсутствовал → fail.
+    """
+    _patch_heartbeat(monkeypatch, minutes_ago=3)
+    result = check_sync_lag(db)
+    anomaly = result.detail["per_task"]["kg_anomaly_detection_task"]
+    assert anomaly["status"] == "ok"
+    assert anomaly["source"] == "heartbeat"
+    # Результата нет вообще — и это не влияет на статус.
+    assert anomaly["last_result_ts"] is None
+
+
+def test_sync_lag_anomaly_ignores_stale_result_while_task_runs(db, monkeypatch):
+    """Последняя аномалия 6 часов назад, но задача прогонялась 3 минуты назад →
+    ok. Наличие РЕЗУЛЬТАТА не является признаком живости детектора."""
+    svc = _mk_service(db)
+    db.add(AnomalyObservation(
+        service_id=svc.id, ts=datetime.utcnow() - timedelta(hours=6),
+        metric="cpu_pct", severity="warning",
+    ))
+    db.commit()
+    _patch_heartbeat(monkeypatch, minutes_ago=3)
+    result = check_sync_lag(db)
+    anomaly = result.detail["per_task"]["kg_anomaly_detection_task"]
+    assert anomaly["status"] == "ok"
+    assert anomaly["last_result_ts"] is not None
+
+
+def test_sync_lag_anomaly_fails_when_task_stopped(db, monkeypatch):
+    """А вот когда сама задача не прогонялась 90 мин (>5× интервала 10 мин) —
+    это настоящий fail, и его heartbeat как раз видит."""
+    _patch_heartbeat(monkeypatch, minutes_ago=90)
+    result = check_sync_lag(db)
+    anomaly = result.detail["per_task"]["kg_anomaly_detection_task"]
+    assert anomaly["status"] == "fail"
+    assert result.status == "fail"
+
+
+def test_sync_lag_anomaly_warns_without_heartbeat(db, monkeypatch):
+    """Нет ключа в redis (перезапуск redis / свежий инстанс) → warn, не fail:
+    «неизвестно» ≠ «задача не ходит»."""
+    _patch_heartbeat(monkeypatch, minutes_ago=None)
+    result = check_sync_lag(db)
+    anomaly = result.detail["per_task"]["kg_anomaly_detection_task"]
+    assert anomaly["status"] == "warn"
+    assert anomaly["lag_minutes"] is None
+    assert "heartbeat" in anomaly["reason"]
+
+
+def test_quiet_anomalies_do_not_produce_conflicting_verdicts(db, monkeypatch):
+    """Корень ложного алерта: тихие 24h check_anomaly_signal_health считает
+    warn, а sync_lag считал fail — fingerprint-dedup (по набору fail-ов) потом
+    надолго закреплял этот fail в Discord. Теперь противоречия нет."""
+    _patch_heartbeat(monkeypatch, minutes_ago=5)
+    lag = check_sync_lag(db).detail["per_task"]["kg_anomaly_detection_task"]
+    signal = check_anomaly_signal_health(db)
+    assert lag["status"] == "ok"
+    assert signal.status == "warn"          # «детектор молчит» — мягкий сигнал
+    assert "anomaly_signal_health" not in fingerprint([signal])
+
+
 def test_sync_lag_ok_when_fresh(db):
     """Все данные свежие — ok."""
     svc = _mk_service(db)

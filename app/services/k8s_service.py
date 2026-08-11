@@ -16,9 +16,8 @@
 """
 from __future__ import annotations
 
-import logging
 import subprocess
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Tuple
 
 from app.config import settings
 from app.core.execution_dsl import ActionType, DSLTranslator, ExecutionIntent
@@ -195,24 +194,20 @@ class K8sService:
         except Exception as e:
             return {"success": False, "error": str(e), "dry_run": dry_run}
 
-    # ── Backward compat: старая run_command-обёртка ────────────────────────
-    # Legacy: исторически использовалась в discord_service.send_approval_request
-    # (удалён в chore/gc-legacy-discord-senders). Оставляем заглушкой на случай,
-    # если внешние интеграции дёрнут — approve-flow теперь через
-    # api/discord_interactions.py (PR #12, button-based).
-    def run_command(
-        self,
-        command: str,
-        risk_level: str = "MEDIUM",
-        dry_run: bool = True,
-        body: Optional[dict] = None,
-    ) -> Dict[str, Any]:
-        logging.warning(
-            "K8sService.run_command — deprecated; use execute_intent(intent) instead"
-        )
-        return self._run_kubectl(
-            command, dry_run=dry_run, post_approval=False, risk=risk_level
-        )
+    # ── Удалено: legacy-обёртка run_command ────────────────────────────────
+    # Была backward-compat заглушкой после выпила
+    # discord_service.send_approval_request (chore/gc-legacy-discord-senders),
+    # но вызывающих в репо не осталось (ни app/, ни app/scripts/, ни tests/) —
+    # только устаревшее упоминание в докстринге stage_executor
+    # (app/workers/pipeline.py), который утверждает, что guard вызывается
+    # «внутри run_command». Фактически она шла СРАЗУ в _run_kubectl, т.е.
+    # K8sSecurityGuard.validate не вызывался вообще: единственной защитой
+    # оставался SAFE_MODE+APPROVAL_REQUIRED-гейт, а read-ветки (dry_run=True) и
+    # write при SAFE_MODE=false проходили в кластер по произвольной
+    # kubectl-строке. Мёртвый метод с такой поверхностью не «оставляем на
+    # всякий случай»: единственная точка входа — execute_intent(intent), где
+    # guard стоит первым шагом. Если внешней интеграции когда-нибудь
+    # понадобится строковый вход — он обязан собирать ExecutionIntent.
 
 
 k8s_service = K8sService()

@@ -74,6 +74,36 @@ spec:
           value: {{ .Values.env.externalProbeEnabled | default "false" | quote }}
         - name: OWNERSHIP_BACKFILL_ENABLED
           value: {{ .Values.env.ownershipBackfillEnabled | default "false" | quote }}
+        # ── Liveness ─────────────────────────────────────────────────────────
+        # Синхронизировано с k8s/worker.yaml (обоснование там же). Смерть beat'а
+        # контейнер переживает сам (PID 1 → рестарт), а ЗАВИСШИЙ планировщик даёт
+        # Running-под, который перестал тикать: ни одна периодическая задача не
+        # ставится, KG протухает молча. `celery inspect ping` для beat не
+        # применим (нет control-pidbox), поэтому проверяем свежесть shelve-файла
+        # расписания: Scheduler.sync_every=180s (celery/beat.py) + writeback=True.
+        # Порог 900s, а не 600s: sync вызывается из apply_entry, то есть только
+        # когда beat что-то отправил (проверено: у beat'а с пустым beat_schedule
+        # файл не переписывается вовсе), поэтому порог должен покрывать самый
+        # редкий гарантированный тик расписания. glob по префиксу, а не имя: оно
+        # зависит от dbm-бэкенда (_gdbm — без суффикса, ndbm — `.db`, dbm.dumb —
+        # `.dat`/`.dir`), точное имя дало бы рестарт-петлю здорового beat'а.
+        livenessProbe:
+          exec:
+            command:
+            - python
+            - -c
+            - |
+              import glob, os, sys, time
+              paths = glob.glob("/tmp/celerybeat-schedule*")
+              if not paths:
+                  sys.exit("celerybeat-schedule missing: beat did not start the scheduler")
+              age = int(time.time() - max(os.path.getmtime(p) for p in paths))
+              if age >= 900:
+                  sys.exit("celerybeat-schedule stale for %ds: beat loop wedged" % age)
+          initialDelaySeconds: 120
+          periodSeconds: 60
+          timeoutSeconds: 10
+          failureThreshold: 3
         resources:
           limits:
             cpu: 100m

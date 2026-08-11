@@ -2,15 +2,17 @@
 
 Порядок проверок: record → already_applied → in_flight-клейм → intent →
 ПОДПИСЬ (обязательна) → signature_mismatch → ActionApproval(approved) →
-свежесть approve → namespace-binding intent ↔ инцидент → risk → dry_run →
-policy-gate → claim-commit → execute → финализация.
+свежесть approve → cluster_state_unknown → namespace-binding intent ↔ инцидент
+→ risk → dry_run → свежесть intent-а → policy-gate → пере-dry-run →
+claim-commit → execute → финализация.
 
 Проверяем:
   - record не найден → incident_not_found
   - no execution_intent → no_intent
   - executor_applied уже есть → already_applied (idempotency)
   - свежий executor_in_flight → apply_in_flight (двухфазный claim)
-  - протухший executor_in_flight → переклейм, apply идёт дальше
+  - протухший executor_in_flight → claim снят, но БЕЗ второго write:
+    инцидент помечен cluster_state_unknown → manual (M2)
   - нет expected_signature → signature_required
   - подпись не совпала → signature_mismatch
   - нет approved-записи в kg_action_approvals → not_approved
@@ -19,9 +21,12 @@ policy-gate → claim-commit → execute → финализация.
   - у инцидента нет namespace → namespace_unbound (fail-closed)
   - risk=high → risk_too_high:high
   - dry_run не прошёл → dry_run_not_ok:<status>
+  - intent старше EXECUTOR_INTENT_MAX_AGE_SECONDS → intent_stale, без kubectl (M1)
+  - возраст intent-а неопределим → intent_age_unknown (fail-closed)
+  - пере-dry-run перед write упал → dry_run_recheck_failed, реального write нет
   - prod-namespace + LLM risk=low → policy_block (детерминированный gate)
   - happy path → execute_intent(dry_run=False, post_approval=True), executor_applied записан
-  - claim коммитится ДО execute_intent (crash-window)
+  - claim коммитится ДО реального execute_intent (crash-window)
   - exception в k8s_service → execute_error, claim остаётся (fail-closed)
 """
 from datetime import datetime, timedelta, timezone
@@ -51,7 +56,33 @@ def _make_record(analysis: dict, data: dict | None = None) -> MagicMock:
     # record.data = сохранённый alert-payload; namespace нужен для
     # server-side binding intent ↔ инцидент.
     rec.data = {"namespace": "squad-1"} if data is None else data
+    # created_at — последний по грубости якорь возраста intent-а (naive UTC,
+    # как DateTime-колонка Postgres). Без него apply fail-closed отказал бы
+    # с intent_age_unknown: возраст плана неизвестен.
+    rec.created_at = datetime.now(timezone.utc).replace(tzinfo=None)
     return rec
+
+
+def _fake_exec(write_result=None, dry_run_result=None, write_exc=None):
+    """Заглушка k8s_service.execute_intent, различающая пере-dry-run и write.
+
+    apply_intent теперь дважды дёргает executor: сначала
+    `--dry-run=server` по текущему состоянию кластера, затем реальный write.
+    Тестам нужно управлять исходами по отдельности.
+    """
+    def _fake(intent, dry_run=True, post_approval=False, **kw):
+        if dry_run:
+            return dry_run_result or {
+                "success": True,
+                "command": "kubectl rollout restart deployment/town-service "
+                           "-n squad-1 --dry-run=server",
+                "exit_code": 0,
+            }
+        if write_exc is not None:
+            raise write_exc
+        return write_result or {"success": True, "command": "kubectl ..."}
+
+    return _fake
 
 
 def _valid_intent_dict() -> dict:
@@ -225,13 +256,17 @@ def test_apply_happy_path_calls_k8s_with_post_approval(mock_session):
         "dry_run": False,
     }
     with _approved(), patch.object(
-        executor_apply.k8s_service, "execute_intent", return_value=fake_result
+        executor_apply.k8s_service, "execute_intent",
+        side_effect=_fake_exec(write_result=fake_result),
     ) as mock_exec:
         out = executor_apply.apply_intent(
             "inc-5", "discord-user-123", _sig_for(_valid_intent_dict())
         )
 
     assert out["ok"] is True
+    # Два вызова: пере-dry-run по текущему кластеру, затем реальный write.
+    assert mock_exec.call_count == 2
+    assert mock_exec.call_args_list[0].kwargs["dry_run"] is True
     _, kwargs = mock_exec.call_args
     assert kwargs["dry_run"] is False
     assert kwargs["post_approval"] is True
@@ -254,6 +289,8 @@ def test_apply_persists_failure_result(mock_session):
     })
     query.first.return_value = record
 
+    # Пере-dry-run проходит (кластер валидирует команду), а реальный write
+    # падает по RBAC — результат должен быть записан, а не потерян.
     fake_result = {
         "success": False,
         "stderr": "Error from server: forbidden",
@@ -261,7 +298,8 @@ def test_apply_persists_failure_result(mock_session):
         "command": "kubectl rollout restart deployment/town-service -n squad-1",
     }
     with _approved(), patch.object(
-        executor_apply.k8s_service, "execute_intent", return_value=fake_result
+        executor_apply.k8s_service, "execute_intent",
+        side_effect=_fake_exec(write_result=fake_result),
     ):
         out = executor_apply.apply_intent(
             "inc-6", "user1", _sig_for(_valid_intent_dict())
@@ -371,8 +409,8 @@ def test_apply_commits_claim_before_execute(mock_session):
     order: list = []
     session.commit.side_effect = lambda: order.append("commit")
 
-    def fake_execute(*a, **kw):
-        order.append("execute")
+    def fake_execute(intent, dry_run=True, post_approval=False, **kw):
+        order.append("dry_run" if dry_run else "execute")
         return {"success": True, "command": "kubectl ..."}
 
     with _approved(), patch.object(
@@ -383,8 +421,9 @@ def test_apply_commits_claim_before_execute(mock_session):
         )
 
     assert out["ok"] is True
-    # Первый commit (claim) СТРОГО раньше execute; финализация — после.
-    assert order == ["commit", "execute", "commit"]
+    # Пере-dry-run — ДО claim-а (read-only проверка не должна оставлять
+    # in-flight маркер), claim — строго раньше реального write, финализация после.
+    assert order == ["dry_run", "commit", "execute", "commit"]
 
 
 def test_apply_crash_after_claim_leaves_claim_and_blocks_retry(mock_session):
@@ -396,9 +435,10 @@ def test_apply_crash_after_claim_leaves_claim_and_blocks_retry(mock_session):
     })
     query.first.return_value = record
 
+    # Пере-dry-run прошёл, реальный write повис → claim остаётся.
     with _approved(), patch.object(
         executor_apply.k8s_service, "execute_intent",
-        side_effect=TimeoutError("kubectl hang"),
+        side_effect=_fake_exec(write_exc=TimeoutError("kubectl hang")),
     ):
         out1 = executor_apply.apply_intent(
             "inc-crash", "user1", _sig_for(_valid_intent_dict())
@@ -445,9 +485,15 @@ def test_apply_refuses_on_fresh_in_flight_claim(mock_session):
     mock_exec.assert_not_called()
 
 
-def test_apply_reclaims_stale_in_flight_claim(mock_session):
-    """Протухший claim (старше TTL) переклеймливается — apply проходит."""
-    _, query = mock_session
+def test_apply_reclaims_stale_claim_without_second_write(mock_session):
+    """Протухший claim: снимается (не висит вечно), но второго write НЕ даёт.
+
+    Раньше переклейм молча гнал kubectl повторно: TTL claim-а 600s короче
+    approval-окна 3600s, а факт первого write никто не проверял — инвариант
+    «≤1 реальный write на одно одобрение» ломался. Теперь инцидент помечается
+    «состояние кластера неизвестно → manual», и apply отказывает.
+    """
+    session, query = mock_session
     stale_ts = (datetime.now(timezone.utc) - timedelta(hours=2)).isoformat()
     record = _make_record({
         "execution_intent": _valid_intent_dict(),
@@ -458,10 +504,73 @@ def test_apply_reclaims_stale_in_flight_claim(mock_session):
 
     with _approved(), patch.object(
         executor_apply.k8s_service, "execute_intent",
-        return_value={"success": True, "command": "kubectl ..."},
-    ):
+        side_effect=_fake_exec(),
+    ) as mock_exec:
         out = executor_apply.apply_intent(
             "inc-reclaim", "user1", _sig_for(_valid_intent_dict())
+        )
+
+    assert out["ok"] is False
+    assert out["reason"].startswith("cluster_state_unknown")
+    # Ни dry-run, ни реального write — kubectl вообще не дёргаем.
+    mock_exec.assert_not_called()
+    assert "executor_applied" not in record.analysis
+    # Claim не висит вечно: снят и заменён явной пометкой (закоммичен).
+    assert "executor_in_flight" not in record.analysis
+    marker = record.analysis["executor_state_unknown"]
+    assert marker["stale_claim"]["claimed_by"] == "old-user"
+    assert marker["resolution"] == "manual"
+    assert session.commit.called
+
+
+def test_apply_refuses_while_state_unknown_marker_present(mock_session):
+    """Пометка cluster_state_unknown держит apply закрытым на старом approve."""
+    _, query = mock_session
+    record = _make_record({
+        "execution_intent": _valid_intent_dict(),
+        "executor_result": {"status": "dry_run_ok"},
+        "executor_state_unknown": {
+            "detected_at": datetime.now(timezone.utc).isoformat(),
+            "stale_claim": {"claimed_by": "old-user"},
+            "resolution": "manual",
+        },
+    })
+    query.first.return_value = record
+
+    # Approve выдан ДО пометки (обычный случай: клик → протухший claim).
+    with _approved(age_seconds=120), patch.object(
+        executor_apply.k8s_service, "execute_intent"
+    ) as mock_exec:
+        out = executor_apply.apply_intent(
+            "inc-unknown", "user1", _sig_for(_valid_intent_dict())
+        )
+
+    assert out["ok"] is False
+    assert out["reason"].startswith("cluster_state_unknown")
+    mock_exec.assert_not_called()
+
+
+def test_apply_allows_after_reapprove_following_state_unknown(mock_session):
+    """Единственный выход: approve, выданный ПОСЛЕ пометки (человек проверил кластер)."""
+    _, query = mock_session
+    record = _make_record({
+        "execution_intent": _valid_intent_dict(),
+        "executor_result": {"status": "dry_run_ok"},
+        "executor_state_unknown": {
+            "detected_at": (
+                datetime.now(timezone.utc) - timedelta(minutes=10)
+            ).isoformat(),
+            "stale_claim": {"claimed_by": "old-user"},
+            "resolution": "manual",
+        },
+    })
+    query.first.return_value = record
+
+    with _approved(age_seconds=30), patch.object(
+        executor_apply.k8s_service, "execute_intent", side_effect=_fake_exec(),
+    ):
+        out = executor_apply.apply_intent(
+            "inc-reapproved", "user1", _sig_for(_valid_intent_dict())
         )
 
     assert out["ok"] is True
@@ -544,11 +653,123 @@ def test_apply_accepts_namespace_from_labels_fallback(mock_session):
     )
 
     with _approved(), patch.object(
-        executor_apply.k8s_service, "execute_intent",
-        return_value={"success": True, "command": "kubectl ..."},
+        executor_apply.k8s_service, "execute_intent", side_effect=_fake_exec(),
     ):
         out = executor_apply.apply_intent(
             "inc-labels", "user1", _sig_for(_valid_intent_dict())
         )
 
     assert out["ok"] is True
+
+
+# ---------------------------------------------------------------------------
+# Свежесть самого intent-а + пере-dry-run перед write (M1)
+# ---------------------------------------------------------------------------
+
+def test_apply_refuses_stale_intent(mock_session):
+    """«Approve & Run» на эмбеде недельной давности → intent_stale, без kubectl.
+
+    Approve свежий, но план посчитан по состоянию кластера, которого уже нет.
+    Якорь возраста — report_sent.sent_at (когда embed с кнопкой ушёл в Discord).
+    """
+    _, query = mock_session
+    week_ago = (datetime.now(timezone.utc) - timedelta(days=7)).isoformat()
+    record = _make_record({
+        "execution_intent": _valid_intent_dict(),
+        "executor_result": {"status": "dry_run_ok"},
+        "report_sent": {"sent_at": week_ago, "attempts": 1},
+    })
+    query.first.return_value = record
+
+    with _approved(age_seconds=30), patch.object(
+        executor_apply.k8s_service, "execute_intent"
+    ) as mock_exec:
+        out = executor_apply.apply_intent(
+            "inc-oldintent", "user1", _sig_for(_valid_intent_dict())
+        )
+
+    assert out["ok"] is False
+    assert out["reason"].startswith("intent_stale:")
+    mock_exec.assert_not_called()
+    assert "executor_in_flight" not in record.analysis
+
+
+def test_apply_accepts_intent_within_max_age(mock_session):
+    """Тот же якорь в пределах окна (час назад) — apply проходит."""
+    _, query = mock_session
+    hour_ago = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()
+    record = _make_record({
+        "execution_intent": _valid_intent_dict(),
+        "executor_result": {"status": "dry_run_ok"},
+        "report_sent": {"sent_at": hour_ago, "attempts": 1},
+    })
+    query.first.return_value = record
+
+    with _approved(age_seconds=30), patch.object(
+        executor_apply.k8s_service, "execute_intent", side_effect=_fake_exec(),
+    ):
+        out = executor_apply.apply_intent(
+            "inc-freshintent", "user1", _sig_for(_valid_intent_dict())
+        )
+
+    assert out["ok"] is True
+    applied = record.analysis["executor_applied"]
+    # Возраст плана и то, чем он измерен, попадают в provenance apply-а.
+    assert applied["intent_time_anchor"] == "report_sent.sent_at"
+    assert 3500 <= applied["intent_age_seconds"] <= 3700
+
+
+def test_apply_refuses_when_intent_age_unknown(mock_session):
+    """Ни одного якоря времени (нет маркеров прогона и created_at) → fail-closed."""
+    _, query = mock_session
+    record = _make_record({
+        "execution_intent": _valid_intent_dict(),
+        "executor_result": {"status": "dry_run_ok"},
+    })
+    record.created_at = None
+    query.first.return_value = record
+
+    with _approved(), patch.object(
+        executor_apply.k8s_service, "execute_intent"
+    ) as mock_exec:
+        out = executor_apply.apply_intent(
+            "inc-noanchor", "user1", _sig_for(_valid_intent_dict())
+        )
+
+    assert out == {"ok": False, "reason": "intent_age_unknown"}
+    mock_exec.assert_not_called()
+
+
+def test_apply_refuses_when_pre_write_dry_run_fails(mock_session):
+    """Свежий --dry-run=server упал (ресурса уже нет) → отказ, реального write нет."""
+    session, query = mock_session
+    record = _make_record({
+        "execution_intent": _valid_intent_dict(),
+        "executor_result": {"status": "dry_run_ok"},
+    })
+    query.first.return_value = record
+
+    failed_dry_run = {
+        "success": False,
+        "stderr": 'Error from server (NotFound): deployments.apps "town-service" not found',
+        "exit_code": 1,
+        "dry_run": True,
+    }
+    with _approved(), patch.object(
+        executor_apply.k8s_service, "execute_intent",
+        side_effect=_fake_exec(dry_run_result=failed_dry_run),
+    ) as mock_exec:
+        out = executor_apply.apply_intent(
+            "inc-recheck", "user1", _sig_for(_valid_intent_dict())
+        )
+
+    assert out["ok"] is False
+    assert out["reason"].startswith("dry_run_recheck_failed:")
+    assert "not found" in out["reason"]
+    # Ровно один вызов, и он dry-run: реального write не было.
+    assert mock_exec.call_count == 1
+    assert mock_exec.call_args.kwargs["dry_run"] is True
+    # Claim не ставился — read-only проверка не должна блокировать кнопку.
+    assert "executor_in_flight" not in record.analysis
+    assert "executor_applied" not in record.analysis
+    session.commit.assert_not_called()

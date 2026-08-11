@@ -57,21 +57,21 @@ resources:
     requests:
       cpu: 200m
       memory: 256Mi
-  # Синхронизировано с k8s/worker.yaml. Связано с worker.concurrency (см. выше):
-  # celery prefork = 1 родитель + concurrency детей, каждый процесс тянет весь
-  # стек (~166 MiB RSS только на импорт `app.workers.tasks`, замерено; тот же
-  # порядок подтверждён OOM-ом beat'а на 128Mi). При concurrency=2 это
-  # 3 × ~170Mi ≈ 510Mi baseline + рабочая куча + RSS kubectl-subprocess'ов,
-  # которые считаются в тот же cgroup → 768Mi. Было 256Mi при 4 (в helm —
-  # вообще без --concurrency, т.е. по числу ядер ноды) — OOM by design.
+  # Синхронизировано с k8s/worker.yaml (источник истины для боевых значений —
+  # он, при расхождении обновлять ОБА файла). Связано с worker.concurrency
+  # (см. выше): celery prefork = 1 родитель + concurrency детей, каждый процесс
+  # тянет весь стек (~166 MiB RSS только на импорт `app.workers.tasks`).
+  # Memory 768Mi → 3Gi вслед за k8s/worker.yaml: на rc.13 воркеры ловили
+  # OOMKilled каждые ~1.5-2ч (44 рестарта за 44ч на двух репликах, 10.08.2026),
+  # и из-за OOM-петли × acks_late × expires дайджест молча протухал в очереди.
   # requests == limits: Guaranteed QoS, воркер выселяется последним.
   worker:
     limits:
       cpu: 600m
-      memory: 768Mi
+      memory: 3Gi
     requests:
       cpu: 600m
-      memory: 768Mi
+      memory: 3Gi
   redis:
     limits:
       cpu: 500m
@@ -147,9 +147,32 @@ env:
 ownershipManifest:
   enabled: true
 
-# All secret keys — fill in before deploying.
-# In production prefer SealedSecrets or ExternalSecrets (see k8s/base/secrets.*.yaml.example).
 secrets:
+  # ── ПУТЬ 1 (для prod, предпочтительный): ссылка на готовый Secret ──────────
+  # Имя Secret-а, созданного ВНЕ чарта (SealedSecrets / ExternalSecrets /
+  # руками — см. k8s/base/secrets.*.yaml.example). Если задано:
+  #   * templates/secret.yaml не рендерится вообще;
+  #   * api/worker/beat/job-migrate берут envFrom прямо из него
+  #     (helper sre-ai-copilot.secretName);
+  #   * ни один секрет не попадает ни в values, ни в helm release Secret
+  #     (sh.helm.release.v1.*), ни в shell history через --set.
+  #
+  #   helm upgrade --install sre-ai ./helm/sre-ai-copilot \
+  #     --set image.tag=<git-sha> --set secrets.existingSecret=sre-ai-secrets
+  #
+  # Требуемые ключи (те же, что ниже): ANTHROPIC_API_KEY, DATABASE_URL,
+  # REDIS_URL, DISCORD_WEBHOOK_URL, ALERTMANAGER_WEBHOOK_SECRET, JWT_PUBLIC_KEY,
+  # JIRA_BASE_URL, JIRA_EMAIL, JIRA_API_TOKEN. Чарт их НЕ валидирует: недостающие
+  # ловятся fail-closed валидаторами app/config.py на старте пода.
+  existingSecret: ""
+
+  # ── ПУТЬ 2 (dev / kind / minikube): значения прямо здесь ───────────────────
+  # ⚠️ Всё, что вписано ниже, уезжает в helm release Secret и живёт там ПО
+  # ВЕРСИЯМ релиза (ротация ключа не вычищает старые), а `--set` дополнительно
+  # светит значение в shell history и в argv (`ps`). Для prod использовать
+  # existingSecret выше. Пустые ключи в Secret не рендерятся — заполненный
+  # руками ключ больше не затирается пустотой при следующем upgrade
+  # (подробности и грабли перехода — в templates/secret.yaml).
   anthropicApiKey: ""
   databaseUrl: ""
   redisUrl: ""

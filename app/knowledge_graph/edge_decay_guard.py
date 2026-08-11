@@ -49,6 +49,15 @@ Fail-closed: kind, не сопоставленный НИ ОДНОМУ исто�
 
 Дисциплина «пустой fetch неотличим от пустого кластера → не чистим»
 зеркалит `k8s_jobs_sync.cleanup_stale_jobs` и `drift_cleanup`.
+
+ТАБЛИЦЫ
+-------
+Тот же механизм обслуживает ДВЕ таблицы рёбер: `kg_service_edges` (карта
+`EDGE_KIND_FRESHNESS_SOURCES`) и `kg_volume_edges` (карта
+`VOLUME_EDGE_KIND_FRESHNESS_SOURCES`, decay живёт в
+`k8s_storage_sync.decay_volume_edges`). Карты раздельные намеренно: kind'ы
+не пересекаются, а смешивать инвентарь двух таблиц в одном источнике —
+значит чинить одно, а ломать другое.
 """
 from __future__ import annotations
 
@@ -60,7 +69,7 @@ from typing import Any, Dict, Mapping, Optional, Tuple
 from sqlalchemy import func
 from sqlalchemy.orm import Session
 
-from app.knowledge_graph.schema import ServiceEdge
+from app.knowledge_graph.schema import ServiceEdge, VolumeEdge
 
 logger = logging.getLogger(__name__)
 
@@ -77,6 +86,11 @@ SOURCE_TOPOLOGY_SERVICES = "k8s_topology_resources_sync/services"
 SOURCE_TOPOLOGY_INGRESSES = "k8s_topology_resources_sync/ingresses"
 SOURCE_INGRESS_SYNC = "k8s_ingress_sync"
 SOURCE_NATS_SUBJECTS_SYNC = "nats_subjects_sync"
+# Storage-слой (`kg_volume_edges`). Тоже по единице fetch'а: `uses_volume`
+# живёт от cluster-wide среза pod'ов, `bound_to` — от среза PVC. Срезы
+# независимы (разные `kubectl get`, разные объёмы, разные режимы отказа).
+SOURCE_STORAGE_PODS = "k8s_storage_sync/pods"
+SOURCE_STORAGE_PVCS = "k8s_storage_sync/pvcs"
 
 
 # ── ЕДИНОЕ МЕСТО: kind ребра → синхронизатор, освежающий его last_seen_at ───
@@ -117,6 +131,21 @@ EDGE_DISCOVERED_BY_SOURCE: Dict[str, str] = {
     "k8s_topology_resources/ingress": SOURCE_TOPOLOGY_INGRESSES,
 }
 
+# ── То же для `kg_volume_edges` (storage-слой, k8s_storage_sync) ────────────
+#
+# Отдельная таблица → отдельная карта. Оба kind'а однозначны, поэтому
+# legacy-группа (см. LEGACY_SOURCE_PREFIX) тут не нужна: даже ребро без
+# `discovered_by` атрибутируется по kind'у.
+VOLUME_EDGE_KIND_FRESHNESS_SOURCES: Dict[str, Tuple[str, ...]] = {
+    "uses_volume": (SOURCE_STORAGE_PODS,),
+    "bound_to": (SOURCE_STORAGE_PVCS,),
+}
+
+VOLUME_EDGE_DISCOVERED_BY_SOURCE: Dict[str, str] = {
+    "k8s_storage/pod_volumes": SOURCE_STORAGE_PODS,
+    "k8s_storage/pvc_spec": SOURCE_STORAGE_PVCS,
+}
+
 # Префикс псевдо-источника для legacy-рёбер: kind известен и неоднозначен, а
 # `discovered_by` пуст/незнаком — атрибутировать такое ребро к конкретному
 # синку нельзя. Судим группу по ней самой: если в ней есть свежие рёбра,
@@ -135,6 +164,11 @@ _SOURCE_FETCH_KEY: Dict[str, str] = {
     SOURCE_TOPOLOGY_INGRESSES: "ingresses_fetched",
     SOURCE_INGRESS_SYNC: "ingresses_fetched",
     SOURCE_NATS_SUBJECTS_SYNC: "files_scanned",
+    # Storage: единица наблюдения `uses_volume` — просканированный pod
+    # (cluster-wide лист pod'ов — самый тяжёлый fetch во всём KG), `bound_to`
+    # — полученный PVC.
+    SOURCE_STORAGE_PODS: "pods_scanned",
+    SOURCE_STORAGE_PVCS: "pvcs_fetched",
 }
 
 # Окно свежести по умолчанию. Должно быть больше максимального интервала
@@ -221,34 +255,70 @@ def get_source_report(source: str) -> Optional[SourceReport]:
     return _REPORTS.get(source)
 
 
-def resolve_edge_sources(
+def _resolve_sources(
     kind: Optional[str],
     discovered_by: Optional[str],
+    kind_map: Mapping[str, Tuple[str, ...]],
+    dby_map: Mapping[str, str],
+    dynamic_prefixes: Mapping[str, str],
 ) -> Tuple[str, ...]:
-    """Источник свежести ребра.
+    """Общее ядро атрибуции ребра к источнику (обе таблицы рёбер).
 
-    Возвращает ПУСТОЙ кортеж, если kind не сопоставлен ни одному источнику —
-    это fail-closed сигнал «децаить нельзя, никто не отвечает за свежесть».
+    `dynamic_prefixes` — синки, которые собирают `discovered_by` на лету
+    (`kg_sync/{source}`): всё, что не перехвачено явной картой, но начинается
+    с префикса, отдаём владельцу префикса.
     """
     dby = (discovered_by or "").strip()
-    exact = EDGE_DISCOVERED_BY_SOURCE.get(dby)
+    exact = dby_map.get(dby)
     if exact:
         return (exact,)
 
     kind_key = (kind or "").strip()
-    sources = EDGE_KIND_FRESHNESS_SOURCES.get(kind_key)
+    sources = kind_map.get(kind_key)
     if not sources:
         return ()
 
-    if dby.startswith("kg_sync/"):
-        # kg_sync собирает `discovered_by` динамически (`kg_sync/{source}`
-        # для uses_db). Всё, что не перехвачено явной картой выше, — его.
-        return (SOURCE_KG_SYNC,)
+    for prefix, owner in dynamic_prefixes.items():
+        if dby.startswith(prefix):
+            return (owner,)
     if len(sources) == 1:
         # kind однозначен — атрибутируем даже без discovered_by.
         return sources
     # kind неоднозначен и автор неизвестен → legacy-группа, судит сама себя.
     return (f"{LEGACY_SOURCE_PREFIX}{kind_key}",)
+
+
+# kg_sync собирает `discovered_by` динамически (`kg_sync/{source}` для
+# uses_db) — перечислить все значения в карте нельзя.
+_DYNAMIC_PREFIX_SOURCES: Dict[str, str] = {"kg_sync/": SOURCE_KG_SYNC}
+
+
+def resolve_edge_sources(
+    kind: Optional[str],
+    discovered_by: Optional[str],
+) -> Tuple[str, ...]:
+    """Источник свежести ребра `kg_service_edges`.
+
+    Возвращает ПУСТОЙ кортеж, если kind не сопоставлен ни одному источнику —
+    это fail-closed сигнал «децаить нельзя, никто не отвечает за свежесть».
+    """
+    return _resolve_sources(
+        kind, discovered_by,
+        EDGE_KIND_FRESHNESS_SOURCES, EDGE_DISCOVERED_BY_SOURCE,
+        _DYNAMIC_PREFIX_SOURCES,
+    )
+
+
+def resolve_volume_edge_sources(
+    kind: Optional[str],
+    discovered_by: Optional[str],
+) -> Tuple[str, ...]:
+    """Источник свежести ребра `kg_volume_edges`. Fail-closed так же."""
+    return _resolve_sources(
+        kind, discovered_by,
+        VOLUME_EDGE_KIND_FRESHNESS_SOURCES, VOLUME_EDGE_DISCOVERED_BY_SOURCE,
+        {},
+    )
 
 
 def _fresh_hours() -> int:
@@ -263,30 +333,42 @@ def _fresh_hours() -> int:
         return _EDGE_SOURCE_FRESH_HOURS_DEFAULT
 
 
-def source_inventory(db: Session) -> Dict[str, Dict[str, Any]]:
-    """Инвентарь графа по источникам: {source: {edges, last_seen}}.
+def _inventory(db: Session, model: Any, resolver: Any) -> Dict[str, Dict[str, Any]]:
+    """Инвентарь таблицы рёбер по источникам: {source: {edges, last_seen}}.
 
     Один GROUP BY по (kind, discovered_by) — дешевле, чем тянуть рёбра.
+    `model` — ServiceEdge либо VolumeEdge (обе имеют kind/discovered_by/
+    last_seen_at), `resolver` — соответствующая функция атрибуции.
     """
     rows = (
         db.query(
-            ServiceEdge.kind,
-            ServiceEdge.discovered_by,
-            func.count(ServiceEdge.id),
-            func.max(ServiceEdge.last_seen_at),
+            model.kind,
+            model.discovered_by,
+            func.count(model.id),
+            func.max(model.last_seen_at),
         )
-        .group_by(ServiceEdge.kind, ServiceEdge.discovered_by)
+        .group_by(model.kind, model.discovered_by)
         .all()
     )
     inv: Dict[str, Dict[str, Any]] = {}
     for kind, dby, cnt, max_seen in rows:
-        for source in resolve_edge_sources(kind, dby):
+        for source in resolver(kind, dby):
             slot = inv.setdefault(source, {"edges": 0, "last_seen": None})
             slot["edges"] += int(cnt or 0)
             prev = slot["last_seen"]
             if max_seen is not None and (prev is None or max_seen > prev):
                 slot["last_seen"] = max_seen
     return inv
+
+
+def source_inventory(db: Session) -> Dict[str, Dict[str, Any]]:
+    """Инвентарь `kg_service_edges` по источникам."""
+    return _inventory(db, ServiceEdge, resolve_edge_sources)
+
+
+def volume_source_inventory(db: Session) -> Dict[str, Dict[str, Any]]:
+    """Инвентарь `kg_volume_edges` по источникам."""
+    return _inventory(db, VolumeEdge, resolve_volume_edge_sources)
 
 
 def _grade_report(report: SourceReport) -> Optional[str]:
@@ -306,7 +388,7 @@ def unhealthy_sources(
     db: Session,
     now: Optional[datetime] = None,
 ) -> Dict[str, str]:
-    """Источники, которым в этом цикле нельзя доверить decay: {source: reason}.
+    """Источники `kg_service_edges`, которым нельзя доверить decay.
 
     Сигналы НЕЗАВИСИМЫ и складываются по «худшему»: источник здоров, только
     если чист и отчёт, и данные. Здоровый отчёт НЕ отменяет data-сигнал —
@@ -316,11 +398,31 @@ def unhealthy_sources(
     Рассматриваются только источники, у которых в графе ЕСТЬ рёбра — защищать
     нечего, если источник ничего не писал никогда.
     """
+    return _unhealthy(source_inventory(db), now)
+
+
+def unhealthy_volume_sources(
+    db: Session,
+    now: Optional[datetime] = None,
+) -> Dict[str, str]:
+    """То же для `kg_volume_edges`: {source: reason}.
+
+    Считается по инвентарю СВОЕЙ таблицы: сбой pod-среза не должен
+    блокировать decay `bound_to`, и наоборот.
+    """
+    return _unhealthy(volume_source_inventory(db), now)
+
+
+def _unhealthy(
+    inventory: Mapping[str, Dict[str, Any]],
+    now: Optional[datetime] = None,
+) -> Dict[str, str]:
+    """Общее ядро: инвентарь источников → {source: reason} для нездоровых."""
     now = now or datetime.utcnow()
     cutoff = now - timedelta(hours=_fresh_hours())
 
     bad: Dict[str, str] = {}
-    for source, slot in source_inventory(db).items():
+    for source, slot in inventory.items():
         if slot["edges"] <= 0:
             continue
         # Сигнал 1: свежий per-cycle отчёт синка — самый точный и
@@ -340,16 +442,11 @@ def unhealthy_sources(
     return bad
 
 
-def edge_block_reason(
-    kind: Optional[str],
-    discovered_by: Optional[str],
+def _block_reason(
+    sources: Tuple[str, ...],
     unhealthy: Mapping[str, str],
 ) -> Optional[str]:
-    """Причина, по которой ребро нельзя децаить сейчас (или None).
-
-    Fail-closed: kind без сопоставленного источника блокируется всегда.
-    """
-    sources = resolve_edge_sources(kind, discovered_by)
+    """Fail-closed: kind без сопоставленного источника блокируется всегда."""
     if not sources:
         return REASON_UNMAPPED_KIND
     for source in sources:
@@ -357,3 +454,23 @@ def edge_block_reason(
         if reason:
             return reason
     return None
+
+
+def edge_block_reason(
+    kind: Optional[str],
+    discovered_by: Optional[str],
+    unhealthy: Mapping[str, str],
+) -> Optional[str]:
+    """Причина, по которой ребро `kg_service_edges` нельзя децаить (или None)."""
+    return _block_reason(resolve_edge_sources(kind, discovered_by), unhealthy)
+
+
+def volume_edge_block_reason(
+    kind: Optional[str],
+    discovered_by: Optional[str],
+    unhealthy: Mapping[str, str],
+) -> Optional[str]:
+    """То же для ребра `kg_volume_edges`."""
+    return _block_reason(
+        resolve_volume_edge_sources(kind, discovered_by), unhealthy,
+    )

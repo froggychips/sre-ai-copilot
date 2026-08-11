@@ -723,7 +723,8 @@ async def test_send_daily_digest_skips_when_disabled():
 @pytest.mark.asyncio
 async def test_send_daily_digest_sends_when_enabled():
     fake_discord = MagicMock()
-    fake_discord.send_stats_report = AsyncMock()
+    # Контракт: send_stats_report → bool (True = фактически доставлено).
+    fake_discord.send_stats_report = AsyncMock(return_value=True)
     # Overhaul: send_daily_digest зовёт _build_digest_with_meta напрямую,
     # build_digest остался как thin wrapper. Мокаем внутренний помощник,
     # отключаем skip-if-noop чтобы тест был детерминистичен.

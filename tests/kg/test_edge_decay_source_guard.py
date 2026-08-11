@@ -28,12 +28,15 @@ from app.knowledge_graph.edge_decay_guard import (
     EDGE_KIND_FRESHNESS_SOURCES, REASON_EMPTY_FETCH, REASON_FETCH_ERRORS,
     REASON_NO_RECENT_REFRESH, REASON_SYNC_FAILED, REASON_UNMAPPED_KIND,
     SOURCE_INGRESS_SYNC, SOURCE_KG_SYNC, SOURCE_NATS_SUBJECTS_SYNC,
-    SOURCE_TOPOLOGY_INGRESSES, SOURCE_TOPOLOGY_SERVICES, edge_block_reason,
-    record_source_run, resolve_edge_sources, unhealthy_sources,
+    SOURCE_STORAGE_PODS, SOURCE_STORAGE_PVCS, SOURCE_TOPOLOGY_INGRESSES,
+    SOURCE_TOPOLOGY_SERVICES, VOLUME_EDGE_KIND_FRESHNESS_SOURCES,
+    edge_block_reason, record_source_run, resolve_edge_sources,
+    resolve_volume_edge_sources, unhealthy_sources, unhealthy_volume_sources,
+    volume_edge_block_reason,
 )
 from app.knowledge_graph.kg_sync import _decay_stale_edges
 from app.knowledge_graph.populator import upsert_edge, upsert_service
-from app.knowledge_graph.schema import ServiceEdge
+from app.knowledge_graph.schema import ServiceEdge, VolumeEdge
 
 KG_SYNC_LOGGER = "app.knowledge_graph.kg_sync"
 
@@ -346,3 +349,86 @@ def test_source_without_edges_is_not_reported_unhealthy(db):
 
     assert SOURCE_TOPOLOGY_SERVICES not in bad
     assert SOURCE_NATS_SUBJECTS_SYNC not in bad
+
+
+# ── тот же guard для kg_volume_edges (storage-слой) ──────────────────────────
+#
+# Decay volume-рёбер (`k8s_storage_sync.decay_volume_edges`) появился в третьей
+# волне ревью: до него удалённый PVC жил в графе вечно. Чистка обязана
+# опираться на здоровье СВОЕГО среза — pod-лист cluster-wide самый тяжёлый
+# fetch во всём KG, и именно он таймаутит первым.
+
+
+def test_every_live_volume_edge_kind_is_mapped_to_a_source():
+    """Карта покрывает все kind'ы, живущие в kg_volume_edges."""
+    from app.knowledge_graph.contract import EDGE_KINDS
+
+    live = {
+        name for name, spec in EDGE_KINDS.items()
+        if spec.get("table") == "kg_volume_edges" and spec.get("status") == "active"
+    }
+    assert live, "контракт не отдал ни одного live volume-kind — проверь фильтр"
+    assert live <= set(VOLUME_EDGE_KIND_FRESHNESS_SOURCES)
+
+
+@pytest.mark.parametrize(
+    "kind,discovered_by,expected",
+    [
+        ("uses_volume", "k8s_storage/pod_volumes", SOURCE_STORAGE_PODS),
+        ("bound_to", "k8s_storage/pvc_spec", SOURCE_STORAGE_PVCS),
+        # Оба kind'а однозначны — атрибутируются и без discovered_by.
+        ("uses_volume", None, SOURCE_STORAGE_PODS),
+        ("bound_to", None, SOURCE_STORAGE_PVCS),
+    ],
+)
+def test_resolve_volume_edge_sources_attribution(kind, discovered_by, expected):
+    assert resolve_volume_edge_sources(kind, discovered_by) == (expected,)
+
+
+def test_volume_and_service_edge_maps_do_not_leak_into_each_other(db):
+    """Таблицы рёбер судятся по СВОЕМУ инвентарю: kind одной не
+    атрибутируется картой другой (иначе сбой одного среза морозил бы decay
+    в чужой таблице)."""
+    assert resolve_edge_sources("uses_volume", None) == ()
+    assert resolve_volume_edge_sources("calls", "kg_sync/env_vars") == ()
+    # В графе только service-рёбра → storage-источники не в инвентаре.
+    _healthy_calls_baseline(db)
+    db.commit()
+    assert unhealthy_volume_sources(db) == {}
+
+
+def test_unmapped_volume_kind_is_fail_closed():
+    assert volume_edge_block_reason("brand_new_volume_kind", None, {}) == (
+        REASON_UNMAPPED_KIND
+    )
+
+
+def test_volume_source_health_is_per_slice(db):
+    """Сбой pod-среза не должен блокировать decay `bound_to` и наоборот."""
+    svc = upsert_service(db, "squad-1", "src")
+    db.flush()
+    now = datetime.utcnow()
+    db.add(VolumeEdge(
+        src_kind="service", src_id=svc.id, dst_kind="pvc", dst_id=1,
+        kind="uses_volume", discovered_by="k8s_storage/pod_volumes",
+        last_seen_at=now,
+    ))
+    db.add(VolumeEdge(
+        src_kind="pvc", src_id=1, dst_kind="pv", dst_id=2,
+        kind="bound_to", discovered_by="k8s_storage/pvc_spec",
+        last_seen_at=now,
+    ))
+    db.commit()
+
+    record_source_run(SOURCE_STORAGE_PODS, {"pods_scanned": 0, "errors": 1})
+    record_source_run(SOURCE_STORAGE_PVCS, {"pvcs_fetched": 42, "errors": 0})
+
+    bad = unhealthy_volume_sources(db)
+
+    assert bad == {SOURCE_STORAGE_PODS: REASON_FETCH_ERRORS}
+    assert volume_edge_block_reason(
+        "uses_volume", "k8s_storage/pod_volumes", bad,
+    ) == REASON_FETCH_ERRORS
+    assert volume_edge_block_reason(
+        "bound_to", "k8s_storage/pvc_spec", bad,
+    ) is None

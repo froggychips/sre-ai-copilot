@@ -28,6 +28,13 @@ storage-слоя.
   не настроен — все ответы = 0, отличить от «реально не использован» нельзя,
   поэтому Wave 1 default OFF.
 
+* **Убыль** (decay/cleanup) — см. `decay_volume_edges` и
+  `_cleanup_absent_volumes`: удалённый в кластере PVC обязан уйти и из графа,
+  иначе он вечно тянется в blast-radius. Обе чистки source-aware: если
+  соответствующий срез kubectl в этом цикле сбойнул, ничего не удаляем
+  (пустой/частичный fetch неотличим от «в кластере больше нет объектов» —
+  ровно тот класс инцидента, который описан в `edge_decay_guard`).
+
 Beat task `kg_storage_sync` каждые 30 минут — storage редко меняется
 (claim создаётся ~раз в неделю, capacity статична), но мы хотим ловить
 phase-переходы Bound→Released в течение получаса.
@@ -40,18 +47,37 @@ import json
 import logging
 import re
 import subprocess
-from datetime import datetime
-from typing import Any, Dict, List, Optional, Tuple, cast
+from datetime import datetime, timedelta
+from typing import Any, Dict, Iterable, Iterator, List, Optional, Sequence, Set, Tuple, cast
 
+from sqlalchemy import and_, or_
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.config import settings
+from app.knowledge_graph.edge_decay_guard import (
+    SOURCE_STORAGE_PODS, SOURCE_STORAGE_PVCS, record_source_run,
+    unhealthy_volume_sources, volume_edge_block_reason,
+)
 from app.knowledge_graph.schema import NODE_KIND_SERVICE, Service, StorageVolume, VolumeEdge
 
 logger = logging.getLogger(__name__)
 
-_KUBECTL_TIMEOUT_S = 30
+# Таймаут одного `kubectl get`. Было 30с — и это заведомо мало для
+# cluster-wide листов: в этом же репо задокументировано, что
+# `kubectl get deployments -A -o json` = 2318 объектов / ~42 МБ pretty-JSON и
+# внутри пода воркера в 30с НЕ укладывался (см. комментарий к
+# `k8s_topology_resources_sync._KUBECTL_TIMEOUT_S` — там из-за этого
+# services_fetched=0 каждый тик). Листы pods/replicasets заведомо больше
+# deployments, а расплата тут та же: uses_volume-рёбра не создаются и не
+# освежаются. Берём тот же порог 180с, что у топологии.
+_KUBECTL_TIMEOUT_S = 180
+
+# Пагинация листа: apiserver отдаёт по _KUBECTL_CHUNK объектов за запрос,
+# kubectl склеивает. Пиковая стоимость одного round-trip падает на порядок,
+# и большой лист не упирается в один таймаут целиком. Значение — как в
+# k8s_topology_resources_sync (там это уже проверено на этом кластере).
+_KUBECTL_CHUNK = 500
 
 # Edge kinds — источник истины `app.knowledge_graph.contract.EDGE_KINDS`.
 # Локальные алиасы — лишь сахар для read-сайта, чтобы при grep'е по
@@ -70,48 +96,111 @@ NODE_PV = "pv"
 DISCOVERED_BY_PODS = "k8s_storage/pod_volumes"
 DISCOVERED_BY_PVC_SPEC = "k8s_storage/pvc_spec"
 
+# Порог «ребро не подтверждено синком» для decay kg_volume_edges. Синк ходит
+# каждые 30 минут, так что 48ч = ~96 пропущенных подтверждений — столько
+# длится только реальная пропажа объекта, а не одиночный сбой. Значение
+# зеркалит KG_K8S_JOBS_STALE_HOURS (k8s_jobs_sync.cleanup_stale_jobs).
+_VOLUME_EDGE_STALE_HOURS_DEFAULT = 48
+
+# Cap на объём одной чистки (и рёбер, и узлов): массовая «пропажа» — симптом
+# сбоя, а не реальной убыли storage. Тот же порог, что у
+# kg_sync.EDGE_DECAY_MAX_DELETE_PCT.
+_VOLUME_MAX_DELETE_PCT = 25.0
+
+# Размер порции для `IN (...)`-удалений: не упираемся в лимит параметров
+# драйвера на больших чистках.
+_DELETE_CHUNK = 500
+
+# Причины пропуска чистки (уходят в stats и в логи).
+REASON_FETCH_FAILED = "fetch_failed"
+REASON_EMPTY_FETCH = "empty_fetch"
+REASON_DELETE_PCT = "delete_pct"
+
+
+class KubectlFetchError(RuntimeError):
+    """kubectl реально упал (rc!=0 / timeout / битый JSON) — в отличие от
+    валидного пустого листа.
+
+    Зеркалит `kg_sync.KubectlFetchError`. Раньше `_kubectl_get_all` на любой
+    сбой возвращал `[]`, и отказ был НЕОТЛИЧИМ от «в кластере нет объектов»:
+    в stats уходило `pods_scanned=0` без единой ошибки, uses_volume-рёбра не
+    создавались и не освежались, а выглядело это как «нет данных». Теперь
+    сбой сигналится исключением, вызывающий инкрементит `errors`, отдаёт это
+    в stats и в `record_source_run` — decay видит нездоровый источник и не
+    трогает его рёбра.
+    """
+
 
 # ── kubectl wrappers ────────────────────────────────────────────────────────
 
 
 def _kubectl_get_all(resource: str) -> List[Dict[str, Any]]:
-    """`kubectl get <resource> -A -o json` → items list (или [] при failure).
+    """`kubectl get <resource> -A -o json --chunk-size=N` → items list.
 
-    Не raise: failure не должна валить beat-loop. Логируем warning со
-    stderr-фрагментом и идём дальше — следующий tick подхватит.
+    Raises `KubectlFetchError` при РЕАЛЬНОМ сбое (timeout / rc!=0 / битый
+    JSON). Пустой список = в кластере действительно нет таких объектов.
+    Ловить исключение — дело вызывающего (см. `_fetch_items`): beat-loop
+    валить нельзя, но и молчать об отказе тоже.
     """
     try:
         out = subprocess.run(
-            ["kubectl", "get", resource, "-A", "-o", "json"],
+            ["kubectl", "get", resource, "-A", "-o", "json",
+             f"--chunk-size={_KUBECTL_CHUNK}"],
             capture_output=True, text=True, check=False,
             timeout=_KUBECTL_TIMEOUT_S,
         )
-    except subprocess.TimeoutExpired:
-        logger.warning("k8s_storage.kubectl_timeout resource=%s", resource)
-        return []
+    except subprocess.TimeoutExpired as e:
+        raise KubectlFetchError(
+            f"kubectl get {resource} timeout={_KUBECTL_TIMEOUT_S}s",
+        ) from e
     except Exception as e:
-        logger.warning(
-            "k8s_storage.kubectl_exception resource=%s err=%s", resource, e,
-        )
-        return []
+        raise KubectlFetchError(f"kubectl get {resource} failed: {e}") from e
 
     if out.returncode != 0:
-        logger.warning(
-            "k8s_storage.kubectl_failed resource=%s rc=%d stderr=%s",
-            resource, out.returncode, (out.stderr or "").strip()[:200],
+        raise KubectlFetchError(
+            f"kubectl get {resource} rc={out.returncode} "
+            f"stderr={(out.stderr or '').strip()[:200]}",
         )
-        return []
 
     try:
         data = json.loads(out.stdout or "{}")
     except json.JSONDecodeError as e:
-        logger.warning(
-            "k8s_storage.json_decode_failed resource=%s err=%s", resource, e,
-        )
-        return []
+        raise KubectlFetchError(
+            f"kubectl get {resource} invalid json: {e}",
+        ) from e
 
     items = data.get("items") or []
     return items if isinstance(items, list) else []
+
+
+def _fetch_items(
+    resource: str,
+    stats: Dict[str, Any],
+) -> Tuple[List[Dict[str, Any]], bool]:
+    """Фетч листа с УЧЁТОМ отказа: (items, fetch_ok).
+
+    При сбое — `errors += 1`, `fetch_failed = True` в переданном stats
+    (оттуда они попадают и в результат таска, и в `record_source_run`), и
+    возвращается ([], False). Вызывающий по `fetch_ok` решает, можно ли
+    что-то чистить по этому снимку.
+    """
+    try:
+        return _kubectl_get_all(resource), True
+    except KubectlFetchError as e:
+        stats["errors"] = int(stats.get("errors") or 0) + 1
+        stats["fetch_failed"] = True
+        logger.warning(
+            "k8s_storage.fetch_failed resource=%s err=%s — отказ учтён в "
+            "errors, чистка по этому снимку пропущена",
+            resource, e,
+        )
+        return [], False
+
+
+def _chunked(seq: Sequence[int], size: int = _DELETE_CHUNK) -> Iterator[Sequence[int]]:
+    """Порции для `IN (...)`: длинный список id в один запрос не влезает."""
+    for start in range(0, len(seq), size):
+        yield seq[start:start + size]
 
 
 # ── pure helpers ────────────────────────────────────────────────────────────
@@ -369,9 +458,9 @@ def _upsert_volume_edge(
 ) -> VolumeEdge:
     """Идемпотентный upsert по (src_kind, src_id, dst_kind, dst_id, kind).
 
-    last_seen_at обновляется на каждом вызове — даёт основу для будущего
-    decay-task'а (edges не подтверждённые N дней соответствуют удалённым
-    PVC/Pod'ам).
+    last_seen_at обновляется на каждом вызове — на нём и стоит decay
+    (`decay_volume_edges`): ребро, не подтверждённое N часов, соответствует
+    удалённому PVC/Pod'у.
     """
     edge = (
         db.query(VolumeEdge)
@@ -485,28 +574,280 @@ def _fetch_disk_pct_map_sync() -> Dict[Tuple[str, str], float]:
     return asyncio.run(_fetch_disk_pct_map())
 
 
+# ── decay / cleanup ─────────────────────────────────────────────────────────
+#
+# Убыль storage раньше не обрабатывалась ВООБЩЕ (чистка была помечена «в
+# будущем»): PVC удаляли из кластера, а узел и его `uses_volume`/`bound_to`
+# рёбра оставались в графе навсегда и продолжали попадать в blast-radius.
+# Здесь две чистки, обе по дисциплине edge_decay_guard / cleanup_stale_jobs:
+#
+#   1. `_cleanup_absent_volumes` — узлы: снимок cluster-wide листа у нас на
+#      руках, поэтому строку, которой в снимке нет, можно удалять сразу
+#      (плюс её рёбра — FK у tagged-id нет, каскада БД не будет).
+#   2. `decay_volume_edges` — рёбра по `last_seen_at`: ловит случай, когда сам
+#      PVC жив, а pod, который его монтировал, исчез.
+#
+# ОБЕ отказываются работать, если источник признан нездоровым: сбойный fetch
+# неотличим от опустевшего кластера, и удаление по нему = та самая «тихая
+# эрозия рёбер».
+
+
+def _volume_edge_stale_hours() -> int:
+    try:
+        return int(getattr(
+            settings, "KG_VOLUME_EDGE_STALE_HOURS",
+            _VOLUME_EDGE_STALE_HOURS_DEFAULT,
+        ))
+    except (TypeError, ValueError):
+        return _VOLUME_EDGE_STALE_HOURS_DEFAULT
+
+
+def _delete_edges_for_volume_ids(
+    db: Session, node_kind: str, ids: Sequence[int],
+) -> int:
+    """Удалить рёбра, висящие на удаляемых узлах (src ИЛИ dst).
+
+    FK у tagged-id (`src_kind` + `src_id`) нет — БД каскадом не подчистит,
+    иначе рёбра остались бы висеть на несуществующих узлах. `node_kind`
+    совпадает со `StorageVolume.kind` (значения 'pvc'/'pv' — это и есть
+    namespacing tagged-id, см. NODE_PVC / NODE_PV).
+    """
+    deleted = 0
+    for part in _chunked(list(ids)):
+        deleted += int(
+            db.query(VolumeEdge)
+            .filter(
+                or_(
+                    and_(VolumeEdge.src_kind == node_kind,
+                         VolumeEdge.src_id.in_(part)),
+                    and_(VolumeEdge.dst_kind == node_kind,
+                         VolumeEdge.dst_id.in_(part)),
+                ),
+            )
+            .delete(synchronize_session=False)
+            or 0
+        )
+    return deleted
+
+
+def _cleanup_absent_volumes(
+    db: Session,
+    *,
+    kind: str,
+    seen: Set[Tuple[str, str]],
+    fetch_ok: bool,
+) -> Dict[str, Any]:
+    """Удалить узлы `kg_storage_volumes` данного kind, которых нет в снимке.
+
+    `seen` — множество (namespace, name) из ТЕКУЩЕГО cluster-wide листа.
+    Пропускаем чистку, если:
+      * `fetch_ok=False` — kubectl сбойнул, снимок неполный;
+      * `seen` пусто — пустой fetch неотличим от пустого кластера
+        (дисциплина `k8s_jobs_sync.cleanup_stale_jobs`);
+      * удаление затронуло бы > `_VOLUME_MAX_DELETE_PCT`% узлов kind'а.
+    """
+    stats: Dict[str, Any] = {
+        "volumes_deleted": 0, "edges_deleted": 0, "skipped": "",
+    }
+    if not fetch_ok:
+        stats["skipped"] = REASON_FETCH_FAILED
+        logger.warning(
+            "k8s_storage.volume_cleanup_skipped kind=%s reason=%s — снимок "
+            "неполный, узлы не чистим",
+            kind, REASON_FETCH_FAILED,
+        )
+        return stats
+    if not seen:
+        stats["skipped"] = REASON_EMPTY_FETCH
+        logger.warning(
+            "k8s_storage.volume_cleanup_skipped kind=%s reason=%s — 0 объектов "
+            "в листе (сбой неотличим от пустого кластера)",
+            kind, REASON_EMPTY_FETCH,
+        )
+        return stats
+
+    rows = (
+        db.query(StorageVolume.id, StorageVolume.namespace, StorageVolume.name)
+        .filter(StorageVolume.kind == kind)
+        .all()
+    )
+    if not rows:
+        return stats
+    absent = [
+        int(row_id) for row_id, ns, name in rows
+        if ((ns or ""), (name or "")) not in seen
+    ]
+    if not absent:
+        return stats
+
+    delete_pct = 100.0 * len(absent) / len(rows)
+    if delete_pct > _VOLUME_MAX_DELETE_PCT:
+        stats["skipped"] = REASON_DELETE_PCT
+        logger.warning(
+            "k8s_storage.volume_cleanup_skipped kind=%s reason=%s "
+            "would_delete=%d of %d (%.1f%% > %.1f%%) — массовая пропажа это "
+            "симптом сбоя, не убыли storage",
+            kind, REASON_DELETE_PCT, len(absent), len(rows),
+            delete_pct, _VOLUME_MAX_DELETE_PCT,
+        )
+        return stats
+
+    stats["edges_deleted"] = _delete_edges_for_volume_ids(db, kind, absent)
+    deleted = 0
+    for part in _chunked(absent):
+        deleted += int(
+            db.query(StorageVolume)
+            .filter(StorageVolume.id.in_(part))
+            .delete(synchronize_session=False)
+            or 0
+        )
+    stats["volumes_deleted"] = deleted
+    logger.info(
+        "k8s_storage.volume_cleanup kind=%s deleted=%d edges_deleted=%d of %d",
+        kind, deleted, stats["edges_deleted"], len(rows),
+    )
+    return stats
+
+
+def _stale_edge_clause(cutoff: datetime) -> Any:
+    """«Ребро не подтверждено с cutoff». last_seen_at NULL у legacy-строк
+    (колонка nullable) — для них судим по created_at."""
+    return or_(
+        and_(VolumeEdge.last_seen_at.isnot(None),
+             VolumeEdge.last_seen_at < cutoff),
+        and_(VolumeEdge.last_seen_at.is_(None),
+             VolumeEdge.created_at < cutoff),
+    )
+
+
+def decay_volume_edges(
+    db: Session,
+    now: Optional[datetime] = None,
+) -> Dict[str, Any]:
+    """Decay `kg_volume_edges` по last_seen_at. Возвращает stats.
+
+    Source-aware, ровно как decay `kg_service_edges`: рёбра kind'а, чей срез
+    kubectl в этом цикле упал / отдал подозрительный ноль / давно не освежал
+    ни одного своего ребра, из чистки ИСКЛЮЧАЮТСЯ (см.
+    `edge_decay_guard.unhealthy_volume_sources`). Fail-closed: kind, не
+    сопоставленный источнику, не децаится вовсе. Любой пропуск логируется
+    warning'ом — молчаливая эрозия и была исходной бедой.
+
+    Плюс cap `_VOLUME_MAX_DELETE_PCT`: массовое удаление отменяет весь проход.
+    """
+    now = now or datetime.utcnow()
+    cutoff = now - timedelta(hours=_volume_edge_stale_hours())
+    stats: Dict[str, Any] = {
+        "deleted": 0, "skipped_decay": 0, "reason": "",
+        "stale_sources": [], "blocked_by_source": 0, "blocked_kinds": {},
+    }
+
+    unhealthy = unhealthy_volume_sources(db, now)
+    stats["stale_sources"] = sorted(unhealthy)
+
+    total = int(db.query(VolumeEdge).count() or 0)
+    candidates = (
+        db.query(VolumeEdge).filter(_stale_edge_clause(cutoff)).all()
+        if total else []
+    )
+
+    blocked: Dict[str, Dict[str, int]] = {}
+    eligible: List[int] = []
+    for edge in candidates:
+        reason = volume_edge_block_reason(
+            cast(Optional[str], edge.kind),
+            cast(Optional[str], edge.discovered_by),
+            unhealthy,
+        )
+        if reason:
+            by_kind = blocked.setdefault(reason, {})
+            kind_name = cast(Optional[str], edge.kind) or "unknown"
+            by_kind[kind_name] = by_kind.get(kind_name, 0) + 1
+            stats["blocked_by_source"] += 1
+        else:
+            eligible.append(cast(int, edge.id))
+
+    stats["blocked_kinds"] = {r: dict(k) for r, k in blocked.items()}
+    for why, by_kind in sorted(blocked.items()):
+        logger.warning(
+            "k8s_storage.volume_decay_blocked reason=%s kinds=%s "
+            "blocked_edges=%d — срез, отвечающий за свежесть этих рёбер, в "
+            "этом цикле не отработал; decay для них пропущен",
+            why, sorted(by_kind), sum(by_kind.values()),
+        )
+
+    if not eligible:
+        return stats
+
+    delete_pct = 100.0 * len(eligible) / total if total else 0.0
+    if delete_pct > _VOLUME_MAX_DELETE_PCT:
+        stats["skipped_decay"] = 1
+        stats["reason"] = REASON_DELETE_PCT
+        logger.warning(
+            "k8s_storage.volume_decay_skipped reason=%s total=%d "
+            "would_delete=%d (%.1f%% > %.1f%%)",
+            REASON_DELETE_PCT, total, len(eligible),
+            delete_pct, _VOLUME_MAX_DELETE_PCT,
+        )
+        return stats
+
+    # Условие возраста ПОВТОРЯЕТСЯ в WHERE самого DELETE: конкурентный синк
+    # мог освежить ребро между SELECT и DELETE (то же, что в
+    # kg_sync._decay_stale_edges).
+    deleted = 0
+    for part in _chunked(eligible):
+        deleted += int(
+            db.query(VolumeEdge)
+            .filter(VolumeEdge.id.in_(part), _stale_edge_clause(cutoff))
+            .delete(synchronize_session=False)
+            or 0
+        )
+    stats["deleted"] = deleted
+    logger.info(
+        "k8s_storage.volume_decay deleted=%d of total=%d stale_after=%dh "
+        "blocked=%d",
+        deleted, total, _volume_edge_stale_hours(), stats["blocked_by_source"],
+    )
+    return stats
+
+
 # ── main syncs ──────────────────────────────────────────────────────────────
 
 
-def sync_pvs(db: Session) -> Dict[str, int]:
-    """Загрузить все PVs cluster-wide и upsert как kg_storage_volumes(kind='pv')."""
-    pvs = _kubectl_get_all("persistentvolumes")
-    stats = {
-        "pvs_fetched": len(pvs),
+def sync_pvs(db: Session) -> Dict[str, Any]:
+    """Загрузить все PVs cluster-wide и upsert как kg_storage_volumes(kind='pv').
+
+    Сбой fetch'а виден в stats (`errors` / `fetch_failed`), а не маскируется
+    под «0 объектов»: по неполному снимку чистка узлов не делается.
+    """
+    stats: Dict[str, Any] = {
+        "pvs_fetched": 0,
         "pvs_upserted": 0,
         "pvs_skipped": 0,
+        "errors": 0,
+        "fetch_failed": False,
     }
+    pvs, fetch_ok = _fetch_items("persistentvolumes", stats)
+    stats["pvs_fetched"] = len(pvs)
+    seen: Set[Tuple[str, str]] = set()
     for pv in pvs:
         fields = _extract_pv_fields(pv)
         if not fields["name"]:
             stats["pvs_skipped"] += 1
             continue
         _upsert_volume(db, fields)
+        seen.add((fields["namespace"], fields["name"]))
         stats["pvs_upserted"] += 1
+    cleanup = _cleanup_absent_volumes(
+        db, kind=NODE_PV, seen=seen, fetch_ok=fetch_ok,
+    )
+    stats["cleanup"] = cleanup
     db.commit()
     logger.info(
-        "k8s_storage.pvs_done fetched=%d upserted=%d skipped=%d",
+        "k8s_storage.pvs_done fetched=%d upserted=%d skipped=%d errors=%d "
+        "cleaned=%d",
         stats["pvs_fetched"], stats["pvs_upserted"], stats["pvs_skipped"],
+        stats["errors"], cleanup["volumes_deleted"],
     )
     return stats
 
@@ -514,7 +855,7 @@ def sync_pvs(db: Session) -> Dict[str, int]:
 def sync_pvcs(
     db: Session,
     disk_pct_map: Optional[Dict[Tuple[str, str], float]] = None,
-) -> Dict[str, int]:
+) -> Dict[str, Any]:
     """Загрузить все PVCs cluster-wide.
 
     Делает upsert kg_storage_volumes(kind='pvc') + edge `bound_to`
@@ -524,17 +865,24 @@ def sync_pvcs(
 
     `disk_pct_map` (ns, pvc_name) → % из VM, опционально. None == все
     PVC получат disk_pct=None (или сохранят прошлое значение).
+
+    Отчитывается в `edge_decay_guard` как источник свежести `bound_to`: если
+    этот срез сбойнул, decay не тронет его рёбра.
     """
-    pvcs = _kubectl_get_all("persistentvolumeclaims")
     disk_pct_map = disk_pct_map or {}
-    stats = {
-        "pvcs_fetched": len(pvcs),
+    stats: Dict[str, Any] = {
+        "pvcs_fetched": 0,
         "pvcs_upserted": 0,
         "pvcs_skipped": 0,
         "edges_bound_to": 0,
         "skipped_unknown_pv": 0,
         "disk_pct_attached": 0,
+        "errors": 0,
+        "fetch_failed": False,
     }
+    pvcs, fetch_ok = _fetch_items("persistentvolumeclaims", stats)
+    stats["pvcs_fetched"] = len(pvcs)
+    seen: Set[Tuple[str, str]] = set()
     for pvc in pvcs:
         fields = _extract_pvc_fields(pvc)
         if not fields["name"]:
@@ -544,6 +892,7 @@ def sync_pvcs(
         if disk_pct is not None:
             stats["disk_pct_attached"] += 1
         pvc_node = _upsert_volume(db, fields, disk_pct=disk_pct)
+        seen.add((fields["namespace"], fields["name"]))
         stats["pvcs_upserted"] += 1
 
         # bound_to PV
@@ -566,18 +915,27 @@ def sync_pvcs(
                 extras={"phase": fields.get("phase")},
             )
             stats["edges_bound_to"] += 1
+    cleanup = _cleanup_absent_volumes(
+        db, kind=NODE_PVC, seen=seen, fetch_ok=fetch_ok,
+    )
+    stats["cleanup"] = cleanup
     db.commit()
     logger.info(
         "k8s_storage.pvcs_done fetched=%d upserted=%d edges_bound=%d "
-        "unknown_pv=%d disk_pct=%d",
+        "unknown_pv=%d disk_pct=%d errors=%d cleaned=%d cleaned_edges=%d",
         stats["pvcs_fetched"], stats["pvcs_upserted"],
         stats["edges_bound_to"], stats["skipped_unknown_pv"],
-        stats["disk_pct_attached"],
+        stats["disk_pct_attached"], stats["errors"],
+        cleanup["volumes_deleted"], cleanup["edges_deleted"],
     )
+    # Отчёт для decay-guard: этот срез отвечает за свежесть `bound_to`.
+    # Ровно тут и ломался бы прод при таймауте листа: pvcs_fetched=0 без
+    # errors выглядел бы как «PVC в кластере не осталось».
+    record_source_run(SOURCE_STORAGE_PVCS, stats)
     return stats
 
 
-def sync_pod_pvc_edges(db: Session) -> Dict[str, int]:
+def sync_pod_pvc_edges(db: Session) -> Dict[str, Any]:
     """Scan all pods → создать `uses_volume` edges (Service → PVC).
 
     Алгоритм:
@@ -591,20 +949,30 @@ def sync_pod_pvc_edges(db: Session) -> Dict[str, int]:
          `skipped_unknown_pvc`, не raise.
 
     Edges идемпотентны через _upsert_volume_edge (UNIQUE).
-    """
-    pods = _kubectl_get_all("pods")
-    replicasets = _kubectl_get_all("replicasets")
-    rs_index = _build_rs_to_deployment_index(replicasets)
 
-    stats = {
-        "pods_scanned": len(pods),
+    Это САМЫЙ тяжёлый fetch модуля (лист pod'ов cluster-wide). Отказ любого
+    из двух срезов уходит в `errors`/`fetch_failed` и в отчёт
+    `SOURCE_STORAGE_PODS`: раньше таймаут давал `pods_scanned=0` БЕЗ ошибок,
+    и отказ был неотличим от «в кластере нет pod'ов с PVC».
+    """
+    stats: Dict[str, Any] = {
+        "pods_scanned": 0,
         "pods_with_pvcs": 0,
         "claim_refs_seen": 0,
         "edges_uses_volume": 0,
         "skipped_no_owner": 0,
         "skipped_no_service": 0,
         "skipped_unknown_pvc": 0,
+        "errors": 0,
+        "fetch_failed": False,
     }
+    pods, _pods_ok = _fetch_items("pods", stats)
+    # Сбой среза RS не обнуляет проход, но деградирует атрибуцию
+    # (Pod → RS → Deployment не резолвится, рёбра уходят в
+    # skipped_no_service) — поэтому это тоже errors, а не тишина.
+    replicasets, _rs_ok = _fetch_items("replicasets", stats)
+    rs_index = _build_rs_to_deployment_index(replicasets)
+    stats["pods_scanned"] = len(pods)
 
     for pod in pods:
         claims = _pod_pvc_claims(pod)
@@ -651,21 +1019,29 @@ def sync_pod_pvc_edges(db: Session) -> Dict[str, int]:
     db.commit()
     logger.info(
         "k8s_storage.pod_edges_done pods=%d with_pvcs=%d edges=%d "
-        "no_owner=%d no_service=%d unknown_pvc=%d",
+        "no_owner=%d no_service=%d unknown_pvc=%d errors=%d",
         stats["pods_scanned"], stats["pods_with_pvcs"],
         stats["edges_uses_volume"], stats["skipped_no_owner"],
         stats["skipped_no_service"], stats["skipped_unknown_pvc"],
+        stats["errors"],
     )
+    # Отчёт для decay-guard: этот срез отвечает за свежесть `uses_volume`.
+    record_source_run(SOURCE_STORAGE_PODS, stats)
     return stats
 
 
 def sync_storage(db: Session) -> Dict[str, Any]:
-    """Main entry: PV → PVC → pod edges → disk_pct enrichment.
+    """Main entry: PV → PVC → pod edges → decay → disk_pct enrichment.
 
     Порядок важен:
       1. PV сначала — чтобы PVC.bound_to мог разрешить FK по volume_name;
       2. PVC — disk_pct прикрепляется здесь;
-      3. Pod edges последними — нужны PVC-nodes в KG для (ns, name) lookup.
+      3. Pod edges последними — нужны PVC-nodes в KG для (ns, name) lookup;
+      4. decay рёбер — ПОСЛЕ всех срезов: он опирается на их
+         `record_source_run`-отчёты, чтобы не чистить рёбра сбойного среза.
+
+    `errors` верхнего уровня — сумма по срезам: по нему видно отказ fetch'а,
+    даже если в графе «просто ничего не поменялось».
     """
     disk_pct_map: Dict[Tuple[str, str], float] = {}
     try:
@@ -677,13 +1053,36 @@ def sync_storage(db: Session) -> Dict[str, Any]:
     pvc_stats = sync_pvcs(db, disk_pct_map=disk_pct_map)
     edge_stats = sync_pod_pvc_edges(db)
 
-    return {
+    # Decay в своей транзакции: его сбой не должен обнулять уже
+    # закоммиченные срезы (зеркалит Pass 3 в kg_sync.sync_topology).
+    decay_error = 0
+    try:
+        decay_stats: Dict[str, Any] = decay_volume_edges(db)
+        db.commit()
+    except Exception as e:
+        logger.warning("k8s_storage.volume_decay_failed err=%s", e)
+        db.rollback()
+        decay_error = 1
+        decay_stats = {"error": str(e)}
+
+    slices: Iterable[Dict[str, Any]] = (pv_stats, pvc_stats, edge_stats)
+    errors = sum(int(s.get("errors") or 0) for s in slices) + decay_error
+    result = {
         "pvs": pv_stats,
         "pvcs": pvc_stats,
         "pod_edges": edge_stats,
+        "edge_decay": decay_stats,
+        "errors": errors,
         "disk_pct_enabled": bool(settings.STORAGE_METRICS_ENABLED),
         "disk_pct_series": len(disk_pct_map),
     }
+    if errors:
+        logger.warning(
+            "k8s_storage.done_with_errors errors=%d — часть срезов kubectl не "
+            "получена, чистка/decay по ним пропущены (см. выше)",
+            errors,
+        )
+    return result
 
 
 if __name__ == "__main__":

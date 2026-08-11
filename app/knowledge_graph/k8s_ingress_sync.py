@@ -40,24 +40,77 @@ from app.knowledge_graph.schema import NODE_KIND_SERVICE, Service
 log = logging.getLogger(__name__)
 
 
-def _kubectl_get_ingresses_all() -> List[Dict[str, Any]]:
-    """kubectl get ingresses -A -o json → list."""
-    out = subprocess.run(
-        ["kubectl", "get", "ingresses", "-A", "-o", "json"],
-        capture_output=True, text=True, check=False, timeout=30,
-    )
+_KUBECTL_TIMEOUT_S = 30
+
+
+class IngressFetchError(RuntimeError):
+    """kubectl реально упал (timeout / rc!=0 / битый JSON) — в отличие от
+    валидного «в кластере нет ingress-ов».
+
+    Аналог `kg_sync.KubectlFetchError`. Нужен, чтобы вызывающий отличал сбой
+    fetch-а от пустого кластера: по пустому тику edge-decay guard не должен
+    легализовать удаление ingress-овых `calls` (их last_seen_at освежает
+    ТОЛЬКО этот синк).
+    """
+
+
+def _kubectl_get_ingresses_all(*, strict: bool = False) -> List[Dict[str, Any]]:
+    """kubectl get ingresses -A -o json → list.
+
+    Раньше `subprocess.run` шёл здесь БЕЗ try/except (единственный такой
+    kubectl-хелпер в синках): `TimeoutExpired` при тупящем apiserver-е
+    вылетал наружу и убивал тик целиком — и `sync_all_ingresses` (не доходя
+    до `record_source_run`, т.е. без отчёта edge-decay guard'у), и
+    `ingress_observations_sync`, который импортирует этот же хелпер. Все
+    соседи (`k8s_jobs_sync`, `k8s_topology_resources_sync`) в этом месте
+    деградируют, а не падают.
+
+    strict=True → сбой сигналится `IngressFetchError` (вызывающий считает
+    его в `errors`). strict=False (default) → `[]` как раньше: контракт для
+    `ingress_observations_sync`, который ждёт список и сам логирует
+    `no_ingresses`.
+    """
+    try:
+        out = subprocess.run(
+            ["kubectl", "get", "ingresses", "-A", "-o", "json"],
+            capture_output=True, text=True, check=False,
+            timeout=_KUBECTL_TIMEOUT_S,
+        )
+    except subprocess.TimeoutExpired as e:
+        log.warning(
+            "ingress_sync.kubectl_timeout timeout=%ds", _KUBECTL_TIMEOUT_S,
+        )
+        if strict:
+            raise IngressFetchError(
+                f"kubectl get ingresses: timeout {_KUBECTL_TIMEOUT_S}s"
+            ) from e
+        return []
+    except OSError as e:
+        # kubectl нет в PATH / fork не удался — тот же класс деградации.
+        log.warning("ingress_sync.kubectl_exception err=%s", e)
+        if strict:
+            raise IngressFetchError(f"kubectl get ingresses: {e}") from e
+        return []
+
     if out.returncode != 0:
         log.warning(
             "ingress_sync.kubectl_failed rc=%d stderr=%s",
-            out.returncode, out.stderr.strip()[:200],
+            out.returncode, (out.stderr or "").strip()[:200],
         )
+        if strict:
+            raise IngressFetchError(
+                f"kubectl get ingresses rc={out.returncode}"
+            )
         return []
     try:
         data = json.loads(out.stdout)
     except json.JSONDecodeError as e:
         log.warning("ingress_sync.json_decode_failed %s", e)
+        if strict:
+            raise IngressFetchError(f"kubectl get ingresses: bad json: {e}") from e
         return []
-    return data.get("items") or []
+    items = data.get("items") or []
+    return items if isinstance(items, list) else []
 
 
 def _extract_routes(ing: Dict[str, Any]) -> List[Dict[str, str]]:
@@ -164,16 +217,30 @@ def sync_all_ingresses(db: Session) -> Dict[str, int]:
     Возвращает stats:
       ingresses_fetched / routes_seen / nodes_created / edges_created
       / skipped_no_backend_match (backend service не существует в KG yet)
-      / errors (routes, откатившиеся per-item savepoint-ом)
+      / errors (routes, откатившиеся per-item savepoint-ом, + сбой fetch-а:
+        kubectl-timeout считается ошибкой, а не «в кластере 0 ingress-ов»)
     """
-    ingresses = _kubectl_get_ingresses_all()
+    # Fetch-сбой не роняет тик: считаем его в errors и идём до
+    # record_source_run — иначе трейсбек уносил и отчёт guard'у (тик терялся
+    # целиком), и тот бы судил свежесть ingress-рёбер по фоллбэку.
+    try:
+        ingresses = _kubectl_get_ingresses_all(strict=True)
+        fetch_errors = 0
+    except IngressFetchError as e:
+        ingresses = []
+        fetch_errors = 1
+        log.warning(
+            "ingress_sync.fetch_failed err=%s — тик деградирует, "
+            "рёбра не освежаем", e,
+        )
+
     stats = {
         "ingresses_fetched": len(ingresses),
         "routes_seen": 0,
         "nodes_created": 0,
         "edges_created": 0,
         "skipped_no_backend_match": 0,
-        "errors": 0,
+        "errors": fetch_errors,
     }
 
     for ing in ingresses:

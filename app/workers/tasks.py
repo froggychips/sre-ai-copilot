@@ -468,12 +468,17 @@ async def async_process_incident(
     with incident_span(incident_id, service=_service, namespace=_namespace) as _root_span:
         db = SessionLocal()
         audit_service.log_event("CELERY_START", {"incident_id": incident_id})
-        record = (
-            db.query(IncidentRecord)
-            .filter(IncidentRecord.incident_id == incident_id)
-            .first()
-        )
+        # record объявляем до try: except-ветка на него смотрит и не должна
+        # падать на NameError, если упал сам query.
+        record = None
         try:
+            # Query — внутри try: OperationalError на нём раньше улетал МИМО
+            # finally и оставлял сессию (коннект из пула) незакрытой.
+            record = (
+                db.query(IncidentRecord)
+                .filter(IncidentRecord.incident_id == incident_id)
+                .first()
+            )
             pipeline = IncidentPipeline(incident_data, db, record, _root_span)
             await pipeline.run()
         except Exception as e:

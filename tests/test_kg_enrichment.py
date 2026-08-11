@@ -1106,13 +1106,48 @@ def _mk_clean_db():
 
 
 def test_health_penalty_high_5xx_rate():
-    """5xx rate 3% (>1% trigger) — penalty в районе 0.10 (capped 0.25)."""
+    """5xx = 0.20 rps (> триггера 0.05 rps) — penalty 0.15 (capped 0.25).
+
+    Единицы — ЗАПРОСОВ/СЕК, не доля: http_5xx_rate приходит из
+    `sum(rate(http_requests_total{status=~"5.."}))` (metrics_sync), знаменателя
+    (общего rps) в kg_service_health нет. Порог приведён к rps (было 0.01 с комментарием
+    «1%» — на любом ненулевом error-трафике штраф упирался бы в cap).
+    """
     from unittest.mock import patch
     from app.knowledge_graph.health_score import compute_health_for_service
     from app.knowledge_graph.schema import Service
     svc = Service(id=1, namespace="ns", name="svc")
     db = _mk_clean_db()
-    # p95 None (нет drift), 5xx = 0.03 (3%), 12 точек (>= 6 min)
+    # p95 None (нет drift), 5xx = 0.20 rps, 12 точек (>= 6 min)
+    with patch(
+        "app.knowledge_graph.health_score._recent_p95_and_5xx",
+        return_value=(None, 0.20, 12),
+    ), patch(
+        "app.knowledge_graph.health_score._baseline_p95",
+        return_value=None,
+    ), patch(
+        "app.knowledge_graph.health_score._latest_signal_aggregate",
+        return_value=None,
+    ):
+        score, signals = compute_health_for_service(db, svc)
+    # penalty = (0.20 - 0.05) * 1.0 = 0.15
+    assert abs(score - 0.85) < 0.01
+    assert signals["http_5xx_rate"] == 0.20
+
+
+def test_health_no_penalty_for_trickle_5xx_rate():
+    """0.03 rps 5xx (≈2 ошибки в минуту) — шум, штрафа быть не должно.
+
+    Регрессия единиц: со старым порогом 0.01 «= 1%» это давало penalty
+    0.10, а 0.06 rps уже упирались в cap — health_score обнулялся бы у
+    любого сервиса с ненулевым error-трафиком, как только WO-12483 откроет
+    скрейп.
+    """
+    from unittest.mock import patch
+    from app.knowledge_graph.health_score import compute_health_for_service
+    from app.knowledge_graph.schema import Service
+    svc = Service(id=1, namespace="ns", name="svc")
+    db = _mk_clean_db()
     with patch(
         "app.knowledge_graph.health_score._recent_p95_and_5xx",
         return_value=(None, 0.03, 12),
@@ -1124,8 +1159,7 @@ def test_health_penalty_high_5xx_rate():
         return_value=None,
     ):
         score, signals = compute_health_for_service(db, svc)
-    # penalty = (0.03 - 0.01) * 5.0 = 0.10
-    assert abs(score - 0.90) < 0.01
+    assert score == 1.0
     assert signals["http_5xx_rate"] == 0.03
 
 

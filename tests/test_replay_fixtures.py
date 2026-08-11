@@ -30,6 +30,13 @@ pipeline на каждый новый prompt change без LLM-burn ($0 за п�
   1. tests/fixtures/incidents/<name>.json — следуй существующей форме
      (_fixture_id, _description обязательны для self-doc).
   2. Добавь имя в `FIXTURE_NAMES`. parametrize-collection подхватит.
+
+## Валидатор снапшотов (app/snapshot/validator.py)
+
+Второй блок в конце файла — контракт `validate_snapshot`: снапшот и есть
+единственный вход в replay (`POST /replay/{incident_id}` → Celery), поэтому
+проверяется, что подменённый материал ловится, а часы источника не роняют
+каждый снапшот в DEGRADED.
 """
 import json
 from pathlib import Path
@@ -40,6 +47,13 @@ import pytest
 from app.agents.models.hypothesis import Hypothesis, HypothesisSet
 from app.core.state_machine import IncidentState
 from app.diagnostics.facts import Fact, FactKind, FactStore
+from app.snapshot.schema import (
+    build_snapshot_from_incident,
+    compute_log_window_hash,
+    compute_metric_snapshot_hash,
+    compute_topology_hash,
+)
+from app.snapshot.validator import validate_snapshot, validate_snapshot_model
 
 _FIXTURE_DIR = Path(__file__).parent / "fixtures" / "incidents"
 
@@ -121,6 +135,13 @@ def mocked_pipeline_deps(mocker):
     mocker.patch(
         "app.workers.pipeline.discord_service.send_report",
         new_callable=AsyncMock,
+    )
+    # Доставка отчёта отдаёт delivered — мокаем, иначе живой POST в
+    # example.com (conftest) даёт False и pipeline уходит в outbox-ретрай.
+    mocker.patch(
+        "app.workers.pipeline.discord_service.send_incident_report",
+        new_callable=AsyncMock,
+        return_value=True,
     )
     mocker.patch("app.workers.pipeline.audit_service.log_event")
 
@@ -237,3 +258,162 @@ async def test_fixtures_are_well_formed_and_unique():
         iid = data["incident_id"]
         assert iid not in seen_ids, f"incident_id {iid} дублируется"
         seen_ids.add(iid)
+
+
+# ── Валидатор снапшотов: хэши материала ──────────────────────────────────
+
+_PAYLOAD = {
+    "targets": [{"id": "inc-1", "kind": "deployment", "name": "town-service"}],
+    "policy_name": "wo-default",
+    "metrics": {"cpu": 0.9},
+    "logs": ["OOMKilled"],
+}
+
+
+def _valid_snapshot(payload: dict | None = None, **overrides) -> dict:
+    """Согласованный снапшот: все три хэша посчитаны по payload-у."""
+    payload = _PAYLOAD if payload is None else payload
+    snap = {
+        "snapshot_id": "snap-inc-1-1",
+        "incident_id": "inc-1",
+        "source_event_ids": ["inc-1"],
+        "timestamps": {
+            "captured_at": "2026-08-10T10:00:05+00:00",
+            "incident_ts": "2026-08-10T10:00:00+00:00",
+        },
+        "topology_hash": compute_topology_hash(payload),
+        "metric_snapshot_hash": compute_metric_snapshot_hash(payload),
+        "log_window_hash": compute_log_window_hash(payload),
+        "ingest_time_source": "collector-node-clock",
+        "correlation_index": [{"event_id": "inc-1", "related_to": ["inc-1"]}],
+        "payload": payload,
+    }
+    snap.update(overrides)
+    return snap
+
+
+def test_intact_snapshot_passes_validation():
+    out = validate_snapshot(_valid_snapshot())
+    assert out["status"] == "PASS", out
+    assert out["confidence_replay_safe"] == "HIGH"
+    assert out["warnings"] == []
+
+
+def test_tampered_topology_targets_are_caught():
+    """Подменённые targets в payload → topology_hash не сходится.
+
+    Раньше topology_hash был единственным хэшем, который НЕ пересчитывался:
+    материал (targets + policy_name) лежит в payload-е, но проверялись только
+    metric/log — рассинхрон топологии уезжал в replay со статусом PASS.
+    """
+    snap = _valid_snapshot()
+    snap["payload"] = {
+        **_PAYLOAD,
+        "targets": [{"id": "inc-1", "kind": "deployment", "name": "ЧУЖОЙ-service"}],
+    }
+    out = validate_snapshot(snap)
+    assert out["status"] == "FAIL"
+    assert out["confidence_replay_safe"] == "LOW"
+    assert "topology_hash mismatch" in out["reasons"]
+    # Остальные хэши по-прежнему сходятся — ошибка ровно одна, адресная.
+    assert out["reasons"] == ["topology_hash mismatch"]
+
+
+def test_tampered_policy_name_is_caught():
+    """policy_name — часть того же материала: подмена политики тоже ловится."""
+    snap = _valid_snapshot()
+    snap["payload"] = {**_PAYLOAD, "policy_name": "wo-permissive"}
+    out = validate_snapshot(snap)
+    assert out["status"] == "FAIL"
+    assert "topology_hash mismatch" in out["reasons"]
+
+
+def test_metric_and_log_hash_mismatch_still_caught():
+    """Регрессия: перевод трёх хэшей на общие формулы из schema.py не ослабил
+    прежние проверки metric/log."""
+    snap = _valid_snapshot()
+    snap["payload"] = {**_PAYLOAD, "metrics": {"cpu": 0.1}, "logs": []}
+    out = validate_snapshot(snap)
+    assert out["status"] == "FAIL"
+    assert "metric_snapshot_hash mismatch" in out["reasons"]
+    assert "log_window_hash mismatch" in out["reasons"]
+
+
+def test_snapshot_built_from_fixture_validates_pass():
+    """Сквозной контракт: то, что собирает build_snapshot_from_incident,
+    валидатор считает согласованным (иначе каждый replay = 422)."""
+    incident_data = _load_fixture("crashloop")
+    snapshot = build_snapshot_from_incident(
+        incident_id=str(incident_data["incident_id"]),
+        incident_data=incident_data,
+        model_version="test-model",
+        runtime_version="worker-test",
+    )
+    out = validate_snapshot_model(snapshot)
+    assert out["status"] == "PASS", out
+
+
+def test_built_snapshot_with_drifted_payload_fails():
+    """Тот же снапшот, но payload разъехался после подсчёта хэшей → FAIL."""
+    incident_data = _load_fixture("crashloop")
+    snapshot = build_snapshot_from_incident(
+        incident_id=str(incident_data["incident_id"]),
+        incident_data=incident_data,
+        model_version="test-model",
+        runtime_version="worker-test",
+    )
+    snapshot.payload = {**snapshot.payload, "targets": [{"id": "smuggled"}]}
+    out = validate_snapshot_model(snapshot)
+    assert out["status"] == "FAIL"
+    assert "topology_hash mismatch" in out["reasons"]
+
+
+# ── Валидатор снапшотов: допуск на рассинхрон часов ──────────────────────
+
+
+def _snapshot_with_skew(seconds: float) -> dict:
+    """Снапшот, где incident_ts опережает captured_at на `seconds`."""
+    from datetime import datetime, timedelta, timezone
+
+    captured = datetime(2026, 8, 10, 10, 0, 0, tzinfo=timezone.utc)
+    incident = captured + timedelta(seconds=seconds)
+    return _valid_snapshot(
+        timestamps={
+            "captured_at": captured.isoformat(),
+            "incident_ts": incident.isoformat(),
+        },
+    )
+
+
+def test_two_second_clock_skew_does_not_degrade():
+    """2 секунды NTP-дрейфа AlertManager-а — не сигнал.
+
+    Без допуска строгое `incident_ts > captured_at` отправляло КАЖДЫЙ такой
+    снапшот в DEGRADED/MEDIUM, а api/replay.py включал low_fidelity_mode.
+    """
+    out = validate_snapshot(_snapshot_with_skew(2))
+    assert out["status"] == "PASS", out
+    assert out["confidence_replay_safe"] == "HIGH"
+    assert out["warnings"] == []
+
+
+def test_clock_skew_at_tolerance_boundary_passes():
+    """Ровно на границе допуска (5с) — ещё не warning."""
+    out = validate_snapshot(_snapshot_with_skew(5))
+    assert out["status"] == "PASS", out
+
+
+def test_minute_in_the_future_still_warns():
+    """Минута «в будущем» — уже не дрейф часов: DEGRADED сохраняется."""
+    out = validate_snapshot(_snapshot_with_skew(60))
+    assert out["status"] == "DEGRADED"
+    assert out["confidence_replay_safe"] == "MEDIUM"
+    assert len(out["warnings"]) == 1
+    assert "incident_ts is after captured_at" in out["warnings"][0]
+
+
+def test_normal_order_of_timestamps_never_warns():
+    """incident_ts раньше captured_at — семантически нормальный порядок."""
+    out = validate_snapshot(_snapshot_with_skew(-600))
+    assert out["status"] == "PASS"
+    assert out["warnings"] == []

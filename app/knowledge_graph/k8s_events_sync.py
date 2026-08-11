@@ -26,10 +26,16 @@ from typing import Any, Dict, List, Optional
 from sqlalchemy.orm import Session
 
 from app.config import settings
+from app.knowledge_graph.nats_subjects_sync import NATS_SUBJECTS_NAMESPACE
 from app.knowledge_graph.populator import record_pod_event
 from app.knowledge_graph.schema import NODE_KIND_SERVICE, Service
 
 logger = logging.getLogger(__name__)
+
+# Namespace, которых в k8s не существует по определению — они чисто
+# KG-конструкция (`nats-subjects` держит subject-узлы из nats_subjects_sync).
+# kubectl на них всегда даёт NotFound.
+_SYNTHETIC_NAMESPACES = frozenset({NATS_SUBJECTS_NAMESPACE})
 
 # Diagnostic reasons мы хотим иметь в KG. Информационный шум (Pulled, Created,
 # Scheduled, Started, Killing) — пропускаем: в эмбеддах копилоту они бесполезны.
@@ -390,6 +396,33 @@ def sync_namespace_events(
     return stats
 
 
+def _scannable_kg_namespaces(db: Session) -> List[str]:
+    """Namespace из `kg_services`, которые имеет смысл спрашивать у kubectl.
+
+    Отсекаем те, которых в кластере нет:
+      * синтетические (`_SYNTHETIC_NAMESPACES`) — `nats-subjects` живёт только
+        в KG;
+      * мёртвые — ns, где не осталось ни одного живого (`synthetic=False`)
+        узла. Именно так выглядит namespace после `drift_cleanup`: он
+        помечает `synthetic=True` всем сервисам ns, исчезнувшего из кластера.
+
+    Раньше перебирались ВСЕ distinct namespace: на каждый мёртвый/синтетический
+    уходило до двух kubectl-вызовов (events + pods) и warning каждые 10 минут
+    (beat-интервал events-синка). Живые ns не страдают: `ingress:<host>` и
+    прочие synthetic-узлы стоят рядом с реальными сервисами, так что ns
+    остаётся в выборке.
+    """
+    rows = (
+        db.query(Service.namespace)
+        .filter(Service.synthetic.is_(False))
+        .distinct()
+        .all()
+    )
+    return sorted(
+        {ns for (ns,) in rows if ns and ns not in _SYNTHETIC_NAMESPACES}
+    )
+
+
 def sync_all_events(
     db: Session,
     namespaces: Optional[List[str]] = None,
@@ -397,16 +430,14 @@ def sync_all_events(
     """Sync events во всех ns из KG (или явно переданных).
 
     `KG_SCAN_NAMESPACES` env — comma-separated whitelist. Пусто → берём
-    из `kg_services.namespace` (distinct).
+    живые ns из `kg_services.namespace` (см. `_scannable_kg_namespaces`).
     """
     if namespaces is None:
         configured = (settings.KG_SCAN_NAMESPACES or "").strip()
         if configured:
             namespaces = [s.strip() for s in configured.split(",") if s.strip()]
         else:
-            namespaces = sorted(
-                {ns for (ns,) in db.query(Service.namespace).distinct().all()}
-            )
+            namespaces = _scannable_kg_namespaces(db)
 
     total = {"namespaces": 0, "fetched": 0, "added": 0, "skipped": 0, "errors": 0}
     for ns in namespaces:

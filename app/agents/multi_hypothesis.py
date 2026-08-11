@@ -24,6 +24,7 @@ from app.agents.base import BaseAgent
 from app.agents.models.hypothesis import Hypothesis, HypothesisSet
 from app.diagnostics.facts import FactKind, FactStore
 from app.observability.ai_metrics import track_generated, track_grounded
+from app.services.llm_service import LLMTruncatedResponse
 from app.services.telemetry_utils import trace_agent
 
 logger = structlog.get_logger()
@@ -122,6 +123,10 @@ class PerspectiveAgent(BaseAgent):
             name=f"Hypothesis-{perspective}",
             role=PERSPECTIVES[perspective],
             task_type="hypothesis",
+            # Ответ — строго JSON {"hypotheses":[...]}; обрезка по max_tokens
+            # = битый JSON → ask поднимает LLMTruncatedResponse, а не огрызок,
+            # который _parse_hypotheses молча превратил бы в [] гипотез.
+            json_response=True,
         )
         self.perspective = perspective
 
@@ -226,6 +231,26 @@ class MultiHypothesisAgent:
             agent.generate(incident_summary, facts) for agent in active_agents
         ]
         results: List[Any] = await asyncio.gather(*tasks, return_exceptions=True)
+
+        # Обрезка по max_tokens — НЕ flaky-провайдер, а систематика: у всех
+        # perspective один MAX_TOKENS и одна форма промпта, поэтому «пережить
+        # обрезку» здесь означало бы молча сузить пространство гипотез (в
+        # пределе — вернуть 0 гипотез с видом честного «нечего предложить»).
+        # Фейлим всю стадию: stage_hypothesize упадёт с LLMTruncatedResponse
+        # (не в RETRIABLE_EXC → tasks.py пишет post-mortem + FAILED, без
+        # ретрая того же промпта с тем же лимитом). Остальные исключения
+        # по-прежнему толерируются per-perspective — там повтор/деградация
+        # осмысленны.
+        truncated = [
+            (agent, res) for agent, res in zip(active_agents, results)
+            if isinstance(res, LLMTruncatedResponse)
+        ]
+        if truncated:
+            logger.error(
+                "multi_hypothesis.truncated_response",
+                perspectives=[a.perspective for a, _ in truncated],
+            )
+            raise truncated[0][1]
 
         merged: List[Hypothesis] = []
         for agent, res in zip(active_agents, results):

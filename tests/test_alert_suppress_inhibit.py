@@ -71,6 +71,81 @@ def test_am_alert_labels_fallback_for_silenced_by():
     assert "sil-12345abc" in a.status_extra["silencedBy"]
 
 
+# ── A1.1b: валидатор не мутирует входной payload ──────────────────────────
+
+
+def test_object_status_validation_does_not_mutate_input_payload():
+    """`mode="before"`-валидатор не правит dict вызывающего.
+
+    Сюда прилетает ровно тот объект, что держит вызывающий — распарсенное тело
+    AM-вебхука. Раньше валидатор перезаписывал `data["status"]` на месте:
+    сохранённый «сырой» алерт врал про то, что реально пришло от AM, а
+    повторная валидация того же dict-а уже не видела объект-status.
+    """
+    original_status = {
+        "state": "suppressed",
+        "silencedBy": ["sil-abcd1234"],
+        "inhibitedBy": [],
+    }
+    payload = {
+        "status": original_status,
+        "labels": {"alertname": "X"},
+        "startsAt": "2026-05-15T12:00:00Z",
+        "fingerprint": "fp-1",
+    }
+    snapshot = {"status": dict(original_status), "labels": {"alertname": "X"},
+                "startsAt": "2026-05-15T12:00:00Z", "fingerprint": "fp-1"}
+
+    alert = AlertManagerAlert.model_validate(payload)
+
+    assert alert.status == "firing"
+    assert alert.status_extra == original_status
+    assert payload == snapshot, "валидатор изменил входной dict"
+    assert payload["status"] is original_status
+    assert "status_extra" not in payload
+
+    # Повторная валидация того же payload даёт тот же результат.
+    again = AlertManagerAlert.model_validate(payload)
+    assert (again.status, again.status_extra) == (alert.status, alert.status_extra)
+
+
+def test_labels_fallback_does_not_mutate_input_payload():
+    """labels-fallback тоже не дописывает `status_extra` в чужой dict."""
+    payload = {
+        "status": "firing",
+        "labels": {"alertname": "X", "inhibited_by": "inh-1"},
+        "startsAt": "2026-05-15T12:00:00Z",
+        "fingerprint": "fp-2",
+    }
+    snapshot = {"status": "firing",
+                "labels": {"alertname": "X", "inhibited_by": "inh-1"},
+                "startsAt": "2026-05-15T12:00:00Z", "fingerprint": "fp-2"}
+
+    alert = AlertManagerAlert.model_validate(payload)
+
+    assert alert.status_extra is not None
+    assert alert.status_extra["inhibitedBy"] == ["inh-1"]
+    assert payload == snapshot, "валидатор изменил входной dict"
+
+
+def test_plain_string_status_returns_payload_untouched():
+    """Обычный firing-алерт без suppress-признаков — payload не копируется зря."""
+    payload = {
+        "status": "firing",
+        "labels": {"alertname": "X"},
+        "startsAt": "2026-05-15T12:00:00Z",
+        "fingerprint": "fp-3",
+    }
+    alert = AlertManagerAlert.model_validate(payload)
+    assert alert.status_extra is None
+    assert payload == {
+        "status": "firing",
+        "labels": {"alertname": "X"},
+        "startsAt": "2026-05-15T12:00:00Z",
+        "fingerprint": "fp-3",
+    }
+
+
 # ── A1.2: _inhibition_state ───────────────────────────────────────────────
 
 

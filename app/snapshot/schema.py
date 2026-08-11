@@ -29,6 +29,35 @@ def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+# ── Хэши материала снапшота ───────────────────────────────────────────────
+# Формулы живут ЗДЕСЬ и переиспользуются валидатором
+# (`app/snapshot/validator.py`). Если считать хэш при создании одним кодом, а
+# перепроверять другим — расчёты разъезжаются, и «рассинхрон снапшота» либо не
+# ловится вообще, либо ловится ложно на каждом снапшоте. Материал берётся из
+# payload-а снапшота (он же incident_data при создании), поэтому обе стороны
+# видят одни и те же данные.
+
+
+def compute_topology_hash(payload: Dict[str, Any]) -> str:
+    """Хэш топологии инцидента: targets + policy_name."""
+    material = str(payload.get("targets", [])) + str(payload.get("policy_name", ""))
+    return sha256(material.encode("utf-8")).hexdigest()
+
+
+def compute_metric_snapshot_hash(payload: Dict[str, Any]) -> str:
+    """Хэш метрик снапшота (canonical JSON, sort_keys)."""
+    return sha256(
+        json.dumps(payload.get("metrics", {}), sort_keys=True).encode("utf-8")
+    ).hexdigest()
+
+
+def compute_log_window_hash(payload: Dict[str, Any]) -> str:
+    """Хэш лог-окна снапшота (canonical JSON, sort_keys)."""
+    return sha256(
+        json.dumps(payload.get("logs", []), sort_keys=True).encode("utf-8")
+    ).hexdigest()
+
+
 def build_snapshot_from_incident(
     incident_id: str,
     incident_data: Dict[str, Any],
@@ -37,16 +66,9 @@ def build_snapshot_from_incident(
     policy_decisions: Optional[Dict[str, Any]] = None,
 ) -> IncidentSnapshotV1:
     event_id = str(incident_data.get("incident_id", incident_id))
-    topology_material = str(incident_data.get("targets", [])) + str(
-        incident_data.get("policy_name", "")
-    )
-    topology_hash = sha256(topology_material.encode("utf-8")).hexdigest()
-    metric_snapshot_hash = sha256(
-        json.dumps(incident_data.get("metrics", {}), sort_keys=True).encode("utf-8")
-    ).hexdigest()
-    log_window_hash = sha256(
-        json.dumps(incident_data.get("logs", []), sort_keys=True).encode("utf-8")
-    ).hexdigest()
+    topology_hash = compute_topology_hash(incident_data)
+    metric_snapshot_hash = compute_metric_snapshot_hash(incident_data)
+    log_window_hash = compute_log_window_hash(incident_data)
     related = [
         str(t.get("id"))
         for t in incident_data.get("targets", [])

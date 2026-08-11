@@ -19,6 +19,8 @@ import json
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Tuple, cast
 
+from sqlalchemy import cast as sa_cast
+from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.orm import Session
 
@@ -30,6 +32,7 @@ from app.knowledge_graph.populator import upsert_edge
 from app.knowledge_graph.schema import NODE_KIND_SERVICE, Deployment, Service, ServiceEdge
 from app.knowledge_graph.stale_classifier import (
     classify_stale_with_deploys,
+    is_ns_broadcast_deploy,
 )
 
 logger = logging.getLogger(__name__)
@@ -976,34 +979,57 @@ def sync_namespace(
 def _refresh_stale_class_for_namespace(db: Session, namespace: str) -> int:
     """Пересчитать ``kg_services.stale_class`` для всех сервисов в namespace.
 
-    Используем max(``kg_deployments.started_at``) per service как «последний
-    deploy». Сервисы без deploy → ``last_deploy_at = None``.
+    Доказательства деплоя РАЗДЕЛЕНЫ на два max(``started_at``):
+
+    * ``last_service_deploy_at`` — записи БЕЗ маркера ns-broadcast, т.е.
+      «катился именно этот сервис»;
+    * ``last_ns_deploy_at`` — записи с ``extras.namespace_scope=True``,
+      которые ``tc_deploys_to_kg`` рассылает на ВСЕ сервисы namespace.
+
+    Раньше здесь считался один слитый max, и ns-broadcast делал каждый сервис
+    активно деплоящегося namespace вечно ``active`` — классификатор отвечал на
+    вопрос «был ли деплой в ns», а не «катился ли этот сервис», из-за чего
+    ``suspicious_stale`` физически не мог сработать там, где он и нужен.
+    Разделение позволяет ``classify_stale_with_deploys`` выдавать ``active``
+    только по собственному деплою сервиса (см. его докстринг).
 
     Возвращает количество обновлённых строк.
     """
-    from sqlalchemy import func
-
     services = db.query(Service).filter(Service.namespace == namespace).all()
     if not services:
         return 0
 
     svc_ids = [s.id for s in services]
-    rows = (
-        db.query(Deployment.service_id, func.max(Deployment.started_at))
+    # extras — JSON-колонка, и маркер приходится разбирать в Python: предикат
+    # по JSON различается между PG и sqlite (тесты гоняются на sqlite), а
+    # выборка ограничена сервисами одного namespace, так что это дёшево.
+    deploy_rows = (
+        db.query(Deployment.service_id, Deployment.started_at, Deployment.extras)
         .filter(Deployment.service_id.in_(svc_ids))
-        .group_by(Deployment.service_id)
         .all()
     )
-    last_deploy_by_svc: Dict[int, datetime] = {sid: ts for sid, ts in rows}
+    last_service_deploy: Dict[int, datetime] = {}
+    last_ns_deploy: Dict[int, datetime] = {}
+    for sid, started_at, extras in deploy_rows:
+        if started_at is None:
+            continue
+        bucket = last_ns_deploy if is_ns_broadcast_deploy(extras) else last_service_deploy
+        known = bucket.get(sid)
+        if known is None or started_at > known:
+            bucket[sid] = started_at
 
     updated = 0
     for svc in services:
         svc_id_int: int = cast(int, svc.id)
-        last = last_deploy_by_svc.get(svc_id_int)
         new_class = classify_stale_with_deploys(
             name=cast(str, svc.name),
             namespace=cast(str, svc.namespace),
-            last_deploy_at=last,
+            # Слитый вход больше не передаём: доказательства разделены ниже,
+            # и классификатор при разделённой атрибуции сырому max'у не верит
+            # (см. attribution_known в classify_stale_with_deploys).
+            last_deploy_at=None,
+            last_service_deploy_at=last_service_deploy.get(svc_id_int),
+            last_ns_deploy_at=last_ns_deploy.get(svc_id_int),
             team_owner=cast(Optional[str], svc.team_owner),
         )
         if svc.stale_class != new_class:
@@ -1243,12 +1269,31 @@ def _decay_stale_edges(
 
     # 1) DELETE старых (>= delete_after_days) с живым источником. Делаем
     #    первым чтобы не помечать как inactive то, что сейчас удалим.
+    #    Условие по last_seen_at ПОВТОРЯЕТСЯ в WHERE самого DELETE: между
+    #    SELECT кандидатов и этим DELETE конкурентный синк (beat-таски
+    #    раскиданы по forked-процессам) мог освежить ребро — удалять его
+    #    нельзя. Иначе живое ребро исчезает и возвращается следующим тиком:
+    #    лишний churn плюс завышенный decay-счётчик, по которому потом
+    #    судят о здоровье графа. Считаем удалённое по rowcount, а не по
+    #    длине списка кандидатов — иначе счётчик врёт ровно на эту гонку.
     if eligible_delete:
-        ids = [e.id for e in eligible_delete]
-        db.query(ServiceEdge).filter(ServiceEdge.id.in_(ids)).delete(
-            synchronize_session=False,
+        ids = [cast(int, e.id) for e in eligible_delete]
+        stats["deleted"] = int(
+            db.query(ServiceEdge)
+            .filter(
+                ServiceEdge.id.in_(ids),
+                ServiceEdge.last_seen_at < delete_cutoff,
+            )
+            .delete(synchronize_session=False)
+            or 0
         )
-    stats["deleted"] = len(eligible_delete)
+        if stats["deleted"] != len(ids):
+            logger.info(
+                "kg_sync.edge_decay_delete_race candidates=%d deleted=%d — "
+                "часть кандидатов освежена конкурентным синком между SELECT и "
+                "DELETE, они оставлены живыми",
+                len(ids), stats["deleted"],
+            )
 
     # 2) Soft-mark inactive (между inactive_after_days и delete_after_days).
     #    Берём edges без `inactive=true` в extras чтобы не перетирать
@@ -1288,17 +1333,43 @@ def _decay_stale_edges(
     return stats
 
 
+def _extras_inactive_filter(db: Session) -> Any:
+    """SQL-условие «в extras висит inactive=true», диалект-зависимое.
+
+    На PostgreSQL — JSONB-containment `extras @> '{"inactive": true}'`
+    (колонка объявлена как json, поэтому нужен cast; оператор `@>` есть
+    только у jsonb). На остальных диалектах (SQLite в тестах) —
+    `json_extract(extras, '$.inactive')`. Тот же приём диалект-зависимой
+    ветки, что в `populator._is_postgresql`.
+
+    Точная проверка всё равно повторяется в Python (`ex.get("inactive") is
+    True`) — SQL здесь нужен только чтобы не тянуть в ORM рёбра, которые
+    гарантированно не при делах.
+    """
+    if db.get_bind().dialect.name == "postgresql":
+        return sa_cast(ServiceEdge.extras, JSONB).contains({"inactive": True})
+    return ServiceEdge.extras["inactive"].as_boolean().is_(True)
+
+
 def _revive_active_edges(db: Session) -> int:
     """Снимает флаг inactive с edges, у которых last_seen_at стал свежим.
 
     Основной sync-проход (upsert_edge) обновляет last_seen_at = now(),
     но не трогает extras['inactive']. Делаем это здесь: если edge свежее
     inactive-cutoff, но в extras висит inactive=true — снимаем флаг.
+
+    Отбор ДВУМЯ условиями сразу, оба в SQL: раньше грузились ВСЕ свежие
+    рёбра (то есть почти весь граф — десятки тысяч ORM-объектов каждый час)
+    ради проверки одного ключа в extras, при том что помеченных `inactive`
+    в норме единицы.
     """
     cutoff = datetime.utcnow() - timedelta(days=EDGE_DECAY_INACTIVE_AFTER_DAYS)
     edges = (
         db.query(ServiceEdge)
-        .filter(ServiceEdge.last_seen_at >= cutoff)
+        .filter(
+            ServiceEdge.last_seen_at >= cutoff,
+            _extras_inactive_filter(db),
+        )
         .all()
     )
     revived = 0
@@ -1319,12 +1390,17 @@ def sync_topology(
     db: Session,
     namespaces: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
-    """Синхронизировать топологию всех namespace'ов. Коммит — снаружи.
+    """Синхронизировать топологию всех namespace'ов. Коммитит сам, per-ns.
+
+    Порядок «весь kubectl-I/O → потом SQL» и короткие per-namespace
+    транзакции — следствие инцидента 08.08.2026 (см. app/database.py и
+    k8s_topology_resources_sync как образец): раньше Pass 1 был одной
+    многоминутной транзакцией на ~80 kubectl-вызовов.
 
     Два прохода:
       Pass 1: per ns — services (+ synthetic flag) + NATS edges + legacy
               URL-based calls-edges (только http(s)://-values).
-      Pass 2: после commit — расширенный env-scan (`*_HOST`/`*_DSN`/etc),
+      Pass 2: после Pass 1 — расширенный env-scan (`*_HOST`/`*_DSN`/etc),
               match только с already-existing services. Это даёт значительно
               больше calls-edges и не создаёт фейк-нодов для external hosts.
 
@@ -1354,17 +1430,31 @@ def sync_topology(
     }
     deploys_cache: Dict[str, List[Dict[str, Any]]] = {}
 
-    # ── Pass 1: services + NATS edges + legacy calls ───────────────────
+    # ── Fetch-фаза: ВЕСЬ kubectl-I/O до первого SQL ────────────────────
+    # Инцидент 08.08.2026: Pass 1 был одной многоминутной транзакцией —
+    # первый ns открывал её, дальше ~80 kubectl-вызовов (таймаут 15с
+    # каждый) шли с открытой транзакцией, и row-locks жили до
+    # единственного commit после цикла. idle_in_transaction_session_timeout
+    # (app/database.py) такую транзакцию НЕ обрывает — между kubectl'ями
+    # сессия успевала выполнить SQL и выглядела «живой». Поэтому внешний
+    # I/O выносим ДО транзакции целиком, как в k8s_topology_resources_sync
+    # (тест test_topology_sync_reads_k8s_before_touching_db).
+    # fetch-ошибка (KubectlFetchError) → errors++, ns НЕ кэшируется для
+    # Pass 1/2 и не считается success-with-0.
     for ns in namespaces:
         try:
-            # fetch-ошибка (KubectlFetchError) прилетает сюда → errors++, ns
-            # НЕ кэшируется для Pass 2 и не считается success-with-0.
-            deploys = _kubectl_get_deployments(ns)
-            deploys_cache[ns] = deploys
+            deploys_cache[ns] = _kubectl_get_deployments(ns)
+        except Exception as e:
+            logger.warning("kg_sync.ns_failed_pass1 ns=%s: %s", ns, e)
+            total["errors"] += 1
+
+    # ── Pass 1: services + NATS edges + legacy calls ───────────────────
+    for ns, deploys in deploys_cache.items():
+        try:
             # SAVEPOINT на namespace: flush-ошибка внутри sync_namespace
             # (IntegrityError/DataError) откатывает только этот ns, не весь
             # проход. Без изоляции Session уходит в aborted-состояние и все
-            # последующие ns + терминальный db.commit() падают с
+            # последующие ns + per-ns db.commit() падают с
             # PendingRollbackError, теряя весь pass. Зеркалит per-item
             # SAVEPOINT из k8s_events_sync.sync_namespace_events.
             with db.begin_nested():
@@ -1378,7 +1468,14 @@ def sync_topology(
         except Exception as e:
             logger.warning("kg_sync.ns_failed_pass1 ns=%s: %s", ns, e)
             total["errors"] += 1
-    db.commit()
+        # Коммит после КАЖДОГО ns, а не один на весь проход: транзакция
+        # живёт ровно SQL-работу одного namespace, локи отпускаются, DDL и
+        # соседние писатели не ждут конца всего синка (инцидент 08.08.2026).
+        # Атомарность прохода не нужна: sync идемпотентен, повторный прогон
+        # дописывает недописанное — образец k8s_topology_resources_sync
+        # (_COMMIT_BATCH). После упавшего ns commit тоже безопасен:
+        # savepoint уже откатил его работу, pending-изменений нет.
+        db.commit()
 
     # ── Pass 2: extended env-scan ──────────────────────────────────────
     known_index = _build_known_index(db)
@@ -1388,7 +1485,7 @@ def sync_topology(
             # (например, конкурентный phantom_db_cleanup удалил db:%-узел,
             # к которому мы цепляем ребро) оставляла Session в aborted-
             # состоянии: последующие ns падали с PendingRollbackError,
-            # терминальный db.commit() убивал task, и Pass 3 (revive/decay)
+            # per-ns db.commit() убивал task, и Pass 3 (revive/decay)
             # не запускался вовсе.
             with db.begin_nested():
                 extra = _enrich_calls_edges_for_ns(db, ns, deploys, known_index)
@@ -1399,7 +1496,10 @@ def sync_topology(
         except Exception as e:
             logger.warning("kg_sync.ns_failed_pass2 ns=%s: %s", ns, e)
             total["errors"] += 1
-    db.commit()
+        # Per-ns commit — те же соображения, что в Pass 1 (инцидент
+        # 08.08.2026): kubectl тут уже не зовём (deploys_cache), но тысячи
+        # upsert'ов под одним commit — это минуты удержания row-locks.
+        db.commit()
 
     # ── Pass 3: edge decay — soft-mark inactive (>7д) + DELETE (>30д) ──
     # Сначала revive: снимаем `inactive` с edges, чьи last_seen_at

@@ -405,6 +405,141 @@ def test_kv_rule_does_not_eat_max_tokens():
 
 
 # ---------------------------------------------------------------------------
+# «Голые» вендорные токены (без key= и без Authorization-заголовка)
+#
+# Регрессия: прогон по реальным строкам показал, что такой токен не ловился
+# НИЧЕМ — kv-правилу нужен `key=`, bearer/basic нужен заголовок, long-hex не
+# видит base64url-алфавит. Токен уезжал в pod-логах в LLM-контекст и в Discord.
+# Литералы собираются из частей, чтобы фикстуры не триггерили secret-scanning.
+# ---------------------------------------------------------------------------
+
+def test_redact_bare_anthropic_key():
+    key = "sk-ant-" + "api03-AbCdEf1234567890_-XyZaBcDeF"
+    out = redact_pii(f"llm call failed with {key} at retry 2")
+    assert "<anthropic-key>" in out
+    assert key not in out
+    assert "sk-ant-" not in out
+    assert "retry 2" in out
+
+
+def test_redact_bare_slack_tokens_all_prefixes():
+    for prefix in ("xoxb", "xoxa", "xoxp", "xoxr", "xoxs"):
+        token = f"{prefix}-" + "1234567890-9876543210-AbCdEfGhIjKlMnOp"
+        out = redact_pii(f"slack post rejected: {token}")
+        assert "<slack-token>" in out, prefix
+        assert token not in out
+
+
+def test_redact_bare_github_classic_pat():
+    token = "ghp" + "_" + "A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8"
+    out = redact_pii(f"git push failed, token {token} expired")
+    assert "<github-token>" in out
+    assert token not in out
+
+
+def test_redact_bare_github_fine_grained_pat():
+    token = "github" + "_pat_" + "11ABCDEFG0abcdefghij_" + "K" * 40
+    out = redact_pii(f"gh api 401 for {token}")
+    assert "<github-token>" in out
+    assert token not in out
+
+
+def test_redact_bare_google_api_key():
+    key = "AIza" + "SyA" + "b" * 32
+    out = redact_pii(f"maps request key={key} denied")
+    # kv-правило (`key=`) тоже сработало бы; главное — ключа в выводе нет.
+    assert key not in out
+    assert "<google-api-key>" in out or "<redacted>" in out
+
+
+def test_redact_bare_google_api_key_without_kv_prefix():
+    key = "AIza" + "SyD" + "z" * 32
+    out = redact_pii(f"quota exceeded for {key} in project foo")
+    assert "<google-api-key>" in out
+    assert key not in out
+    assert "project foo" in out
+
+
+def test_redact_bare_stripe_live_and_restricted_keys():
+    for prefix in ("sk_live_", "sk_test_", "rk_live_"):
+        token = prefix + "51AbCdEfGhIjKlMnOpQrSt"
+        out = redact_pii(f"charge failed with {token}")
+        assert "<stripe-key>" in out, prefix
+        assert token not in out
+
+
+def test_vendor_tokens_are_idempotent():
+    raw = (
+        "sk-ant-" + "api03-AbCdEf1234567890 "
+        "xoxb-" + "1234567890-abcdefghijkl "
+        "ghp" + "_" + "A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8"
+    )
+    once = redact_pii(raw)
+    assert once == redact_pii(once)
+    assert "<anthropic-key>" in once
+    assert "<slack-token>" in once
+    assert "<github-token>" in once
+
+
+# ---- анти-FP: обычные строки, похожие на префиксы, не режем ---------------
+
+def test_vendor_patterns_do_not_eat_plain_words():
+    text = (
+        "risk-antenna calibration ok; ghost_pipeline restarted; "
+        "AIzawa-san reviewed; task_live_migration done; sk_liver enzyme"
+    )
+    out = redact_pii(text)
+    assert out == text
+
+
+def test_vendor_patterns_do_not_eat_short_lookalikes():
+    # Короткие хвосты (< порога) — это не токены: имена контейнеров, метки.
+    text = "images ghp_v2 and sk-ant-1 and xoxb-1 remain readable"
+    out = redact_pii(text)
+    assert out == text
+
+
+def test_vendor_patterns_do_not_eat_k8s_names_and_shas():
+    text = (
+        "pod town-service-7d9f4-abcde restarted; image "
+        "docker.lastoasisgame.com/wo/town-service:1.42.0-rc3 pulled; "
+        "commit a1b2c3d4e5f"
+    )
+    out = redact_pii(text)
+    assert out == text
+
+
+def test_google_pattern_requires_full_length():
+    # AIza + 20 символов — не ключ (полный = AIza + 35).
+    short = "AIza" + "b" * 20
+    out = redact_pii(f"value {short} ignored")
+    assert short in out
+    assert "<google-api-key>" not in out
+
+
+# ---------------------------------------------------------------------------
+# Креды внутри URI (`scheme://user:password@host`)
+# ---------------------------------------------------------------------------
+
+def test_redact_uri_credentials():
+    out = redact_pii("conn failed: postgres://svc_user:hunter2@db-host:5432/town")
+    assert "hunter2" not in out
+    assert "svc_user:<redacted>" in out
+    assert "db-host" in out  # хост остаётся — он нужен для диагностики
+
+
+def test_uri_credentials_do_not_eat_plain_urls():
+    text = "GET https://api.lastoasisgame.com/v1/status returned 503"
+    assert redact_pii(text) == text
+
+
+def test_uri_credentials_idempotent():
+    once = redact_pii("redis://user:p@ss-less@cache:6379")
+    assert once == redact_pii(once)
+    assert "<redacted>" in once
+
+
+# ---------------------------------------------------------------------------
 # Truncation
 # ---------------------------------------------------------------------------
 
@@ -432,6 +567,31 @@ def test_no_truncation_under_limit():
     out = redact_pii(text)
     assert out == "short message"
     assert "[truncated]" not in out
+
+
+def test_max_len_none_disables_truncation():
+    """pod-логи в LLM-контекст редактируем, но НЕ режем до 500 символов.
+
+    Иначе `logs.py` / `k8s_facts.py` отдали бы модели только голову блоба, а
+    диагностика (stacktrace, exit reason) живёт в хвосте.
+    """
+    text = "z" * 2000
+    out = redact_pii(text, max_len=None)
+    assert out == text
+    assert "[truncated]" not in out
+
+
+def test_max_len_custom_value():
+    out = redact_pii("y" * 300, max_len=100)
+    assert len(out) == 100
+    assert out.endswith("[truncated]")
+
+
+def test_max_len_none_still_redacts():
+    out = redact_pii("user a@b.co from 10.0.0.1 " + "z" * 900, max_len=None)
+    assert "a@b.co" not in out
+    assert "10.0.0.1" not in out
+    assert len(out) > 500
 
 
 # ---------------------------------------------------------------------------

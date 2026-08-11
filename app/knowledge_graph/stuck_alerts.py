@@ -27,10 +27,10 @@ from __future__ import annotations
 from collections import defaultdict
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import structlog
-from sqlalchemy import func
+from sqlalchemy import case, func
 from sqlalchemy.orm import Session
 
 from app.knowledge_graph.schema import AlertEvent, Service
@@ -123,6 +123,54 @@ def _bumped_severity(base: Optional[str], hours_firing: float) -> str:
     return base or "warning"
 
 
+def _recurrence_counts(
+    db: Session,
+    alertnames: Sequence[str],
+    since_24h: datetime,
+    since_7d: datetime,
+) -> Tuple[Dict[Tuple[int, str], Tuple[int, int]], Dict[str, Tuple[int, int]]]:
+    """Recurrence-счётчики ОДНИМ агрегатом на весь прогон.
+
+    Возвращает два индекса:
+      * `{(service_id, alertname): (count_24h, count_7d)}` — для алертов с
+        привязкой к сервису;
+      * `{alertname: (count_24h, count_7d)}` — суммы по всем сервисам, для
+        orphan-алертов (service_id IS NULL): у них recurrence считается по
+        одному alertname по всем ns, как и было.
+
+    24h-счётчик берём CASE-суммой внутри 7d-окна: 24h ⊂ 7d, отдельный запрос
+    не нужен. Скан ограничен `alertnames` залипших алертов — агрегат не
+    превращается в проход по всей 7-дневной истории kg_alerts.
+    """
+    grouped = (
+        db.query(
+            AlertEvent.service_id,
+            AlertEvent.alertname,
+            func.count(AlertEvent.id).label("cnt_7d"),
+            func.sum(
+                case((AlertEvent.fired_at >= since_24h, 1), else_=0)
+            ).label("cnt_24h"),
+        )
+        .filter(
+            AlertEvent.alertname.in_(list(alertnames)),
+            AlertEvent.fired_at >= since_7d,
+        )
+        .group_by(AlertEvent.service_id, AlertEvent.alertname)
+        .all()
+    )
+
+    by_svc: Dict[Tuple[int, str], Tuple[int, int]] = {}
+    by_name: Dict[str, Tuple[int, int]] = {}
+    for row in grouped:
+        c24 = int(row.cnt_24h or 0)
+        c7d = int(row.cnt_7d or 0)
+        if row.service_id is not None:
+            by_svc[(int(row.service_id), row.alertname)] = (c24, c7d)
+        name_24h, name_7d = by_name.get(row.alertname, (0, 0))
+        by_name[row.alertname] = (name_24h + c24, name_7d + c7d)
+    return by_svc, by_name
+
+
 # ── Core query ────────────────────────────────────────────────────────────
 
 
@@ -139,6 +187,12 @@ def find_stuck_alerts(
 
     LEFT JOIN на kg_services — alert может быть orphan (без service_id),
     в этом случае team_owner=None и попадает в группу "unknown".
+
+    Стоимость: РОВНО 2 запроса независимо от числа залипших алертов (сам
+    список + один агрегат recurrence). Раньше на каждый stuck-алерт летели
+    2 отдельных COUNT-а — при десятках-сотнях залипших это сотни запросов
+    каждый час (задача hourly), причём ровно в те моменты, когда БД и без
+    того под инцидентом.
     """
     cutoff = _now() - timedelta(hours=min_duration_hours)
     now = _now()
@@ -163,27 +217,24 @@ def find_stuck_alerts(
         .all()
     )
 
+    if not rows:
+        return []
+
+    stuck_names = {r.alertname for r in rows if r.alertname is not None}
+    rec_by_svc, rec_by_name = _recurrence_counts(
+        db, sorted(stuck_names), since_24h, since_7d,
+    )
+
     result: List[Dict[str, Any]] = []
     for r in rows:
         hours = (now - r.fired_at).total_seconds() / 3600.0
         # Recurrence считаем по (service_id, alertname). Если service_id
         # None — orphan, recurrence по одному alertname по всем ns
         # (значит и расстановка приоритета будет грубее, но это окей).
-        rec_q_24h = (
-            db.query(func.count(AlertEvent.id))
-            .filter(AlertEvent.alertname == r.alertname)
-            .filter(AlertEvent.fired_at >= since_24h)
-        )
-        rec_q_7d = (
-            db.query(func.count(AlertEvent.id))
-            .filter(AlertEvent.alertname == r.alertname)
-            .filter(AlertEvent.fired_at >= since_7d)
-        )
         if r.service_id is not None:
-            rec_q_24h = rec_q_24h.filter(AlertEvent.service_id == r.service_id)
-            rec_q_7d = rec_q_7d.filter(AlertEvent.service_id == r.service_id)
-        rec_24h = int(rec_q_24h.scalar() or 0)
-        rec_7d = int(rec_q_7d.scalar() or 0)
+            rec_24h, rec_7d = rec_by_svc.get((r.service_id, r.alertname), (0, 0))
+        else:
+            rec_24h, rec_7d = rec_by_name.get(r.alertname, (0, 0))
 
         result.append({
             "alert_id": int(r.id),

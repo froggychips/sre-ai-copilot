@@ -61,7 +61,11 @@ async def get_current_user(
 
     # iss ОБЯЗАТЕЛЕН всегда (иначе токен другого сервиса того же IdP-ключа
     # аутентифицируется здесь); значение сверяется, когда задан JWT_ISSUER.
-    # aud требуется и сверяется, когда задан JWT_AUDIENCE.
+    # aud требуется и сверяется, когда задан JWT_AUDIENCE; токен С aud при
+    # незаданном JWT_AUDIENCE PyJWT отклоняет сам (InvalidAudienceError).
+    # В проде оба значения ОБЯЗАТЕЛЬНЫ — форсится _enforce_prod_invariants
+    # в app/config.py, иначе сверка тихо не включалась и токен, выписанный
+    # тем же IdP-ключом другому сервису, проходил с ролью approver.
     expected_issuer = getattr(settings, "JWT_ISSUER", None)
     required_claims = ["exp", "sub", "iss"]
     if settings.JWT_AUDIENCE:

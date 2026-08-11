@@ -61,16 +61,28 @@ def _conn_kwargs() -> dict:
     }
 
 
+# Транзиентные классы psycopg2: обрыв/недоступность коннекта к statics-PG.
+# ВАЖНО: внутри декорированных функций их нельзя глотать широким
+# `except Exception → return None` — with_external_retry (resilience.py)
+# ретраит ТОЛЬКО на raise, а проглоченная ошибка возвращала None с первой
+# попытки, и retry был мёртвым кодом. Деградация в None живёт в
+# НЕдекорированных обёртках ниже — после исчерпания попыток (как в
+# clickhouse_service.get_blast_radius, где try/except снаружи client.query).
+_STATICS_TRANSIENT = (psycopg2.OperationalError, psycopg2.InterfaceError)
+
+
 @with_external_retry(
     max_attempts=3, initial_delay=0.5, name="statics.run_check",
-    retry_on=(psycopg2.OperationalError, psycopg2.InterfaceError),
+    retry_on=_STATICS_TRANSIENT,
 )
-def _run_statics_check(error_text: str, recent_n: int) -> Optional[str]:
+def _statics_check_query(error_text: str, recent_n: int) -> Optional[str]:
     """Sync check: подключаемся к statics, ищем таблицы по ключевым словам.
 
     Retry-ится только на connection-class ошибках (OperationalError/
     InterfaceError) — semantic SQL errors (broken query, missing table)
-    retry-ить смысла нет."""
+    retry-ить смысла нет. Транзиентные ошибки НАМЕРЕННО пробрасываются
+    наружу: их ловит декоратор (повтор), а затем _run_statics_check
+    (деградация в None)."""
     keywords = _extract_keywords(error_text)
     if not keywords:
         return None
@@ -124,6 +136,11 @@ def _run_statics_check(error_text: str, recent_n: int) -> Optional[str]:
                 cnt = row["cnt"] if row else 0
                 status = "OK" if cnt > 0 else "EMPTY"
                 verdicts.append(f"  {tbl}: {cnt} rows → {status}")
+            except _STATICS_TRANSIENT:
+                # Коннект умер посреди обхода таблиц — это не «таблица битая»:
+                # иначе ВСЕ оставшиеся таблицы получат query_failed и вердикт
+                # уедет в шум. Пробрасываем декоратору на повтор проверки.
+                raise
             except Exception as e:
                 verdicts.append(f"  {tbl}: query_failed ({e})")
 
@@ -137,15 +154,26 @@ def _run_statics_check(error_text: str, recent_n: int) -> Optional[str]:
 
         return "\n".join(lines)
 
-    except Exception as e:
-        logger.warning("statics_service.check_failed: %s", e)
-        return None
     finally:
         # with_external_retry ретраит OperationalError/InterfaceError —
         # каждая неудачная попытка обязана закрыть свой коннект, иначе они
         # копятся (psycopg2-leak, Infra H6). conn=None если connect() упал.
         if conn is not None:
             conn.close()
+
+
+def _run_statics_check(error_text: str, recent_n: int) -> Optional[str]:
+    """Graceful-degrade обёртка над _statics_check_query.
+
+    Ретраи живут в декораторе внутри; None здесь — уже ПОСЛЕ исчерпания
+    попыток (транзиент) либо на детерминированной ошибке (битый SQL,
+    отсутствующая таблица schema_migrations).
+    """
+    try:
+        return _statics_check_query(error_text, recent_n)
+    except Exception as e:
+        logger.warning("statics_service.check_failed: %s", e)
+        return None
 
 
 async def check_statics_for_error(error_text: str) -> Optional[str]:
@@ -216,14 +244,15 @@ def statics_env_from_namespace(namespace: Optional[str]) -> Optional[str]:
 
 @with_external_retry(
     max_attempts=3, initial_delay=0.5, name="statics.latest_version",
-    retry_on=(psycopg2.OperationalError, psycopg2.InterfaceError),
+    retry_on=_STATICS_TRANSIENT,
 )
-def _run_latest_statics_version(env: str) -> Optional[Dict]:
+def _latest_statics_version_query(env: str) -> Optional[Dict]:
     """Sync: последняя (и предыдущая по номеру) версия статики для env.
 
     env — суффикс имени version-БД ('prod'/'preprod'/'preupdate'/'squad-N'/
     'squad-gd'). Возвращает `{version, prev_version, datname, env}` либо None
-    если версий для env нет. Retry только на connection-class ошибках."""
+    если версий для env нет. Retry только на connection-class ошибках, они
+    пробрасываются наружу к декоратору (см. _STATICS_TRANSIENT)."""
     conn = None
     try:
         conn = psycopg2.connect(database="gd", **_conn_kwargs())
@@ -258,12 +287,23 @@ def _run_latest_statics_version(env: str) -> Optional[Dict]:
             "datname": top["datname"],
             "env": env,
         }
-    except Exception as e:
-        logger.warning("statics_service.latest_version_failed env=%s: %s", env, e)
-        return None
     finally:
         if conn is not None:
             conn.close()
+
+
+def _run_latest_statics_version(env: str) -> Optional[Dict]:
+    """Graceful-degrade обёртка над _latest_statics_version_query.
+
+    None — после исчерпания ретраев (транзиент) либо на детерминированной
+    ошибке. Вызывающий (observe_statics_version) дегрейдит в прежнее
+    поведение «версия неизвестна».
+    """
+    try:
+        return _latest_statics_version_query(env)
+    except Exception as e:
+        logger.warning("statics_service.latest_version_failed env=%s: %s", env, e)
+        return None
 
 
 def get_latest_statics_version(env: str) -> Optional[Dict]:

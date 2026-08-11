@@ -35,7 +35,8 @@ from sqlalchemy.orm import Session
 
 from app.config import settings
 from app.context.vm_client import VMClient
-from app.knowledge_graph.schema import Service, ServiceHealth
+from app.knowledge_graph.schema import (NODE_KIND_SERVICE, Service,
+                                        ServiceHealth)
 
 log = logging.getLogger(__name__)
 
@@ -232,8 +233,17 @@ async def _sync_service_health_async(db: Session) -> Dict[str, Any]:
         return {"skipped": "no_vm_url"}
 
     vm = VMClient(settings.VICTORIA_METRICS_URL, timeout=15.0)
+    # node_kind='service': с contract 2.4 у пары «k8s Service foo + Deployment
+    # foo» ДВА non-synthetic узла. Метрики агрегируются по имени, поэтому без
+    # фильтра каждая пара писала бы две идентичные строки kg_service_health
+    # каждые 10 минут (и удваивала queries/inserted в stats).
     services: List[Service] = (
-        db.query(Service).filter(Service.synthetic.is_(False)).all()
+        db.query(Service)
+        .filter(
+            Service.synthetic.is_(False),
+            Service.node_kind == NODE_KIND_SERVICE,
+        )
+        .all()
     )
     ts = datetime.utcnow()
 

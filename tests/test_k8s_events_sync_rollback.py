@@ -107,3 +107,66 @@ def test_clean_namespace_sync_commits_all(db, monkeypatch):
     assert stats["added"] == 2
     assert stats["errors"] == 0
     assert db.query(PodEvent).count() == 2
+
+
+# ── Ревью 2026-08-10: перебор ns — только живые, без синтетики ──────────────
+
+
+def _seed_namespaces(db):
+    """Живой ns, синтетический `nats-subjects` и мёртвый (весь synthetic)."""
+    db.add_all([
+        Service(namespace="squad-1", name="bot-service", synthetic=False),
+        # ingress:<host> — synthetic, но стоит рядом с живым сервисом:
+        # namespace обязан остаться в переборе.
+        Service(namespace="squad-1", name="ingress:a.example.com", synthetic=True),
+        # subject-узлы nats_subjects_sync: ns в k8s не существует вовсе.
+        Service(namespace="nats-subjects", name="subject:ping", synthetic=True),
+        # мёртвый ns после drift_cleanup: все узлы помечены synthetic=True.
+        Service(namespace="squad-dead", name="old-service", synthetic=True),
+    ])
+    db.commit()
+
+
+def test_sync_all_events_skips_synthetic_and_dead_namespaces(db, monkeypatch):
+    """Пустой KG_SCAN_NAMESPACES → перебираем только живые ns.
+
+    Раньше брались ВСЕ distinct namespace: синтетический `nats-subjects` и
+    мёртвые ns давали по два kubectl-вызова и warning каждые 10 минут.
+    """
+    _seed_namespaces(db)
+    monkeypatch.setattr(k8s_events_sync.settings, "KG_SCAN_NAMESPACES", "")
+
+    seen = []
+    monkeypatch.setattr(
+        k8s_events_sync, "sync_namespace_events",
+        lambda db, ns: seen.append(ns) or {
+            "fetched": 0, "added": 0, "skipped": 0, "errors": 0,
+        },
+    )
+
+    total = k8s_events_sync.sync_all_events(db)
+
+    assert seen == ["squad-1"]
+    assert "nats-subjects" not in seen
+    assert "squad-dead" not in seen
+    assert total["namespaces"] == 1
+
+
+def test_scannable_namespaces_helper_filters_synthetic(db):
+    """Прямой контракт хелпера (используется и как док-фиксация признака)."""
+    _seed_namespaces(db)
+    assert k8s_events_sync._scannable_kg_namespaces(db) == ["squad-1"]
+
+
+def test_explicit_namespaces_argument_is_not_filtered(db, monkeypatch):
+    """Явный список (CLI / whitelist) уважается как есть — фильтр не мешает."""
+    _seed_namespaces(db)
+    seen = []
+    monkeypatch.setattr(
+        k8s_events_sync, "sync_namespace_events",
+        lambda db, ns: seen.append(ns) or {
+            "fetched": 0, "added": 0, "skipped": 0, "errors": 0,
+        },
+    )
+    k8s_events_sync.sync_all_events(db, namespaces=["squad-dead"])
+    assert seen == ["squad-dead"]

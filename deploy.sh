@@ -117,9 +117,39 @@ apply_with_image k8s/base/deployment.yaml
 apply_with_image k8s/worker.yaml
 kubectl -n "${NAMESPACE}" apply -f k8s/networkpolicy.yaml
 
+# Раньше здесь стояло `rollout status ... || true`, и финальное «Deploy OK»
+# печаталось при ЛЮБОМ исходе: ImagePullBackOff, CrashLoopBackOff, зависший на
+# readiness под — скрипт возвращал 0 и рапортовал успех. Тот же класс дефекта,
+# что «зелёный билд при мёртвой статике»: единственный сигнал о выкате врёт, а
+# CI/оператор верит exit code. Теперь неуспешный rollout = явный не-OK и exit 1.
+#
+# Цикл при этом НЕ выходит на первом упавшем (`if !`, а не голый вызов под
+# set -e): оператору нужна полная картина по всем трём деплойментам, поэтому
+# провалы копятся в rollout_failed, а exit — после цикла. `|| true` осталось
+# только на диагностических kubectl-вызовах: их отказ не должен подменять
+# причину падения (например, при отозванных правах на describe).
+rollout_failed=""
 for d in sre-ai-api copilot-worker copilot-beat; do
-    kubectl -n "${NAMESPACE}" rollout status "deploy/${d}" --timeout=300s || true
+    if ! kubectl -n "${NAMESPACE}" rollout status "deploy/${d}" --timeout=300s; then
+        echo "ERROR: rollout deploy/${d} не сошёлся за 300s." >&2
+        # Причина почти всегда видна тут же: ImagePullBackOff (тег/registry),
+        # CrashLoopBackOff (fail-closed валидаторы config.py на пустых секретах),
+        # Unhealthy от liveness-пробы воркера (см. k8s/worker.yaml).
+        kubectl -n "${NAMESPACE}" get pods -l "app=${d}" -o wide >&2 || true
+        kubectl -n "${NAMESPACE}" describe deploy "${d}" 2>/dev/null \
+            | tail -20 >&2 || true
+        rollout_failed="${rollout_failed} ${d}"
+    fi
 done
+
+if [[ -n "${rollout_failed}" ]]; then
+    echo "" >&2
+    echo "Deploy FAILED: не сошлись деплойменты:${rollout_failed}" >&2
+    echo "  Образ ${IMAGE} и миграции применены — откат делать вручную:" >&2
+    echo "    kubectl -n ${NAMESPACE} rollout undo deploy/<name>" >&2
+    echo "    kubectl -n ${NAMESPACE} logs deploy/<name> --tail=100" >&2
+    exit 1
+fi
 
 echo "Deploy OK: ${IMAGE} → ns ${NAMESPACE}"
 echo "(Опционально: k8s/prometheus-rules.yaml, k8s/vmalertmanagerconfig.yaml,"

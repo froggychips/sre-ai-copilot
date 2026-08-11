@@ -9,19 +9,71 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
-from sqlalchemy import func, or_
+from sqlalchemy import and_, func, or_
 from sqlalchemy.orm import Session
 
 from app.knowledge_graph.confidence import (confidence_label,
                                             confidence_score)
-from app.knowledge_graph.schema import (NODE_KIND_SERVICE, AlertEvent,
-                                        Deployment, IngressObservation,
-                                        LogObservation, PodEvent, Service,
-                                        ServiceEdge)
+from app.knowledge_graph.schema import (NODE_KIND_SERVICE, NODE_KIND_WORKLOAD,
+                                        AlertEvent, Deployment,
+                                        IngressObservation, LogObservation,
+                                        PodEvent, Service, ServiceEdge)
 
 
 def _ensure_aware(dt: datetime) -> datetime:
     return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+
+
+def _ensure_naive(dt: datetime) -> datetime:
+    """Naive **UTC** — в таком виде лежат все timestamp-колонки KG.
+
+    Голый ``.replace(tzinfo=None)`` был корректен только для UTC-aware
+    входа: AlertManager-webhook отдаёт `startsAt` с реальным offset'ом
+    (`+03:00` у наших рантаймов), и обрезание tzinfo превращало 12:00+03:00
+    в naive 12:00, то есть сдвигало ВСЁ окно на 3 часа — deploy-атрибуция и
+    pod trail молча смотрели не туда. Зеркалит
+    ``stale_classifier._ensure_naive``.
+    """
+    if dt.tzinfo is not None:
+        return dt.astimezone(timezone.utc).replace(tzinfo=None)
+    return dt
+
+
+# ── ns-level deploy attribution: как не считать один билд K×2 раза ──────────
+#
+# `tc_deploys_to_kg` (app/workers/tasks.py) броадкастит ОДИН TC-билд на
+# КАЖДЫЙ non-synthetic узел namespace — включая workload-дубль одноимённого
+# сервиса (contract 2.4: Service `auth` и workload `auth` — разные строки
+# kg_services). Джойн по одному namespace поэтому возвращает один билд
+# K×2 раза: `limit` съедался копиями одного билда, а «60 deploys» в эмбеде
+# означали один билд, разосланный 30 сервисам. Честны были только
+# `distinct_builds`.
+#
+# Лечим двумя фильтрами:
+#   1. считаем деплои только по service-узлам — workload-узел заводится
+#      топологическим синком РЯДОМ с одноимённым service-узлом того же ns
+#      (k8s_topology_resources_sync._sync_one_service), а kg_sync держит
+#      service-узел для каждого k8s Deployment ns, поэтому ни один билд из
+#      ns-broadcast так не теряется;
+#   2. схлопываем fan-out по (namespace, buildtype_id, build_number) —
+#      «сколько деплоев» становится «сколько билдов реально каталось в ns».
+#
+# Потолок строк под дедуп: один билд лежит в K строках, поэтому `limit`
+# уникальных билдов может оказаться за сотнями строк. 2000 хватает на
+# ~40 билдов при фан-ауте 50 и держит запрос ограниченным.
+_NS_DEPLOY_SCAN_CAP = 2000
+
+
+def _deploy_dedup_key(deploy: Deployment, namespace: str) -> tuple:
+    """Ключ схлопывания ns-broadcast: один TC-билд = одна строка на namespace.
+
+    Записи без build-инфо (`record_deployment` без TC-контекста: только
+    `started_at`) не идентифицируемы — общий ключ схлопнул бы РАЗНЫЕ деплои
+    в один, поэтому для них дедуп выключен (ключ = id строки).
+    """
+    if not deploy.buildtype_id and not deploy.build_number:
+        return ("deploy_id", int(deploy.id))
+    return (namespace, deploy.buildtype_id, deploy.build_number)
 
 
 def _service_by_namespace_name(
@@ -86,8 +138,8 @@ def recent_deploys_for(
         db.query(Deployment)
         .filter(
             Deployment.service_id == svc.id,
-            Deployment.started_at >= since.replace(tzinfo=None),
-            Deployment.started_at <= before_aware.replace(tzinfo=None),
+            Deployment.started_at >= _ensure_naive(since),
+            Deployment.started_at <= _ensure_naive(before_aware),
         )
         .order_by(Deployment.started_at.desc())
         .all()
@@ -129,6 +181,10 @@ def recent_deploys_for_namespaces(
     «это деплой или нет» отвечается и без сервиса: был ли ХОТЬ ОДИН deploy
     в namespace прямо перед алертом. kg_deployments не хранит namespace —
     идём через join на kg_services.
+
+    `limit` — количество РАЗНЫХ билдов (см. `_deploy_dedup_key`): без дедупа
+    ns-broadcast'а пять слотов забирали пять копий одного билда, и эмбед
+    показывал «5 деплоев», которых не было.
     """
     if not namespaces:
         return []
@@ -139,15 +195,21 @@ def recent_deploys_for_namespaces(
         .join(Service, Deployment.service_id == Service.id)
         .filter(
             Service.namespace.in_(namespaces),
-            Deployment.started_at >= since.replace(tzinfo=None),
-            Deployment.started_at <= before_aware.replace(tzinfo=None),
+            Service.node_kind == NODE_KIND_SERVICE,
+            Deployment.started_at >= _ensure_naive(since),
+            Deployment.started_at <= _ensure_naive(before_aware),
         )
         .order_by(Deployment.started_at.desc())
-        .limit(limit)
+        .limit(_NS_DEPLOY_SCAN_CAP)
         .all()
     )
     out: List[Dict[str, Any]] = []
+    seen_builds: set = set()
     for d, svc in rows:
+        bkey = _deploy_dedup_key(d, svc.namespace)
+        if bkey in seen_builds:
+            continue
+        seen_builds.add(bkey)
         delta_min = int(
             (before_aware - d.started_at.replace(tzinfo=timezone.utc)).total_seconds() // 60
         )
@@ -166,6 +228,8 @@ def recent_deploys_for_namespaces(
             "url": extras.get("url"),
             "minutes_before_incident": delta_min,
         })
+        if len(out) >= limit:
+            break
     return out
 
 
@@ -196,6 +260,12 @@ def cluster_deploy_activity(
       namespaces: [{namespace, deploys}, ...]  (desc by deploys),
       sample_builds: [{buildtype_name, number, triggered_by, namespace,
                        minutes_before_incident}, ...]  (ближайшие по времени).
+
+    `total_deploys` / `namespaces[].deploys` считаются в РАЗНЫХ билдах на
+    namespace, а не в строках kg_deployments: ns-broadcast раздаёт один билд
+    всем узлам ns, и построчный счёт врал в десятки раз («60 deploys» вместо
+    «1 билд»). Один билд, прокатившийся по трём соседним ns, даёт
+    total_deploys=3 при distinct_builds=1 — это и есть bulk-rollout.
     """
     prefixes = [p for p in (sibling_prefixes or []) if p]
     if not prefixes:
@@ -208,8 +278,9 @@ def cluster_deploy_activity(
         .filter(
             or_(*[Service.namespace.like(f"{p}%") for p in prefixes]),
             Service.namespace != exclude_namespace,
-            Deployment.started_at >= since.replace(tzinfo=None),
-            Deployment.started_at <= before_aware.replace(tzinfo=None),
+            Service.node_kind == NODE_KIND_SERVICE,
+            Deployment.started_at >= _ensure_naive(since),
+            Deployment.started_at <= _ensure_naive(before_aware),
         )
         .order_by(Deployment.started_at.desc())
         .all()
@@ -220,7 +291,12 @@ def cluster_deploy_activity(
     per_ns: Dict[str, int] = {}
     distinct_builds = set()
     enriched: List[Dict[str, Any]] = []
+    seen_ns_builds: set = set()
     for d, svc in rows:
+        bkey = _deploy_dedup_key(d, svc.namespace)
+        if bkey in seen_ns_builds:
+            continue
+        seen_ns_builds.add(bkey)
         per_ns[svc.namespace] = per_ns.get(svc.namespace, 0) + 1
         distinct_builds.add((d.buildtype_id, d.build_number))
         delta_min = int(
@@ -236,22 +312,23 @@ def cluster_deploy_activity(
             "minutes_before_incident": delta_min,
         })
 
-    # sample_builds — ближайшие к алерту, dedup по (buildtype, number):
-    # один TC-билд деплоит десятки сервисов и забил бы выборку дублями.
+    # sample_builds — ближайшие к алерту, dedup по (buildtype, number) уже
+    # БЕЗ namespace: один билд, прокатившийся по трём соседним ns, в примерах
+    # интересен один раз (в total_deploys он честно лежит тремя ns-деплоями).
     enriched.sort(key=lambda r: r["minutes_before_incident"])
     sample_builds: List[Dict[str, Any]] = []
-    seen_builds = set()
+    seen_sample_builds = set()
     for r in enriched:
         bkey = (r["buildtype_id"], r["number"])
-        if bkey in seen_builds:
+        if bkey in seen_sample_builds:
             continue
-        seen_builds.add(bkey)
+        seen_sample_builds.add(bkey)
         sample_builds.append(r)
         if len(sample_builds) >= sample_limit:
             break
 
     return {
-        "total_deploys": len(rows),
+        "total_deploys": len(enriched),
         "distinct_builds": len(distinct_builds),
         "earliest_minutes_before": min(r["minutes_before_incident"] for r in enriched),
         "namespaces": [
@@ -322,8 +399,8 @@ def incidents_on(
         db.query(AlertEvent)
         .filter(
             AlertEvent.service_id == svc.id,
-            AlertEvent.fired_at >= _ensure_aware(since).replace(tzinfo=None),
-            AlertEvent.fired_at <= _ensure_aware(until).replace(tzinfo=None),
+            AlertEvent.fired_at >= _ensure_naive(since),
+            AlertEvent.fired_at <= _ensure_naive(until),
         )
         .order_by(AlertEvent.fired_at.desc())
         .all()
@@ -386,8 +463,8 @@ def blast_radius_for(
     """Wave 7 (X, PR #71): blast radius для упавшего сервиса.
 
     Считает:
-        * `serves_traffic` IN-edges (kind='serves_traffic', dst=svc):
-          какие k8s-Service'ы маршрутят трафик на этот Deployment.
+        * `serves_traffic` IN-edges (kind='serves_traffic', dst=workload-узлы
+          сервиса): какие k8s-Service'ы маршрутят трафик на этот Deployment.
           Это «сервисные точки входа» — клиенты ходят через них.
         * `routes_to` IN-edges (kind='routes_to', dst=svc): какие
           Ingress-ресурсы натравлены на этот backend. extras.host даёт
@@ -403,11 +480,26 @@ def blast_radius_for(
         return {"services": [], "urls": [], "services_total": 0, "urls_total": 0}
 
     # serves_traffic — `kg_services` ноды (k8s Service), маршрутизирующие
-    # трафик на этот Deployment. Имя ноды k8s-Service'а лежит как есть.
+    # трафик на этот Deployment. Producer (k8s_topology_resources_sync) пишет
+    # ребро src=Service-узел → dst=WORKLOAD-узел, а `svc` выше резолвится с
+    # node_kind='service' — фильтр `dst_id == svc.id` не матчил НИКОГДА, и
+    # секция «Blast radius» в critical-embed молча пустовала. Поэтому dst
+    # ищем среди workload-узлов этого сервиса (same namespace+name); svc.id
+    # оставлен в списке ради legacy-рёбер, записанных до node_kind.
+    workload_ids: List[int] = [
+        wid
+        for (wid,) in db.query(Service.id)
+        .filter(
+            Service.namespace == namespace,
+            Service.name == service_name,
+            Service.node_kind == NODE_KIND_WORKLOAD,
+        )
+        .all()
+    ]
     serves_rows = (
         db.query(ServiceEdge)
         .filter(
-            ServiceEdge.dst_id == svc.id,
+            ServiceEdge.dst_id.in_([*workload_ids, svc.id]),
             ServiceEdge.kind == "serves_traffic",
         )
         .all()
@@ -550,6 +642,34 @@ def nats_impact_for(
     return result[:top_n]
 
 
+# ── PodEvent: окно по ПЕРЕСЕЧЕНИЮ, а не по first_seen ──────────────────────
+#
+# k8s агрегирует повторы одного и того же события в ОДНУ запись: растёт
+# `count` и `lastTimestamp`, а `firstTimestamp` остаётся моментом первого
+# срабатывания. У сервиса, крашащегося неделю, BackOff лежит одной строкой с
+# first_seen неделю назад и живым last_seen. Фильтр `first_seen BETWEEN
+# since AND until` такую строку выбрасывал — и секция «🕒 Pod trail» в
+# critical-эмбеде показывала `total=0` для сервиса в хроническом crashloop,
+# то есть ровно там, где она нужнее всего.
+#
+# Правильный предикат — пересечение интервала события [first_seen,
+# last_seen] с окном [since, until]: событие «идёт» в окне, если началось не
+# позже конца окна и последний раз виделось не раньше начала. `last_seen`
+# nullable (старые строки до k8s_events_sync) — coalesce к first_seen
+# сохраняет прежнее поведение для них.
+def _pod_event_last_activity():
+    """SQL-выражение «последняя активность события»."""
+    return func.coalesce(PodEvent.last_seen, PodEvent.first_seen)
+
+
+def _pod_event_in_window(since: datetime, until: datetime):
+    """Предикат пересечения события с окном [since, until] (naive UTC)."""
+    return and_(
+        PodEvent.first_seen <= _ensure_naive(until),
+        _pod_event_last_activity() >= _ensure_naive(since),
+    )
+
+
 def pod_event_summary_for(
     db: Session,
     namespace: str,
@@ -566,6 +686,9 @@ def pod_event_summary_for(
 
     Возвращает `{total: int, by_reason: [(reason, count), ...desc]}`.
     Пустой dict если нет событий (skip-if-empty в embed).
+
+    Окно матчится ПЕРЕСЕЧЕНИЕМ интервала события [first_seen, last_seen] с
+    [around±window], а не только по `first_seen` — см. `_pod_event_in_window`.
     """
     svc = _service_by_namespace_name(db, namespace, service_name)
     if svc is None:
@@ -578,8 +701,7 @@ def pod_event_summary_for(
         db.query(PodEvent)
         .filter(
             PodEvent.service_id == svc.id,
-            PodEvent.first_seen >= since.replace(tzinfo=None),
-            PodEvent.first_seen <= until.replace(tzinfo=None),
+            _pod_event_in_window(since, until),
         )
         .all()
     )
@@ -694,7 +816,16 @@ def recent_pod_events_for(
     upstream-rule может не отразить.
 
     Возвращает [{reason, pod_name, first_seen, last_seen, count,
-                  minutes_before, message}] по убыванию first_seen.
+                  minutes_before, minutes_since_last, message}] по убыванию
+    последней активности.
+
+    Окно — пересечение [first_seen, last_seen] с [around±window] (см.
+    `_pod_event_in_window`): у хронического crashloop first_seen лежит вне
+    любого окна при живом last_seen. По той же причине сортировка идёт по
+    последней активности, а не по first_seen: иначе `limit` отдавал бы
+    свежие мелочи, а идущий неделю BackOff уходил в хвост.
+    `minutes_before` считается от first_seen («за сколько минут до алерта
+    событие НАЧАЛОСЬ»), `minutes_since_last` — от последней активности.
     """
     svc = _service_by_namespace_name(db, namespace, service_name)
     if svc is None:
@@ -707,16 +838,16 @@ def recent_pod_events_for(
         db.query(PodEvent)
         .filter(
             PodEvent.service_id == svc.id,
-            PodEvent.first_seen >= since.replace(tzinfo=None),
-            PodEvent.first_seen <= until.replace(tzinfo=None),
+            _pod_event_in_window(since, until),
         )
-        .order_by(PodEvent.first_seen.desc())
+        .order_by(_pod_event_last_activity().desc())
         .limit(limit)
         .all()
     )
     out: List[Dict[str, Any]] = []
     for r in rows:
         first_aware = _ensure_aware(r.first_seen)
+        last_aware = _ensure_aware(r.last_seen or r.first_seen)
         delta_min = int((around_aware - first_aware).total_seconds() // 60)
         out.append({
             "reason": r.reason,
@@ -725,6 +856,9 @@ def recent_pod_events_for(
             "last_seen": r.last_seen,
             "count": r.count,
             "minutes_before": delta_min,
+            "minutes_since_last": int(
+                (around_aware - last_aware).total_seconds() // 60
+            ),
             "message": (r.message or "")[:200],
         })
     return out
@@ -795,9 +929,7 @@ def log_error_rate_for(
         return None
 
     use_levels = list(levels) if levels else list(_LOG_ERROR_LEVELS)
-    ref = (now or datetime.utcnow())
-    if ref.tzinfo is not None:
-        ref = ref.replace(tzinfo=None)
+    ref = _ensure_naive(now or datetime.utcnow())
     since = ref - timedelta(minutes=window_minutes)
 
     total, buckets = (
@@ -869,7 +1001,7 @@ def ingress_health_for(
     if svc is None:
         return {}
 
-    now = now or datetime.utcnow()
+    now = _ensure_naive(now) if now is not None else datetime.utcnow()
     cutoff = now - timedelta(minutes=window_minutes)
     rows = (
         db.query(IngressObservation)

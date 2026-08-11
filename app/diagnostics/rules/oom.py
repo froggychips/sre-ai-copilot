@@ -8,6 +8,14 @@
 (≠ 0, ≠ 137), текстовый fallback подавляется. Иначе "OOMKilled" из событий
 соседних подов namespace даёт ложный positive.
 
+ВАЖНО-2 (attribution): если у инцидента нет ни pod, ни service, текстовое
+hard-совпадение не к чему привязать — оно вполне может быть из blob-а чужого
+пода namespace-а. Такой факт эмитим с confidence в soft-зоне критика
+(_UNATTRIBUTED_HARD_CONFIDENCE), а не 0.95: observed-факт с высокой
+уверенностью критик опровергнуть не может, и неверная причина уезжала в
+Discord как «уверенная». Скоупинг самого blob-а (когда target известен)
+делает app/context/k8s_facts.py.
+
 Конкретные паттерны взяты из реальных текстов k8s events:
     "OOMKilled"
     "out of memory"
@@ -30,6 +38,12 @@ _HARD_PATTERN = re.compile(
 )
 # Слабый: exit 137 может быть от ручного kill -9, не только OOM.
 _SOFT_PATTERN = re.compile(r"exit\s*code\s*137|\bsigkill\b", re.IGNORECASE)
+
+# Confidence hard-совпадения, которое не к чему привязать (алерт без pod и
+# service). Значение выбрано внутри soft-зоны fact_critic
+# [_VERY_LOW_CONFIDENCE=0.25, _LOW_CONFIDENCE=0.5): мягкий штраф, а не
+# жёсткое algo-опровержение — сигнал слабый, но не пренебрежимый.
+_UNATTRIBUTED_HARD_CONFIDENCE = 0.45
 
 
 class OOMKilledRule(Rule):
@@ -70,13 +84,34 @@ class OOMKilledRule(Rule):
         soft = self.count_matches(text, _SOFT_PATTERN)
 
         if hard >= 1:
+            # Attribution: если у алерта нет ни pod, ни service, привязать
+            # текстовое совпадение к workload-у нечем. Именно так рождался
+            # инцидент «уверенная неверная причина»: ns-алерт + чужой OOM в
+            # blob-е → observed conf=0.95, критик observed-факт не опровергает.
+            # Отдаём наблюдение, но в soft-зоне fact_critic ([0.25, 0.5)):
+            # гипотеза выживает и мягко штрафуется вместо жёсткой анкеровки.
+            attributable = pod is not None
             return [
                 Fact(
                     kind=FactKind.OOM_KILLED,
                     observed=True,
-                    confidence=0.95,
+                    confidence=0.95 if attributable else _UNATTRIBUTED_HARD_CONFIDENCE,
                     subject=pod,
-                    evidence={"hard_matches": hard, "soft_matches": soft},
+                    evidence={
+                        "hard_matches": hard,
+                        "soft_matches": soft,
+                        **(
+                            {}
+                            if attributable
+                            else {
+                                "attribution": "unverified",
+                                "note": (
+                                    "text match without pod/service label — "
+                                    "may belong to another workload in the namespace"
+                                ),
+                            }
+                        ),
+                    },
                     source_rule=self.name,
                 )
             ]

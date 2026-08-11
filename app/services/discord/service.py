@@ -12,6 +12,7 @@ alert, self-health alert). Helpers вынесены в соседние моду
 
 import asyncio
 import logging
+import re
 import time
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
@@ -133,6 +134,101 @@ _EMBED_PROTECTED_FIELDS: Tuple[str, ...] = (
 )
 
 
+# ── stats-дайджест: обрезка description с сохранением критичного хвоста ──────
+# Discord embed.description hard-limit 4096, держим safe-margin 4000.
+_STATS_DESC_LIMIT = 4000
+
+# Блоки дайджеста, которые обрезка НЕ имеет права съесть. Дайджест из ~20
+# секций регулярно перерастает лимит, а слепой `description[:3990]` рубил
+# ровно хвост — то есть сначала предупреждение «Секции недоступны» (ради
+# которого механизм самодиагностики и делался после инцидента 07.08.2026),
+# затем kg_quality и footer с heartbeat'ами синков. Дайджест терял именно те
+# строки, по которым читатель понимает, можно ли верить остальным.
+#
+# Матчинг по подстроке — маркеры совпадают с тем, что рендерит stats_digest
+# (`section_failures_line`, `kg_quality_section`, `beat_heartbeats_footer`).
+# Импортировать оттуда константы намеренно не стали: discord-сервис не должен
+# зависеть от модуля дайджеста (тот сам импортит discord_service).
+_STATS_PROTECTED_MARKERS: Tuple[str, ...] = (
+    "Секции недоступны",   # самодиагностика сборки
+    "🧬 KG quality",       # состояние графа
+    "_Syncs:",             # footer beat-heartbeats
+)
+_STATS_CUT_MARKER = "_…truncated_"
+_STATS_DROP_MARKER = "_…вырезано секций: {n} (лимит Discord)…_"
+# Меньше этого куска обрезанный блок бессмыслен — дропаем целиком.
+_STATS_MIN_PARTIAL_BLOCK = 120
+
+
+def _truncate_stats_description(
+    description: str, limit: int = _STATS_DESC_LIMIT
+) -> str:
+    """Ужать digest под лимит, сохранив критичные блоки и порядок чтения.
+
+    Режем ПО СЕКЦИЯМ (блоки, разделённые пустой строкой), а не по символам:
+      1. защищённые блоки (`_STATS_PROTECTED_MARKERS`) откладываем целиком, и
+         те, что стояли ДО первой обычной секции (строка «Секции
+         недоступны»), остаются на своём месте — сверху, как их и читают;
+      2. остальную голову набираем по порядку, пока хватает бюджета; первый
+         не влезший блок при осмысленном остатке режем с `_…truncated_`;
+      3. количество выброшенных секций проговариваем строкой — «дайджест
+         короче обычного» не должно выглядеть как «в кластере тихо».
+    """
+    if len(description) <= limit:
+        return description
+
+    sep = "\n\n"
+    blocks = description.split(sep)
+    protected_idx = [
+        i for i, b in enumerate(blocks)
+        if any(m in b for m in _STATS_PROTECTED_MARKERS)
+    ]
+    protected_set = set(protected_idx)
+    head_idx = [i for i in range(len(blocks)) if i not in protected_set]
+    first_head = head_idx[0] if head_idx else len(blocks)
+
+    lead = sep.join(blocks[i] for i in protected_idx if i < first_head)
+    tail = sep.join(blocks[i] for i in protected_idx if i >= first_head)
+    head = [blocks[i] for i in head_idx]
+
+    # Патологический случай: сами защищённые блоки не влезают в лимит. Тогда
+    # приоритизировать уже нечего — режем по символам, как раньше.
+    protected_text = sep.join(p for p in (lead, tail) if p)
+    if len(protected_text) + len(sep) + len(_STATS_CUT_MARKER) > limit:
+        return (
+            protected_text[: limit - len(_STATS_CUT_MARKER) - 1]
+            + "\n" + _STATS_CUT_MARKER
+        )
+
+    reserve = len(protected_text) + (len(sep) if protected_text else 0)
+    reserve += len(sep) + len(_STATS_DROP_MARKER.format(n=len(head)))
+    budget = limit - reserve
+
+    kept: List[str] = []
+    used = 0
+    dropped = 0
+    for i, block in enumerate(head):
+        extra = len(sep) if kept else 0
+        if used + extra + len(block) <= budget:
+            kept.append(block)
+            used += extra + len(block)
+            continue
+        room = budget - used - extra - len(sep) - len(_STATS_CUT_MARKER)
+        if room >= _STATS_MIN_PARTIAL_BLOCK:
+            kept.append(block[:room] + "\n" + _STATS_CUT_MARKER)
+            dropped = len(head) - i - 1
+        else:
+            dropped = len(head) - i
+        break
+
+    parts = [p for p in (lead, sep.join(kept)) if p]
+    if dropped:
+        parts.append(_STATS_DROP_MARKER.format(n=dropped))
+    if tail:
+        parts.append(tail)
+    return sep.join(parts)
+
+
 def _parse_retry_after(resp: Any, default: float = _RATELIMIT_DEFAULT_WAIT) -> float:
     """Сколько ждать до ретрая по Discord 429 (в секундах).
 
@@ -158,6 +254,18 @@ def _parse_retry_after(resp: Any, default: float = _RATELIMIT_DEFAULT_WAIT) -> f
     except (ValueError, TypeError, AttributeError):
         pass
     return default
+
+
+def _redact_webhook_url(url: str) -> str:
+    """Webhook-URL для логов — БЕЗ токена.
+
+    Раньше логировался `url[:60]`: у discord-вебхука
+    (`https://discord.com/api/webhooks/{id}/{token}`) id заканчивается
+    примерно на 52-й позиции, т.е. в лог утекали первые ~8 символов токена.
+    Оставляем id вебхука (достаточно для атрибуции канала), токен-сегмент
+    маскируем; суффикс `/messages/{msg_id}` PATCH-endpoint-а сохраняем.
+    """
+    return re.sub(r"(/webhooks/\d+)/[^/?]+", r"\1/***", url or "")
 
 
 def _embed_total_len(embed: Dict[str, Any]) -> int:
@@ -319,24 +427,34 @@ class DiscordService:
             return
         payload = {"content": report_text}
         async with httpx.AsyncClient() as client:
-            await client.post(url, json=payload)
+            # #3: через ratelimit-обёртку — голый POST в alert-storm ловил 429
+            # и молча терял сообщение (Retry-After не читался).
+            await self._request_with_ratelimit(client, "post", url, json=payload)
 
-    async def send_stats_report(self, content: str) -> None:
+    async def send_stats_report(self, content: str) -> bool:
         """Отправить markdown-content в канал #stats как Discord embed.
 
         Используем embed (description-limit 4096) вместо content (limit 2000).
         Daily-digest сейчас ~2800 chars — в content не влезет.
 
         Первая строка контента вынесена в embed.title (если bold + emoji),
-        остальное — в description.
+        остальное — в description; переполнение режется по секциям с
+        сохранением критичных строк (`_truncate_stats_description`).
+
+        Возвращает фактический статус доставки — по нему stats_digest решает,
+        писать ли deadman-маркер (раньше недоставка молча глоталась и маркер
+        писался при мёртвом вебхуке):
+          * True  — POST прошёл (2xx) либо DISCORD_DRY_RUN (доставка
+            подавлена намеренно);
+          * False — вебхук не настроен или Discord ответил >=400.
         """
+        if settings.DISCORD_DRY_RUN:
+            _dry_run_log.info("discord.dry_run.send_stats_report", content=content[:500])
+            return True
         url = settings.DISCORD_WEBHOOK_STATS_URL
         if not url:
             logging.warning("DISCORD_WEBHOOK_STATS_URL not set, skipping stats report")
-            return
-        if settings.DISCORD_DRY_RUN:
-            _dry_run_log.info("discord.dry_run.send_stats_report", content=content[:500])
-            return
+            return False
 
         lines = content.split("\n", 1)
         if len(lines) == 2 and lines[0].strip():
@@ -345,9 +463,11 @@ class DiscordService:
         else:
             title = "Stats digest"
             description = content
-        # Embed description hard-limit 4096; truncate с маркером.
-        if len(description) > 4000:
-            description = description[:3990] + "\n_…truncated_"
+        # Embed description hard-limit 4096. Обрезаем по секциям с сохранением
+        # критичного хвоста (самодиагностика / kg_quality / heartbeats) —
+        # слепой срез по символам съедал именно их (см.
+        # `_truncate_stats_description`).
+        description = _truncate_stats_description(description)
 
         payload = {
             "embeds": [{
@@ -357,12 +477,15 @@ class DiscordService:
             }]
         }
         async with httpx.AsyncClient() as client:
-            r = await client.post(url, json=payload)
+            # #3: 429 в alert-storm ретраится (bounded), а не глотается.
+            r = await self._request_with_ratelimit(client, "post", url, json=payload)
             if r.status_code >= 400:
                 logging.error(
                     "discord_stats_report_failed",
                     extra={"status": r.status_code, "body": r.text[:200]},
                 )
+                return False
+        return True
 
     async def send_incident_report(
         self,
@@ -389,11 +512,19 @@ class DiscordService:
         metric_source: Optional[str] = None,
         fired_at: Optional[datetime] = None,
         acked_by: Optional[str] = None,
-    ) -> None:
+    ) -> bool:
         """Единый embed-отчёт, заменяющий сырой алерт от Spidey Bot.
 
         Формат: заголовок алерта (что видел Spidey Bot) + root cause +
         краткий вывод пайплайна — всё в одном Discord-сообщении.
+
+        Контракт с workers/pipeline: возвращает bool фактической доставки и
+        НИКОГДА не бросает наружу ошибку отправки (HTTP-ошибки/исключения
+        send-пути глотаются с логом — pipeline полагается на это):
+          * True  — embed в канале есть (POST 2xx, PATCH-dedup существующего
+            сообщения, отправка через bot API или DISCORD_DRY_RUN);
+          * False — доставки не было (severity-gate skip, вебхук не настроен,
+            HTTP >=400 или исключение на POST-е).
 
         Новые kwargs (Wave 3):
           - deploy_correlation: результат `correlate_deploy_to_incident`. Если
@@ -419,7 +550,7 @@ class DiscordService:
                 "incident.skipped_low_severity",
                 incident_id=incident_id, severity=severity,
             )
-            return
+            return False
 
         # A2 severity decay: critical >24h без ack → orange + 🪦 STALE prefix.
         # Helper покрывает все edge-cases (acked / younger / non-critical).
@@ -459,6 +590,10 @@ class DiscordService:
         flap_tag = f" · 🔄 ×{flap_count}" if flap_count > 0 else ""
         ns_part = f" · {namespace}" if namespace else ""
         title = f"{status_icon} {alertname}{ns_part}{recurrence_tag}{flap_tag}"
+        # Discord title-limit 256: длинный alertname+ns раньше давал 400 и
+        # алерт дропался целиком. Маркер обрезки — как в enriched-пути.
+        if len(title) > 256:
+            title = title[:255] + "…"
 
         fields = []
         if service:
@@ -638,6 +773,11 @@ class DiscordService:
             "footer": {"text": footer_text[:2048]},
             "timestamp": datetime.now(timezone.utc).isoformat(),
         }
+        # #6: тот же 6000-char TOTAL guard, что и в enriched-пути. Полностью
+        # обогащённый инцидент (root cause 1024 + suspect deploy + similar past
+        # + proposed action + dry-run verdict) превышал лимит → Discord 400 →
+        # алерт дропался целиком.
+        _fit_embed_to_limit(embed)
         payload = {
             "embeds": [embed],
             "components": components,
@@ -651,7 +791,7 @@ class DiscordService:
                 team_owner=team_owner,
                 deploy_suspect=(deploy_correlation or {}).get("verdict") in ("likely", "suspect"),
             )
-            return
+            return True
 
         # Если есть approve/decline buttons — обязаны слать через bot API
         # (webhook не рендерит interactive components). Иначе fallback на
@@ -660,7 +800,7 @@ class DiscordService:
         if approve_row and self._can_send_via_bot():
             sent = await self._send_via_bot(payload)
             if sent:
-                return
+                return True
             # Bot-send упал — fallback на webhook, но БЕЗ approve-кнопок
             # (Discord webhook отвергнет любые custom_id-components кроме
             # тех что от того же application — у webhook'а нет application_id).
@@ -672,7 +812,7 @@ class DiscordService:
         url = _pick_webhook_url(team_owner=team_owner, severity=severity)
         if not url:
             logging.warning("DISCORD_WEBHOOK_URL not set, skipping incident report")
-            return
+            return False
 
         # #1 + #9 dedup. Ключи кэша:
         #   - content-key (alertname, ns, service, reason) — точечный дедуп
@@ -681,7 +821,7 @@ class DiscordService:
         #     dedup не срабатывал. Content-key решает.
         #   - per (alertname,) — burst-агрегация (#9), если ≥3 за 5 мин.
         # Берём решение под локом.
-        await self._post_or_edit_incident(
+        return await self._post_or_edit_incident(
             url=url,
             payload=payload,
             embed=embed,
@@ -706,8 +846,13 @@ class DiscordService:
         severity: str,
         pod_event_reason: Optional[str] = None,
         metric_source: Optional[str] = None,
-    ) -> None:
+    ) -> bool:
         """Решает: новый POST или PATCH существующего сообщения.
+
+        Возвращает bool доставки (контракт send_incident_report): True — embed
+        в канале есть (свежий POST 2xx либо dedup-ветка: сообщение уже
+        запощено/PATCH-ится, дубль подавлен намеренно), False — свежий POST
+        не удался (HTTP >=400 / исключение). Наружу не бросает.
 
         Логика:
           1. Если content-key (alertname, ns, service, reason) уже в кэше
@@ -769,7 +914,8 @@ class DiscordService:
                 logging.info(
                     "discord_incident_dedup_claimed_elsewhere key=%s", key_full,
                 )
-                return
+                # Сообщение постит другая реплика — дедуп, не потеря.
+                return True
             self._audit_dedup_event(
                 "DEDUP_HIT_CONTENT" if dedup_mode == "content"
                 else "DEDUP_HIT_FINGERPRINT",
@@ -777,7 +923,9 @@ class DiscordService:
                 service=service, key=key_full,
             )
             await self._patch_recurrence_exact(url, embed, pg_key, now)
-            return
+            # Исходное сообщение в канале живо — фейл PATCH-а (только счётчик
+            # recurrence) недоставкой не считаем.
+            return True
 
         # Свежий — записываем DEDUP_MISS_FRESH ниже после успешного POST.
         self._audit_dedup_event(
@@ -803,7 +951,8 @@ class DiscordService:
                 url, embed, key_full, key_alert, namespace, pod,
                 mode="linked", now=now,
             )
-            return
+            # Burst-агрегация: первое сообщение alertname уже в канале.
+            return True
 
         # Иначе — новый POST (claim наш). wait=true чтобы получить msg_id
         # для будущего edit.
@@ -822,7 +971,7 @@ class DiscordService:
                     # POST не случился — отпускаем claim, иначе ключ молча
                     # глушит алерты до конца TTL-окна.
                     dedup_store.release(pg_key)
-                    return
+                    return False
                 # wait=true → 200 OK + JSON message. wait=false → 204 No Content.
                 if r.status_code == 200:
                     try:
@@ -832,7 +981,7 @@ class DiscordService:
         except Exception as e:
             logging.error("discord_incident_report_exception", extra={"error": str(e)})
             dedup_store.release(pg_key)
-            return
+            return False
 
         if not msg_id:
             # Без msg_id мы не сможем PATCH-ить (legacy webhook, wait=false) —
@@ -840,7 +989,8 @@ class DiscordService:
             # того же ключа пойдёт новым POST-ом. Claim отпускаем, иначе
             # placeholder глушил бы его до конца TTL-окна.
             dedup_store.release(pg_key)
-            return
+            # POST при этом прошёл (2xx без тела) — доставка состоялась.
+            return True
 
         # Cross-replica: фиксируем POST в PG-store (UPSERT по pg_key).
         # webhook_url в store НЕ кладём — это токен на постинг в канал, а
@@ -875,6 +1025,7 @@ class DiscordService:
                     "embed": embed,
                     "group_ns_pod": [f"{namespace}/{pod}"],
                 }
+        return True
 
     async def _patch_recurrence_exact(
         self,
@@ -1098,7 +1249,13 @@ class DiscordService:
                 break
             logging.warning(
                 "discord_rate_limited",
-                extra={"retry_after": retry_after, "attempt": attempts, "url": url[:60]},
+                extra={
+                    "retry_after": retry_after,
+                    "attempt": attempts,
+                    # Без токен-сегмента: url[:60] раньше утаскивал в логи
+                    # первые ~8 символов webhook-токена.
+                    "url": _redact_webhook_url(url)[:80],
+                },
             )
             await asyncio.sleep(wait)
             total_waited += wait
@@ -1147,7 +1304,7 @@ class DiscordService:
         contexts: List["EnrichedContext"],
         env: Optional[str] = None,
         resurfaced: bool = False,
-    ) -> None:
+    ) -> bool:
         """Детерминированный embed с KG-контекстом, БЕЗ LLM.
 
         Принимает batch `EnrichedContext` (несколько алертов одного типа в
@@ -1156,9 +1313,18 @@ class DiscordService:
 
         Не вызывает модель. Latency бюджет — <500ms p95 синхронно
         в HTTP-handler'е /webhooks/alertmanager/enrich-and-forward.
+
+        Возвращает delivered — тот же контракт, что у send_incident_report /
+        send_stats_report: True когда embed в канале есть (POST 2xx,
+        PATCH-dedup, placeholder живой реплики, DISCORD_DRY_RUN), False когда
+        доставки не было (severity-gate, нет вебхука, HTTP>=400, исключение).
+        Наружу не бросает. Нужно вызывающей стороне в
+        /webhooks/alertmanager/enrich-and-forward: без явного False откат
+        tentative-инкремента chronic-счётчика срабатывал только на
+        исключениях, а HTTP>=400 молча оставлял счётчик наращённым.
         """
         if not contexts:
-            return
+            return False
         head = contexts[0]
         incident = head.incident
         labels = incident.labels
@@ -1171,7 +1337,7 @@ class DiscordService:
                 "incident.skipped_low_severity",
                 alertname=alertname, severity=severity, path="enriched",
             )
-            return
+            return False
 
         # Цвет + emoji. B-блок #11 — severity-tier visual codes
         # (red/yellow/green/orange, title prefix 🚨/⚠️/✅/🔁).
@@ -1856,11 +2022,13 @@ class DiscordService:
                 resurfaced=resurfaced,
                 rollout_noise=head.rollout_noise,
             )
-            return
+            # DRY_RUN — намеренное подавление доставки, не сбой: счётчик
+            # дедупа откатывать не нужно (как в send_stats_report).
+            return True
         url = settings.DISCORD_WEBHOOK_URL
         if not url:
             logging.warning("DISCORD_WEBHOOK_URL not set, skipping enriched alert")
-            return
+            return False
         # Compact-mode payload не содержит embeds — PATCH-dedup-канал не
         # применим (нет structured fields для merge). Просто POST один раз.
         if is_compact:
@@ -1874,19 +2042,21 @@ class DiscordService:
                             "discord_enriched_alert_compact_failed",
                             extra={"status": r.status_code, "body": r.text[:200]},
                         )
+                        return False
             except Exception as e:
                 logging.error(
                     "discord_enriched_alert_compact_exception",
                     extra={"error": str(e)},
                 )
-            return
+                return False
+            return True
 
         # Stage 2: PATCH-dedup. Раньше send_enriched_alert POSTил на каждую
         # (alertname, severity)-группу AM batch'а — без content-dedup,
         # 18 embed/сутки в preprod (group_interval=10m, repeat=4h).
         # Теперь — content-key (alertname,ns,service,severity)+30-мин окно
         # → 1 POST + N PATCH (counter в footer'е).
-        await self._post_or_patch_enriched(
+        return await self._post_or_patch_enriched(
             url=url,
             payload=payload,
             embed=payload["embeds"][0],
@@ -1908,7 +2078,7 @@ class DiscordService:
         namespace: Optional[str],
         service: Optional[str],
         severity: str,
-    ) -> None:
+    ) -> bool:
         """PATCH-dedup для enriched-канала. Аналог `_post_or_edit_incident`,
         но с собственным кэшем `_recent_enriched` и без burst-агрегации
         (#9 здесь не нужна — enriched уже схлопывает AM batch в один embed).
@@ -1932,8 +2102,7 @@ class DiscordService:
         )
         if key is None:
             # Без alertname или невалидный вход — POST без dedup.
-            await self._post_enriched_raw(url, payload)
-            return
+            return await self._post_enriched_raw(url, payload)
 
         # Cross-replica store (PG, fallback на in-memory при недоступном PG):
         # per-process dict ломался на 2 репликах api — каждый под промахивался
@@ -1952,12 +2121,13 @@ class DiscordService:
                 logging.info(
                     "discord_enriched_dedup_claimed_elsewhere key=%s", key,
                 )
-                return
+                # Placeholder живой реплики = embed в канале будет: не недоставка.
+                return True
             await self._patch_enriched_recurrence(
                 url=url, embed=embed, key=key,
                 ttl_sec=ttl, now=now,
             )
-            return
+            return True
 
         # Новый POST (claim наш). wait=true чтобы получить msg_id.
         post_url = _ensure_wait_param(url)
@@ -1974,7 +2144,7 @@ class DiscordService:
                     )
                     # POST не случился — отпускаем claim.
                     dedup_store.release(key)
-                    return
+                    return False
                 if r.status_code == 200:
                     try:
                         msg_id = str(r.json().get("id") or "") or None
@@ -1983,14 +2153,15 @@ class DiscordService:
         except Exception as e:
             logging.error("discord_enriched_alert_exception", extra={"error": str(e)})
             dedup_store.release(key)
-            return
+            return False
 
         if not msg_id:
             # Legacy webhook без wait=true → нечего PATCH-ить, dedup-кэш
             # не пополняем (контракт прежний: следующий firing = новый POST).
             # Claim отпускаем — это симметрично с `_post_or_edit_incident`.
             dedup_store.release(key)
-            return
+            # POST прошёл (2xx), просто нечего PATCH-ить — доставка состоялась.
+            return True
 
         # Без webhook_url: enriched-канал всегда шлёт на
         # settings.DISCORD_WEBHOOK_URL, PATCH перечитает его из настроек.
@@ -2004,6 +2175,7 @@ class DiscordService:
             severity=severity,
             now=now,
         )
+        return True
 
     async def send_resolved_notice(
         self,
@@ -2043,9 +2215,13 @@ class DiscordService:
             return
         await self._post_enriched_raw(url, payload)
 
-    async def _post_enriched_raw(self, url: str, payload: Dict[str, Any]) -> None:
+    async def _post_enriched_raw(self, url: str, payload: Dict[str, Any]) -> bool:
         """Fallback-POST когда _compute_enriched_key вернул None.
-        Без dedup — просто шлём embed."""
+
+        Без dedup — просто шлём embed. Возвращает delivered (см. контракт
+        send_enriched_alert): False на HTTP>=400, чтобы вызывающая сторона
+        могла откатить tentative-инкремент chronic-счётчика.
+        """
         async with httpx.AsyncClient() as client:
             r = await self._request_with_ratelimit(
                 client, "post", url, json=payload
@@ -2055,6 +2231,8 @@ class DiscordService:
                     "discord_enriched_alert_failed",
                     extra={"status": r.status_code, "body": r.text[:200]},
                 )
+                return False
+        return True
 
     async def _patch_enriched_recurrence(
         self,
@@ -2202,7 +2380,8 @@ class DiscordService:
             }]
         }
         async with httpx.AsyncClient() as client:
-            r = await client.post(url, json=payload)
+            # #3: 429 в alert-storm (probe-алерты идут вместе с ним) ретраится.
+            r = await self._request_with_ratelimit(client, "post", url, json=payload)
             if r.status_code >= 400:
                 logging.error(
                     "discord_external_probe_alert_failed",
@@ -2262,7 +2441,9 @@ class DiscordService:
             }]
         }
         async with httpx.AsyncClient() as client:
-            r = await client.post(url, json=payload)
+            # #3: self-health алерт нужен ровно тогда, когда всё горит и Discord
+            # рейтлимитит — 429 ретраится, а не глотается.
+            r = await self._request_with_ratelimit(client, "post", url, json=payload)
             if r.status_code >= 400:
                 logging.error(
                     "discord_self_health_alert_failed",
@@ -2321,20 +2502,23 @@ class DiscordService:
                 "inline": False,
             })
 
-        payload = {
-            "embeds": [{
-                "title": (
-                    f"🔴 {total_count} stuck alerts "
-                    f"(>{min_duration_hours}h firing)"
-                )[:256],
-                "color": _COLOR_CRITICAL,
-                "fields": fields,
-                "footer": {"text": "runbook: ..."},
-                "timestamp": datetime.now(timezone.utc).isoformat(),
-            }]
+        embed: Dict[str, Any] = {
+            "title": (
+                f"🔴 {total_count} stuck alerts "
+                f"(>{min_duration_hours}h firing)"
+            )[:256],
+            "color": _COLOR_CRITICAL,
+            "fields": fields,
+            "footer": {"text": "runbook: ..."},
+            "timestamp": datetime.now(timezone.utc).isoformat(),
         }
+        # #6: 15 полей × до 1024 chars — потенциально >6000 TOTAL → Discord 400
+        # → эскалация дропалась бы целиком именно на больших завалах.
+        _fit_embed_to_limit(embed)
+        payload = {"embeds": [embed]}
         async with httpx.AsyncClient() as client:
-            r = await client.post(url, json=payload)
+            # #3: 429 в alert-storm ретраится, а не глотается.
+            r = await self._request_with_ratelimit(client, "post", url, json=payload)
             if r.status_code >= 400:
                 logging.error(
                     "discord_stuck_alerts_escalation_failed",

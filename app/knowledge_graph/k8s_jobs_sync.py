@@ -53,6 +53,13 @@ logger = logging.getLogger(__name__)
 
 _KUBECTL_TIMEOUT_S = 30
 
+# Коммитим порциями, а не одной транзакцией на весь тик — та же дисциплина,
+# что в k8s_topology_resources_sync: транзакция держит локи на kg_k8s_jobs /
+# kg_services всё время своей жизни, и при волне джоб (накат миграций) это
+# минуты, в которые DDL не может взять ACCESS EXCLUSIVE. Синк идемпотентен,
+# поэтому потеря атомарности тика безопасна, а долгая блокировка — нет.
+_COMMIT_BATCH = 200
+
 # Bounded cleanup для kg_k8s_jobs: строки, не подтверждённые sync-ом дольше
 # N часов (default ниже, конфигурируется KG_K8S_JOBS_STALE_HOURS) — удалённые
 # из кластера Job/CronJob. Без чистки удалённый one-off migration-Job с
@@ -477,8 +484,59 @@ def _upsert_k8s_job(
 # ── sync logic ──────────────────────────────────────────────────────────────
 
 
-def _sync_one_job(db: Session, job: Dict[str, Any], stats: Dict[str, int]) -> None:
-    """Обработать один Job. Вызывается под per-item SAVEPOINT-ом."""
+def _prefetch_failed_job_exit_codes(
+    jobs: List[Dict[str, Any]], stats: Dict[str, int],
+) -> Dict[Tuple[str, str], int]:
+    """kubectl-фетчи exit-кодов failed-джоб — ДО открытия транзакции тика.
+
+    Раньше `_kubectl_get_pod_exit_code` вызывался из `_sync_one_job`, то есть
+    внутри уже открытой транзакции: волна failed-джоб (накат миграций) давала
+    N внешних вызовов по 30с каждый, пока транзакция держала локи на
+    kg_k8s_jobs / kg_services. Ровно эту дисциплину («внешние вызовы раньше
+    первого SQL») чинили в k8s_topology_resources_sync и kg_sync.
+
+    Ключ — (namespace, name), дубли пар фетчим один раз. Фильтр по
+    failed_count>0 сохранён: у succeeded job-а exit=0 уже implied, и на 100%
+    success кластере kubectl не вызывается вовсе.
+
+    Разбор status обёрнут в try: битую запись разберёт основной цикл под
+    SAVEPOINT-ом и посчитает в `errors` — префетч не вправе ронять тик.
+    """
+    resolved: Dict[Tuple[str, str], int] = {}
+    for job in jobs:
+        try:
+            meta = job.get("metadata") or {}
+            ns = meta.get("namespace") or "default"
+            name = meta.get("name")
+            if not name:
+                continue
+            if _extract_job_status(job)["failed_count"] <= 0:
+                continue
+            key = (ns, name)
+            if key in resolved:
+                continue
+            code = _kubectl_get_pod_exit_code(ns, name)
+        except Exception as e:
+            logger.warning("k8s_jobs_sync.exit_code_prefetch_failed err=%s", e)
+            continue
+        if code is not None:
+            resolved[key] = code
+            stats["exit_codes_resolved"] += 1
+    return resolved
+
+
+def _sync_one_job(
+    db: Session,
+    job: Dict[str, Any],
+    stats: Dict[str, int],
+    exit_codes: Optional[Dict[Tuple[str, str], int]] = None,
+) -> None:
+    """Обработать один Job. Вызывается под per-item SAVEPOINT-ом.
+
+    `exit_codes` — карта из `_prefetch_failed_job_exit_codes`, собранная ДО
+    транзакции. None (прямой вызов из CLI/тестов) → старое поведение с
+    kubectl по месту.
+    """
     meta = job.get("metadata") or {}
     ns = meta.get("namespace") or "default"
     name = meta.get("name")
@@ -492,9 +550,12 @@ def _sync_one_job(db: Session, job: Dict[str, Any], stats: Dict[str, int]) -> No
     # kubectl-вызовы на 100% success cluster-ах.
     exit_code: Optional[int] = None
     if status_fields["failed_count"] > 0:
-        exit_code = _kubectl_get_pod_exit_code(ns, name)
-        if exit_code is not None:
-            stats["exit_codes_resolved"] += 1
+        if exit_codes is not None:
+            exit_code = exit_codes.get((ns, name))
+        else:
+            exit_code = _kubectl_get_pod_exit_code(ns, name)
+            if exit_code is not None:
+                stats["exit_codes_resolved"] += 1
 
     obj_labels = meta.get("labels") or {}
     pod_labels = _extract_pod_template_labels(job, "job")
@@ -558,13 +619,17 @@ def sync_all_jobs(db: Session) -> Dict[str, int]:
         "errors": 0,
     }
 
-    for job in jobs:
+    # Все внешние вызовы — здесь, до первого SQL: транзакция тика больше не
+    # ждёт kubectl (см. _prefetch_failed_job_exit_codes).
+    exit_codes = _prefetch_failed_job_exit_codes(jobs, stats)
+
+    for i, job in enumerate(jobs, 1):
         try:
             # SAVEPOINT на item: одна битая запись (DataError и т.п.) не
             # переводит Session в aborted-состояние и не роняет весь tick.
             # Зеркалит per-item SAVEPOINT из k8s_events_sync.
             with db.begin_nested():
-                _sync_one_job(db, job, stats)
+                _sync_one_job(db, job, stats, exit_codes=exit_codes)
         except Exception as e:
             stats["errors"] += 1
             logger.warning(
@@ -572,6 +637,10 @@ def sync_all_jobs(db: Session) -> Dict[str, int]:
                 (job.get("metadata") or {}).get("namespace"),
                 (job.get("metadata") or {}).get("name"), e,
             )
+        if i % _COMMIT_BATCH == 0:
+            # Короткая транзакция = локи отпускаются, соседние писатели и DDL
+            # не ждут конца всего тика.
+            db.commit()
 
     db.commit()
     logger.info(
@@ -710,6 +779,10 @@ def _link_jobs_to_cronjob_owners(db: Session) -> int:
     знает к какому Service относится без повторного label-resolve.
 
     Возвращает кол-во linked Job-ов.
+
+    Родители берутся ОДНИМ запросом. Раньше на каждый Job с
+    ownerRef=CronJob шёл отдельный SELECT: на сотнях джоб — сотни запросов
+    каждые 15 минут, все внутри одной транзакции.
     """
     linked = 0
     jobs = (
@@ -717,6 +790,10 @@ def _link_jobs_to_cronjob_owners(db: Session) -> int:
         .filter(K8sJob.kind == "job")
         .all()
     )
+
+    # Первый проход — только чтение metadata (без SQL): собираем пары
+    # (namespace, cronjob-name), по которым нужны родители.
+    pending: List[Tuple[K8sJob, Dict[str, Any], str]] = []
     for j in jobs:
         meta: Dict[str, Any] = cast(Dict[str, Any], j.metadata_json or {})
         owner_refs = meta.get("owner_references") or []
@@ -727,20 +804,38 @@ def _link_jobs_to_cronjob_owners(db: Session) -> int:
                 break
         if not cj_name:
             continue
-        parent = (
-            db.query(K8sJob)
-            .filter_by(namespace=j.namespace, name=cj_name, kind="cronjob")
-            .one_or_none()
+        pending.append((j, meta, cj_name))
+
+    if not pending:
+        return 0
+
+    namespaces = {str(j.namespace) for j, _, _ in pending}
+    cj_names = {cj_name for _, _, cj_name in pending}
+    parents = (
+        db.query(K8sJob)
+        .filter(
+            K8sJob.kind == "cronjob",
+            K8sJob.namespace.in_(namespaces),
+            K8sJob.name.in_(cj_names),
         )
-        if parent is None:
-            continue
-        parent_meta: Dict[str, Any] = cast(Dict[str, Any], parent.metadata_json or {})
-        owner_id = parent_meta.get("owner_service_id")
+        .all()
+    )
+    # IN×IN может принести лишние пары (ns-A/cron-B, которого никто не просил) —
+    # выбираем по точному ключу, лишнее просто не находится.
+    owner_by_key: Dict[Tuple[str, str], Any] = {
+        (str(p.namespace), str(p.name)): (
+            cast(Dict[str, Any], p.metadata_json or {})
+        ).get("owner_service_id")
+        for p in parents
+    }
+
+    for j, meta, cj_name in pending:
+        owner_id = owner_by_key.get((str(j.namespace), cj_name))
         if not owner_id:
             continue
-        meta_updated = dict(meta)
-        if meta_updated.get("owner_service_id") == owner_id:
+        if meta.get("owner_service_id") == owner_id:
             continue
+        meta_updated = dict(meta)
         meta_updated["owner_service_id"] = owner_id
         j.metadata_json = cast(Any, meta_updated)
         linked += 1

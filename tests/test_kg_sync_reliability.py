@@ -20,7 +20,8 @@ from datetime import datetime, timedelta
 
 import pytest
 import sqlalchemy.orm as orm
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, update
+from sqlalchemy.dialects import postgresql
 from sqlalchemy.orm import sessionmaker
 
 import app.knowledge_graph.kg_sync as kg_sync
@@ -29,7 +30,8 @@ from app.knowledge_graph.edge_decay_guard import reset_source_reports
 from app.knowledge_graph.k8s_jobs_sync import _upsert_k8s_job
 from app.knowledge_graph.k8s_storage_sync import _upsert_volume
 from app.knowledge_graph.kg_sync import (
-    EDGE_DECAY_MAX_DELETE_PCT, KubectlFetchError, _edge_decay_should_skip,
+    EDGE_DECAY_MAX_DELETE_PCT, KubectlFetchError, _decay_stale_edges,
+    _edge_decay_should_skip, _extras_inactive_filter, _revive_active_edges,
     sync_topology,
 )
 from app.knowledge_graph.populator import upsert_edge, upsert_service
@@ -458,3 +460,256 @@ def test_upsert_volume_recovers_from_integrity_race(db, monkeypatch):
 
     assert db.query(StorageVolume).count() == 1   # без дубля
     assert vol.phase == "Released"                # апдейт применён
+
+
+# ── #5 инцидент 08.08.2026: короткие транзакции вместо многоминутной ─────────
+#
+# Pass 1 был одной транзакцией на весь проход: первый ns открывал её, дальше
+# ~80 kubectl-вызовов (таймаут 15с каждый) и тысячи upsert'ов шли до
+# единственного db.commit() после цикла. Активную транзакцию
+# idle_in_transaction_session_timeout НЕ обрывает — row-locks жили минутами
+# (см. app/database.py и tests/test_idle_transaction_guard.py). Фикс — как в
+# k8s_topology_resources_sync: весь kubectl-I/O до первого SQL + commit после
+# каждого namespace.
+
+
+def test_pass1_and_pass2_commit_per_namespace(db, monkeypatch):
+    """После КАЖДОГО namespace в Pass 1 и Pass 2 идёт db.commit().
+
+    Если commit снова уедет за цикл — вернётся многоминутная транзакция
+    08.08.2026, которую серверный idle-timeout не обрывает.
+    """
+    order: list[str] = []
+    monkeypatch.setattr(kg_sync, "_kubectl_get_deployments", lambda ns: [])
+
+    def fake_sync_ns(db_, ns, deploys=None):
+        order.append(f"p1:{ns}")
+        return {"services": 0, "edges": 0, "skipped": 0}
+
+    def fake_enrich(db_, ns, deploys, known_index):
+        order.append(f"p2:{ns}")
+        return 0
+
+    monkeypatch.setattr(kg_sync, "sync_namespace", fake_sync_ns)
+    monkeypatch.setattr(kg_sync, "_enrich_calls_edges_for_ns", fake_enrich)
+
+    real_commit = db.commit
+
+    def spy_commit():
+        order.append("commit")
+        real_commit()
+
+    monkeypatch.setattr(db, "commit", spy_commit)
+
+    namespaces = ["squad-1", "squad-2", "squad-3"]
+    total = sync_topology(db, namespaces=namespaces)
+    assert total["errors"] == 0
+    assert total["namespaces"] == 3
+
+    for marker in ("p1", "p2"):
+        # Между соседними ns одного прохода обязан быть commit…
+        for a, b in zip(namespaces, namespaces[1:]):
+            ia = order.index(f"{marker}:{a}")
+            ib = order.index(f"{marker}:{b}")
+            assert "commit" in order[ia + 1:ib], (
+                f"между {marker}:{a} и {marker}:{b} нет commit — проход "
+                "снова копит одну длинную транзакцию (инцидент 08.08.2026)"
+            )
+        # …и после последнего ns прохода — тоже (хвост не висит до Pass 3).
+        last = order.index(f"{marker}:{namespaces[-1]}")
+        assert "commit" in order[last + 1:], (
+            f"после {marker}:{namespaces[-1]} нет commit"
+        )
+
+
+def test_kg_sync_reads_k8s_before_touching_db(monkeypatch):
+    """Все kubectl-фетчи Pass 1 идут РАНЬШЕ первого обращения к Session.
+
+    Зеркалит test_topology_sync_reads_k8s_before_touching_db: пока порядок
+    «fetch → SQL», транзакция на время внешних вызовов не открыта вовсе и
+    ACCESS SHARE никого не держит. Если kubectl вернётся внутрь SQL-цикла,
+    транзакция первого ns снова уедет в 15-секундные kubectl'и открытой.
+    """
+    order: list[str] = []
+
+    class _NoOp:
+        """Callable + context manager: покрывает db.commit() и
+        `with db.begin_nested():` без реальной сессии."""
+
+        def __call__(self, *a, **kw):
+            return self
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    class _TxSpySession:
+        """Любое обращение к сессии = потенциальное открытие транзакции."""
+
+        def __getattr__(self, name):
+            order.append(f"db.{name}")
+            return _NoOp()
+
+    monkeypatch.setattr(
+        kg_sync, "_kubectl_get_deployments",
+        lambda ns: order.append("kubectl") or [{"metadata": {"name": f"svc-{ns}"}}],
+    )
+    monkeypatch.setattr(
+        kg_sync, "sync_namespace",
+        lambda db_, ns, deploys=None: order.append("sql")
+        or {"services": 0, "edges": 0, "skipped": 0},
+    )
+    monkeypatch.setattr(
+        kg_sync, "_build_known_index", lambda db_: order.append("sql") or {},
+    )
+    monkeypatch.setattr(
+        kg_sync, "_enrich_calls_edges_for_ns",
+        lambda db_, ns, deploys, known_index: order.append("sql") or 0,
+    )
+    # Pass 3 против spy-сессии не работает — глушим (его границы транзакций
+    # проверяют соседние тесты на реальной sqlite).
+    monkeypatch.setattr(kg_sync, "_revive_active_edges", lambda db_: 0)
+    monkeypatch.setattr(
+        kg_sync, "_decay_stale_edges",
+        lambda db_, has_fetch_errors=False: {
+            "marked_inactive": 0, "deleted": 0, "skipped_decay": 0,
+            "stale_sources": [], "blocked_by_source": 0, "blocked_kinds": {},
+        },
+    )
+
+    sync_topology(_TxSpySession(), namespaces=["squad-1", "squad-2"])
+
+    kubectl_calls = [i for i, x in enumerate(order) if x == "kubectl"]
+    db_touches = [
+        i for i, x in enumerate(order) if x == "sql" or x.startswith("db.")
+    ]
+    assert len(kubectl_calls) == 2
+    assert db_touches, "SQL-фаза не отработала — тест сломан"
+    assert max(kubectl_calls) < min(db_touches), (
+        f"kubectl после первого SQL: {order} — транзакция уедет в kubectl "
+        "открытой (инцидент 08.08.2026)"
+    )
+
+
+# ── #6 Pass 3: точечный SQL вместо загрузки графа в ORM ──────────────────────
+#
+# `_revive_active_edges` тянул в ORM ВСЕ свежие рёбра (то есть почти весь
+# граф — десятки тысяч объектов каждый час) только чтобы проверить один ключ
+# `extras['inactive']`, которых в норме единицы. Фильтр ушёл в БД:
+# JSONB-containment на PG, json_extract на sqlite.
+
+
+def _spy_query_all(monkeypatch):
+    """Записывать размер каждой ORM-выборки рёбер (Query.all)."""
+    sizes: list[int] = []
+    orig = orm.Query.all
+
+    def spy(self):
+        rows = orig(self)
+        if rows and isinstance(rows[0], ServiceEdge):
+            sizes.append(len(rows))
+        return rows
+
+    monkeypatch.setattr(orm.Query, "all", spy)
+    return sizes
+
+
+def test_revive_active_edges_loads_only_inactive_edges(db, monkeypatch):
+    """Загружается ровно помеченное ребро, а не весь свежий граф."""
+    src = upsert_service(db, "squad-1", "src")
+    for i in range(20):
+        dst = upsert_service(db, "squad-1", f"fresh-{i}")
+        upsert_edge(db, src, dst, kind="calls", discovered_by="kg_sync/env_vars")
+    marked = upsert_edge(
+        db, src, upsert_service(db, "squad-1", "was-inactive"),
+        kind="calls", discovered_by="kg_sync/env_vars",
+    )
+    marked.extras = {"inactive": True, "inactivated_at": "2026-08-01T00:00:00"}
+    db.commit()
+    assert db.query(ServiceEdge).count() == 21
+
+    sizes = _spy_query_all(monkeypatch)
+    revived = _revive_active_edges(db)
+    db.commit()
+
+    assert revived == 1
+    assert sizes == [1], (
+        f"в ORM загружено {sizes} рёбер вместо одного помеченного — фильтр по "
+        "extras снова считается в Python"
+    )
+    assert (db.get(ServiceEdge, marked.id).extras or {}) == {}
+
+
+def test_revive_filter_uses_jsonb_containment_on_postgres():
+    """На PG условие компилируется в `@>` (index-friendly containment), а не
+    в загрузку рёбер. sqlite-ветка проверяется тестом выше."""
+
+    class _FakeBind:
+        dialect = postgresql.dialect()
+
+    class _FakeSession:
+        def get_bind(self):
+            return _FakeBind()
+
+    sql = str(
+        _extras_inactive_filter(_FakeSession()).compile(
+            dialect=postgresql.dialect(),
+        )
+    )
+    assert "@>" in sql
+    assert "JSONB" in sql.upper()
+
+
+def test_decay_delete_spares_edge_refreshed_between_select_and_delete(
+    db, monkeypatch,
+):
+    """Ребро, освежённое конкурентным синком между SELECT кандидатов и DELETE,
+    остаётся живым: условие по last_seen_at повторяется в WHERE самого DELETE.
+
+    Раньше DELETE шёл по списку id без повторной проверки — живое ребро
+    исчезало и возвращалось следующим тиком (лишний churn + завышенный
+    decay-счётчик, по которому судят о здоровье графа).
+    """
+    _seed_edges(db, fresh=8, old_days_each=[40, 40])  # 10 рёбер, 2 старых = 20%
+    stale_ids = [
+        e.id for e in db.query(ServiceEdge)
+        .filter(ServiceEdge.last_seen_at < datetime.utcnow() - timedelta(days=30))
+        .all()
+    ]
+    assert len(stale_ids) == 2
+    refreshed_id = stale_ids[0]
+
+    orig_all = orm.Query.all
+    fired = {"done": False}
+
+    def spy(self):
+        rows = orig_all(self)
+        if (
+            not fired["done"]
+            and rows
+            and isinstance(rows[0], ServiceEdge)
+            and any(e.id == refreshed_id for e in rows)
+        ):
+            fired["done"] = True
+            # Конкурентный синк (beat-таски живут в forked-процессах) освежил
+            # ребро сразу после нашего SELECT-а.
+            db.execute(
+                update(ServiceEdge)
+                .where(ServiceEdge.id == refreshed_id)
+                .values(last_seen_at=datetime.utcnow()),
+            )
+        return rows
+
+    monkeypatch.setattr(orm.Query, "all", spy)
+    stats = _decay_stale_edges(db, has_fetch_errors=False)
+    monkeypatch.undo()
+    db.commit()
+
+    assert fired["done"], "гонка не сэмулирована — тест сломан"
+    alive = {e.id for e in db.query(ServiceEdge).all()}
+    assert refreshed_id in alive, "освежённое ребро удалили вслепую по списку id"
+    assert stale_ids[1] not in alive          # реально старое — удалено
+    # Счётчик считает фактически удалённое, а не число кандидатов.
+    assert stats["deleted"] == 1

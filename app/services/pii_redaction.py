@@ -30,7 +30,7 @@ Limits:
 from __future__ import annotations
 
 import re
-from typing import Pattern
+from typing import List, Optional, Pattern, Tuple
 
 # ---------------------------------------------------------------------------
 # Pattern definitions
@@ -65,6 +65,14 @@ _PEM_PRIVATE_KEY_TRUNCATED: Pattern[str] = re.compile(
 # the kv-rule so `aws_access_key_id=AKIA...` still collapses the id cleanly.
 _AWS_ACCESS_KEY_ID: Pattern[str] = re.compile(r"\b(?:AKIA|ASIA)[0-9A-Z]{16}\b")
 
+# Креды внутри URI: `scheme://user:password@host`. Самый частый секрет в
+# pod-логах (connection string к PG/Redis/NATS в сообщении об ошибке) — и он
+# не ловится ни kv-правилом (нет `password=`), ни long-hex. Требуем `://`
+# перед и `@` после, поэтому ложных срабатываний на обычном тексте нет.
+_URI_CREDENTIALS: Pattern[str] = re.compile(
+    r"(?<=://)([^\s:/@]+):([^\s:/@]+)(?=@)"
+)
+
 # RFC-light email. We deliberately don't try to follow RFC 5322 — too greedy
 # regexes have caused CPU bombs in the wild. `\S` excluded so we don't eat
 # spaces, and we cap the local-part at 64 / domain-part at 253.
@@ -92,6 +100,32 @@ _BASIC_AUTH: Pattern[str] = re.compile(
     r"\bBasic\s+[A-Za-z0-9+/]{8,}={0,2}",
     re.IGNORECASE,
 )
+
+# Вендорные API-токены с фиксированным префиксом. «Голый» токен (вне key=value
+# и вне Authorization-заголовка) не ловится ни kv-правилом, ни bearer/basic-
+# правилами, ни long-hex catch-all-ом (алфавит base64url, не hex) — прогон по
+# реальным строкам это подтвердил. Каждому вендору — явный префиксный паттерн:
+# префиксы достаточно уникальны, чтобы не давать ложных срабатываний на
+# обычном тексте. Агрессивные «похоже-на-base64» эвристики намеренно НЕ
+# используем — они бы порезали обычные слова/идентификаторы в логах.
+_VENDOR_TOKENS: List[Tuple[Pattern[str], str]] = [
+    # Anthropic: sk-ant-api03-... (base64url + дефисы). Case-sensitive: реальный
+    # префикс всегда lowercase, а `\b` не даёт матчиться внутри слов ("risk-ant…").
+    (re.compile(r"\bsk-ant-[A-Za-z0-9_\-]{10,}"), "<anthropic-key>"),
+    # Slack: xox[baprs]-… (bot/app/legacy/refresh/session). Тело — цифры и
+    # base64url-сегменты через дефис.
+    (re.compile(r"\bxox[baprs]-[A-Za-z0-9\-]{10,}"), "<slack-token>"),
+    # GitHub classic tokens: ghp_ (PAT), gho_/ghu_/ghs_/ghr_ (OAuth/app) —
+    # один формат: префикс + 36+ alnum. Порог 20 отсекает случайные слова.
+    (re.compile(r"\bgh[opsur]_[A-Za-z0-9]{20,}\b"), "<github-token>"),
+    # GitHub fine-grained PAT: github_pat_<22>_<59>, алфавит с underscore.
+    (re.compile(r"\bgithub_pat_[A-Za-z0-9_]{20,}\b"), "<github-token>"),
+    # Google API key: AIza + 35 символов [0-9A-Za-z_\-] (полный ключ = 39).
+    # `{35,}` — чтобы дожевать хвост, если ключ длиннее канонического.
+    (re.compile(r"\bAIza[0-9A-Za-z_\-]{35,}"), "<google-api-key>"),
+    # Stripe: sk_live_/sk_test_ (secret) и rk_live_/rk_test_ (restricted).
+    (re.compile(r"\b[sr]k_(?:live|test)_[A-Za-z0-9]{10,}\b"), "<stripe-key>"),
+]
 
 # UUID v1-v5 (8-4-4-4-12 hex). Must come BEFORE long-hex catch-all.
 _UUID: Pattern[str] = re.compile(
@@ -157,29 +191,38 @@ def _kv_replace(match: "re.Match[str]") -> str:
     return f"{key}{sep}{quote}<redacted>{quote}"
 
 
-def redact_pii(text: str) -> str:
-    """Redact PII / credentials from `text` and truncate to `_MAX_LEN`.
+def redact_pii(text: str, max_len: Optional[int] = _MAX_LEN) -> str:
+    """Redact PII / credentials from `text` and truncate to `max_len`.
 
     Returns a redacted, possibly truncated string. Empty / None-equivalent
     inputs return empty string.
+
+    `max_len` — граница усечения результата (по умолчанию `_MAX_LEN`, как
+    исторически для Discord/KG-пути). `None` = без усечения: нужен для
+    pod-логов, уходящих в LLM-контекст, где 500 символов срезали бы весь
+    диагностический хвост (redact — да, truncate — нет).
 
     Order of operations:
         1.  PEM key      → `<private-key>` (whole armoured block, DOTALL;
                            then a dangling BEGIN-without-END tail — a log
                            line truncated mid-key must not leak the body)
+        1b. URI creds    → `user:<redacted>` (`scheme://user:password@host`)
         2.  Emails       → `<email>`
         3.  JWT          → `<jwt>`
         4.  AWS key id   → `<aws-key-id>` (AKIA.../ASIA...)
         5.  Bearer ...   → `Bearer <token>`
         6.  Basic ...    → `Basic <credentials>`
-        7.  UUIDs        → `<uuid>`
-        8.  key=value    → `key=<redacted>` (password/token/secret/api_key/...
+        7.  Vendor keys  → `<anthropic-key>` / `<slack-token>` /
+                           `<github-token>` / `<google-api-key>` /
+                           `<stripe-key>` (голые префиксные токены)
+        8.  UUIDs        → `<uuid>`
+        9.  key=value    → `key=<redacted>` (password/token/secret/api_key/...
                            incl. underscore-prefixed keys like
                            aws_secret_access_key / client_secret / refresh_token)
-        9.  Long hex     → `<hex:N>`
-        10. IPv6         → `<ip>`
-        11. IPv4         → `<ip>`
-        12. Truncate     → first `_MAX_LEN` chars + marker if longer
+        10. Long hex     → `<hex:N>`
+        11. IPv6         → `<ip>`
+        12. IPv4         → `<ip>`
+        13. Truncate     → first `max_len` chars + marker if longer
 
     PEM blocks are scrubbed first so the base64 body isn't shredded into
     `<hex:N>` / `<email>` fragments (which would leave a partial key carcass).
@@ -196,19 +239,26 @@ def redact_pii(text: str) -> str:
 
     out = _PEM_PRIVATE_KEY.sub("<private-key>", out)
     out = _PEM_PRIVATE_KEY_TRUNCATED.sub("<private-key>", out)
+    # До email/ip: в `postgres://svc:pw@host` пароль иначе доживёт до вывода.
+    out = _URI_CREDENTIALS.sub(r"\1:<redacted>", out)
     out = _EMAIL.sub("<email>", out)
     out = _JWT.sub("<jwt>", out)
     out = _AWS_ACCESS_KEY_ID.sub("<aws-key-id>", out)
     out = _BEARER.sub("Bearer <token>", out)
     out = _BASIC_AUTH.sub("Basic <credentials>", out)
+    # Вендорные токены — до kv-правила: `token=sk-ant-...` тоже схлопнется
+    # (kv-правило потом заменит уже-обезличенный placeholder на <redacted>),
+    # а «голый» токен без key= иначе не поймал бы никто.
+    for pattern, placeholder in _VENDOR_TOKENS:
+        out = pattern.sub(placeholder, out)
     out = _UUID.sub("<uuid>", out)
     out = _KV_SECRET.sub(_kv_replace, out)
     out = _LONG_HEX.sub(lambda m: f"<hex:{len(m.group(0))}>", out)
     out = _IPV6.sub("<ip>", out)
     out = _IPV4.sub("<ip>", out)
 
-    if len(out) > _MAX_LEN:
-        # Reserve room for the marker so the final string is `_MAX_LEN` chars.
-        head = out[: _MAX_LEN - len(_TRUNCATE_MARKER)]
+    if max_len is not None and len(out) > max_len:
+        # Reserve room for the marker so the final string is `max_len` chars.
+        head = out[: max_len - len(_TRUNCATE_MARKER)]
         out = f"{head}{_TRUNCATE_MARKER}"
     return out

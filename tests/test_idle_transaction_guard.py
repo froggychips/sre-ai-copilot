@@ -54,6 +54,27 @@ def test_timeout_targets_idle_only_not_active_queries():
     assert "statement_timeout" not in options
 
 
+def test_module_engine_pins_session_timezone_to_utc():
+    """У модульного engine в options есть `-c timezone=UTC`.
+
+    Отдельный от pool-config guard: инвариант «в БД naive UTC, сессия
+    принудительно в UTC» (docstring app/database.py, docs/SEMANTIC_CONTRACT.md
+    §10) должен держаться на РЕАЛЬНОМ engine, а не только в билдере. Соседство
+    двух `-c`-параметров в одной строке — тоже часть проверки: раньше там был
+    один, и дописать второй легко неправильно (без пробела опции склеятся и
+    libpq отвергнет коннект).
+    """
+    import app.database as db_mod
+
+    if db_mod._is_sqlite:
+        assert "connect_args" not in db_mod._pool_kwargs
+        return
+
+    options = db_mod._pool_kwargs["connect_args"]["options"]
+    assert "-c timezone=UTC" in options, f"options={options!r}"
+    assert "idle_in_transaction_session_timeout" in options
+
+
 def test_topology_sync_reads_k8s_before_touching_db():
     """В `sync_topology_resources` kubectl идёт РАНЬШЕ первого запроса к БД.
 

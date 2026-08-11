@@ -8,11 +8,37 @@ Service URL:
   http://localhost:8000
 {{- end }}
 
-IMPORTANT: configure secrets before the pods will start:
+Secrets:
+{{- if .Values.secrets.existingSecret }}
+  Используется существующий Secret "{{ .Values.secrets.existingSecret }}"
+  (рекомендуемый путь). Чарт его НЕ рендерит и НЕ перезаписывает при upgrade —
+  владелец Secret-а остаётся SealedSecrets / ExternalSecrets / оператор.
 
-  kubectl -n {{ .Release.Namespace }} edit secret {{ include "sre-ai-copilot.secretName" . }}
+  Проверить набор ключей (значения не печатаются):
 
-Required keys: ANTHROPIC_API_KEY, DATABASE_URL, REDIS_URL, DISCORD_WEBHOOK_URL,
-ALERTMANAGER_WEBHOOK_SECRET, JWT_PUBLIC_KEY, JIRA_BASE_URL, JIRA_EMAIL, JIRA_API_TOKEN.
+    kubectl -n {{ .Release.Namespace }} describe secret {{ .Values.secrets.existingSecret }}
+{{- else }}
+  ⚠️  WARNING: секреты идут ЧЕРЕЗ VALUES (secrets.existingSecret не задан).
 
-For production use SealedSecrets or ExternalSecrets instead of plain Secret.
+  Значения из values попадают в helm release Secret
+  (sh.helm.release.v1.{{ .Release.Name }}.vN) и хранятся там по версиям релиза:
+  ротация ключа не убирает его из истории. `--set secrets.*=...` дополнительно
+  светит значение в shell history и в argv (виден в `ps`). Это допустимо для
+  kind/minikube и НЕ допустимо для prod.
+
+  Как перейти на безопасный путь:
+
+    1. создать Secret вне чарта (SealedSecrets / ExternalSecrets —
+       см. k8s/base/secrets.sealed.yaml.example, secrets.external.yaml.example);
+    2. helm upgrade ... --set secrets.existingSecret=<name>
+       и убрать значения из values-файлов;
+    3. проверить, что поды перечитали env: kubectl -n {{ .Release.Namespace }} rollout restart \
+         deploy/{{ include "sre-ai-copilot.fullname" . }}-api \
+         deploy/{{ include "sre-ai-copilot.fullname" . }}-worker \
+         deploy/{{ include "sre-ai-copilot.fullname" . }}-beat
+{{- end }}
+
+Требуемые ключи: ANTHROPIC_API_KEY, DATABASE_URL, REDIS_URL, DISCORD_WEBHOOK_URL,
+ALERTMANAGER_WEBHOOK_SECRET, JWT_PUBLIC_KEY, JIRA_BASE_URL, JIRA_EMAIL,
+JIRA_API_TOKEN. Недостающие ключи под не «пропустит»: env=production включает
+fail-closed валидаторы app/config.py, под падает на старте (by design).

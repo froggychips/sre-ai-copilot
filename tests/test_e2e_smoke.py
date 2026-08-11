@@ -123,7 +123,31 @@ def mock_teamcity():
         yield
 
 
-def test_webhook_creates_incident_record(app_client, mock_llm, mock_k8s_context, mock_teamcity):
+@pytest.fixture
+def mock_discord_delivery():
+    """Отчёт «доставлен» — тест про incident record, а не про Discord.
+
+    conftest подставляет DISCORD_WEBHOOK_URL=https://example.com/..., поэтому
+    без мока POST реально уходит и возвращает 405. С outbox-семантикой
+    доставки (кодревью 10.08.2026) это уже не глотается: delivered=False →
+    pipeline поднимает ReportDeliveryPending, чтобы Celery переотправил
+    отчёт. Тест падал именно на этом, хотя проверяет создание записи
+    инцидента. Такой же мок стоит в остальных тестах, гоняющих пайплайн
+    целиком (test_pipeline_trace, test_state_transitions, test_replay_fixtures).
+    """
+    async def _delivered(*a, **kw):
+        return True
+
+    with patch(
+        "app.services.discord_service.discord_service.send_incident_report",
+        new=_delivered,
+    ):
+        yield
+
+
+def test_webhook_creates_incident_record(
+    app_client, mock_llm, mock_k8s_context, mock_teamcity, mock_discord_delivery
+):
     # Уникальный fingerprint на каждый прогон — иначе при повторе теста (или
     # на dev-машине с локальным sre.db) попадётся существующая запись со
     # status=RESOLVED и pipeline упадёт на transition RESOLVED → INVESTIGATING.

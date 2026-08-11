@@ -417,7 +417,9 @@ class LogObservation(Base):
     # Сырой `App`-тэг из Seq — детерминированная NOT NULL часть UNIQUE-ключа
     # (вместо NULLABLE service_id, см. docstring). Legacy-строки бэкфиллятся
     # суррогатами `legacy-svc:<service_id>` / `legacy:<id>` в миграции
-    # 20260807_0200 — без потери данных.
+    # 20260807_0400 (kg_idempotency_constraints, пункт 2) — без потери данных.
+    # Ссылка была на 20260807_0200 (add_node_kind) — та к app_name отношения
+    # не имеет; при инцидентном откате это направляло оператора не туда.
     app_name = Column(String, nullable=False, default="", server_default="")
     created_at = Column(DateTime, default=datetime.utcnow)
 

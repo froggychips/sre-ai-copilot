@@ -15,11 +15,13 @@ beat-task'ом kg_stuck_alerts_check.
 
 SQLite in-memory как и test_kg_self_health.
 """
+from contextlib import contextmanager
 from datetime import datetime, timedelta
+from typing import List
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, event
 from sqlalchemy.orm import sessionmaker
 
 from app.database import Base
@@ -141,6 +143,93 @@ def test_find_stuck_alerts_recurrence_counts(db):
     assert result[0]["recurrence_24h"] == 3
     # За 7d: stuck (30h) + 3 свежих + 2 старых = 6
     assert result[0]["recurrence_7d"] == 6
+
+
+def test_find_stuck_alerts_orphan_recurrence_counts_across_services(db):
+    """Orphan (service_id=None): recurrence считается по одному alertname по
+    всем сервисам/ns — семантика сохранена после схлопывания в один агрегат."""
+    svc = _mk_service(db)
+    _mk_alert(db, None, alertname="EtcdMembersDown", fired_hours_ago=30,
+              fingerprint_str="orphan-stuck")
+    # Тот же alertname, но с привязкой к сервису — должен попасть в счётчик.
+    _mk_alert(db, svc, alertname="EtcdMembersDown", fired_hours_ago=3,
+              resolved_hours_ago=1, fingerprint_str="linked-rec")
+    # Другой alertname — не должен.
+    _mk_alert(db, svc, alertname="OtherAlert", fired_hours_ago=3,
+              resolved_hours_ago=1, fingerprint_str="other")
+
+    rows = [r for r in find_stuck_alerts(db, 24) if r["team_owner"] is None]
+    assert len(rows) == 1
+    # 24h: только linked (orphan горит 30h — вне окна). 7d: оба.
+    assert rows[0]["recurrence_24h"] == 1
+    assert rows[0]["recurrence_7d"] == 2
+
+
+# ── N+1 регрессия (review 2026-08) ────────────────────────────────────────
+
+
+@contextmanager
+def _sql_counter(db):
+    """Считать SQL-стейтменты, реально уехавшие в БД."""
+    engine = db.get_bind()
+    statements: List[str] = []
+
+    def _before(conn, cursor, statement, params, context, executemany):
+        statements.append(statement)
+
+    event.listen(engine, "before_cursor_execute", _before)
+    try:
+        yield statements
+    finally:
+        event.remove(engine, "before_cursor_execute", _before)
+
+
+def _selects(statements):
+    return [s for s in statements if s.lstrip().upper().startswith("SELECT")]
+
+
+def test_find_stuck_alerts_does_not_do_n_plus_1(db):
+    """Раньше на КАЖДЫЙ stuck-алерт летели 2 отдельных COUNT-а: при десятках
+    залипших — сотни запросов, причём hourly и ровно во время инцидента.
+    Теперь ровно 2 SELECT-а: список + один GROUP BY на recurrence."""
+    svc = _mk_service(db)
+    for i in range(12):
+        _mk_alert(db, svc, alertname=f"Stuck{i}", fired_hours_ago=30 + i,
+                  fingerprint_str=f"stuck-{i}")
+
+    with _sql_counter(db) as statements:
+        rows = find_stuck_alerts(db, 24)
+
+    assert len(rows) == 12
+    assert len(_selects(statements)) == 2, _selects(statements)
+
+
+def test_find_stuck_alerts_query_count_is_constant(db):
+    """Число запросов не должно расти вместе с числом залипших алертов."""
+    svc = _mk_service(db)
+    _mk_alert(db, svc, alertname="Only", fired_hours_ago=30,
+              fingerprint_str="only")
+    with _sql_counter(db) as few:
+        find_stuck_alerts(db, 24)
+
+    for i in range(40):
+        _mk_alert(db, svc, alertname=f"Many{i}", fired_hours_ago=25 + i,
+                  fingerprint_str=f"many-{i}")
+    with _sql_counter(db) as many:
+        rows = find_stuck_alerts(db, 24)
+
+    assert len(rows) == 41
+    assert len(_selects(many)) == len(_selects(few))
+
+
+def test_find_stuck_alerts_empty_result_skips_recurrence_query(db):
+    """Нет залипших — recurrence-агрегат вообще не гоняем."""
+    svc = _mk_service(db)
+    _mk_alert(db, svc, alertname="Fresh", fired_hours_ago=2,
+              fingerprint_str="fresh")
+    with _sql_counter(db) as statements:
+        assert find_stuck_alerts(db, 24) == []
+    assert len(_selects(statements)) == 1, _selects(statements)
 
 
 def test_find_stuck_alerts_severity_bumped_at_48h(db):

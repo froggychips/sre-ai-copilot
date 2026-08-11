@@ -454,6 +454,57 @@ def test_confidence_calibration_axes():
     assert pytest.approx(s_max.confidence, abs=1e-6) == 1.0
 
 
+# ── Единообразие списка окружений (prod/preprod/preupdate/dev/staging/qa) ─
+
+
+@pytest.mark.parametrize("env", list(ownership_suggester._ENVS))
+def test_bare_env_shared_is_multi_squad_for_every_env(env):
+    """Любой bare `<env>-shared` — мультитенантная зона → multi-squad-заглушка.
+
+    До фикса `_BARE_SHARED_RE` держал свою копию списка env БЕЗ `preupdate`:
+    `preupdate-shared` получал owner `shared` с полной силой 0.5, а
+    prod/preprod-shared — заглушку 0.20. Симптом маскировался manual-правилом
+    `preupdate-shared → @platform` в config/ownership.yaml.
+    """
+    sug = suggest_owner_multi_signal(f"{env}-shared", db=None)
+    assert sug.owner == "multi-squad"
+    assert sug.sources == ["prefix"]
+    # 0.5 (_W_PREFIX) * 0.4 (_BARE_SHARED_STRENGTH) — ниже threshold 0.5,
+    # чтобы любой реальный сигнал (deploy_history/labels/manual) перевешивал.
+    assert pytest.approx(sug.confidence, abs=1e-6) == 0.2
+
+
+def test_preupdate_shared_behaves_like_prod_and_preprod_shared():
+    """Три реальных WO-окружения одного класса дают ОДИН результат."""
+    sugs = {
+        env: suggest_owner_multi_signal(f"{env}-shared", db=None)
+        for env in ("prod", "preprod", "preupdate")
+    }
+    owners = {env: s.owner for env, s in sugs.items()}
+    confidences = {env: round(s.confidence, 6) for env, s in sugs.items()}
+    assert set(owners.values()) == {"multi-squad"}, owners
+    assert len(set(confidences.values())) == 1, confidences
+
+
+@pytest.mark.parametrize("env", list(ownership_suggester._ENVS))
+def test_env_list_drives_all_ns_patterns(env):
+    """Один список `_ENVS` обслуживает и kingdom-, и single-realm-паттерны.
+
+    Защита от возврата к четырём копиям альтернации: новый env, добавленный в
+    `_ENVS`, обязан работать во ВСЕХ паттернах сразу.
+    """
+    assert suggest_owner_multi_signal(f"{env}-kingdom5", db=None).owner == "kingdom5"
+    assert suggest_owner_multi_signal(f"{env}-statics", db=None).owner == "statics"
+
+
+def test_legacy_api_shared_unchanged_for_preupdate():
+    """Legacy `suggest_owner_for_ns` по-прежнему отдаёт `shared` — как для
+    prod/preprod (multi-squad живёт только в multi_signal-пайплайне)."""
+    assert suggest_owner_for_ns("preupdate-shared") == "shared"
+    assert suggest_owner_for_ns("prod-shared") == "shared"
+    assert suggest_owner_for_ns("preupdate-kingdom5") == "kingdom5"
+
+
 # ── owner_aliases ───────────────────────────────────────────────────────
 
 

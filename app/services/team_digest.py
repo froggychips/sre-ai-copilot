@@ -31,9 +31,9 @@ from sqlalchemy import func, text
 from sqlalchemy.orm import Session
 
 from app.config import settings
-from app.database import SessionLocal
-from app.knowledge_graph.schema import (AlertEvent, Deployment, Service,
-                                        SignalAggregate)
+from app.database import ReadOnlyAutocommitSession
+from app.knowledge_graph.schema import (NODE_KIND_SERVICE, AlertEvent,
+                                        Deployment, Service, SignalAggregate)
 from app.knowledge_graph.stuck_alerts import (find_stuck_alerts,
                                               severity_emoji)
 
@@ -60,12 +60,18 @@ _TOP_STUCK = 5
 def _top_fragile_services(
     db: Session, team_owner: str, limit: int = _TOP_FRAGILE,
 ) -> List[Dict[str, Any]]:
-    """Top-N сервисов с наименьшим health_score (asc). NULL пропускаем."""
+    """Top-N сервисов с наименьшим health_score (asc). NULL пропускаем.
+
+    Фильтр node_kind обязателен (contract 2.4): workload-узлы живут в той же
+    таблице, и без него один сервис попадал в top-5 двумя строками
+    (service + его Deployment).
+    """
     rows = (
         db.query(Service.name, Service.namespace, Service.health_score)
         .filter(
             Service.team_owner == team_owner,
             Service.synthetic.is_(False),
+            Service.node_kind == NODE_KIND_SERVICE,
             Service.health_score.isnot(None),
         )
         .order_by(Service.health_score.asc())
@@ -197,11 +203,14 @@ def _top_stuck_alerts(
 
 
 def _real_service_count(db: Session, team_owner: str) -> int:
+    # Считаем ТОЛЬКО node_kind='service' (contract 2.4) — иначе workload-узлы
+    # удваивают счётчик и «Services: N» расходится со stats digest.
     return (
         db.query(func.count(Service.id))
         .filter(
             Service.team_owner == team_owner,
             Service.synthetic.is_(False),
+            Service.node_kind == NODE_KIND_SERVICE,
         )
         .scalar()
         or 0
@@ -517,7 +526,10 @@ async def send_team_digest(
 ) -> Dict[str, Any]:
     """Собирает digest и шлёт в Discord. Возвращает status-dict.
 
-    `db` — для DI в тестах. По умолчанию открываем SessionLocal и закрываем.
+    `db` — для DI в тестах. По умолчанию открываем ReadOnlyAutocommitSession
+    и закрываем: по PG digest read-only, а AUTOCOMMIT не держит транзакцию
+    открытой через Discord I/O (та же защита от idle-in-transaction, что
+    #252 сделал для stats/chronic).
     `stuck_all` — pre-fetched stuck-alerts всех команд (см. _top_stuck_alerts).
     """
     if not getattr(settings, "TEAM_DIGEST_ENABLED", False):
@@ -525,7 +537,7 @@ async def send_team_digest(
 
     owned_session = False
     if db is None:
-        db = SessionLocal()
+        db = ReadOnlyAutocommitSession()
         owned_session = True
     try:
         digest = build_team_digest(
@@ -584,7 +596,9 @@ async def send_all_team_digests(window_hours: int = 24) -> Dict[str, Any]:
     if not getattr(settings, "TEAM_DIGEST_ENABLED", False):
         return {"status": "skipped", "reason": "TEAM_DIGEST_ENABLED=false"}
 
-    db = SessionLocal()
+    # Read-only чтения (team-список + full scan stuck-alerts) — AUTOCOMMIT,
+    # чтобы длинный SELECT не оставлял открытую транзакцию (см. #252).
+    db = ReadOnlyAutocommitSession()
     try:
         teams = _distinct_team_owners(db)
         # N+1 fix: find_stuck_alerts — full scan kg_alerts. Раньше он
@@ -612,9 +626,13 @@ async def send_all_team_digests(window_hours: int = 24) -> Dict[str, Any]:
         "results": [],
     }
     for team in teams:
-        # Открываем новую сессию per team — длинная транзакция на 60+ teams
-        # держит lock на kg_services дольше чем нужно.
-        db = SessionLocal()
+        # Новая сессия per team, AUTOCOMMIT: SQL-чтения перемежаются Discord
+        # I/O с ретраями (до ~40с на команду), обычная сессия висела бы
+        # idle-in-transaction все 60+ команд подряд — PG убивает такие
+        # соединения через 120с (антипаттерн, который #252 чинил в
+        # stats/chronic). По PG digest read-only — писать через эту
+        # сессию нельзя.
+        db = ReadOnlyAutocommitSession()
         try:
             res = await send_team_digest(
                 team, window_hours=window_hours, db=db, stuck_all=stuck_all,

@@ -86,6 +86,13 @@ class StateMachine:
             IncidentState.RESOLVED,
             # Зеркалим RESOLVED: un-resolved инцидент уходит в triage.
             IncidentState.TRIAGE_REQUIRED,
+            # Follow-up вопрос в multi-turn /copilot-диалоге: каждый прогон
+            # generate_reply начинается с transition(INVESTIGATING), а
+            # успешный прогон оставляет диалог в FIX_PROPOSED. Без этого
+            # перехода ВТОРОЕ сообщение в диалог всегда падало на invalid
+            # transition и уводило state в FAILED (терминал) — диалог
+            # умирал после первого же ответа.
+            IncidentState.INVESTIGATING,
             IncidentState.FAILED,
         },
         IncidentState.APPROVAL_PENDING: {IncidentState.EXECUTING, IncidentState.FAILED},

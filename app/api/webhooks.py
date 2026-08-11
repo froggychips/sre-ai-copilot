@@ -643,7 +643,8 @@ async def alertmanager_webhook_enrich_and_forward(
     suppressed_rollout = 0
     suppressed_inhibited = 0
     if settings.DISCORD_ENRICH_ENABLED and firing_incidents:
-        from app.services.alert_dedup import Decision, decide_send
+        from app.services.alert_dedup import (Decision, decide_send,
+                                              rollback_undelivered)
         from app.services.alert_enrichment import (_inhibition_state,
                                                    resolve_store_service)
 
@@ -667,6 +668,11 @@ async def alertmanager_webhook_enrich_and_forward(
 
         discord_service = DiscordService()
         for (alertname, sev), incs in groups.items():
+            # Нужны в except-ветке для отката tentative-инкремента дедупа —
+            # инициализируем ДО try, иначе на падении до decide_send они
+            # unbound.
+            decision: Optional[Decision] = None
+            head_service: Optional[str] = None
             try:
                 # Дедуп решается per первой incident-у группы (один service —
                 # один state-ключ; namespace-агрегацию уже сделал AM group_by).
@@ -737,11 +743,32 @@ async def alertmanager_webhook_enrich_and_forward(
                 ctxs = [await enrich_alert_async(db, inc) for inc in incs]
                 env_hint = _env_hint(incs[0].namespace)
                 resurfaced = (decision == Decision.SEND_RESURFACED)
-                await discord_service.send_enriched_alert(
+                delivered = await discord_service.send_enriched_alert(
                     ctxs, env=env_hint, resurfaced=resurfaced,
                 )
+                # Фаза подтверждения дедупа. decide_send уже нарастил
+                # chronic-счётчик (tentative) — если embed не ушёл, счётчик
+                # надо откатить, иначе три подряд неудачные доставки глушат
+                # четвёртый, уже успешный fire на всё 6h-окно.
+                # send_enriched_alert доставку пока не возвращает (None) —
+                # трактуем None как «ушло, исключения не было»; явный False
+                # (контракт send_incident_report/send_stats_report) — как
+                # недоставку.
+                if delivered is False:
+                    log.warning(
+                        "enrich_forward.send_not_delivered",
+                        alertname=alertname,
+                        severity=sev,
+                        service=head_service,
+                    )
+                    await rollback_undelivered(alertname, head_service, decision)
+                    continue
                 enriched_groups += 1
             except Exception as e:
+                # Счётчик подавления обязан считать ФАКТИЧЕСКИ отправленные
+                # embed-ы: снимаем tentative-инкремент этого fire-а.
+                if decision is not None:
+                    await rollback_undelivered(alertname, head_service, decision)
                 log.warning(
                     "enrich_forward.send_failed",
                     alertname=alertname,

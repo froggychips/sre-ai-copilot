@@ -12,9 +12,16 @@
       не настоящий incident.
 
 Fail-open: при недоступности Redis возвращаем SEND (как в rate_limit.py).
+
+Двухфазность: decide_send наращивает chronic-счётчик TENTATIVE-но — ДО
+фактической отправки embed-а (иначе конкурентные batch-и теряют инкременты).
+Вторая фаза на стороне caller-а: при недоставке он обязан позвать
+`rollback_undelivered`, иначе подавление считает embed-ы, которых в канале
+не было.
 """
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime, timedelta, timezone
 from enum import Enum
 from typing import Optional
@@ -33,6 +40,10 @@ CHRONIC_WINDOW_SECONDS = 6 * 3600       # 6h хранения state
 CHRONIC_QUIET_RESET_SECONDS = 2 * 3600  # >2h тишины → resurfaced
 CHRONIC_MIN_COUNT = 3                   # с какого N считаем хроникой
 ROLLOUT_NOISE_THRESHOLD_SECONDS = 10 * 60  # <10 мин длительность = noise
+# Сколько живёт маркер «право на resurface-embed уже выдано». Закрывает ровно
+# окно гонки двух реплик, разбирающих ОДИН AM-batch (секунды), поэтому минуты,
+# а не 6h: следующий legit-resurface через 2h+ тишины маркер глушить не должен.
+RESURFACE_CLAIM_SECONDS = 120
 
 _redis: Optional[aioredis.Redis] = None
 
@@ -61,6 +72,15 @@ def _last_key(alertname: str, service: str) -> str:
     return f"enrich:lastsent:{alertname}:{service}:last"
 
 
+#   *:resurface — короткоживущий маркер «этот resurface уже кто-то забрал».
+#            Ставится SET NX (атомарный single-winner, Lua не нужен —
+#            одной команды достаточно). Без него ветка resurface была
+#            GET→check→SET: две реплики, разобравшие один AM-batch после
+#            >2h тишины, обе видели старый `last` и обе слали 🌀-embed.
+def _resurface_key(alertname: str, service: str) -> str:
+    return f"enrich:lastsent:{alertname}:{service}:resurface"
+
+
 class Decision(str, Enum):
     """Что делать с алертом на уровне Discord-send."""
 
@@ -81,6 +101,13 @@ async def decide_send(
 ) -> Decision:
     """Главная точка дедупа — вызывается из enrich-and-forward.
 
+    ДВУХФАЗНОСТЬ: SEND / SEND_RESURFACED инкрементят chronic-счётчик
+    TENTATIVE-но — ДО того, как embed реально ушёл в канал (иначе
+    конкурентные batch-и теряли бы инкременты). Вторая фаза —
+    подтверждение: caller ОБЯЗАН при недоставке позвать
+    `rollback_undelivered(alertname, service, decision)`, иначе подавление
+    считает embed-ы, которых в канале не было (см. её докстринг).
+
     Args:
         alertname: e.g. KubePodCrashLooping
         namespace: k8s namespace (нужен для L4 lookup в kg_alerts)
@@ -98,7 +125,14 @@ async def decide_send(
     # ── L4: rollout-noise silent для mismatch-class alerts ─────────────
     if alertname in {"KubeDeploymentGenerationMismatch", "KubeReplicaSetMismatch"} and namespace:
         try:
-            recent = incidents_on(
+            # incidents_on — СИНХРОННЫЙ SQL, а зовут нас из async-хендлера
+            # API-процесса: прямой вызов блокировал event loop (на storm-е
+            # вместе с health-пробами). Уводим в thread pool, как
+            # enrich_alert_async. Конкурентно с той же `db` не вызываем —
+            # decide_send и enrich идут последовательно в одном хендлере,
+            # так что сессией в каждый момент владеет один поток.
+            recent = await asyncio.to_thread(
+                incidents_on,
                 db,
                 namespace=namespace,
                 service_name=service,
@@ -144,16 +178,34 @@ async def decide_send(
         if last is not None:
             delta = now_unix - last
             if delta > CHRONIC_QUIET_RESET_SECONDS:
-                # >2h тишины — это resurface, сбрасываем counter и якорим
-                # новое окно на текущем fire.
-                await client.set(key_cnt, 1, ex=CHRONIC_WINDOW_SECONDS)
-                await client.set(key_last, now_unix, ex=CHRONIC_WINDOW_SECONDS)
+                # >2h тишины — это resurface. Право на 🌀-embed выдаётся
+                # АТОМАРНО (SET NX на маркер): прежний GET→check→SET
+                # раздавал SEND_RESURFACED обеим репликам, разобравшим один
+                # batch, — два одинаковых embed-а в канал.
+                won = await client.set(
+                    _resurface_key(alertname, service),
+                    now_unix,
+                    ex=RESURFACE_CLAIM_SECONDS,
+                    nx=True,
+                )
+                if won:
+                    # Сбрасываем counter и якорим новое окно на текущем fire.
+                    await client.set(key_cnt, 1, ex=CHRONIC_WINDOW_SECONDS)
+                    await client.set(key_last, now_unix, ex=CHRONIC_WINDOW_SECONDS)
+                    log.info(
+                        "dedup.resurfaced",
+                        alertname=alertname, service=service,
+                        quiet_seconds=delta,
+                    )
+                    return Decision.SEND_RESURFACED
+                # Гонку проиграли: 🌀-embed уже отправляет победитель, он же
+                # сбросил окно. Наш fire идём считать обычным in-window
+                # путём (второй 🌀 в канал не уходит).
                 log.info(
-                    "dedup.resurfaced",
+                    "dedup.resurface_claim_lost",
                     alertname=alertname, service=service,
                     quiet_seconds=delta,
                 )
-                return Decision.SEND_RESURFACED
         else:
             delta = 0
 
@@ -178,6 +230,52 @@ async def decide_send(
     except Exception as e:
         log.warning("dedup.redis_unavailable", error=str(e))
         return Decision.SEND_NO_DEDUP
+
+
+async def rollback_undelivered(
+    alertname: str,
+    service: Optional[str],
+    decision: Decision,
+) -> None:
+    """Фаза подтверждения: снять tentative-инкремент, если embed НЕ ушёл.
+
+    Инцидентный контекст: enrich+send в /alertmanager/enrich-and-forward
+    обёрнут в `except Exception → log.warning`, а счётчик наращивался ещё в
+    decide_send. Три подряд неудачные доставки (Discord 5xx, таймаут,
+    падение enrichment-а) поднимали счётчик до 3 — и четвёртый, уже
+    успешный fire получал SUPPRESS_CHRONIC, хотя в канале не было НИ ОДНОГО
+    embed-а. Дальше 6h-окно молчало целиком.
+
+    Откатываем ровно то, что гейтит подавление:
+
+      * счётчик — DECR; ноль/минус удаляем (информации не несёт, а DECR по
+        уже истёкшему ключу создал бы его БЕЗ TTL — та же грабля, что была
+        с cb:fail:* в resilience.py);
+      * resurface-маркер — DEL, чтобы 🌀-embed можно было отправить снова.
+
+    `last` НЕ откатываем намеренно: он значит «последний раз ВИДЕЛИ fire», а
+    fire реально был; от него зависит только quiet-reset.
+
+    Fail-open: сбой Redis тут ничего не ломает — остаётся прежнее (худшее)
+    поведение с завышенным счётчиком.
+    """
+    if not service or decision not in (Decision.SEND, Decision.SEND_RESURFACED):
+        return
+    try:
+        client = _get_client()
+        key_cnt = _count_key(alertname, service)
+        new_count = int(await client.decr(key_cnt))
+        if new_count <= 0:
+            await client.delete(key_cnt)
+        if decision == Decision.SEND_RESURFACED:
+            await client.delete(_resurface_key(alertname, service))
+        log.info(
+            "dedup.rollback_undelivered",
+            alertname=alertname, service=service,
+            decision=decision.value, count=max(new_count, 0),
+        )
+    except Exception as e:
+        log.warning("dedup.rollback_failed", error=str(e))
 
 
 async def close() -> None:

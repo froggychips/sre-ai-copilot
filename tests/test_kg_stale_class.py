@@ -7,6 +7,9 @@
 * ``stale_classifier.classify_stale_with_deploys`` — 3-классная (active/
   expected_stale/suspicious_stale) с разными комбинациями last_deploy_at,
   team_owner, name/ns.
+* Атрибуция деплоя: ns-broadcast (`extras.namespace_scope`) сам по себе
+  ``active`` НЕ даёт — иначе классификатор отвечает «был ли деплой в ns», а
+  не «катился ли ЭТОТ сервис».
 * ``kg_sync.sync_namespace`` populates ``stale_class`` on upsert (idempotent).
 * ``queries.services_by_stale_class`` фильтрует по column.
 * ``stats_digest.stale_deployments_section`` читает column как primary source
@@ -30,6 +33,7 @@ from app.knowledge_graph.stale_classifier import (
     STALE_CLASS_SUSPICIOUS,
     _classify_stale,
     classify_stale_with_deploys,
+    is_ns_broadcast_deploy,
 )
 
 
@@ -186,6 +190,102 @@ def test_classify_3class_aware_datetime_ok():
     )
 
 
+# ── ns-broadcast vs свой деплой (атрибуция) ─────────────────────────────────
+
+
+def test_is_ns_broadcast_deploy_marker():
+    """Единственный признак в данных — `extras.namespace_scope`."""
+    assert is_ns_broadcast_deploy({"namespace_scope": True, "branch": "preprod"})
+    assert not is_ns_broadcast_deploy({"branch": "preprod"})
+    assert not is_ns_broadcast_deploy(None)
+    assert not is_ns_broadcast_deploy("не dict")
+
+
+def test_ns_broadcast_alone_is_not_active():
+    """Деплой соседа по ns не делает сервис `active`.
+
+    Регрессия: `last_deploy_at` = max по kg_deployments, а ns-broadcast пишет
+    билд ВСЕМ узлам ns → в активно деплоящемся namespace все сервисы вечно
+    `active`, и классификатор отвечал «был ли деплой в ns», а не «катился ли
+    ЭТОТ сервис». `suspicious_stale` при таком входе не мог сработать.
+    """
+    now = datetime(2026, 8, 10, 12, 0, 0)
+    yesterday = now - timedelta(days=1)
+    assert (
+        classify_stale_with_deploys(
+            "town-service", "prod-kingdom1", yesterday,
+            now=now, last_ns_deploy_at=yesterday,
+        )
+        == STALE_CLASS_SUSPICIOUS
+    )
+
+
+def test_own_deploy_is_active_even_with_ns_broadcast():
+    """Есть своя запись (без маркера ns_scope) → честный `active`."""
+    now = datetime(2026, 8, 10, 12, 0, 0)
+    yesterday = now - timedelta(days=1)
+    assert (
+        classify_stale_with_deploys(
+            "town-service", "prod-kingdom1", yesterday,
+            now=now,
+            last_service_deploy_at=now - timedelta(days=3),
+            last_ns_deploy_at=yesterday,
+        )
+        == STALE_CLASS_ACTIVE
+    )
+
+
+def test_own_deploy_stale_while_namespace_rolls_is_suspicious():
+    """Свой деплой 90d назад, ns катится ежедневно → suspicious_stale."""
+    now = datetime(2026, 8, 10, 12, 0, 0)
+    assert (
+        classify_stale_with_deploys(
+            "town-service", "prod-kingdom1", now - timedelta(days=1),
+            now=now,
+            last_service_deploy_at=now - timedelta(days=90),
+            last_ns_deploy_at=now - timedelta(days=1),
+        )
+        == STALE_CLASS_SUSPICIOUS
+    )
+
+
+def test_ns_broadcast_does_not_override_expected_shape():
+    """Backup/system-форма остаётся expected_stale, не обвиняем её."""
+    now = datetime(2026, 8, 10, 12, 0, 0)
+    yesterday = now - timedelta(days=1)
+    assert (
+        classify_stale_with_deploys(
+            "town-db-backup", "prod-shared", yesterday,
+            now=now, last_ns_deploy_at=yesterday,
+        )
+        == STALE_CLASS_EXPECTED
+    )
+    # infra-owner тоже сохраняет снисхождение: ns-деплой свежее infra-окна.
+    assert (
+        classify_stale_with_deploys(
+            "vmagent", "prod-kingdom1", yesterday,
+            team_owner="platform", now=now, last_ns_deploy_at=yesterday,
+        )
+        == STALE_CLASS_EXPECTED
+    )
+
+
+def test_merged_attribution_keeps_legacy_active():
+    """Слитый вход (только last_deploy_at) — прежнее поведение.
+
+    Осознанная деградация: разделить доказательства может только вызывающий
+    (у него на руках `Deployment.extras`), а молча объявить подозрительными
+    все сервисы активно деплоящихся ns — обвинение на масштабе.
+    """
+    now = datetime(2026, 8, 10, 12, 0, 0)
+    assert (
+        classify_stale_with_deploys(
+            "town-service", "prod-kingdom1", now - timedelta(days=1), now=now,
+        )
+        == STALE_CLASS_ACTIVE
+    )
+
+
 # ── kg_sync populate stale_class on upsert ──────────────────────────────────
 
 
@@ -207,13 +307,18 @@ def _make_deploy_doc(name: str, env_vars=None):
     }
 
 
-def _add_deploy_record(db, svc: Service, started_at: datetime):
-    """Добавить запись в kg_deployments."""
+def _add_deploy_record(db, svc: Service, started_at: datetime, *, ns_broadcast=False):
+    """Добавить запись в kg_deployments.
+
+    ``ns_broadcast=True`` ставит маркер ``extras.namespace_scope``, которым
+    ``tc_deploys_to_kg`` помечает рассылку одного TC-билда на ВСЕ сервисы ns.
+    """
     d = Deployment(
         service_id=svc.id,
         sha="abc123",
         started_at=started_at,
         status="SUCCESS",
+        extras={"namespace_scope": True} if ns_broadcast else None,
     )
     db.add(d)
     db.flush()
@@ -281,6 +386,56 @@ def test_sync_namespace_populates_suspicious_for_old_app_deploy(db):
 
     db.refresh(svc)
     assert svc.stale_class == STALE_CLASS_SUSPICIOUS
+
+
+def test_sync_namespace_ns_broadcast_does_not_mask_stale_service(db):
+    """ns-broadcast свежий + свой деплой 90d назад → suspicious_stale.
+
+    Регрессия на разделение доказательств в
+    ``kg_sync._refresh_stale_class_for_namespace``: раньше здесь считался
+    ОДИН слитый max(started_at), поэтому рассылка TC-билда на все сервисы
+    namespace делала каждый сервис активно деплоящегося ns вечно ``active``,
+    и ``suspicious_stale`` не мог сработать именно там, где нужен.
+    """
+    from app.knowledge_graph import kg_sync
+
+    deploy_doc = _make_deploy_doc("auth")
+    with patch.object(kg_sync, "_kubectl_get_deployments", return_value=[deploy_doc]):
+        kg_sync.sync_namespace(db, "prod-kingdom1")
+
+    svc = db.query(Service).filter_by(namespace="prod-kingdom1", name="auth").one()
+    # Свой деплой давно, а ns катится прямо сейчас (broadcast-запись свежая).
+    _add_deploy_record(db, svc, datetime.utcnow() - timedelta(days=90))
+    _add_deploy_record(
+        db, svc, datetime.utcnow() - timedelta(hours=2), ns_broadcast=True
+    )
+
+    with patch.object(kg_sync, "_kubectl_get_deployments", return_value=[deploy_doc]):
+        kg_sync.sync_namespace(db, "prod-kingdom1")
+
+    db.refresh(svc)
+    assert svc.stale_class == STALE_CLASS_SUSPICIOUS
+
+
+def test_sync_namespace_own_deploy_wins_over_ns_broadcast(db):
+    """Свой свежий деплой → active, даже если рядом есть ns-broadcast."""
+    from app.knowledge_graph import kg_sync
+
+    deploy_doc = _make_deploy_doc("auth")
+    with patch.object(kg_sync, "_kubectl_get_deployments", return_value=[deploy_doc]):
+        kg_sync.sync_namespace(db, "prod-kingdom1")
+
+    svc = db.query(Service).filter_by(namespace="prod-kingdom1", name="auth").one()
+    _add_deploy_record(db, svc, datetime.utcnow() - timedelta(hours=3))
+    _add_deploy_record(
+        db, svc, datetime.utcnow() - timedelta(hours=1), ns_broadcast=True
+    )
+
+    with patch.object(kg_sync, "_kubectl_get_deployments", return_value=[deploy_doc]):
+        kg_sync.sync_namespace(db, "prod-kingdom1")
+
+    db.refresh(svc)
+    assert svc.stale_class == STALE_CLASS_ACTIVE
 
 
 def test_sync_namespace_idempotent_reclassifies(db):

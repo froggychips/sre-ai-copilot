@@ -7,6 +7,7 @@ from app.core.tracing import record_llm_call
 from app.llm.router import ModelRouter
 from app.observability.ai_metrics import track_llm_usage_per_agent
 from app.services.audit_logger import audit_service
+from app.services.llm_service import LLMTruncatedResponse
 from app.services.prompt_guard import prompt_guard
 from app.services.telemetry_utils import record_llm_metrics, tracer
 
@@ -14,10 +15,24 @@ logger = structlog.get_logger()
 
 
 class BaseAgent:
-    def __init__(self, name: str, role: str, task_type: str = "analysis"):
+    def __init__(
+        self,
+        name: str,
+        role: str,
+        task_type: str = "analysis",
+        json_response: bool = False,
+    ):
         self.name = name
         self.role = role
         self.task_type = task_type
+        # JSON-агенты (multi_hypothesis/fact_critic): ответ, обрезанный по
+        # max_tokens (stop_reason="max_tokens"), — это гарантированно битый
+        # JSON, который парсер молча превратит в «пусто», неотличимое от
+        # честного пустого результата (кодревью 2026-08: слабая гипотеза
+        # переживала критику с полной confidence). Для них ask поднимает
+        # LLMTruncatedResponse вместо возврата огрызка. Прозаические агенты
+        # (analyzer/synthesis) обрезку переживают — частичный текст полезен.
+        self.json_response = json_response
 
     async def ask(self, user_context: str, instruction: str = "") -> str:
         with tracer.start_as_current_span(f"LLM_Call: {self.name}") as span:
@@ -38,7 +53,7 @@ Task: {instruction}
 </user_context>
 """
             start = time.monotonic()
-            recorded = False  # flag: empty-response уже записал свой error, exception-branch пропускает
+            recorded = False  # flag: empty/truncated-response уже записал свой error, exception-branch пропускает
             try:
                 # route_and_call_full возвращает usage с реальными числами
                 # из Anthropic response (claude_cli возвращает 0/0).
@@ -67,6 +82,47 @@ Task: {instruction}
                     })
                     recorded = True
                     raise ValueError("Empty response from model")
+
+                truncated = (
+                    bool(result.get("truncated")) if isinstance(result, dict) else False
+                )
+                if truncated and self.json_response:
+                    # Обрезка по max_tokens для JSON-агента: хвост JSON потерян,
+                    # парсер выдал бы «пусто» с видом честного результата —
+                    # именно так обрезанный critic пропускал слабую гипотезу
+                    # людям с полной confidence. Фейлим вызов явно: стадия
+                    # пайплайна упадёт как FAILED с причиной truncated_response
+                    # (LLMTruncatedResponse не в RETRIABLE_EXC — Celery не
+                    # пережигает бюджет ретраями того же промпта).
+                    record_llm_call(
+                        backend=model_name,
+                        duration_ms=duration_ms,
+                        error="truncated_response",
+                    )
+                    track_llm_usage_per_agent(
+                        agent=self.name, model=model_name,
+                        input_tokens=input_tokens, output_tokens=output_tokens,
+                        latency_s=duration_s, error_type="truncated_response",
+                    )
+                    audit_service.log_event("LLM_CALL_TRUNCATED", {
+                        "agent": self.name, "model": model_name,
+                        "duration_ms": duration_ms,
+                        "input_tokens": input_tokens,
+                        "output_tokens": output_tokens,
+                    })
+                    recorded = True
+                    raise LLMTruncatedResponse(
+                        f"LLM response truncated by max_tokens "
+                        f"(agent={self.name}, model={model_name}) — "
+                        f"JSON contract cannot be satisfied by a partial answer"
+                    )
+                if truncated:
+                    # Прозаический агент: обрезанный текст всё ещё полезен —
+                    # предупреждаем (generate_full уже дал root-warning) и отдаём.
+                    logger.warning(
+                        "llm_response_truncated",
+                        agent=self.name, model=model_name,
+                    )
 
                 record_llm_call(backend=model_name, duration_ms=duration_ms)
                 track_llm_usage_per_agent(

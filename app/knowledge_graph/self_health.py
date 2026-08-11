@@ -17,7 +17,9 @@ dev-канал, не #infra-error).
        kg_service_health. Wave 5 reproducer. Allowlist для TODO-метрик
        (http_5xx_rate, p95_latency_ms — пока WO scrape config не на месте).
     2. sync_lag — задержка по beat-задачам (max(ts) / max(created_at)).
-       >2× ожидаемого интервала → warn, >5× → fail.
+       >2× ожидаемого интервала → warn, >5× → fail. Для задач, чей результат
+       не обязан появляться каждый тик (anomaly detection), опора — redis-
+       heartbeat ПРОГОНА задачи, а не max(ts) результата.
     3. anomaly_signal_health — count(kg_anomaly_observations за 24h).
        0 → warn (либо детектор поломан, либо данные плоские).
        >500 → warn (overload, threshold не работает).
@@ -80,6 +82,12 @@ _SERVICE_HEALTH_METRICS = (
 # Beat task → (timestamp column factory, expected interval minutes).
 # Каждая enrty задаёт «когда последняя запись и какой нормальный период».
 # Используется sync_lag check.
+#
+# `column`      — max(timestamp) материализованных данных задачи;
+# `heartbeat_task` — если задан, свежесть берётся из redis-heartbeat самой
+#                 задачи (факт ПРОГОНА), а `column` остаётся информационным.
+#                 Нужно там, где результат задачи не обязан появляться каждый
+#                 тик (см. kg_anomaly_detection_task).
 _SYNC_LAG_TARGETS: Dict[str, Dict[str, Any]] = {
     "kg_topology_sync": {
         # Topology обновляет Service.updated_at каждый час.
@@ -100,10 +108,20 @@ _SYNC_LAG_TARGETS: Dict[str, Dict[str, Any]] = {
         "interval_minutes": 10,
     },
     "kg_anomaly_detection_task": {
-        # AnomalyObservation.ts — точка детекции. Создаётся не каждый тик,
-        # но в живой системе обязан появляться хотя бы за 50 мин.
-        "column": lambda: func.max(AnomalyObservation.ts),
+        # Свежесть — по ФАКТУ ПРОГОНА (redis-heartbeat), а не по наличию
+        # результата. Раньше брался max(AnomalyObservation.ts) с интервалом
+        # 10 мин → fail при >50 мин без единой аномалии. Но аномалия — это
+        # РЕЗУЛЬТАТ: после noise-floor и volume guard тихий час абсолютно
+        # нормален, и check_anomaly_signal_health тот же ноль (уже за 24h!)
+        # трактует лишь как warn. Две проверки противоречили друг другу, а
+        # fingerprint-dedup (по набору fail-ов) закреплял этот ложный fail
+        # в Discord надолго. Heartbeat пишется task_postrun-сигналом только
+        # для успешных прогонов (см. tasks._record_beat_heartbeat), т.е.
+        # «детектор реально ходит» — именно то, что мы хотим проверить.
+        "heartbeat_task": "kg_anomaly_detection_task",
         "interval_minutes": 10,
+        # Информационно (в статус не входит): когда последний раз ЧТО-ТО нашли.
+        "column": lambda: func.max(AnomalyObservation.ts),
     },
     "kg_signal_aggregates_compute": {
         # SignalAggregate.window_end шагает каждые 24h, но компьютится hourly;
@@ -128,6 +146,31 @@ def _now() -> datetime:
     # Все timestamp'ы в БД — naive UTC (datetime.utcnow). Используем тот же
     # формат чтобы сравнение не падало в sqlite/postgres.
     return datetime.utcnow()
+
+
+def _last_heartbeat(task_name: str) -> Optional[datetime]:
+    """Время последнего успешного прогона beat-задачи (naive UTC) или None.
+
+    Тот же механизм, что у дайджеста (check_digest_delivery): redis-ключ
+    `stats:beat:last_run:<task>`, который пишет `task_postrun`-сигнал
+    (app/workers/tasks._record_beat_heartbeat) только для SUCCESS-прогонов
+    без error-маркера в retval.
+
+    В redis лежит tz-aware ISO, а весь этот модуль работает в naive UTC —
+    нормализуем, иначе вычитание падает с "can't subtract offset-naive and
+    offset-aware datetimes". Fail-open: redis недоступен / ключа нет → None.
+    """
+    try:
+        from app.services.stats_digest import _get_beat_last_run
+        last = _get_beat_last_run(task_name)
+    except Exception as e:  # pragma: no cover — defensive (redis/import)
+        log.warning("self_health.heartbeat_read_failed", task=task_name, error=str(e))
+        return None
+    if last is None:
+        return None
+    if last.tzinfo is not None:
+        last = last.astimezone(timezone.utc).replace(tzinfo=None)
+    return last
 
 
 # ── Individual checks ─────────────────────────────────────────────────────
@@ -203,27 +246,58 @@ def check_materialization_zero_rate(db: Session) -> CheckResult:
 def check_sync_lag(db: Session) -> CheckResult:
     """Свежесть каждой beat-задачи vs ожидаемый интервал.
 
-    Берём last-timestamp из релевантной колонки (см. _SYNC_LAG_TARGETS).
+    Берём last-timestamp из релевантной колонки (см. _SYNC_LAG_TARGETS), а для
+    задач с `heartbeat_task` — из redis-heartbeat самой задачи (факт прогона,
+    а не наличие результата).
     lag > 5× interval → fail, > 2× → warn. Если данных нет совсем — fail
     (если сервис только что поднят, это всё равно сигнал, чтоб отследить).
+    Исключение: у heartbeat-задач отсутствие ключа = warn, а не fail —
+    «неизвестно» (redis перезапускался / инстанс только поднят) не то же
+    самое, что «задача не ходит».
     """
     now = _now()
     per_task: Dict[str, Dict[str, Any]] = {}
     worst_status = "ok"
 
     for task_name, cfg in _SYNC_LAG_TARGETS.items():
-        col_factory = cfg["column"]
         interval = cfg["interval_minutes"]
-        last_ts: Optional[datetime] = db.query(col_factory()).scalar()
-        if last_ts is None:
-            per_task[task_name] = {
-                "last_ts": None,
-                "lag_minutes": None,
-                "expected_interval_minutes": interval,
-                "status": "fail",
-            }
-            worst_status = "fail"
-            continue
+        hb_task = cfg.get("heartbeat_task")
+        entry: Dict[str, Any] = {
+            "expected_interval_minutes": interval,
+            "source": "heartbeat" if hb_task else "data_ts",
+        }
+        last_ts: Optional[datetime]
+        if hb_task:
+            last_ts = _last_heartbeat(hb_task)
+            col_factory = cfg.get("column")
+            if col_factory is not None:
+                # Информационно: когда задача последний раз что-то материализовала.
+                data_ts: Optional[datetime] = db.query(col_factory()).scalar()
+                entry["last_result_ts"] = (
+                    data_ts.isoformat() if data_ts is not None else None
+                )
+            if last_ts is None:
+                entry.update({
+                    "last_ts": None,
+                    "lag_minutes": None,
+                    "status": "warn",
+                    "reason": "нет heartbeat в redis (ключ не найден/redis недоступен)",
+                })
+                per_task[task_name] = entry
+                if worst_status != "fail":
+                    worst_status = "warn"
+                continue
+        else:
+            last_ts = db.query(cfg["column"]()).scalar()
+            if last_ts is None:
+                entry.update({
+                    "last_ts": None,
+                    "lag_minutes": None,
+                    "status": "fail",
+                })
+                per_task[task_name] = entry
+                worst_status = "fail"
+                continue
         lag = (now - last_ts).total_seconds() / 60.0
         if lag > 5 * interval:
             this_status = "fail"
@@ -231,12 +305,12 @@ def check_sync_lag(db: Session) -> CheckResult:
             this_status = "warn"
         else:
             this_status = "ok"
-        per_task[task_name] = {
+        entry.update({
             "last_ts": last_ts.isoformat(),
             "lag_minutes": round(lag, 1),
-            "expected_interval_minutes": interval,
             "status": this_status,
-        }
+        })
+        per_task[task_name] = entry
         if this_status == "fail" or (this_status == "warn" and worst_status != "fail"):
             worst_status = this_status
 

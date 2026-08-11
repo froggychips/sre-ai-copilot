@@ -146,6 +146,43 @@ def test_generic_preprod_shared_catchall_to_platform():
     assert sug.manual is True
 
 
+def test_generic_preupdate_shared_catchall_to_platform():
+    """`preupdate-shared` покрыт тем же ns catch-all-ом, что prod/preprod.
+
+    Проверяем и обратную сторону фикса `_BARE_SHARED_RE`: manual-правило бьёт
+    раньше эвристики, поэтому приведение паттерна к единому списку env ничего
+    здесь не меняет — @platform как и раньше.
+    """
+    sug = suggest_owner_multi_signal(
+        "preupdate-shared", db=None, name="some-random-helper"
+    )
+    assert sug.owner == "platform"
+    assert sug.manual is True
+
+
+def test_shared_catchall_identical_across_real_envs():
+    """prod/preprod/preupdate-shared в манифесте ведут себя одинаково."""
+    owners = {
+        env: suggest_owner_multi_signal(f"{env}-shared", db=None).owner
+        for env in ("prod", "preprod", "preupdate")
+    }
+    assert set(owners.values()) == {"platform"}, owners
+
+
+def test_preupdate_shared_falls_back_to_multi_squad_without_manifest(monkeypatch):
+    """Без манифеста preupdate-shared деградирует в ту же заглушку, что соседи.
+
+    Раньше эвристика отдавала `shared` с полной силой — расхождение было видно
+    только при снятом манифесте (backfill с --filter-ns, локальный прогон).
+    """
+    monkeypatch.delenv("OWNERSHIP_MANIFEST_PATH", raising=False)
+    ownership_suggester.reset_manifest_cache()
+    for env in ("prod", "preprod", "preupdate"):
+        sug = suggest_owner_multi_signal(f"{env}-shared", db=None)
+        assert sug.owner == "multi-squad", f"{env}-shared → {sug.owner}"
+        assert sug.manual is False
+
+
 def test_ns_only_call_skips_name_pattern_rules():
     """Если caller не передал name (digest-level вызов), правила с
     name_pattern пропускаются. preprod-shared без name → попадает

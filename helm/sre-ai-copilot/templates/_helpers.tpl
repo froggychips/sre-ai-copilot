@@ -63,10 +63,23 @@ Name of the ServiceAccount
 {{- end }}
 
 {{/*
-Name of the Secret
+Name of the Secret with app credentials (используется во ВСЕХ envFrom:
+api / worker / beat / job-migrate — точка подмены одна, здесь).
+
+Два пути, см. values.yaml → secrets:
+  1. secrets.existingSecret — ПРЕДПОЧТИТЕЛЬНЫЙ: Secret создан заранее и вне
+     чарта (SealedSecrets / ExternalSecrets / руками), чарт только ссылается
+     на него и НИЧЕГО не рендерит → ключи не попадают ни в helm release
+     Secret (sh.helm.release.v1.*), ни в shell history через --set.
+  2. пусто (дефолт) — чарт рендерит templates/secret.yaml из values.
+     Небезопасный путь, оставлен для kind/minikube; см. warning там же.
 */}}
 {{- define "sre-ai-copilot.secretName" -}}
+{{- if .Values.secrets.existingSecret }}
+{{- .Values.secrets.existingSecret }}
+{{- else }}
 {{- printf "%s-secrets" (include "sre-ai-copilot.fullname" .) }}
+{{- end }}
 {{- end }}
 
 {{/*

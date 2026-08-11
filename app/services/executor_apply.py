@@ -24,6 +24,9 @@
        - approval СВЕЖИЙ: decided_at не старше EXECUTOR_APPROVAL_MAX_AGE_SECONDS
          (часовой давности апрув не должен авторизовывать повторный kubectl
          после re-fire, который стёр executor_applied)
+       - сам INTENT свежий: возраст плана не старше
+         EXECUTOR_INTENT_MAX_AGE_SECONDS (см. ниже, M1)
+       - инцидент не помечен «состояние кластера неизвестно» (M2)
        - intent.namespace == namespace инцидента из record.data (server-side
          binding: галлюцинированный/инжектированный intent не может действовать
          в чужом namespace)
@@ -34,12 +37,38 @@
   3. Двухфазный claim: ПЕРЕД kubectl пишет и КОММИТИТ analysis.executor_in_flight
      (timestamp + user). Краш/таймаут между мутацией кластера и записью
      executor_applied больше не оставляет живую кнопку: свежий claim = отказ
-     apply_in_flight; протухший (EXECUTOR_IN_FLIGHT_TTL_SECONDS) — можно
-     переклеймить.
-  4. Вызывает k8s_service.execute_intent(intent, dry_run=False, post_approval=True).
-  5. Записывает результат в record.analysis.executor_applied (claim снимается)
-     с timestamp + user.
-  6. Audit-event EXECUTOR_APPLIED (или EXECUTOR_APPLY_REFUSED при отказе).
+     apply_in_flight; протухший (EXECUTOR_IN_FLIGHT_TTL_SECONDS) снимается, но
+     БЕЗ повторного write (M2, см. ниже).
+  4. Пере-dry-run: kubectl --dry-run=server ещё раз, непосредственно перед
+     реальным write (M1в). Провал → отказ, write не выполняется.
+  5. Вызывает k8s_service.execute_intent(intent, dry_run=False, post_approval=True).
+  6. Записывает результат в record.analysis.executor_applied (claim снимается)
+     с timestamp + user + якорем времени intent-а.
+  7. Audit-event EXECUTOR_APPLIED (или EXECUTOR_APPLY_REFUSED при отказе).
+
+Свежесть плана, а не только одобрения (M1):
+  Approval-окно ограничивает время от клика Approve, но не возраст самого
+  плана. Оператор мог нажать «Approve & Run» на эмбеде недельной давности:
+  approve свежий, а kubectl посчитан по состоянию кластера, которого уже нет.
+  Поэтому:
+    - возраст intent-а сверяется с EXECUTOR_INTENT_MAX_AGE_SECONDS. Явного
+      created_at пайплайн в analysis не пишет (app/workers/pipeline.py вне
+      скоупа), поэтому якорь выбирается из доступных — см.
+      intent_signature.intent_recorded_at; нет ни одного → отказ
+      intent_age_unknown (fail-closed);
+    - разрешение к записи подтверждается СВЕЖИМ server-side dry-run
+      непосредственно перед write: kube-apiserver ещё раз валидирует ровно
+      ту же команду по ТЕКУЩЕМУ состоянию кластера (ресурс мог быть удалён,
+      переименован, замещён другим владельцем). Провал → отказ без write.
+  Разрешённый возраст фиксируется в executor_applied (provenance apply-а).
+
+Протухший in-flight claim (M2):
+  Claim снимается по TTL, но «claim протух» ≠ «write не состоялся»: kubectl мог
+  успеть мутировать кластер, а финализация — не закоммититься. Поэтому
+  переклейм больше НЕ выполняет write молча: инцидент помечается
+  analysis.executor_state_unknown (состояние кластера неизвестно → manual), и
+  apply отказывает. Разблокировать может только одобрение, выданное ПОСЛЕ
+  этой пометки (человек сходил в кластер, увидел факт и одобрил заново).
 """
 from __future__ import annotations
 
@@ -54,6 +83,7 @@ from app.core.execution_dsl import ExecutionIntent
 from app.database import IncidentRecord, SessionLocal
 from app.observability.ai_metrics import track_executor_applied
 from app.services.audit_logger import audit_service
+from app.services.intent_signature import intent_recorded_at, parse_utc_ts
 from app.services.k8s_service import k8s_service
 
 log = structlog.get_logger()
@@ -94,6 +124,61 @@ def _in_flight_is_fresh(entry: Dict[str, Any], ttl_sec: int) -> bool:
         claimed_at = claimed_at.replace(tzinfo=timezone.utc)
     age = (datetime.now(timezone.utc) - claimed_at).total_seconds()
     return age <= ttl_sec
+
+
+def _approved_after(approval: Any, state_unknown: Any) -> bool:
+    """True если approve выдан ПОЗЖЕ пометки executor_state_unknown.
+
+    Единственный легальный выход из состояния «кластер в неизвестном виде»:
+    человек проверил кластер и одобрил действие уже после пометки. Одобрение
+    того же прогона всегда старше пометки (сначала клик, потом протухший
+    claim), поэтому само себя разблокировать не может. Любая неоднозначность
+    (нет даты, битая дата, пометка не dict) → False, fail-closed.
+    """
+    if not isinstance(state_unknown, dict):
+        return False
+    detected_at = parse_utc_ts(state_unknown.get("detected_at"))
+    decided_at = parse_utc_ts(getattr(approval, "decided_at", None))
+    if detected_at is None or decided_at is None:
+        return False
+    return decided_at > detected_at
+
+
+def _mark_state_unknown(
+    db: Any,
+    record: Any,
+    analysis: Dict[str, Any],
+    stale_claim: Any,
+    applied_by: str,
+) -> None:
+    """Снять протухший claim и пометить инцидент «cluster state unknown».
+
+    Claim не должен висеть вечно (иначе кнопка мертва навсегда), но и молча
+    пускать второй write нельзя: kubectl прошлого apply мог выполниться, а
+    финализация — нет. Пометка переживает мерж analysis в pipeline._persist,
+    как executor_applied.
+    """
+    analysis.pop("executor_in_flight", None)
+    analysis["executor_state_unknown"] = {
+        "detected_at": datetime.now(timezone.utc).isoformat(),
+        "detected_by": applied_by,
+        "stale_claim": stale_claim if isinstance(stale_claim, dict) else str(stale_claim),
+        "resolution": "manual",
+    }
+    record.analysis = analysis
+    flag_modified(record, "analysis")
+    try:
+        db.commit()
+    except Exception as e:  # pragma: no cover — БД недоступна
+        # Не смогли записать пометку — отказ всё равно отдаём (write не идёт).
+        log.error(
+            "executor_apply.state_unknown_persist_failed",
+            error=str(e),
+        )
+        try:
+            db.rollback()
+        except Exception:
+            pass
 
 
 def _incident_namespace(record: Any) -> Optional[str]:
@@ -172,8 +257,7 @@ def apply_intent(
 
         # ── Двухфазный claim: apply уже стартовал (и мог мутировать кластер,
         # не успев записать executor_applied — краш/таймаут в окне между
-        # kubectl и commit)? Свежий claim = отказ. Протухший (kubectl-таймаут
-        # 30s << TTL) — переклеймим ниже.
+        # kubectl и commit)? Свежий claim = отказ.
         in_flight = analysis.get("executor_in_flight")
         in_flight_ttl = int(
             getattr(settings, "EXECUTOR_IN_FLIGHT_TTL_SECONDS", 600) or 600
@@ -181,10 +265,32 @@ def apply_intent(
         if isinstance(in_flight, dict) and _in_flight_is_fresh(in_flight, in_flight_ttl):
             return _refuse(incident_id, "apply_in_flight", applied_by)
         if in_flight:
+            # Протухший claim (M2). Раньше он просто переклеймивался, и apply
+            # шёл дальше: TTL 600s < approval-окна 3600s, поэтому один approve
+            # легально давал ВТОРОЙ реальный write, а факт первого никто не
+            # проверял (kubectl мог выполниться и мутировать кластер — не
+            # закоммитилась только финализация). Инвариант «≤1 write на
+            # approve» держим так: claim снимаем (кнопка не мертва навсегда),
+            # но write НЕ делаем — помечаем инцидент как «состояние кластера
+            # неизвестно → manual» и отказываем.
             log.warning(
-                "executor_apply.stale_in_flight_reclaimed",
+                "executor_apply.stale_in_flight_state_unknown",
                 incident_id=incident_id,
                 stale_claim=in_flight,
+            )
+            _mark_state_unknown(db, record, analysis, in_flight, applied_by)
+            audit_service.log_event(
+                "EXECUTOR_STATE_UNKNOWN",
+                {
+                    "incident_id": incident_id,
+                    "applied_by": applied_by,
+                    "stale_claim": in_flight,
+                },
+            )
+            return _refuse(
+                incident_id,
+                "cluster_state_unknown:manual_verify_then_reapprove",
+                applied_by,
             )
 
         intent_data = analysis.get("execution_intent")
@@ -226,6 +332,19 @@ def apply_intent(
         if _approval_is_stale(approval, approval_max_age):
             return _refuse(incident_id, "approval_stale", applied_by)
 
+        # ── Инцидент уже помечен «состояние кластера неизвестно» (M2) ───
+        # Пометку ставит переклейм протухшего claim-а выше. Снять её может
+        # только одобрение, выданное ПОСЛЕ пометки: человек сходил в кластер,
+        # убедился, что первого write не было (или откатил его), и одобрил
+        # заново. Одобрение того же прогона всегда старше пометки.
+        state_unknown = analysis.get("executor_state_unknown")
+        if state_unknown and not _approved_after(approval, state_unknown):
+            return _refuse(
+                incident_id,
+                "cluster_state_unknown:manual_verify_then_reapprove",
+                applied_by,
+            )
+
         # ── Binding intent ↔ инцидент ──────────────────────────────────
         # Intent генерирует LLM из обогащённого промпта (логи/алерты =
         # untrusted input) — сверяем namespace intent-а с namespace самого
@@ -247,6 +366,32 @@ def apply_intent(
                 f"dry_run_not_ok:{executor_result.get('status', 'missing')}",
                 applied_by,
             )
+
+        # ── Свежесть самого intent-а (M1) ──────────────────────────────
+        # Approve-окно ограничивает время от клика, но не возраст плана:
+        # «Approve & Run» на эмбеде недельной давности давал свежий approve на
+        # kubectl, посчитанный по состоянию кластера, которого уже нет.
+        # Якорь — время прогона пайплайна (какое именно поле взято, пишем в
+        # audit/лог и в executor_applied, см. intent_recorded_at).
+        intent_max_age = int(
+            getattr(settings, "EXECUTOR_INTENT_MAX_AGE_SECONDS", 86400) or 86400
+        )
+        recorded_at, anchor = intent_recorded_at(
+            analysis, getattr(record, "created_at", None)
+        )
+        if recorded_at is None:
+            # Возраст плана неизвестен → write запрещён (fail-closed).
+            return _refuse(incident_id, "intent_age_unknown", applied_by)
+        intent_age = int((datetime.now(timezone.utc) - recorded_at).total_seconds())
+        if intent_age > intent_max_age:
+            log.info(
+                "executor_apply.intent_stale",
+                incident_id=incident_id,
+                intent_age_seconds=intent_age,
+                max_age_seconds=intent_max_age,
+                time_anchor=anchor,
+            )
+            return _refuse(incident_id, f"intent_stale:{intent_age}s", applied_by)
 
         # ── Детерминированный policy-gate ──────────────────────────────
         # Финальный серверный рубеж: пересчитываем риск из самого intent-а
@@ -273,6 +418,32 @@ def apply_intent(
             )
             return _refuse(incident_id, f"policy_block:{reason_code}", applied_by)
 
+        # ── Пере-dry-run по ТЕКУЩЕМУ состоянию кластера (M1в) ───────────
+        # executor_result.dry_run_ok в analysis — снимок момента прогона
+        # пайплайна. Между ним и кликом deployment мог быть удалён,
+        # переименован, пересоздан другим владельцем или отскейлен вручную.
+        # Прогоняем ровно ту же команду через kubectl --dry-run=server
+        # (kube-apiserver валидирует, ничего не пишет) непосредственно перед
+        # реальным write; провал = отказ, write не выполняется. Делаем это ДО
+        # claim-а: read-only проверка не должна оставлять in-flight маркер.
+        recheck = k8s_service.execute_intent(intent, dry_run=True)
+        if not recheck.get("success"):
+            detail = str(
+                recheck.get("error")
+                or (recheck.get("stderr") or "").strip()
+                or f"exit_code={recheck.get('exit_code')}"
+            )[:160]
+            audit_service.log_event(
+                "EXECUTOR_APPLY_DRY_RUN_RECHECK_FAILED",
+                {
+                    "incident_id": incident_id,
+                    "applied_by": applied_by,
+                    "command": recheck.get("command"),
+                    "detail": detail,
+                },
+            )
+            return _refuse(incident_id, f"dry_run_recheck_failed:{detail}", applied_by)
+
         # ── Фаза 1: claim ПЕРЕД kubectl ────────────────────────────────
         # Мутация кластера и запись о ней раньше были в одной транзакции:
         # краш/таймаут между execute_intent и commit оставлял кластер
@@ -284,6 +455,9 @@ def apply_intent(
         analysis["executor_in_flight"] = {
             "claimed_at": datetime.now(timezone.utc).isoformat(),
             "claimed_by": applied_by,
+            # Provenance: по какому плану и какой свежести идёт write.
+            "intent_recorded_at": recorded_at.isoformat(),
+            "intent_time_anchor": anchor,
         }
         record.analysis = analysis
         # SQLAlchemy не видит in-place изменения внутри JSON Column без явного флага.
@@ -297,6 +471,16 @@ def apply_intent(
         applied_entry = {
             "applied_at": datetime.now(timezone.utc).isoformat(),
             "applied_by": applied_by,
+            # Возраст плана на момент write + чем он был измерен: без этого
+            # post-mortem не отличит «применили свежий разбор» от «применили
+            # вчерашний» (явного created_at у intent-а в analysis нет).
+            "intent_recorded_at": recorded_at.isoformat(),
+            "intent_time_anchor": anchor,
+            "intent_age_seconds": intent_age,
+            "pre_write_dry_run": {
+                "command": recheck.get("command"),
+                "exit_code": recheck.get("exit_code"),
+            },
             "result": {
                 "success": result.get("success", False),
                 "command": result.get("command"),
@@ -321,6 +505,9 @@ def apply_intent(
                 "command": result.get("command"),
                 "success": result.get("success", False),
                 "policy_decision": gate_dict,
+                # По какому по свежести плану сработал write (audit-трейл).
+                "intent_age_seconds": intent_age,
+                "intent_time_anchor": anchor,
             },
         )
         track_executor_applied(bool(result.get("success", False)))

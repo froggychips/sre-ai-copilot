@@ -70,6 +70,11 @@ def happy_path_dependencies(mocker):
     mocker.patch("app.workers.pipeline.diag_engine.run", return_value=_fact_store())
     mocker.patch("app.workers.pipeline.discord_service.send_report",
                  new_callable=AsyncMock)
+    # send_incident_report возвращает delivered (outbox в pipeline): без мока
+    # тест бил живым POST-ом в example.com из conftest → 405 → delivered=False
+    # → ReportDeliveryPending.
+    mocker.patch("app.workers.pipeline.discord_service.send_incident_report",
+                 new_callable=AsyncMock, return_value=True)
     mocker.patch("app.workers.pipeline.audit_service.log_event")
 
     record = MagicMock()
@@ -191,6 +196,18 @@ def test_legacy_path_still_valid():
     )
 
 
+def test_fix_proposed_allows_followup_investigating():
+    """Multi-turn /copilot: FIX_PROPOSED → INVESTIGATING (follow-up вопрос).
+
+    Каждый прогон generate_reply начинается с transition(INVESTIGATING),
+    успешный прогон оставляет FIX_PROPOSED. Без этого перехода второе
+    сообщение в диалог всегда падало и уводило state в FAILED (терминал).
+    """
+    assert StateMachine.validate_transition(
+        IncidentState.FIX_PROPOSED, IncidentState.INVESTIGATING
+    )
+
+
 def test_cannot_skip_investigating_to_facts_collected():
     assert not StateMachine.validate_transition(
         IncidentState.OPEN, IncidentState.FACTS_COLLECTED
@@ -273,6 +290,11 @@ async def test_pipeline_handles_no_record_gracefully(mocker, incident_data):
     mocker.patch("app.workers.pipeline.diag_engine.run", return_value=_fact_store())
     mocker.patch("app.workers.pipeline.discord_service.send_report",
                  new_callable=AsyncMock)
+    # send_incident_report возвращает delivered (outbox в pipeline): без мока
+    # тест бил живым POST-ом в example.com из conftest → 405 → delivered=False
+    # → ReportDeliveryPending.
+    mocker.patch("app.workers.pipeline.discord_service.send_incident_report",
+                 new_callable=AsyncMock, return_value=True)
     mocker.patch("app.workers.pipeline.audit_service.log_event")
 
     mock_session = MagicMock()
