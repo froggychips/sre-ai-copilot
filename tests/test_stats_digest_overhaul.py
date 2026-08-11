@@ -89,7 +89,9 @@ def test_changes_section_renders_full_delta():
         kg_edges_yesterday=1453,
     )
     text = stats_digest.changes_section(report)
-    assert "+12` new alerts (5 chronic)" in text
+    # Порог у числа обязателен: «chronic» в дайджесте встречается трижды с
+    # разными порогами (см. test_stats_digest_consistency.py).
+    assert "+12` new alerts (5 chronic ≥5 fires/24h)" in text
     assert "-8` resolved" in text
     assert "+47` KG edges" in text
 
@@ -193,30 +195,35 @@ def test_team_digest_queries_have_team_owner_filter():
 
 def test_chronic_action_items_returns_top_3():
     db = MagicMock()
+    # Row shape: (service, namespace, alertname, fires) — ns в выдаче
+    # обязателен, см. test_stats_digest_fixes про схлопывание одноимённых.
     db.execute.return_value.fetchall.return_value = [
-        ("clickhouse-keeper", "OOMKilled", 25),
-        ("bot-service", "CrashLooping", 18),
-        ("map-service", "RestartLoop", 12),
+        ("clickhouse-keeper", "prod-shared", "OOMKilled", 25),
+        ("bot-service", "prod-kingdom1", "CrashLooping", 18),
+        ("map-service", "prod-kingdom2", "RestartLoop", 12),
     ]
     items = stats_digest._chronic_action_items(db, threshold=10)
     assert len(items) == 3
     assert items[0]["service"] == "clickhouse-keeper"
+    assert items[0]["namespace"] == "prod-shared"
     assert items[0]["fires"] == 25
 
 
 def test_action_items_section_renders_three_categories():
     db = MagicMock()
     # scalar() для unowned/stale + drill-down (callers, ext/mcp).
-    # fetchall() для chronic + drill-down prod_with_alerts.
+    # fetchall() для chronic (4-col) + drill-down prod_with_alerts (2-col):
+    # оба unpack-а совместимы с одним rows-списком, т.к. prod-drill-down
+    # берёт только r[0]/r[1].
     db.execute.return_value.fetchall.return_value = [
-        ("svc-a", "AlertX", 15),
+        ("svc-a", "prod-x", "AlertX", 15),
     ]
     # Order: unowned=5, stale_total=7, then drill-down callers=2, ext_mcp=1
     db.execute.return_value.scalar.side_effect = [5, 7, 2, 1]
     text = stats_digest.action_items_section(db, chronic_threshold=10)
     assert "Action items" in text
     assert "chronic alerts" in text
-    assert "RCA: svc-a" in text
+    assert "RCA: `svc-a` prod-x" in text  # ns рядом с именем — хвост #254
     assert "without_owner_count_5" not in text  # sanity
     assert "5` services без owner" in text
     assert "7` suspicious_stale" in text

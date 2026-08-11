@@ -485,10 +485,120 @@ async def test_send_incident_dry_run_no_http(webhook_env, monkeypatch):
     svc = DiscordService()
     mock_client = _httpx_mock_returning_msg()
     with patch("app.services.discord_service.httpx.AsyncClient", return_value=mock_client):
-        await svc.send_incident_report(
+        delivered = await svc.send_incident_report(
             incident_id="INC", alertname="X", namespace="ns", pod="p",
             service="s", node=None, severity="critical",
             cause="c", resolution_quality="unresolved", synthesis="...",
         )
     mock_client.post.assert_not_called()
     mock_client.patch.assert_not_called()
+    assert delivered is True  # dry-run = намеренное подавление, не потеря
+
+
+# ---------------------------------------------------------------------------
+# Review-fix: 6000-char TOTAL guard + title[:256] + bool-контракт доставки.
+# Раньше incident-embed уходил в Discord без _fit_embed_to_limit (он был
+# только в enriched-пути) → полностью обогащённый инцидент >6000 = 400 =
+# алерт дропнут целиком.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_send_incident_fits_embed_over_6000(webhook_env):
+    """Раздутый инцидент (>6000 TOTAL) ужимается и всё равно постится."""
+    from app.services.discord_service import DiscordService, _embed_total_len
+
+    svc = DiscordService()
+    mock_client = _httpx_mock_returning_msg(msg_id="m-big")
+    big = "x" * 1000
+    with patch("app.services.discord_service.httpx.AsyncClient", return_value=mock_client):
+        delivered = await svc.send_incident_report(
+            incident_id="INC-BIG", alertname="X", namespace="ns", pod="p",
+            service="s", node=None, severity="critical",
+            cause=big,  # root cause до 1024
+            resolution_quality="unresolved",
+            synthesis="S" * 4000,  # description → 1200 после обрезки
+            deploy_correlation={
+                "verdict": "likely", "confidence": 0.9,
+                "deploy": {
+                    "buildtype_name": "b" * 400, "number": "42",
+                    "minutes_before_incident": 4,
+                },
+            },
+            executor_result={"status": "dry_run_failed", "stderr": big},
+        )
+    assert mock_client.post.await_count == 1, "алерт не должен быть дропнут"
+    embed = mock_client.post.await_args.kwargs["json"]["embeds"][0]
+    total = _embed_total_len(embed)
+    assert total <= 6000, f"embed {total} > 6000 — Discord ответит 400"
+    # Root cause выживает — именно он нужен on-call.
+    names = [f["name"] for f in embed["fields"]]
+    assert any("Root Cause" in n for n in names)
+    assert delivered is True
+
+
+@pytest.mark.asyncio
+async def test_send_incident_truncates_title_over_256(webhook_env):
+    """Длинный alertname+ns → title режется до 256 с маркером обрезки."""
+    from app.services.discord_service import DiscordService
+
+    svc = DiscordService()
+    mock_client = _httpx_mock_returning_msg(msg_id="m-title")
+    with patch("app.services.discord_service.httpx.AsyncClient", return_value=mock_client):
+        await svc.send_incident_report(
+            incident_id="INC-T", alertname="A" * 300, namespace="n" * 100,
+            pod="p", service="s", node=None, severity="critical",
+            cause="c", resolution_quality="unresolved", synthesis="...",
+        )
+    title = mock_client.post.await_args.kwargs["json"]["embeds"][0]["title"]
+    assert len(title) <= 256
+    assert title.endswith("…")
+
+
+@pytest.mark.asyncio
+async def test_send_incident_returns_false_on_http_error(webhook_env):
+    """HTTP>=400 → False, но исключение наружу НЕ летит (контракт pipeline)."""
+    from app.services.discord_service import DiscordService
+
+    svc = DiscordService()
+    mock_client = _httpx_mock_returning_msg(msg_id="m", status=400)
+    with patch("app.services.discord_service.httpx.AsyncClient", return_value=mock_client):
+        delivered = await svc.send_incident_report(
+            incident_id="INC-400", alertname="X", namespace="ns", pod="p",
+            service="s", node=None, severity="critical",
+            cause="c", resolution_quality="unresolved", synthesis="...",
+        )
+    assert delivered is False
+
+
+@pytest.mark.asyncio
+async def test_send_incident_swallows_post_exception(webhook_env):
+    """Исключение транспорта → False, наружу не бросаем (pipeline полагается)."""
+    from app.services.discord_service import DiscordService
+
+    svc = DiscordService()
+    mock_client = _httpx_mock_returning_msg()
+    mock_client.post = AsyncMock(side_effect=RuntimeError("connection reset"))
+    with patch("app.services.discord_service.httpx.AsyncClient", return_value=mock_client):
+        delivered = await svc.send_incident_report(
+            incident_id="INC-EXC", alertname="X", namespace="ns", pod="p",
+            service="s", node=None, severity="critical",
+            cause="c", resolution_quality="unresolved", synthesis="...",
+        )
+    assert delivered is False
+
+
+@pytest.mark.asyncio
+async def test_send_incident_returns_false_on_low_severity(webhook_env):
+    """severity-gate skip = недоставка (False), не успех."""
+    from app.services.discord_service import DiscordService
+
+    svc = DiscordService()
+    mock_client = _httpx_mock_returning_msg()
+    with patch("app.services.discord_service.httpx.AsyncClient", return_value=mock_client):
+        delivered = await svc.send_incident_report(
+            incident_id="INC-INFO", alertname="X", namespace="ns", pod="p",
+            service="s", node=None, severity="info",
+            cause="c", resolution_quality="unresolved", synthesis="...",
+        )
+    assert delivered is False

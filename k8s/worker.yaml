@@ -64,6 +64,67 @@ spec:
           value: "production"
         - name: SAFE_MODE
           value: "true"
+        # ── Liveness ─────────────────────────────────────────────────────────
+        # До этого у воркера НЕ БЫЛО ни одной пробы (у api — все три). OOM ловит
+        # kubelet сам, но всё, что НЕ OOM — CPU-троттлинг, залипший
+        # kubectl-subprocess, потерянный broker-коннект после сетевого флапа —
+        # оставляет процесс Running бесконечно и без единого сигнала: при
+        # 2 репликах × concurrency=2 тихо выпадает половина слотов, задачи
+        # копятся в redis и мрут по expires. Именно так дайджест
+        # daily_stats_digest два дня молча протухал в очереди (10.08.2026).
+        #
+        # ПОЧЕМУ ПРОБА НЕ УБЬЁТ ЗАНЯТЫЙ ВОРКЕР. `inspect ping` обслуживает
+        # control-thread ГЛАВНОГО процесса, а не prefork-дети: воркер, у которого
+        # все слоты заняты 30-минутным incident-pipeline (hard limit 1800s),
+        # отвечает на ping штатно — проверено локально на занятом concurrency=1
+        # воркере: exit 0 за 0.19s. Провалить пробу может только вставший main
+        # loop или потеря связи с брокером — ровно то, что мы и ловим.
+        #
+        # `-b "$REDIS_URL"` вместо `-A app.workers.tasks.celery_app` — НАМЕРЕННО.
+        # С `-A` каждая проба импортировала бы весь стек приложения (~166 MiB RSS
+        # и секунды CPU в лимите 600m, см. арифметику в resources ниже) — то есть
+        # сама создавала бы троттлинг и таймауты, от которых должна защищать.
+        # Без `-A` поднимается только celery+kombu: замер — 41 MiB peak RSS,
+        # 0.19s CPU. REDIS_URL берётся из того же envFrom (sre-ai-secrets), из
+        # которого его читает сам воркер, → проба смотрит ровно в тот брокер,
+        # из которого воркер ест. Результат-бэкенд пробе не нужен: control-ответ
+        # идёт по брокерному pidbox.
+        #
+        # `-d celery@<pod>` ОБЯЗАТЕЛЕН: без destination ping — это broadcast, и
+        # за зависшую реплику ответит живая соседка (проба стала бы фикцией).
+        # Имя нода celery — `celery@$(socket.gethostname())` = имя пода.
+        # HOSTNAME проставляет runtime; `hostname` — фолбэк, если его нет.
+        #
+        # ПАРАМЕТРЫ:
+        #   initialDelaySeconds=120 — старт воркера = импорт стека + коннект к
+        #     брокеру; на 600m это десятки секунд, берём ×4 запаса.
+        #   periodSeconds=60 — при 0.19s CPU на пробу это 0.3% ядра.
+        #   timeoutSeconds=15 > `-t 10` — kubelet не должен срезать пробу раньше,
+        #     чем celery сам вернёт non-zero (недостижимый брокер = exit 69
+        #     примерно за 6s: kombu до отказа ретраит коннект).
+        #   failureThreshold=5 — рестарт только после ~5 минут молчания. Liveness,
+        #     висящая на внешней зависимости, легко превращает блип redis в
+        #     аутедж: оба воркера уходят в рестарт-петлю одновременно. 5 минут —
+        #     заведомо больше любого реконнекта celery и меньше времени, за
+        #     которое очередь начинает терять задачи по expires (минимальный
+        #     expires в beat_schedule — 50s у kg-external-probe, но её потеря
+        #     безобидна; критичные — часы).
+        livenessProbe:
+          exec:
+            command:
+            - sh
+            - -c
+            # stdout НЕ глушим: текст ошибки celery попадает в Unhealthy-event
+            # (`kubectl describe pod`) — иначе диагностика сводится к «проба упала».
+            - 'celery -b "$REDIS_URL" inspect ping -d "celery@${HOSTNAME:-$(hostname)}" -t 10'
+          initialDelaySeconds: 120
+          periodSeconds: 60
+          timeoutSeconds: 15
+          failureThreshold: 5
+        # readinessProbe у воркера НЕТ намеренно: он не стоит ни за одним
+        # Service, endpoint'ов не отдаёт, а вот rollout (`kubectl rollout status`
+        # в deploy.sh, теперь блокирующий) начал бы ждать тот же ping и падать
+        # по таймауту на медленном старте.
         # Лимиты приведены в соответствие с --concurrency (было: concurrency=4
         # при 256Mi/200m — конфигурация, которая не могла не OOM-иться).
         #
@@ -198,6 +259,55 @@ spec:
           value: "production"
         - name: SAFE_MODE
           value: "true"
+        # ── Liveness ─────────────────────────────────────────────────────────
+        # У beat пробы тоже не было. Смерть процесса контейнер переживёт сам
+        # (beat = PID 1, падение → рестарт), а вот ЗАВИСШИЙ планировщик —
+        # это Running-под, который просто перестал тикать: ни одна периодическая
+        # задача не ставится, KG протухает молча (тот же класс тишины, что
+        # 1565 OOM-рестартов beat'а до 2026-06-24).
+        #
+        # Проверяем самое дешёвое, что доказывает «планировщик тикает»: свежесть
+        # shelve-файла расписания. celery.beat.Scheduler.sync_every = 3*60 (см.
+        # celery/beat.py), PersistentScheduler открывает shelve с writeback=True.
+        # `celery inspect ping` здесь неприменим — у beat нет control-pidbox.
+        #
+        # ВАЖНАЯ ТОНКОСТЬ, проверенная экспериментом: sync вызывается НЕ по
+        # таймеру, а из apply_entry — то есть только когда beat что-то отправил
+        # (у beat'а с пустым beat_schedule файл не переписался ни разу за 13
+        # минут). Значит порог должен покрывать не sync_every, а самый редкий
+        # ГАРАНТИРОВАННЫЙ тик расписания. Сейчас это минутная kg-external-probe
+        # (crontab(minute="*") — ставится независимо от EXTERNAL_PROBE_ENABLED,
+        # флаг проверяется внутри таски), но если её однажды уберут, следующая по
+        # частоте — */10, и порог 600s оказался бы ровно на границе. Отсюда 900s:
+        # ×5 к sync_every, ×1.5 к десятиминутному тику, и всё равно вставший
+        # цикл виден максимум за ~15 минут вместо бесконечной тишины.
+        #
+        # glob по префиксу, а НЕ точное имя: конкретный dbm-бэкенд решает, как
+        # называть файл (_gdbm — ровно `celerybeat-schedule`, ndbm — `.db`,
+        # dbm.dumb — `.dat`/`.dir`/`.bak`). Проверено: на ndbm файл появляется
+        # как celerybeat-schedule.db, и проба по точному имени срабатывала бы
+        # вечно и ложно → рестарт-петля здорового beat'а.
+        #
+        # Параметры: initialDelaySeconds=120 (импорт стека при cpu limit 100m —
+        # это десятки секунд), periodSeconds=60, timeoutSeconds=10 (python -c
+        # без импорта приложения — ~0.03s CPU), failureThreshold=3.
+        livenessProbe:
+          exec:
+            command:
+            - python
+            - -c
+            - |
+              import glob, os, sys, time
+              paths = glob.glob("/tmp/celerybeat-schedule*")
+              if not paths:
+                  sys.exit("celerybeat-schedule missing: beat did not start the scheduler")
+              age = int(time.time() - max(os.path.getmtime(p) for p in paths))
+              if age >= 900:
+                  sys.exit("celerybeat-schedule stale for %ds: beat loop wedged" % age)
+          initialDelaySeconds: 120
+          periodSeconds: 60
+          timeoutSeconds: 10
+          failureThreshold: 3
         resources:
           limits:
             cpu: 100m

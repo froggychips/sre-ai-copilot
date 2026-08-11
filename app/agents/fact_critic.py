@@ -35,6 +35,7 @@ from app.agents.base import BaseAgent
 from app.agents.models.hypothesis import Hypothesis, HypothesisSet
 from app.diagnostics.facts import FactStore
 from app.observability.ai_metrics import track_refuted, track_stage_duration
+from app.services.llm_service import LLMTruncatedResponse
 from app.services.telemetry_utils import trace_agent
 
 logger = structlog.get_logger()
@@ -194,6 +195,10 @@ class FactCriticAgent(BaseAgent):
                 "evidence consistency."
             ),
             task_type="critic",
+            # Ответ — строго JSON {"refutations":[...]}; обрезка по max_tokens
+            # = битый JSON → ask поднимает LLMTruncatedResponse вместо огрызка,
+            # который _parse_refutations молча превратил бы в [].
+            json_response=True,
         )
 
     @trace_agent("FactCritic")
@@ -230,6 +235,14 @@ class FactCriticAgent(BaseAgent):
         _t0 = time.monotonic()
         try:
             raw = await self.ask(user_context=user_context, instruction=instruction)
+        except LLMTruncatedResponse:
+            track_stage_duration("llm_critic", time.monotonic() - _t0)
+            # Обрезанный по max_tokens JSON — НЕ «критик не нашёл противоречий».
+            # Молчание здесь (ветка ниже) дало бы слабой гипотезе пережить
+            # критику с полной confidence. Пробрасываем: stage_critique фейлится
+            # терминально (LLMTruncatedResponse не в RETRIABLE_EXC → post-mortem
+            # + FAILED в tasks.py) — честнее уверенно-неверного вывода людям.
+            raise
         except Exception as e:
             track_stage_duration("llm_critic", time.monotonic() - _t0)
             logger.warning(

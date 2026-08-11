@@ -138,8 +138,14 @@ class TestRateLimiting:
         assert results[10] is False
 
     @pytest.mark.asyncio
-    async def test_rate_limit_fail_open_on_redis_down(self):
-        """При недоступности Redis ratelimiter пропускает запрос (fail-open)."""
+    async def test_rate_limit_single_request_passes_on_redis_down(self):
+        """При недоступности Redis одиночный запрос проходит.
+
+        Раньше это был полный fail-open (`return True` на любой ошибке).
+        Теперь решение принимает in-process fallback-счётчик с тем же порогом:
+        первый запрос в окне так же проходит, но лимит целиком не снимается —
+        см. tests/test_rate_limit_degradation.py.
+        """
         from app.api import rate_limit
 
         fake = MagicMock()
@@ -149,7 +155,7 @@ class TestRateLimiting:
 
         with patch.object(rate_limit, "_get_client", return_value=fake):
             ok = await rate_limit.check_alertmanager("203.0.113.20")
-        assert ok is True  # fail-open: HMAC всё ещё закрывает auth
+        assert ok is True  # первый в окне: пропускает fallback-счётчик
 
 
 class TestSecurityValidation:

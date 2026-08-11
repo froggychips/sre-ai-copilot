@@ -68,6 +68,14 @@ log = logging.getLogger(__name__)
 
 
 # ── Сигнал A: prefix patterns ─────────────────────────────────────────────
+# ЕДИНЫЙ список WO-окружений для ВСЕХ ns-паттернов ниже. Раньше альтернация
+# была скопирована в 4 места, и в одном из них (`_BARE_SHARED_RE`) забыли
+# `preupdate` — из-за этого `preupdate-shared` вёл себя иначе, чем
+# prod/preprod-shared (см. комментарий у _BARE_SHARED_RE). Любой новый env
+# добавляется здесь один раз.
+_ENVS = ("prod", "preprod", "preupdate", "dev", "staging", "qa")
+_ENV_ALT = "|".join(_ENVS)
+
 # Префикс-патерны в порядке specificity (более узкие выше).
 # Каждый паттерн вытаскивает «team-токен» из ns-имени.
 _PREFIX_PATTERNS = [
@@ -76,11 +84,11 @@ _PREFIX_PATTERNS = [
     # squad-gd-realm → squad-gd (GD-стенд: суффикс не число)
     (re.compile(r"^squad-(gd)-"), lambda m: f"squad-{m.group(1)}"),
     # <env>-kingdom<N> → kingdom<N>  (preupdate включён: реальный WO-env)
-    (re.compile(r"^(?:prod|preprod|preupdate|dev|staging|qa)-kingdom(\d+)$"), lambda m: f"kingdom{m.group(1)}"),
+    (re.compile(rf"^(?:{_ENV_ALT})-kingdom(\d+)$"), lambda m: f"kingdom{m.group(1)}"),
     # <env>-shared → shared
-    (re.compile(r"^(?:prod|preprod|preupdate|dev|staging|qa)-shared$"), lambda _m: "shared"),
+    (re.compile(rf"^(?:{_ENV_ALT})-shared$"), lambda _m: "shared"),
     # <env>-payments / <env>-data / <env>-tools / т.п. — single-realm
-    (re.compile(r"^(?:prod|preprod|preupdate|dev|staging|qa)-(payments|data|tools|cdn|statics|logging|monitoring|search)$"),
+    (re.compile(rf"^(?:{_ENV_ALT})-(payments|data|tools|cdn|statics|logging|monitoring|search)$"),
      lambda m: m.group(1)),
     # bare team-namespaces без env-префикса: monitoring/logging/cert-manager/ingress-nginx
     (re.compile(r"^(monitoring|logging|cert-manager|ingress-nginx|kube-system|cattle-system|metallb-system|local-path-storage)$"),
@@ -101,7 +109,14 @@ _PREFIX_PATTERNS = [
 # но labels не самостоятельно перевешивает, так что multi-squad всё ещё
 # дефолт без других сигналов). Любой реальный сигнал ≥ medium strength —
 # побеждает placeholder, как и задумано в живом preview 2026-05-24.
-_BARE_SHARED_RE = re.compile(r"^(?:prod|preprod|dev|staging|qa)-shared$")
+# Список env — тот же `_ENVS`, что и у _PREFIX_PATTERNS. До фикса здесь была
+# своя копия альтернации БЕЗ `preupdate`: `preupdate-shared` (23 unowned-сервиса
+# в KG-снимке 2026-05-25, ровно такой же мультитенантный ns, как prod/preprod)
+# получал owner `shared` с ПОЛНОЙ силой 0.5 вместо multi-squad-заглушки 0.20.
+# Симптом маскировался manual-правилом `preupdate-shared → @platform` в
+# config/ownership.yaml (оно бьёт раньше эвристик), но стоило снять манифест —
+# и env вёл себя не как соседи.
+_BARE_SHARED_RE = re.compile(rf"^(?:{_ENV_ALT})-shared$")
 _BARE_SHARED_STRENGTH = 0.4
 _BARE_SHARED_OWNER = "multi-squad"
 

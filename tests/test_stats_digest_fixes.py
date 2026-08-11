@@ -13,14 +13,24 @@
   * M5 — (a) Δ24h сравнивает like-for-like (today-fires vs yesterday-fires),
     (b) MTTR trend сравнивает предыдущее НЕпересекающееся окно той же длины.
 
-Все тесты на MagicMock — без живого PostgreSQL. Для M2/M4 PG-специфичный SQL
-не гоняется, поэтому проверяем сам SQL-текст и поведение на моках.
+Ревью-фиксы 2026-08-10:
+  * R1 — пустой VICTORIA_METRICS_URL не роняет сборку NameError'ом
+    (vm=None + mcp_kg_usage_section скрывается без VM).
+  * R2 — chronic action items группируются с namespace: одноимённые сервисы
+    из разных ns не схлопываются в один ложный chronic (хвост #254).
+  * R3 — deadman-heartbeat доставки пишется ТОЛЬКО при подтверждённой
+    отправке (send_stats_report → bool); False → status=send_failed.
+
+Все тесты на MagicMock — без живого PostgreSQL. Для M2/M4/R2 PG-специфичный
+SQL не гоняется, поэтому проверяем сам SQL-текст и поведение на моках.
 """
 from __future__ import annotations
 
 from collections import Counter
 from datetime import datetime, timedelta, timezone
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
+
+import pytest
 
 from app.services import stats_digest
 
@@ -233,3 +243,184 @@ def test_mttr_trend_compares_nonoverlapping_previous_window():
     # старый gate `prev.samples > now.samples` это ошибочно подавлял.
     assert "trend" in text
     assert "-5min" in text          # median 10 − 15
+
+
+# ── R1. VM-less сборка: пустой VICTORIA_METRICS_URL не роняет дайджест ──────
+
+
+def _empty_db() -> MagicMock:
+    """Session-мок, отвечающий «пусто» на любой запрос секции."""
+    db = MagicMock()
+    db.execute.return_value.fetchall.return_value = []
+    db.execute.return_value.fetchone.return_value = None
+    db.execute.return_value.scalar.return_value = 0
+    return db
+
+
+@pytest.mark.asyncio
+async def test_build_digest_survives_empty_victoria_metrics_url():
+    """Регрессия: `vm` рождался только внутри `if settings.VICTORIA_METRICS_URL`,
+    а `mcp_kg_usage_section(vm)` звался безусловно — при пустом URL вся сборка
+    падала NameError, и дайджест не выходил вообще.
+
+    VM-less путь легитимен: секции без VM обязаны честно сказать «не настроен»
+    (Cluster Health) либо скрыться (MCP usage), а сборка — дойти до конца.
+    """
+    db = _empty_db()
+    with patch.object(stats_digest.settings, "VICTORIA_METRICS_URL", ""), \
+         patch.object(stats_digest, "_read_last_firing_series",
+                      new=AsyncMock(return_value=None)), \
+         patch.object(stats_digest, "_read_day_snapshot",
+                      new=AsyncMock(return_value=None)), \
+         patch.object(stats_digest, "_write_last_firing_series",
+                      new=AsyncMock(return_value=None)), \
+         patch.object(stats_digest, "_write_day_snapshot",
+                      new=AsyncMock(return_value=None)), \
+         patch.object(stats_digest, "recent_deploys_section",
+                      new=AsyncMock(return_value="")), \
+         patch.object(stats_digest, "_kubectl_get_deployments_json",
+                      return_value=[]), \
+         patch.object(stats_digest, "pipeline_health_section", return_value=""), \
+         patch.object(stats_digest, "beat_heartbeats_footer", return_value=""):
+        content, meta = await stats_digest._build_digest_with_meta(db)
+
+    assert "Cluster Daily Digest" in content
+    # Соседняя секция честно объявляет об отсутствии VM…
+    assert "VICTORIA_METRICS_URL не настроен" in content
+    # …а MCP-usage без VM просто скрыт, а не падает.
+    assert "KG через MCP" not in content
+    assert "mcp_kg_usage_section" not in (meta["failed_sections"] or [])
+
+
+@pytest.mark.asyncio
+async def test_mcp_kg_usage_section_hidden_without_vm():
+    """vm=None → секция скрыта и НЕ считается упавшей (это штатный путь,
+    а не сбой: жаловаться на ненастроенный VM — работа Cluster Health)."""
+    stats_digest._reset_section_failures()
+    assert await stats_digest.mcp_kg_usage_section(None) == ""
+    try:
+        failures = list(stats_digest._section_failures.get())
+    except LookupError:
+        failures = []
+    assert failures == []
+
+
+# ── R2. Chronic action items: namespace в GROUP BY и в строке ───────────────
+
+
+def test_chronic_action_items_group_by_includes_namespace():
+    """Хвост #254: без ns в GROUP BY семь одноимённых `bot` из разных ns по
+    2 fires схлопывались в один ложный chronic «14 fires»."""
+    db = MagicMock()
+    db.execute.return_value.fetchall.return_value = []
+    stats_digest._chronic_action_items(db, threshold=10)
+
+    sql = str(db.execute.call_args[0][0])
+    assert "s.namespace" in sql
+    assert "GROUP BY s.id, s.name, s.namespace, a.alertname" in sql
+
+
+def test_chronic_action_items_keeps_same_name_from_different_namespaces():
+    """Одноимённые сервисы из разных ns — ДВА разных item-а с своими fires."""
+    db = MagicMock()
+    db.execute.return_value.fetchall.return_value = [
+        ("bot", "prod-kingdom1", "KubePodCrashLooping", 12),
+        ("bot", "prod-kingdom2", "KubePodCrashLooping", 11),
+    ]
+    items = stats_digest._chronic_action_items(db, threshold=10)
+    assert [(i["service"], i["namespace"], i["fires"]) for i in items] == [
+        ("bot", "prod-kingdom1", 12),
+        ("bot", "prod-kingdom2", 11),
+    ]
+
+
+def test_action_items_renders_namespace_next_to_chronic_service():
+    """В строке дайджеста ns стоит рядом с именем — иначе два `bot` в
+    «RCA: bot, bot» неразличимы."""
+    db = MagicMock()
+    with patch.object(stats_digest, "_chronic_action_items", return_value=[
+        {"service": "bot", "namespace": "prod-kingdom1",
+         "alertname": "KubePodCrashLooping", "fires": 12},
+        {"service": "bot", "namespace": "prod-kingdom2",
+         "alertname": "KubePodCrashLooping", "fires": 11},
+    ]), \
+         patch.object(stats_digest, "_unowned_action_items", return_value=0), \
+         patch.object(stats_digest, "_suspicious_stale_action_items", return_value=0):
+        text = stats_digest.action_items_section(db)
+
+    assert "`bot` prod-kingdom1" in text
+    assert "`bot` prod-kingdom2" in text
+
+
+def test_suspicious_in_prod_top_renders_with_namespace():
+    """Топ-имена prod-bucket-а тоже с ns (были только имена)."""
+    db = MagicMock()
+    with patch.object(stats_digest, "_chronic_action_items", return_value=[]), \
+         patch.object(stats_digest, "_unowned_action_items", return_value=0), \
+         patch.object(stats_digest, "_suspicious_stale_action_items", return_value=5), \
+         patch.object(stats_digest, "_suspicious_in_prod_with_alerts",
+                      return_value=(2, [("bot", "prod-kingdom1"),
+                                        ("bot", "prod-kingdom2")])), \
+         patch.object(stats_digest, "_suspicious_with_callers", return_value=0), \
+         patch.object(stats_digest, "_suspicious_in_external_or_mcp", return_value=0):
+        text = stats_digest.action_items_section(db)
+
+    assert "`bot` prod-kingdom1" in text
+    assert "`bot` prod-kingdom2" in text
+
+
+def test_suspicious_in_prod_with_alerts_selects_namespace():
+    db = MagicMock()
+    db.execute.return_value.fetchall.return_value = []
+    stats_digest._suspicious_in_prod_with_alerts(db, days=60)
+    sql = str(db.execute.call_args[0][0])
+    assert "SELECT s.name, s.namespace" in sql
+
+
+# ── R3. Deadman-маркер доставки только при подтверждённой отправке ──────────
+
+
+def _sent_meta() -> dict:
+    return {
+        "sections_with_content": 3,
+        "change_report": stats_digest.ChangeReport(new_alerts_24h=1),
+        "fired_series_count": 1,
+    }
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_not_recorded_when_delivery_failed():
+    """send_stats_report глотает свои ошибки и возвращает False (нет вебхука /
+    HTTP>=400). Раньше heartbeat писался безусловно — deadman видел «доставлено»
+    у дайджеста, который до Discord не доехал, и молчал."""
+    fake_discord = MagicMock()
+    fake_discord.send_stats_report = AsyncMock(return_value=False)
+    heartbeat = MagicMock()
+    with patch.object(stats_digest.settings, "STATS_DIGEST_ENABLED", True), \
+         patch.object(stats_digest.settings, "STATS_DIGEST_SKIP_NOOP", False, create=True), \
+         patch.object(stats_digest, "_build_digest_with_meta",
+                      new=AsyncMock(return_value=("BODY", _sent_meta()))), \
+         patch.object(stats_digest, "_record_task_heartbeat", heartbeat), \
+         patch("app.services.discord_service.discord_service", fake_discord):
+        result = await stats_digest.send_daily_digest(db=MagicMock())
+
+    assert result["status"] == "send_failed"
+    heartbeat.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_recorded_when_delivery_confirmed():
+    """True (2xx или DISCORD_DRY_RUN) → heartbeat доставки пишется."""
+    fake_discord = MagicMock()
+    fake_discord.send_stats_report = AsyncMock(return_value=True)
+    heartbeat = MagicMock()
+    with patch.object(stats_digest.settings, "STATS_DIGEST_ENABLED", True), \
+         patch.object(stats_digest.settings, "STATS_DIGEST_SKIP_NOOP", False, create=True), \
+         patch.object(stats_digest, "_build_digest_with_meta",
+                      new=AsyncMock(return_value=("BODY", _sent_meta()))), \
+         patch.object(stats_digest, "_record_task_heartbeat", heartbeat), \
+         patch("app.services.discord_service.discord_service", fake_discord):
+        result = await stats_digest.send_daily_digest(db=MagicMock())
+
+    assert result["status"] == "sent"
+    heartbeat.assert_called_once_with(stats_digest.DIGEST_DELIVERY_TASK)

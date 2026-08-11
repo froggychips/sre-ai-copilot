@@ -46,8 +46,8 @@ from typing import Any, Dict, List, Optional, Tuple, cast
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from app.knowledge_graph.schema import (AnomalyObservation, LogObservation,
-                                        Service, ServiceHealth)
+from app.knowledge_graph.schema import (NODE_KIND_SERVICE, AnomalyObservation,
+                                        LogObservation, Service, ServiceHealth)
 
 log = logging.getLogger(__name__)
 
@@ -527,8 +527,17 @@ def detect_anomalies(
     crit_thresh = _threshold_crit()
     rel_floor = _rel_spread_floor()
 
+    # node_kind='service': с contract 2.4 «Service foo + Deployment foo» —
+    # два non-synthetic узла с одинаковыми метриками (kg_service_health пишется
+    # по имени). Без фильтра каждая аномалия рождалась ДВАЖДЫ — по разу на
+    # узел пары — и удвоение шло прямиком в порог >500/сутки в self_health.
     services: List[Service] = (
-        db.query(Service).filter(Service.synthetic.is_(False)).all()
+        db.query(Service)
+        .filter(
+            Service.synthetic.is_(False),
+            Service.node_kind == NODE_KIND_SERVICE,
+        )
+        .all()
     )
     stats: Dict[str, Any] = {
         "real_services": len(services),

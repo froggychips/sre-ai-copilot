@@ -197,11 +197,19 @@ EDGE_KINDS: Dict[str, EdgeKindSpec] = {
         "table": "kg_service_edges",
     },
     "serves_traffic": {
-        "semantic": "src получает HTTP-трафик через ingress dst",
-        "src_kinds": REAL_SERVICE_KINDS,
-        "dst_kinds": {"ingress"},
+        "semantic": "k8s Service src маршрутизирует трафик на свой backing "
+                    "workload dst (selector-match)",
+        # NB: src/dst живут в node_kind namespace (contract 2.4), не в
+        # SERVICE_KINDS: это ребро связывает роль-узлы одной пары
+        # «Service + workload», а не k8s-типы. До этой правки registry
+        # описывал противоположное направление («src получает трафик через
+        # ingress dst», dst_kinds={'ingress'}) — producer же НИКОГДА не писал
+        # рёбра на ingress-узлы; consumer'ы, поверившие «источнику истины»
+        # (blast_radius_for), искали dst=Service-узел и не матчили ничего.
+        "src_kinds": {NODE_KIND_SERVICE},
+        "dst_kinds": {NODE_KIND_WORKLOAD},
         "source": "k8s_topology_resources_sync (Wave 7 / G1.3)",
-        "example": "wo-api-squad-1 --serves_traffic--> ingress:wo-api-squad-1.lastoasisgame.com",
+        "example": "wo-api-squad-1 (Service-узел) --serves_traffic--> wo-api-squad-1 (workload-узел, Deployment)",
         "status": "active",
         "table": "kg_service_edges",
     },
@@ -447,9 +455,10 @@ def owner_known(service: "Service") -> bool:
     return True
 
 
-#: Все известные node-kinds (service + storage). Используется
-#: тестами drift-check для валидации src/dst у edge-specs.
-ALL_NODE_KINDS: Set[str] = SERVICE_KINDS | STORAGE_NODE_KINDS
+#: Все известные node-kinds (service + storage + графовые NODE_KINDS из
+#: contract 2.4 — serves_traffic описан в терминах node_kind, см. NB там).
+#: Используется тестами drift-check для валидации src/dst у edge-specs.
+ALL_NODE_KINDS: Set[str] = SERVICE_KINDS | STORAGE_NODE_KINDS | NODE_KINDS
 
 
 # ---------------------------------------------------------------------------

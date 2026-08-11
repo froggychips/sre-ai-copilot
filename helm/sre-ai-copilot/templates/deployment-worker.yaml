@@ -88,6 +88,33 @@ spec:
         - name: OWNERSHIP_MANIFEST_PATH
           value: {{ .Values.env.ownershipManifestPath | default "/config/ownership.yaml" | quote }}
         {{- end }}
+        # ── Liveness ─────────────────────────────────────────────────────────
+        # Синхронизировано с k8s/worker.yaml — подробное обоснование каждого
+        # параметра там же (источник истины). Коротко:
+        #   * без пробы воркер, вставший НЕ по памяти (CPU-троттлинг, залипший
+        #     kubectl-subprocess, потерянный broker-коннект), остаётся Running
+        #     навсегда и уносит половину слотов (2 реплики × concurrency=2);
+        #   * `inspect ping` обслуживает control-thread главного процесса, поэтому
+        #     воркер, занятый 30-минутным pipeline, пробу проходит (проверено);
+        #   * `-b "$REDIS_URL"` вместо `-A app.workers.tasks.celery_app`, чтобы
+        #     проба не импортировала весь стек (~166 MiB, секунды CPU) каждую
+        #     минуту: с `-b` это 41 MiB и 0.19s CPU;
+        #   * `-d celery@<pod>` обязателен, иначе за зависшую реплику ответит
+        #     живая соседка (ping без destination — broadcast).
+        livenessProbe:
+          exec:
+            command:
+            - sh
+            - -c
+            - 'celery -b "$REDIS_URL" inspect ping -d "celery@${HOSTNAME:-$(hostname)}" -t 10'
+          initialDelaySeconds: 120
+          periodSeconds: 60
+          # timeoutSeconds > `-t 10`: kubelet не должен срезать пробу раньше,
+          # чем celery вернёт non-zero сам.
+          timeoutSeconds: 15
+          # ~5 минут молчания до рестарта: короткий флап redis не должен
+          # укладывать все реплики в рестарт-петлю разом.
+          failureThreshold: 5
         resources:
           {{- toYaml .Values.resources.worker | nindent 10 }}
         {{- if .Values.ownershipManifest.enabled }}

@@ -7,34 +7,40 @@
 Overhaul 2026-05-25: digest стал Δ-only + action-driven + observability-rich.
 Изменения:
   * `_compute_change_report`/`_changes_section` — Δ vs Redis-snapshot prev-day.
-  * Skip-if-noop в `send_daily_digest` — пустой digest вообще не постится.
+  * Skip-if-noop в `send_daily_digest` — пустой digest вообще не постится
+    (условие достижимо только вместе с `change_report_has_signal`: текст
+    Δ-секции непустой всегда, и по нему счётчик никогда не был нулём).
   * `action_items_section` — chronic/unowned/suspicious_stale RCA-candidates.
-  * `noisemakers_section` — top-3 сервисов генерирующих >20% алертов.
+  * `noisemakers_section` — top-3 сервисов, держащих >20% firing-серий снимка.
   * `mttr_section` — median/p95 MTTR resolved alerts за 7d + trend.
-  * `deploy_incident_correlation_section` — deploy→alert within 30m.
+  * `deploy_incident_correlation_section` — deploy→alert в окне
+    [started-5m; finished+60m].
   * `topology_growth_section` — Δ services/edges/NATS subjects vs snapshot.
   * `pipeline_health_section` — vmsingle/vmagent/AM/copilot/seq freshness.
   * `beat_heartbeats_footer` — last_run per sync task.
   * `recent_deploys_section` — clickable TC build URLs (Markdown link).
 
 Секции (в порядке вывода, после overhaul):
-  0. pipeline_health (header) — gauge vmagent/AM/copilot/seq freshness
-  1. cluster_health — snapshot + Δ vs yesterday
-  2. changes — Δ-only: new alerts / resolved / KG-edges (item A1)
-  3. action_items — RCA-candidates (item B4)
-  4. firing_alerts_by_squad
-  5. unowned_namespaces
-  6. top_alert_types — Δ24h + chronic/resurfaced
-  7. noisemakers — top-3 сервисов с >20% alerts (item B5)
-  8. mttr — resolved alerts last 7d (item B6)
-  9. deploy_incident_correlation — deploy→alert within 30m (item B7)
-  10. topology_growth — Δ services/edges/NATS (item B8)
-  11. anomaly_summary / anomaly_top / log_errors (Wave 2)
-  12. recent_deploys — TC deployer activity, clickable build URLs
-  13. fragile_services / blast_radius
-  14. stale_deployments
-  15. kg_quality
-  16. beat_heartbeats (footer, item C10)
+  0. section_failures — «какие секции не собрались»: первой строкой, чтобы
+     предупреждение о неполноте не отрезалось лимитом Discord
+  1. pipeline_health (header) — gauge vmagent/AM/copilot/seq freshness
+  2. cluster_health — snapshot + Δ vs yesterday
+  3. changes — Δ-only: new alerts / resolved / KG-edges (item A1)
+  4. action_items — RCA-candidates (item B4)
+  5. firing_alerts_by_squad
+  6. unowned_namespaces
+  7. top_alert_types — Δ24h + chronic/resurfaced
+  8. noisemakers — top-3 сервисов с >20% firing-серий снимка (item B5)
+  9. mttr — resolved alerts last 7d (item B6)
+  10. deploy_incident_correlation — deploy→alert в окне
+      [started-5m; finished+60m] (item B7)
+  11. topology_growth — Δ services/edges/NATS (item B8)
+  12. anomaly_summary / anomaly_top / log_errors (Wave 2)
+  13. recent_deploys — TC deployer activity, clickable build URLs
+  14. fragile_services / blast_radius
+  15. stale_deployments
+  16. kg_quality
+  17. beat_heartbeats (footer, item C10)
 
 Запускается через Celery beat task `daily_stats_digest`
 (см. app/workers/tasks.py).
@@ -42,6 +48,7 @@ Overhaul 2026-05-25: digest стал Δ-only + action-driven + observability-ric
 from __future__ import annotations
 
 import json
+import re
 import subprocess
 import sys
 from collections import Counter, defaultdict
@@ -117,6 +124,33 @@ class ChangeReport:
 _TC_URL_PREFIX_DEFAULT = "https://wo-teamcity.lastoasisgame.com"
 
 
+# ── Пороги «chronic»: три числа в одном дайджесте ───────────────────────────
+#
+# Слово «chronic» встречается в трёх соседних секциях, и порог у каждой свой
+# (3 / 5 / 10 fires за 24h). Само по себе это осмысленно — цена ложного
+# срабатывания разная: пометить тип алерта «повторяющимся» дёшево, позвать
+# команду на RCA дорого. Но пока порог был безымянным числом в SQL и не
+# назывался в тексте, три «chronic» в одном сообщении не сходились друг с
+# другом и с 6-часовым chronic-дайджестом, а сверить их читатель не мог.
+#
+# Правило: порог живёт в именованной константе И проговаривается в тексте
+# секции («≥N fires/24h»), чтобы каждая цифра объясняла себя сама.
+CHRONIC_WINDOW_HOURS = 24
+
+# top_alert_types: сколько сервисов повторяют данный alertname. Низкий порог —
+# это «шумит регулярно», а не «нужен RCA».
+CHRONIC_REPEAT_MIN_FIRES = 3
+
+# changes: сколько (сервис, alertname) пар тлеет. Порог намеренно совпадает с
+# `settings.CHRONIC_DIGEST_MIN_FIRES` — chronic-дайджест раз в 6h перечисляет
+# ИМЕННО эти пары, и число в Changes обязано сходиться с длиной того списка
+# (сверка глазами — штатный сценарий, оба сообщения летят в #stats).
+CHRONIC_TRACKED_MIN_FIRES = 5
+
+# action_items: кандидаты на RCA. Самый высокий порог — строка зовёт людей.
+CHRONIC_RCA_MIN_FIRES = 10
+
+
 # Имена секций, упавших в текущей сборке дайджеста. ContextVar, а не
 # модульный список: воркер может собирать дайджест конкурентно с другими
 # задачами, и глобальный список утёк бы между ними.
@@ -160,8 +194,12 @@ def _note_section_failure(section: str) -> None:
 def section_failures_line() -> str:
     """Строка для дайджеста со списком недоступных секций (или "").
 
-    Рендерится в самом конце: читатель должен видеть, что часть картины
-    отсутствует, иначе он примет неполный дайджест за полный.
+    СЧИТАЕТСЯ последней (после всех секций), но РЕНДЕРИТСЯ сразу под
+    заголовком: читатель должен видеть, что часть картины отсутствует, иначе
+    он примет неполный дайджест за полный. Пока строка стояла в самом конце,
+    её первой съедала обрезка по лимиту Discord — то есть предупреждение
+    исчезало именно тогда, когда дайджест и правда был неполным
+    (см. discord.service._truncate_stats_description).
     """
     try:
         failures = _section_failures.get()
@@ -244,17 +282,28 @@ def _get_ns_to_team_map(db: Session) -> Dict[str, str]:
     Теперь `!= 'platform'` переехало из WHERE в FILTER: приоритет
     business-team сохранён (он выигрывает всегда, когда есть), а
     platform-only namespace получает честного владельца вместо «нет owner».
+
+    Ошибка БД здесь особенно дорога: карта строится ПЕРВОЙ в сборке, поэтому
+    незаизолированное исключение роняло дайджест целиком — ни одной секции,
+    вместо «команды не подписаны, остальное на месте». Ловим по образцу
+    остальных секций: `_tx_clean` (rollback + отметка в трекере сбоев) и
+    пустая карта — все namespace-ы просто отрисуются как `(unowned)`.
     """
-    rows = db.execute(text("""
-        SELECT namespace,
-               COALESCE(
-                   MIN(team_owner) FILTER (WHERE team_owner != 'platform'),
-                   MIN(team_owner)
-               ) AS team
-        FROM kg_services
-        WHERE team_owner IS NOT NULL
-        GROUP BY namespace
-    """)).fetchall()
+    try:
+        rows = db.execute(text("""
+            SELECT namespace,
+                   COALESCE(
+                       MIN(team_owner) FILTER (WHERE team_owner != 'platform'),
+                       MIN(team_owner)
+                   ) AS team
+            FROM kg_services
+            WHERE team_owner IS NOT NULL
+            GROUP BY namespace
+        """)).fetchall()
+    except Exception as e:  # noqa: BLE001 — одна секция выпадает, дайджест живёт
+        _tx_clean(db)
+        log.warning("stats_digest.ns_to_team_map_failed", error=str(e))
+        return {}
     return {ns: team for ns, team in rows}
 
 
@@ -264,6 +313,13 @@ def _get_ns_to_team_map(db: Session) -> Dict[str, str]:
 # expired ключе).
 _FIRING_SERIES_REDIS_KEY = "stats:firing_series:last_day"
 _FIRING_SERIES_REDIS_TTL = 25 * 3600
+
+# Окно, за которое реально берётся `fired_series` в `_build_digest_with_meta`
+# (`ALERTS{alertstate="firing"}` за последние 5 минут). Секции, считающие
+# доли по этому списку, обязаны подписывать в заголовке ЭТО окно, а не «24h»:
+# «Noisemakers (24h)» поверх пятиминутного снимка — ложное обобщение.
+_FIRING_SERIES_WINDOW_MINUTES = 5
+_FIRING_SERIES_WINDOW_LABEL = f"снимок firing-серий за {_FIRING_SERIES_WINDOW_MINUTES}m"
 
 
 async def _read_last_firing_series() -> Optional[int]:
@@ -877,7 +933,10 @@ def _alert_type_metadata(
         """), {"names": alertnames}).fetchall()
         today: Dict[str, int] = {name: cnt for name, cnt in today_rows}
 
-        # 2) chronic — service где (service_id, alertname) имеет ≥3 fires за 24h.
+        # 2) chronic — service где (service_id, alertname) имеет
+        # ≥CHRONIC_REPEAT_MIN_FIRES fires за окно. Порог именованный и
+        # проговаривается в заголовке секции — иначе три разных «chronic» в
+        # дайджесте не сверить между собой.
         chronic_rows = db.execute(text("""
             SELECT alertname, count(*) AS chronic_svc
             FROM (
@@ -887,10 +946,11 @@ def _alert_type_metadata(
                   AND fired_at > NOW() - INTERVAL '24 hours'
                   AND service_id IS NOT NULL
                 GROUP BY alertname, service_id
-                HAVING count(*) >= 3
+                HAVING count(*) >= :chronic_min
             ) t
             GROUP BY alertname
-        """), {"names": alertnames}).fetchall()
+        """), {"names": alertnames,
+               "chronic_min": CHRONIC_REPEAT_MIN_FIRES}).fetchall()
         chronic: Dict[str, int] = {name: cnt for name, cnt in chronic_rows}
 
         # 3) resurfaced — service-alertname пары где есть resolved + позднее fired.
@@ -997,9 +1057,16 @@ def top_alert_types_section(
                 sign = "+" if delta >= 0 else ""
                 parts.append(f"Δ24h {sign}{delta}")
             if chronic:
-                parts.append(f"{chronic} chronic")
+                # Порог подписан прямо у числа: это САМЫЙ низкий из трёх
+                # «chronic» дайджеста и считает СЕРВИСЫ, а не алерты. Без
+                # подписи три соседние секции говорили «chronic» про три
+                # разные величины, и сверить их было невозможно.
+                parts.append(
+                    f"{chronic} chronic svc "
+                    f"≥{CHRONIC_REPEAT_MIN_FIRES}/{CHRONIC_WINDOW_HOURS}h"
+                )
             if resurfaced:
-                parts.append(f"{resurfaced} resurfaced")
+                parts.append(f"{resurfaced} resurfaced svc")
 
         suffix = f" ({', '.join(parts)})" if parts else ""
         lines.append(f"  `{name}` × {cnt}{suffix}")
@@ -1183,9 +1250,22 @@ def stale_deployments_section(
     if hide_expected is None:
         hide_expected = getattr(settings, "STATS_HIDE_EXPECTED_STALE", True)
 
-    wo_namespaces = sorted({
-        ns for (ns,) in db.execute(text("SELECT DISTINCT namespace FROM kg_services")).fetchall()
-    })
+    # Первый запрос секции не был обёрнут: транзиентная ошибка БД здесь
+    # роняла всю сборку дайджеста, а не одну секцию (остальные ~15 секций
+    # ловят свои исключения сами). Без списка namespace-ов делать нечего —
+    # честно скрываемся и отмечаемся в трекере сбоев.
+    try:
+        wo_namespaces = sorted({
+            ns for (ns,) in db.execute(
+                text("SELECT DISTINCT namespace FROM kg_services")
+            ).fetchall()
+        })
+    # `as exc`, а не `as e`: ниже в этой же функции `e` — переменная цикла по
+    # entries, а Python удаляет имя исключения на выходе из except-блока.
+    except Exception as exc:  # noqa: BLE001 — одна секция выпадает, дайджест живёт
+        _tx_clean(db)
+        log.warning("stats_digest.stale_deployments_failed", error=str(exc))
+        return ""
 
     # KG Coverage #4: primary source of truth — `kg_services.stale_class`.
     # Если column заполнен (kg_sync уже прошёл) — фильтр expected через DB
@@ -1734,33 +1814,44 @@ def kg_quality_section(db: Session) -> str:
     is_orphan, is_synthetic) и `docs/KG_SCHEMA_CONTRACT.md`. Логика
     ниже — оптимизированная SQL-агрегация, эквивалентная сумме per-service
     `is_orphan(s, edges)` из contract.py.
-    """
-    # node_kind='service': workload-узлы (backing Deployment, contract 2.4)
-    # живут в той же таблице, но это не «ещё 2000 сервисов» — иначе строка
-    # Services: удваивается за один тик синка и читается как рост топологии.
-    services_total = db.execute(text(
-        "SELECT count(*) FROM kg_services WHERE node_kind = 'service'"
-    )).scalar() or 0
-    if services_total == 0:
-        return "**🧬 KG quality**\n  _KG пустой — kg_topology_sync ещё не выполнялся_"
 
-    edges_total = db.execute(
-        text("SELECT count(*) FROM kg_service_edges")
-    ).scalar() or 0
-    edges_by_kind: Dict[str, int] = {
-        k: v for k, v in db.execute(
-            text("SELECT kind, count(*) FROM kg_service_edges GROUP BY kind")
-        ).fetchall()
-    }
-    synthetic = db.execute(
-        text("SELECT count(*) FROM kg_services "
-             "WHERE synthetic = true AND node_kind = 'service'")
-    ).scalar() or 0
-    # Orphan — единый источник `contract.compute_orphan_stats` (app-scope:
-    # real-сервисы без ЛЮБОГО edge, знаменатель без expected_stale-инфры).
-    # Synthetic (backup-cron'ы, nats-tools, observability-exporters) и
-    # expected_stale (DB/headless/system) исключены — они безрёберны by design.
-    orphan_stats = compute_orphan_stats(db)
+    Пять запросов подряд и ни одного `try` — любая транзиентная ошибка БД
+    роняла сборку целиком. Обёрнуто по образцу остальных секций: `_tx_clean`
+    (rollback + отметка в трекере) и "" — про пропажу скажет строка
+    «Секции недоступны».
+    """
+    try:
+        # node_kind='service': workload-узлы (backing Deployment, contract 2.4)
+        # живут в той же таблице, но это не «ещё 2000 сервисов» — иначе строка
+        # Services: удваивается за один тик синка и читается как рост топологии.
+        services_total = db.execute(text(
+            "SELECT count(*) FROM kg_services WHERE node_kind = 'service'"
+        )).scalar() or 0
+        if services_total == 0:
+            return "**🧬 KG quality**\n  _KG пустой — kg_topology_sync ещё не выполнялся_"
+
+        edges_total = db.execute(
+            text("SELECT count(*) FROM kg_service_edges")
+        ).scalar() or 0
+        edges_by_kind: Dict[str, int] = {
+            k: v for k, v in db.execute(
+                text("SELECT kind, count(*) FROM kg_service_edges GROUP BY kind")
+            ).fetchall()
+        }
+        synthetic = db.execute(
+            text("SELECT count(*) FROM kg_services "
+                 "WHERE synthetic = true AND node_kind = 'service'")
+        ).scalar() or 0
+        # Orphan — единый источник `contract.compute_orphan_stats` (app-scope:
+        # real-сервисы без ЛЮБОГО edge, знаменатель без expected_stale-инфры).
+        # Synthetic (backup-cron'ы, nats-tools, observability-exporters) и
+        # expected_stale (DB/headless/system) исключены — они безрёберны by design.
+        orphan_stats = compute_orphan_stats(db)
+    except Exception as e:  # noqa: BLE001 — одна секция выпадает, дайджест живёт
+        _tx_clean(db)
+        log.warning("stats_digest.kg_quality_failed", error=str(e))
+        return ""
+
     orphan = orphan_stats["orphan"]
     app_scope = orphan_stats["app_scope"]
     pct_orphan = (100 * orphan // app_scope) if app_scope else 0
@@ -1843,8 +1934,16 @@ def _count_alerts_in_window(db: Session, hours: int) -> Tuple[int, int]:
         return 0, 0
 
 
-def _count_chronic_in_window(db: Session, hours: int, min_fires: int = 5) -> int:
-    """Сколько (service, alertname) пар с ≥ min_fires fires в окне."""
+def _count_chronic_in_window(
+    db: Session, hours: int, min_fires: int = CHRONIC_TRACKED_MIN_FIRES
+) -> int:
+    """Сколько (service, alertname) пар с ≥ min_fires fires в окне.
+
+    Критерий намеренно совпадает с chronic-дайджестом
+    (`settings.CHRONIC_DIGEST_MIN_FIRES`, группировка по ns+сервис+alertname):
+    оба сообщения летят в #stats, и число в Changes должно сходиться с длиной
+    того списка.
+    """
     try:
         cnt = db.execute(text("""
             SELECT count(*) FROM (
@@ -1929,8 +2028,10 @@ async def _compute_change_report(
 
     `previous=None` → new_baseline=True, deltas пусты.
     """
-    new_alerts, resolved_alerts = _count_alerts_in_window(db, hours=24)
-    chronic = _count_chronic_in_window(db, hours=24, min_fires=5)
+    new_alerts, resolved_alerts = _count_alerts_in_window(db, hours=CHRONIC_WINDOW_HOURS)
+    chronic = _count_chronic_in_window(
+        db, hours=CHRONIC_WINDOW_HOURS, min_fires=CHRONIC_TRACKED_MIN_FIRES
+    )
     edges_today = _count_edges(db)
     services_today = _count_real_services(db)
 
@@ -1962,28 +2063,80 @@ async def _compute_change_report(
     )
 
 
+def change_report_has_signal(report: ChangeReport) -> bool:
+    """Есть ли в Δ-отчёте хоть один НЕнулевой сигнал (A2, skip-if-noop).
+
+    `changes_section` рендерит непустой текст ВСЕГДА — даже «+0 new alerts ·
+    -0 resolved» имеет заголовок и тело. Из-за этого `changes_text` всегда
+    попадал в `actionable_sections`, счётчик не-пустых секций никогда не был
+    нулём, и документированный инвариант A2 («пустой digest вообще не
+    постится») не работал: дайджест уходил в #stats каждый день, включая
+    полностью тихие.
+
+    Секцию из `actionable_sections` не выкидываем — она полезна как «сегодня
+    ничего не менялось» в живом дайджесте. Вместо этого для целей skip-noop
+    спрашиваем ДАННЫЕ, а не текст: пустой Δ-отчёт = отсутствие сигнала.
+
+    Сигнал = что-то реально произошло за окно: новые/закрытые алерты,
+    chronic-пары, известная НЕнулевая дельта графа, новые NATS-subjects.
+    `new_baseline` сам по себе сигналом НЕ считается (это про отсутствие
+    снапшота, а не про события в кластере), иначе первый прогон после
+    Redis-flush всегда постился бы пустым.
+    """
+    if report.new_alerts_24h or report.resolved_alerts_24h or report.chronic_in_new:
+        return True
+    if report.nats_subjects_new:
+        return True
+    if (
+        report.kg_edges_today is not None
+        and report.kg_edges_yesterday is not None
+        and report.kg_edges_today != report.kg_edges_yesterday
+    ):
+        return True
+    if (
+        report.kg_services_today is not None
+        and report.kg_services_yesterday is not None
+        and report.kg_services_today != report.kg_services_yesterday
+    ):
+        return True
+    return False
+
+
 def changes_section(report: ChangeReport) -> str:
     """A1. Δ-only since yesterday — что изменилось vs прошлого окна.
 
     Пример:
       📈 Changes since yesterday
-      +12 new alerts (5 chronic) · -8 resolved · +47 KG edges
+      +12 new alerts (5 chronic ≥5 fires/24h) · -8 resolved · +47 KG edges
 
     Если `new_baseline=True` — секция показывает только сегодняшние counts
     с пометкой `(new baseline)`.
+
+    NB: текст непустой всегда — для skip-if-noop смотреть не на него, а на
+    `change_report_has_signal(report)`.
     """
     if report.new_baseline:
+        # `?` вместо литерального None: kg_edges_today=None означает «не
+        # смогли посчитать», и «`None` KG edges» читалось как настоящее
+        # значение. Остальные ветки этот класс багов уже вычистили
+        # (см. _fmt_snapshot_metric и ветку с KG edges `?` ниже).
         return (
             "**📈 Changes since yesterday**\n"
             f"  `{report.new_alerts_24h}` new alerts · "
             f"`{report.resolved_alerts_24h}` resolved · "
-            f"`{report.kg_edges_today}` KG edges _(new baseline)_"
+            f"`{_fmt_snapshot_metric(report.kg_edges_today)}` KG edges "
+            "_(new baseline)_"
         )
 
     parts: List[str] = []
     parts.append(
         f"`+{report.new_alerts_24h}` new alerts" + (
-            f" ({report.chronic_in_new} chronic)" if report.chronic_in_new else ""
+            # Порог подписан у числа: «chronic» в этой строке — пары
+            # (сервис, alertname) по критерию chronic-дайджеста, а в Top alert
+            # types и Action items тем же словом названы другие величины.
+            f" ({report.chronic_in_new} chronic "
+            f"≥{CHRONIC_TRACKED_MIN_FIRES} fires/{CHRONIC_WINDOW_HOURS}h)"
+            if report.chronic_in_new else ""
         )
     )
     parts.append(f"`-{report.resolved_alerts_24h}` resolved")
@@ -2001,25 +2154,33 @@ def changes_section(report: ChangeReport) -> str:
     return "**📈 Changes since yesterday**\n  " + " · ".join(parts)
 
 
-def _chronic_action_items(db: Session, threshold: int = 10) -> List[Dict[str, Any]]:
+def _chronic_action_items(
+    db: Session, threshold: int = CHRONIC_RCA_MIN_FIRES
+) -> List[Dict[str, Any]]:
     """B4. Service+alertname пары с ≥threshold fires за 24h → RCA-кандидаты.
 
-    Возвращает [{service, alertname, fires}, ...] sorted by fires desc, cap=3.
+    Возвращает [{service, namespace, alertname, fires}, ...] sorted by fires
+    desc, cap=3.
+
+    Группировка по s.id (+ ns в выдаче) обязательна: GROUP BY по одному
+    s.name схлопывал одноимённые сервисы из разных namespace-ов — семь `bot`
+    по 2 fires выглядели как один ложный chronic «14 fires» (хвост #254,
+    формат — как в anomaly/log_errors секциях).
     """
     try:
         rows = db.execute(text("""
-            SELECT s.name AS service, a.alertname, count(*) AS fires
+            SELECT s.name AS service, s.namespace, a.alertname, count(*) AS fires
             FROM kg_alerts a
             JOIN kg_services s ON s.id = a.service_id
             WHERE a.fired_at > NOW() - INTERVAL '24 hours'
               AND a.service_id IS NOT NULL
-            GROUP BY s.name, a.alertname
+            GROUP BY s.id, s.name, s.namespace, a.alertname
             HAVING count(*) >= :threshold
             ORDER BY count(*) DESC
             LIMIT 3
         """), {"threshold": threshold}).fetchall()
         return [
-            {"service": r[0], "alertname": r[1], "fires": int(r[2])}
+            {"service": r[0], "namespace": r[1], "alertname": r[2], "fires": int(r[3])}
             for r in rows
         ]
     except Exception as e:
@@ -2072,16 +2233,17 @@ def _suspicious_stale_action_items(db: Session, days: int = 60) -> int:
 
 def _suspicious_in_prod_with_alerts(
     db: Session, days: int = 60
-) -> Tuple[int, List[str]]:
+) -> Tuple[int, List[Tuple[str, str]]]:
     """Suspicious-stale сервисы которые сидят в prod-* ns И при этом имеют
     хотя бы один firing alert (resolved_at IS NULL) — это самый острый
     actionable bucket: видимо deploys тоже не идут, а alerts горят.
 
-    Возвращает (count, top_3_names).
+    Возвращает (count, top_3 как [(name, namespace), ...]) — ns обязателен:
+    одноимённые сервисы из разных ns в топе иначе неразличимы (хвост #254).
     """
     try:
         rows = db.execute(text("""
-            SELECT s.name
+            SELECT s.name, s.namespace
             FROM kg_services s
             WHERE NOT s.synthetic
               AND s.node_kind = 'service'
@@ -2106,7 +2268,7 @@ def _suspicious_in_prod_with_alerts(
         except Exception:
             pass
         return (0, [])
-    names = [r[0] for r in rows if r and r[0]]
+    names = [(r[0], r[1]) for r in rows if r and r[0]]
     return (len(names), names[:3])
 
 
@@ -2194,13 +2356,14 @@ def _suspicious_remaining(
 def action_items_section(
     db: Session,
     *,
-    chronic_threshold: int = 10,
+    chronic_threshold: int = CHRONIC_RCA_MIN_FIRES,
     suspicious_days: int = 60,
 ) -> str:
     """B4. Action items — RCA-кандидаты вместо просто-наблюдательного списка.
 
     Три категории:
-      1. Chronic (≥threshold fires/24h) → RCA нужен.
+      1. Chronic (≥threshold fires/24h, самый высокий из трёх порогов
+         дайджеста — строка зовёт людей на RCA) → RCA нужен.
       2. Без owner → manual ownership.yaml.
       3. Suspicious stale ≥60d → review/delete.
 
@@ -2215,8 +2378,10 @@ def action_items_section(
 
     lines = ["**🎯 Action items**"]
     if chronic:
+        # ns в строке обязателен: одноимённые сервисы из разных ns иначе
+        # неразличимы (формат `имя` ns — как в anomaly/log_errors секциях).
         services_str = ", ".join(
-            f"{c['service']}" for c in chronic
+            f"`{c['service']}` {c['namespace']}" for c in chronic
         )
         lines.append(
             f"  • `{len(chronic)}` chronic alerts ≥{chronic_threshold} fires/24h "
@@ -2246,7 +2411,12 @@ def action_items_section(
         if prod_cnt:
             top_str = ""
             if prod_top:
-                top_str = f" (e.g. {', '.join(f'`{n}`' for n in prod_top)})"
+                # `имя` ns — как в остальных секциях (см. anomaly/log_errors).
+                top_str = (
+                    " (e.g. "
+                    + ", ".join(f"`{n}` {ns}" for n, ns in prod_top)
+                    + ")"
+                )
             lines.append(
                 f"     - `{prod_cnt}` in prod/* (has firing alerts){top_str} → priority"
             )
@@ -2265,11 +2435,57 @@ def action_items_section(
     return "\n".join(lines)
 
 
-def noisemakers_section(fired_series: List[dict], threshold_pct: float = 20.0) -> str:
-    """B5. Top-3 service генерирующих >threshold_pct% алертов.
+# ── имя владельца по имени пода (fallback, когда нет service-лейбла) ────────
+#
+# `pod.rsplit("-", 2)[0]` рубил ДВА последних сегмента всегда, а это верно
+# только для Deployment-подов (`<name>-<rs-hash>-<suffix>`). Поды
+# StatefulSet-а заканчиваются порядковым номером, поэтому
+# `clickhouse-keeper-0` превращался в `clickhouse` — имя несуществующего
+# сервиса, по которому в дайджесте ничего не найти. DaemonSet/Job теряли
+# только один сегмент, и их тоже резало лишнее.
+#
+# Random-хвосты k8s (pod-template-hash реплика-сета и суффикс имени пода)
+# генерируются алфавитом БЕЗ гласных (`rand.SafeEncodeString`) — это и берём
+# признаком «сгенерированный хвост», а не часть имени сервиса. Формат не
+# распознан → возвращаем имя пода как есть: показать лишний хвост честнее,
+# чем отрезать половину имени.
+_K8S_RAND_CHAR = "[bcdfghjklmnpqrstvwxz0-9]"
+_POD_DEPLOYMENT_RE = re.compile(
+    rf"^(?P<name>.+)-{_K8S_RAND_CHAR}{{5,10}}-{_K8S_RAND_CHAR}{{5}}$"
+)
+_POD_STATEFULSET_RE = re.compile(r"^(?P<name>.+)-\d{1,3}$")
+_POD_HASHED_RE = re.compile(rf"^(?P<name>.+)-{_K8S_RAND_CHAR}{{5}}$")
 
-    Группируем series по (namespace, service-label). Если ни один сервис не
-    набрал ≥threshold% — секция скрыта.
+
+def _owner_name_from_pod(pod: str) -> str:
+    """Имя workload-владельца по имени пода. Неизвестный формат → как есть."""
+    for pattern in (_POD_DEPLOYMENT_RE, _POD_STATEFULSET_RE, _POD_HASHED_RE):
+        m = pattern.match(pod)
+        if m:
+            return m.group("name")
+    return pod
+
+
+def noisemakers_section(
+    fired_series: List[dict],
+    threshold_pct: float = 20.0,
+    *,
+    window_label: str = _FIRING_SERIES_WINDOW_LABEL,
+) -> str:
+    """B5. Top-3 сервиса, на которых висит >threshold_pct% firing-серий.
+
+    Вход — тот же `fired_series`, что у firing_alerts: снимок
+    `ALERTS{alertstate="firing"}` за последние 5 минут. Заголовок говорил
+    «(24h)», хотя окна за сутки здесь не было никогда — читатель складывал в
+    голове суточную картину из пятиминутного снимка.
+
+    Группировка — по ПАРЕ (namespace, service). По одному имени сервиса
+    одноимённые `bot`/`town-service` из 70 squad-ов схлопывались в один
+    «шумный сервис», а `ns_map.setdefault` подписывал сумму первым
+    попавшимся namespace — то есть строка обвиняла конкретное окружение в
+    чужих сериях.
+
+    Если ни одна пара не набрала ≥threshold% — секция скрыта.
     """
     if not fired_series:
         return ""
@@ -2278,11 +2494,12 @@ def noisemakers_section(fired_series: List[dict], threshold_pct: float = 20.0) -
     if total == 0:
         return ""
 
+    # Ключ — (ns, svc). Одноимённые сервисы разных окружений остаются разными
+    # строками, и подпись `@ns` перестаёт быть догадкой.
     counter: Counter = Counter()
-    ns_map: Dict[str, str] = {}
     for s in fired_series:
         m = s.get("metric", {})
-        # Резолв service-имени: пробуем явные labels, fallback на pod-prefix.
+        # Резолв service-имени: пробуем явные labels, fallback на имя пода.
         svc = (
             m.get("service")
             or m.get("deployment")
@@ -2291,34 +2508,36 @@ def noisemakers_section(fired_series: List[dict], threshold_pct: float = 20.0) -
         if not svc:
             pod = m.get("pod")
             if pod:
-                svc = pod.rsplit("-", 2)[0]
+                svc = _owner_name_from_pod(pod)
         if not svc or svc == "?":
             continue
         ns = m.get("namespace") or m.get("exported_namespace") or "?"
-        counter[svc] += 1
-        ns_map.setdefault(svc, ns)
+        counter[(ns, svc)] += 1
 
     if not counter:
         return ""
 
     top = counter.most_common(3)
-    notable = [(svc, cnt) for svc, cnt in top if (cnt / total * 100) >= threshold_pct]
+    notable = [
+        (key, cnt) for key, cnt in top if (cnt / total * 100) >= threshold_pct
+    ]
     if not notable:
         return ""
 
-    lines = ["**🔊 Noisemakers (24h)**"]
-    for svc, cnt in notable:
+    # Окно в заголовке — то же, что реально в данных (см. window_label).
+    lines = [f"**🔊 Noisemakers** ({window_label})"]
+    for (ns, svc), cnt in notable:
         pct = (cnt / total * 100)
-        ns = ns_map.get(svc, "")
         # DQ polish 2026-05-25: формат с `@<ns>` явно подчёркивает что это
         # namespace (старый italic-формат `_mcp_` смотрелся typo-подобно).
         # Если ns пустой/неизвестный — без `@` маркера.
-        if ns and ns != "?":
-            ns_part = f" @{ns}"
-        else:
-            ns_part = ""
+        ns_part = f" @{ns}" if ns and ns != "?" else ""
+        # Единица — firing-СЕРИИ снимка, не «события за сутки»: считаем
+        # элементы `fired_series`, а один и тот же алерт живёт в снимке ровно
+        # одной серией.
         lines.append(
-            f"  • `{svc}`{ns_part} — `{pct:.0f}%` alerts ({cnt} events)"
+            f"  • `{svc}`{ns_part} — `{pct:.0f}%` firing-серий "
+            f"({cnt} из {total})"
         )
     return "\n".join(lines)
 
@@ -2436,16 +2655,34 @@ def mttr_section(db: Session, days: int = 7) -> str:
     return "\n".join(lines)
 
 
+# Окно матча деплой↔алерт. Подпись ОДНА для всех строк секции (overall,
+# диагностика, Worst) — раньше в тексте стояло «30m», хотя SQL матчил
+# [started-5m; finished+60m], и читатель искал алерты не в том интервале.
+_DEPLOY_ALERT_WINDOW_LABEL = "[-5m; finished+60m]"
+
+
 def deploy_incident_correlation_section(db: Session, hours: int = 24) -> str:
     """B7. Deploy → incident correlation.
 
-    JOIN kg_deployments × kg_alerts: service_id same AND alert last_notified_at
-    в окне [-5m, finished_at+60m] вокруг деплоя. Используем last_notified_at
-    вместо fired_at — хронические алерты (fired_at недели назад) попадают в
-    окно по факту повторной нотификации от AM во время деплоя.
+    JOIN kg_deployments × kg_alerts: тот же service_id И время алерта в окне
+    `_DEPLOY_ALERT_WINDOW_LABEL` = [started_at-5m; COALESCE(finished_at,
+    started_at)+60m]. Никаких «30m» — это была подпись из первой версии,
+    окно с тех пор другое.
+
+    Время алерта — `COALESCE(last_notified_at, fired_at)`, ровно как в
+    `_deploy_correlation_diagnostics`. Раньше матч шёл ТОЛЬКО по
+    `last_notified_at`: алерт с NULL в этой колонке (никогда не
+    ре-нотифицированный AM) в матче не участвовал вообще, зато диагностика
+    считала его «привязанным» — и на attributed=0 печатала «Привязка целая»
+    про алерты, которых матч не видел. `last_notified_at` в приоритете
+    осознанно: хроника с fired_at недельной давности должна попадать в окно
+    по факту повторной нотификации во время деплоя.
+
+    NB: `attributed` — это число РАСКАТОК (строк kg_deployments), у которых
+    нашёлся хотя бы один алерт в окне, а не число алертов.
     """
     try:
-        # Сначала overall: сколько deploys, сколько attributed (≥1 alert в окне).
+        # Сначала overall: сколько rollout-ов, у скольких есть алерт в окне.
         overall = db.execute(text("""
             WITH recent_deploys AS (
                 SELECT id, service_id, started_at, finished_at, status,
@@ -2458,8 +2695,9 @@ def deploy_incident_correlation_section(db: Session, hours: int = 24) -> str:
                 count(*) FILTER (WHERE EXISTS (
                     SELECT 1 FROM kg_alerts a
                     WHERE a.service_id = recent_deploys.service_id
-                      AND a.last_notified_at BETWEEN recent_deploys.started_at - INTERVAL '5 minutes'
-                                                 AND COALESCE(recent_deploys.finished_at, recent_deploys.started_at) + INTERVAL '60 minutes'
+                      AND COALESCE(a.last_notified_at, a.fired_at)
+                          BETWEEN recent_deploys.started_at - INTERVAL '5 minutes'
+                              AND COALESCE(recent_deploys.finished_at, recent_deploys.started_at) + INTERVAL '60 minutes'
                 )) AS attributed,
                 count(*) FILTER (WHERE status = 'SUCCESS') AS successes,
                 -- Одна строка kg_deployments = один СЕРВИС, раскатанный сборкой,
@@ -2497,8 +2735,9 @@ def deploy_incident_correlation_section(db: Session, hours: int = 24) -> str:
                 count(a.id) AS alert_cnt
             FROM kg_deployments d
             JOIN kg_alerts a ON a.service_id = d.service_id
-                AND a.last_notified_at BETWEEN d.started_at - INTERVAL '5 minutes'
-                                           AND COALESCE(d.finished_at, d.started_at) + INTERVAL '60 minutes'
+                AND COALESCE(a.last_notified_at, a.fired_at)
+                    BETWEEN d.started_at - INTERVAL '5 minutes'
+                        AND COALESCE(d.finished_at, d.started_at) + INTERVAL '60 minutes'
             WHERE d.started_at > NOW() - (:hours || ' hours')::interval
             GROUP BY d.id, d.build_number, d.triggered_by
             ORDER BY count(a.id) DESC
@@ -2522,9 +2761,14 @@ def deploy_incident_correlation_section(db: Session, hours: int = 24) -> str:
         if builds:
             bits.append(f"`{builds}` сборок")
         scope = " (" + " · ".join(bits) + ")"
+    # `attributed` = count(*) FILTER (WHERE EXISTS ...), т.е. число РАСКАТОК
+    # с хотя бы одним алертом в окне. Подпись «attributed alerts» называла
+    # это алертами — величина другая (алертов на раскатку может быть много),
+    # и рядом стоящий процент считался от числа раскаток, а не от алертов.
     lines.append(
-        f"  `{total}` service-rollouts{scope} · `{attributed}` attributed alerts "
-        f"({attributed_pct:.0f}%) · success rate `{success_pct:.0f}%`"
+        f"  `{total}` service-rollouts{scope} · `{attributed}` rollouts с "
+        f"алертами в окне {_DEPLOY_ALERT_WINDOW_LABEL} ({attributed_pct:.0f}% "
+        f"раскаток) · success rate `{success_pct:.0f}%`"
     )
 
     # DQ polish 2026-05-25: если attributed=0 при большом N — это почти
@@ -2555,21 +2799,23 @@ def deploy_incident_correlation_section(db: Session, hours: int = 24) -> str:
             )
         else:
             # Привязка целая И множества пересекаются, но ни один алерт не попал
-            # в окно [-5m, finished+60m]. Значит горит не от деплоя (хроника,
-            # которая тлеет между окнами) либо окно слишком узкое.
+            # в окно деплоя. Значит горит не от деплоя (хроника, которая тлеет
+            # между окнами) либо окно слишком узкое.
             lines.append(
                 f"  ℹ️ Привязка целая (`{diag['deploys_linked_pct']:.0f}%`/"
                 f"`{diag['alerts_linked_pct']:.0f}%`), общих svc `{diag['overlap']}`, "
-                f"но ни один алерт не попал в окно деплоя — горит не от раскаток "
-                f"(хроника между окнами), а не «нет корреляции»"
+                f"но ни один алерт не попал в окно {_DEPLOY_ALERT_WINDOW_LABEL} — "
+                f"горит не от раскаток (хроника между окнами), а не «нет корреляции»"
             )
 
     if worst and int(worst[2] or 0) >= 2:
         b_num, b_user, b_cnt = worst
         user_str = f"by `{b_user}`" if b_user else "_auto_"
+        # «in 30m» было неверным: JOIN считает алерты в том же окне
+        # [-5m; finished+60m], что и attributed.
         lines.append(
-            f"  Worst: Build #{b_num} {user_str} → `{int(b_cnt)}` alerts in 30m "
-            f"(rollback recommended)"
+            f"  Worst: Build #{b_num} {user_str} → `{int(b_cnt)}` alerts в окне "
+            f"{_DEPLOY_ALERT_WINDOW_LABEL} (rollback recommended)"
         )
     return "\n".join(lines)
 
@@ -2586,8 +2832,11 @@ def _deploy_correlation_diagnostics(
 
     Если linked% высокие, а overlap≈0 — это НЕ linkage-баг (service_id есть),
     а просто непересекающиеся множества: деплои на одних сервисах, алерты на
-    других. Окно алертов — по COALESCE(last_notified_at, fired_at), как в самой
-    корреляции. При ошибках — все нули.
+    других. Окно алертов — по COALESCE(last_notified_at, fired_at); тот же
+    COALESCE теперь стоит и в самой корреляции, иначе диагностика считала по
+    одной популяции алертов, а матч — по другой (только last_notified_at) и
+    честно докладывала «привязка целая» про алерты, невидимые для матча.
+    При ошибках — все нули.
     """
     zero = {"deploys_linked_pct": 0.0, "alerts_linked_pct": 0.0,
             "deploy_svc": 0, "alert_svc": 0, "overlap": 0}
@@ -2671,7 +2920,7 @@ def _is_human_key(key_name: str) -> bool:
     )
 
 
-async def mcp_kg_usage_section(vm: VMClient) -> str:
+async def mcp_kg_usage_section(vm: Optional[VMClient]) -> str:
     """Сколько люди спрашивали Knowledge Graph через MCP за сутки.
 
     Метрика отвечает на вопрос «граф вообще кому-то нужен»: рост числа
@@ -2681,7 +2930,13 @@ async def mcp_kg_usage_section(vm: VMClient) -> str:
     Источник — `mcp_tool_calls_total{tool,key_name,status}` из tools-server.
     Служебные ключи отфильтрованы (см. `_MCP_SERVICE_KEYS`), иначе цифру
     полностью определял бы knowledge-generator.
+
+    `vm=None` (VICTORIA_METRICS_URL не настроен) — секция скрывается: без VM
+    спрашивать нечего, а о ненастроенном VM читателю уже говорит соседний
+    Cluster Health.
     """
+    if vm is None:
+        return ""
     try:
         today = await vm.query_instant_by_labels(
             'sum by (tool, key_name) (increase(mcp_tool_calls_total{tool=~"kg_.*"}[24h]))',
@@ -2996,12 +3251,20 @@ async def _build_digest_with_meta(db: Session) -> Tuple[str, Dict[str, Any]]:
     ns_to_team = _get_ns_to_team_map(db)
     fired_series: List[dict] = []
 
+    # VM-less путь легитимен (VICTORIA_METRICS_URL пуст): vm остаётся None,
+    # VM-секции честно скрываются / рисуют «не настроен». Раньше vm рождался
+    # только внутри if-ветки, а mcp_kg_usage_section(vm) звался безусловно —
+    # NameError ронял всю сборку дайджеста.
+    vm: Optional[VMClient] = None
     if settings.VICTORIA_METRICS_URL:
         vm = VMClient(settings.VICTORIA_METRICS_URL, timeout=15.0)
         try:
+            # Окно = _FIRING_SERIES_WINDOW_MINUTES; секции, считающие доли по
+            # этому списку, подписывают в заголовке ровно его.
             fired_series = await vm.query_range(
                 'ALERTS{alertstate="firing"}',
-                datetime.now(timezone.utc) - timedelta(minutes=5),
+                datetime.now(timezone.utc)
+                - timedelta(minutes=_FIRING_SERIES_WINDOW_MINUTES),
                 datetime.now(timezone.utc),
                 step="30s",
             )
@@ -3078,8 +3341,15 @@ async def _build_digest_with_meta(db: Session) -> Tuple[str, Dict[str, Any]]:
 
     # Item A2: skip-if-noop — meta-счётчик не-пустых action/Δ секций.
     # Cluster health, pipeline и kg_quality рисуются всегда, не считаем.
+    #
+    # `changes_text` учитываем по ДАННЫМ, а не по тексту: секция рендерит
+    # непустую строку всегда (даже «+0 new alerts · -0 resolved»), из-за чего
+    # счётчик никогда не был нулём и весь skip-noop был мёртвым кодом —
+    # дайджест постился каждый день, включая полностью тихие. См.
+    # `change_report_has_signal`.
     actionable_sections = [
-        changes_text, actions_text, noise_text, mttr_text, deploy_corr_text,
+        changes_text if change_report_has_signal(change_report) else "",
+        actions_text, noise_text, mttr_text, deploy_corr_text,
         topology_text, alerts_text if "ни одной серии" not in alerts_text else "",
         unowned_text, top_types_text if "нет активных алертов" not in top_types_text else "",
         anomaly_summary_text if "ни одной аномалии" not in anomaly_summary_text else "",
@@ -3093,6 +3363,13 @@ async def _build_digest_with_meta(db: Session) -> Tuple[str, Dict[str, Any]]:
     # двойной перевод строки и в Discord будет пустая дыра.
     sections = [
         f"📊 **Cluster Daily Digest** · {now}",
+        # Жалоба дайджеста на самого себя — СРАЗУ под заголовком, хотя
+        # считается последней. Раньше строка стояла в самом конце, а дайджест
+        # из ~20 секций регулярно не влезает в лимит Discord: обрезка первым
+        # делом съедала именно предупреждение «Секции недоступны», ради
+        # которого механизм и делался после инцидента 07.08.2026. Читатель
+        # видел укороченный дайджест без единого признака неполноты.
+        section_failures_line(),
         pipeline_text,
         health_text,
         changes_text,
@@ -3113,9 +3390,6 @@ async def _build_digest_with_meta(db: Session) -> Tuple[str, Dict[str, Any]]:
         stale_text,
         kg_text,
         heartbeats_text,
-        # Последней строкой — жалоба дайджеста на самого себя: какие секции
-        # не собрались. Считается ПОСЛЕ всех секций, поэтому и в конце списка.
-        section_failures_line(),
     ]
     content = "\n\n".join(s for s in sections if s)
 
@@ -3171,8 +3445,13 @@ async def send_daily_digest(db: Session) -> Dict[str, Any]:
 
     # Импорт locally чтобы избежать circular-import на старте модуля.
     from app.services.discord_service import discord_service
-    await discord_service.send_stats_report(content)
-    # Heartbeat пишем ПОСЛЕ фактической отправки — иначе deadman считал бы
-    # успехом сборку, которая до Discord так и не доехала.
+    delivered = await discord_service.send_stats_report(content)
+    if not delivered:
+        # send_stats_report глотает свои ошибки и возвращает False (нет
+        # вебхука / HTTP>=400). Heartbeat в этом случае НЕ пишем — иначе
+        # deadman считал бы успехом сборку, которая до Discord не доехала.
+        log.error("stats_digest.delivery_failed", content_len=len(content))
+        return {"status": "send_failed", "content_len": len(content)}
+    # Heartbeat пишем ПОСЛЕ фактически подтверждённой отправки.
     _record_task_heartbeat(DIGEST_DELIVERY_TASK)
     return {"status": "sent", "content_len": len(content)}

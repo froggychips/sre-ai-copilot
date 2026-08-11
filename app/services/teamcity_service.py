@@ -409,6 +409,23 @@ _DEPLOY_NAME_TOKENS = ("deploy", "update", "backup")
 _DEPLOY_NAME_EXCLUDE = ("set client min", "set ab test", "update terrain",
                         "update secret", "delete namespace")
 
+# Пагинация TC REST. Раньше был один запрос `count:200`: TC отдавал 200 САМЫХ
+# СВЕЖИХ билдов проекта (включая не-deploy), и только потом Python-фильтр по
+# имени buildType выкидывал лишнее — т.е. кап съедали чужие билды.
+# `backfill_tc_deploys --days 30 --limit 1000` реально получал ≤200 сырых
+# билдов на проект и молча терял хвост истории. Теперь идём страницами
+# (`count:N,start:M` — постраничный локатор TC REST), достижение капа логируем.
+#
+# Фильтр по deploy-имени НАМЕРЕННО остался в Python: локатор TC не умеет
+# substring-матч по buildType.name (только точное имя/id), а вердикт
+# `_is_deploy_buildtype_name` — эвристика из токенов + исключений
+# («Update terrain»/«Set ab test» не деплои). Перечислять buildType-ы
+# явно в локаторе = ручной whitelist, который протухнет с первым новым
+# пайплайном. Кап при этом больше не съедается: страницы идут до
+# исчерпания окна, а не до 200 сырых билдов.
+_TC_PAGE_SIZE = 200
+_TC_MAX_PAGES = 10  # ≤2000 сырых билдов на проект за окно
+
 
 def _is_deploy_buildtype_name(name: Optional[str]) -> bool:
     if not name:
@@ -426,9 +443,10 @@ def _fetch_recent_deploys_direct(
 ) -> list[dict[str, Any]]:
     """Sync TC REST: finished builds в проекте с `triggered.user` и `buildType.name`.
 
-    Запускается в thread pool из async-контекста. Фильтр по deploy-name
-    делается на стороне Python — TC locator не поддерживает name-pattern
-    на buildType.
+    Запускается в thread pool из async-контекста. Идёт постранично
+    (`count:_TC_PAGE_SIZE,start:…`) до исчерпания окна `since` либо капа
+    _TC_MAX_PAGES; фильтр по deploy-name — на стороне Python (см. комментарий
+    у _TC_PAGE_SIZE). Достижение капа логируется warning-ом.
     """
     client = _TCClient(url=settings.TC_URL, token=settings.TC_TOKEN,
                        timeout=settings.TC_TIMEOUT_SECONDS * 2)
@@ -443,54 +461,81 @@ def _fetch_recent_deploys_direct(
         )
         # TC sinceDate format: yyyyMMdd'T'HHmmss±HHmm
         since_str = since.astimezone(timezone.utc).strftime("%Y%m%dT%H%M%S+0000")
-        locator = (
-            f"affectedProject:(id:{project_id}),"
-            f"state:finished,sinceDate:{since_str},count:200"
-        )
-        data = client.get_json("/app/rest/builds",
-                               params={"locator": locator, "fields": fields})
-        raw = data.get("build", [])
 
         out: list[dict[str, Any]] = []
-        for b in raw:
-            btype_name = (b.get("buildType") or {}).get("name")
-            if not _is_deploy_buildtype_name(btype_name):
-                continue
-            triggered = b.get("triggered") or {}
-            trig_user = triggered.get("user") or {}
-            # revisions: для monorepo может быть несколько VCS root.
-            # Основной SHA — первый, полный список идёт в all_revisions.
-            raw_revs = (b.get("revisions") or {}).get("revision", []) or []
-            all_revs: list[dict[str, Any]] = []
-            for r in raw_revs:
-                ver = r.get("version")
-                if not ver:
+        scanned = 0
+        for page in range(_TC_MAX_PAGES):
+            locator = (
+                f"affectedProject:(id:{project_id}),"
+                f"state:finished,sinceDate:{since_str},"
+                f"count:{_TC_PAGE_SIZE},start:{page * _TC_PAGE_SIZE}"
+            )
+            try:
+                data = client.get_json("/app/rest/builds",
+                                       params={"locator": locator, "fields": fields})
+            except Exception:
+                if page == 0:
+                    raise  # первая страница не поднялась — это отказ проекта
+                # Дальше по истории: отдаём собранное, но не молча.
+                logger.warning(
+                    "teamcity.recent_deploys_page_failed",
+                    project=project_id, page=page, collected=len(out),
+                    exc_info=True,
+                )
+                break
+            raw = data.get("build", []) or []
+            scanned += len(raw)
+
+            for b in raw:
+                btype_name = (b.get("buildType") or {}).get("name")
+                if not _is_deploy_buildtype_name(btype_name):
                     continue
-                vri = r.get("vcs-root-instance") or {}
-                all_revs.append({
-                    "sha": ver,
-                    "root": vri.get("name"),
-                    "vcs_root_id": vri.get("vcs-root-id") or vri.get("vcsRootId"),
+                triggered = b.get("triggered") or {}
+                trig_user = triggered.get("user") or {}
+                # revisions: для monorepo может быть несколько VCS root.
+                # Основной SHA — первый, полный список идёт в all_revisions.
+                raw_revs = (b.get("revisions") or {}).get("revision", []) or []
+                all_revs: list[dict[str, Any]] = []
+                for r in raw_revs:
+                    ver = r.get("version")
+                    if not ver:
+                        continue
+                    vri = r.get("vcs-root-instance") or {}
+                    all_revs.append({
+                        "sha": ver,
+                        "root": vri.get("name"),
+                        "vcs_root_id": vri.get("vcs-root-id") or vri.get("vcsRootId"),
+                    })
+                sha = all_revs[0]["sha"] if all_revs else None
+                out.append({
+                    "id": b.get("id"),
+                    "number": b.get("number"),
+                    "status": b.get("status"),
+                    "branch": b.get("branchName"),
+                    "buildtype_id": b.get("buildTypeId"),
+                    "buildtype_name": btype_name,
+                    "started_at": _tc_to_iso(b.get("startDate")),
+                    "finished_at": _tc_to_iso(b.get("finishDate")),
+                    "triggered_by": trig_user.get("username") or trig_user.get("name"),
+                    "triggered_type": triggered.get("type"),
+                    "sha": sha,
+                    "all_revisions": all_revs,
+                    "url": (
+                        f"{settings.TEAMCITY_WEB_URL.rstrip('/')}/viewLog.html?buildId={b.get('id')}"
+                        if settings.TEAMCITY_WEB_URL and b.get("id") else None
+                    ),
                 })
-            sha = all_revs[0]["sha"] if all_revs else None
-            out.append({
-                "id": b.get("id"),
-                "number": b.get("number"),
-                "status": b.get("status"),
-                "branch": b.get("branchName"),
-                "buildtype_id": b.get("buildTypeId"),
-                "buildtype_name": btype_name,
-                "started_at": _tc_to_iso(b.get("startDate")),
-                "finished_at": _tc_to_iso(b.get("finishDate")),
-                "triggered_by": trig_user.get("username") or trig_user.get("name"),
-                "triggered_type": triggered.get("type"),
-                "sha": sha,
-                "all_revisions": all_revs,
-                "url": (
-                    f"{settings.TEAMCITY_WEB_URL.rstrip('/')}/viewLog.html?buildId={b.get('id')}"
-                    if settings.TEAMCITY_WEB_URL and b.get("id") else None
-                ),
-            })
+
+            if len(raw) < _TC_PAGE_SIZE:
+                break  # неполная страница → билды в окне исчерпаны
+        else:
+            # Кап страниц исчерпан — хвост окна не просмотрен. Для backfill
+            # это значит «истории меньше, чем в TC», о чём надо знать.
+            logger.warning(
+                "teamcity.recent_deploys_page_cap_reached",
+                project=project_id, pages=_TC_MAX_PAGES,
+                scanned=scanned, deploys=len(out), since=since_str,
+            )
 
         out.sort(key=lambda x: x.get("finished_at") or "", reverse=True)
         return out[:limit]

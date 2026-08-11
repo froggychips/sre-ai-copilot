@@ -18,8 +18,8 @@ from app.database import Base
 from app.knowledge_graph.anomaly_detection import (LOG_ERROR_METRIC,
                                                    VOLUME_GUARD_MAX_PER_HOUR,
                                                    detect_anomalies)
-from app.knowledge_graph.schema import (AnomalyObservation, LogObservation,
-                                        Service, ServiceHealth)
+from app.knowledge_graph.schema import (NODE_KIND_WORKLOAD, AnomalyObservation,
+                                        LogObservation, Service, ServiceHealth)
 
 
 @pytest.fixture
@@ -110,6 +110,44 @@ def test_real_spike_triggers_critical(db):
     assert obs.extras is not None
     # Baseline 22 точек < 50 → flat path.
     assert obs.extras["method"] == "robust_z_flat"
+
+
+def test_workload_twin_does_not_double_anomaly(db):
+    """Пара «Service foo + workload foo» (contract 2.4) с идентичными
+    ServiceHealth-строками → аномалия рождается ОДИН раз, на Service-узле.
+
+    Регрессия: без фильтра node_kind в detect_anomalies каждая аномалия
+    вставлялась дважды (по разу на узел пары) — удвоение шло прямиком в
+    порог >500/сутки в self_health.
+    """
+    svc = _svc(db)
+    twin = Service(name=svc.name, namespace=svc.namespace, synthetic=False,
+                   node_kind=NODE_KIND_WORKLOAD)
+    db.add(twin)
+    db.commit()
+    db.refresh(twin)
+
+    now = datetime(2026, 5, 23, 12, 0, 0)
+    # Тот же spike-сценарий, что в test_real_spike_triggers_critical,
+    # продублированный на оба узла (metrics_sync до фикса писал health
+    # обоим — воспроизводим состояние БД после миграции).
+    points = []
+    baseline_start = now - timedelta(days=6)
+    rng_values = [18.0, 22.0, 19.5, 20.5, 21.0, 19.0, 20.0, 21.5,
+                  18.5, 22.5, 19.8, 20.2, 20.8, 19.2, 21.2, 18.8,
+                  20.0, 21.0, 19.5, 20.5, 19.0, 21.5]
+    for i, v in enumerate(rng_values):
+        points.append((baseline_start + timedelta(hours=4 * i), v))
+    for i in range(6):
+        points.append((now - timedelta(minutes=10 * (5 - i)), 200.0))
+    _seed_health(db, svc.id, points)
+    _seed_health(db, twin.id, points)
+
+    stats = detect_anomalies(db, now=now)
+    assert stats["real_services"] == 1
+    assert stats["inserted"] == 1
+    obs = db.query(AnomalyObservation).one()
+    assert obs.service_id == svc.id
 
 
 def test_volume_guard_caps_observations_per_hour(db):

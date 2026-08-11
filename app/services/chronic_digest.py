@@ -22,6 +22,10 @@ from sqlalchemy.orm import Session
 
 from app.config import settings
 from app.knowledge_graph.schema import AlertEvent, Service
+# Порог, с которым daily-дайджест считает своё «chronic» в секции Changes.
+# Импортируем, а не дублируем числом: два сообщения летят в один #stats и
+# обязаны сходиться (см. stats_digest.CHRONIC_TRACKED_MIN_FIRES).
+from app.services.stats_digest import CHRONIC_TRACKED_MIN_FIRES
 
 log = structlog.get_logger()
 
@@ -59,12 +63,21 @@ def _aggregate(db: Session, window_hours: int, min_fires: int) -> List[Dict[str,
     ]
 
 
-def _format(rows: List[Dict[str, Any]], window_hours: int) -> str:
+def _format(
+    rows: List[Dict[str, Any]],
+    window_hours: int,
+    min_fires: int = CHRONIC_TRACKED_MIN_FIRES,
+) -> str:
     if not rows:
         return ""
     now = datetime.now(timezone.utc)
+    # Порог и единица группировки — в заголовке. «Chronic» встречается ещё в
+    # трёх местах daily-дайджеста с другими порогами, и без подписи читатель
+    # не мог сверить это число ни с одним из них (см. stats_digest,
+    # CHRONIC_* константы).
     lines = [
-        f"**📉 Chronic alerts (last {window_hours}h)**",
+        f"**📉 Chronic alerts** (≥{min_fires} fires/{window_hours}h "
+        "по ns+сервис+alertname)",
         "Эти сервисы фигурируют в #error часто — suppress-chronic скрыл повторы. Список — что фактически тлеет:",
         "",
     ]
@@ -99,7 +112,11 @@ async def send_chronic_digest(db: Session) -> Dict[str, Any]:
         log.info("chronic_digest.empty")
         return {"status": "empty", "rows": 0}
 
-    content = _format(rows, settings.CHRONIC_DIGEST_WINDOW_HOURS)
+    content = _format(
+        rows,
+        settings.CHRONIC_DIGEST_WINDOW_HOURS,
+        min_fires=settings.CHRONIC_DIGEST_MIN_FIRES,
+    )
     from app.services.discord_service import DiscordService
     await DiscordService().send_stats_report(content)
     return {"status": "sent", "rows": len(rows)}

@@ -89,8 +89,10 @@ def test_excludes_own_namespace(db):
 
 
 def test_aggregates_concurrent_sibling_rollout(db):
-    # Воспроизводим инцидент: bulk-rollout в squad-gd-shared (3) и
-    # preprod-shared (2) пока prod-shared (свой ns) без деплоя.
+    # Воспроизводим инцидент: bulk-rollout в squad-gd-shared (#728) и
+    # preprod-shared (#727) пока prod-shared (свой ns) без деплоя.
+    # По 3 и 2 сервиса на билд — это ns-broadcast `tc_deploys_to_kg`, один и
+    # тот же билд размножен по узлам ns, а не 5 разных деплоев.
     for i in range(3):
         s = _svc(db, f"svc-gd-{i}", "squad-gd-shared")
         _deploy(db, s.id, minutes_before=10, number="728")
@@ -102,18 +104,66 @@ def test_aggregates_concurrent_sibling_rollout(db):
         db, sibling_prefixes=_NEW_CLUSTER, exclude_namespace="prod-shared",
         before=_INCIDENT_AT, lookback_minutes=60,
     )
-    assert act["total_deploys"] == 5
-    # 2 разных билда (#728, #727) несмотря на 5 строк.
+    # Два ns-деплоя (#728 в squad-gd-shared, #727 в preprod-shared), а не 5
+    # строк kg_deployments: ns-broadcast схлопнут по (ns, buildtype, number).
+    assert act["total_deploys"] == 2
     assert act["distinct_builds"] == 2
-    # namespaces отсортированы по числу деплоев desc.
-    assert act["namespaces"][0] == {"namespace": "squad-gd-shared", "deploys": 3}
-    assert {"namespace": "preprod-shared", "deploys": 2} in act["namespaces"]
+    assert {"namespace": "squad-gd-shared", "deploys": 1} in act["namespaces"]
+    assert {"namespace": "preprod-shared", "deploys": 1} in act["namespaces"]
     # ближайший деплой — preprod (7м) < gd (10м).
     assert act["earliest_minutes_before"] == 7
     # sample dedup по (buildtype, number): 2 уникальных билда.
     assert len(act["sample_builds"]) == 2
     assert act["sample_builds"][0]["minutes_before_incident"] == 7
     assert act["sample_builds"][0]["namespace"] == "preprod-shared"
+
+
+def test_one_build_across_two_namespaces_is_two_ns_deploys(db):
+    """Один билд, прокатившийся по двум соседним ns = 2 ns-деплоя, 1 билд.
+
+    Регрессия: без дедупа по (ns, билд) `total_deploys` считал СТРОКИ
+    kg_deployments и на ns-broadcast врал в разы («60 deploys» вместо
+    «1 билд»); честен был только `distinct_builds`.
+    """
+    for i in range(10):
+        s = _svc(db, f"svc-gd-{i}", "squad-gd-shared")
+        _deploy(db, s.id, minutes_before=9, number="900")
+    for i in range(10):
+        s = _svc(db, f"svc-pp-{i}", "preprod-shared")
+        _deploy(db, s.id, minutes_before=9, number="900")
+
+    act = cluster_deploy_activity(
+        db, sibling_prefixes=_NEW_CLUSTER, exclude_namespace="prod-shared",
+        before=_INCIDENT_AT, lookback_minutes=60,
+    )
+    assert act["total_deploys"] == 2, "20 строк ns-broadcast = 2 ns-деплоя"
+    assert act["distinct_builds"] == 1
+    assert act["namespaces"] == [
+        {"namespace": "squad-gd-shared", "deploys": 1},
+        {"namespace": "preprod-shared", "deploys": 1},
+    ] or act["namespaces"] == [
+        {"namespace": "preprod-shared", "deploys": 1},
+        {"namespace": "squad-gd-shared", "deploys": 1},
+    ]
+    # В примерах билд показываем один раз — он один и тот же.
+    assert len(act["sample_builds"]) == 1
+
+
+def test_two_different_builds_in_one_namespace_both_counted(db):
+    """Дедуп не съедает РАЗНЫЕ билды в одном ns."""
+    for i in range(3):
+        s = _svc(db, f"svc-gd-{i}", "squad-gd-shared")
+        _deploy(db, s.id, minutes_before=20, number="801")
+        _deploy(db, s.id, minutes_before=5, number="802")
+
+    act = cluster_deploy_activity(
+        db, sibling_prefixes=_NEW_CLUSTER, exclude_namespace="prod-shared",
+        before=_INCIDENT_AT, lookback_minutes=60,
+    )
+    assert act["total_deploys"] == 2
+    assert act["distinct_builds"] == 2
+    assert act["namespaces"] == [{"namespace": "squad-gd-shared", "deploys": 2}]
+    assert act["earliest_minutes_before"] == 5
 
 
 def test_window_excludes_old_deploys(db):

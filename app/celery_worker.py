@@ -48,6 +48,16 @@ resilience = LLMResilienceManager(_redis)
 session_manager = SessionManager(_redis)
 
 
+# Терминальные состояния — те, у которых в TRANSITIONS нет исходящих
+# переходов (RESOLVED / TRIAGE_REQUIRED / FAILED). Выводим из TRANSITIONS,
+# а не хардкодим, чтобы список не разъехался при появлении новых терминалов.
+_TERMINAL_STATE_VALUES = {
+    state.value
+    for state, targets in StateMachine.TRANSITIONS.items()
+    if not targets
+}
+
+
 async def _generate_reply_logic(
     conversation_id: str,
     prompt: str,
@@ -56,23 +66,30 @@ async def _generate_reply_logic(
     environment_fingerprint: str | None = None,
 ) -> str:
     db = SessionLocal()
-    conv = db.query(Conversation).filter_by(id=conversation_id).first()
-    if conv is None:
-        raise ValueError(f"Conversation {conversation_id!r} not found")
-
-    def transition(to_state: IncidentState):
-        if not StateMachine.validate_transition(
-            IncidentState(conv.current_state), to_state
-        ):
-            # В режиме replay игнорируем ошибки переходов для гибкости
-            if not replay_mode:
-                raise Exception(
-                    f"Invalid transition from {conv.current_state} to {to_state}"
-                )
-        conv.current_state = to_state.value
-        db.commit()
-
+    # conv объявляем до try: except-ветка смотрит на него и не должна
+    # падать на NameError, если упал сам query.
+    conv: Conversation | None = None
     try:
+        # Первый query — внутри try: OperationalError на нём раньше улетал
+        # МИМО finally и оставлял сессию (коннект из пула) незакрытой.
+        conv = db.query(Conversation).filter_by(id=conversation_id).first()
+        if conv is None:
+            raise ValueError(f"Conversation {conversation_id!r} not found")
+
+        def transition(to_state: IncidentState):
+            if not StateMachine.validate_transition(
+                IncidentState(conv.current_state), to_state
+            ):
+                # В режиме replay игнорируем ошибки переходов для гибкости
+                if not replay_mode:
+                    # ValueError = детерминированная ошибка: generate_reply
+                    # по ней НЕ ретраит (см. предикат в таске ниже).
+                    raise ValueError(
+                        f"Invalid transition from {conv.current_state} to {to_state}"
+                    )
+            conv.current_state = to_state.value
+            db.commit()
+
         transition(IncidentState.INVESTIGATING)
         if replay_mode:
             assert_replay_isolated_runtime(
@@ -133,7 +150,14 @@ async def _generate_reply_logic(
         return analysis_data
 
     except Exception as e:
-        if conv:
+        # Сначала rollback: транзакция могла быть abort-нута (например, упал
+        # сам commit) — без него следующий SQL кидает PendingRollbackError
+        # и маскирует первопричину.
+        db.rollback()
+        # FAILED пишем только поверх НЕтерминальных состояний: перезапись
+        # RESOLVED/TRIAGE_REQUIRED/FAILED ломала бы инвариант state machine
+        # (у терминалов нет исходящих переходов).
+        if conv is not None and conv.current_state not in _TERMINAL_STATE_VALUES:
             conv.current_state = IncidentState.FAILED.value
             db.commit()
         logger.error("celery_task_failed", error=str(e))
@@ -157,5 +181,12 @@ def generate_reply(
                 conversation_id, prompt, replay_mode, snapshot, environment_fingerprint
             )
         )
+    except ValueError:
+        # Детерминированные ошибки (Conversation not found, invalid
+        # transition): повтор с теми же входными данными заведомо мёртв —
+        # retry только жёг бы попытки и держал слот воркера. Транзиентные
+        # (OperationalError, сеть и т.п.) уходят в self.retry ниже — ср. с
+        # предикатным подходом в app/services/resilience.py.
+        raise
     except Exception as exc:
         raise self.retry(exc=exc, countdown=2**self.request.retries)

@@ -6,6 +6,8 @@ K8sService теперь:
      `kubectl rollout restart` (cmd_parts[2]="restart" не в ALLOWED_RESOURCES).
   2. Блокирует dry_run=False при SAFE_MODE+APPROVAL_REQUIRED, кроме случая
      post_approval=True (рукоприкладство утверждено).
+  3. Не имеет второго, НЕохраняемого входа: legacy `run_command` (шла сразу в
+     _run_kubectl, минуя K8sSecurityGuard) удалена — см. тест внизу файла.
 """
 from unittest.mock import MagicMock, patch
 
@@ -151,3 +153,31 @@ def test_execute_intent_blocked_by_guard_returns_structured_error():
     result = svc.execute_intent(intent, dry_run=True)
     assert result["success"] is False
     assert result["error"].startswith("GUARDRAIL_BLOCK")
+
+
+# ── Нет второго входа в kubectl мимо guard-а ─────────────────────────────
+
+
+def test_legacy_run_command_is_gone():
+    """`run_command` удалена: это был мёртвый НЕохраняемый путь.
+
+    Вызывающих в репо не осталось, а сама обёртка шла сразу в _run_kubectl —
+    K8sSecurityGuard.validate не вызывался вообще, единственной защитой был
+    SAFE_MODE-гейт. Если кто-то вернёт метод «для совместимости» — этот тест
+    напомнит собирать ExecutionIntent и идти через execute_intent.
+    """
+    assert not hasattr(K8sService, "run_command")
+
+
+def test_execute_intent_is_the_only_public_entrypoint():
+    """Публичная поверхность K8sService — ровно execute_intent.
+
+    Остальное — приватные хелперы (_run_kubectl), т.е. любой внешний вызов
+    обязан пройти guard.
+    """
+    public = {
+        name
+        for name in vars(K8sService)
+        if not name.startswith("_") and callable(getattr(K8sService, name))
+    }
+    assert public == {"execute_intent"}, f"неожиданная публичная поверхность: {public}"

@@ -390,3 +390,81 @@ async def test_incident_patches_on_store_hit_from_other_replica(webhook_env):
     assert mock_client.patch.await_count == 1
     footer = mock_client.patch.await_args_list[-1].kwargs["json"]["embeds"][0]["footer"]["text"]
     assert "×2 в 30мин" in footer
+
+
+# ───────────────────────────────────────────────────────────────────
+# Осиротевший claim не глушит critical (реплика убита между claim и save)
+#
+# SIGKILL (OOM) не даёт выполнить release(), и placeholder msg_id="" висел
+# до конца окна дедупа — все реплики видели «кто-то уже постит» и critical
+# не уходил в канал ВООБЩЕ. Placeholder теперь самоистекающий.
+# ───────────────────────────────────────────────────────────────────
+
+
+async def _send_critical(svc, incident_id: str):
+    return await svc.send_incident_report(
+        incident_id=incident_id,
+        alertname="KubePodCrashLooping",
+        namespace="preprod-kingdom1",
+        pod="auth-pod",
+        service="auth-service",
+        node=None,
+        severity="critical",
+        cause="BackOff",
+        resolution_quality="unresolved",
+        synthesis="...",
+        pod_event_reason="BackOff",
+    )
+
+
+@pytest.mark.asyncio
+async def test_orphan_claim_does_not_swallow_critical(webhook_env):
+    """Placeholder мёртвой реплики старше claim-TTL → POST всё равно уходит."""
+    import time as _t
+
+    from app.services.discord import dedup_store
+    from app.services.discord_service import DiscordService
+
+    stale_placeholder = {
+        "msg_id": "",  # claim без финализации: процесс умер до save()
+        "embed": None,
+        "first_ts": _t.time() - dedup_store.CLAIM_PLACEHOLDER_TTL_SECONDS - 60,
+        "last_ts": _t.time() - dedup_store.CLAIM_PLACEHOLDER_TTL_SECONDS - 60,
+        "count": 1,
+    }
+    svc = DiscordService()
+    mock_client = _httpx_mock(msg_id="m-after-oom")
+    with patch("app.services.discord_service.httpx.AsyncClient", return_value=mock_client), \
+         patch.object(dedup_store, "get_fresh", return_value=stale_placeholder):
+        delivered = await _send_critical(svc, "INC-ORPHAN")
+
+    assert delivered is True
+    assert mock_client.post.await_count == 1, (
+        "осиротевший placeholder глушил critical до конца окна дедупа"
+    )
+
+
+@pytest.mark.asyncio
+async def test_fresh_claim_still_suppresses_duplicate(webhook_env):
+    """Свежий placeholder (реплика реально в середине POST-а) — дубль не шлём."""
+    import time as _t
+
+    from app.services.discord import dedup_store
+    from app.services.discord_service import DiscordService
+
+    fresh_placeholder = {
+        "msg_id": "",
+        "embed": None,
+        "first_ts": _t.time(),
+        "last_ts": _t.time(),
+        "count": 1,
+    }
+    svc = DiscordService()
+    mock_client = _httpx_mock(msg_id="m-dup")
+    with patch("app.services.discord_service.httpx.AsyncClient", return_value=mock_client), \
+         patch.object(dedup_store, "get_fresh", return_value=fresh_placeholder):
+        delivered = await _send_critical(svc, "INC-MIDPOST")
+
+    # Сообщение постит другая реплика — это дедуп, не потеря доставки.
+    assert delivered is True
+    assert mock_client.post.await_count == 0

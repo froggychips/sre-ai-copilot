@@ -259,7 +259,12 @@ def test_suspicious_stale_drill_down_renders_buckets():
     #   _suspicious_in_external_or_mcp → scalar
     db.execute.return_value.fetchall.side_effect = [
         [],  # chronic_action_items empty
-        [("payments-svc",), ("auth-svc",), ("billing-svc",)],  # prod_with_alerts
+        # prod_with_alerts — (name, namespace)
+        [
+            ("payments-svc", "prod-kingdom1"),
+            ("auth-svc", "prod-kingdom2"),
+            ("billing-svc", "prod-shared"),
+        ],
     ]
     db.execute.return_value.scalar.side_effect = [
         10,  # unowned
@@ -286,11 +291,14 @@ def test_suspicious_stale_drill_down_renders_buckets():
 def test_suspicious_in_prod_with_alerts_helper():
     db = MagicMock()
     db.execute.return_value.fetchall.return_value = [
-        ("svc-1",), ("svc-2",), ("svc-3",), ("svc-4",), ("svc-5",),
+        ("svc-1", "prod-k1"), ("svc-2", "prod-k2"), ("svc-3", "prod-k3"),
+        ("svc-4", "prod-k4"), ("svc-5", "prod-k5"),
     ]
     cnt, top = stats_digest._suspicious_in_prod_with_alerts(db, days=60)
     assert cnt == 5
-    assert top == ["svc-1", "svc-2", "svc-3"]
+    # top — (name, namespace): ns обязателен, одноимённые сервисы из разных
+    # ns иначе неразличимы.
+    assert top == [("svc-1", "prod-k1"), ("svc-2", "prod-k2"), ("svc-3", "prod-k3")]
 
 
 def test_suspicious_remaining_is_non_negative():

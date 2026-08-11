@@ -111,6 +111,15 @@ def mocked_dependencies(mocker):
         "app.workers.pipeline.discord_service.send_report",
         new_callable=AsyncMock,
     )
+    # Доставка отчёта теперь возвращает delivered (outbox-семантика в
+    # pipeline._deliver_report): без мока тест уходил живым POST-ом на
+    # example.com из conftest, получал 405 → delivered=False → пайплайн
+    # поднимал ReportDeliveryPending.
+    mocker.patch(
+        "app.workers.pipeline.discord_service.send_incident_report",
+        new_callable=AsyncMock,
+        return_value=True,
+    )
     mocker.patch("app.workers.pipeline.audit_service.log_event")
 
     record = MagicMock()

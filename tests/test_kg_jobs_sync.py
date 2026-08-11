@@ -670,3 +670,224 @@ def test_sync_all_jobs_part_of_label_wins_over_pattern(db):
     node = db.query(K8sJob).one()
     assert node.owner_service_name == "canonical"
     assert node.metadata_json["owner_resolved_via"] == "part-of_label"
+
+
+# ── Ревью 2026-08-10: kubectl вне транзакции + O(1) запросов на линковку ────
+
+
+def _select_spy(session):
+    """Счётчик SELECT-ов на engine сессии. Возвращает (counter, detach)."""
+    from sqlalchemy import event
+
+    counter = {"n": 0}
+    engine = session.get_bind()
+
+    def _before(conn, cursor, statement, params, context, executemany):
+        if statement.lstrip().upper().startswith("SELECT"):
+            counter["n"] += 1
+
+    event.listen(engine, "before_cursor_execute", _before)
+    return counter, lambda: event.remove(engine, "before_cursor_execute", _before)
+
+
+def test_exit_codes_fetched_before_transaction_opens(db):
+    """Все kubectl-фетчи exit-кодов — ДО первого SAVEPOINT-а тика.
+
+    Раньше `_kubectl_get_pod_exit_code` вызывался из `_sync_one_job`, то есть
+    внутри открытой транзакции: волна failed-джоб (накат миграций) держала
+    локи на kg_k8s_jobs всё время N внешних вызовов по 30с.
+    """
+    jobs = [
+        _mk_job("m-1", "sre-ai", failed=1),
+        _mk_job("m-2", "sre-ai", failed=2),
+        _mk_job("ok", "sre-ai", succeeded=1),
+    ]
+    order = []
+
+    real_begin_nested = db.begin_nested
+
+    def spy_begin_nested():
+        order.append("tx")
+        return real_begin_nested()
+
+    with patch(
+        "app.knowledge_graph.k8s_jobs_sync._kubectl_get_all",
+        return_value=jobs,
+    ), patch(
+        "app.knowledge_graph.k8s_jobs_sync._kubectl_get_pod_exit_code",
+        side_effect=lambda ns, name: order.append(f"kubectl:{name}") or 137,
+    ), patch.object(db, "begin_nested", spy_begin_nested):
+        stats = sync_all_jobs(db)
+
+    # SAVEPOINT на каждую джобу (+ вложенный на INSERT в _upsert_k8s_job).
+    assert order.count("tx") >= 3
+    kubectl_calls = [o for o in order if o.startswith("kubectl:")]
+    assert kubectl_calls == ["kubectl:m-1", "kubectl:m-2"], (
+        "exit-код должен фетчиться только у failed-джоб"
+    )
+    # Ключевое: ни одного kubectl ПОСЛЕ открытия первой транзакции.
+    assert order.index("tx") > order.index("kubectl:m-2"), (
+        f"kubectl уехал внутрь транзакции: {order}"
+    )
+    # Семантика счётчиков и записи сохранена.
+    assert stats["exit_codes_resolved"] == 2
+    assert stats["errors"] == 0
+    assert {
+        (n.name, n.last_pod_exit_code)
+        for n in db.query(K8sJob).all()
+    } == {("m-1", 137), ("m-2", 137), ("ok", None)}
+
+
+def test_exit_code_prefetch_deduplicates_same_job(db):
+    """Дубль (ns, name) в выдаче kubectl → один фетч exit-кода."""
+    jobs = [_mk_job("dup", "ns", failed=1), _mk_job("dup", "ns", failed=1)]
+    calls = []
+    with patch(
+        "app.knowledge_graph.k8s_jobs_sync._kubectl_get_all",
+        return_value=jobs,
+    ), patch(
+        "app.knowledge_graph.k8s_jobs_sync._kubectl_get_pod_exit_code",
+        side_effect=lambda ns, name: calls.append(name) or 1,
+    ):
+        stats = sync_all_jobs(db)
+    assert calls == ["dup"]
+    assert stats["exit_codes_resolved"] == 1
+
+
+def test_broken_status_in_prefetch_does_not_kill_tick(db):
+    """Битый status в префетче не роняет тик — джобу разберёт SAVEPOINT."""
+    bad = _mk_job("bad", "ns")
+    bad["status"] = {"failed": "not-a-number"}
+    good = _mk_job("good", "ns", succeeded=1)
+    with patch(
+        "app.knowledge_graph.k8s_jobs_sync._kubectl_get_all",
+        return_value=[bad, good],
+    ), patch(
+        "app.knowledge_graph.k8s_jobs_sync._kubectl_get_pod_exit_code",
+        return_value=1,
+    ):
+        stats = sync_all_jobs(db)
+    assert stats["errors"] == 1              # битая джоба откатана per-item
+    assert stats["nodes_upserted"] == 1      # соседняя записана
+    assert db.query(K8sJob).one().name == "good"
+
+
+def test_sync_all_jobs_commits_in_batches(db, monkeypatch):
+    """Транзакция дробится: не один commit на весь тик."""
+    monkeypatch.setattr(
+        "app.knowledge_graph.k8s_jobs_sync._COMMIT_BATCH", 2,
+    )
+    jobs = [_mk_job(f"j-{i}", "ns", succeeded=1) for i in range(5)]
+
+    commits = {"n": 0}
+    real_commit = db.commit
+
+    def spy_commit():
+        commits["n"] += 1
+        return real_commit()
+
+    with patch(
+        "app.knowledge_graph.k8s_jobs_sync._kubectl_get_all",
+        return_value=jobs,
+    ), patch.object(db, "commit", spy_commit):
+        sync_all_jobs(db)
+
+    # 2 батчевых (после 2-й и 4-й джобы) + финальный.
+    assert commits["n"] == 3
+    assert db.query(K8sJob).count() == 5
+
+
+def _prepare_cronjob_owned_jobs(db, n_jobs: int) -> None:
+    """1 CronJob с owner_service_id + n_jobs дочерних Job-ов."""
+    from app.knowledge_graph.k8s_jobs_sync import _upsert_k8s_job
+
+    svc = upsert_service(db, namespace="prod-shared", name="town")
+    db.flush()
+    _upsert_k8s_job(
+        db, namespace="prod-shared", name="town-unusual", kind="cronjob",
+        fields={"schedule": "0 * * * *"},
+        metadata={"owner_service_id": svc.id},
+    )
+    for i in range(n_jobs):
+        _upsert_k8s_job(
+            db, namespace="prod-shared", name=f"town-unusual-{i}", kind="job",
+            fields={"failed_count": 1},
+            metadata={
+                "owner_references": [
+                    {"kind": "CronJob", "name": "town-unusual"},
+                ],
+            },
+        )
+    db.commit()
+
+
+def _link_selects_for(n_jobs: int) -> tuple:
+    """(linked, кол-во SELECT-ов) для `_link_jobs_to_cronjob_owners` на n джоб."""
+    from app.knowledge_graph.k8s_jobs_sync import _link_jobs_to_cronjob_owners
+
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    session = sessionmaker(bind=engine, autocommit=False, autoflush=False)()
+    try:
+        _prepare_cronjob_owned_jobs(session, n_jobs)
+        counter, detach = _select_spy(session)
+        try:
+            linked = _link_jobs_to_cronjob_owners(session)
+        finally:
+            detach()
+        return linked, counter["n"]
+    finally:
+        session.close()
+        engine.dispose()
+
+
+def test_link_jobs_to_cronjob_owners_is_constant_query_count():
+    """O(1) запросов вместо N+1: SELECT-родитель больше не per-job.
+
+    На сотнях джоб это были сотни SELECT-ов каждые 15 минут внутри одной
+    транзакции.
+    """
+    linked_small, selects_small = _link_selects_for(3)
+    linked_big, selects_big = _link_selects_for(30)
+
+    assert linked_small == 3 and linked_big == 30
+    # Два запроса: сами джобы + пачка родителей.
+    assert selects_small == 2, f"неожиданный план запросов: {selects_small}"
+    assert selects_big == selects_small, (
+        f"число SELECT-ов растёт с числом джоб: {selects_small} → {selects_big}"
+    )
+
+
+def test_link_jobs_to_cronjob_owners_ignores_foreign_namespace(db):
+    """Родитель ищется по паре (ns, name) — чужой ns не линкуется.
+
+    IN×IN может принести лишние пары; выборка по точному ключу это ловит.
+    """
+    from app.knowledge_graph.k8s_jobs_sync import (
+        _link_jobs_to_cronjob_owners, _upsert_k8s_job)
+
+    svc = upsert_service(db, namespace="dev-shared", name="town")
+    db.flush()
+    # CronJob с owner-ом живёт в dev-shared…
+    _upsert_k8s_job(
+        db, namespace="dev-shared", name="town-unusual", kind="cronjob",
+        fields={"schedule": "0 * * * *"},
+        metadata={"owner_service_id": svc.id},
+    )
+    # …а CronJob того же имени в prod-shared owner-а не имеет.
+    _upsert_k8s_job(
+        db, namespace="prod-shared", name="town-unusual", kind="cronjob",
+        fields={"schedule": "0 * * * *"}, metadata={},
+    )
+    _upsert_k8s_job(
+        db, namespace="prod-shared", name="town-unusual-1", kind="job",
+        fields={"failed_count": 1},
+        metadata={
+            "owner_references": [{"kind": "CronJob", "name": "town-unusual"}],
+        },
+    )
+    db.commit()
+
+    assert _link_jobs_to_cronjob_owners(db) == 0
+    job_node = db.query(K8sJob).filter_by(kind="job").one()
+    assert "owner_service_id" not in (job_node.metadata_json or {})

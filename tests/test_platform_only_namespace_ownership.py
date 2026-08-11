@@ -120,3 +120,20 @@ def test_manifest_covers_platform_system_namespaces():
     assert by_ns.get("metallb-system") == "@platform"
     # sre-ai лежал там и раньше — фиксируем, чтобы не удалили как «дубль».
     assert by_ns.get("sre-ai") == "@platform"
+
+
+def test_manifest_covers_every_real_shared_env():
+    """prod/preprod/preupdate-shared — по явному правилу на каждый env.
+
+    Эвристика для этих ns отдаёт только `multi-squad`-заглушку (мультитенантная
+    зона, см. `_BARE_SHARED_RE`), поэтому @mention в роутинге алертов держится
+    ровно на этих правилах. Пропуск одного env — ровно тот класс расхождения,
+    из-за которого `preupdate` когда-то выпал из самого паттерна.
+    """
+    rules = yaml.safe_load((_REPO_ROOT / "config" / "ownership.yaml").read_text("utf-8"))
+    by_ns = {r["ns_pattern"]: r["owner"] for r in rules if "ns_pattern" in r}
+
+    for env in ("prod", "preprod", "preupdate"):
+        assert by_ns.get(f"{env}-shared") == "@platform", (
+            f"{env}-shared без явного правила — ns останется без owner-а"
+        )

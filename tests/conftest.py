@@ -119,3 +119,31 @@ def isolate_discord_dedup_state():
     _clear()
     yield
     _clear()
+
+
+@pytest.fixture(autouse=True)
+def isolate_rate_limit_fallback_state():
+    """Сбросить in-process rate-limit-счётчик перед каждым тестом.
+
+    Та же природа, что у isolate_discord_dedup_state выше: глобальное
+    per-process состояние переживает тест и красит следующий.
+
+    До 10.08.2026 при недоступном Redis rate-limit был fail-open — тесты
+    вебхука проходили любым числом запросов. Теперь деградация ограниченная
+    (in-process fixed-window с тем же порогом), а TestClient всегда приходит
+    с ОДНОГО ip, поэтому квота 10/min выгорала на весь прогон:
+    test_alertmanager_store_endpoint (8 POST-ов) плюс e2e-smoke уже получали
+    429 вместо 202/401 — падало не то, что тест проверяет.
+
+    Внутри одного теста накопление счётчика сохраняется, поэтому
+    test_rate_limit_degradation (у него своя такая же fixture) продолжает
+    проверять именно накопление.
+    """
+    try:
+        from app.api import rate_limit
+    except Exception:  # pragma: no cover — модуль всегда импортируем
+        yield
+        return
+    rate_limit.reset_local_fallback()
+    yield
+    rate_limit.reset_local_fallback()
