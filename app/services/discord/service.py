@@ -1600,15 +1600,17 @@ class DiscordService:
         # мы не знаем. Берём самый свежий (минимальный age) снимок, чтобы
         # multi-ns embed не объявил поток мёртвым по одному отстающему ns.
         deploy_stream: Dict[str, Any] = {}
+
+        def _stream_age(snapshot: Dict[str, Any]) -> float:
+            """age_hours как число. None (пустая таблица) — «бесконечно старо»."""
+            v = snapshot.get("age_hours")
+            return float(v) if isinstance(v, (int, float)) else float("inf")
+
         for c in ns_scope_ctxs:
             s = getattr(c, "deploy_stream", None) or {}
             if not s:
                 continue
-            if not deploy_stream or (
-                (s.get("age_hours") if s.get("age_hours") is not None else 1e9)
-                < (deploy_stream.get("age_hours")
-                   if deploy_stream.get("age_hours") is not None else 1e9)
-            ):
+            if not deploy_stream or _stream_age(s) < _stream_age(deploy_stream):
                 deploy_stream = s
         deploy_stream_stale = bool(deploy_stream.get("stale"))
         # Минуты до алерта у ближайшего ns-scope деплоя — вход для
