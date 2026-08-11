@@ -8,7 +8,8 @@
 
 Запуск: k8s CronJob на образе sre-ai-copilot, SA sre-ai (умеет list namespaces).
 Env: DATABASE_URL, TC_URL, TC_TOKEN, CONFLUENCE_BASE, CONFLUENCE_EMAIL, CONFLUENCE_TOKEN,
-     CONFLUENCE_PAGE_ID, CONFLUENCE_TITLE, [WINDOW=400], [SQUADS="1..24"], [DRY_RUN=1].
+     CONFLUENCE_PAGE_ID, CONFLUENCE_TITLE, [WINDOW=400], [SQUADS="1..24"], [DRY_RUN=1],
+     [NAME_OVERRIDES='{"логин":"Имя Фамилия"}' — для учёток вне TeamCity].
 DRY_RUN=1 — всё собрать и отрендерить, но НЕ писать в Confluence (печатает сводку).
 
 Источники логики: ref_kg_squad_dashboard_query (KG-SQL), ~/tc_squad_last_build.sh (TC REST).
@@ -158,6 +159,62 @@ def tc_get(path):
     return r.json()
 
 
+_TC_NAMES = None
+
+
+def tc_names():
+    """Карта TC-логин → «Имя Фамилия» из профилей TeamCity (кириллица), с кэшем.
+
+    TC недоступен / 401 — НЕ роняем дашборд: пустая карта, все «людские» колонки
+    деградируют к логинам, как было до этого.
+    """
+    global _TC_NAMES
+    if _TC_NAMES is not None:
+        return _TC_NAMES
+    try:
+        users = tc_get("/app/rest/users?fields=user(username,name)").get("user", [])
+    except requests.RequestException as e:
+        log(f"  users: TC недоступен ({e}) → в колонках останутся логины")
+        users = []
+    _TC_NAMES = {}
+    for u in users:
+        login = u.get("username")
+        name = (u.get("name") or "").strip()
+        # служебные учётки (name пуст или равен логину) оставляем логином
+        if login and name and name != login:
+            _TC_NAMES[login] = name
+    log(f"  users: ФИО из TC для {len(_TC_NAMES)} логинов")
+    return _TC_NAMES
+
+
+_OVERRIDES = None
+
+
+def name_overrides():
+    """Логин → имя для учёток, которых в TeamCity нет (удалена, лейбл проставлен руками).
+
+    Задаётся ТОЛЬКО через env NAME_OVERRIDES (JSON, ConfigMap squad-dashboard-env).
+    В репозитории карты нет и быть не должно: он публичный, а связка логин↔человек —
+    личные данные. Кривой JSON — не роняем прогон, просто остаются логины.
+    """
+    global _OVERRIDES
+    if _OVERRIDES is None:
+        raw = (os.environ.get("NAME_OVERRIDES") or "").strip()
+        try:
+            _OVERRIDES = json.loads(raw) if raw else {}
+        except ValueError as e:
+            log(f"  NAME_OVERRIDES: не разобрался как JSON ({e}) → игнорируем")
+            _OVERRIDES = {}
+    return _OVERRIDES
+
+
+def human(login):
+    """«Имя Фамилия»: профиль TeamCity, затем env-оверрайд; иначе логин как есть."""
+    if not login:
+        return login
+    return tc_names().get(login) or name_overrides().get(login, login)
+
+
 def fetch_oneservice():
     """Оконный скан OneService -> {squad: {last_build, last_deployer}}.
 
@@ -299,7 +356,8 @@ def build_cell(lb):
     if not lb:
         return loz("idle (нет OneService в окне)")
     st = "Green" if lb.get("status") == "SUCCESS" else "Red"
-    txt = f'#{esc(lb.get("number"))} {esc(lb.get("service") or "")} — {esc(lb.get("by"))} — {esc(fmt_ts(lb.get("started")))}'
+    txt = (f'#{esc(lb.get("number"))} {esc(lb.get("service") or "")} — '
+           f'{esc(human(lb.get("by")))} — {esc(fmt_ts(lb.get("started")))}')
     return f'{txt} {loz(lb.get("status"), st)}'
 
 
@@ -309,7 +367,15 @@ def inst_cell(inst):
     # компактнее: RebuildSquadFromSource -> Rebuild, InstallSquadEnv -> Install; дата без времени
     bt = inst["buildtype"].replace("SquadFromSource", "").replace("SquadEnv", "")
     date = fmt_ts(inst["started"]).split(" ")[0]
-    return esc(f'{bt} #{inst["number"]} · {inst["by"]} · {date}')
+    return esc(f'{bt} #{inst["number"]} · {human(inst["by"])} · {date}')
+
+
+def reserved_cell(value):
+    """«Reserved for»: логин из карты RESERVED → ФИО, нода остаётся как есть."""
+    if not value:
+        return ""
+    login, sep, node = value.partition(" · ")
+    return loz(human(login) + (f" · {node}" if sep else ""), "Blue")
 
 
 def activity_cell(act, today):
@@ -493,9 +559,9 @@ def render(rows, gen_date, jira_statuses=None, today=None):
     today = today or datetime.datetime.utcnow()
     # (заголовок, ширина px). Цифровые колонки — узкие, текстовые — широкие.
     cols = [
-        ("Статус", 78), ("Squad", 78), ("Занявший", 100), ("Reserved for", 96), ("Задача", 110),
-        ("Ветка", 140), ("Активность", 110), ("Последняя сборка (OneService)", 240),
-        ("Установка / Rebuild", 165), ("Возраст, дн", 68), ("NS", 45),
+        ("Статус", 78), ("Squad", 78), ("Занявший", 140), ("Reserved for", 150), ("Задача", 110),
+        ("Ветка", 140), ("Активность", 110), ("Последняя сборка (OneService)", 265),
+        ("Установка / Rebuild", 190), ("Возраст, дн", 68), ("NS", 45),
         ("Svc", 50), ("Health", 62), ("Краши 7д", 145), ("Ev 24ч", 60),
         ("Alerts", 56),
     ]
@@ -509,8 +575,8 @@ def render(rows, gen_date, jira_statuses=None, today=None):
         status_txt, status_col, sq_bg = classify(r, jira_statuses, today)
         status = loz(status_txt, status_col)
         task = f'<a href="{jira}{esc(r["task"])}">{esc(r["task"])}</a>' if r["task"] else ""
-        owner = esc(r["owner"]) if r["owner"] else loz("нет лейбла")
-        reserved = loz(esc(r["reserved"]), "Blue") if r.get("reserved") else ""
+        owner = esc(human(r["owner"])) if r["owner"] else loz("нет лейбла")
+        reserved = reserved_cell(r.get("reserved"))
         age = esc(r["age"]) if r["age"] is not None else loz("нет в KG")
         alerts = loz(str(r["al"]), "Red") if r["al"] else (esc(r["al"]) if r["al"] is not None else "")
         ev24 = (loz(str(r["ev24h"]), "Yellow") if (r["ev24h"] and r["ev24h"] > 20)
@@ -537,7 +603,8 @@ def render(rows, gen_date, jira_statuses=None, today=None):
         f'Снимок: {esc(gen_date)} UTC.</p></ac:rich-text-body></ac:structured-macro>'
         f'<p><strong>Источники</strong> (джойн по ключу <code>squad-N</code>): Knowledge Graph (kg_query) — возраст, NS/svc, '
         f'health, pod_events, alerts; TeamCity REST + лейблы namespace — занявший (deployed-by), задача '
-        f'(deployed-branch → WO-тикет), последняя сборка (OneServiceBuildAndUpdate), провенанс install/rebuild.</p>'
+        f'(deployed-branch → WO-тикет), последняя сборка (OneServiceBuildAndUpdate), провенанс install/rebuild, '
+        f'имена и фамилии людей — профили TeamCity.</p>'
         f'{table}'
         f'<h2>Как читать — расшифровка колонок</h2><ul>'
         f'<li><strong>Статус</strong> — '
@@ -548,9 +615,11 @@ def render(rows, gen_date, jira_statuses=None, today=None):
         f'либо известный деплой &gt;{STALE_DAYS}д назад, либо живых логинов нет &gt;{STALE_DAYS}д — кандидат на возврат. '
         f'(Нет данных о деплое/активности — «не знаю», оставляем «занят».) '
         f'Ячейка <strong>Squad</strong> подсвечена тем же цветом.</li>'
-        f'<li><strong>Занявший</strong> — кто задеплоил (лейбл namespace <code>deployed-by</code> = TC-логин).</li>'
+        f'<li><strong>Занявший</strong> — кто задеплоил: лейбл namespace <code>deployed-by</code> (TC-логин), '
+        f'показывается как <strong>имя и фамилия</strong> из профиля TeamCity. Логин остаётся, только если профиля '
+        f'в TC нет (служебная учётка, удалённый пользователь).</li>'
         f'<li><strong>Reserved for</strong> — за кем закреплён сквад и на какой выделенной 128GB-ноде (WO-12485), '
-        f'формат «логин · нода»; по 2 сквада на разработчика, оба на одной ноде (co-location из-за local-path PVC). '
+        f'формат «имя и фамилия · нода»; по 2 сквада на разработчика, оба на одной ноде (co-location из-за local-path PVC). '
         f'Резерв (squad→разработчик→нода) — из карты в генераторе, зеркало <code>services/squad-mapping.yaml</code> (wo-k8s). '
         f'Пусто = сквад не зарезервирован под дедик-ноду. Для squad-40..53 и squad-60..69 сквад может ещё не быть создан.</li>'
         f'<li><strong>Задача</strong> — WO-тикет из ветки деплоя; пусто при preprod/default.</li>'
