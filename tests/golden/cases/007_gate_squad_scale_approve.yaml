@@ -1,0 +1,19 @@
+id: 007_gate_squad_scale_approve
+title: масштабирование в squad-namespace уходит на approve, а не блок
+source: synthetic
+llm: false
+incident: {incident_id: golden-007, severity: warning, status: firing, summary: guard,
+           description: "", namespace: squad-1, labels: {alertname: Guard},
+           annotations: {}, starts_at: "2026-08-10T10:00:00Z", ends_at: null,
+           generator_url: null, raw: {}}
+intent:
+  action: scale_deployment
+  resource_type: deployment
+  resource_name: map-service
+  namespace: squad-1
+  risk: medium
+  params: {replicas: 3}
+expect:
+  # Обратная сторона инварианта: гейт не должен блокировать ВСЁ подряд,
+  # иначе кнопка Apply бесполезна и её перестанут воспринимать всерьёз.
+  gate: approve

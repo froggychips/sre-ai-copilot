@@ -1,0 +1,35 @@
+id: 020_gen_mismatch_rollout_noise
+title: GenerationMismatch при сошедшемся rollout — шум, а не инцидент
+source: real          # 131 срабатывание в неделю, v0.14.0
+llm: false
+incident:
+  incident_id: golden-020
+  severity: warning
+  status: firing
+  summary: Deployment generation mismatch for map-service
+  description: >-
+    Deployment generation mismatch: observed 41, desired 42.
+    Replicas ready 3/3.
+  namespace: squad-4-kingdom2
+  labels:
+    alertname: KubeDeploymentGenerationMismatch
+    severity: warning
+    namespace: squad-4-kingdom2
+    deployment: map-service
+  annotations:
+    summary: Deployment generation mismatch for map-service
+    description: "Deployment generation mismatch: observed 41, desired 42. Replicas ready 3/3."
+  starts_at: "2026-08-11T09:00:00Z"
+  ends_at: null
+  generator_url: null
+  raw: {}
+context: {}
+expect:
+  # Ни одного факта отказа: rollout сошёлся (ready==desired), контейнеры живы.
+  # Кейс держит границу «шум ≠ инцидент» на уровне фактов — render-time
+  # suppression поверх этого проверяется своими тестами.
+  facts:
+    crashloop: false
+    oom_killed: false
+    process_crash: false
+    failed_scheduling: false

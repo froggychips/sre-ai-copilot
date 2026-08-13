@@ -1,0 +1,43 @@
+id: 001_notificator_sigsegv
+title: notificator exit 139 (SIGSEGV) в squad-10-shared
+source: real          # combat run 3–4, docs/RUNBOOK.md
+llm: true
+incident:
+  incident_id: golden-001
+  severity: critical
+  status: firing
+  summary: Pod notificator-ddb645b4b-s5cv6 is crash looping
+  description: Container exited with code 139 (SIGSEGV)
+  namespace: squad-10-shared
+  labels:
+    alertname: PodCrashLooping
+    service: notificator
+    namespace: squad-10-shared
+    pod: notificator-ddb645b4b-s5cv6
+    severity: critical
+  annotations:
+    summary: Pod notificator-ddb645b4b-s5cv6 is crash looping
+    description: Container exited with code 139 (SIGSEGV)
+  starts_at: "2026-05-12T19:00:00Z"
+  ends_at: null
+  generator_url: null
+  raw: {}
+context:
+  k8s_pod_state:
+    notificator-ddb645b4b-s5cv6:
+      exit_code: 139
+      reason: Error
+      restart_count: 7
+  logs_summary: |
+    Last state: terminated, exit code 139, signal SIGSEGV
+    Startup: loading configuration, initializing notification providers
+  k8s_events:
+    - {type: Warning, reason: BackOff, count: 7,
+       message: "Back-off restarting failed container notificator in pod notificator-ddb645b4b-s5cv6"}
+expect:
+  facts:
+    process_crash: true
+    oom_killed: false      # 137 ≠ 139 — регрессия combat run 1/3
+    crashloop: true
+  resolution: resolved
+  cause_not_contains: ["oom", "out of memory", "memory limit"]

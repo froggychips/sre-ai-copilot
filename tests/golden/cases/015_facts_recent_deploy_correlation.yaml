@@ -1,0 +1,17 @@
+id: 015_facts_recent_deploy_correlation
+title: краш через 10 минут после сборки — deploy попадает в окно корреляции
+source: synthetic
+llm: false
+incident: {incident_id: golden-015, severity: critical, status: firing,
+           summary: "Pod api-3 crash-looping", description: "CrashLoopBackOff",
+           namespace: squad-1,
+           labels: {alertname: KubePodCrashLooping, pod: api-3, service: api},
+           annotations: {description: "CrashLoopBackOff"},
+           starts_at: "2026-08-10T10:00:00Z", ends_at: null, generator_url: null, raw: {}}
+context:
+  recent_deployments:
+    - {name: Wo_Backend_BuildApi, ts: "2026-08-10T09:50:00Z", status: SUCCESS}
+expect:
+  facts:
+    recent_deploy: true
+    crashloop: true

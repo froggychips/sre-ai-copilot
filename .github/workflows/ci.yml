@@ -160,6 +160,21 @@ jobs:
           export DOCKER_HOST="unix://$HOME/.rd/docker.sock"
           docker rm -f copilot-ci-pg >/dev/null 2>&1 || true
 
+      # Golden-eval — blocking. Единственная метрика, которая описывает сам
+      # продукт: до неё качество разбора инцидента проверялось шестью ручными
+      # прогонами в README и 👍/👎 в Discord, то есть на глаз.
+      # Здесь режим replay: записанные LLM-ответы, без сети и ключа —
+      # детерминированно и бесплатно. Он меряет ОБВЕС вокруг модели (правила
+      # фактов, grounding, отбор гипотезы, executor-гейт), а не саму модель;
+      # качество промптов меряет отдельный eval-live.yml по расписанию.
+      # --check-baseline валит шаг при просадке метрик, в том числе поgrouppам:
+      # без разреза «плюс два кейса на факты» замаскировали бы «минус один
+      # на гейт». Поднимать baseline — отдельным осознанным коммитом.
+      - name: Golden eval (replay against baseline)
+        env:
+          LLM_BACKEND: claude_cli   # в replay модель не вызывается вообще
+        run: .venv/bin/python scripts/eval_golden.py --mode replay --check-baseline
+
       # bandit — статический security-скан кода. Игнорируем low/info,
       # фейлим только на medium+. Известные исключения добавлять в
       # .bandit/.bandit.yml, а не понижать порог.

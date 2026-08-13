@@ -1,0 +1,17 @@
+id: 016_facts_node_resource_pressure
+title: нода под давлением — cpu 96%, memory 91%
+source: synthetic
+llm: false
+incident: {incident_id: golden-016, severity: warning, status: firing,
+           summary: "Node dev-14 saturated",
+           description: "Node dev-14 condition DiskPressure=true, imagefs 92% used",
+           namespace: squad-26,
+           labels: {alertname: KubeNodeDiskPressure, node: dev-14},
+           annotations: {description: "Node dev-14 condition DiskPressure=true, imagefs 92% used"},
+           starts_at: "2026-08-11T10:00:00Z", ends_at: null, generator_url: null, raw: {}}
+context:
+  metrics_summary: {cpu_pressure: true, memory_pressure: true}
+expect:
+  facts:
+    resource_pressure: true
+    oom_killed: false

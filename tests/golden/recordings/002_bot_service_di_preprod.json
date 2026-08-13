@@ -1,0 +1,100 @@
+{
+  "calls": [
+    {
+      "role": "df34e1588a327ff7",
+      "ctx": "97b9d526bf66735d",
+      "task_type": "hypothesis",
+      "text": "{\"hypotheses\":[\n  {\"cause\":\"Upstream dependency refusing connections at startup causing fatal abort\",\"detail\":\"exit_code=134/SIGABRT typically indicates the process called abort() — in many runtimes this happens when a required upstream (e.g. auth service, config endpoint, broker) is unreachable at initialization and the application treats it as unrecoverable. The crashloop with count=12 back-offs confirms repeated startup failures rather than a mid-run instability, consistent with a dependency that is consistently rejecting or timing out TCP/TLS handshakes on each restart attempt.\",\"anchored_facts\":[\"process_crash\",\"crashloop\"],\"confidence\":0.55},\n  {\"cause\":\"TLS certificate validation failure against an upstream endpoint triggering abort()\",\"detail\":\"SIGABRT at exit_code=134 without OOM or scheduling issues points to a software-initiated abort. If bot-service validates a peer TLS certificate on startup (e.g. against an internal CA, a secrets vault, or an mTLS-gated API) and the cert is expired, rotated, or the CA bundle is stale in this preprod environment, strict TLS libraries call abort() on fatal handshake errors. The consistent crash-loop cadence supports a deterministic failure path rather than transient flapping.\",\"anchored_facts\":[\"process_crash\",\"crashloop\"],\"confidence\":0.40},\n  {\"cause\":\"DNS resolution failure for a required upstream preventing process initialization\",\"detail\":\"If the service resolves upstream hostnames at startup (common for queue brokers, service-mesh control planes, or external APIs) and DNS returns NXDOMAIN or times out — possible in preprod-kingdom1 if the namespace network policy or CoreDNS config diverges from prod — some SDKs escalate to abort() when a critical host is unresolvable. Repeated BackOff events (count=12) with no evidence of resource pressure or scheduling issues narrows the failure to within the container startup sequence, consistent with a DNS/network dependency path.\",\"anchored_facts\":[\"process_crash\",\"crashloop\"],\"confidence\":0.35}\n]}"
+    },
+    {
+      "role": "d44ffaeccde4d5f4",
+      "ctx": "97b9d526bf66735d",
+      "task_type": "hypothesis",
+      "text": "{\"hypotheses\":[\n  {\"cause\":\"Unrecovered application panic (Go runtime or equivalent) causing SIGABRT on every startup\", \"detail\":\"Exit code 134 maps to signal 6 (SIGABRT), which is the canonical signature of an unrecovered Go goroutine panic — the runtime calls abort() after printing the stack trace. The crash is deterministic (max_restart_count=0 yet BackOff count=12), meaning the same code path fails on every container start. Likely candidates: nil pointer dereference, out-of-bounds slice access, or a failed type assertion in initialization code that runs before any recovery middleware is installed.\", \"anchored_facts\":[\"process_crash\",\"crashloop\"], \"confidence\":0.72},\n  {\"cause\":\"Fatal startup assertion or mandatory config/env-var validation calling abort()\", \"detail\":\"Some frameworks and internal SDKs call abort() (or log.Fatal → os.Exit(2) wrapped in a signal handler that re-raises SIGABRT) when a required configuration key is missing or fails validation at boot. The deterministic crash-loop pattern with BackOff count=12 and no variation in exit code strongly suggests the failure occurs before the service reaches a steady state — consistent with early-lifecycle initialization code that asserts required values are present.\", \"anchored_facts\":[\"process_crash\",\"crashloop\"], \"confidence\":0.55},\n  {\"cause\":\"Heap corruption or CGO/native-library assertion triggering SIGABRT from the C allocator\", \"detail\":\"If bot-service links native code via CGO (e.g., a compression, crypto, or serialization library), a corrupted heap or a failed C-level assert() will raise SIGABRT, producing exit_code=134. Unlike OOM (which is excluded), this class of crash is silent in Kubernetes terminated-state logs ('text matches suppressed' in the oom_killed fact confirms log suppression is occurring) and repeats identically on every restart because the corrupting input or state is reproduced from a persistent source (message queue, config mount, or environment variable).\", \"anchored_facts\":[\"process_crash\",\"crashloop\"], \"confidence\":0.32}\n]}"
+    },
+    {
+      "role": "b2c6508c81d5e042",
+      "ctx": "97b9d526bf66735d",
+      "task_type": "hypothesis",
+      "text": "{\"hypotheses\":[\n  {\"cause\":\"Native heap corruption triggering allocator abort()\",\"detail\":\"exit_code=134/SIGABRT is the canonical outcome when glibc malloc (or jemalloc/tcmalloc) detects heap metadata corruption — double-free, use-after-free, or buffer overrun — and self-signals SIGABRT. In a bot-service context this is typical of P/Invoke or JNI interop where unmanaged code corrupts the managed heap boundary, or of a native dependency with a memory-safety bug. The process is terminating itself deliberately rather than being killed externally, which is why oom_killed is ✗ despite exit_code=134.\",\"anchored_facts\":[\"process_crash\",\"crashloop\"],\"confidence\":0.72},\n  {\"cause\":\"CLR/JVM unrecoverable runtime fault (ExecutionEngineException / HotSpot fatal error)\",\"detail\":\"The .NET CLR raises SIGABRT on fatal internal errors: ExecutionEngineException, corrupted object headers, GC heap invariant violations, or stack overflow in a native frame where the CLR cannot unwind safely. The JVM similarly calls abort() on HotSpot internal assertions or JNI frame corruption. Both runtimes produce exit_code=134 with no OOM marker — matching the ✗ oom_killed / ✓ process_crash pattern exactly. The repeating crash-loop (BackOff count=12) suggests the fault is deterministic and reproducible rather than transient resource exhaustion.\",\"anchored_facts\":[\"process_crash\",\"crashloop\"],\"confidence\":0.65},\n  {\"cause\":\"Unhandled exception in async/background thread calling std::terminate or runtime abort handler\",\"detail\":\"In Go (cgo), .NET (unobserved Task exception on older runtimes), or C++ (std::terminate from a noexcept-violated async callback), an exception that escapes a background goroutine/thread boundary can invoke the runtime's abort handler, producing SIGABRT. This is consistent with a service that handles concurrent bot events: a panic in a goroutine without a recover(), or a finalizer thread crash in .NET, will bring down the whole process with signal 6. The low max_restart_count=0 at pod level alongside BackOff count=12 at namespace event level suggests the container exits quickly and consistently each restart cycle.\",\"anchored_facts\":[\"process_crash\",\"crashloop\"],\"confidence\":0.55}\n]}"
+    },
+    {
+      "role": "d4e8e579b37e765d",
+      "ctx": "97b9d526bf66735d",
+      "task_type": "hypothesis",
+      "text": "{\"hypotheses\":[{\"cause\":\"Process invoking abort() due to heap or memory corruption\",\"detail\":\"Exit code 134 maps to SIGABRT (128+6). In native runtimes this signal is raised by the allocator on double-free, heap metadata corruption, or explicit abort() calls — none of which trigger the OOM killer, consistent with oom_killed=✗. The crash recurs deterministically (BackOff count=12) suggesting a reproducible code path rather than a transient resource spike. Infrastructure angle: if the container memory limit is set too close to actual working set, the allocator may corrupt internal bookkeeping under pressure even when the node itself shows no resource_pressure.\",\"anchored_facts\":[\"process_crash\",\"crashloop\"],\"confidence\":0.72},{\"cause\":\"Missing or incompatible shared library / dynamic linker abort at container startup\",\"detail\":\"SIGABRT is sent by the dynamic linker (ld.so) when a required symbol or library is unresolvable at dlopen time on some libc versions, producing exit_code=134 with no application log. The fact that max_restart_count=0 in one observation (fresh pod) yet BackOff count=12 exists suggests the crash happens very early — before the app writes any logs — which is consistent with a linker-level abort. Root cause could be a base image layer mismatch or a volume-mounted library path that is missing or stale in this preprod environment.\",\"anchored_facts\":[\"process_crash\",\"crashloop\"],\"confidence\":0.55},{\"cause\":\"Persistent crash-loop driven by a deterministic SIGABRT with no self-healing path\",\"detail\":\"The combination of BackOff count=12 and exit_code=134 (SIGABRT) with no OOM, no scheduling failure, and no recent deploy signal points to a container that crashes on every start due to an internal abort, and Kubernetes backoff is the only active mitigation. From an infra standpoint the kubelet will keep restarting indefinitely with exponential backoff (up to 5 min). If the SIGABRT source is a corrupted writable layer or a bad emptyDir/ConfigMap mount, the fix requires pod eviction and a clean reschedule rather than waiting for the backoff window.\",\"anchored_facts\":[\"crashloop\",\"process_crash\"],\"confidence\":0.60}]}"
+    },
+    {
+      "role": "255f96ccff71b5fe",
+      "ctx": "d66090a88be142d3",
+      "task_type": "critic",
+      "text": "{\"refutations\": [\"The hypothesis asserts the crash is deterministic across many restarts, citing BackOff count=12 as evidence. However, the only fact supplying that count is a ✓ crashloop (conf=0.38, source=k8s_event) explicitly marked attribution=unverified with note='namespace-wide event; alert has no pod/service label to attribute it to the target workload' — the 12 BackOff events may belong to a different workload entirely. The authoritative ✓ crashloop (conf=0.80, source=k8s_terminated_state) records max_restart_count=0 and recent_backoff_events=1, consistent with a single crash, not a repeating deterministic failure loop. This undercuts the 'deterministic on every startup' claim that the hypothesis uses to narrow causation to a code-path bug.\"]}"
+    },
+    {
+      "role": "255f96ccff71b5fe",
+      "ctx": "f5de1374976fc69d",
+      "task_type": "critic",
+      "text": "```json\n{\"refutations\": [\"crashloop (conf=0.80) shows max_restart_count=0 and recent_backoff_events=1, directly contradicting the hypothesis's core claim of a 'deterministic crash-loop pattern with BackOff count=12' — the highest-confidence crashloop observation shows essentially one event and zero accumulated restarts, not the repeated deterministic loop the hypothesis requires.\", \"crashloop (conf=0.38) is the only fact supporting count=12, but it is explicitly marked attribution=unverified with note='namespace-wide event; alert has no pod/service label to attribute it to the target workload' — the hypothesis treats this count as strong structural evidence of determinism, but the fact itself disavows reliable attribution to the target pod, making that inference unsupported.\"]}\n```"
+    },
+    {
+      "role": "255f96ccff71b5fe",
+      "ctx": "9fbfd7198b2dbf0a",
+      "task_type": "critic",
+      "text": "{\"refutations\": [\"The hypothesis claims that 'text matches suppressed' in the oom_killed fact 'confirms log suppression is occurring,' using this as supporting evidence for why the CGO/SIGABRT crash is silent. However, the oom_killed fact is explicitly marked ✗ (NOT observed). A ✗ fact cannot serve as positive confirmation of any condition the hypothesis needs to be true; the note merely describes tool output formatting, not Kubernetes suppressing crash-level logs.\"]}"
+    },
+    {
+      "role": "255f96ccff71b5fe",
+      "ctx": "e7f8da6b11c31f90",
+      "task_type": "critic",
+      "text": "{\"refutations\": [\"resource_pressure (conf=0.75) subject=preprod-kingdom1 is marked ✗ (NOT observed), which undermines the hypothesis's infrastructure angle that 'container memory limit set too close to actual working set' causes allocator corruption under memory pressure — no resource pressure was observed on the node.\"]}"
+    },
+    {
+      "role": "255f96ccff71b5fe",
+      "ctx": "cd53be62aab4abf3",
+      "task_type": "critic",
+      "text": "{\"refutations\": [\"The hypothesis explicitly anchors part of its reasoning on 'BackOff count=12 exists' to infer very-early crashes, but the observed fact_kind 'crashloop (conf=0.38)' carries attribution=unverified and notes it is a 'namespace-wide event; alert has no pod/service label to attribute it to the target workload' — meaning this BackOff count cannot be reliably tied to bot-service-56567b98-5jmct, invalidating that inference.\", \"The hypothesis proposes 'base image layer mismatch' as a concrete root-cause mechanism, which requires a recent change to the image or its layers; the fact_kind 'recent_deploy (conf=0.70)' is marked ✗ (NOT observed, reason=no_deploys_or_no_timestamp), directly contradicting the premise that a freshly-introduced image incompatibility triggered the linker abort.\"]}"
+    },
+    {
+      "role": "255f96ccff71b5fe",
+      "ctx": "0797ea39198c5e19",
+      "task_type": "critic",
+      "text": "{\"refutations\": [\"crashloop (conf=0.80, source=k8s_pod_status) shows max_restart_count=0 and phrase_hits=0, directly contradicting the hypothesis claim of a *persistent* crash-loop that 'crashes on every start' — a deterministic abort repeating across restarts would produce a non-zero restart count.\", \"crashloop (conf=0.38, source=k8s_event) explicitly carries attribution=unverified and the note 'namespace-wide event; alert has no pod/service label to attribute it to the target workload' — the BackOff count=12 that the hypothesis uses as a primary anchor cannot be reliably tied to bot-service-56567b98-5jmct, undermining the core evidence for the exponential-backoff narrative.\"]}"
+    },
+    {
+      "role": "255f96ccff71b5fe",
+      "ctx": "e71e6be6303360c9",
+      "task_type": "critic",
+      "text": "{\"refutations\": [\"upstream_degraded is marked ✗ (NOT observed) with reason=no_graph_data — the hypothesis requires a consistently unreachable upstream to explain the repeated SIGABRT crashes, but no upstream degradation was detected, directly contradicting the core causal claim\"]}"
+    },
+    {
+      "role": "255f96ccff71b5fe",
+      "ctx": "2f07904174b25e00",
+      "task_type": "critic",
+      "text": "{\"refutations\": [\"upstream_degraded is marked ✗ (NOT observed) with reason=no_graph_data: the hypothesis specifically requires a failing upstream TLS endpoint, but no upstream degradation signal was detected — weakening the claim that an upstream cert/CA issue is the trigger\", \"crashloop (conf=0.80) shows phrase_hits=0: if a TLS library were aborting on handshake failure it would typically emit distinctive log phrases (e.g. 'certificate verify failed', 'SSL_connect', 'abort'); zero phrase hits means no such log evidence was captured, leaving the TLS-abort causal chain unsupported by log data\"]}"
+    },
+    {
+      "role": "255f96ccff71b5fe",
+      "ctx": "16c004109232d188",
+      "task_type": "critic",
+      "text": "```json\n{\"refutations\": [\"crashloop (conf=0.80, source=k8s_terminated_state) shows recent_backoff_events=1 and max_restart_count=0, directly contradicting the hypothesis's claim that 'Repeated BackOff events (count=12)' narrow the failure to a startup-sequence DNS path — the higher-confidence crashloop observation does not support repeated restarts.\", \"crashloop (conf=0.38, source=k8s_event) carries attribution=unverified and the explicit note 'namespace-wide event; alert has no pod/service label to attribute it to the target workload' — the count=12 BackOff figure the hypothesis treats as key evidence cannot be reliably attributed to bot-service-56567b98-5jmct, undermining the entire 'narrowing' argument.\"]}\n```"
+    },
+    {
+      "role": "255f96ccff71b5fe",
+      "ctx": "ad5a6b8b7c764fa7",
+      "task_type": "critic",
+      "text": "{\"refutations\": []}"
+    },
+    {
+      "role": "255f96ccff71b5fe",
+      "ctx": "20ef39e3cbcc360e",
+      "task_type": "critic",
+      "text": "```json\n{\"refutations\": [\"The ✓ crashloop (conf=0.80) fact shows max_restart_count=0 and recent_backoff_events=1, directly contradicting the hypothesis claim that 'BackOff count=12' evidences a deterministic, repeating crash loop — the highest-confidence crashloop fact does not support repeated reproducible failure.\", \"The ✓ crashloop (conf=0.38) fact is explicitly marked attribution=unverified with note='namespace-wide event; alert has no pod/service label to attribute it to the target workload' — the count=12 figure the hypothesis anchors as proof of deterministic fault cannot be reliably attributed to bot-service, undermining that pillar of the argument.\"]}\n```"
+    },
+    {
+      "role": "255f96ccff71b5fe",
+      "ctx": "2412a06c6c40a058",
+      "task_type": "critic",
+      "text": "{\"refutations\": [\"The hypothesis explicitly uses 'BackOff count=12 at namespace event level' as supporting evidence for the container 'exiting quickly and consistently each restart cycle,' but the ✓ crashloop (conf=0.38) fact states attribution=unverified and 'namespace-wide event; alert has no pod/service label to attribute it to the target workload' — this count cannot be reliably attributed to bot-service, undermining that pillar of the hypothesis.\", \"The pod-level ✓ crashloop (conf=0.80) fact shows recent_backoff_events=1 (not 12) and max_restart_count=0, directly contradicting the hypothesis's portrayal of 12 consistent restart cycles; a single observed backoff event does not establish the repeated, stable crash pattern the hypothesis relies on to argue the abort is deterministic and reproducible.\"]}"
+    }
+  ]
+}

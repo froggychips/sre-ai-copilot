@@ -1,0 +1,25 @@
+id: 013_facts_oom_false_positive_guard
+title: OOM у СОСЕДНЕГО пода не приписывается цели с exit 139
+source: real          # регрессия combat run 1 и 3, docs/RUNBOOK.md
+llm: false
+incident: {incident_id: golden-013, severity: critical, status: firing,
+           summary: "Pod notificator-1 crash-looping",
+           description: "Container exited with code 139 (SIGSEGV)",
+           namespace: squad-10-shared,
+           labels: {alertname: KubePodCrashLooping, pod: notificator-1, service: notificator},
+           annotations: {description: "Container exited with code 139 (SIGSEGV)"},
+           starts_at: "2026-08-10T10:00:00Z", ends_at: null, generator_url: null, raw: {}}
+context:
+  k8s_pod_state:
+    notificator-1: {exit_code: 139, reason: Error, restart_count: 7}
+    other-pod-9: {exit_code: 137, reason: OOMKilled, restart_count: 2}
+  logs_summary: |
+    Events: other-pod-9 OOMKilled, memory limit exceeded
+    Events: notificator-1 BackOff restarting failed container
+expect:
+  # Дважды стоивший разбор: текст «OOMKilled» в событиях чужого пода делал
+  # oom_killed=true у цели с exit 139, гипотезы якорились на него, и весь
+  # разбор уходил в память вместо segfault.
+  facts:
+    oom_killed: false
+    process_crash: true
