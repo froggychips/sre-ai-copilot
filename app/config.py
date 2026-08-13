@@ -233,6 +233,16 @@ class Settings(BaseSettings):
     # уже работает правильно с корректным ns. kill-switch.
     ENRICH_PROBE_NS_RESOLVE_ENABLED: bool = True
 
+    # Имя ноды вместо IP пода в нодовых алертах.
+    # У метрик node-exporter нет метки `node`, а `instance` — IP ПОДА (DaemonSet
+    # не в hostNetwork): в Discord приезжало «NodeSystemSaturation ·
+    # 192.168.74.165:9100». Для НАШИХ VMRule связка вшита в expr (VMRule
+    # node-name-info), но группа `node-exporter` приходит из чарта
+    # victoria-metrics-k8s-stack — её expr мы не контролируем. Резолвим по метке
+    # `pod` через kube_pod_info на входе вебхука. kill-switch; при выключенном
+    # флаге или пустом VICTORIA_METRICS_URL алерт уходит с IP, как раньше.
+    NODE_NAME_RESOLVE_ENABLED: bool = True
+
     # Kube-resource alert attribution (баг «vm-kube-state-metrics 52% noisemaker»).
     # У KubeDeployment*/KubeStatefulSet*/KubeDaemonSet*-алертов лейбл `service`
     # (== job/service метрики-ИСТОЧНИКА kube-state-metrics) равен
