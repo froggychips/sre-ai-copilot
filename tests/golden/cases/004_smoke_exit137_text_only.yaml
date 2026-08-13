@@ -1,0 +1,32 @@
+id: 004_smoke_exit137_text_only
+title: exit 137 только в тексте алерта, структурных данных о поде нет
+source: real          # e2e-smoke, тот самый «exit 137 only» soft-match
+llm: false            # проверяем ровно поведение правил, не модель
+incident:
+  incident_id: golden-004
+  severity: critical
+  status: firing
+  summary: stub-pod-1 CrashLoopBackOff
+  description: exit code 137
+  namespace: squad-1
+  labels:
+    alertname: PodCrashLooping
+    severity: critical
+    namespace: squad-1
+    pod: stub-pod-1
+  annotations:
+    summary: stub-pod-1 CrashLoopBackOff
+    description: exit code 137
+  starts_at: "2026-05-12T10:00:00Z"
+  ends_at: null
+  generator_url: null
+  raw: {}
+context: {}
+expect:
+  # Без k8s_pod_state правило остаётся на текстовом уровне: OOM отмечается,
+  # но это soft-match, а не структурное наблюдение. Кейс фиксирует, что
+  # текстового «exit code 137» достаточно ровно для oom_killed и ни для чего
+  # больше — в частности, process_crash не выдумывается.
+  facts:
+    oom_killed: true
+    process_crash: false

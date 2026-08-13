@@ -1,0 +1,16 @@
+id: 006_gate_prod_restart_blocked
+title: рестарт в prod-namespace блокируется детерминированно
+source: synthetic
+llm: false
+incident: {incident_id: golden-006, severity: critical, status: firing, summary: guard,
+           description: "", namespace: prod-kingdom1, labels: {alertname: Guard},
+           annotations: {}, starts_at: "2026-08-10T10:00:00Z", ends_at: null,
+           generator_url: null, raw: {}}
+intent:
+  action: restart_deployment
+  resource_type: deployment
+  resource_name: bot-service
+  namespace: prod-kingdom1
+  risk: low            # ← LLM утверждает «низкий»; гейт обязан не поверить
+expect:
+  gate: block

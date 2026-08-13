@@ -1,0 +1,17 @@
+id: 014_facts_failed_scheduling
+title: под не шедулится — insufficient cpu на всех нодах
+source: synthetic
+llm: false
+incident: {incident_id: golden-014, severity: warning, status: firing,
+           summary: "Pod api-2 not ready",
+           description: "0/12 nodes are available: insufficient cpu. FailedScheduling",
+           namespace: squad-1,
+           labels: {alertname: KubePodNotReady, pod: api-2, service: api},
+           annotations: {description: "0/12 nodes are available: insufficient cpu. FailedScheduling"},
+           starts_at: "2026-08-10T10:00:00Z", ends_at: null, generator_url: null, raw: {}}
+context: {}
+expect:
+  facts:
+    failed_scheduling: true
+    oom_killed: false
+    crashloop: false

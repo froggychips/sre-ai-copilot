@@ -1,0 +1,22 @@
+{
+  "calls": [
+    {
+      "role": "d4e8e579b37e765d",
+      "ctx": "6dfd79821ca464a6",
+      "task_type": "hypothesis",
+      "text": "{\"hypotheses\":[]}"
+    },
+    {
+      "role": "d44ffaeccde4d5f4",
+      "ctx": "6dfd79821ca464a6",
+      "task_type": "hypothesis",
+      "text": "{\"hypotheses\":[]}"
+    },
+    {
+      "role": "df34e1588a327ff7",
+      "ctx": "6dfd79821ca464a6",
+      "task_type": "hypothesis",
+      "text": "{\"hypotheses\":[]}"
+    }
+  ]
+}

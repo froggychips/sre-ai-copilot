@@ -1,0 +1,91 @@
+# Golden-eval против настоящей модели.
+#
+# Отдельно от CI намеренно: этот прогон стоит денег и ходит в сеть, поэтому
+# его нельзя вешать на каждый PR. На PR-ах гоняется replay-режим (записанные
+# ответы) — он ловит регрессии обвеса, но по определению ничего не говорит о
+# качестве текущих промптов. Ровно этот вопрос и закрывает live.
+#
+# Результат не блокирует ветку: деградация метрики — повод посмотреть, а не
+# автоматически считать код сломанным (модель могла ответить иначе на том же
+# промпте). Сводка уезжает артефактом, а падение — в лог джобы.
+name: Golden Eval (live)
+
+on:
+  schedule:
+    # Воскресенье 05:00 UTC — раннер один и делится с CI/CodeQL, длинный
+    # прогон не должен драться с проверками PR-ов в рабочее время.
+    - cron: '0 5 * * 0'
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: 'live (только измерить) или record (перезаписать эталонные ответы)'
+        required: false
+        default: live
+        type: choice
+        options: [live, record]
+
+permissions:
+  contents: read
+
+jobs:
+  eval:
+    name: Golden Eval
+    runs-on: [self-hosted, macOS, ARM64]
+    # Без ключа прогон бессмысленен: секрет отсутствует → джоба не стартует
+    # вместо того, чтобы падать на середине набора.
+    if: ${{ github.event_name == 'workflow_dispatch' || github.repository == 'froggychips/sre-ai-copilot' }}
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v7
+        with:
+          clean: false
+
+      - name: Create venv and install dependencies
+        run: |
+          /opt/homebrew/bin/python3.12 -m venv .venv
+          .venv/bin/pip install --upgrade pip
+          .venv/bin/pip install -r requirements.txt
+          .venv/bin/pip install pyyaml
+
+      - name: Run golden eval
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          LLM_BACKEND: anthropic
+        run: |
+          if [ -z "$ANTHROPIC_API_KEY" ]; then
+            echo "::warning::ANTHROPIC_API_KEY не задан — live-прогон пропущен"
+            exit 0
+          fi
+          .venv/bin/python scripts/eval_golden.py \
+            --mode "${{ inputs.mode || 'live' }}" \
+            --json-out eval-summary.json
+
+      - name: Upload summary
+        if: always()
+        uses: actions/upload-artifact@v7
+        # Квота artifact storage на аккаунте переполнена — сводка есть и в
+        # логе джобы, поэтому её загрузка не должна валить прогон.
+        continue-on-error: true
+        with:
+          name: golden-eval-${{ github.run_number }}
+          path: eval-summary.json
+
+      - name: Show diff against baseline
+        if: always()
+        run: |
+          # Информативно: что изменилось относительно эталона. Не блокирует —
+          # решение «поднять baseline или чинить» принимает человек.
+          if [ -f eval-summary.json ]; then
+            .venv/bin/python - <<'PY'
+          import json, pathlib
+          cur = json.loads(pathlib.Path("eval-summary.json").read_text())
+          base_path = pathlib.Path("tests/golden/baseline.json")
+          base = json.loads(base_path.read_text()) if base_path.exists() else {}
+          print(f"кейсы: {cur['cases_passed']}/{cur['cases_total']} "
+                f"(baseline {base.get('cases_passed', '?')}/{base.get('cases_total', '?')})")
+          for group, rate in sorted(cur.get("by_check", {}).items()):
+              was = base.get("by_check", {}).get(group)
+              mark = "" if was is None else (" ↓" if rate < was else (" ↑" if rate > was else " ="))
+              print(f"  {group:18} {rate:.0%}{mark}")
+          PY
+          fi

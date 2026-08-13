@@ -1,0 +1,18 @@
+id: 009_gate_forbidden_namespace_rejected
+title: kube-system отсекается ещё на разборе intent-а, до гейта
+source: synthetic
+llm: false
+incident: {incident_id: golden-009, severity: critical, status: firing, summary: guard,
+           description: "", namespace: kube-system, labels: {alertname: Guard},
+           annotations: {}, starts_at: "2026-08-10T10:00:00Z", ends_at: null,
+           generator_url: null, raw: {}}
+intent:
+  action: restart_deployment
+  resource_type: deployment
+  resource_name: coredns
+  namespace: kube-system
+  risk: low
+expect:
+  # Глубина обороны: FORBIDDEN_NAMESPACES отвергает интент на pydantic-валидации,
+  # то есть до того, как политика вообще получит шанс ошибиться.
+  intent_rejected: true

@@ -1,0 +1,58 @@
+{
+  "calls": [
+    {
+      "role": "d4e8e579b37e765d",
+      "ctx": "73b670557d05fad6",
+      "task_type": "hypothesis",
+      "text": "{\"hypotheses\":[{\"cause\":\"Bad deploy introduced a misconfiguration or code defect causing request failures\",\"detail\":\"Wo_Backend_BuildApiGateway deployed 6 minutes before the incident began, which is a tight causal window. A misconfigured routing rule, broken health check, or faulty code path introduced by this deploy is the most likely explanation for the 18% 5xx rate without OOM or crashloop signals — the process stays up but returns errors.\",\"anchored_facts\":[\"recent_deploy\"],\"confidence\":0.82}]}"
+    },
+    {
+      "role": "df34e1588a327ff7",
+      "ctx": "73b670557d05fad6",
+      "task_type": "hypothesis",
+      "text": "{\"hypotheses\":[{\"cause\":\"Faulty deployment introduced bad upstream routing or TLS config\",\"detail\":\"Deploy 'Wo_Backend_BuildApiGateway' landed 6 minutes before incident onset. A misconfigured upstream endpoint, changed TLS certificate, or broken load balancer backend pool in the new release would cause api-gateway to fail requests to upstream services, producing 18% 5xx without pod crashes or OOM events.\",\"anchored_facts\":[\"recent_deploy\"],\"confidence\":0.82},{\"cause\":\"New release introduced broken connection pool or timeout config causing upstream exhaustion\",\"detail\":\"The deploy 6 minutes prior may have shipped a changed connection timeout, pool size, or retry budget. Under normal traffic load, the gateway begins exhausting connections to upstream services, causing latency cascades and 5xx responses while the process itself stays healthy.\",\"anchored_facts\":[\"recent_deploy\"],\"confidence\":0.65}]}"
+    },
+    {
+      "role": "d44ffaeccde4d5f4",
+      "ctx": "73b670557d05fad6",
+      "task_type": "hypothesis",
+      "text": "{\"hypotheses\":[{\"cause\":\"Недавний деплой api-gateway внёс регрессию, которая приводит к ошибкам при обработке запросов\",\"detail\":\"Деплой Wo_Backend_BuildApiGateway был выполнен за 6 минут до инцидента. 18% 5xx с высокой вероятностью вызваны багом в новом коде: паника в обработчике, некорректный парсинг конфига, сломанный middleware или изменение бизнес-логики, которое не покрыто тестами. OOM и crashloop отсутствуют, что указывает на soft-failure (исключение/ошибка), а не на crash процесса.\",\"anchored_facts\":[\"recent_deploy\"],\"confidence\":0.88},{\"cause\":\"Деплой изменил конфигурацию роутинга или таймаутов, что сломало подмножество эндпоинтов\",\"detail\":\"Новая версия api-gateway могла изменить конфиг upstream-маршрутов, circuit breaker thresholds или таймауты. Это объясняет частичный 5xx (18%, не 100%) — затронуты только конкретные маршруты или методы. Факт upstream_degraded не подтверждён, но это согласуется с тем, что деградация вызвана самим gateway, а не апстримом.\",\"anchored_facts\":[\"recent_deploy\"],\"confidence\":0.72},{\"cause\":\"Деплой привёл к несовместимости схемы запроса/ответа с одним из апстримов, вызывая сериализационные ошибки\",\"detail\":\"Если деплой изменил контракт API (новые обязательные поля, изменение типов, версионирование), api-gateway может получать валидные ответы от апстримов, но падать при десериализации или валидации, генерируя 5xx. Это объясняет стабильный процент ошибок без OOM и crashloop.\",\"anchored_facts\":[\"recent_deploy\"],\"confidence\":0.55}]}"
+    },
+    {
+      "role": "255f96ccff71b5fe",
+      "ctx": "2ec30a9a5c0a3a11",
+      "task_type": "critic",
+      "text": "{\"refutations\": []}"
+    },
+    {
+      "role": "255f96ccff71b5fe",
+      "ctx": "105b43ccde4ad4f0",
+      "task_type": "critic",
+      "text": "{\"refutations\": []}"
+    },
+    {
+      "role": "255f96ccff71b5fe",
+      "ctx": "722e4a2d5a11b3d3",
+      "task_type": "critic",
+      "text": "{\"refutations\": []}"
+    },
+    {
+      "role": "255f96ccff71b5fe",
+      "ctx": "30406d49a2e57b67",
+      "task_type": "critic",
+      "text": "{\"refutations\": []}"
+    },
+    {
+      "role": "255f96ccff71b5fe",
+      "ctx": "57dd3f81d10f52c3",
+      "task_type": "critic",
+      "text": "{\"refutations\": [\"upstream_degraded (conf=0.30, reason=no_graph_data) is ✗ NOT observed for api-gateway. The hypothesis asserts that bad upstream routing or TLS config causes api-gateway to fail requests to upstream services — this mechanism would be expected to produce observable upstream degradation signals. Its absence (even if due to no_graph_data rather than positive confirmation of health) means the predicted downstream effect of the claimed cause cannot be corroborated from the available fact set.\"]}"
+    },
+    {
+      "role": "255f96ccff71b5fe",
+      "ctx": "0ff83b2db895a4b1",
+      "task_type": "critic",
+      "text": "{\"refutations\": [\"upstream_degraded is ✗ NOT observed (conf=0.30, reason=no_graph_data): the hypothesis requires the gateway to be exhausting connections to upstream services and causing cascades there, but no upstream degradation was detected — even accounting for no_graph_data, the absence of any positive upstream_degraded signal means the core causal mechanism (upstream exhaustion) has no supporting evidence in the observed facts\"]}"
+    }
+  ]
+}

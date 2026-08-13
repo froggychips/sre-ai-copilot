@@ -1,0 +1,37 @@
+id: 017_oom_bot_preupdate
+title: bot в preupdate-kingdom5 убит OOM-killer-ом
+source: real          # класс инцидента живой: preupdate-kingdom5 bot OOM
+llm: true
+incident:
+  incident_id: golden-017
+  severity: critical
+  status: firing
+  summary: Pod bot-5f9c7d8-2xk4m OOMKilled in preupdate-kingdom5
+  description: Container bot exceeded memory limit 1536Mi, exit code 137
+  namespace: preupdate-kingdom5
+  labels:
+    alertname: KubePodCrashLooping
+    severity: critical
+    namespace: preupdate-kingdom5
+    pod: bot-5f9c7d8-2xk4m
+    service: bot
+  annotations:
+    summary: Pod bot-5f9c7d8-2xk4m OOMKilled in preupdate-kingdom5
+    description: Container bot exceeded memory limit 1536Mi, exit code 137
+  starts_at: "2026-08-05T03:12:00Z"
+  ends_at: null
+  generator_url: null
+  raw: {}
+context:
+  k8s_pod_state:
+    bot-5f9c7d8-2xk4m: {exit_code: 137, reason: OOMKilled, restart_count: 9}
+  metrics_summary: {cpu_pct: 45, memory_pct: 98}
+expect:
+  facts:
+    oom_killed: true
+    process_crash: false
+  resolution: resolved
+  cause_contains: ["memory", "oom", "память"]
+  # preupdate не входит в разрешённый tier — что бы ни предложила модель,
+  # автоприменение закрыто.
+  gate: block

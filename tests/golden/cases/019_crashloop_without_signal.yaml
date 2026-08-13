@@ -1,0 +1,38 @@
+id: 019_crashloop_without_signal
+title: crashloop без единого диагностического сигнала — честная неуверенность
+source: synthetic
+llm: true
+incident:
+  incident_id: golden-019
+  severity: critical
+  status: firing
+  summary: Pod worker-7b6d-9plq restarting
+  description: Pod is restarting 4 times in 10 minutes
+  namespace: squad-2
+  labels:
+    alertname: KubePodCrashLooping
+    severity: critical
+    namespace: squad-2
+    pod: worker-7b6d-9plq
+    service: worker
+  annotations:
+    summary: Pod worker-7b6d-9plq restarting
+    description: Pod is restarting 4 times in 10 minutes
+  starts_at: "2026-08-10T10:00:00Z"
+  ends_at: null
+  generator_url: null
+  raw: {}
+context: {}
+expect:
+  # Данных, кроме факта рестартов, нет. Кейс охраняет право системы сказать
+  # «не знаю» вместо уверенной выдумки: причина не должна ссылаться ни на
+  # OOM, ни на выкат, ни на upstream — ничего из этого не наблюдалось.
+  facts:
+    # Кумулятивный счётчик рестартов правилом НЕ считается активным
+    # crashloop-ом (см. crashloop.py): «4 рестарта за 10 минут» в тексте
+    # алерта — история, а не наблюдение BackOff. Ни одного факта нет вообще.
+    crashloop: false
+    oom_killed: false
+    recent_deploy: false
+    upstream_degraded: false
+  cause_not_contains: ["oom", "out of memory", "recent deploy", "upstream"]

@@ -1,0 +1,100 @@
+{
+  "calls": [
+    {
+      "role": "df34e1588a327ff7",
+      "ctx": "ee22fe7d7dda3956",
+      "task_type": "hypothesis",
+      "text": "{\"hypotheses\":[\n  {\"cause\":\"Upstream dependency unreachable on startup causes process to exit(1)\", \"detail\":\"map-service exits with code 1 (non-OOM, non-signal) immediately after start, consistent with a blocking synchronous call to an upstream service (e.g. config store, service registry, database, or message broker) that times out or refuses connection. The service treats inability to reach the upstream as fatal and calls exit(1), producing the observed crashloop with BackOff count=27.\", \"anchored_facts\":[\"process_crash\",\"crashloop\"], \"confidence\":0.62},\n  {\"cause\":\"DNS resolution failure for an upstream endpoint prevents the process from initialising\", \"detail\":\"A stale or missing DNS record for a dependent service (e.g. after a namespace migration or CoreDNS disruption in squad-4-kingdom2) causes the initial lookup to fail. The service cannot resolve the upstream host, aborts startup with exit_code=1, and kubelet keeps restarting it — visible as BackOff events.\", \"anchored_facts\":[\"process_crash\",\"crashloop\"], \"confidence\":0.38},\n  {\"cause\":\"TLS handshake failure with a required upstream (expired cert or mutual-TLS misconfiguration) causes startup crash\", \"detail\":\"map-service attempts to establish a TLS connection to an upstream (e.g. an internal API or gRPC service) during initialisation. A recently rotated or expired certificate causes the handshake to fail with a fatal error, the process exits with code 1, and the pod enters the BackOff crashloop seen in k8s events.\", \"anchored_facts\":[\"process_crash\",\"crashloop\"], \"confidence\":0.28}\n]}"
+    },
+    {
+      "role": "b2c6508c81d5e042",
+      "ctx": "ee22fe7d7dda3956",
+      "task_type": "hypothesis",
+      "text": "{\"hypotheses\":[\n  {\"cause\":\"Unhandled exception during process startup (application-level crash, not OS signal)\",\"detail\":\"exit_code=1 with no captured signal (signal= empty) points to an application-level fatal error rather than SIGSEGV/SIGABRT. In .NET this maps to an unhandled CLR exception propagating past Main(); in JVM to an uncaught exception on the main thread; in Go to a panic that exits via os.Exit(1). The process starts, hits a fatal path (missing config, failed dependency handshake, nil dereference during init), and terminates with code 1 before the container becomes healthy — triggering the BackOff loop (count=27).\",\"anchored_facts\":[\"process_crash\",\"crashloop\"],\"confidence\":0.62},\n  {\"cause\":\"Runtime initialization failure: heap/GC bootstrap or native interop error at container cold-start\",\"detail\":\"exit_code=1 can be emitted by runtimes before the application layer is even reached — e.g., .NET CLR failing to JIT a P/Invoke binding, JVM hitting a native library load error (UnsatisfiedLinkError mapped to exit 1), or Go's runtime.throw() path when the environment is inconsistent (stack size limits, /proc constraints in the container). The consistent crash-loop without OOM and without a raw OS signal (no SIGSEGV/132/134/139) aligns with a deterministic runtime bootstrap failure that repeats on every restart.\",\"anchored_facts\":[\"process_crash\",\"crashloop\"],\"confidence\":0.45},\n  {\"cause\":\"Async/thread-pool starvation or deadlock during startup causing the process to hang then be killed, or to self-exit with code 1\",\"detail\":\"Thread pool exhaustion in .NET (all ThreadPool threads blocked on sync-over-async) or a goroutine deadlock detected by the Go runtime both produce fatal exits without OS signals. If the container has a liveness/readiness probe with a short timeout, the probe kill would register as exit_code=1 (SIGTERM → exit 1) rather than SIGKILL. The repeated BackOff events (count=27) without any OOM indicator suggest the failure is deterministic and fast, consistent with a deadlock hit early in the startup path.\",\"anchored_facts\":[\"process_crash\",\"crashloop\"],\"confidence\":0.30}\n]}"
+    },
+    {
+      "role": "d44ffaeccde4d5f4",
+      "ctx": "ee22fe7d7dda3956",
+      "task_type": "hypothesis",
+      "text": "{\"hypotheses\":[\n  {\"cause\":\"Application startup config/environment failure causing immediate exit\",\"detail\":\"Exit code 1 with no OOM signal and no recent deploy points to the process failing during initialisation — most likely a missing or rotated secret, invalid env var, or a config map value the app fails to validate/parse. The container starts, attempts to read its configuration, and exits cleanly with code 1 before serving traffic, triggering the BackOff loop (count=27).\",\"anchored_facts\":[\"process_crash\",\"crashloop\"],\"confidence\":0.62},\n  {\"cause\":\"Unhandled exception or panic in application startup path\",\"detail\":\"Exit code 1 without a signal (not a kernel kill, not OOM) is the typical fingerprint of a framework-level panic or uncaught exception that exits via the runtime's default error handler. Given no deploy was detected, a latent code path may have been activated by a feature flag state change or a runtime condition (e.g. empty dataset, unexpected nil) that only surfaces at boot time in this specific pod.\",\"anchored_facts\":[\"process_crash\",\"crashloop\"],\"confidence\":0.45},\n  {\"cause\":\"Required downstream dependency unavailable at startup causing fatal initialisation error\",\"detail\":\"Many service frameworks treat a failed mandatory dependency probe (DB ping, cache connect, gRPC health-check of a sidecar) as a fatal error and call os.Exit(1). The crashloop BackOff count of 27 suggests repeated short-lived runs consistent with fast startup→failure cycles. No upstream_degraded fact was observed, but absence of graph data means it was not ruled in, not ruled out — this remains an application-layer hypothesis because the failure mode is the app's own startup logic treating an unavailable dep as unrecoverable.\",\"anchored_facts\":[\"process_crash\",\"crashloop\"],\"confidence\":0.38}\n]}"
+    },
+    {
+      "role": "d4e8e579b37e765d",
+      "ctx": "ee22fe7d7dda3956",
+      "task_type": "hypothesis",
+      "text": "{\"hypotheses\":[{\"cause\":\"Unavailable or misconfigured storage volume (PV/PVC or projected Secret/ConfigMap) causing immediate container exit\",\"detail\":\"exit_code=1 with reason=Error — not OOM, not scheduling — is consistent with the container starting but failing at the OS/process boundary before the application reaches its main loop. If a required PersistentVolume is in a bad state, a mounted Secret is missing/stale, or a ConfigMap key is absent, the entrypoint fails synchronously and exits with a non-zero code. BackOff count of 27 confirms repeated rapid restarts with no recovery, which is the expected pattern for a mount-time failure that the kubelet cannot self-heal.\",\"anchored_facts\":[\"process_crash\",\"crashloop\"],\"confidence\":0.52},{\"cause\":\"Node-level CRI or kubelet instability silently killing the container at startup without triggering OOM accounting\",\"detail\":\"exit_code=1 rules out OOM (which yields 137/SIGKILL). However, kubelet-side container runtime errors (e.g., runc exec failure, image layer I/O error on a degraded node disk, or a cgroup setup race) can surface as exit_code=1 rather than a signal. The crashloop with max_restart_count=0 yet 27 BackOff events sourced from a namespace-wide event (attribution=unverified) weakens pod-specific attribution but is still consistent with a node-scoped CRI fault affecting this pod.\",\"anchored_facts\":[\"process_crash\",\"crashloop\"],\"confidence\":0.30},{\"cause\":\"Liveness probe misconfigured with an overly aggressive threshold, causing kubelet to SIGKILL the container before it is ready, but the process catching the signal and exiting with code 1\",\"detail\":\"Some runtimes and language runtimes (JVM, Python) intercept SIGTERM/SIGKILL and exit with code 1 rather than 128+signal. If the liveness probe fires too early (initialDelaySeconds too short) and the pod has no resource pressure to explain slow startup, the kubelet would restart the container repeatedly — producing the observed BackOff pattern and process_crash with exit_code=1. This is an infrastructure configuration concern (probe tuning) rather than an application bug.\",\"anchored_facts\":[\"crashloop\",\"process_crash\"],\"confidence\":0.25}]}"
+    },
+    {
+      "role": "255f96ccff71b5fe",
+      "ctx": "ab8a87576bab0c18",
+      "task_type": "critic",
+      "text": "{\"refutations\": [\"crashloop (conf=0.80): max_restart_count=0 — if the container were repeatedly exiting during initialisation, the k8s restart counter should be elevated; a value of 0 is inconsistent with an ongoing crash-loop that the hypothesis requires.\", \"crashloop (conf=0.38): attribution=unverified, note=namespace-wide event; alert has no pod/service label to attribute it to the target workload — the BackOff count=27 that the hypothesis anchors its crash-loop conclusion on cannot be reliably attributed to map-service, undermining the core evidence chain.\"]}"
+    },
+    {
+      "role": "255f96ccff71b5fe",
+      "ctx": "5df2a42ce126669b",
+      "task_type": "critic",
+      "text": "```json\n{\"refutations\": [\"crashloop (conf=0.80) reports phrase_hits=0 — an unhandled exception or framework-level panic at startup would almost always emit a stack trace or error line to stderr/stdout; zero matching log phrases directly undermines the startup-panic hypothesis\", \"crashloop (conf=0.38) has attribution=unverified with note that the BackOff event is namespace-wide and has no pod/service label to attribute it to the target workload — the crashloop evidence the hypothesis anchors on may not even belong to this pod\", \"crashloop (conf=0.80) reports max_restart_count=0 — if the pod were repeatedly crashing on startup as the hypothesis describes, the restart counter should be elevated; a count of zero is inconsistent with a recurring boot-time failure\"]}\n```"
+    },
+    {
+      "role": "255f96ccff71b5fe",
+      "ctx": "f77f119502b957d6",
+      "task_type": "critic",
+      "text": "```json\n{\"refutations\": [\"upstream_degraded is ✗ NOT observed (conf=0.30, reason=no_graph_data): the hypothesis requires an unavailable downstream dependency as the root cause, yet the fact intended to capture exactly that signal is absent; even granting no_graph_data as inconclusive, the hypothesis has no positive evidence that any dependency was actually unreachable, only the absence of a ruling-out\", \"crashloop (conf=0.80) reports phrase_hits=0: if the app were logging connection errors, timeout messages, or health-check failures to a mandatory dependency on every startup attempt, at least one phrase would be expected to match; zero phrase hits undercuts the claim that logs contain startup-dependency-failure evidence\", \"crashloop (conf=0.38) carries attribution=unverified with note 'namespace-wide event; alert has no pod/service label to attribute it to the target workload': the BackOff count=27 that the hypothesis treats as key evidence of repeated fast startup→failure cycles cannot be confirmed as belonging to map-service-84d688bc69-279vz, removing the quantitative anchor for the crashloop pattern\"]}\n```"
+    },
+    {
+      "role": "255f96ccff71b5fe",
+      "ctx": "a1a992dd54c42001",
+      "task_type": "critic",
+      "text": "```json\n{\"refutations\": [\"crashloop (conf=0.80): max_restart_count=0 — the hypothesis claims 'BackOff count of 27 confirms repeated rapid restarts with no recovery,' but the higher-confidence crashloop fact records zero actual container restarts, which is inconsistent with a mount-time failure that loops indefinitely.\", \"crashloop (conf=0.38): attribution=unverified, note='namespace-wide event; alert has no pod/service label to attribute it to the target workload' — the hypothesis anchors its confidence on count=27 BackOff events as direct evidence of repeated restarts on map-service, but the fact explicitly states this count cannot be attributed to the target workload, removing the primary behavioral evidence cited in the detail.\"]}\n```"
+    },
+    {
+      "role": "255f96ccff71b5fe",
+      "ctx": "294af773d8b1e5d2",
+      "task_type": "critic",
+      "text": "{\"refutations\": [\"The observed `crashloop` fact (conf=0.80, max_restart_count=0) directly contradicts the hypothesis: if CRI or kubelet instability were repeatedly killing the container at startup, the kubelet restart counter would be elevated above zero. max_restart_count=0 means no actual restarts were registered, which is inconsistent with repeated node-level CRI-induced container kills.\", \"The `crashloop` fact (conf=0.38) notes attribution=unverified and marks the 27 BackOff events as a namespace-wide event with no pod/service label linking it to the target workload. The hypothesis relies on these 27 BackOff events as evidence of pod-specific CRI fault activity, but this fact explicitly states the events cannot be attributed to the target pod — removing the main quantitative evidence the hypothesis uses for repeated CRI failures.\", \"The `resource_pressure` fact is marked ✗ (NOT observed, conf=0.75) for the node/squad. The hypothesis invokes 'image layer I/O error on a degraded node disk' as the CRI failure mechanism; a degraded node disk causing I/O errors would typically surface as resource_pressure signals. Its absence weakens the node-level hardware degradation vector the hypothesis depends on.\"]}"
+    },
+    {
+      "role": "255f96ccff71b5fe",
+      "ctx": "0bbd34c3c10d4971",
+      "task_type": "critic",
+      "text": "```json\n{\"refutations\": [\"process_crash (signal=) is empty — if the kubelet killed the container via SIGKILL (or even SIGTERM) the terminated state would carry a non-empty signal field; an empty signal strongly implies the process exited under its own control with code 1, contradicting the hypothesis that kubelet-sent SIGKILL is the cause\", \"crashloop (conf=0.80) shows max_restart_count=0 — a liveness probe firing repeatedly before the container is ready would accumulate a non-zero restart count; max_restart_count=0 is inconsistent with the repeated probe-induced kill loop the hypothesis describes\", \"crashloop (conf=0.38) is marked attribution=unverified with note 'namespace-wide event; alert has no pod/service label to attribute it to the target workload' — the BackOff event the hypothesis anchors to cannot be confirmed to belong to the target pod, undermining the evidence base for the repeated-restart pattern\"]}\n```"
+    },
+    {
+      "role": "255f96ccff71b5fe",
+      "ctx": "7d00db5748a54326",
+      "task_type": "critic",
+      "text": "{\"refutations\": [\"upstream_degraded is marked ✗ with reason=no_graph_data — the hypothesis requires an upstream dependency to be unreachable, but the upstream_degraded fact was NOT observed; without evidence of upstream degradation, the proposed cause lacks direct support.\", \"crashloop (source=k8s_event) carries attribution=unverified and note=namespace-wide event; alert has no pod/service label to attribute it to the target workload — the BackOff count=27 cited as evidence in the hypothesis cannot be reliably attributed to map-service, undermining the anchored crashloop fact.\", \"crashloop (source=k8s_terminated_state) reports max_restart_count=0, which contradicts the count=27 restart narrative the hypothesis relies on; if the pod's own restart counter is zero, the process is not exhibiting the repeated-exit-on-startup pattern the hypothesis describes.\"]}"
+    },
+    {
+      "role": "255f96ccff71b5fe",
+      "ctx": "2841753ba286368c",
+      "task_type": "critic",
+      "text": "{\"refutations\": [\"upstream_degraded is ✗ NOT observed (reason=no_graph_data): the hypothesis requires that DNS failure makes an upstream endpoint unreachable, yet there is no observed evidence of upstream degradation — the very downstream consequence the DNS cause should produce is absent.\", \"recent_deploy is ✗ NOT observed (reason=no_deploys_or_no_timestamp): the hypothesis explicitly anchors the triggering event on 'a namespace migration or CoreDNS disruption', both of which would leave a deployment footprint; no such footprint exists.\"]}"
+    },
+    {
+      "role": "255f96ccff71b5fe",
+      "ctx": "3406fe5b138abdf4",
+      "task_type": "critic",
+      "text": "{\"refutations\": [\"upstream_degraded is marked ✗ (not observed, reason=no_graph_data): the hypothesis requires that map-service fails to reach an upstream due to a TLS problem; if such an upstream had an expired or misconfigured certificate, some upstream degradation signal would be expected — its absence removes the primary evidentiary basis for a TLS-upstream cause.\", \"recent_deploy is marked ✗ (not observed, reason=no_deploys_or_no_timestamp): the hypothesis specifically attributes the crash to a 'recently rotated' certificate, implying a recent change event; no recent deploy or timestamp was detected, directly undermining the 'recently rotated' aspect of the proposed cause.\"]}"
+    },
+    {
+      "role": "255f96ccff71b5fe",
+      "ctx": "a5efe6de09332bf3",
+      "task_type": "critic",
+      "text": "{\"refutations\": [\"crashloop (conf=0.38, attribution=unverified): the BackOff count=27 is a namespace-wide event with no pod/service label tying it to map-service-84d688bc69-279vz — the hypothesis anchors its 'BackOff loop (count=27)' detail on this fact, but the fact itself explicitly states attribution is unverified, undermining the causal chain\", \"crashloop (conf=0.80, max_restart_count=0): the k8s_terminated_state source reports max_restart_count=0, which contradicts the hypothesis's claim of an active crash-restart cycle accumulating 27 BackOff events on this specific container\", \"upstream_degraded (conf=0.30) NOT observed: the hypothesis explicitly names 'failed dependency handshake' as one of the fatal startup paths, but upstream_degraded is marked ✗ with reason=no_graph_data — removing this sub-cause weakens the stated causal model without an alternative mechanism being confirmed\"]}"
+    },
+    {
+      "role": "255f96ccff71b5fe",
+      "ctx": "affe8b0dc01f2a47",
+      "task_type": "critic",
+      "text": "{\"refutations\": []}"
+    },
+    {
+      "role": "255f96ccff71b5fe",
+      "ctx": "8c3ba37615a76aad",
+      "task_type": "critic",
+      "text": "{\"refutations\": [\"crashloop (conf=0.38): attribution=unverified, note=namespace-wide event; alert has no pod/service label to attribute it to the target workload — the count=27 BackOff repetitions the hypothesis uses to argue determinism cannot be attributed to the target pod, removing the primary behavioral evidence for repeated deterministic failure.\", \"crashloop (conf=0.80): max_restart_count=0, recent_backoff_events=1 — the higher-confidence crashloop observation shows only 1 recent BackOff event and zero restart count, directly contradicting the hypothesis's claim that 27 repeated BackOff events indicate a deterministic early-startup failure pattern.\", \"process_crash (conf=0.55): signal= (empty) — the hypothesis claims a liveness/readiness probe SIGTERM would register as exit_code=1; if SIGTERM had been delivered by the kubelet, Kubernetes would record signal=15 in the terminated state; the empty signal field refutes the probe-kill-via-SIGTERM sub-claim and instead indicates a self-exit, which is also consistent with the deadlock sub-claim but removes the probe-kill pathway.\"]}"
+    }
+  ]
+}

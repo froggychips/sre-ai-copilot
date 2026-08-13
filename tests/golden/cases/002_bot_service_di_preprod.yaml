@@ -1,0 +1,53 @@
+id: 002_bot_service_di_preprod
+title: bot-service падает на DI-исключении в preprod-kingdom1
+source: real
+llm: true
+incident:
+  incident_id: golden-002
+  severity: critical
+  status: firing
+  summary: Pod bot-service-56567b98-5jmct crash-looping in preprod-kingdom1
+  description: >-
+    Unhandled exception: System.InvalidOperationException: Unable to resolve service
+    for type IStatics<IStaticEntityComponentIndex<SkillBase>> while attempting to
+    activate CityEffectListProvider. Exit code 134.
+  namespace: preprod-kingdom1
+  labels:
+    alertname: KubePodCrashLooping
+    severity: critical
+    namespace: preprod-kingdom1
+    pod: bot-service-56567b98-5jmct
+    app: bot-service
+    service: bot-service
+  annotations:
+    summary: Pod bot-service-56567b98-5jmct crash-looping in preprod-kingdom1
+    description: >-
+      Unhandled exception: System.InvalidOperationException: Unable to resolve service
+      for type IStatics<IStaticEntityComponentIndex<SkillBase>> while attempting to
+      activate CityEffectListProvider. Exit code 134.
+  starts_at: "2026-05-12T17:50:51Z"
+  ends_at: null
+  generator_url: null
+  raw: {}
+context:
+  k8s_pod_state:
+    bot-service-56567b98-5jmct:
+      exit_code: 134
+      reason: Error
+      restart_count: 12
+  logs_summary: |
+    Unhandled exception. System.InvalidOperationException: Unable to resolve service
+    for type 'IStatics`1[IStaticEntityComponentIndex`1[SkillBase]]' while attempting
+    to activate 'CityEffectListProvider'.
+       at Microsoft.Extensions.DependencyInjection.ActivatorUtilities.GetService(...)
+    Aborted (core dumped)
+  k8s_events:
+    - {type: Warning, reason: BackOff, count: 12,
+       message: "Back-off restarting failed container bot-service in pod bot-service-56567b98-5jmct"}
+expect:
+  facts:
+    process_crash: true
+    oom_killed: false
+    crashloop: true
+  resolution: resolved
+  cause_not_contains: ["oom", "out of memory"]

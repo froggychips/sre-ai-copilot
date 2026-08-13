@@ -1,0 +1,16 @@
+id: 012_facts_structured_oom
+title: структурный OOM — exit 137 + reason OOMKilled у целевого пода
+source: synthetic
+llm: false
+incident: {incident_id: golden-012, severity: critical, status: firing,
+           summary: "Pod api-1 crash-looping", description: "Container terminated",
+           namespace: squad-1, labels: {alertname: KubePodCrashLooping, pod: api-1, service: api},
+           annotations: {description: "Container terminated"},
+           starts_at: "2026-08-10T10:00:00Z", ends_at: null, generator_url: null, raw: {}}
+context:
+  k8s_pod_state:
+    api-1: {exit_code: 137, reason: OOMKilled, restart_count: 5}
+expect:
+  facts:
+    oom_killed: true
+    process_crash: false
