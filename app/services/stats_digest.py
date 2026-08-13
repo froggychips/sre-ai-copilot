@@ -52,7 +52,6 @@ import re
 import subprocess
 import sys
 from collections import Counter, defaultdict
-from contextvars import ContextVar
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
@@ -63,24 +62,35 @@ from sqlalchemy.orm import Session
 
 from app.config import settings
 from app.context.vm_client import VMClient
+from app.services.digest.failures import (failed_sections as _failed_sections,
+                                          note_section_failure as _note_section_failure,
+                                          reset_section_failures as _reset_section_failures,
+                                          section_failures_line)
+from app.services.digest.formatting import (SNAPSHOT_METRIC_SOURCES as _SNAPSHOT_METRIC_SOURCES,
+                                            fmt_delta_int as _fmt_delta_int,
+                                            fmt_delta_pp as _fmt_delta_pp,
+                                            fmt_firing_series_trend as _fmt_firing_series_trend,
+                                            fmt_snapshot_metric as _fmt_snapshot_metric,
+                                            format_gap_minutes as _format_gap_minutes,
+                                            format_services_list as _format_services_list,
+                                            health_marker as _health_marker,
+                                            humanize_ago as _humanize_ago)
+from app.services.digest.state import (FIRING_SERIES_WINDOW_LABEL as _FIRING_SERIES_WINDOW_LABEL,
+                                       FIRING_SERIES_WINDOW_MINUTES as _FIRING_SERIES_WINDOW_MINUTES,
+                                       detect_first_run as _detect_first_run,
+                                       get_beat_last_run as _get_beat_last_run,
+                                       read_day_snapshot as _read_day_snapshot,
+                                       read_last_firing_series as _read_last_firing_series,
+                                       read_topology_snapshot as _read_topology_snapshot,
+                                       record_task_heartbeat as _record_task_heartbeat,
+                                       write_day_snapshot as _write_day_snapshot,
+                                       write_last_firing_series as _write_last_firing_series,
+                                       write_topology_snapshot as _write_topology_snapshot)
 
 log = structlog.get_logger()
 
 
 # ── Overhaul 2026-05-25: shared dataclasses + Redis snapshot keys ───────────
-
-# Все Redis ключи под prefix `stats:`. TTL не более 25h — переписывается каждым
-# daily-run, при пропуске следующий run помечает (new baseline).
-_DAY_SNAPSHOT_REDIS_KEY = "stats:digest:last_day_snapshot"
-_TOPOLOGY_SNAPSHOT_REDIS_KEY = "stats:topology:last_day_snapshot"
-_DAY_SNAPSHOT_REDIS_TTL = 25 * 3600
-
-# Beat-task heartbeat ключи (см. _record_task_heartbeat / _get_beat_last_run).
-# Пишутся `task_postrun`-сигналом из app/workers/tasks.py для каждого таска
-# из `BEAT_HEARTBEAT_TASKS`. Используется pipeline_health_section чтобы
-# отличать «task ходит, но данные stale» (VM scrape gap) от «task завис».
-_BEAT_HEARTBEAT_REDIS_PREFIX = "stats:beat:last_run"
-_BEAT_HEARTBEAT_REDIS_TTL = 7 * 24 * 3600  # 7 дней — на случай долгого простоя
 
 # Ожидаемые интервалы (минуты) для тасков, проверяемых в pipeline_health.
 # Совпадают с _SYNC_LAG_TARGETS в self_health, но дублируются здесь чтобы
@@ -151,17 +161,6 @@ CHRONIC_TRACKED_MIN_FIRES = 5
 CHRONIC_RCA_MIN_FIRES = 10
 
 
-# Имена секций, упавших в текущей сборке дайджеста. ContextVar, а не
-# модульный список: воркер может собирать дайджест конкурентно с другими
-# задачами, и глобальный список утёк бы между ними.
-#
-# Зачем вообще: секция, поймавшая исключение, возвращает "" — и пустая
-# секция становится неотличима от «нет данных». 07.08.2026 из дайджеста так
-# молча пропали два блока (deploy→incident и beat_heartbeats), причём
-# заметили это глазами, а не мониторингом. Теперь падения перечисляются
-# явной строкой в самом дайджесте.
-_section_failures: ContextVar[List[str]] = ContextVar("digest_section_failures")
-
 # Отдельный heartbeat-ключ «дайджест ДОЕХАЛ до Discord».
 #
 # Почему не обычный beat-heartbeat задачи: тот пишется из celery-сигнала
@@ -173,45 +172,6 @@ _section_failures: ContextVar[List[str]] = ContextVar("digest_section_failures")
 #
 # На него смотрит self_health.check_digest_delivery.
 DIGEST_DELIVERY_TASK = "daily_stats_digest:delivered"
-
-
-def _reset_section_failures() -> None:
-    """Начать новую сборку дайджеста с чистым списком сбоев."""
-    _section_failures.set([])
-
-
-def _note_section_failure(section: str) -> None:
-    """Запомнить, что секция не смогла отработать."""
-    try:
-        failures = _section_failures.get()
-    except LookupError:
-        failures = []
-        _section_failures.set(failures)
-    if section not in failures:
-        failures.append(section)
-
-
-def section_failures_line() -> str:
-    """Строка для дайджеста со списком недоступных секций (или "").
-
-    СЧИТАЕТСЯ последней (после всех секций), но РЕНДЕРИТСЯ сразу под
-    заголовком: читатель должен видеть, что часть картины отсутствует, иначе
-    он примет неполный дайджест за полный. Пока строка стояла в самом конце,
-    её первой съедала обрезка по лимиту Discord — то есть предупреждение
-    исчезало именно тогда, когда дайджест и правда был неполным
-    (см. discord.service._truncate_stats_description).
-    """
-    try:
-        failures = _section_failures.get()
-    except LookupError:
-        return ""
-    if not failures:
-        return ""
-    listed = ", ".join(f"`{f}`" for f in sorted(failures))
-    return (
-        f"⚠️ **Секции недоступны ({len(failures)}):** {listed} — данные ниже "
-        "неполные, смотреть логи воркера по `stats_digest.*_failed`"
-    )
 
 
 def _tx_clean(db: Optional[Session]) -> None:
@@ -305,276 +265,6 @@ def _get_ns_to_team_map(db: Session) -> Dict[str, str]:
         log.warning("stats_digest.ns_to_team_map_failed", error=str(e))
         return {}
     return {ns: team for ns, team in rows}
-
-
-# Redis key для firing-series day-over-day trend (item #3 stats-UX).
-# TTL 25h — чтобы переписывалось каждым daily-run, но не дольше суток без
-# обновления (если digest упал — следующий run покажет «(new baseline)» при
-# expired ключе).
-_FIRING_SERIES_REDIS_KEY = "stats:firing_series:last_day"
-_FIRING_SERIES_REDIS_TTL = 25 * 3600
-
-# Окно, за которое реально берётся `fired_series` в `_build_digest_with_meta`
-# (`ALERTS{alertstate="firing"}` за последние 5 минут). Секции, считающие
-# доли по этому списку, обязаны подписывать в заголовке ЭТО окно, а не «24h»:
-# «Noisemakers (24h)» поверх пятиминутного снимка — ложное обобщение.
-_FIRING_SERIES_WINDOW_MINUTES = 5
-_FIRING_SERIES_WINDOW_LABEL = f"снимок firing-серий за {_FIRING_SERIES_WINDOW_MINUTES}m"
-
-
-async def _read_last_firing_series() -> Optional[int]:
-    """Прочитать вчерашний firing-count из Redis. None если ключа нет."""
-    try:
-        from app.services.alert_dedup import _get_client
-        client = _get_client()
-        raw = await client.get(_FIRING_SERIES_REDIS_KEY)
-        if raw is None:
-            return None
-        return int(raw)
-    except Exception as e:
-        log.warning("stats_digest.firing_series_redis_read_failed", error=str(e))
-        return None
-
-
-async def _write_last_firing_series(value: int) -> None:
-    """Сохранить сегодняшний count для завтрашнего сравнения."""
-    try:
-        from app.services.alert_dedup import _get_client
-        client = _get_client()
-        await client.set(_FIRING_SERIES_REDIS_KEY, str(value), ex=_FIRING_SERIES_REDIS_TTL)
-    except Exception as e:
-        log.warning("stats_digest.firing_series_redis_write_failed", error=str(e))
-
-
-# ── Snapshot helpers (item A1, B8) ──────────────────────────────────────────
-
-
-async def _read_day_snapshot() -> Optional[Dict[str, Any]]:
-    """Прочитать вчерашний snapshot. None если ключа нет / parse-error."""
-    try:
-        from app.services.alert_dedup import _get_client
-        client = _get_client()
-        raw = await client.get(_DAY_SNAPSHOT_REDIS_KEY)
-        if raw is None:
-            return None
-        return json.loads(raw)
-    except Exception as e:
-        log.warning("stats_digest.snapshot_read_failed", error=str(e))
-        return None
-
-
-async def _write_day_snapshot(snapshot: Dict[str, Any]) -> None:
-    """Сохранить сегодняшний snapshot для завтрашнего Δ-сравнения."""
-    try:
-        from app.services.alert_dedup import _get_client
-        client = _get_client()
-        await client.set(
-            _DAY_SNAPSHOT_REDIS_KEY,
-            json.dumps(snapshot, default=str),
-            ex=_DAY_SNAPSHOT_REDIS_TTL,
-        )
-    except Exception as e:
-        log.warning("stats_digest.snapshot_write_failed", error=str(e))
-
-
-async def _read_topology_snapshot() -> Optional[Dict[str, Any]]:
-    """Прочитать topology snapshot. None если ключа нет."""
-    try:
-        from app.services.alert_dedup import _get_client
-        client = _get_client()
-        raw = await client.get(_TOPOLOGY_SNAPSHOT_REDIS_KEY)
-        if raw is None:
-            return None
-        return json.loads(raw)
-    except Exception as e:
-        log.warning("stats_digest.topology_snapshot_read_failed", error=str(e))
-        return None
-
-
-async def _write_topology_snapshot(snapshot: Dict[str, Any]) -> None:
-    try:
-        from app.services.alert_dedup import _get_client
-        client = _get_client()
-        await client.set(
-            _TOPOLOGY_SNAPSHOT_REDIS_KEY,
-            json.dumps(snapshot, default=str),
-            ex=_DAY_SNAPSHOT_REDIS_TTL,
-        )
-    except Exception as e:
-        log.warning("stats_digest.topology_snapshot_write_failed", error=str(e))
-
-
-def _detect_first_run(snapshot: Optional[Dict[str, Any]]) -> bool:
-    """First-run = ни snapshot нет, ни ключевых полей в нём.
-
-    Используется topology_growth_section и потенциально другими first-run
-    pill-эффектами. Вынесено в helper для симметрии и тестируемости.
-    """
-    if snapshot is None:
-        return True
-    # Snapshot есть, но пуст / dict без значимых полей — тоже first-run.
-    if not snapshot:
-        return True
-    return False
-
-
-def _beat_heartbeat_key(task_name: str) -> str:
-    return f"{_BEAT_HEARTBEAT_REDIS_PREFIX}:{task_name}"
-
-
-# Module-level sync Redis-клиент для heartbeat-ключей. Раньше КАЖДЫЙ вызов
-# _record_task_heartbeat/_get_beat_last_run строил новый redis.Redis.from_url
-# и никогда его не закрывал — постоянный connection churn (heartbeat пишется
-# task_postrun-сигналом каждого beat-таска). redis-py клиент внутри держит
-# connection pool: он потокобезопасен, переживает fork (pool сбрасывается по
-# pid-check) и сам переподключается — один клиент на процесс достаточен.
-#
-# Кэш ключуется ИДЕНТИЧНОСТЬЮ модуля `redis`: тесты подменяют его через
-# sys.modules (см. test_stats_topology_pipeline_fixes), и клиент от прежнего
-# (фейкового/реального) модуля не должен пережить подмену. В проде модуль
-# один → кэш стабильный.
-_beat_redis_cache: Optional[Tuple[Any, Any]] = None  # (redis-модуль, клиент)
-
-
-def _get_beat_redis():
-    """Переиспользуемый sync-клиент для heartbeat-ключей.
-
-    Может бросить (Redis недоступен на этапе конструирования) — вызывающие
-    оборачивают в свой try/except (fail-open). Неудачная инициализация НЕ
-    кэшируется.
-    """
-    global _beat_redis_cache
-    import redis
-    if _beat_redis_cache is not None and _beat_redis_cache[0] is redis:
-        return _beat_redis_cache[1]
-    client = redis.Redis.from_url(settings.REDIS_URL, decode_responses=True)
-    _beat_redis_cache = (redis, client)
-    return client
-
-
-def _record_task_heartbeat(task_name: str, ts: Optional[datetime] = None) -> None:
-    """Зафиксировать факт успешного завершения beat-task'а.
-
-    Sync-функция, вызывается из celery `task_postrun`-сигнала. Использует
-    synchronous redis client (не aioredis), потому что celery signal handler
-    бежит в worker-процессе без event-loop.
-
-    Идемпотентна: пишет ISO-timestamp в Redis с TTL 7d. Fail-open — при
-    недоступности Redis warning в лог, exception не пробрасываем (это
-    monitoring-канал, он не должен ломать сам task).
-    """
-    if ts is None:
-        ts = datetime.now(timezone.utc)
-    try:
-        client = _get_beat_redis()
-        client.set(
-            _beat_heartbeat_key(task_name),
-            ts.isoformat(),
-            ex=_BEAT_HEARTBEAT_REDIS_TTL,
-        )
-    except Exception as e:
-        log.warning(
-            "stats_digest.beat_heartbeat_write_failed",
-            task=task_name,
-            error=str(e),
-        )
-
-
-def _get_beat_last_run(task_name: str) -> Optional[datetime]:
-    """Прочитать last_run timestamp beat-task'а.
-
-    Sync — вызывается из sync pipeline_health_section. None если ключа нет
-    (task ещё не отработал ни разу после переразвёртывания copilot'а).
-    """
-    try:
-        client = _get_beat_redis()
-        raw = client.get(_beat_heartbeat_key(task_name))
-        if raw is None:
-            return None
-        # decode_responses=True уже даёт str.
-        return datetime.fromisoformat(raw)
-    except Exception as e:
-        log.warning(
-            "stats_digest.beat_heartbeat_read_failed",
-            task=task_name,
-            error=str(e),
-        )
-        return None
-
-
-def _fmt_firing_series_trend(today: int, yesterday: Optional[int]) -> str:
-    """Формат trend-суффикса для `Firing series: 673 (+47 vs вчера, +7.5%)`.
-
-    Если yesterday is None — это первый запуск, метим `(new baseline)`.
-    Если разница 0 — `(=0 vs вчера)`.
-    """
-    if yesterday is None:
-        return " (new baseline)"
-    delta = today - yesterday
-    if delta == 0:
-        return " (=0 vs вчера)"
-    sign = "+" if delta > 0 else ""
-    if yesterday > 0:
-        pct = (delta / yesterday) * 100
-        return f" ({sign}{delta} vs вчера, {sign}{pct:.1f}%)"
-    # yesterday=0, today>0 → не делим на ноль, просто +N
-    return f" ({sign}{delta} vs вчера)"
-
-
-def _fmt_delta_pp(today: Optional[float], yesterday: Optional[float]) -> str:
-    """Δ в percentage-points: '+3pp' / '-1pp' / '±0pp'. None → пусто."""
-    if today is None or yesterday is None:
-        return ""
-    delta = today - yesterday
-    if abs(delta) < 0.5:
-        return "±0pp"
-    sign = "+" if delta >= 0 else ""
-    return f"{sign}{delta:.0f}pp"
-
-
-def _fmt_delta_int(today: Optional[float], yesterday: Optional[float]) -> str:
-    """Δ для integer-метрик (crashloops): '+2' / '-1' / '±0'."""
-    if today is None or yesterday is None:
-        return ""
-    delta = today - yesterday
-    if abs(delta) < 0.5:
-        return "±0"
-    sign = "+" if delta >= 0 else ""
-    return f"{sign}{delta:.0f}"
-
-
-# Откуда физически берётся каждая метрика снапшота — чтобы в предупреждении о
-# неполном снапшоте было написано, ЧТО чинить, а не абстрактное «нет данных».
-# Обе метрики в get_cluster_health() запрашиваются из kube_*, т.е. из KSM:
-#   nodes_ready = count(kube_node_status_condition{condition="Ready",...})
-#   crashloops  = sum(kube_pod_container_status_waiting_reason{reason="CrashLoopBackOff"})
-_SNAPSHOT_METRIC_SOURCES = {
-    "nodes_ready": "kube-state-metrics",
-    "crashloops": "kube-state-metrics",
-}
-
-
-def _fmt_snapshot_metric(value: Any) -> str:
-    """Значение метрики снапшота, где None = «нет данных», а НЕ ноль.
-
-    `VMClient.query_instant` намеренно различает 0.0 и None (см. его контракт),
-    а `get_cluster_health` кладёт None в metrics и выставляет
-    data_available=False / health_status="unknown". Раньше секция брала
-    `d.get("crashloops", "?")` — но дефолт `"?"` не срабатывает, когда ключ
-    ЕСТЬ со значением None, и в дайджест уходило литеральное
-    `Crashloops: None`. Читается как «крашлупов нет», означает ровно
-    обратное — метрику не получили.
-
-    Прецедент 06.08.2026: KSM переросла vmagent-овый maxScrapeSize, все
-    kube_* исчезли из VM → снапшот отрисовал `Crashloops: None` рядом с
-    trend-строкой `crashloops avg 40→35` из kg_cluster_observations, то есть
-    дайджест противоречил сам себе в двух соседних строках.
-    """
-    if value is None:
-        return "?"
-    if isinstance(value, float):
-        return f"{value:.0f}"
-    return str(value)
 
 
 def _cluster_trend_24h(db: Session) -> Optional[Dict[str, Any]]:
@@ -1097,15 +787,6 @@ def top_alert_types_section(
     return "\n".join(lines)
 
 
-def _health_marker(score: float) -> str:
-    """Цветовой маркер для health_score: 🟢 ≥0.7, 🟡 0.4-0.7, 🔴 <0.4."""
-    if score >= 0.7:
-        return "🟢"
-    if score >= 0.4:
-        return "🟡"
-    return "🔴"
-
-
 # Item #6 stats-UX: fragile vs blast-radius. «Fragile» — это активный сигнал
 # деградации (health_score < threshold + ≥3 callers). «Blast-radius» — просто
 # много inbound callers (риск, если что-то сломается, но сейчас всё ОК).
@@ -1383,26 +1064,6 @@ def stale_deployments_section(
 # ── recent TC deploys (cluster-wide deployer activity) ──────────────────────
 
 
-def _humanize_ago(iso_str: Optional[str], now: Optional[datetime] = None) -> str:
-    """ISO timestamp → '5m ago' / '2h ago' / '3d ago'."""
-    if not iso_str:
-        return "?"
-    try:
-        dt = datetime.fromisoformat(iso_str.replace("Z", "+00:00"))
-    except ValueError:
-        return "?"
-    now = now or datetime.now(timezone.utc)
-    delta = now - dt
-    secs = int(delta.total_seconds())
-    if secs < 60:
-        return f"{secs}s ago"
-    if secs < 3600:
-        return f"{secs // 60}m ago"
-    if secs < 86400:
-        return f"{secs // 3600}h ago"
-    return f"{secs // 86400}d ago"
-
-
 def _cascade_fingerprint(build: dict) -> Tuple[Any, ...]:
     """Fingerprint для агрегации cascade-deploys.
 
@@ -1421,19 +1082,6 @@ def _cascade_fingerprint(build: dict) -> Tuple[Any, ...]:
         build.get("triggered_by") or build.get("triggered_type"),
         build.get("status"),
     )
-
-
-def _format_services_list(names: List[str], cap: int = 3) -> str:
-    """`['town-service', 'chat-tasks-service', 'map-service', 'a', 'b']`
-    → `'town-service/chat-tasks-service/map-service +2 more'`."""
-    if not names:
-        return "?"
-    shown = names[:cap]
-    rest = len(names) - cap
-    base = "/".join(shown)
-    if rest > 0:
-        base += f" +{rest} more"
-    return base
 
 
 async def recent_deploys_section(
@@ -3166,14 +2814,6 @@ def pipeline_health_section(db: Session, stale_minutes: Optional[int] = None) ->
     return line
 
 
-def _format_gap_minutes(lag_min: float) -> str:
-    """`5m` / `90m` → `1h` / `2h` (часы при >= 60m). Используется gauge'ами."""
-    hours = lag_min / 60
-    if hours >= 1:
-        return f"{hours:.0f}h"
-    return f"{lag_min:.0f}m"
-
-
 def beat_heartbeats_footer(db: Session) -> str:
     """C10. Beat-task heartbeats — last_run per sync task. Footer-row.
 
@@ -3393,10 +3033,7 @@ async def _build_digest_with_meta(db: Session) -> Tuple[str, Dict[str, Any]]:
     ]
     content = "\n\n".join(s for s in sections if s)
 
-    try:
-        failed_sections = list(_section_failures.get())
-    except LookupError:
-        failed_sections = []
+    failed_sections = _failed_sections()
     if failed_sections:
         log.warning("stats_digest.sections_failed", sections=failed_sections)
 

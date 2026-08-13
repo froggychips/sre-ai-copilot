@@ -21,6 +21,7 @@ from collections import Counter
 import pytest
 
 from tests.conftest import requires_postgres
+from app.services.digest import failures as digest_failures
 
 pytestmark = requires_postgres
 
@@ -55,7 +56,7 @@ def _run_and_collect_failures(call):
     sd._reset_section_failures()
     call()
     try:
-        return list(sd._section_failures.get())
+        return digest_failures.failed_sections()
     except LookupError:
         return []
 
@@ -101,7 +102,7 @@ async def test_topology_growth_section_sql_is_valid(db_session):
     sd._reset_section_failures()
     await sd.topology_growth_section(db=db_session)
     try:
-        failures = list(sd._section_failures.get())
+        failures = digest_failures.failed_sections()
     except LookupError:
         failures = []
 
@@ -122,7 +123,7 @@ async def test_cluster_health_section_sql_is_valid(db_session):
     sd._reset_section_failures()
     await sd.cluster_health_section(vm=vm, fired_series=[], db=db_session)
     try:
-        failures = list(sd._section_failures.get())
+        failures = digest_failures.failed_sections()
     except LookupError:
         failures = []
 
