@@ -16,6 +16,7 @@ from app.api import approvals, discord_interactions, rate_limit, replay, webhook
 from app.evaluation import feedback
 from app.auth import User, get_current_user
 from app.celery_worker import celery_app, generate_reply, redis_client, resilience
+from app import __version__
 from app.config import settings
 from app.database import SessionLocal, engine
 from app.knowledge_graph.contract import (
@@ -110,14 +111,14 @@ async def lifespan(app: FastAPI):
 if settings.is_production:
     app = FastAPI(
         title="SRE AI Copilot",
-        version="1.0.0-rc.3",
+        version=__version__,
         lifespan=lifespan,
         docs_url=None,
         redoc_url=None,
         openapi_url=None,
     )
 else:
-    app = FastAPI(title="SRE AI Copilot", version="1.0.0-rc.3", lifespan=lifespan)
+    app = FastAPI(title="SRE AI Copilot", version=__version__, lifespan=lifespan)
 setup_telemetry(app)
 
 app.add_middleware(RequestIDMiddleware)
