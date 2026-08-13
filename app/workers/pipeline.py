@@ -14,14 +14,14 @@ Stage order:
   6. stage_fix          — FixAgent ExecutionIntent (recurrence + Jira aware)
   7. stage_risk         — RiskAgent assessment
   8. stage_synthesize   — SynthesisAgent final report + DB persist
-  9. _flush_pending_report — доставка отчёта в Discord ВНЕ per-stage cap,
-     через outbox-маркер report_pending (см. _REPORT_PENDING_KEY)
+  9. self.report.flush() — доставка отчёта в Discord ВНЕ per-stage cap, через
+     outbox-маркер report_pending (механика — app/workers/report_delivery.py)
 """
 from __future__ import annotations
 
 import asyncio
-from datetime import datetime, timedelta, timezone
-from typing import Any, Callable, Dict, List, Optional
+from datetime import datetime, timedelta
+from typing import Any, Dict, List, Optional
 
 import structlog
 
@@ -63,7 +63,7 @@ from app.observability.ai_metrics import (
 )
 from app.services.audit_logger import audit_service
 from app.services.clickhouse_service import get_blast_radius
-from app.services.discord_service import discord_service
+from app.workers.report_delivery import ReportDelivery
 from app.services.gitlab_service import enrich_with_gitlab, gitlab_context_to_prompt
 from app.services.statics_service import check_statics_for_error
 from app.services.teamcity_service import incident_teamcity_context, teamcity_context_to_prompt
@@ -95,18 +95,6 @@ class IncidentResolvedExternally(Exception):
     Control-flow сигнал, не ошибка: run() ловит его, останавливается чисто и
     фиксирует resolved_early-маркер вместо мусорного «Invalid state transition»
     в analysis.failed.
-    """
-
-
-class ReportDeliveryPending(ConnectionError):
-    """Discord-отчёт не доставлен; терминальный state УЖЕ закоммичен.
-
-    НАМЕРЕННО наследует ConnectionError: RETRIABLE_EXC в app/workers/tasks.py
-    (тот же кортеж читает Celery `autoretry_for`) содержит ConnectionError,
-    поэтому таск ретраится, а следующая попытка видит outbox-маркер
-    report_pending и досылает ТОЛЬКО отчёт — без повторного прожига LLM-стадий.
-    Бросается строго ПОСЛЕ коммита терминального state: статус инцидента
-    ретраем не откатывается, ретраится ровно доставка.
     """
 
 
@@ -157,34 +145,10 @@ ROLLOUT_NOISE_NEVER_SUPPRESS = frozenset({
 # зачищается в _persist по успешному завершению прогона.
 _CHECKPOINT_KEY = "pipeline_checkpoint"
 
-# ── Outbox доставки Discord-отчёта ──────────────────────────────────────────
-# Терминальный state (RESOLVED/TRIAGE_REQUIRED) коммитится ДО отправки отчёта,
-# а сама отправка одноразовая и наружу не бросает. Отсюда два сценария тихой
-# потери разбора с approve-кнопками:
-#   (а) транзиентный фейл POST-а — таск завершался «успешно», отчёта нет;
-#   (б) смерть воркера в окне «commit → send → ack» (acks_late) — redelivery
-#       видела терминальный start_state и уходила в _record_resolved_early.
-# Лечится outbox-маркерами в record.analysis. Они переживают мерж блоба в
-# _persist так же, как executor_applied/executor_in_flight (см.
-# app/services/executor_apply.py): _persist мержит, а не заменяет analysis.
-#
-#   report_pending = {"args": {...готовые поля embed...}, "attempts": N,
-#                     "queued_at": iso, "last_error_at": iso}
-#       «терминальный state закоммичен, отчёт ещё НЕ доставлен». Пишется в ТОЙ
-#       ЖЕ транзакции, что и терминальный переход, поэтому «статус есть, а
-#       маркера нет» невозможно.
-#   report_sent   = {"sent_at": iso, "attempts": N} — доставлено, pending снят.
-#   report_failed = {"failed_at": iso, "attempts": N, "reason": ...} — сдались
-#       после _REPORT_MAX_ATTEMPTS, чтобы ретраи не крутились на мёртвом
-#       вебхуке вечно.
-_REPORT_PENDING_KEY = "report_pending"
-_REPORT_SENT_KEY = "report_sent"
-_REPORT_FAILED_KEY = "report_failed"
-
-# Сколько попыток доставки суммарно (первая + Celery-ретраи). 4 = 1 + max_retries
-# у process_incident_task: на последней пишем report_failed и НЕ бросаем, чтобы
-# не тратить лишний прогон таска. getattr — чтобы не трогать config.py.
-_REPORT_MAX_ATTEMPTS = int(getattr(settings, "REPORT_DELIVERY_MAX_ATTEMPTS", 4) or 4)
+# Outbox доставки Discord-отчёта (маркеры report_pending/sent/failed, счётчик
+# попыток, решение «ретраить или сдаться») живёт в app/workers/report_delivery.py:
+# доставка происходит ПОСЛЕ коммита терминального state и не является стадией
+# разбора. Здесь остаётся только оркестрация — что отправить и когда.
 
 # Какие стадии уже завершены для данного состояния строки. Стадия считается
 # завершённой ровно тогда, когда её state-transition закоммичен.
@@ -199,22 +163,6 @@ _COMPLETED_BY_STATE: Dict[IncidentState, frozenset] = {
         {"analyze", "diagnose", "hypothesize", "critique", "jira", "fix"}
     ),
 }
-
-
-def _severity_routeable(severity: Optional[str]) -> bool:
-    """Уйдёт ли отчёт в канал вообще (severity-gate discord-сервиса).
-
-    info/none/пустой severity сервис в #infra-error НЕ шлёт и по контракту
-    отдаёт delivered=False. Это не потеря отчёта, поэтому такой False не должен
-    поднимать ReportDeliveryPending. Читаем ровно тот же helper, что и сервис —
-    чтобы правило не разъехалось с ним. Недоступен → считаем routeable
-    (лучше лишний ретрай, чем молча похоронённый разбор).
-    """
-    try:
-        from app.services.discord.routing import _should_route_to_error
-        return bool(_should_route_to_error(severity or ""))
-    except Exception:
-        return True
 
 
 def _current_state(record) -> IncidentState:
@@ -328,11 +276,8 @@ class IncidentPipeline:
         # Wave 3 #13: окно для recurrence-label «×N in 24h · M in 7d».
         self.recurrence_count_24h: int = 0
         self.recurrence_count_7d: int = 0
-        # Outbox доставки отчёта (см. _REPORT_PENDING_KEY): in-memory копия
-        # маркера + признак того, что он реально закоммичен в БД (только тогда
-        # ретрай сможет досоздать отчёт без повторных LLM-стадий).
-        self._pending_report: Optional[Dict[str, Any]] = None
-        self._report_outboxed: bool = False
+        # Доставка отчёта со всей outbox-механикой (см. report_delivery.py).
+        self.report = ReportDelivery(self.incident_id, db, record)
 
     # ------------------------------------------------------------------
     # State machine helpers
@@ -1098,7 +1043,7 @@ class IncidentPipeline:
     async def stage_synthesize(self) -> None:
         """LLM-синтез + persist. Сама Discord-отправка — уже НЕ здесь.
 
-        Отправка вынесена в run() (_flush_pending_report) и потому живёт вне
+        Отправка вынесена в run() (self.report.flush) и потому живёт вне
         per-stage cap `_STAGE_TIMEOUT`: LLM-работа к этому моменту закончена и
         закоммичена, а 240s-таймаут стадии мог бы оборвать ровно доставку
         отчёта — тот самый сбой, от которого защищает outbox.
@@ -1194,17 +1139,13 @@ class IncidentPipeline:
             # и глушил бы повторную отправку.
             for stale_key in (
                 _CHECKPOINT_KEY, "failed", "resolved_early",
-                _REPORT_SENT_KEY, _REPORT_FAILED_KEY,
+                ReportDelivery.SENT_KEY, ReportDelivery.FAILED_KEY,
             ):
                 merged_analysis.pop(stale_key, None)
             # Outbox: маркер «отчёт ещё не доставлен» уходит в БД в ТОЙ ЖЕ
             # транзакции, что и терминальный переход ниже (transition_to
             # коммитит оба изменения разом).
-            merged_analysis[_REPORT_PENDING_KEY] = {
-                "args": report_args,
-                "attempts": 0,
-                "queued_at": datetime.now(timezone.utc).isoformat(),
-            }
+            merged_analysis[ReportDelivery.PENDING_KEY] = self.report.new_marker(report_args)
             record.analysis = merged_analysis
             # Если ни одна гипотеза не пережила critique (self.best is None,
             # resolution_quality=="unresolved") — инцидент НЕ разрешён, уводим
@@ -1217,7 +1158,7 @@ class IncidentPipeline:
             record.trace = self.traces + [synth_snap]
             self.db.commit()
             # Маркер закоммичен вместе со статусом — ретрай сможет досылать.
-            self._report_outboxed = True
+            self.report.mark_outboxed()
         else:
             self.traces.append(synth_snap)
 
@@ -1233,11 +1174,11 @@ class IncidentPipeline:
         report_args["team_owner"] = self.team_owner
         report_args["recurrence_count_24h"] = self.recurrence_count_24h
         report_args["recurrence_count_7d"] = self.recurrence_count_7d
-        self._pending_report = {"args": report_args, "attempts": 0}
-        if self._report_outboxed:
+        self.report.stage(report_args)
+        if self.report.outboxed:
             # Досыпаем обогащённые поля в уже закоммиченный маркер (best-effort):
             # повторная отправка после смерти воркера отдаст полный embed.
-            self._refresh_pending_report_args(report_args)
+            self.report.refresh_args(report_args)
 
     def _build_report_args(
         self, alertname: str, labels: Dict[str, Any], incident_ts: Optional[datetime]
@@ -1274,221 +1215,6 @@ class IncidentPipeline:
             "recurrence_count_7d": self.recurrence_count_7d,
             "incident_ts": incident_ts.isoformat() if incident_ts else None,
         }
-
-    def _report_send_kwargs(self, args: Dict[str, Any]) -> Dict[str, Any]:
-        """Развернуть сериализованные поля маркера в kwargs discord-сервиса."""
-        kwargs = dict(args)
-        intent_raw = kwargs.get("execution_intent")
-        if isinstance(intent_raw, dict):
-            try:
-                kwargs["execution_intent"] = ExecutionIntent.model_validate(intent_raw)
-            except Exception:
-                # Битый intent не должен стоить нам всего отчёта — шлём без него
-                # (без intent-а просто не будет apply/approve-кнопок).
-                kwargs["execution_intent"] = None
-        ts_raw = kwargs.get("incident_ts")
-        if isinstance(ts_raw, str):
-            try:
-                kwargs["incident_ts"] = datetime.fromisoformat(ts_raw)
-            except ValueError:
-                kwargs["incident_ts"] = None
-        return kwargs
-
-    # ------------------------------------------------------------------
-    # Outbox доставки отчёта (см. _REPORT_PENDING_KEY)
-    # ------------------------------------------------------------------
-
-    async def _send_incident_report(self, args: Dict[str, Any]) -> bool:
-        """Одна попытка доставки. Возвращает delivered, наружу не бросает.
-
-        Контракт discord-сервиса: send_incident_report отдаёт bool delivered
-        и сам не бросает. Явный False = «не доставлено» → ретрай по outbox-у.
-        Возврат None трактуем как доставку: так ведёт себя старый контракт
-        (метод ничего не возвращал), а ретраить вслепую хуже, чем поверить.
-        """
-        try:
-            delivered = await discord_service.send_incident_report(
-                **self._report_send_kwargs(args)
-            )
-        except Exception as e:
-            # Defensive: по контракту сюда не приходим, но проглоченный отчёт
-            # без маркера хуже, чем лишний ретрай.
-            logger.warning(
-                "pipeline.report_send_raised",
-                incident_id=self.incident_id,
-                error=type(e).__name__,
-            )
-            return False
-        return delivered is not False
-
-    async def _flush_pending_report(self) -> None:
-        """Доставить отчёт этого прогона (вызывается из run() после synthesize)."""
-        if self._pending_report is None:
-            return
-        await self._deliver_report(self._pending_report)
-
-    async def _resend_pending_report(self, pending: Dict[str, Any]) -> None:
-        """Повторная отправка по живому outbox-маркеру. LLM-стадии НЕ трогаем.
-
-        Дубля не будет: дедуп Discord-а живёт в таблице discord_dedup и
-        клеймится ДО POST-а (claim/release в app/services/discord/dedup_store.py).
-        Провалившийся POST claim отпускает — повторная попытка честно постит
-        заново. Если воркер умер между claim и POST-ом, повтор увидит
-        placeholder без msg_id и промолчит (дубля не создаст), а после TTL
-        отправит заново; от вечного круга страхует _REPORT_MAX_ATTEMPTS.
-        """
-        audit_service.log_event(
-            "PIPELINE_REPORT_RESEND",
-            {
-                "incident_id": self.incident_id,
-                "attempts_done": int(pending.get("attempts") or 0),
-            },
-        )
-        self._report_outboxed = True
-        self._pending_report = pending
-        await self._deliver_report(pending)
-
-    async def _deliver_report(self, pending: Dict[str, Any]) -> None:
-        args = pending.get("args")
-        if not isinstance(args, dict):
-            logger.error(
-                "pipeline.report_marker_unusable",
-                incident_id=self.incident_id,
-            )
-            self._mark_report_failed(int(pending.get("attempts") or 0), "marker_unusable")
-            return
-        attempts = int(pending.get("attempts") or 0) + 1
-        if await self._send_incident_report(args):
-            self._mark_report_sent(attempts)
-            return
-        if not self._report_outboxed:
-            # Строки инцидента нет (ad-hoc прогон) — переотправлять не с чего:
-            # ретрай прогонит LLM-стадии заново, что дороже потерянного embed-а.
-            logger.error(
-                "pipeline.report_delivery_lost_no_record",
-                incident_id=self.incident_id,
-            )
-            return
-        if not _severity_routeable(args.get("severity")):
-            # Не сбой доставки: discord-сервис намеренно не шлёт info/none в
-            # #infra-error (severity-gate) и отдаёт False. Ретраить нечего.
-            logger.info(
-                "pipeline.report_delivery_skipped_low_severity",
-                incident_id=self.incident_id,
-                severity=args.get("severity"),
-            )
-            self._mark_report_failed(attempts, "severity_gate_skip")
-            return
-        if attempts >= _REPORT_MAX_ATTEMPTS:
-            logger.error(
-                "pipeline.report_delivery_gave_up",
-                incident_id=self.incident_id,
-                attempts=attempts,
-            )
-            audit_service.log_event(
-                "PIPELINE_REPORT_DELIVERY_FAILED",
-                {"incident_id": self.incident_id, "attempts": attempts},
-            )
-            self._mark_report_failed(attempts, "discord_delivery_failed")
-            return
-        self._bump_report_attempts(args, attempts)
-        raise ReportDeliveryPending(
-            f"incident {self.incident_id}: Discord report not delivered "
-            f"(attempt {attempts}/{_REPORT_MAX_ATTEMPTS}); terminal state is "
-            f"committed, {_REPORT_PENDING_KEY} kept for redelivery"
-        )
-
-    def _load_pending_report(self) -> Optional[Dict[str, Any]]:
-        """Живой outbox-маркер (отчёт не доставлен) или None."""
-        if self.record is None:
-            return None
-        analysis = self.record.analysis
-        if not isinstance(analysis, dict):
-            return None
-        if analysis.get(_REPORT_SENT_KEY) or analysis.get(_REPORT_FAILED_KEY):
-            # Доставлено либо сдались — pending-хвост не воскрешаем.
-            return None
-        pending = analysis.get(_REPORT_PENDING_KEY)
-        if not isinstance(pending, dict) or not isinstance(pending.get("args"), dict):
-            return None
-        return pending
-
-    def _update_analysis(self, mutate: Callable[[Dict[str, Any]], None], marker: str) -> None:
-        """Точечно поправить record.analysis и закоммитить. Best-effort."""
-        if self.record is None:
-            return
-        try:
-            current = self.record.analysis
-            analysis = dict(current) if isinstance(current, dict) else {}
-            mutate(analysis)
-            self.record.analysis = analysis
-            self.db.commit()
-        except Exception as e:
-            logger.warning(
-                "pipeline.report_marker_write_failed",
-                incident_id=self.incident_id,
-                marker=marker,
-                error=str(e),
-            )
-            try:
-                self.db.rollback()
-            except Exception:
-                pass
-
-    def _mark_report_sent(self, attempts: int) -> None:
-        def _mutate(analysis: Dict[str, Any]) -> None:
-            analysis.pop(_REPORT_PENDING_KEY, None)
-            analysis[_REPORT_SENT_KEY] = {
-                "sent_at": datetime.now(timezone.utc).isoformat(),
-                "attempts": attempts,
-            }
-
-        self._pending_report = None
-        self._update_analysis(_mutate, _REPORT_SENT_KEY)
-
-    def _mark_report_failed(self, attempts: int, reason: str) -> None:
-        def _mutate(analysis: Dict[str, Any]) -> None:
-            analysis.pop(_REPORT_PENDING_KEY, None)
-            analysis[_REPORT_FAILED_KEY] = {
-                "failed_at": datetime.now(timezone.utc).isoformat(),
-                "attempts": attempts,
-                "reason": reason,
-            }
-
-        self._pending_report = None
-        self._update_analysis(_mutate, _REPORT_FAILED_KEY)
-
-    def _bump_report_attempts(self, args: Dict[str, Any], attempts: int) -> None:
-        """Зафиксировать номер попытки в маркере ДО броска ReportDeliveryPending."""
-        now_iso = datetime.now(timezone.utc).isoformat()
-
-        def _mutate(analysis: Dict[str, Any]) -> None:
-            pending = analysis.get(_REPORT_PENDING_KEY)
-            base = dict(pending) if isinstance(pending, dict) else {"queued_at": now_iso}
-            base["args"] = args
-            base["attempts"] = attempts
-            base["last_error_at"] = now_iso
-            analysis[_REPORT_PENDING_KEY] = base
-
-        if self._pending_report is not None:
-            self._pending_report["attempts"] = attempts
-        self._update_analysis(_mutate, _REPORT_PENDING_KEY)
-
-    def _refresh_pending_report_args(self, args: Dict[str, Any]) -> None:
-        def _mutate(analysis: Dict[str, Any]) -> None:
-            pending = analysis.get(_REPORT_PENDING_KEY)
-            base = (
-                dict(pending)
-                if isinstance(pending, dict)
-                else {
-                    "attempts": 0,
-                    "queued_at": datetime.now(timezone.utc).isoformat(),
-                }
-            )
-            base["args"] = args
-            analysis[_REPORT_PENDING_KEY] = base
-
-        self._update_analysis(_mutate, _REPORT_PENDING_KEY)
 
     def _compute_recurrence_counts(self, alertname: str) -> None:
         """Wave 3 #13: посчитать сколько раз alertname сработал за 24h/7d.
@@ -1649,7 +1375,7 @@ class IncidentPipeline:
             # _persist упёрся во внешний resolve на терминальном переходе):
             # отчёт мы не отправляли и не будем — иначе следующий прогон принял
             # бы его за «недоставленный» и дослал бы разбор по закрытому алерту.
-            merged.pop(_REPORT_PENDING_KEY, None)
+            merged.pop(ReportDelivery.PENDING_KEY, None)
             merged["resolved_early"] = {
                 "reason": reason,
                 "state": state.value,
@@ -1677,13 +1403,13 @@ class IncidentPipeline:
             else IncidentState.OPEN
         )
         if start_state in (IncidentState.RESOLVED, IncidentState.TRIAGE_REQUIRED):
-            pending = self._load_pending_report()
+            pending = self.report.load_pending()
             if pending is not None:
                 # Терминал поставил ПРЕДЫДУЩИЙ прогон, но отчёт не доставлен
                 # (живой report_pending): смерть воркера в окне «commit → send →
                 # ack» либо фейл POST-а. Досылаем ТОЛЬКО отчёт — все поля embed
                 # лежат в маркере, повторных LLM-стадий не нужно.
-                await self._resend_pending_report(pending)
+                await self.report.resend(pending)
                 return
             # Resolve-webhook закрыл инцидент до старта pipeline-а.
             self._record_resolved_early(
@@ -1739,4 +1465,4 @@ class IncidentPipeline:
         # закоммичена вместе с outbox-маркером. При недоставке поднимается
         # ReportDeliveryPending (retriable) — Celery повторит таск, и повтор
         # уйдёт по resend-ветке в начале run(), без прожига LLM.
-        await self._flush_pending_report()
+        await self.report.flush()
