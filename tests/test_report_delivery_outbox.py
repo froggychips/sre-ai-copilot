@@ -28,9 +28,15 @@ from app.agents.models.hypothesis import Hypothesis, HypothesisSet
 from app.core.execution_dsl import ActionType, ExecutionIntent
 from app.core.state_machine import IncidentState
 from app.diagnostics.facts import Fact, FactKind, FactStore
-from app.workers.pipeline import (_REPORT_FAILED_KEY, _REPORT_MAX_ATTEMPTS,
-                                  _REPORT_PENDING_KEY, _REPORT_SENT_KEY,
-                                  IncidentPipeline, ReportDeliveryPending)
+from app.workers.pipeline import IncidentPipeline
+from app.workers.report_delivery import ReportDelivery, ReportDeliveryPending
+
+# Маркеры и лимит попыток переехали в ReportDelivery вместе с механикой
+# доставки; тест по-прежнему смотрит на них снаружи, через контракт класса.
+_REPORT_PENDING_KEY = ReportDelivery.PENDING_KEY
+_REPORT_SENT_KEY = ReportDelivery.SENT_KEY
+_REPORT_FAILED_KEY = ReportDelivery.FAILED_KEY
+_REPORT_MAX_ATTEMPTS = ReportDelivery.MAX_ATTEMPTS
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────
@@ -104,7 +110,7 @@ def mocked_agents(mocker):
 
 def _patch_send(mocker, *, delivered):
     return mocker.patch(
-        "app.workers.pipeline.discord_service.send_incident_report",
+        "app.workers.report_delivery.discord_service.send_incident_report",
         new_callable=AsyncMock,
         return_value=delivered,
     )
@@ -343,7 +349,7 @@ async def test_send_exception_is_swallowed_into_retry(
 ):
     """Контракт «сервис не бросает» подстрахован: исключение = недоставка."""
     send = mocker.patch(
-        "app.workers.pipeline.discord_service.send_incident_report",
+        "app.workers.report_delivery.discord_service.send_incident_report",
         new_callable=AsyncMock,
         side_effect=RuntimeError("boom"),
     )
