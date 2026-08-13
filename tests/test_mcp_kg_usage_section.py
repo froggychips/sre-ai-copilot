@@ -15,6 +15,7 @@ from unittest.mock import AsyncMock
 import pytest
 
 from app.services.stats_digest import _is_human_key, mcp_kg_usage_section
+from app.services.digest import failures as digest_failures
 
 
 @pytest.mark.parametrize("key,expected", [
@@ -127,7 +128,7 @@ async def test_vm_failure_is_reported_not_swallowed():
 
     sd._reset_section_failures()
     assert await mcp_kg_usage_section(vm) == ""
-    assert "mcp_kg_usage_section" in list(sd._section_failures.get())
+    assert "mcp_kg_usage_section" in digest_failures.failed_sections()
 
 
 @pytest.mark.asyncio

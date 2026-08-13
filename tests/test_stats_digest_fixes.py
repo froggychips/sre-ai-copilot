@@ -33,6 +33,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from app.services import stats_digest
+from app.services.digest import failures as digest_failures
 
 
 # ── M2. suspicious_with_callers: правильная edge-таблица ────────────────────
@@ -299,7 +300,7 @@ async def test_mcp_kg_usage_section_hidden_without_vm():
     stats_digest._reset_section_failures()
     assert await stats_digest.mcp_kg_usage_section(None) == ""
     try:
-        failures = list(stats_digest._section_failures.get())
+        failures = digest_failures.failed_sections()
     except LookupError:
         failures = []
     assert failures == []
