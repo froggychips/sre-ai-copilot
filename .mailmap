@@ -9,3 +9,7 @@ froggychips <big@froggychips.xyz> <big@froggychips.xyz>
 froggychips <big@froggychips.xyz> <fagionpw@gmail.com>
 froggychips <big@froggychips.xyz> <yar.shulgin@gmail.com>
 froggychips <big@froggychips.xyz> <yaroslav@JabBook-Air-m3.local>
+# Адрес, которым GitHub подписывает squash-мержи с 11.08.2026, когда primary
+# email стал приватным. То есть это адрес ВСЕХ будущих коммитов master —
+# без него файл схлопывал бы только прошлое и снова расслаивался бы вперёд.
+froggychips <big@froggychips.xyz> <47030406+froggychips@users.noreply.github.com>
