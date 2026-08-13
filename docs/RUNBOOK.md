@@ -1270,3 +1270,86 @@ for r in deployments statefulsets daemonsets; do
     --as=system:serviceaccount:sre-ai:sre-ai --all-namespaces
 done
 ```
+
+---
+
+## CI runner is a single point of failure
+
+All CI for this repository runs on **one** self-hosted runner
+(`jabbook-air-m3-sre-copilot`, a personal Mac). GitHub-hosted runners are not
+an option today: the account is locked for a billing issue and any job with
+`runs-on: ubuntu-latest` dies in ~3s with the annotation *"The job was not
+started because your account is locked due to a billing issue."* (verified
+2026-08-13).
+
+Consequence: when that Mac sleeps, loses the LaunchAgent, or the runner
+process dies, **CI silently stops** — pushes get queued forever instead of
+failing. That is exactly how CI stayed dead for 27 days (2026-07-04 →
+2026-07-31) without a single alert.
+
+### The canary
+
+`scripts/ci_deadman.py`, deployed as the `ci-deadman` CronJob
+(`k8s/ci-deadman.yaml`), runs **in the cluster** — deliberately not as a
+workflow, because a workflow-based check dies together with what it watches.
+Hourly it verifies: runner online, no run queued longer than `QUEUE_MINUTES`,
+no green PR sitting longer than `STALE_PR_DAYS` (the dependabot deadlock), and
+the default branch not red. It posts to Discord only when something is wrong.
+
+Run it by hand (nothing is written anywhere with `DRY_RUN=1`):
+
+```bash
+GITHUB_TOKEN=$(gh auth token) DRY_RUN=1 python3 scripts/ci_deadman.py
+```
+
+### Runner is offline — recovery
+
+```bash
+# 1. Is it the runner or GitHub?
+gh api /repos/froggychips/sre-ai-copilot/actions/runners \
+  --jq '.runners[] | "\(.name) \(.status) busy=\(.busy)"'
+
+# 2. On the Mac: the runner is a LaunchAgent, not a shell session.
+launchctl list | grep -i actions.runner
+launchctl kickstart -k "gui/$(id -u)/actions.runner.froggychips-sre-ai-copilot.$(hostname -s)"
+
+# 3. Logs (the runner writes its own, GitHub shows nothing for a dead runner):
+tail -50 ~/actions-runner-sre-copilot/_diag/Runner_*.log
+```
+
+Two known traps on this host, both already paid for once:
+* the LaunchAgent session has no Keychain access (`errSecInteractionNotAllowed
+  -25308`) — Docker credentials must come from a job-local `docker config`
+  without `credsStore`, which `ci.yml` already does;
+* `caffeinate` matters: a sleeping Mac is indistinguishable from a dead runner
+  from GitHub's side.
+
+### Rebuilding the runner on another machine
+
+The runner registration is per-repository and disposable — re-registering
+elsewhere is the fastest disaster recovery, and it needs no state from the old
+host:
+
+```bash
+mkdir actions-runner && cd actions-runner
+curl -o actions-runner-osx-arm64.tar.gz -L \
+  https://github.com/actions/runner/releases/latest/download/actions-runner-osx-arm64-<VER>.tar.gz
+tar xzf actions-runner-osx-arm64.tar.gz
+./config.sh --url https://github.com/froggychips/sre-ai-copilot \
+  --token "$(gh api -X POST /repos/froggychips/sre-ai-copilot/actions/runners/registration-token --jq .token)" \
+  --labels self-hosted,macOS,ARM64 --unattended
+./svc.sh install && ./svc.sh start
+```
+
+The workflows target the **labels** (`[self-hosted, macOS, ARM64]`), not the
+runner name, so a replacement host picks up jobs with no workflow change. The
+new host still needs: Docker (Rancher Desktop, socket in `~/.rd`), Homebrew
+Python 3.12, and the `~/.docker/cli-plugins` buildx plugin — see the comments
+in `.github/workflows/ci.yml`.
+
+### The real fix
+
+Unlocking billing (or moving the account to a paid plan) puts `ubuntu-latest`
+back on the table, at which point `Lint and Test` should move to GitHub-hosted
+and the Mac should keep only what genuinely needs macOS. Until then the single
+runner stays a known, monitored risk rather than an invisible one.
