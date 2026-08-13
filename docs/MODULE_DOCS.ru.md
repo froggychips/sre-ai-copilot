@@ -19,6 +19,8 @@
 
 ## Workers и оркестрация
 - `app/workers/tasks.py`: Celery-задача `process_incident` — полный 8-стадийный агентный пайплайн: DiagnosticsEngine, MultiHypothesis, FactCritic, Jira enrichment, Fix, Risk, обновление KG.
+- `app/workers/pipeline.py`: `IncidentPipeline` — сами стадии, по одному async-методу на каждую, с возобновлением из checkpoint-а после Celery-ретрая.
+- `app/workers/report_delivery.py`: `ReportDelivery` — outbox доставки Discord-отчёта (маркеры `report_pending` / `report_sent` / `report_failed`, счётчик попыток, решение «ретраить или сдаться»). Намеренно не стадия пайплайна: работает ПОСЛЕ коммита терминального state, переживает смерть воркера и ретраится Celery без повторного прожига LLM-стадий.
 - `app/celery_worker.py`: Celery-задача `generate_reply`, переходы состояний, итеративный confidence loop.
 - `app/core/state_machine.py`: допустимые состояния и переходы жизненного цикла инцидента.
 

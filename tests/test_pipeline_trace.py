@@ -108,7 +108,7 @@ def mocked_dependencies(mocker):
     )
 
     mocker.patch(
-        "app.workers.pipeline.discord_service.send_report",
+        "app.workers.report_delivery.discord_service.send_report",
         new_callable=AsyncMock,
     )
     # Доставка отчёта теперь возвращает delivered (outbox-семантика в
@@ -116,7 +116,7 @@ def mocked_dependencies(mocker):
     # example.com из conftest, получал 405 → delivered=False → пайплайн
     # поднимал ReportDeliveryPending.
     mocker.patch(
-        "app.workers.pipeline.discord_service.send_incident_report",
+        "app.workers.report_delivery.discord_service.send_incident_report",
         new_callable=AsyncMock,
         return_value=True,
     )

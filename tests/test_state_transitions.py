@@ -68,12 +68,12 @@ def happy_path_dependencies(mocker):
                  new_callable=AsyncMock, return_value="s")
     mocker.patch("app.workers.pipeline.SimilarIncidentEngine.find", return_value=[])
     mocker.patch("app.workers.pipeline.diag_engine.run", return_value=_fact_store())
-    mocker.patch("app.workers.pipeline.discord_service.send_report",
+    mocker.patch("app.workers.report_delivery.discord_service.send_report",
                  new_callable=AsyncMock)
     # send_incident_report возвращает delivered (outbox в pipeline): без мока
     # тест бил живым POST-ом в example.com из conftest → 405 → delivered=False
     # → ReportDeliveryPending.
-    mocker.patch("app.workers.pipeline.discord_service.send_incident_report",
+    mocker.patch("app.workers.report_delivery.discord_service.send_incident_report",
                  new_callable=AsyncMock, return_value=True)
     mocker.patch("app.workers.pipeline.audit_service.log_event")
 
@@ -288,12 +288,12 @@ async def test_pipeline_handles_no_record_gracefully(mocker, incident_data):
                  new_callable=AsyncMock, return_value="s")
     mocker.patch("app.workers.pipeline.SimilarIncidentEngine.find", return_value=[])
     mocker.patch("app.workers.pipeline.diag_engine.run", return_value=_fact_store())
-    mocker.patch("app.workers.pipeline.discord_service.send_report",
+    mocker.patch("app.workers.report_delivery.discord_service.send_report",
                  new_callable=AsyncMock)
     # send_incident_report возвращает delivered (outbox в pipeline): без мока
     # тест бил живым POST-ом в example.com из conftest → 405 → delivered=False
     # → ReportDeliveryPending.
-    mocker.patch("app.workers.pipeline.discord_service.send_incident_report",
+    mocker.patch("app.workers.report_delivery.discord_service.send_incident_report",
                  new_callable=AsyncMock, return_value=True)
     mocker.patch("app.workers.pipeline.audit_service.log_event")
 

@@ -133,13 +133,13 @@ def mocked_pipeline_deps(mocker):
         return_value=[],
     )
     mocker.patch(
-        "app.workers.pipeline.discord_service.send_report",
+        "app.workers.report_delivery.discord_service.send_report",
         new_callable=AsyncMock,
     )
     # Доставка отчёта отдаёт delivered — мокаем, иначе живой POST в
     # example.com (conftest) даёт False и pipeline уходит в outbox-ретрай.
     mocker.patch(
-        "app.workers.pipeline.discord_service.send_incident_report",
+        "app.workers.report_delivery.discord_service.send_incident_report",
         new_callable=AsyncMock,
         return_value=True,
     )
