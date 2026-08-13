@@ -35,6 +35,15 @@ _CPU_THROTTLE_PCT = 0.20
 # k8s-объектов; на mismatch — fail-safe (не строим запрос, отдаём нулевой dict).
 _K8S_NAME_RE = re.compile(r"^[a-z0-9]([a-z0-9.\-]*[a-z0-9])?$")
 
+# Связка «под node-exporter → имя ноды». Константа, в неё не подставляются
+# значения из алертов — инъекции здесь нет по построению.
+_NODE_NAME_QUERY = (
+    "node:node_name_info"
+    " or max by (namespace, pod, node) ("
+    'last_over_time(kube_pod_info{namespace="monitoring", pod=~"vm-node-exporter-.*"}[6h])'
+    ")"
+)
+
 
 def _valid_label(value: str) -> bool:
     """True если value безопасно подставлять в PromQL-матчер (charset имён k8s)."""
@@ -253,6 +262,30 @@ class VMClient:
                 "vm_client.query_instant_by_labels failed query=%r: %s", query, e,
             )
         return out
+
+    async def resolve_node_names(self) -> Dict[str, str]:
+        """{pod node-exporter'а → имя ноды} для всего кластера, один запрос.
+
+        У метрик node-exporter метки `node` нет, а `instance` — это IP ПОДА
+        (DaemonSet не в hostNetwork), поэтому нодовые алерты приезжают как
+        `192.168.74.165:9100` и человек не понимает, о какой ноде речь.
+        Связка идёт по метке `pod`: она есть и у node-exporter, и у
+        kube_pod_info.
+
+        Первый операнд — recording rule `node:node_name_info` (VMRule
+        node-name-info в ns monitoring). Второй — то же выражение напрямую:
+        правило может быть ещё не применено или переехать, и тогда резолв
+        обязан продолжать работать сам. `or` берёт rule, а для label-set'ов,
+        которых в ней нет, добирает из kube_pod_info.
+
+        `last_over_time[6h]` — потому что источник kube-state-metrics, а её
+        скрейп в этом кластере периодически умирает по maxScrapeSize и уносит
+        весь класс kube_*-метрик.
+
+        Пустой dict при недоступной VM — вызывающий оставляет IP как был.
+        """
+        pairs = await self.query_instant_by_labels(_NODE_NAME_QUERY, ("pod", "node"))
+        return {pod: node for (pod, node) in pairs}
 
     @with_external_retry(max_attempts=3, initial_delay=0.5, name="vm.cluster_health")
     async def get_cluster_health(self) -> ClusterHealth:
