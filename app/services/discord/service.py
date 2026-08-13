@@ -131,6 +131,9 @@ _EMBED_PROTECTED_FIELDS: Tuple[str, ...] = (
     "🎯 TL;DR",         # header TL;DR
     "Namespaces",
     "Owner",
+    # Для нодового алерта имя ноды — это и есть ответ «где», без него
+    # остаётся только IP пода-экспортёра. Дропу не подлежит.
+    "Нода",
 )
 
 
@@ -1378,7 +1381,11 @@ class DiscordService:
                 namespaces.append(ns)
 
         ns_str = ", ".join(namespaces[:4]) + (f" (+{len(namespaces) - 4})" if len(namespaces) > 4 else "")
-        svc_or_pod = head.service or head.pod or "?"
+        # У нодовых алертов сервиса нет, а pod — это `vm-node-exporter-XXXXX`,
+        # то есть источник метрики, а не то, что сломалось. Имя ноды (его
+        # резолвит node_resolver по метке pod) занимает место сервиса: в
+        # заголовке должно стоять `dev-14`, а не IP пода и не «vm-node».
+        svc_or_pod = head.service or head.node or head.pod or "?"
 
         recurrence_tag = ""
         rec_max = max((len(c.recurrence_24h) for c in contexts), default=0)
@@ -1435,6 +1442,14 @@ class DiscordService:
             "value": f"`{ns_str}`",
             "inline": True,
         })
+        # Нода отдельным полем, а не только в заголовке: у нодовых алертов это
+        # единственная координата «где именно», а заголовок сворачивается.
+        if head.node:
+            fields.append({
+                "name": "Нода",
+                "value": f"`{head.node}`",
+                "inline": True,
+            })
         if head.team_owner:
             fields.append({
                 "name": "Owner",

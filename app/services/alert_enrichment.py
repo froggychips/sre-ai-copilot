@@ -37,6 +37,7 @@ from app.knowledge_graph.queries import (blast_radius_for,
                                          recent_pod_events_for, upstream_of)
 from app.knowledge_graph.schema import NODE_KIND_SERVICE, Service, ServiceEdge
 from app.models.incident import Incident
+from app.services.node_resolver import is_node_exporter_pod
 from app.services.statics_service import (observe_statics_version,
                                           statics_env_from_namespace)
 
@@ -184,6 +185,12 @@ class EnrichedContext:
     incident: Incident
     service: Optional[str] = None
     pod: Optional[str] = None
+    # Имя ноды для нодовых алертов (NodeSystemSaturation и вся группа
+    # node-exporter). У этих алертов нет ни сервиса, ни осмысленного
+    # `instance` — только IP пода, поэтому node занимает место сервиса в
+    # заголовке. Заполняется из метки `node`, которую кладёт node_resolver на
+    # входе вебхука; None для всех остальных алертов.
+    node: Optional[str] = None
     team_owner: Optional[str] = None
     in_kg: bool = False
 
@@ -462,6 +469,12 @@ def _resolve_target_service_from_labels(
         if value:
             return (namespace, value)
     pod = labels.get("pod")
+    # Под node-exporter'а — не workload, а источник метрики: strip даёт из
+    # `vm-node-exporter-gbn9k` фантомный «vm-node» (два хвостовых сегмента
+    # выглядят как rs-hash + pod-hash), и он же уезжал в заголовок embed'а.
+    # У таких алертов target — нода, её имя подставляет node_resolver.
+    if pod and is_node_exporter_pod(pod):
+        return (namespace, None)
     if pod:
         derived = _strip_pod_hash(pod)
         if derived:
@@ -764,6 +777,7 @@ def enrich_alert(db: Session, incident: Incident) -> EnrichedContext:
         incident=incident,
         service=service,
         pod=pod,
+        node=labels.get("node") or None,
         inhibition_state=_inhibition_state(incident),
     )
     if probe_ns_from is not None:

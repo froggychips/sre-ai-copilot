@@ -589,6 +589,7 @@ async def alertmanager_webhook_enrich_and_forward(
     from app.knowledge_graph.auto_populator import populate_from_incident
     from app.services.alert_enrichment import enrich_alert_async
     from app.services.discord_service import DiscordService
+    from app.services.node_resolver import annotate_node_label
 
     raw_payload = payload.model_dump()
     raw_payload.setdefault("id", payload.groupKey)
@@ -609,6 +610,15 @@ async def alertmanager_webhook_enrich_and_forward(
         except HTTPException:
             log.warning("enrich_forward.skipped_invalid_alert", labels=alert.labels)
             continue
+
+        # Нодовые алерты приезжают с `instance` = IP ПОДА node-exporter'а и без
+        # метки `node`. Дописываем имя ноды ДО populate_from_incident, чтобы оно
+        # попало и в kg_alerts, и в embed. Резолв не может провалить приём
+        # алерта: при мёртвой VM возвращается None и всё идёт как раньше.
+        try:
+            await annotate_node_label(incident.labels)
+        except Exception as e:
+            log.debug("enrich_forward.node_resolve_failed", error=str(e))
 
         if alert.status == "resolved":
             # Warning-резолвы в Discord не идут (шум); critical — короткий
