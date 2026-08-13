@@ -291,6 +291,20 @@ Full details: [docs/RUNBOOK.md](docs/RUNBOOK.md)
 | 5 | Live preprod pod crash | ✅ **resolved** | TC context missing (`no_deploys_or_no_timestamp`) — flagged as gap, not false root cause | Correct cautious behaviour; TC MCP URL not configured locally |
 | 6 | Live preprod pod crash | ✅ **resolved** | Pipeline self-diagnosed a false refutation in synthesis | Correct — synthesis explicitly noted the contradiction and recommended manual check |
 
+Those six runs were **hand-checked** — which is exactly the problem they
+illustrate: everything else here is gated automatically (ruff, mypy, bandit,
+pip-audit, coverage, KG contract drift), while the one thing the product is
+*for* was measured by eye. The **[golden set](tests/golden/README.md)** closes
+that gap: 20 frozen incidents with expectations, run on every PR in `replay`
+mode (recorded LLM answers — no network, no key, deterministic) and against
+the real model on a schedule (`.github/workflows/eval-live.yml`). Runs 1–3
+above are now cases `001` and `013`: the false positive that cost three runs
+cannot come back unnoticed.
+
+```bash
+python scripts/eval_golden.py --mode replay --check-baseline
+```
+
 ### Security
 
 - **Defence in depth around kubectl** (hardened in v1.0.0-rc.1): AI never calls kubectl directly — `FixAgent` emits structured `ExecutionIntent` (JSON, pydantic-validated, `FORBIDDEN_NAMESPACES` rejected at parse time), the `DSLTranslator` produces the canonical `kubectl` string deterministically, and `K8sSecurityGuard` validates `(verb, resource, namespace)` derived structurally from the action — not from text-parsing the command. Before any real write the apply path now passes a **deterministic server-side policy gate** (`app/remediation`, 8 risk axes) that recomputes risk from the *structured* intent and blocks prod/system/data-plane/irreversible — the LLM `risk` field is advisory only and cannot be talked past via prompt injection. `apply_intent` additionally requires a matching intent **signature** (TOCTOU) **and** a recorded `ActionApproval` for the incident before executing, with a row-lock against double-apply. `post_approval=True` (the legacy SAFE_MODE bypass) is no longer trusted on its own.
@@ -333,6 +347,7 @@ See [docs/RUNBOOK.md → Executor incidents](docs/RUNBOOK.md#executor-incidents)
 | Semantic contract | [SEMANTIC_CONTRACT.md](docs/SEMANTIC_CONTRACT.md) | — |
 | FAQ | [FAQ.md](docs/FAQ.md) | [FAQ.ru.md](docs/FAQ.ru.md) |
 | DR plan | [DR.md](docs/DR.md) | — |
+| Golden eval set | [tests/golden/README.md](tests/golden/README.md) | — |
 | Changelog | [CHANGELOG.md](CHANGELOG.md) | — |
 
 ### sre-ai-copilot vs froggy-sre
@@ -610,6 +625,20 @@ helm install sre-ai-copilot helm/sre-ai-copilot/ \
 | 5 | Live preprod pod crash | ✅ **resolved** | TC-контекст missing (`no_deploys_or_no_timestamp`) — отмечен как gap, не ложный root cause | Корректная осторожность; `TEAMCITY_MCP_URL` не настроен локально |
 | 6 | Live preprod pod crash | ✅ **resolved** | Пайплайн самодиагностировал ложное опровержение в синтезе | Корректно — синтез явно отметил противоречие и рекомендовал ручную проверку |
 
+Эти шесть прогонов проверены **руками** — и в этом ровно та проблема, которую
+они же иллюстрируют: всё остальное здесь под автоматикой (ruff, mypy, bandit,
+pip-audit, coverage, KG contract drift), а единственное, ради чего продукт
+существует, меряли на глаз. Дыру закрывает
+**[golden-набор](tests/golden/README.md)**: 20 зафиксированных инцидентов с
+ожиданиями, прогон на каждом PR в режиме `replay` (записанные ответы LLM — без
+сети, без ключа, детерминированно) и против живой модели по расписанию
+(`.github/workflows/eval-live.yml`). Прогоны 1–3 выше стали кейсами `001` и
+`013`: false positive, стоивший трёх разборов, больше не вернётся незаметно.
+
+```bash
+python scripts/eval_golden.py --mode replay --check-baseline
+```
+
 ### Безопасность
 
 - **Defence in depth вокруг kubectl** (усилено в v1.0.0-rc.1): AI не вызывает kubectl напрямую — `FixAgent` выдаёт структурный `ExecutionIntent` (JSON, pydantic-валидирован, `FORBIDDEN_NAMESPACES` отбрасываются на парсе), `DSLTranslator` детерминированно строит kubectl-строку, `K8sSecurityGuard` валидирует `(verb, resource, namespace)` структурно (не через text-parsing). Перед любым реальным write apply-путь теперь проходит **детерминированный серверный policy-gate** (`app/remediation`, 8 risk axes): риск пересчитывается из *структурного* intent-а и блокируется prod/system/data-plane/необратимое — LLM-`risk` лишь advisory, его нельзя обойти prompt-injection'ом. `apply_intent` дополнительно требует совпадения **подписи** intent-а (TOCTOU) **и** записи `ActionApproval` для инцидента до выполнения, с row-lock против двойного apply. `post_approval=True` (прежний обход SAFE_MODE) больше не является достаточным сам по себе.
@@ -652,4 +681,5 @@ Executor-трек **сделан и закрыт за явные opt-in флаг
 | Semantic Contract | [SEMANTIC_CONTRACT.md](docs/SEMANTIC_CONTRACT.md) | — |
 | FAQ | [FAQ.md](docs/FAQ.md) | [FAQ.ru.md](docs/FAQ.ru.md) |
 | DR Plan | [DR.md](docs/DR.md) | — |
+| Golden eval set | [tests/golden/README.md](tests/golden/README.md) | — |
 | Changelog | [CHANGELOG.md](CHANGELOG.md) | — |
