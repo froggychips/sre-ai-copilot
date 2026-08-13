@@ -115,6 +115,13 @@ def test_released_versions_have_tags():
     if out.returncode != 0:  # pragma: no cover
         pytest.skip("git tag вернул ошибку")
     tags = set(out.stdout.split())
+    if not tags:
+        # Ни одного тега вообще — это не «релизы не тегированы», а клон без
+        # тегов: actions/checkout по умолчанию их не выкачивает. Проверять
+        # тут нечего, и падать на этом значит врать о состоянии репозитория.
+        # В CI теги подтягиваются явно (fetch-tags в .github/workflows/ci.yml),
+        # так что до skip доходят только чужие shallow-клоны.
+        pytest.skip("в клоне нет тегов (shallow checkout) — проверять нечего")
 
     missing = [r for r in releases if f"v{r}" not in tags]
     assert not missing, (
