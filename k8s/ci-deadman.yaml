@@ -1,0 +1,111 @@
+# Deadman-канарейка для CI (scripts/ci_deadman.py).
+#
+# Живёт в кластере, а НЕ в GitHub Actions, и это главное свойство: весь CI
+# репозитория гоняется на единственном self-hosted раннере (личный Mac —
+# GitHub-hosted недоступны, аккаунт заблокирован по биллингу). Проверка,
+# написанная как workflow, умирала бы вместе с объектом наблюдения: раннер
+# офлайн → джоба не стартует → тишина. Именно так CI простоял мёртвым
+# 27 дней (04.07–31.07.2026), и узнали об этом случайно.
+#
+# Что проверяет: раннер online, очередь не стоит, зелёные PR-ы не висят
+# (dependabot-дедлок), дефолтная ветка не красная. Молчит, когда всё чисто.
+#
+# Установка (значения — в in-cluster объектах, манифест остаётся generic):
+#
+#   # 1. ConfigMap со скриптом:
+#   kubectl -n sre-ai create configmap ci-deadman-script \
+#     --from-file=ci_deadman.py=scripts/ci_deadman.py \
+#     --dry-run=client -o yaml | kubectl apply -f -
+#
+#   # 2. ConfigMap с env (несекретное):
+#   kubectl -n sre-ai create configmap ci-deadman-env \
+#     --from-literal=GITHUB_REPO=froggychips/sre-ai-copilot \
+#     --from-literal=RUNNER_NAME=jabbook-air-m3-sre-copilot \
+#     --from-literal=QUEUE_MINUTES=30 \
+#     --from-literal=STALE_PR_DAYS=3 \
+#     --dry-run=client -o yaml | kubectl apply -f -
+#
+#   # 3. Секрет с токенами (--from-file, чтобы значения не попали в history шелла):
+#   kubectl -n sre-ai create secret generic ci-deadman-secrets \
+#     --from-file=github_token=/path/gh_ro_token \
+#     --from-file=discord_webhook_url=/path/webhook_url \
+#     --dry-run=client -o yaml | kubectl apply -f -
+#   # github_token — fine-grained PAT только на этот репозиторий, права
+#   # read-only: Actions:read, Pull requests:read, Metadata:read, Administration:read
+#   # (последнее нужно для /actions/runners — без него список раннеров даёт 403).
+#
+# Образ: тот же sre-ai-copilot (нужен только python3 + requests), в проде
+# патчится на внутренний реестр через deploy.sh, как остальные CronJob-ы.
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: ci-deadman
+  labels:
+    app: ci-deadman
+spec:
+  # Раз в час: CI-прогон занимает ~11 минут, а «раннер умер» — состояние,
+  # которое терпит час, но не терпит недели. Чаще смысла нет, GitHub API
+  # на fine-grained PAT даёт 5000 req/h, но канарейка не должна их жечь.
+  schedule: "17 * * * *"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 5
+  jobTemplate:
+    spec:
+      backoffLimit: 1
+      activeDeadlineSeconds: 300
+      template:
+        metadata:
+          labels:
+            app: ci-deadman
+        spec:
+          # SA по умолчанию: канарейке не нужен k8s API вообще, только
+          # исходящий HTTPS к api.github.com и discord.com.
+          automountServiceAccountToken: false
+          restartPolicy: Never
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 10001
+            fsGroup: 10001
+            seccompProfile:
+              type: RuntimeDefault
+          containers:
+          - name: ci-deadman
+            # IMAGE_PLACEHOLDER подставляет deploy.sh целиком (registry+repo+tag).
+            image: IMAGE_PLACEHOLDER
+            imagePullPolicy: IfNotPresent
+            command: ["python3", "/scripts/ci_deadman.py"]
+            securityContext:
+              readOnlyRootFilesystem: true
+              allowPrivilegeEscalation: false
+              capabilities:
+                drop: ["ALL"]
+            envFrom:
+            - configMapRef:
+                name: ci-deadman-env
+            env:                                # remap lowercase secret-ключей
+            - name: GITHUB_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: ci-deadman-secrets
+                  key: github_token
+            - name: DISCORD_WEBHOOK_URL
+              valueFrom:
+                secretKeyRef:
+                  name: ci-deadman-secrets
+                  key: discord_webhook_url
+            resources:
+              limits:
+                cpu: 200m
+                memory: 128Mi
+              requests:
+                cpu: 50m
+                memory: 64Mi
+            volumeMounts:
+            - name: script
+              mountPath: /scripts
+              readOnly: true
+          volumes:
+          - name: script
+            configMap:
+              name: ci-deadman-script

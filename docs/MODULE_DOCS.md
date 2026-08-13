@@ -19,6 +19,8 @@
 
 ## Workers & Orchestration
 - `app/workers/tasks.py`: Celery task `process_incident` — full 8-stage agent pipeline including DiagnosticsEngine, MultiHypothesis, FactCritic, Jira enrichment, Fix, Risk, KG update.
+- `app/workers/pipeline.py`: `IncidentPipeline` — the stages themselves, one async method each, resumable from a checkpoint after a Celery retry.
+- `app/workers/report_delivery.py`: `ReportDelivery` — Discord report outbox (`report_pending` / `report_sent` / `report_failed` markers, attempt counter, retry-or-give-up decision). Deliberately not a pipeline stage: it runs *after* the terminal state is committed, survives worker death and is retried by Celery without re-running any LLM stage.
 - `app/celery_worker.py`: Celery task `generate_reply`, state transitions, iterative confidence loop.
 - `app/core/state_machine.py`: Valid states and lifecycle transitions for an incident.
 
