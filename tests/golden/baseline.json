@@ -1,12 +1,13 @@
 {
-  "cases_total": 14,
-  "cases_passed": 14,
-  "cases_skipped": 6,
+  "cases_total": 20,
+  "cases_passed": 20,
+  "cases_skipped": 0,
   "case_pass_rate": 1.0,
-  "checks_total": 28,
-  "checks_passed": 28,
+  "checks_total": 55,
+  "checks_passed": 55,
   "check_pass_rate": 1.0,
   "by_check": {
+    "cause_contains": 1.0,
     "cause_not_contains": 1.0,
     "fact": 1.0,
     "gate": 1.0,

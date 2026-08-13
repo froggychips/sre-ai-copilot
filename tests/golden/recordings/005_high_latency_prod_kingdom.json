@@ -1,0 +1,28 @@
+{
+  "calls": [
+    {
+      "role": "d4e8e579b37e765d",
+      "ctx": "fc128d65571cd3f4",
+      "task_type": "hypothesis",
+      "text": "{\"hypotheses\":[]}"
+    },
+    {
+      "role": "d44ffaeccde4d5f4",
+      "ctx": "fc128d65571cd3f4",
+      "task_type": "hypothesis",
+      "text": "{\"hypotheses\":[]}"
+    },
+    {
+      "role": "df34e1588a327ff7",
+      "ctx": "fc128d65571cd3f4",
+      "task_type": "hypothesis",
+      "text": "{\"hypotheses\":[]}"
+    },
+    {
+      "role": "7c4251f62a1f40b7",
+      "ctx": "44421f24863e79c0",
+      "task_type": "analysis",
+      "text": "```json\n{\n    \"action\": \"describe_resource\",\n    \"resource_type\": \"pod\",\n    \"resource_name\": \"unknown\",\n    \"namespace\": \"default\",\n    \"params\": {},\n    \"risk\": \"low\"\n}\n```"
+    }
+  ]
+}

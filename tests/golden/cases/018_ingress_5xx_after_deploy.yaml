@@ -32,4 +32,7 @@ expect:
     recent_deploy: true
     oom_killed: false
   resolution: resolved
-  cause_contains: ["deploy", "выкат", "release", "rollout", "version", "change"]
+  # Ответ приходит и по-русски, и по-английски — список это синонимы одной
+  # причины, а не требование к языку вывода: «деплой» не содержит «deploy»
+  # как подстроку, и первый же прогон это показал.
+  cause_contains: ["deploy", "деплой", "выкат", "release", "rollout", "регресс"]
