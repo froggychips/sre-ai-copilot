@@ -1,0 +1,35 @@
+id: 018_ingress_5xx_after_deploy
+title: всплеск 5xx на ингрессе через 6 минут после выката
+source: synthetic
+llm: true
+incident:
+  incident_id: golden-018
+  severity: critical
+  status: firing
+  summary: 5xx rate 18% on api-gateway ingress
+  description: nginx ingress 5xx ratio 0.18 over 5m, upstream api-gateway
+  namespace: squad-4-kingdom2
+  labels:
+    alertname: IngressHigh5xxRate
+    severity: critical
+    namespace: squad-4-kingdom2
+    service: api-gateway
+  annotations:
+    summary: 5xx rate 18% on api-gateway ingress
+    description: nginx ingress 5xx ratio 0.18 over 5m, upstream api-gateway
+  starts_at: "2026-08-10T14:06:00Z"
+  ends_at: null
+  generator_url: null
+  raw: {}
+context:
+  recent_deployments:
+    - {name: Wo_Backend_BuildApiGateway, ts: "2026-08-10T14:00:00Z", status: SUCCESS}
+  logs_summary: |
+    upstream connect error or disconnect/reset before headers
+    HTTP 502 from api-gateway:8080
+expect:
+  facts:
+    recent_deploy: true
+    oom_killed: false
+  resolution: resolved
+  cause_contains: ["deploy", "выкат", "release", "rollout", "version", "change"]

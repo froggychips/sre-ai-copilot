@@ -1,0 +1,18 @@
+id: 008_gate_data_plane_blocked
+title: рестарт БД в dev-сквадe блокируется как data-plane
+source: synthetic
+llm: false
+incident: {incident_id: golden-008, severity: critical, status: firing, summary: guard,
+           description: "", namespace: squad-1, labels: {alertname: Guard},
+           annotations: {}, starts_at: "2026-08-10T10:00:00Z", ends_at: null,
+           generator_url: null, raw: {}}
+intent:
+  action: restart_deployment
+  resource_type: deployment
+  resource_name: town-db
+  namespace: squad-1
+  risk: low
+expect:
+  # Namespace разрешённый, но цель — данные: блок по data_plane и
+  # reversibility, а не по tier.
+  gate: block

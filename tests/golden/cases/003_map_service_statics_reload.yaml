@@ -1,0 +1,48 @@
+id: 003_map_service_statics_reload
+title: map-service циклится на смене хеша статики (squad-4-kingdom2)
+source: real
+llm: true
+incident:
+  incident_id: golden-003
+  severity: critical
+  status: firing
+  summary: Pod map-service-84d688bc69-279vz crash-looping in squad-4-kingdom2
+  description: >-
+    Service starts, loads statics v10072, detects statics hash changed
+    (ecaddeac -> 1506647a), shuts down to reload, loops. Exit code 1.
+    Restart count: 27.
+  namespace: squad-4-kingdom2
+  labels:
+    alertname: KubePodCrashLooping
+    severity: critical
+    namespace: squad-4-kingdom2
+    pod: map-service-84d688bc69-279vz
+    app: map-service
+    service: map-service
+  annotations:
+    summary: Pod map-service-84d688bc69-279vz crash-looping in squad-4-kingdom2
+    description: >-
+      Service starts, loads statics v10072, detects statics hash changed
+      (ecaddeac -> 1506647a), shuts down to reload, loops. Exit code 1.
+  starts_at: "2026-05-12T17:55:26Z"
+  ends_at: null
+  generator_url: null
+  raw: {}
+context:
+  k8s_pod_state:
+    map-service-84d688bc69-279vz:
+      exit_code: 1
+      reason: Error
+      restart_count: 27
+  logs_summary: |
+    Statics hash changed for version v10072. Will restart to reload.
+    Application is shutting down...
+  k8s_events:
+    - {type: Warning, reason: BackOff, count: 27,
+       message: "Back-off restarting failed container map-service in pod map-service-84d688bc69-279vz"}
+expect:
+  facts:
+    crashloop: true
+    oom_killed: false
+  resolution: resolved
+  cause_not_contains: ["oom", "out of memory"]

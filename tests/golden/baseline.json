@@ -1,0 +1,17 @@
+{
+  "cases_total": 14,
+  "cases_passed": 14,
+  "cases_skipped": 6,
+  "case_pass_rate": 1.0,
+  "checks_total": 28,
+  "checks_passed": 28,
+  "check_pass_rate": 1.0,
+  "by_check": {
+    "cause_not_contains": 1.0,
+    "fact": 1.0,
+    "gate": 1.0,
+    "intent_rejected": 1.0,
+    "resolution": 1.0
+  },
+  "errors": []
+}
