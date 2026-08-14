@@ -889,6 +889,7 @@ def fragile_services_section(db: Session, ns_to_team: Dict[str, str]) -> str:
 from app.knowledge_graph.contract import (  # noqa: E402
     STALE_CLASS_EXPECTED_STALE,
     compute_orphan_stats,
+    compute_orphan_stats_by_env,
 )
 from app.knowledge_graph.schema import Service  # noqa: E402
 # Re-exports для legacy-import паттерна (stats_digest._EXPECTED_STALE_*) —
@@ -1495,6 +1496,11 @@ def kg_quality_section(db: Session) -> str:
         # Synthetic (backup-cron'ы, nats-tools, observability-exporters) и
         # expected_stale (DB/headless/system) исключены — они безрёберны by design.
         orphan_stats = compute_orphan_stats(db)
+        # Разрез по средам: агрегат почти целиком описывает связность
+        # эфемерных сквадов (14.08.2026 — 4447 из 4971 узлов scope) и прячет
+        # то, ради чего метрика нужна: прод, где blast radius реально
+        # спрашивают. Замер того же дня: squad 61.7%, prod 13.8%.
+        orphan_by_env = compute_orphan_stats_by_env(db)
     except Exception as e:  # noqa: BLE001 — одна секция выпадает, дайджест живёт
         _tx_clean(db)
         log.warning("stats_digest.kg_quality_failed", error=str(e))
@@ -1506,12 +1512,27 @@ def kg_quality_section(db: Session) -> str:
     edges_str = ", ".join(f"{k}={v}" for k, v in sorted(edges_by_kind.items()))
     synthetic_suffix = f" · synthetic скрыты: `{synthetic}`" if synthetic else ""
 
-    return "\n".join([
+    # Среды в порядке операционной важности, а не по величине: prod первым,
+    # даже если узлов там в тридцать раз меньше, чем в сквадах.
+    env_order = ("prod", "preprod", "preupdate", "squad", "infra/other")
+    env_parts = []
+    for env in env_order:
+        stats = orphan_by_env.get(env)
+        if not stats or not stats["app_scope"]:
+            continue
+        env_parts.append(
+            f"{env} `{stats['orphan']}`/`{stats['app_scope']}` "
+            f"({stats['orphan_pct']:.0f}%)"
+        )
+    lines = [
         "**🧬 KG quality**",
         # Знаменатель — app-scope (real, excl expected_stale), не real_total.
         f"  Services: `{services_total}` · Orphan: `{orphan}`/`{app_scope}` ({pct_orphan}%){synthetic_suffix}",
-        f"  Edges: `{edges_total}` ({edges_str})",
-    ])
+    ]
+    if env_parts:
+        lines.append("  Orphan по средам: " + " · ".join(env_parts))
+    lines.append(f"  Edges: `{edges_total}` ({edges_str})")
+    return "\n".join(lines)
 
 
 def _kubectl_get_deployments_json(namespace: str) -> List[Dict[str, Any]]:

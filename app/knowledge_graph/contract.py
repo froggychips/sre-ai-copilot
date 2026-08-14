@@ -454,6 +454,82 @@ def compute_orphan_stats(db: "Session") -> OrphanStats:
     return {"orphan": int(orphan), "app_scope": int(app_scope), "orphan_pct": orphan_pct}
 
 
+#: Как namespace относится к среде. Порядок важен: первое совпадение выигрывает,
+#: поэтому `preupdate-` и `preprod-` стоят до общего правила.
+ENV_PREFIXES: tuple[tuple[str, str], ...] = (
+    ("prod-", "prod"),
+    ("preprod-", "preprod"),
+    ("preupdate-", "preupdate"),
+    ("squad-", "squad"),
+)
+ENV_OTHER: str = "infra/other"
+
+
+def env_of_namespace(namespace: Optional[str]) -> str:
+    """Среда по имени namespace. Неизвестное → `infra/other`."""
+    ns = (namespace or "").lower()
+    for prefix, env in ENV_PREFIXES:
+        if ns.startswith(prefix):
+            return env
+    return ENV_OTHER
+
+
+def compute_orphan_stats_by_env(db: "Session") -> Dict[str, OrphanStats]:
+    """Тот же orphan, но разрезанный по средам.
+
+    Зачем разрез: агрегат по всему графу вводит в заблуждение, потому что
+    подавляющая часть узлов — эфемерные dev-сквады. Замер 14.08.2026:
+
+        squad        4447 узлов, 61.7% orphan
+        preupdate     191            57.1%
+        preprod       141            52.5%
+        prod          160            13.8%
+        infra/other    32            93.8%
+
+    Общая цифра при этом 59.9% — то есть она почти целиком описывает связность
+    стендов, живущих несколько дней, и прячет главное: на проде, где реально
+    нужен blast radius, orphan уже 13.8%. Цель «снизить orphan» имеет смысл
+    только per-env, иначе она превращается в задачу «дорисовать рёбра сквадам».
+
+    Считаем в Python поверх одного прохода по узлам: сред пять, узлов тысячи —
+    пять отдельных SQL-агрегатов дороже и не атомарны между собой.
+    """
+    from sqlalchemy import text
+
+    params = {
+        "exp": STALE_CLASS_EXPECTED_STALE,
+        "svc_kind": NODE_KIND_SERVICE,
+        "st": EDGE_SERVES_TRAFFIC,
+    }
+    rows = db.execute(text(
+        "SELECT s.namespace, "
+        "       (s.id NOT IN ("
+        "           SELECT src_id FROM kg_service_edges "
+        "           WHERE src_id <> dst_id AND kind <> :st "
+        "           UNION SELECT dst_id FROM kg_service_edges "
+        "           WHERE src_id <> dst_id AND kind <> :st"
+        "       )) AS is_orphan "
+        "FROM kg_services s "
+        "WHERE NOT s.synthetic "
+        "  AND s.node_kind = :svc_kind "
+        "  AND coalesce(s.stale_class, '') <> :exp"
+    ), params).fetchall()
+
+    buckets: Dict[str, OrphanStats] = {}
+    for namespace, is_orphan in rows:
+        env = env_of_namespace(namespace)
+        slot = buckets.setdefault(
+            env, {"orphan": 0, "app_scope": 0, "orphan_pct": None}
+        )
+        slot["app_scope"] += 1
+        if is_orphan:
+            slot["orphan"] += 1
+    for slot in buckets.values():
+        if slot["app_scope"]:
+            slot["orphan_pct"] = round(100.0 * slot["orphan"] / slot["app_scope"], 1)
+    return buckets
+
+
 def owner_known(service: "Service") -> bool:
     """Заполнен ли `team_owner` (не None, не пустая строка, не 'unknown')."""
     owner: Optional[str] = getattr(service, "team_owner", None)
