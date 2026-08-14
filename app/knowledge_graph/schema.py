@@ -12,6 +12,7 @@ from sqlalchemy import (JSON, BigInteger, Boolean, Column, DateTime, Float,
 from sqlalchemy.orm import relationship
 
 from app.database import Base
+from app.knowledge_graph.contract import UQ_KG_SERVICE_NS_NAME_KIND
 
 
 # ── Типы узлов графа ────────────────────────────────────────────────────────
@@ -80,7 +81,10 @@ class Service(Base):
         # node_kind в ключе: Service и workload с одинаковым именем — это
         # РАЗНЫЕ узлы, иначе serves_traffic снова схлопнется в self-loop.
         UniqueConstraint(
-            "namespace", "name", "node_kind", name="uq_kg_service_ns_name_kind",
+            # Имя — из contract.py: тот же литерал читает единственный upsert,
+            # поэтому переименование констрейнта не может разъехаться с
+            # `ON CONFLICT` (регрессия #245).
+            "namespace", "name", "node_kind", name=UQ_KG_SERVICE_NS_NAME_KIND,
         ),
     )
 
