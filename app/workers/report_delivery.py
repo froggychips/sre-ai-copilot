@@ -155,13 +155,61 @@ class ReportDelivery:
             return None
         return pending
 
-    def _update_analysis(
-        self, mutate: Callable[[Dict[str, Any]], None], marker: str
-    ) -> None:
-        """Точечно поправить record.analysis и закоммитить. Best-effort."""
+    def _lock_record(self) -> None:
+        """Взять row-lock на строку инцидента и перечитать её (SELECT … FOR UPDATE).
+
+        Без лока запись маркера — классический read-modify-write по JSON-колонке:
+        прочитали `analysis` целиком, дописали свой ключ, записали целиком.
+        Второй писатель, прочитавший ту же версию, затирает работу первого — и
+        теряется не «лишний» ключ, а, например, `executor_applied`, который
+        служит единственным guard-ом от повторного реального kubectl.
+
+        Параллельный писатель здесь реален: при `acks_late` + redis-брокере
+        задача переотправляется по visibility timeout, и redelivery может
+        начать досылку отчёта, пока прежний воркер ещё дописывает маркер.
+
+        Тот же приём и по тем же причинам применён в `executor_apply.py:245` и
+        в `discord/dedup_store.py`; здесь он до сих пор отсутствовал.
+
+        Именно `refresh`, а не отдельный SELECT в новый объект: перечитывание в
+        новую переменную уже дало дефект — на сессии-моке запрос возвращал не ту
+        строку, и маркер уезжал в пустой `analysis`, затирая `executor_applied`
+        (поймано `test_failed_delivery_marker_survives_analysis_merge`). refresh
+        обновляет ТОТ ЖЕ объект, поэтому identity map остаётся согласованной, а
+        вызывающий продолжает работать с той же записью.
+
+        Побочный и главный эффект: под локом мы видим свежую версию `analysis`,
+        то есть чужие ключи, дописанные параллельным писателем, попадают в нашу
+        копию, а не затираются ею.
+
+        Лок держится до commit/rollback в `_update_analysis`. На SQLite (тесты)
+        `FOR UPDATE` — no-op, поведение не меняется. Любая ошибка здесь
+        проглатывается: маркер важнее лока, и терять его из-за недоступного
+        `SELECT … FOR UPDATE` нельзя.
+        """
         if self.record is None:
             return
         try:
+            self.db.refresh(self.record, with_for_update=True)
+        except Exception as e:  # noqa: BLE001 — лок best-effort, маркер важнее
+            logger.debug(
+                "pipeline.report_marker_lock_skipped",
+                incident_id=self.incident_id,
+                error=type(e).__name__,
+            )
+
+    def _update_analysis(
+        self, mutate: Callable[[Dict[str, Any]], None], marker: str
+    ) -> None:
+        """Точечно поправить record.analysis под row-lock и закоммитить.
+
+        Best-effort: маркер — служебная запись поверх уже закоммиченного
+        терминального состояния, и её неудача не должна ронять разбор.
+        """
+        if self.record is None:
+            return
+        try:
+            self._lock_record()
             current = self.record.analysis
             analysis = dict(current) if isinstance(current, dict) else {}
             mutate(analysis)
