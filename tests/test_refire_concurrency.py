@@ -284,3 +284,37 @@ def test_retriable_exc_tuple_is_shared_with_autoretry():
     assert ConnectionError in RETRIABLE_EXC
     # Same object drives Celery's autoretry_for → cannot drift.
     assert process_incident_task.autoretry_for == RETRIABLE_EXC
+
+
+def test_report_delivery_pending_is_retriable_by_celery():
+    """Недоставленный отчёт обязан ретраиться — проверяем связь напрямую.
+
+    `ReportDeliveryPending` наследует `ConnectionError` именно ради попадания в
+    `RETRIABLE_EXC`, и до сих пор это держалось на комментарии: тест проверял
+    лишь то, что `ConnectionError` в кортеже. Если завтра исключение
+    перевесят на другого предка (или заведут свой базовый класс для
+    бизнес-ошибок), Celery перестанет ретраить доставку, а инцидент останется
+    с живым `report_pending` навсегда — молча.
+    """
+    from app.workers.report_delivery import ReportDeliveryPending
+    from app.workers.tasks import RETRIABLE_EXC, process_incident_task
+
+    exc = ReportDeliveryPending("отчёт не доставлен")
+    assert isinstance(exc, RETRIABLE_EXC), (
+        "ReportDeliveryPending выпал из retriable-набора: доставка отчёта "
+        "перестанет повторяться после смерти воркера"
+    )
+    assert isinstance(exc, process_incident_task.autoretry_for)
+
+
+def test_pipeline_stage_timeout_is_not_retriable():
+    """Обратная сторона того же контракта: намеренный cap НЕ ретраится.
+
+    Иначе стадийный таймаут пережигал бы LLM-бюджет трижды подряд — ровно то,
+    ради чего `PipelineStageTimeout` намеренно не наследует `TimeoutError`
+    (на 3.11+ тот является подклассом `OSError`, а `OSError` в RETRIABLE_EXC).
+    """
+    from app.workers.pipeline import PipelineStageTimeout
+    from app.workers.tasks import RETRIABLE_EXC
+
+    assert not isinstance(PipelineStageTimeout("cap"), RETRIABLE_EXC)

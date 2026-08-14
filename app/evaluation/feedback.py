@@ -43,7 +43,15 @@ async def submit_feedback(
     }
     record.is_accepted = "ACCEPTED" if feedback.is_accepted else "REJECTED"
 
-    db.commit()
+    try:
+        db.commit()
+    except Exception:
+        # Явный rollback, а не расчёт на то, что get_db закроет сессию: пока
+        # исключение летит наверх, сессия остаётся в грязном состоянии, и любой
+        # код в том же запросе (обработчик ошибки, middleware) получил бы
+        # InFailedSqlTransaction вместо осмысленной 500-ки.
+        db.rollback()
+        raise
     return {
         "status": "recorded",
         "incident_id": incident_id,
