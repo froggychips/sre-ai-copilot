@@ -18,7 +18,8 @@ from typing import Any, Dict, Optional
 import structlog
 from sqlalchemy.orm import Session
 
-from app.knowledge_graph.contract import UQ_KG_SERVICE_NS_NAME_KIND
+from app.knowledge_graph.contract import (UQ_KG_SERVICE_NS_NAME_KIND,
+                                          owner_source_valid)
 from app.knowledge_graph.schema import (NODE_KIND_SERVICE, AlertEvent,
                                         Deployment, PodEvent, Service,
                                         ServiceEdge)
@@ -39,6 +40,7 @@ def upsert_service(
     synthetic: Optional[bool] = None,
     node_kind: str = NODE_KIND_SERVICE,
     stale_class: Optional[str] = None,
+    owner_source: Optional[str] = None,
 ) -> Service:
     """Idempotent upsert узла графа — ЕДИНСТВЕННЫЙ путь записи kg_services.
 
@@ -47,6 +49,12 @@ def upsert_service(
     (#245): вторая ссылалась на удалённый констрейнт, kg_topology_sync падал на
     каждом namespace, services=0 сутки. Теперь второй путь — тонкая обёртка
     вокруг этого, а имя констрейнта берётся из contract.
+
+    `owner_source` (contract 2.6) — откуда взят `team_owner`. Пишется только
+    вместе с самим владельцем: источник без владельца бессмыслен, а владелец
+    без источника — это уже 12 577 существующих строк, у которых провенанс
+    неизвестен. Неизвестное значение отбрасывается с warning, чтобы опечатка
+    не завела в графе седьмой «источник».
 
     `node_kind` различает k8s Service, workload (Deployment/StatefulSet/
     DaemonSet) и synthetic ingress-узлы. Дефолт 'service' — так все прежние
@@ -57,14 +65,20 @@ def upsert_service(
     race condition при параллельных worker'ах.
     На других диалектах (SQLite в тестах) — старый SELECT+INSERT.
     """
+    if owner_source is not None and not owner_source_valid(owner_source):
+        logger.warning(
+            "kg.owner_source_unknown",
+            namespace=namespace, name=name, owner_source=owner_source,
+        )
+        owner_source = None
     if _is_postgresql(db):
         return _upsert_service_pg(
             db, namespace, name, team_owner, metadata, synthetic, node_kind,
-            stale_class,
+            stale_class, owner_source,
         )
     return _upsert_service_fallback(
         db, namespace, name, team_owner, metadata, synthetic, node_kind,
-        stale_class,
+        stale_class, owner_source,
     )
 
 
@@ -77,6 +91,7 @@ def _upsert_service_pg(
     synthetic: Optional[bool],
     node_kind: str = NODE_KIND_SERVICE,
     stale_class: Optional[str] = None,
+    owner_source: Optional[str] = None,
 ) -> Service:
     from sqlalchemy.dialects.postgresql import insert as pg_insert
 
@@ -86,6 +101,7 @@ def _upsert_service_pg(
         "name": name,
         "node_kind": node_kind,
         "team_owner": team_owner,
+        "owner_source": owner_source,
         "metadata_json": metadata,
         "synthetic": bool(synthetic) if synthetic is not None else False,
         "stale_class": stale_class,
@@ -95,6 +111,9 @@ def _upsert_service_pg(
     set_clause: Dict[str, Any] = {"updated_at": now}
     if team_owner:
         set_clause["team_owner"] = team_owner
+        # Источник переписываем только вместе с владельцем: иначе у строки
+        # остался бы провенанс от предыдущего, уже перезаписанного значения.
+        set_clause["owner_source"] = owner_source
     # stale_class обновляем только когда вызывающий его посчитал: None здесь
     # означает «не знаю», а не «сбросить в NULL» (иначе topology-sync стирал бы
     # expected_stale, выставленный другим источником).
@@ -149,6 +168,7 @@ def _upsert_service_fallback(
     synthetic: Optional[bool],
     node_kind: str = NODE_KIND_SERVICE,
     stale_class: Optional[str] = None,
+    owner_source: Optional[str] = None,
 ) -> Service:
     svc = (
         db.query(Service)
@@ -165,6 +185,7 @@ def _upsert_service_fallback(
             name=name,
             node_kind=node_kind,
             team_owner=team_owner,
+            owner_source=owner_source,
             metadata_json=metadata,
             synthetic=bool(synthetic) if synthetic is not None else False,
             stale_class=stale_class,
@@ -176,6 +197,7 @@ def _upsert_service_fallback(
         changed = False
         if team_owner and svc.team_owner != team_owner:
             svc.team_owner = team_owner
+            svc.owner_source = owner_source
             changed = True
         # None = «вызывающий не считал», а не «сбросить» — зеркалит PG-путь.
         if stale_class is not None and svc.stale_class != stale_class:
