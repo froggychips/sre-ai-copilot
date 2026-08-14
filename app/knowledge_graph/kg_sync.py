@@ -21,14 +21,13 @@ from typing import Any, Dict, List, Optional, Tuple, cast
 
 from sqlalchemy import cast as sa_cast
 from sqlalchemy.dialects.postgresql import JSONB
-from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.orm import Session
 
 from app.knowledge_graph.edge_decay_guard import (
     REASON_UNMAPPED_KIND, SOURCE_KG_SYNC, edge_block_reason, record_source_run,
     unhealthy_sources,
 )
-from app.knowledge_graph.populator import upsert_edge
+from app.knowledge_graph.populator import upsert_edge, upsert_service
 from app.knowledge_graph.schema import NODE_KIND_SERVICE, Deployment, Service, ServiceEdge
 from app.knowledge_graph.stale_classifier import (
     classify_stale_with_deploys,
@@ -735,95 +734,30 @@ def _upsert_service_pg(
     synthetic: Optional[bool] = None,
     stale_class: Optional[str] = None,
 ) -> Service:
-    """PG-нативный UPSERT для kg_services.
+    """Upsert логического сервиса — тонкая обёртка над единственным writer-ом.
 
-    INSERT IF NOT EXISTS из populator.upsert_service не апдейтил уже
-    существующие строки — labels/team_owner/metadata дрейфили месяцами.
-    Здесь делаем `INSERT ... ON CONFLICT (namespace, name) DO UPDATE` —
-    обновляем team_owner / metadata_json / updated_at при каждом sync.
+    Раньше здесь лежала ВТОРАЯ копия `INSERT … ON CONFLICT` со своим литералом
+    имени констрейнта. Копии разъехались при переходе на трёхколоночный ключ
+    (миграция 20260807_0200, #245): здешний `ON CONFLICT` сослался на удалённое
+    имя, и kg_topology_sync падал на КАЖДОМ namespace — 79 ошибок за тик,
+    services=0, граф по сервисам не обновлялся сутки. Merge-политика metadata,
+    правила synthetic и stale_class при этом всё время дублировались «зеркально»
+    — то есть расхождение было вопросом времени и в остальных полях.
 
-    Поля:
-      - created_at: только на insert (server default), не апдейтим.
-      - updated_at: всегда now() на update.
-      - synthetic: обновляем ТОЛЬКО если новое значение False (сервис стал
-        реальным — был synthetic, перестал). Обратной деградации не делаем,
-        чтобы случайное упущение в `_is_synthetic_service` не стёрло флаг.
-
-    Требует UNIQUE constraint `uq_kg_service_ns_name_kind` на
-    (namespace, name, node_kind) — он есть в schema.py (см.
-    Service.__table_args__) и создаётся миграцией 20260807_0200.
+    Функция сохранена (её зовут пять мест в этом модуле) и фиксирует ровно одно:
+    этот путь заводит ТОЛЬКО логические сервисы, node_kind=service. Workload-узлы
+    создаёт k8s_topology_resources_sync своим вызовом того же writer-а.
     """
-    now = datetime.utcnow()
-    values = {
-        "namespace": namespace,
-        "name": name,
-        # Этот путь заводит ТОЛЬКО логические сервисы; workload-узлы создаёт
-        # k8s_topology_resources_sync. Указываем явно, а не полагаемся на
-        # server_default, чтобы ON CONFLICT работал по всем трём колонкам.
-        "node_kind": NODE_KIND_SERVICE,
-        "team_owner": team_owner,
-        "metadata_json": metadata,
-        "synthetic": bool(synthetic) if synthetic is not None else False,
-        "stale_class": stale_class,
-        "created_at": now,
-        "updated_at": now,
-    }
-
-    # Set-клауза: обновляем только то что реально меняется в sync-е.
-    # team_owner — берём новый если задан (COALESCE для случая когда вызов
-    # передал None — оставить существующий).
-    set_clause: Dict[str, Any] = {
-        "updated_at": now,
-    }
-    if team_owner is not None:
-        set_clause["team_owner"] = team_owner
-    # metadata_json НЕ в set_clause: полный overwrite стирал ключи других
-    # источников (auto_populator, drift_cleanup, topology-sync). Merge —
-    # ниже в Python, зеркалит populator._upsert_service_pg.
-    # synthetic: апдейтим только если новое значение False (стал реальным).
-    if synthetic is False:
-        set_clause["synthetic"] = False
-    if stale_class is not None:
-        set_clause["stale_class"] = stale_class
-
-    stmt = (
-        pg_insert(Service.__table__)
-        .values(**values)
-        .on_conflict_do_update(
-            # Имя изменено миграцией 20260807_0200: ключ стал трёхколоночным
-            # (namespace, name, node_kind). Здесь ВТОРАЯ копия upsert-логики
-            # (первая — populator._upsert_service_pg), и при вводе node_kind
-            # её пропустили: ON CONFLICT ссылался на удалённый констрейнт, и
-            # kg_topology_sync падал на КАЖДОМ namespace — 79 ошибок за тик,
-            # services=0, граф по сервисам не обновлялся сутки.
-            constraint="uq_kg_service_ns_name_kind",
-            set_=set_clause,
-        )
-        .returning(Service.__table__.c.id)
+    return upsert_service(
+        db,
+        namespace=namespace,
+        name=name,
+        team_owner=team_owner,
+        metadata=metadata,
+        synthetic=synthetic,
+        node_kind=NODE_KIND_SERVICE,
+        stale_class=stale_class,
     )
-    result = db.execute(stmt)
-    row = result.first()
-    # ORM-объект нужен для downstream upsert_edge (использует svc.id).
-    # populate_existing — identity-map мог держать stale-инстанс после
-    # Core-upsert-а.
-    svc = (
-        db.query(Service)
-        .filter_by(namespace=namespace, name=name, node_kind=NODE_KIND_SERVICE)
-        .populate_existing()
-        .one()
-    )
-    if metadata is not None:
-        existing_meta: Dict[str, Any] = (
-            svc.metadata_json if isinstance(svc.metadata_json, dict) else {}
-        )
-        merged = dict(existing_meta)
-        merged.update(metadata)
-        if merged != existing_meta:
-            svc.metadata_json = cast(Any, merged)
-    if row is not None:
-        # flush чтобы downstream видели обновления в этой транзакции.
-        db.flush()
-    return svc
 
 
 def _known_db_node_namespaces(db: Session) -> Dict[str, str]:
