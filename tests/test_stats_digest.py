@@ -635,6 +635,7 @@ def test_kg_quality_renders_full_state():
        4. synthetic .scalar
        5. compute_orphan_stats → app_scope .scalar
        6. compute_orphan_stats → orphan .scalar
+       7. compute_orphan_stats_by_env → (namespace, is_orphan) .fetchall
     """
     db = MagicMock()
     call_results = [
@@ -644,6 +645,11 @@ def test_kg_quality_renders_full_state():
         MagicMock(scalar=lambda: 82),   # synthetic
         MagicMock(scalar=lambda: 302),  # compute_orphan_stats: app_scope
         MagicMock(scalar=lambda: 47),   # compute_orphan_stats: orphan
+        MagicMock(fetchall=lambda: [   # разрез по средам
+            ("prod-kingdom1", False), ("prod-kingdom1", False),
+            ("squad-1", True), ("squad-2", True), ("squad-3", False),
+            ("mcp", True),
+        ]),
     ]
     db.execute.side_effect = call_results
 
@@ -657,6 +663,12 @@ def test_kg_quality_renders_full_state():
     # Team-owned строка убрана (всегда 100% после KG team_owner enrichment) —
     # она была шумом, занимала самую длинную строку в digest.
     assert "Team-owned" not in rendered
+    # Разрез по средам: prod первым, даже если узлов там меньше всех — агрегат
+    # почти целиком описывает сквады и прячет состояние прода.
+    assert "Orphan по средам:" in rendered
+    assert "prod `0`/`2` (0%)" in rendered
+    assert "squad `2`/`3` (67%)" in rendered
+    assert rendered.index("prod `0`") < rendered.index("squad `2`")
 
 
 def test_kg_quality_no_synthetic_no_suffix():
@@ -669,6 +681,7 @@ def test_kg_quality_no_synthetic_no_suffix():
         MagicMock(scalar=lambda: 0),    # synthetic = 0
         MagicMock(scalar=lambda: 100),  # compute_orphan_stats: app_scope
         MagicMock(scalar=lambda: 10),   # compute_orphan_stats: orphan
+        MagicMock(fetchall=lambda: [("squad-1", True)]),
     ]
     rendered = stats_digest.kg_quality_section(db)
     assert "synthetic скрыты" not in rendered

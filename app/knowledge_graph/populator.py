@@ -18,7 +18,8 @@ from typing import Any, Dict, Optional
 import structlog
 from sqlalchemy.orm import Session
 
-from app.knowledge_graph.contract import owner_source_valid
+from app.knowledge_graph.contract import (UQ_KG_SERVICE_NS_NAME_KIND,
+                                          owner_source_valid)
 from app.knowledge_graph.schema import (NODE_KIND_SERVICE, AlertEvent,
                                         Deployment, PodEvent, Service,
                                         ServiceEdge)
@@ -38,9 +39,16 @@ def upsert_service(
     metadata: Optional[Dict[str, Any]] = None,
     synthetic: Optional[bool] = None,
     node_kind: str = NODE_KIND_SERVICE,
+    stale_class: Optional[str] = None,
     owner_source: Optional[str] = None,
 ) -> Service:
-    """Idempotent upsert узла графа.
+    """Idempotent upsert узла графа — ЕДИНСТВЕННЫЙ путь записи kg_services.
+
+    До 14.08.2026 путей было два: этот и `kg_sync._upsert_service_pg` со своей
+    копией `ON CONFLICT`. Копии разъехались при переходе на трёхколоночный ключ
+    (#245): вторая ссылалась на удалённый констрейнт, kg_topology_sync падал на
+    каждом namespace, services=0 сутки. Теперь второй путь — тонкая обёртка
+    вокруг этого, а имя констрейнта берётся из contract.
 
     `owner_source` (contract 2.6) — откуда взят `team_owner`. Пишется только
     вместе с самим владельцем: источник без владельца бессмыслен, а владелец
@@ -66,11 +74,11 @@ def upsert_service(
     if _is_postgresql(db):
         return _upsert_service_pg(
             db, namespace, name, team_owner, metadata, synthetic, node_kind,
-            owner_source,
+            stale_class, owner_source,
         )
     return _upsert_service_fallback(
         db, namespace, name, team_owner, metadata, synthetic, node_kind,
-        owner_source,
+        stale_class, owner_source,
     )
 
 
@@ -82,6 +90,7 @@ def _upsert_service_pg(
     metadata: Optional[Dict[str, Any]],
     synthetic: Optional[bool],
     node_kind: str = NODE_KIND_SERVICE,
+    stale_class: Optional[str] = None,
     owner_source: Optional[str] = None,
 ) -> Service:
     from sqlalchemy.dialects.postgresql import insert as pg_insert
@@ -95,6 +104,7 @@ def _upsert_service_pg(
         "owner_source": owner_source,
         "metadata_json": metadata,
         "synthetic": bool(synthetic) if synthetic is not None else False,
+        "stale_class": stale_class,
         "created_at": now,
         "updated_at": now,
     }
@@ -104,6 +114,11 @@ def _upsert_service_pg(
         # Источник переписываем только вместе с владельцем: иначе у строки
         # остался бы провенанс от предыдущего, уже перезаписанного значения.
         set_clause["owner_source"] = owner_source
+    # stale_class обновляем только когда вызывающий его посчитал: None здесь
+    # означает «не знаю», а не «сбросить в NULL» (иначе topology-sync стирал бы
+    # expected_stale, выставленный другим источником).
+    if stale_class is not None:
+        set_clause["stale_class"] = stale_class
     # metadata_json НЕ кладём в set_clause: полный overwrite стирал ключи
     # других источников (auto_populator пишет app/component/version,
     # drift_cleanup — drift_marked_at, topology-sync — k8s_service).
@@ -116,7 +131,7 @@ def _upsert_service_pg(
         pg_insert(Service.__table__)
         .values(**values)
         .on_conflict_do_update(
-            constraint="uq_kg_service_ns_name_kind",
+            constraint=UQ_KG_SERVICE_NS_NAME_KIND,
             set_=set_clause,
         )
         .returning(Service.__table__.c.id)
@@ -152,6 +167,7 @@ def _upsert_service_fallback(
     metadata: Optional[Dict[str, Any]],
     synthetic: Optional[bool],
     node_kind: str = NODE_KIND_SERVICE,
+    stale_class: Optional[str] = None,
     owner_source: Optional[str] = None,
 ) -> Service:
     svc = (
@@ -172,6 +188,7 @@ def _upsert_service_fallback(
             owner_source=owner_source,
             metadata_json=metadata,
             synthetic=bool(synthetic) if synthetic is not None else False,
+            stale_class=stale_class,
         )
         db.add(svc)
         db.flush()
@@ -181,6 +198,10 @@ def _upsert_service_fallback(
         if team_owner and svc.team_owner != team_owner:
             svc.team_owner = team_owner
             svc.owner_source = owner_source
+            changed = True
+        # None = «вызывающий не считал», а не «сбросить» — зеркалит PG-путь.
+        if stale_class is not None and svc.stale_class != stale_class:
+            svc.stale_class = stale_class
             changed = True
         if metadata is not None:
             # Merge, не overwrite — сохраняем ключи других источников
