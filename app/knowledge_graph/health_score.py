@@ -30,7 +30,8 @@ Score [0, 1], 1.0 = perfect health, 0.0 = down/broken. Деривируется
 (graceful degradation, не penalty).
 
 ⚠️ ОГРАНИЧЕНИЕ (частично закрыто 2026-06-10): `p95 latency` и `http_5xx_rate`
-в `kg_service_health` **всё ещё всегда 0** — app `/metrics` (Kestrel) закрыт
+в `kg_service_health` **пишутся как NULL** (не 0 — проверено 14.08.2026 на
+2.8 млн строк за 10 суток) — app `/metrics` (Kestrel) закрыт
 JWT-middleware, скрейпа нет (бэкенд-тикет WO-12483). Ingress-часть закрыта:
 nginx-ingress метрики собираются по всем окружениям, per-host/path 5xx и
 latency живут в `kg_ingress_observations` — но это другой разрез (endpoint,
@@ -105,7 +106,7 @@ _SLO_BURN_WEIGHT_PER_PCT = 0.01
 
 # Ingress-derived 5xx (kg_ingress_observations.error_5xx_rate — 5xx запросов/сек
 # на ingress-границе сервиса). Живой источник (nginx-ingress) в отличие от
-# per-service kg_service_health.http_5xx_rate (закрыт JWT, WO-12483, всегда 0).
+# per-service kg_service_health.http_5xx_rate (закрыт JWT, WO-12483, NULL).
 # Меряет трафик НА ГРАНИЦЕ, поэтому отдельный компонент, а не подмена.
 _INGRESS_5XX_TRIGGER_RPS = 0.05    # < 0.05 rps 5xx = шум, не штрафуем
 _INGRESS_5XX_WEIGHT = 1.0          # 0.30 rps over → 0.30 → capped 0.25
