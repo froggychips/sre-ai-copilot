@@ -102,6 +102,15 @@ NODE_KIND_WORKLOAD: str = "workload"
 NODE_KIND_INGRESS: str = "ingress"
 NODE_KINDS: Set[str] = {NODE_KIND_SERVICE, NODE_KIND_WORKLOAD, NODE_KIND_INGRESS}
 
+#: Имя UNIQUE-констрейнта узла графа — (namespace, name, node_kind).
+#: Литерал этого имени раньше жил в ДВУХ независимых `ON CONFLICT` (populator и
+#: kg_sync). При переходе на трёхколоночный ключ (миграция 20260807_0200) вторую
+#: копию пропустили: `ON CONFLICT` сослался на удалённый констрейнт, и
+#: kg_topology_sync падал на КАЖДОМ namespace — 79 ошибок за тик, services=0,
+#: граф по сервисам не обновлялся сутки (#245). Имя объявляется здесь, а
+#: `schema.py` и единственный upsert берут его отсюда: разъехаться больше нечему.
+UQ_KG_SERVICE_NS_NAME_KIND: str = "uq_kg_service_ns_name_kind"
+
 #: Node kinds для `kg_volume_edges` (PR #84, k8s_storage_sync). Это
 #: heterogeneous-граф: src/dst могут быть из `kg_services` ИЛИ из
 #: `kg_storage_volumes`. Поэтому отдельный namespacing от SERVICE_KINDS.
