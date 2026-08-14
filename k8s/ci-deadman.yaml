@@ -59,8 +59,13 @@ spec:
           labels:
             app: ci-deadman
         spec:
-          # SA по умолчанию: канарейке не нужен k8s API вообще, только
-          # исходящий HTTPS к api.github.com и discord.com.
+          # SA sre-ai нужен РОВНО ради imagePullSecrets: образ лежит во
+          # внутреннем реестре, а pull-secret привязан к этому ServiceAccount
+          # (не к подам). Без него под уходит на SA default и падает в
+          # ImagePullBackOff — проверено при первом развёртывании 14.08.2026.
+          # Токен при этом НЕ монтируется: k8s API канарейке не нужен, ей
+          # нужен только исходящий HTTPS к api.github.com и discord.com.
+          serviceAccountName: sre-ai
           automountServiceAccountToken: false
           restartPolicy: Never
           securityContext:
