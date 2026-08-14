@@ -1,6 +1,6 @@
 # KG Schema / Quality Contract
 
-> **Версия контракта:** `kg_schema: 2.3`
+> **Версия контракта:** `kg_schema: 2.5`
 > **Дата:** 2026-06-10 (doc-update: `kg_ingress_observations` наполняется — §6.6;
 > уточнены consumer caveats §7.5: причина нулей `http_5xx`/`p95` в
 > `kg_service_health` — только app `/metrics` за JWT, не ingress-метрики)
@@ -72,6 +72,12 @@ KG_SCHEMA_VERSION = "2.5"
 * `node_kind='workload'` — Deployment / StatefulSet / DaemonSet. Заводится
   синком топологии, `team_owner` наследует от своего Service.
 * `node_kind='ingress'` — synthetic-узлы `ingress:<name>` / `ingress:<host>`.
+  **Объявлен, но не используется**: на 14.08.2026 в графе 0 таких узлов при
+  1672 рёбрах `routes_to` — маршрутизация висит на `service`-узлах. То есть
+  тип пока декларативный; consumer'ам не на что фильтроваться, а фильтр
+  `node_kind='ingress'` вернёт пусто, а не «ингрессов нет». Либо завести
+  узлы (тогда `routes_to` перевесить на них), либо убрать тип из контракта —
+  ровно та же развилка, что была у `serves_traffic` до 2.4.
 
 Уникальный ключ: `(namespace, name, node_kind)` — `uq_kg_service_ns_name_kind`.
 
@@ -383,7 +389,7 @@ Target `orphan_rate_max_pct = 10.0` пока **не достигнут** — э�
 
 | Сигнал | Ограничение | Как трактовать |
 |---|---|---|
-| `kg_service_health.http_5xx_rate`, `p95_latency_ms` | По-прежнему **всегда 0** (на 2026-06-10) — app `/metrics` ASP.NET-сервисов закрыт JWT (401), скрейпа нет. Бэкенд-тикет **WO-12483**; после раскатки поля оживут (через VMServiceScrape на app-ns). Ingress-метрики тут НЕ причина — они собираются (см. §6.6). | `0` = **«нет данных»**, НЕ «нет ошибок / быстро». Не делать вывод о user-facing impact. Per-host/path HTTP-сигнал смотреть в `kg_ingress_observations`. |
+| `kg_service_health.http_5xx_rate`, `p95_latency_ms` | **NULL, а не 0** (проверено 14.08.2026: 2 824 728 строк за 10 суток, нулей — ноль). Источника по-прежнему нет: app `/metrics` ASP.NET-сервисов закрыт JWT (401), бэкенд-тикет **WO-12483**; после раскатки VMServiceScrape поля оживут. Ingress-метрики тут НЕ причина — они собираются (см. §6.6). | `NULL` = «нет данных» и читается как таковое любым агрегатом (`avg`/`max` его пропускают). Прежняя формулировка «всегда 0» устарела и была опасной: `0` в RED-метрике читается как «нет ошибок / быстро». Per-host/path HTTP-сигнал — в `kg_ingress_observations`. |
 | `kg_ingress_observations` (`p95`/`p99`/`rps`/`4xx`/`5xx`) | Наполняется с 2026-06-10 (nginx-ingress метрики на обоих DS + VMPodScrape honorLabels). Endpoint-разрез (host/path), **НЕ per-service агрегат**. | `error_5xx_rate=0` при ненулевых `rps`/`p95` = реально **«ошибок нет»** (данные есть). Отсутствие ряда = нет данных по endpoint'у. |
 | `kg_services.health_score` | Формула включает 5xx/p95 из `kg_service_health`, но они =0 (app `/metrics` за JWT, WO-12483) → компоненты не срабатывают. Фактически инфра-прокси: alerts + pod_events + deploy/slo aggregates. | Высокий score = «инфра/события в норме», **НЕ «нет 5xx»**. Не «здоровье для пользователя». |
 | Отсутствие edge (`kg_service_edges`) | Топология неполна (prod-app ~82%, dev меньше); WO общается через NATS/Orleans, не только HTTP. | Отсутствие ребра **≠ «нет зависимости»**. Edge есть → зависимость реальна; нет → неизвестно. |
