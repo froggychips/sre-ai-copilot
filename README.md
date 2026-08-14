@@ -348,6 +348,7 @@ See [docs/RUNBOOK.md → Executor incidents](docs/RUNBOOK.md#executor-incidents)
 | FAQ | [FAQ.md](docs/FAQ.md) | [FAQ.ru.md](docs/FAQ.ru.md) |
 | DR plan | [DR.md](docs/DR.md) | — |
 | Golden eval set | [tests/golden/README.md](tests/golden/README.md) | — |
+| KG orphan R&D | [docs/KG_ORPHAN_RND.md](docs/KG_ORPHAN_RND.md) | — |
 | Changelog | [CHANGELOG.md](CHANGELOG.md) | — |
 
 ### sre-ai-copilot vs froggy-sre
@@ -682,4 +683,5 @@ Executor-трек **сделан и закрыт за явные opt-in флаг
 | FAQ | [FAQ.md](docs/FAQ.md) | [FAQ.ru.md](docs/FAQ.ru.md) |
 | DR Plan | [DR.md](docs/DR.md) | — |
 | Golden eval set | [tests/golden/README.md](tests/golden/README.md) | — |
+| KG orphan R&D | [docs/KG_ORPHAN_RND.md](docs/KG_ORPHAN_RND.md) | — |
 | Changelog | [CHANGELOG.md](CHANGELOG.md) | — |
