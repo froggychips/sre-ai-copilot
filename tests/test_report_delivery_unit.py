@@ -262,12 +262,26 @@ def test_silent_severities_are_not_routeable():
     assert severity_routeable(None) is False
 
 
-def test_broken_routing_helper_defaults_to_routeable(monkeypatch):
+def test_missing_routing_helper_defaults_to_routeable(monkeypatch):
     """Хелпер сервиса недоступен → лишний ретрай лучше похороненного разбора."""
     import app.services.discord.routing as routing
 
+    monkeypatch.delattr(routing, "_should_route_to_error")
+    assert severity_routeable("info") is True
+
+
+def test_unexpected_error_in_routing_helper_is_not_swallowed(monkeypatch):
+    """А вот ошибка ВНУТРИ хелпера обязана лететь наверх.
+
+    Раньше здесь стоял широкий `except Exception`, и NameError/TypeError после
+    рефакторинга молча превращали severity-gate в «всё routeable»: info-алерты
+    начали бы ретраиться как недоставленные. Такую поломку лучше видеть сразу.
+    """
+    import app.services.discord.routing as routing
+
     def boom(_severity):
-        raise RuntimeError("routing module broken")
+        raise TypeError("сигнатура helper-а изменилась")
 
     monkeypatch.setattr(routing, "_should_route_to_error", boom)
-    assert severity_routeable("info") is True
+    with pytest.raises(TypeError):
+        severity_routeable("info")
