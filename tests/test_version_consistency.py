@@ -105,6 +105,11 @@ def test_released_versions_have_tags():
         s for s in sections
         if s.lower() != "unreleased" and s.startswith("1.")
     ]
+    # Текущую версию из проверки исключаем: тег ставится ПОСЛЕ мержа
+    # релизного коммита, иначе получается курица-яйцо — тест требует тег,
+    # который физически нельзя создать до появления коммита в master.
+    # Все предыдущие релизы обязаны быть закрыты тегом.
+    releases = [r for r in releases if r != __version__]
 
     try:
         out = subprocess.run(
