@@ -15,6 +15,7 @@ from app.services.audit_logger import audit_service
 from app.services.telemetry_utils import incident_span
 from app.telemetry import setup_telemetry
 from app.workers.pipeline import IncidentPipeline, transition_to
+from app.workers.task_lock import single_instance
 
 setup_telemetry(service_name="copilot-worker")
 
@@ -530,6 +531,7 @@ async def async_process_incident(
 
 
 @celery_app.task(name="kg_topology_sync")
+@single_instance(ttl_seconds=3600)
 def kg_topology_sync_task():
     from app.knowledge_graph.kg_sync import sync_topology
 
@@ -546,6 +548,7 @@ def kg_topology_sync_task():
 
 
 @celery_app.task(name="k8s_pod_events_sync")
+@single_instance(ttl_seconds=1800)
 def k8s_pod_events_sync_task():
     """A4: pull Warning k8s-events → kg_pod_events. БЕЗ LLM."""
     from app.knowledge_graph.k8s_events_sync import sync_all_events
@@ -559,6 +562,7 @@ def k8s_pod_events_sync_task():
 
 
 @celery_app.task(name="kg_ingress_sync")
+@single_instance(ttl_seconds=1800)
 def kg_ingress_sync_task():
     """Phase 3-B: sync k8s Ingress → external entrypoint edges."""
     from app.knowledge_graph.k8s_ingress_sync import sync_all_ingresses
@@ -574,6 +578,7 @@ def kg_ingress_sync_task():
 
 
 @celery_app.task(name="kg_topology_resources_sync")
+@single_instance(ttl_seconds=3600)
 def kg_topology_resources_sync_task():
     """Wave 7 / G1.3: declarative k8s Service + Ingress resources → KG.
 
@@ -619,6 +624,7 @@ def kg_jobs_sync_task():
 
 
 @celery_app.task(name="kg_storage_sync")
+@single_instance(ttl_seconds=1800)
 def kg_storage_sync_task():
     """KG Coverage #2: sync PVC + PV + uses_volume/bound_to edges.
 
@@ -906,6 +912,7 @@ def chronic_alerts_digest_task():
 
 
 @celery_app.task(name="kg_metrics_sync")
+@single_instance(ttl_seconds=1800)
 def kg_metrics_sync_task():
     """Per-service метрики из VM → kg_service_health (snapshot per ~10 мин)."""
     from app.knowledge_graph.metrics_sync import sync_service_health
@@ -967,6 +974,7 @@ def kg_signal_aggregates_compute_task():
 
 
 @celery_app.task(name="kg_anomaly_detection_task")
+@single_instance(ttl_seconds=1800)
 def kg_anomaly_detection_task():
     """Rolling z-score аномалии по kg_service_health → kg_anomaly_observations.
 
@@ -1265,6 +1273,7 @@ async def _kg_stuck_alerts_logic() -> dict:
 
 
 @celery_app.task(name="kg_seq_logs_sync")
+@single_instance(ttl_seconds=1800)
 def kg_seq_logs_sync_task():
     """Error/Fatal логи из Seq → kg_log_observations (per ~10 мин).
 
@@ -1324,6 +1333,7 @@ def kg_statics_versions_sync_task():
 
 
 @celery_app.task(name="kg_nats_subjects_sync")
+@single_instance(ttl_seconds=3600)
 def kg_nats_subjects_sync_task():
     """Wave 7-Z: парсер NATS subjects из исходников WO monorepo.
 
@@ -1460,6 +1470,13 @@ def _record_beat_heartbeat(sender=None, task_id=None, task=None, state=None, **k
         if isinstance(retval, dict) and (
             retval.get("error") is not None or retval.get("status") == "error"
         ):
+            return
+        # Прогон пропущен singleton-локом (предыдущий экземпляр ещё идёт) —
+        # это НЕ выполнение. Записать heartbeat означало бы отрапортовать
+        # «синк живой» ровно в тот момент, когда он завис: deadman в
+        # self_health смотрит именно на этот ключ.
+        from app.workers.task_lock import is_skipped
+        if is_skipped(retval):
             return
         # Lazy import — stats_digest тяжеловат на boot.
         from app.services.stats_digest import _record_task_heartbeat
