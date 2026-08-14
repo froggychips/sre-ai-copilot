@@ -62,7 +62,7 @@ METRICS: Tuple[str, ...] = (
 
 # Лог-производный app-сигнал (consumer для log_error_rate, см. queries.py).
 # Отдельная метрика поверх kg_log_observations — НЕ из ServiceHealth, т.к.
-# http_5xx/p95 там всегда 0 (app /metrics за JWT, WO-12483), а лог-ошибки есть.
+# http_5xx/p95 там NULL (app /metrics за JWT, WO-12483), а лог-ошибки есть.
 # Семантика: всплеск Error/Fatal-логов сервиса относительно его ЖЕ типичного
 # объёма ошибок (НЕ HTTP 5xx). Это proxy — помечаем в extras.
 LOG_ERROR_METRIC = "log_error_rate"
@@ -426,7 +426,7 @@ def _detect_log_errors_for_service(
 
     Ограничение v1: «впервые ошибся» (пустой baseline / MAD=0) НЕ ловится —
     robust-z требует baseline-разброс. Это всё равно строго лучше нуля
-    app-слойных аномалий (http_5xx/p95 в ServiceHealth всегда 0 до WO-12483).
+    app-слойных аномалий (http_5xx/p95 в ServiceHealth = NULL до WO-12483).
     Флагуем только ПОЛОЖИТЕЛЬНЫЙ z (рост ошибок; падение — не инцидент).
     """
     counters = {

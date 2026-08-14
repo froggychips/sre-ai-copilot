@@ -931,7 +931,7 @@ def log_error_rate_for(
     фоновой джобой, health-probe или вообще не относиться к user-facing
     трафику. НЕ записывать это в ``kg_service_health.http_5xx_rate``:
     смешение двух разных сигналов введёт consumer'ов в заблуждение
-    (http_5xx в service_health всегда 0, потому что app /metrics закрыт
+    (http_5xx в service_health = NULL, потому что app /metrics закрыт
     JWT — WO-12483; подменять его логами было бы фальшивым «зелёным».
     Per-host/path HTTP 5xx с 2026-06-10 есть в kg_ingress_observations —
     это endpoint-разрез, а не per-service).
@@ -1016,7 +1016,7 @@ def ingress_health_for(
 
     ВАЖНО — СЕМАНТИКА: это **ingress-derived** сигнал (nginx-ingress controller
     метрики per host/path), а НЕ per-service app `/metrics`. Последний закрыт
-    JWT (WO-12483) → ``kg_service_health.http_5xx_rate/p95`` всегда 0. Этот
+    JWT (WO-12483) → ``kg_service_health.http_5xx_rate/p95`` = NULL. Этот
     источник доступен с 2026-06-10 и покрывает сервисы с Ingress'ом. Он
     меряет трафик НА ГРАНИЦЕ (ingress), не внутренние service-to-service
     вызовы — поэтому маркируется ``is_ingress_derived=True`` и НЕ пишется в
