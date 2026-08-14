@@ -1421,6 +1421,16 @@ _BEAT_HEARTBEAT_TASKS = frozenset({
     "kg_topology_sync",
     "kg_seq_logs_sync",
     "kg_signal_aggregates_compute",
+    # Ниже — источники отдельных видов рёбер. Их молчание агрегатная
+    # проверка свежести (check_edges_freshness, порог 30% просроченных по
+    # ВСЕМУ графу) заметить не может: на 14.08.2026 uses_nats это 20.8%
+    # рёбер, serves_traffic — 31.2%, routes_to — 9.8%. То есть полная
+    # остановка NATS- или ingress-синка не поднимала бы её порог никогда.
+    # Heartbeat отвечает на другой вопрос, чем свежесть данных: «таск
+    # вообще ходит» против «таск что-то записал».
+    "kg_nats_subjects_sync",
+    "kg_topology_resources_sync",
+    "kg_ingress_sync",
 })
 
 

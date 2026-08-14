@@ -129,6 +129,23 @@ _SYNC_LAG_TARGETS: Dict[str, Dict[str, Any]] = {
         "column": lambda: func.max(SignalAggregate.window_end),
         "interval_minutes": 24 * 60,
     },
+    # Источники отдельных видов рёбер. Проверяются ПО ФАКТУ ПРОГОНА: у них
+    # нет своей колонки-таймстампа, а свежесть их результата ловит
+    # check_edge_kind_freshness. Две проверки отвечают на разные вопросы —
+    # «таск ходит» и «данные обновились», и расхождение между ними как раз
+    # и есть интересный случай (ходит, но ничего не пишет).
+    "kg_nats_subjects_sync": {
+        "heartbeat_task": "kg_nats_subjects_sync",
+        "interval_minutes": 60,
+    },
+    "kg_topology_resources_sync": {
+        "heartbeat_task": "kg_topology_resources_sync",
+        "interval_minutes": 30,
+    },
+    "kg_ingress_sync": {
+        "heartbeat_task": "kg_ingress_sync",
+        "interval_minutes": 60,
+    },
 }
 
 
@@ -443,6 +460,110 @@ def check_edges_freshness(db: Session) -> CheckResult:
     )
 
 
+#: Ожидаемый интервал обновления рёбер каждого вида и таск, который их пишет.
+#: Интервал — не расписание таска, а «через сколько молчание становится
+#: подозрительным»: берём с запасом ×3 от периода синка, чтобы один
+#: пропущенный тик не поднимал шум.
+_EDGE_KIND_SOURCES: Dict[str, Dict[str, Any]] = {
+    "calls": {"task": "kg_topology_sync", "stale_after_minutes": 180},
+    "uses_db": {"task": "kg_topology_sync", "stale_after_minutes": 180},
+    "uses_nats": {"task": "kg_nats_subjects_sync", "stale_after_minutes": 180},
+    "serves_traffic": {"task": "kg_topology_resources_sync", "stale_after_minutes": 120},
+    "routes_to": {"task": "kg_ingress_sync", "stale_after_minutes": 180},
+}
+
+
+def check_edge_kind_freshness(db: Session) -> CheckResult:
+    """Свежесть рёбер ПО ВИДАМ — deadman на источник каждого вида.
+
+    Зачем отдельно от `check_edges_freshness`: та считает долю просроченных
+    рёбер по ВСЕМУ графу с порогом 30%, и по арифметике не может заметить
+    смерть отдельного источника. Замер 14.08.2026:
+
+        serves_traffic  5336  31.2%
+        uses_db         4459  26.0%
+        uses_nats       3560  20.8%
+        calls           2096  12.2%
+        routes_to       1672   9.8%
+
+    Полная остановка NATS-синка даёт 20.8% просроченных рёбер — ниже порога,
+    то есть агрегатная проверка промолчит и через сутки, и через неделю.
+    Заметен ей только тотальный отказ kg_sync целиком. Именно этот класс
+    слепоты («сигнал есть, но не про то») уже стоил суток простоя
+    deploy-stream: проверка существовала и рапортовала ok.
+
+    Здесь смотрим на max(last_seen_at) КАЖДОГО вида отдельно и называем
+    таск, который его пишет, — чтобы алерт говорил, что чинить, а не «в
+    графе что-то не так».
+
+    Вид, которого в графе нет вообще, — не fail: `routes_to` появился
+    позже остальных, и пустой kind у свежей инсталляции нормален.
+    """
+    now = _now()
+    per_kind: Dict[str, Dict[str, Any]] = {}
+    worst = "ok"
+
+    rows = (
+        db.query(ServiceEdge.kind, func.max(ServiceEdge.last_seen_at), func.count(ServiceEdge.id))
+        .group_by(ServiceEdge.kind)
+        .all()
+    )
+    seen = {kind: (last_ts, count) for kind, last_ts, count in rows}
+
+    for kind, cfg in _EDGE_KIND_SOURCES.items():
+        threshold = int(cfg["stale_after_minutes"])
+        entry: Dict[str, Any] = {
+            "writer_task": cfg["task"],
+            "stale_after_minutes": threshold,
+        }
+        if kind not in seen:
+            # Вида нет вовсе — нечего проверять на свежесть.
+            entry.update({"edges": 0, "status": "ok", "reason": "kind отсутствует в графе"})
+            per_kind[kind] = entry
+            continue
+
+        last_ts, count = seen[kind]
+        entry["edges"] = int(count or 0)
+        if last_ts is None:
+            entry.update({
+                "last_seen_at": None,
+                "lag_minutes": None,
+                "status": "fail",
+                "reason": "у всех рёбер вида last_seen_at IS NULL",
+            })
+            per_kind[kind] = entry
+            worst = "fail"
+            continue
+
+        # Все timestamp'ы в БД — naive UTC (см. _now), приводить нечего.
+        lag = (now - last_ts).total_seconds() / 60.0
+        entry["last_seen_at"] = last_ts.isoformat()
+        entry["lag_minutes"] = round(lag, 1)
+        if lag > threshold * 2:
+            entry["status"] = "fail"
+            worst = "fail"
+        elif lag > threshold:
+            entry["status"] = "warn"
+            if worst != "fail":
+                worst = "warn"
+        else:
+            entry["status"] = "ok"
+        per_kind[kind] = entry
+
+    unknown = sorted(set(seen) - set(_EDGE_KIND_SOURCES))
+    return CheckResult(
+        name="edge_kind_freshness",
+        status=worst,
+        detail={
+            "per_kind": per_kind,
+            # Вид рёбер, которого нет в карте источников: кто-то завёл новый
+            # kind, не описав, какой таск его пишет — deadman на него не
+            # распространяется, и это стоит видеть.
+            "unmapped_kinds": unknown,
+        },
+    )
+
+
 def _run_coro_blocking(coro):
     """Выполнить корутину из СИНХРОННОГО чека, где бы он ни вызывался.
 
@@ -723,6 +844,7 @@ _ALL_CHECKS = (
     check_alerts_resolve_freshness,
     check_pod_events_link_rate,
     check_edges_freshness,
+    check_edge_kind_freshness,
     check_deploy_stream_ingestion,
     check_graph_integrity,
 )
