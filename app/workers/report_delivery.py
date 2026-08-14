@@ -69,7 +69,12 @@ def severity_routeable(severity: Optional[str]) -> bool:
     try:
         from app.services.discord.routing import _should_route_to_error
         return bool(_should_route_to_error(severity or ""))
-    except Exception:
+    except (ImportError, AttributeError):
+        # Ровно два случая, когда «не смогли спросить сервис»: модуль не
+        # импортируется либо helper переименовали. Широкий `except Exception`
+        # здесь был опасен в другую сторону: он бы проглотил и NameError с
+        # TypeError из самого helper-а, то есть после рефакторинга severity-gate
+        # молча превратился бы в «ретраить всё», включая info-алерты.
         return True
 
 
