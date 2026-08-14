@@ -34,6 +34,61 @@ NODE_KIND_INGRESS = "ingress"    # synthetic-узел ingress:<name>
 NODE_KINDS = (NODE_KIND_SERVICE, NODE_KIND_WORKLOAD, NODE_KIND_INGRESS)
 
 
+#: Состояния жизненного цикла namespace (колонка kg_namespaces.state).
+#: Семантика и переходы — docs/KG_SCHEMA_CONTRACT.md.
+NS_STATE_ACTIVE = "active"      # namespace виден в кластере
+NS_STATE_MISSING = "missing"    # исчез, но ещё не забыт
+NS_STATE_RETIRED = "retired"    # забыт: узлы и история удалены
+NS_STATES = (NS_STATE_ACTIVE, NS_STATE_MISSING, NS_STATE_RETIRED)
+
+
+class Namespace(Base):
+    """Namespace как объект со своей жизнью, а не строка-текст в kg_services.
+
+    До появления этой таблицы граф знал про namespace только его имя. Отсюда
+    три поломки сразу:
+
+      * **выход не отслеживался** — узлы снесённого стенда оставались навсегда
+        (198 namespace в графе против 139 живых на 14.08.2026);
+      * **пересоздание было невидимо** — сквад сносят и раскатывают заново под
+        тем же именем, а upsert по (namespace, name, node_kind) попадает в
+        СТАРУЮ строку: к новому стенду прилипают health-точки, алерты и
+        `created_at` предыдущего. Замер: `squad-1-shared` — узлы на 82 дня
+        старше самого namespace, 39 775 health-точек прошлой жизни;
+      * **уборка блокировала сама себя** — guard `drift_pct > 20%` считал долю
+        и переставал работать ровно тогда, когда мусора накопилось больше
+        всего (29.8% при пороге 20%).
+
+    Идентичность инкарнации — `k8s_uid`. Ключ остался именем: по нему идут все
+    существующие джойны, а UID хранится атрибутом. Смена UID при том же имени =
+    новая инкарнация (`incarnation` инкрементится).
+    """
+
+    __tablename__ = "kg_namespaces"
+
+    namespace = Column(String, primary_key=True)
+    #: metadata.uid namespace в кластере. NULL у строк, заведённых до того,
+    #: как синк начал его читать — для них инкарнация неизвестна.
+    k8s_uid = Column(String, nullable=True, index=True)
+    #: metadata.creationTimestamp — возраст САМОГО namespace, в отличие от
+    #: created_at узлов, который у пересозданного стенда врёт.
+    k8s_created_at = Column(DateTime, nullable=True)
+    #: Счётчик пересозданий: 1 у первой известной инкарнации.
+    incarnation = Column(Integer, nullable=False, default=1, server_default="1")
+    state = Column(
+        String, nullable=False, index=True,
+        default=NS_STATE_ACTIVE, server_default=NS_STATE_ACTIVE,
+    )
+    #: Когда граф впервые увидел ЭТУ инкарнацию (не namespace вообще).
+    first_seen_at = Column(DateTime, default=datetime.utcnow)
+    #: Последний тик, в котором namespace был жив в кластере.
+    last_seen_at = Column(DateTime, default=datetime.utcnow, index=True)
+    #: Когда впервые не увидели. NULL у active — по нему считается TTL до
+    #: retired, то есть время, а не доля, решает судьбу узлов.
+    missing_since = Column(DateTime, nullable=True, index=True)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
 class Service(Base):
     """Узел графа: сервис, workload или ingress — см. `node_kind`.
 

@@ -174,6 +174,13 @@ celery_app.conf.beat_schedule = {
     # D2-auto: drift cleanup. Раз в час пересинхронизирует kg_services со
     # списком существующих в k8s ns. Safety threshold 20% — защита от
     # mass-mark при временной недоступности API server.
+    "kg-namespace-lifecycle": {
+        "task": "kg_namespace_lifecycle",
+        # Каждые 10 минут: пересоздание сквада занимает минуты, и час — слишком
+        # грубое окно, чтобы отличить «пересоздали» от «был недоступен».
+        "schedule": crontab(minute="*/10"),
+        "options": {"expires": 540},
+    },
     "kg-drift-cleanup": {
         "task": "kg_drift_cleanup",
         "schedule": crontab(minute=17),  # ежечасно в 17 мин
@@ -692,6 +699,31 @@ def kg_alerts_resolve_sync_task():
         return _aio.run(run_alerts_resolve_sync(db))
     except Exception as e:
         logger.warning("kg_alerts_resolve_sync.failed: %s", e)
+        return {"error": str(e)}
+    finally:
+        db.close()
+
+
+@celery_app.task(name="kg_namespace_lifecycle")
+@single_instance(ttl_seconds=1800)
+def kg_namespace_lifecycle_task():
+    """B2: сверить kg_namespaces с кластером — присутствие и инкарнации.
+
+    Дешёвый таск: один `kubectl get ns -o json` и апдейт таблицы из ~200
+    строк. Отдельный от kg_topology_sync намеренно — он должен видеть ВСЕ
+    namespace кластера, а не только те, что синк обходит; именно расхождение
+    между этими списками и было слепой зоной (25 обходимых против 139 живых).
+
+    Ничего не удаляет: только помечает присутствие и считает инкарнации.
+    """
+    from app.knowledge_graph.namespace_lifecycle import sync_namespace_lifecycle
+
+    db = SessionLocal()
+    try:
+        return sync_namespace_lifecycle(db)
+    except Exception as e:
+        logger.warning("kg_namespace_lifecycle.failed: %s", e)
+        db.rollback()
         return {"error": str(e)}
     finally:
         db.close()
