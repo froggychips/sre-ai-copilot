@@ -18,6 +18,7 @@ from typing import Any, Dict, Optional
 import structlog
 from sqlalchemy.orm import Session
 
+from app.knowledge_graph.contract import owner_source_valid
 from app.knowledge_graph.schema import (NODE_KIND_SERVICE, AlertEvent,
                                         Deployment, PodEvent, Service,
                                         ServiceEdge)
@@ -37,8 +38,15 @@ def upsert_service(
     metadata: Optional[Dict[str, Any]] = None,
     synthetic: Optional[bool] = None,
     node_kind: str = NODE_KIND_SERVICE,
+    owner_source: Optional[str] = None,
 ) -> Service:
     """Idempotent upsert узла графа.
+
+    `owner_source` (contract 2.6) — откуда взят `team_owner`. Пишется только
+    вместе с самим владельцем: источник без владельца бессмыслен, а владелец
+    без источника — это уже 12 577 существующих строк, у которых провенанс
+    неизвестен. Неизвестное значение отбрасывается с warning, чтобы опечатка
+    не завела в графе седьмой «источник».
 
     `node_kind` различает k8s Service, workload (Deployment/StatefulSet/
     DaemonSet) и synthetic ingress-узлы. Дефолт 'service' — так все прежние
@@ -49,12 +57,20 @@ def upsert_service(
     race condition при параллельных worker'ах.
     На других диалектах (SQLite в тестах) — старый SELECT+INSERT.
     """
+    if owner_source is not None and not owner_source_valid(owner_source):
+        logger.warning(
+            "kg.owner_source_unknown",
+            namespace=namespace, name=name, owner_source=owner_source,
+        )
+        owner_source = None
     if _is_postgresql(db):
         return _upsert_service_pg(
             db, namespace, name, team_owner, metadata, synthetic, node_kind,
+            owner_source,
         )
     return _upsert_service_fallback(
         db, namespace, name, team_owner, metadata, synthetic, node_kind,
+        owner_source,
     )
 
 
@@ -66,6 +82,7 @@ def _upsert_service_pg(
     metadata: Optional[Dict[str, Any]],
     synthetic: Optional[bool],
     node_kind: str = NODE_KIND_SERVICE,
+    owner_source: Optional[str] = None,
 ) -> Service:
     from sqlalchemy.dialects.postgresql import insert as pg_insert
 
@@ -75,6 +92,7 @@ def _upsert_service_pg(
         "name": name,
         "node_kind": node_kind,
         "team_owner": team_owner,
+        "owner_source": owner_source,
         "metadata_json": metadata,
         "synthetic": bool(synthetic) if synthetic is not None else False,
         "created_at": now,
@@ -83,6 +101,9 @@ def _upsert_service_pg(
     set_clause: Dict[str, Any] = {"updated_at": now}
     if team_owner:
         set_clause["team_owner"] = team_owner
+        # Источник переписываем только вместе с владельцем: иначе у строки
+        # остался бы провенанс от предыдущего, уже перезаписанного значения.
+        set_clause["owner_source"] = owner_source
     # metadata_json НЕ кладём в set_clause: полный overwrite стирал ключи
     # других источников (auto_populator пишет app/component/version,
     # drift_cleanup — drift_marked_at, topology-sync — k8s_service).
@@ -131,6 +152,7 @@ def _upsert_service_fallback(
     metadata: Optional[Dict[str, Any]],
     synthetic: Optional[bool],
     node_kind: str = NODE_KIND_SERVICE,
+    owner_source: Optional[str] = None,
 ) -> Service:
     svc = (
         db.query(Service)
@@ -147,6 +169,7 @@ def _upsert_service_fallback(
             name=name,
             node_kind=node_kind,
             team_owner=team_owner,
+            owner_source=owner_source,
             metadata_json=metadata,
             synthetic=bool(synthetic) if synthetic is not None else False,
         )
@@ -157,6 +180,7 @@ def _upsert_service_fallback(
         changed = False
         if team_owner and svc.team_owner != team_owner:
             svc.team_owner = team_owner
+            svc.owner_source = owner_source
             changed = True
         if metadata is not None:
             # Merge, не overwrite — сохраняем ключи других источников

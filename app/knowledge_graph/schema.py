@@ -53,6 +53,16 @@ class Service(Base):
         default=NODE_KIND_SERVICE, server_default=NODE_KIND_SERVICE,
     )
     team_owner = Column(String, nullable=True)   # squad, например `squad-gd`
+    # Откуда взялся team_owner. Значения — contract.OWNER_SOURCES.
+    # NULL = провенанс неизвестен (строки до 14.08.2026 и любой источник,
+    # который его ещё не проставляет). Смысл: префиксная эвристика ошибается
+    # на переименованиях, k8s-лейбл не врёт — а без этой колонки оба выглядят
+    # одинаково, и «12 577 узлов с владельцем» читается как 12 577 надёжных.
+    # Без index: значений всего шесть (contract.OWNER_SOURCES), и единственный
+    # сценарий чтения — агрегат «сколько узлов по каждому источнику». На такой
+    # селективности PostgreSQL всё равно выберет seq scan, а лишний индекс на
+    # kg_services — это ещё одна структура, которую ALTER TABLE будет блокировать.
+    owner_source = Column(String, nullable=True)
     metadata_json = Column(JSON, nullable=True)  # labels, репо, runbook URL...
     # Synthetic = по дизайну никогда не имеет edges (cron-backups, nats-tools,
     # observability-exporters). Исключается из Orphan %-метрики в kg_quality.

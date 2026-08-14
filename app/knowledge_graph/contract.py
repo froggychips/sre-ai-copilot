@@ -114,9 +114,11 @@ STORAGE_NODE_KINDS: Set[str] = {"service", "pvc", "pv"}
 # Owner sources
 # ---------------------------------------------------------------------------
 
-#: Откуда мог быть взят `kg_services.team_owner`. Сейчас в схеме поле
-#: одно (без `owner_source`), но мы фиксируем семантику чтобы дальнейшие
-#: волны могли начать прокидывать `owner_source` как metadata-key.
+#: Откуда взят `kg_services.team_owner`. С contract 2.6 (миграция
+#: 20260814_0100) это не только семантика, но и колонка `owner_source`:
+#: до неё 12 577 узлов с владельцем выглядели одинаково надёжными, хотя
+#: угаданный по префиксу namespace владелец и владелец из k8s-лейбла — вещи
+#: очень разного качества. NULL в колонке = провенанс неизвестен.
 #:
 #: Naming convention: контракт фиксирует «slug» источника (snake_case,
 #: длинная форма). `ownership_suggester` использует короткие алиасы в поле
@@ -144,6 +146,25 @@ OWNER_SOURCE_ALIASES: Dict[str, str] = {
     "deploy_history": "deploy_history",
     "manual": "manual",
 }
+
+#: Насколько доверять владельцу из данного источника (1.0 — максимум).
+#: Не порог и не фильтр, а подсказка потребителю: на чей `team_owner` можно
+#: ссылаться в эскалации, а какой стоит перепроверить, прежде чем звать людей
+#: ночью. Префиксная эвристика первой ломается на переименованиях сквадов,
+#: лейбл ставит человек, «suggested» ещё никем не подтверждён.
+OWNER_SOURCE_TRUST: Dict[str, float] = {
+    "manual": 1.0,
+    "k8s_labels": 0.9,
+    "platform_static": 0.8,
+    "deploy_history": 0.6,
+    "namespace_prefix": 0.4,
+    "suggested": 0.2,
+}
+
+
+def owner_source_valid(source: Optional[str]) -> bool:
+    """Известен ли источник владельца. None (провенанс не указан) — валиден."""
+    return source is None or source in OWNER_SOURCES
 
 
 # ---------------------------------------------------------------------------
@@ -627,6 +648,8 @@ __all__ = [
     "ALL_NODE_KINDS",
     "OWNER_SOURCES",
     "OWNER_SOURCE_ALIASES",
+    "OWNER_SOURCE_TRUST",
+    "owner_source_valid",
     "EDGE_KINDS",
     "EdgeKindSpec",
     "QUALITY_THRESHOLDS",
