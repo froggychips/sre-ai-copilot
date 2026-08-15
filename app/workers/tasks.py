@@ -174,6 +174,13 @@ celery_app.conf.beat_schedule = {
     # D2-auto: drift cleanup. Раз в час пересинхронизирует kg_services со
     # списком существующих в k8s ns. Safety threshold 20% — защита от
     # mass-mark при временной недоступности API server.
+    # Ретеншен истории метрик. Ночью и раз в сутки: спешить некуда, а
+    # удаление батчами всё равно даёт работу автовакууму.
+    "kg-health-retention": {
+        "task": "kg_health_retention",
+        "schedule": crontab(hour=3, minute=40),
+        "options": {"expires": 3600},
+    },
     "kg-namespace-lifecycle": {
         "task": "kg_namespace_lifecycle",
         # Каждые 10 минут: пересоздание сквада занимает минуты, и час — слишком
@@ -723,6 +730,31 @@ def kg_namespace_lifecycle_task():
         return sync_namespace_lifecycle(db)
     except Exception as e:
         logger.warning("kg_namespace_lifecycle.failed: %s", e)
+        db.rollback()
+        return {"error": str(e)}
+    finally:
+        db.close()
+
+
+@celery_app.task(name="kg_health_retention")
+@single_instance(ttl_seconds=3600)
+def kg_health_retention_task():
+    """Удалить точки kg_service_health старше срока хранения.
+
+    Политики хранения у таблицы не было вообще: к 15.08.2026 она выросла до
+    18.2 млн строк и 4.2 ГБ — 79% всей базы, при том что самый глубокий
+    потребитель (baseline детектора аномалий) смотрит на 7 дней.
+
+    Раз в сутки и ночью: удаление батчами всё равно нагружает автовакуум, а
+    срочности в нём никакой.
+    """
+    from app.knowledge_graph.health_retention import purge_old_health
+
+    db = SessionLocal()
+    try:
+        return purge_old_health(db, retention_days=settings.KG_HEALTH_RETENTION_DAYS)
+    except Exception as e:
+        logger.warning("kg_health_retention.failed: %s", e)
         db.rollback()
         return {"error": str(e)}
     finally:

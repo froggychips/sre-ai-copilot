@@ -708,6 +708,11 @@ class Settings(BaseSettings):
     # Заполняй через env: KG_SCAN_NAMESPACES="prod-a,prod-b,staging-c"
     KG_SCAN_NAMESPACES: str = Field("", description="Comma-separated namespaces для kg_topology_sync (пусто → auto-discovery)")
 
+    # Ретеншен истории метрик. 30 дней = 4× самое глубокое окно потребителя
+    # (baseline детектора аномалий — 7 дней). Ниже 7 модуль откажется работать:
+    # см. health_retention.MIN_RETENTION_DAYS.
+    KG_HEALTH_RETENTION_DAYS: int = Field(30, description="Сколько суток хранить kg_service_health")
+
     # Daily stats digest — Celery beat task который собирает cluster-health
     # + KG-quality + stale-deployments и шлёт в DISCORD_WEBHOOK_STATS_URL.
     # БЕЗ LLM-вызовов (см. tests/test_stats_digest_no_llm.py).
