@@ -1353,3 +1353,79 @@ Unlocking billing (or moving the account to a paid plan) puts `ubuntu-latest`
 back on the table, at which point `Lint and Test` should move to GitHub-hosted
 and the Mac should keep only what genuinely needs macOS. Until then the single
 runner stays a known, monitored risk rather than an invisible one.
+
+---
+
+## Releasing: migrations are part of the deploy, not an afterthought
+
+**Incident 2026-08-14.** Image `rc.19` shipped code referencing a new column
+(`kg_services.owner_source`), but the migration was never applied to prod —
+the release recipe simply did not mention migrations. `kg_topology_sync` then
+failed on **all 129 namespaces** with `column "owner_source" does not exist`
+and wrote zero nodes and zero edges per tick.
+
+Two things are worth remembering about how it was found and why it wasn't worse.
+
+It was **not** caught by an alert. The only visible symptom was a suspiciously
+fast tick — 40 seconds instead of minutes — noticed while looking at something
+else. Nothing in the monitoring said "schema is behind the code".
+
+Data survived by architecture, not by vigilance: `edge_decay`'s deadman saw the
+fetch errors and refused to delete anything (`edge_decay_deadman errors=234 —
+decay пропущен`). Without that guard it would have concluded the whole topology
+had vanished and dropped ~17k edges.
+
+### The order that actually works
+
+```bash
+SHA=<merged master sha>
+DST=docker.lastoasisgame.com/wo/sre-ai-copilot:<next-rc>
+
+# 1. mirror the image CI already built and signed
+docker pull --platform linux/amd64 ghcr.io/froggychips/sre-ai-copilot:$SHA
+docker tag  ghcr.io/froggychips/sre-ai-copilot:$SHA $DST
+docker push $DST
+
+# 2. MIGRATIONS FIRST — on the new image, before any pod runs the new code.
+#    PGOPTIONS=-c lock_timeout=15s is already baked into the Job manifest:
+#    ALTER TABLE takes ACCESS EXCLUSIVE, and a queued DDL blocks every reader
+#    that arrives after it (POSTMORTEM 2026-08-08 §3.2).
+kubectl -n sre-ai delete job sre-ai-migrate --ignore-not-found=true
+sed "s|IMAGE_PLACEHOLDER|$DST|" k8s/migrate-job.yaml | kubectl -n sre-ai apply -f -
+kubectl -n sre-ai wait --for=condition=complete job/sre-ai-migrate --timeout=300s
+kubectl -n sre-ai logs job/sre-ai-migrate | tail -5
+
+# 3. only then roll the deployments
+kubectl -n sre-ai set image deploy/sre-ai-api api=$DST
+kubectl -n sre-ai set image deploy/copilot-worker worker=$DST
+kubectl -n sre-ai set image deploy/copilot-beat beat=$DST
+kubectl -n sre-ai set env deploy/sre-ai-api deploy/copilot-worker deploy/copilot-beat \
+  BUILD_VERSION=<next-rc>
+```
+
+**Why migrations run on the new image:** the migration files themselves ship
+inside it. Running `alembic upgrade head` from the old image applies only the
+revisions the old image knows about — which is exactly nothing new.
+
+### Verifying afterwards
+
+```bash
+kubectl -n sre-ai exec deploy/copilot-worker -- python3 -c "
+import os, psycopg2
+c = psycopg2.connect(os.environ['DATABASE_URL']); cur = c.cursor()
+cur.execute('SELECT version_num FROM alembic_version'); print(cur.fetchone()[0])"
+```
+
+Compare it with the head revision the code expects. Since 2026-08-14 this is
+also checked automatically: `self_health.check_schema_version` compares
+`alembic_version` against the revision chain in `alembic/versions` and fails
+when the database is **behind** the code (a database ahead of the code is only
+a warning — that happens on image rollback and breaks nothing).
+
+### If a deploy already went out without migrations
+
+Symptoms: syncs failing wholesale with `UndefinedColumn` / `UndefinedTable`,
+tick durations collapsing, `services=0 edges=0 errors=<number of namespaces>`.
+Fix is the Job above — it is idempotent and safe to run at any time. Check
+afterwards that `edge_decay` skipped rather than deleted; if it did delete,
+edges rebuild on the next successful tick, but node history does not.
