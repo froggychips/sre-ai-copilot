@@ -68,8 +68,15 @@ def test_expires_shorter_than_interval(name, cfg):
     # 6 минут» вместо «раз в 6 часов».
     hour_m = re.search(r"hour='?\*/(\d+)", schedule)
     minute_m = re.search(r"minute='?\*/(\d+)", schedule)
+    # celery печатает crontab как `<crontab: 40 3 * * * (...)>` — минута, час,
+    # день. Конкретный час (не `*`, не `*/N`) означает «раз в сутки»; без этой
+    # ветки суточная задача читалась бы как ежечасная и требовала expires < 1ч
+    # без всякой причины.
+    daily_m = re.search(r"<crontab: \d+ (\d+) \* \* \*", schedule)
     if hour_m:
         interval = int(hour_m.group(1)) * 3600
+    elif daily_m:
+        interval = 24 * 3600
     elif minute_m:
         interval = int(minute_m.group(1)) * 60
     elif re.search(r"minute='?\*'?[,)]", schedule):
