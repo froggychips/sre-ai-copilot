@@ -176,6 +176,12 @@ celery_app.conf.beat_schedule = {
     # mass-mark при временной недоступности API server.
     # Ретеншен истории метрик. Ночью и раз в сутки: спешить некуда, а
     # удаление батчами всё равно даёт работу автовакууму.
+    # Endpoints: каждые 15 минут, в такт топологическому синку.
+    "kg-endpoints-sync": {
+        "task": "kg_endpoints_sync",
+        "schedule": crontab(minute="*/15"),
+        "options": {"expires": 600},
+    },
     "kg-health-retention": {
         "task": "kg_health_retention",
         "schedule": crontab(hour=3, minute=40),
@@ -730,6 +736,31 @@ def kg_namespace_lifecycle_task():
         return sync_namespace_lifecycle(db)
     except Exception as e:
         logger.warning("kg_namespace_lifecycle.failed: %s", e)
+        db.rollback()
+        return {"error": str(e)}
+    finally:
+        db.close()
+
+
+@celery_app.task(name="kg_endpoints_sync")
+@single_instance(ttl_seconds=900)
+def kg_endpoints_sync_task():
+    """Сверить Service-узлы с реальными endpoints кластера.
+
+    Отвечает на вопрос, которого граф не знал: стоят ли за Service живые
+    поды. Замер 15.08.2026 — 4732 Service с адресами и 83 без, причём среди
+    пустых нет ни одного headless или ExternalName: все 83 аномальны.
+
+    Каждые 15 минут, рядом с топологическим синком: endpoints меняются при
+    каждом рестарте пода, и часовое окно давало бы устаревшую картину.
+    """
+    from app.knowledge_graph.k8s_endpoints_sync import sync_endpoints
+
+    db = SessionLocal()
+    try:
+        return sync_endpoints(db)
+    except Exception as e:
+        logger.warning("kg_endpoints_sync.failed: %s", e)
         db.rollback()
         return {"error": str(e)}
     finally:
