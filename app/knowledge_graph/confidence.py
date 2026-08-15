@@ -38,6 +38,10 @@ _SOURCE_PRECEDENCE: Dict[str, float] = {
     "kg_sync/vm_runtime": 1.0,
     "kg_sync/runtime_seen": 1.0,    # зарезервировано под L7-источники
     "kg_sync/runtime_corr": 0.95,   # PodEvent ↔ ServiceEdge correlation
+    # Endpoints — фактическое состояние кластера, а не манифест: контроллер
+    # записал адреса РЕАЛЬНО готовых подов. Сильнее объявления (0.85), но
+    # слабее наблюдённого вызова: «поды есть» ещё не значит «к ним ходят».
+    "k8s_endpoints/ready": 0.90,
     # Tier 2: declarative k8s resources (0.85). Manifest существует физически.
     "kg_sync/ingress": 0.85,
     "kg_sync/service": 0.85,
