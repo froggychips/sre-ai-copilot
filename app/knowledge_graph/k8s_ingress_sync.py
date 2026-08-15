@@ -35,7 +35,8 @@ from sqlalchemy.orm import Session
 from app.knowledge_graph.edge_decay_guard import (
     SOURCE_INGRESS_SYNC, record_source_run)
 from app.knowledge_graph.populator import upsert_edge, upsert_service
-from app.knowledge_graph.schema import NODE_KIND_SERVICE, Service
+from app.knowledge_graph.schema import (NODE_KIND_INGRESS, NODE_KIND_SERVICE,
+                                        Service)
 
 log = logging.getLogger(__name__)
 
@@ -147,10 +148,20 @@ def _canonical_host_node_ns(db: Session, host: str, fallback_ns: str) -> str:
     """Namespace для `ingress:<host>`-узла: host — глобальное имя, узел один.
 
     Если узел(ы) с этим именем уже есть — берём лексикографически
-    минимальный namespace (детерминизм; тот же приём, что у db:-узлов в
-    `kg_sync._known_db_node_namespaces`). Иначе — ns текущего Ingress-а.
+    минимальный namespace (детерминизм). Иначе — ns текущего Ingress-а.
     Так один host в N namespace-ах перестаёт плодить N узлов, деливших
     единственный `external_probe:{host}`-fingerprint.
+
+    Схлопывание здесь законно именно потому, что host — **глобальное** имя:
+    `api.lastoasisgame.com` в мире один, в каком бы namespace ни лежал его
+    Ingress. Тот же приём применялся к `db:<driver>:<host>` и там оказался
+    неверен — у БД host это service-name внутри namespace, то есть имя
+    локальное, и 41 разная база схлопнулась в один узел (contract 2.7).
+    Правило: сводить узлы по имени можно ровно тогда, когда имя глобально.
+
+    Поиск идёт по имени БЕЗ `node_kind` намеренно: узлы, созданные до
+    15.08.2026, лежат с `node_kind='service'`, и фильтр отсёк бы их,
+    заставив синк создать вторую копию рядом.
     """
     rows = (
         db.query(Service.namespace)
@@ -160,6 +171,42 @@ def _canonical_host_node_ns(db: Session, host: str, fallback_ns: str) -> str:
     if rows:
         return min(ns for (ns,) in rows)
     return fallback_ns
+
+
+def _adopt_legacy_ingress_node(db: Session, namespace: str, name: str) -> None:
+    """Перевести уже существующий `ingress:*`-узел на node_kind='ingress'.
+
+    Ключ узла — (namespace, name, node_kind), поэтому строка, созданная до
+    15.08.2026 с `node_kind='service'`, для upsert'а выглядит другим узлом:
+    без этой правки синк создал бы ВТОРУЮ копию рядом, и 3218 рёбер
+    разъехались бы между старой и новой.
+
+    Миграция `20260815_0100` делает то же самое разом, но полагаться только на
+    неё нельзя: код и схема катятся не одновременно, и в обе стороны есть
+    окно. Самолечение здесь снимает вопрос порядка выката целиком.
+
+    Если строка с `node_kind='ingress'` уже есть, старую не трогаем: UPDATE
+    упёрся бы в UNIQUE, а рёбра на legacy-узел доживут своё через edge_decay.
+    """
+    already = (
+        db.query(Service)
+        .filter_by(namespace=namespace, name=name, node_kind=NODE_KIND_INGRESS)
+        .first()
+    )
+    if already is not None:
+        return
+
+    legacy = (
+        db.query(Service)
+        .filter_by(namespace=namespace, name=name, node_kind=NODE_KIND_SERVICE)
+        .first()
+    )
+    if legacy is None:
+        return
+
+    legacy.node_kind = NODE_KIND_INGRESS  # type: ignore[assignment]
+    db.flush()
+    log.info("ingress_sync.node_kind_adopted namespace=%s name=%s", namespace, name)
 
 
 def _sync_one_route(
@@ -189,12 +236,21 @@ def _sync_one_route(
     # _canonical_host_node_ns), не per-namespace.
     external_node_name = f"ingress:{host}"
     node_ns = _canonical_host_node_ns(db, host, ns)
+    # До upsert'а: строка могла быть создана старым кодом как 'service', и
+    # тогда ключ (namespace, name, node_kind) не совпадёт — родится дубль.
+    _adopt_legacy_ingress_node(db, node_ns, external_node_name)
     ext = upsert_service(
         db,
         namespace=node_ns,
         name=external_node_name,
         team_owner="external",
         synthetic=True,
+        # Внешняя точка входа — не k8s Service. Контракт объявлял этот
+        # node_kind с самого введения поля, но никто его не проставлял: до
+        # 15.08.2026 все 559 узлов `ingress:*` лежали как `service`, то есть
+        # `node_kind='service'` снова означал две разные сущности — ровно ту
+        # болезнь, ради лечения которой поле и вводили.
+        node_kind=NODE_KIND_INGRESS,
     )
     stats["nodes_created"] += 1  # idempotent: upsert не дубль; считаем "touched"
 
