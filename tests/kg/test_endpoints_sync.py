@@ -176,3 +176,44 @@ def test_not_ready_addresses_do_not_count(db, cluster, monkeypatch):
     }])
     stats = sync_endpoints(db)
     assert stats["empty"] == 1
+
+
+# --- транзакции -----------------------------------------------------------
+#
+# Первый плановый прогон (15.08.2026, 11:15) упал с DeadlockDetected: один
+# коммит на весь проход держал блокировки на тысячах строк, пока рядом писал
+# соседний синк. Вручную тот же код отрабатывал — конкурента не было.
+#
+# Правило в проекте не новое: kg_sync коммитит после КАЖДОГО namespace по
+# следам инцидента 08.08.2026.
+
+
+def test_commits_in_batches_not_once(db, cluster, monkeypatch):
+    """Транзакция обязана жить секунды, а не весь проход."""
+    monkeypatch.setattr(eps, "_COMMIT_BATCH", 2)
+    for i in range(3, 9):
+        db.add(Service(id=i, namespace=NS, name=f"svc{i}", node_kind=NODE_KIND_SERVICE))
+    db.commit()
+    cluster({(NS, f"svc{i}"): 1 for i in range(3, 9)})
+
+    commits = []
+    real_commit = db.commit
+    monkeypatch.setattr(db, "commit", lambda: (commits.append(1), real_commit())[1])
+
+    sync_endpoints(db)
+    assert len(commits) > 1, "один коммит на весь проход — это и был дедлок"
+
+
+def test_nodes_are_processed_in_stable_order(db, cluster):
+    """Два писателя в разном порядке блокируют друг друга крест-накрест."""
+    for i in range(3, 6):
+        db.add(Service(id=i, namespace=NS, name=f"svc{i}", node_kind=NODE_KIND_SERVICE))
+    db.commit()
+    cluster({(NS, f"svc{i}"): 1 for i in range(3, 6)})
+
+    sync_endpoints(db)
+    touched = [
+        s.id for s in db.query(Service).order_by(Service.id).all()
+        if (s.metadata_json or {}).get("endpoints_checked_at")
+    ]
+    assert touched == sorted(touched)
