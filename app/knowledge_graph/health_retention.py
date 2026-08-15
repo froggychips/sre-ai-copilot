@@ -36,9 +36,9 @@ from __future__ import annotations
 
 import logging
 from datetime import datetime, timedelta
-from typing import Any, Dict
+from typing import Any, Dict, cast
 
-from sqlalchemy import text
+from sqlalchemy import CursorResult, text
 from sqlalchemy.orm import Session
 
 logger = logging.getLogger(__name__)
@@ -104,14 +104,19 @@ def purge_old_health(
         # DELETE ... WHERE id IN (SELECT ... LIMIT n) — портируемый способ
         # ограничить батч: у PostgreSQL нет LIMIT в DELETE, а ORDER BY ts
         # даёт предсказуемый порядок (сначала самое старое).
-        result = db.execute(
-            text(
-                "DELETE FROM kg_service_health WHERE id IN ("
-                "  SELECT id FROM kg_service_health"
-                "  WHERE ts < :cutoff ORDER BY ts LIMIT :lim"
-                ")"
+        # cast: у DML-запроса execute() возвращает CursorResult с rowcount,
+        # но стабы объявляют общий Result — по нему счётчика не видно.
+        result = cast(
+            CursorResult,
+            db.execute(
+                text(
+                    "DELETE FROM kg_service_health WHERE id IN ("
+                    "  SELECT id FROM kg_service_health"
+                    "  WHERE ts < :cutoff ORDER BY ts LIMIT :lim"
+                    ")"
+                ),
+                {"cutoff": cutoff, "lim": batch_size},
             ),
-            {"cutoff": cutoff, "lim": batch_size},
         )
         # Коммит на каждый батч: транзакция живёт ровно один батч, и
         # прерывание прогона не откатывает уже сделанную работу.
