@@ -17,12 +17,13 @@ import re
 import subprocess
 import json
 from datetime import datetime, timedelta
-from typing import Any, Dict, List, Optional, Tuple, cast
+from typing import Any, Dict, List, Optional, Set, Tuple, cast
 
 from sqlalchemy import cast as sa_cast
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Session
 
+from app.knowledge_graph.contract import shared_namespace_of
 from app.knowledge_graph.edge_decay_guard import (
     REASON_UNMAPPED_KIND, SOURCE_KG_SYNC, edge_block_reason, record_source_run,
     unhealthy_sources,
@@ -760,30 +761,54 @@ def _upsert_service_pg(
     )
 
 
-def _known_db_node_namespaces(db: Session) -> Dict[str, str]:
-    """C2: map `db:<driver>:<host>` node-name → namespace где он УЖЕ есть в KG.
+#: Кэш «существует ли namespace» на время одного прохода sync_all: список
+#: namespace за проход не меняется, а спрашивать БД на каждый env-ref дорого.
+_EXISTING_NS_CACHE: Optional[Set[str]] = None
 
-    Реестр реальных db-узлов для дедупа secret_hint-таргетов. Физический
-    кластер БД один (напр. town-db), но secret_hint строит host эвристикой и
-    кладёт узел в own_namespace — отсюда per-namespace фантом-дубли одного
-    кластера, раздувающие blast-radius.
 
-    Если узел с тем же каноническим именем уже создан где-то (через точный
-    dsn_env или предыдущий sync), переиспользуем тот namespace вместо
-    плодения копии. При нескольких — берём «канонический»: lexicographically
-    minimal (детерминизм; shared-кластеры обычно в *-shared).
+def _reset_existing_ns_cache() -> None:
+    """Сбросить кэш существующих namespace (вызывается в начале прохода)."""
+    global _EXISTING_NS_CACHE
+    _EXISTING_NS_CACHE = None
+
+
+def _db_namespace_for_client(db: Session, client_namespace: str) -> Optional[str]:
+    """Namespace, где лежит БД клиента из `client_namespace`, или None.
+
+    `<realm>-shared` по contract.shared_namespace_of, но **только если такой
+    namespace в графе действительно есть**. Правило выведено из кластера
+    (41 база `config-db-postgresql`, все в `*-shared`), однако имя namespace —
+    это соглашение, а не гарантия: применить его вслепую значит сослаться на
+    узел, которого может не существовать, и получить ту же ложь, только новую.
+
+    None означает «не знаю» — вызывающий оставит узел в own_namespace и
+    понизит confidence. Не знать честнее, чем угадать.
     """
-    idx: Dict[str, str] = {}
-    rows = (
-        db.query(Service.name, Service.namespace)
-        .filter(Service.name.like("db:%"))
-        .all()
-    )
-    for name, ns in rows:
-        cur = idx.get(name)
-        if cur is None or ns < cur:
-            idx[name] = ns
-    return idx
+    global _EXISTING_NS_CACHE
+    target = shared_namespace_of(client_namespace)
+    if target is None:
+        return None
+    if _EXISTING_NS_CACHE is None:
+        _EXISTING_NS_CACHE = {
+            ns for (ns,) in db.query(Service.namespace).distinct().all() if ns
+        }
+    return target if target in _EXISTING_NS_CACHE else None
+
+
+# УДАЛЕНО 15.08.2026: `_known_db_node_namespaces` — дедуп db-узлов по
+# лексикографически минимальному namespace.
+#
+# Приём сам по себе рабочий и живёт в `k8s_ingress_sync._canonical_host_node_ns`,
+# но там он применяется к DNS-именам, а DNS-имя глобально: `api.example.com`
+# в мире одно, и сводить его в один узел правильно.
+#
+# Для БД host — это service-name ВНУТРИ namespace, то есть имя локальное.
+# `config` в каждом из 41 `*-shared` — разные физические базы. Сводя их по
+# имени, дедуп собрал `db:postgres:config` в `preprod-kingdom1` с 1430 рёбрами
+# из 106 namespace и заставил граф утверждать, что прод ходит в базу препрода.
+#
+# Различие стоит помнить: схлопывать по имени можно ровно тогда, когда имя
+# глобально. Замена — `_db_namespace_for_client` (realm → `<realm>-shared`).
 
 
 def sync_namespace(
@@ -801,11 +826,6 @@ def sync_namespace(
         deploys = _kubectl_get_deployments(namespace)
 
     src_team = _derive_team_owner(namespace)
-
-    # C2: реестр уже существующих db-узлов — лениво, только когда встретится
-    # secret_hint-таргет (host угадан) и нужна дедупликация против реальных
-    # узлов. None = ещё не загружали (избегаем лишнего запроса для ns без БД).
-    known_db: Optional[Dict[str, str]] = None
 
     for deploy in deploys:
         name = deploy.get("metadata", {}).get("name", "")
@@ -868,23 +888,34 @@ def sync_namespace(
                 edge_extras["confidence"] = "inferred_env"
             else:
                 # C2: secret_hint — host УГАДАН regex'ом из имени secret/ключа,
-                # а db_ns всегда == own_namespace. Без проверки это плодит
-                # per-namespace фантом-дубли одного физического кластера
-                # (напр. db:postgres:town в каждом ns town-db) → раздутый
-                # blast-radius. Сверяемся с реестром реальных db-узлов:
-                #   - матч → переиспользуем канонический namespace узла
-                #     (не плодим копию), confidence остаётся inferred_secret_name;
-                #   - нет матча → host не подтверждён ничем; всё равно создаём
-                #     (не теряем сигнал), но помечаем confidence='unverified_host'
-                #     + unverified_host=True, чтобы консьюмеры (blast-radius)
-                #     могли отфильтровать.
-                if known_db is None:
-                    known_db = _known_db_node_namespaces(db)
-                canonical_ns = known_db.get(db_node)
-                if canonical_ns is not None:
-                    db_ns = canonical_ns
+                # а db_ns приходит как own_namespace. Куда его отнести — вопрос
+                # с историей, и оба прежних ответа были неверны.
+                #
+                # Оставлять в own_namespace нельзя: физический кластер один на
+                # realm, и получались per-namespace фантом-копии.
+                #
+                # Дедуп по «каноническому» узлу (lexicographically minimal ns
+                # среди уже существующих) оказался хуже: он сводил РАЗНЫЕ
+                # физические базы в одну. Замер 15.08.2026 —
+                # `db:postgres:config` жил в `preprod-kingdom1` и собрал 1430
+                # рёбер из 106 namespace, тогда как таких баз в кластере 41,
+                # по одной на `*-shared`. Граф утверждал, что прод ходит в базу
+                # препрода: не «неточно», а неверный факт, причём ровно в
+                # blast-radius.
+                #
+                # Правильный ответ — realm: БД живёт в `<realm>-shared`
+                # (contract.shared_namespace_of). Правило выведено из кластера,
+                # но вслепую не применяется — если такого namespace в графе нет,
+                # остаёмся в own_namespace и честно понижаем confidence.
+                resolved_ns = _db_namespace_for_client(db, namespace)
+                if resolved_ns is not None:
+                    db_ns = resolved_ns
                     edge_extras["confidence"] = "inferred_secret_name"
+                    edge_extras["db_namespace_source"] = "realm_shared"
                 else:
+                    # Realm не распознан или его `*-shared` не существует: host
+                    # не подтверждён ничем. Сигнал не теряем, но помечаем, чтобы
+                    # консьюмеры (blast-radius) могли отфильтровать.
                     edge_extras["confidence"] = "unverified_host"
                     edge_extras["unverified_host"] = True
             dst = _upsert_service_pg(
