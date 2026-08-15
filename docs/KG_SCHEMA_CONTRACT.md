@@ -1,7 +1,9 @@
 # KG Schema / Quality Contract
 
-> **Версия контракта:** `kg_schema: 2.5`
-> **Дата:** 2026-06-10 (doc-update: `kg_ingress_observations` наполняется — §6.6;
+> **Версия контракта:** `kg_schema: 2.7`
+> **Дата:** 2026-08-15 (2.7 — db-узлы привязаны к realm, §1.3;
+> 2.6 — `owner_source`)
+> **Предыдущая правка:** 2026-06-10 (doc-update: `kg_ingress_observations` наполняется — §6.6;
 > уточнены consumer caveats §7.5: причина нулей `http_5xx`/`p95` в
 > `kg_service_health` — только app `/metrics` за JWT, не ingress-метрики)
 > **Источник истины кода:** [`app/knowledge_graph/contract.py`](../app/knowledge_graph/contract.py)
@@ -22,7 +24,7 @@
 ## 1. Версия
 
 ```
-KG_SCHEMA_VERSION = "2.5"
+KG_SCHEMA_VERSION = "2.7"
 ```
 
 `major.minor`:
@@ -32,6 +34,40 @@ KG_SCHEMA_VERSION = "2.5"
   semantic существующего kind перевёрнут. Требует миграции consumer'ов.
 * **minor** — additive: новый edge kind, новый synthetic prefix, новые
   поля QUALITY_THRESHOLDS, перевод planned → active.
+
+### 1.3. Что изменилось в 2.7 — db-узлы привязаны к realm
+
+`db:<driver>:<host>`-узлы из `secret_hint` больше **не схлопываются по имени**.
+Раньше дедуп выбирал «канонический» namespace как лексикографически минимальный
+среди существующих, и это сводило разные физические базы в одну.
+
+Замер прода 15.08.2026:
+
+| | |
+|---|---|
+| узел `db:postgres:config` | один, в `preprod-kingdom1` |
+| рёбер к нему | 1430, из 106 namespace |
+| физических баз `config-db-postgresql` | **41**, по одной в каждом `*-shared` |
+
+То есть граф отвечал, что `prod-kingdom1` ходит в базу препрода — и отвечал это
+в blast radius, ровно там, где ошибка дороже всего. Не «неполно», а неверно.
+
+Теперь namespace БД вычисляется по realm клиента
+(`contract.shared_namespace_of`: `prod-kingdom1` → `prod-shared`,
+`squad-37-kingdom2` → `squad-37-shared`) и **применяется только если такой
+namespace в графе существует**. Иначе узел остаётся в own_namespace, а ребро
+получает `confidence=unverified_host` — «не знаю» честнее, чем красивая догадка.
+
+Ребро с realm-атрибуцией помечается `extras.db_namespace_source='realm_shared'`.
+
+**Для консьюмеров:** узлы, считавшиеся одной сущностью, разделятся по realm.
+Рёбра на старый схлопнутый узел исчезнут сами — их снимет `edge_decay`, когда
+источник перестанет их подтверждать.
+
+**Правило на будущее:** схлопывать узлы по имени можно ровно тогда, когда имя
+глобально. У `ingress:<host>` DNS-имя глобально, и там дедуп корректен
+(`k8s_ingress_sync._canonical_host_node_ns`). У БД host — service-name внутри
+namespace, то есть имя локальное.
 
 ### 1.2. Что изменилось в 2.5 — orphan не считает `serves_traffic`
 

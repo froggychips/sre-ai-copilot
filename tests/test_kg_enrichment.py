@@ -6,6 +6,7 @@ sync_namespace через моки upsert_service / upsert_edge / kubectl.
 """
 from unittest.mock import MagicMock, patch
 
+from app.knowledge_graph.contract import shared_namespace_of
 from app.knowledge_graph.kg_sync import (
     _derive_team_owner,
     _discover_namespaces,
@@ -645,78 +646,98 @@ def _mk_db_deploy(name: str, secret_envs: dict | None = None, dsn_envs: dict | N
     }
 
 
-def _run_sync_namespace_db(deploy, namespace, known_db):
-    """Прогон sync_namespace с замоканными upsert/kubectl/known_db.
-    Возвращает (svc_calls, edge_calls)."""
+def _run_sync_namespace_db(deploy, namespace, existing_ns=()):
+    """Прогон sync_namespace с замоканными upsert/kubectl.
+
+    `existing_ns` — namespace, которые «есть в графе»: от этого зависит,
+    примет ли `_db_namespace_for_client` вычисленный `<realm>-shared`.
+    """
+    import app.knowledge_graph.kg_sync as ks
+    ks._reset_existing_ns_cache()
     with patch("app.knowledge_graph.kg_sync._kubectl_get_deployments", return_value=[deploy]), \
          patch("app.knowledge_graph.kg_sync._upsert_service_pg") as mock_svc, \
          patch("app.knowledge_graph.kg_sync.upsert_edge") as mock_edge, \
-         patch("app.knowledge_graph.kg_sync._known_db_node_namespaces", return_value=known_db) as mock_known, \
+         patch("app.knowledge_graph.kg_sync._db_namespace_for_client",
+               side_effect=lambda db, ns: (
+                   shared if (shared := shared_namespace_of(ns)) in set(existing_ns) else None
+               )), \
          patch("app.knowledge_graph.kg_sync._refresh_stale_class_for_namespace", return_value=0):
         mock_svc.return_value = MagicMock()
         sync_namespace(db=MagicMock(), namespace=namespace)
-    return mock_svc.call_args_list, mock_edge.call_args_list, mock_known
+    return mock_svc.call_args_list, mock_edge.call_args_list
 
 
-def test_secret_hint_unverified_when_no_known_db_node():
-    """secret_hint host не найден среди реальных db-узлов → confidence=unverified_host
-    + unverified_host=True, namespace остаётся own (узел всё равно создаём)."""
+# --- db-узлы: realm вместо «канонического» имени -------------------------
+#
+# Прежний дедуп сводил db-узлы по лексикографически минимальному namespace.
+# Замер прода 15.08.2026: `db:postgres:config` оказался один, в
+# `preprod-kingdom1`, с 1430 рёбрами из 106 namespace — при 41 физической базе
+# `config-db-postgresql`, по одной на `*-shared`. Граф утверждал, что прод
+# ходит в базу препрода, и делал это в blast-radius.
+
+
+def test_secret_hint_db_node_lands_in_own_realm_shared():
+    """БД клиента из prod-kingdom1 — в prod-shared, а не в чужом realm."""
     deploy = _mk_db_deploy("town-service", secret_envs={
         "DB_URL": ("postgres-town-secret", "url"),
     })
-    svc_calls, edge_calls, mock_known = _run_sync_namespace_db(deploy, "prod-kingdom1", {})
-    mock_known.assert_called_once()  # реестр загружен лениво
-    db_edge = [c for c in edge_calls if c.kwargs.get("kind") == "uses_db"]
-    assert len(db_edge) == 1
-    ex = db_edge[0].kwargs["extras"]
+    svc_calls, edge_calls = _run_sync_namespace_db(
+        deploy, "prod-kingdom1", existing_ns=["prod-shared"])
+
+    db_svc = [c for c in svc_calls if str(c.kwargs.get("name", "")).startswith("db:")]
+    assert db_svc[0].kwargs["namespace"] == "prod-shared"
+    ex = [c for c in edge_calls if c.kwargs.get("kind") == "uses_db"][0].kwargs["extras"]
+    assert ex["confidence"] == "inferred_secret_name"
+    assert ex["db_namespace_source"] == "realm_shared"
+    assert "unverified_host" not in ex
+
+
+def test_two_realms_get_two_distinct_db_nodes():
+    """Главное свойство: одинаковое имя в разных realm — РАЗНЫЕ базы.
+
+    Ровно то, что схлопывал прежний дедуп.
+    """
+    deploy = _mk_db_deploy("town-service", secret_envs={
+        "DB_URL": ("postgres-town-secret", "url"),
+    })
+    prod, _ = _run_sync_namespace_db(deploy, "prod-kingdom1",
+                                     existing_ns=["prod-shared", "squad-37-shared"])
+    squad, _ = _run_sync_namespace_db(deploy, "squad-37-kingdom2",
+                                      existing_ns=["prod-shared", "squad-37-shared"])
+
+    ns_of = lambda calls: [  # noqa: E731 — короткий локальный хелпер
+        c.kwargs["namespace"] for c in calls
+        if str(c.kwargs.get("name", "")).startswith("db:")
+    ][0]
+    assert ns_of(prod) == "prod-shared"
+    assert ns_of(squad) == "squad-37-shared"
+    assert ns_of(prod) != ns_of(squad), "разные realm обязаны дать разные узлы"
+
+
+def test_unknown_realm_stays_own_ns_and_is_marked_unverified():
+    """`<realm>-shared` не существует → не выдумываем, честно понижаем доверие."""
+    deploy = _mk_db_deploy("town-service", secret_envs={
+        "DB_URL": ("postgres-town-secret", "url"),
+    })
+    svc_calls, edge_calls = _run_sync_namespace_db(deploy, "sre-ai", existing_ns=[])
+
+    db_svc = [c for c in svc_calls if str(c.kwargs.get("name", "")).startswith("db:")]
+    assert db_svc[0].kwargs["namespace"] == "sre-ai"
+    ex = [c for c in edge_calls if c.kwargs.get("kind") == "uses_db"][0].kwargs["extras"]
     assert ex["confidence"] == "unverified_host"
     assert ex["unverified_host"] is True
-    # db-узел создан в own_namespace
-    db_svc = [c for c in svc_calls if str(c.kwargs.get("name", "")).startswith("db:")]
-    assert db_svc[0].kwargs["namespace"] == "prod-kingdom1"
-
-
-def test_secret_hint_reuses_canonical_ns_when_known():
-    """secret_hint host совпал с уже существующим db-узлом → переиспользуем его
-    канонический namespace (не плодим per-ns дубль), confidence inferred_secret_name."""
-    deploy = _mk_db_deploy("town-service", secret_envs={
-        "DB_URL": ("postgres-town-secret", "url"),
-    })
-    known = {"db:postgres:town": "prod-shared"}  # реальный узел живёт в shared
-    svc_calls, edge_calls, _ = _run_sync_namespace_db(deploy, "prod-kingdom1", known)
-    db_svc = [c for c in svc_calls if str(c.kwargs.get("name", "")).startswith("db:")]
-    assert db_svc[0].kwargs["namespace"] == "prod-shared"  # канонический, не own
-    db_edge = [c for c in edge_calls if c.kwargs.get("kind") == "uses_db"]
-    ex = db_edge[0].kwargs["extras"]
-    assert ex["confidence"] == "inferred_secret_name"
-    assert "unverified_host" not in ex
 
 
 def test_dsn_env_target_not_marked_unverified():
-    """dsn_env host точный (из реального значения) → не трогаем, реестр не нужен."""
+    """dsn_env host точный (из реального значения) → realm-логика не нужна."""
     deploy = _mk_db_deploy("town-service", dsn_envs={
         "DB_URL": "postgres://u@finance-db.prod-shared:5432/d",
     })
-    svc_calls, edge_calls, mock_known = _run_sync_namespace_db(deploy, "prod-kingdom1", {})
-    mock_known.assert_not_called()  # dsn_env не лезет в реестр
-    db_edge = [c for c in edge_calls if c.kwargs.get("kind") == "uses_db"]
-    ex = db_edge[0].kwargs["extras"]
+    _, edge_calls = _run_sync_namespace_db(deploy, "prod-kingdom1", existing_ns=["prod-shared"])
+    ex = [c for c in edge_calls if c.kwargs.get("kind") == "uses_db"][0].kwargs["extras"]
     assert ex["confidence"] == "inferred_env"
     assert "unverified_host" not in ex
-
-
-def test_known_db_node_namespaces_picks_lexicographically_minimal():
-    """При нескольких namespace с одним db-узлом — детерминированно minimal."""
-    from app.knowledge_graph.kg_sync import _known_db_node_namespaces
-    fake_db = MagicMock()
-    query = fake_db.query.return_value
-    query.filter.return_value.all.return_value = [
-        ("db:postgres:town", "prod-shared"),
-        ("db:postgres:town", "prod-kingdom1"),
-        ("db:redis:cache", "prod-kingdom2"),
-    ]
-    out = _known_db_node_namespaces(fake_db)
-    assert out == {"db:postgres:town": "prod-kingdom1", "db:redis:cache": "prod-kingdom2"}
+    assert "db_namespace_source" not in ex, "точный DSN не проходит через realm-догадку"
 
 
 # ── A4: k8s_events_sync ─────────────────────────────────────────────────────
