@@ -53,6 +53,11 @@ DISCOVERED_BY_ENDPOINTS = "k8s_endpoints/ready"
 
 _KUBECTL_TIMEOUT_S = 30
 
+#: Узлов между коммитами. 200 — компромисс: транзакция живёт секунды, а не
+#: весь проход, и при этом коммитов не тысячи. Значение того же порядка, что
+#: `_COMMIT_BATCH` в k8s_topology_resources_sync.
+_COMMIT_BATCH = 200
+
 
 class EndpointsFetchError(RuntimeError):
     """kubectl не отдал endpoints — состояние кластера неизвестно.
@@ -136,6 +141,11 @@ def sync_endpoints(db: Session, now: Optional[datetime] = None) -> Dict[str, Any
     nodes = (
         db.query(Service)
         .filter(Service.node_kind == NODE_KIND_SERVICE, Service.synthetic.is_(False))
+        # Детерминированный порядок: два писателя, идущие по строкам в разном
+        # порядке, блокируют друг друга крест-накрест. `id` монотонен и
+        # одинаков для всех — этого достаточно, чтобы взаимной блокировки не
+        # возникало по вине самого обхода.
+        .order_by(Service.id)
         .all()
     )
     for node in nodes:
@@ -179,6 +189,18 @@ def sync_endpoints(db: Session, now: Optional[datetime] = None) -> Dict[str, Any
                 extras={"endpoints_ready": ready},
             )
             stats["edges_corroborated"] += 1
+
+        # Коммит батчами, а не один на весь проход. Первый плановый прогон
+        # (15.08.2026, 11:15) упал с `DeadlockDetected`: транзакция держала
+        # блокировки на тысячах строк kg_services и kg_service_edges, пока
+        # рядом писал соседний синк. Вручную тот же код отработал — конкурента
+        # просто не было.
+        #
+        # Правило в этом проекте не новое: `kg_sync` коммитит после КАЖДОГО
+        # namespace по следам инцидента 08.08.2026, где одна многоминутная
+        # транзакция держала row-locks весь проход.
+        if stats["matched"] % _COMMIT_BATCH == 0:
+            db.commit()
 
     db.commit()
     log.info(
