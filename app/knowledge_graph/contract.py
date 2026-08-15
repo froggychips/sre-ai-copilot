@@ -147,13 +147,24 @@ STORAGE_NODE_KINDS: Set[str] = {"service", "pvc", "pv"}
 #:   labels       ↔ k8s_labels
 #:   deploy_history ↔ deploy_history
 #:   manual       ↔ manual
+#: Именованные константы источников. Объявлены, чтобы продюсеры не писали
+#: литералы: строка `"namespace_prefix"`, разъехавшаяся между таблицей и
+#: писателем, уже стоила графу 7209 занижённых рёбер в соседнем реестре
+#: (`confidence._SOURCE_PRECEDENCE`, исправлено 15.08.2026).
+OWNER_SOURCE_MANUAL: str = "manual"
+OWNER_SOURCE_K8S_LABELS: str = "k8s_labels"
+OWNER_SOURCE_NAMESPACE_PREFIX: str = "namespace_prefix"
+OWNER_SOURCE_DEPLOY_HISTORY: str = "deploy_history"
+OWNER_SOURCE_PLATFORM_STATIC: str = "platform_static"
+OWNER_SOURCE_SUGGESTED: str = "suggested"
+
 OWNER_SOURCES: Set[str] = {
-    "manual",            # ручная правка через admin endpoint / OWNERSHIP_MANIFEST_PATH
-    "k8s_labels",        # лейбл `team-owner` / `owner` / `squad` / part-of (alias: `labels`)
-    "namespace_prefix",  # эвристика по namespace (`squad-N` → owner=`squad-N`) (alias: `prefix`)
-    "deploy_history",    # PR #85: most-frequent `triggered_by` за 30d в kg_deployments
-    "platform_static",   # synthetic-узлы platform/data/external — захардкожено
-    "suggested",         # AI/heuristic suggestion (требует approve, planned)
+    OWNER_SOURCE_MANUAL,            # ручная правка через admin endpoint / OWNERSHIP_MANIFEST_PATH
+    OWNER_SOURCE_K8S_LABELS,        # лейбл `team-owner` / `owner` / `squad` / part-of (alias: `labels`)
+    OWNER_SOURCE_NAMESPACE_PREFIX,  # эвристика по namespace (`squad-N` → owner=`squad-N`) (alias: `prefix`)
+    OWNER_SOURCE_DEPLOY_HISTORY,    # PR #85: most-frequent `triggered_by` за 30d в kg_deployments
+    OWNER_SOURCE_PLATFORM_STATIC,   # synthetic-узлы platform/data/external — захардкожено
+    OWNER_SOURCE_SUGGESTED,         # AI/heuristic suggestion (требует approve, planned)
 }
 
 #: Маппинг коротких алиасов из `OwnerSuggestion.sources` в канонические
@@ -789,6 +800,12 @@ __all__ = [
     "OWNER_SOURCES",
     "OWNER_SOURCE_ALIASES",
     "OWNER_SOURCE_TRUST",
+    "OWNER_SOURCE_NAMESPACE_PREFIX",
+    "OWNER_SOURCE_PLATFORM_STATIC",
+    "OWNER_SOURCE_K8S_LABELS",
+    "OWNER_SOURCE_MANUAL",
+    "OWNER_SOURCE_DEPLOY_HISTORY",
+    "OWNER_SOURCE_SUGGESTED",
     "owner_source_valid",
     "EDGE_KINDS",
     "EdgeKindSpec",

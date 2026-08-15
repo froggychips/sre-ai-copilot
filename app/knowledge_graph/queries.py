@@ -500,6 +500,7 @@ def blast_radius_for(
     namespace: str,
     service_name: str,
     top_n: int = 3,
+    min_confidence: float = 0.0,
 ) -> Dict[str, Any]:
     """Wave 7 (X, PR #71): blast radius для упавшего сервиса.
 
@@ -512,7 +513,20 @@ def blast_radius_for(
           внешний URL.
 
     Возвращает `{services: [name, ...top_n], urls: [host, ...top_n],
-                  services_total: int, urls_total: int}`.
+                  services_total: int, urls_total: int}` плюс
+    `services_detailed` / `urls_detailed` — те же элементы с достоверностью
+    ребра, и `min_confidence_seen` — худшая достоверность в выдаче.
+
+    **Достоверность.** До 15.08.2026 blast radius был единственным публичным
+    запросом графа, который не отдавал её вовсе: `upstream_of` возвращает
+    `confidence_score` с 2026-06, а здесь список имён выглядел одинаково
+    уверенно независимо от того, прочитано ребро из k8s-манифеста или
+    угадано. Между тем это самый дорогой вопрос к графу — «кого заденет», —
+    и цена ошибки в нём выше, чем где-либо ещё.
+
+    `min_confidence` фильтрует выдачу по порогу: 0.85 оставит только
+    прочитанное из k8s, 0.0 (по умолчанию) — всё. В инциденте вопрос «что
+    ТОЧНО заденет» и «что может задеть» — разные вопросы.
 
     Используется в Discord embed-секции «🎯 Blast radius» (только critical).
     """
@@ -546,12 +560,24 @@ def blast_radius_for(
         .all()
     )
     services_seen: List[str] = []
+    services_detailed: List[Dict[str, Any]] = []
+    scores_seen: List[float] = []
     for edge in serves_rows:
         if edge.src is None:
             continue
         if edge.src.name in services_seen:
             continue
+        score = confidence_score(edge.extras, edge.last_seen_at)
+        if score < min_confidence:
+            continue
         services_seen.append(edge.src.name)
+        scores_seen.append(score)
+        services_detailed.append({
+            "name": edge.src.name,
+            "namespace": edge.src.namespace,
+            "confidence_score": score,
+            "confidence_label": confidence_label(score),
+        })
 
     # routes_to — Ingress synthetic nodes (`ingress:<name>`). Хост-имя
     # лежит в `extras.host`. Если host='*' (wildcard) — пропускаем,
@@ -565,6 +591,7 @@ def blast_radius_for(
         .all()
     )
     urls_seen: List[str] = []
+    urls_detailed: List[Dict[str, Any]] = []
     for edge in routes_rows:
         extras: Dict[str, Any] = (
             edge.extras if isinstance(edge.extras, dict) else {}
@@ -574,13 +601,29 @@ def blast_radius_for(
             continue
         if host in urls_seen:
             continue
+        score = confidence_score(edge.extras, edge.last_seen_at)
+        if score < min_confidence:
+            continue
         urls_seen.append(host)
+        scores_seen.append(score)
+        urls_detailed.append({
+            "host": host,
+            "confidence_score": score,
+            "confidence_label": confidence_label(score),
+        })
 
     return {
+        # Плоские списки оставлены как были: на них смотрит Discord-embed,
+        # и ломать формат ради нового поля незачем.
         "services": services_seen[:top_n],
         "urls": urls_seen[:top_n],
         "services_total": len(services_seen),
         "urls_total": len(urls_seen),
+        "services_detailed": services_detailed[:top_n],
+        "urls_detailed": urls_detailed[:top_n],
+        # Худшая достоверность в выдаче: по ней потребитель решает, стоит ли
+        # вообще показывать ответ как надёжный. None — показывать нечего.
+        "min_confidence_seen": min(scores_seen) if scores_seen else None,
     }
 
 
