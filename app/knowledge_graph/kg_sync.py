@@ -23,7 +23,10 @@ from sqlalchemy import cast as sa_cast
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Session
 
-from app.knowledge_graph.contract import shared_namespace_of
+from app.knowledge_graph.contract import (
+    OWNER_SOURCE_NAMESPACE_PREFIX, OWNER_SOURCE_PLATFORM_STATIC,
+    shared_namespace_of,
+)
 from app.knowledge_graph.edge_decay_guard import (
     REASON_UNMAPPED_KIND, SOURCE_KG_SYNC, edge_block_reason, record_source_run,
     unhealthy_sources,
@@ -734,6 +737,7 @@ def _upsert_service_pg(
     metadata: Optional[Dict[str, Any]] = None,
     synthetic: Optional[bool] = None,
     stale_class: Optional[str] = None,
+    owner_source: Optional[str] = None,
 ) -> Service:
     """Upsert логического сервиса — тонкая обёртка над единственным writer-ом.
 
@@ -758,6 +762,7 @@ def _upsert_service_pg(
         synthetic=synthetic,
         node_kind=NODE_KIND_SERVICE,
         stale_class=stale_class,
+        owner_source=owner_source,
     )
 
 
@@ -835,6 +840,12 @@ def sync_namespace(
         src = _upsert_service_pg(
             db, namespace=namespace, name=name, team_owner=src_team,
             synthetic=_is_synthetic_service(name),
+            # Провенанс владельца: `_derive_team_owner` — это ровно
+            # эвристика по префиксу namespace, самая слабая из известных
+            # (OWNER_SOURCE_TRUST = 0.4). До 15.08.2026 колонка не
+            # заполнялась вовсе: 6441 узел с NULL, то есть угаданный
+            # владелец и владелец из k8s-лейбла выглядели одинаково.
+            owner_source=OWNER_SOURCE_NAMESPACE_PREFIX,
         )
         stats["services"] += 1
 
@@ -846,6 +857,7 @@ def sync_namespace(
                 namespace=up_ns,
                 name=up_svc,
                 team_owner=_derive_team_owner(up_ns),
+                owner_source=OWNER_SOURCE_NAMESPACE_PREFIX,
             )
             upsert_edge(
                 db, src=src, dst=dst, kind="calls",
@@ -864,6 +876,7 @@ def sync_namespace(
                 namespace=nats_ns,
                 name=nats_name,
                 team_owner="platform",
+                owner_source=OWNER_SOURCE_PLATFORM_STATIC,
             )
             upsert_edge(
                 db, src=src, dst=dst,
@@ -923,6 +936,7 @@ def sync_namespace(
                 namespace=db_ns,
                 name=db_node,
                 team_owner="data",
+                owner_source=OWNER_SOURCE_PLATFORM_STATIC,
                 synthetic=True,
             )
             upsert_edge(
