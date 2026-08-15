@@ -15,3 +15,9 @@ docs/kg-presentation.html
 # k8s/base/secrets.yaml прямо инструктирует создать secrets.local.yaml с
 # боевыми ключами и обещает, что он в .gitignore — выполняем обещание.
 secrets.local.yaml
+
+# Рабочие деревья агентов — вложенные git-репозитории, в истории им не место.
+# 15.08.2026 они уехали в релизный коммит через `git add -A`.
+.claude/worktrees/
+.coverage
+coverage.xml
