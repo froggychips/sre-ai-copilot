@@ -146,6 +146,29 @@ rules:
 - apiGroups: ["apps"]
   resources: ["replicasets"]
   verbs: ["get", "list", "watch"]
+# Endpoints (15.08.2026) — точный ответ на «какие поды реально стоят за этим
+# Service». Без них `serves_traffic` достраивается по совпадению имён, а
+# «Service объявлен, за ним пусто» не видно вовсе: замер дал 83 таких Service,
+# и ни один не был headless или ExternalName — то есть все 83 аномальны.
+#
+# NB: namespace-scoped Role `sre-ai-read` выше тоже перечисляет endpoints, но
+# действует ТОЛЬКО в namespace копилота. До этого правила `can-i get endpoints`
+# отвечал `yes` в `sre-ai` и `no` во всех остальных — легко принять за
+# «доступ есть».
+- apiGroups: [""]
+  resources: ["endpoints"]
+  verbs: ["get", "list", "watch"]
+# NetworkPolicies (15.08.2026) — объявленные связи «кто с кем говорит».
+# Масштаб честный: из 775 политик кластера только 55 несут peer-селекторы и
+# дают ~638 рёбер (3% графа). Ценность не в объёме, а в классе: это
+# declared_k8s, которых в графе всего 44.6%.
+#
+# Осторожно с обратным выводом: 1441 правило — «разрешить всем», а под, не
+# покрытый ни одной политикой, в k8s разрешён везде. Поэтому «путь запрещён»
+# из отсутствия правила НЕ следует.
+- apiGroups: ["networking.k8s.io"]
+  resources: ["networkpolicies"]
+  verbs: ["get", "list", "watch"]
 
 ---
 apiVersion: rbac.authorization.k8s.io/v1
