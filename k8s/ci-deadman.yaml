@@ -25,14 +25,25 @@
 #     --from-literal=STALE_PR_DAYS=3 \
 #     --dry-run=client -o yaml | kubectl apply -f -
 #
-#   # 3. Секрет с токенами (--from-file, чтобы значения не попали в history шелла):
+#   # 3. Секрет (--from-file, чтобы значения не попали в history шелла).
+#   #    Обязателен только вебхук — GitHub-токен опционален, см. ниже:
 #   kubectl -n sre-ai create secret generic ci-deadman-secrets \
-#     --from-file=github_token=/path/gh_ro_token \
 #     --from-file=discord_webhook_url=/path/webhook_url \
 #     --dry-run=client -o yaml | kubectl apply -f -
-#   # github_token — fine-grained PAT только на этот репозиторий, права
-#   # read-only: Actions:read, Pull requests:read, Metadata:read, Administration:read
-#   # (последнее нужно для /actions/runners — без него список раннеров даёт 403).
+#
+#   # GITHUB_TOKEN не нужен: репозиторий публичный, и очередь, PR-ы и ветка
+#   # читаются анонимным API. 401 отдаёт только /actions/runners, поэтому без
+#   # токена отключается ровно одна проверка из четырёх — статус раннера.
+#   # Ту же аварию (раннер офлайн) ловят две другие: очередь стоит, а прогоны
+#   # на master отменяются. Это осознанный размен: держать в кластере токен с
+#   # доступом к чужим репозиториям ради одной проверки дороже, чем потерять её.
+#   #
+#   # Захотите точный статус раннера — добавьте fine-grained PAT только на этот
+#   # репозиторий (Actions:read, Pull requests:read, Metadata:read,
+#   # Administration:read — последнее как раз для /actions/runners):
+#   #   kubectl -n sre-ai patch secret ci-deadman-secrets \
+#   #     --type merge -p "{\"stringData\":{\"github_token\":\"$(cat /path/pat)\"}}"
+#   # Проверка включится сама на следующем тике, менять манифест не нужно.
 #
 # Образ: тот же sre-ai-copilot (нужен только python3 + requests), в проде
 # патчится на внутренний реестр через deploy.sh, как остальные CronJob-ы.
@@ -89,11 +100,15 @@ spec:
             - configMapRef:
                 name: ci-deadman-env
             env:                                # remap lowercase secret-ключей
+            # optional: без ключа под ДОЛЖЕН стартовать, иначе канарейка
+            # умирает от отсутствия токена, который ей по большей части не
+            # нужен, — и молчит ровно так же, как молчал бы мёртвый CI.
             - name: GITHUB_TOKEN
               valueFrom:
                 secretKeyRef:
                   name: ci-deadman-secrets
                   key: github_token
+                  optional: true
             - name: DISCORD_WEBHOOK_URL
               valueFrom:
                 secretKeyRef:

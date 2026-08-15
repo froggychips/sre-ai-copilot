@@ -39,36 +39,46 @@ def _iso(minutes_ago=0, days_ago=0):
 
 
 # --- раннеры --------------------------------------------------------------
+#
+# Токен здесь обязателен: без него проверка штатно пропускается (см. секцию
+# «работа без токена»), и тест на молчание при живом раннере зеленел бы по
+# ложной причине — пустой список от пропуска неотличим от «всё хорошо».
 
 
-def test_offline_runner_is_a_finding(dm, monkeypatch):
-    monkeypatch.setattr(dm, "gh", lambda *a, **k: {
+@pytest.fixture
+def token(dm, monkeypatch):
+    monkeypatch.setattr(dm, "TOKEN", "t")
+    return dm
+
+
+def test_offline_runner_is_a_finding(token, monkeypatch):
+    monkeypatch.setattr(token, "gh", lambda *a, **k: {
         "runners": [{"name": "jabbook-air-m3-sre-copilot", "status": "offline"}]
     })
-    problems = dm.check_runners()
+    problems = token.check_runners()
     assert len(problems) == 1
     assert "offline" in problems[0]
 
 
-def test_no_runners_at_all_is_a_finding(dm, monkeypatch):
-    monkeypatch.setattr(dm, "gh", lambda *a, **k: {"runners": []})
-    assert dm.check_runners(), "пустой список раннеров обязан быть находкой"
+def test_no_runners_at_all_is_a_finding(token, monkeypatch):
+    monkeypatch.setattr(token, "gh", lambda *a, **k: {"runners": []})
+    assert token.check_runners(), "пустой список раннеров обязан быть находкой"
 
 
-def test_online_runner_is_silent(dm, monkeypatch):
-    monkeypatch.setattr(dm, "gh", lambda *a, **k: {
+def test_online_runner_is_silent(token, monkeypatch):
+    monkeypatch.setattr(token, "gh", lambda *a, **k: {
         "runners": [{"name": "jabbook-air-m3-sre-copilot", "status": "online"}]
     })
-    assert dm.check_runners() == []
+    assert token.check_runners() == []
 
 
-def test_watched_runner_missing_is_a_finding(dm, monkeypatch):
+def test_watched_runner_missing_is_a_finding(token, monkeypatch):
     """Раннер переименовали/снесли — молчать нельзя: гонять больше не на чем."""
-    monkeypatch.setattr(dm, "RUNNER_NAME", "jabbook-air-m3-sre-copilot")
-    monkeypatch.setattr(dm, "gh", lambda *a, **k: {
+    monkeypatch.setattr(token, "RUNNER_NAME", "jabbook-air-m3-sre-copilot")
+    monkeypatch.setattr(token, "gh", lambda *a, **k: {
         "runners": [{"name": "someone-elses-runner", "status": "online"}]
     })
-    problems = dm.check_runners()
+    problems = token.check_runners()
     assert problems and "не зарегистрирован" in problems[0]
 
 
@@ -229,7 +239,155 @@ def test_findings_are_posted(dm, monkeypatch):
     assert posted == [["раннер offline"]]
 
 
-def test_no_token_exits_nonzero(dm, monkeypatch):
-    """Без токена канарейка обязана падать заметно, а не «проверять» вхолостую."""
+# --- работа без токена ----------------------------------------------------
+#
+# Репозиторий публичный: очередь, PR-ы и ветка читаются анонимно, а 401 отдаёт
+# только `/actions/runners`. Класть в кластер полноправный токен ради одной
+# проверки — размен не в нашу пользу, поэтому режим без токена штатный.
+
+
+def test_anonymous_run_works(dm, monkeypatch):
+    """Нет токена — канарейка работает, а не выходит с ошибкой."""
     monkeypatch.setattr(dm, "TOKEN", "")
-    assert dm.main() == 2
+    monkeypatch.setattr(dm, "CHECKS", (("queue", lambda: []),))
+    monkeypatch.setattr(dm, "post_discord", lambda p: None)
+    assert dm.main() == 0
+
+
+def test_runners_check_is_skipped_without_token(dm, monkeypatch):
+    """Пропуск тихий: ежечасная жалоба на известное ограничение = шум."""
+    monkeypatch.setattr(dm, "TOKEN", "")
+    monkeypatch.setattr(dm, "gh", lambda *a, **k: pytest.fail("не должно ходить в API"))
+    assert dm.check_runners() == []
+
+
+def test_runners_check_runs_when_token_present(dm, monkeypatch):
+    """Появился токен — проверка включается сама, без правок конфигурации."""
+    monkeypatch.setattr(dm, "TOKEN", "t")
+    monkeypatch.setattr(dm, "gh", lambda *a, **k: {
+        "runners": [{"name": "mac", "status": "offline"}]
+    })
+    problems = dm.check_runners()
+    assert problems and "offline" in problems[0]
+
+
+def test_no_auth_header_without_token(dm, monkeypatch):
+    captured = {}
+
+    class R:
+        status_code = 200
+        headers: dict = {}
+
+        @staticmethod
+        def raise_for_status():
+            return None
+
+        @staticmethod
+        def json():
+            return {}
+
+    def fake_get(url, headers=None, params=None, timeout=None):
+        captured.update(headers or {})
+        return R()
+
+    monkeypatch.setattr(dm, "TOKEN", "")
+    monkeypatch.setattr(dm.requests, "get", fake_get)
+    dm.gh("/x")
+    assert "Authorization" not in captured
+
+
+def test_rate_limit_is_distinct_from_broken_ci(dm, monkeypatch):
+    """Лимит 60/час на IP — это «мы ослепли», и молчать об этом нельзя."""
+    class R:
+        status_code = 403
+        headers = {"X-RateLimit-Remaining": "0", "X-RateLimit-Limit": "60",
+                   "X-RateLimit-Reset": "1"}
+
+        @staticmethod
+        def raise_for_status():
+            raise AssertionError("должно упасть раньше, своим типом")
+
+    monkeypatch.setattr(dm, "TOKEN", "")
+    monkeypatch.setattr(dm.requests, "get", lambda *a, **k: R())
+    with pytest.raises(dm.RateLimited):
+        dm.gh("/x")
+
+
+def test_forbidden_without_exhausted_limit_is_not_rate_limit(dm, monkeypatch):
+    """403 с остатком запросов — это отказ в доступе, другая болезнь."""
+    class R:
+        status_code = 403
+        headers = {"X-RateLimit-Remaining": "42"}
+
+        @staticmethod
+        def raise_for_status():
+            raise RuntimeError("403 Forbidden")
+
+    monkeypatch.setattr(dm, "TOKEN", "")
+    monkeypatch.setattr(dm.requests, "get", lambda *a, **k: R())
+    with pytest.raises(RuntimeError) as e:
+        dm.gh("/x")
+    assert not isinstance(e.value, dm.RateLimited)
+
+
+# --- отменённый прогон как след офлайн-раннера ----------------------------
+
+
+def test_cancelled_run_on_default_branch_is_a_finding(dm, monkeypatch):
+    """Так выглядит офлайн-раннер снаружи: очередь стоит, GitHub отменяет.
+
+    Заменяет прямую проверку раннера в анонимном режиме — master руками
+    никто не отменяет.
+    """
+    monkeypatch.setattr(dm, "DEFAULT_BRANCH", "master")
+    monkeypatch.setattr(dm, "gh", lambda *a, **k: {
+        "workflow_runs": [
+            {"name": "CI Pipeline", "run_number": 9, "conclusion": "cancelled",
+             "html_url": "u", "updated_at": _iso(minutes_ago=10)}
+        ]
+    })
+    problems = dm.check_default_branch_red()
+    assert problems and "отменён" in problems[0]
+
+
+def test_successful_run_stays_silent(dm, monkeypatch):
+    monkeypatch.setattr(dm, "DEFAULT_BRANCH", "master")
+    monkeypatch.setattr(dm, "gh", lambda *a, **k: {
+        "workflow_runs": [
+            {"name": "CI Pipeline", "run_number": 9, "conclusion": "success",
+             "html_url": "u", "updated_at": _iso(minutes_ago=10)}
+        ]
+    })
+    assert dm.check_default_branch_red() == []
+
+
+# --- срез по лимиту не выдаётся за полную проверку ------------------------
+
+
+def test_pr_cap_is_reported_not_silent(dm, monkeypatch):
+    """Проверено не всё — канарейка обязана сказать это вслух."""
+    monkeypatch.setattr(dm, "MAX_PR_CHECKS", 1)
+    prs = [
+        {"number": n, "title": f"pr{n}", "draft": False,
+         "created_at": _iso(days_ago=10), "html_url": "u",
+         "head": {"sha": f"sha{n}"}}
+        for n in (1, 2, 3)
+    ]
+
+    def fake_gh(path, params=None):
+        if path.endswith("/pulls"):
+            return prs
+        return {"check_runs": [{"status": "completed", "conclusion": "success"}]}
+
+    monkeypatch.setattr(dm, "gh", fake_gh)
+    problems = dm.check_stale_green_prs()
+    assert any("2 пропущено" in p for p in problems)
+
+
+def test_only_runners_check_requires_a_token(dm):
+    """Флаг живёт на функции — если его потеряют, пропуск станет ложным «OK»."""
+    assert dm.check_runners.needs_token is True
+    others = [fn for name, fn in dm.CHECKS if name != "runners"]
+    assert not any(getattr(fn, "needs_token", False) for fn in others), (
+        "анонимный режим сломается: проверка требует токен, но не помечена"
+    )
