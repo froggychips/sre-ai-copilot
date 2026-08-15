@@ -27,8 +27,20 @@ def _load():
 
 
 @pytest.fixture
-def dm():
-    return _load()
+def dm(monkeypatch):
+    """Модуль канарейки, отвязанный от окружения запуска.
+
+    GitHub Actions экспортирует в job переменные RUNNER_NAME и GITHUB_TOKEN, а
+    модуль читает их на импорте. Из-за этого тесты вели себя по-разному
+    локально и в CI: на раннере `jabbook-air-m3-sre-copilot` проверка уходила
+    в ветку «нужный раннер не зарегистрирован» и роняла сборку, зелёную на
+    ноутбуке. Значения задаём явно — тест не должен зависеть от того, где его
+    запустили.
+    """
+    mod = _load()
+    monkeypatch.setattr(mod, "RUNNER_NAME", "")   # пусто → смотрим все раннеры
+    monkeypatch.setattr(mod, "TOKEN", "")         # анонимный режим по умолчанию
+    return mod
 
 
 def _iso(minutes_ago=0, days_ago=0):
