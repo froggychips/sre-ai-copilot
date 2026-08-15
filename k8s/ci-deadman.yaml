@@ -47,6 +47,14 @@
 #
 # Образ: тот же sre-ai-copilot (нужен только python3 + requests), в проде
 # патчится на внутренний реестр через deploy.sh, как остальные CronJob-ы.
+#
+# ⚠️ `kubectl apply -f` этим файлом ВОЗВРАЩАЕТ image в IMAGE_PLACEHOLDER, и
+# следующий тик падает в InvalidImageName — молча, потому что CronJob не
+# алертит на несозданный под (проверено 15.08.2026). Применять только через
+# deploy.sh, либо сразу после apply вернуть образ:
+#   kubectl -n sre-ai set image cronjob/ci-deadman ci-deadman=$(
+#     kubectl -n sre-ai get deploy sre-ai-api \
+#       -o jsonpath='{.spec.template.spec.containers[0].image}')
 apiVersion: batch/v1
 kind: CronJob
 metadata:
