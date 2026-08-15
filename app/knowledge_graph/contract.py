@@ -20,6 +20,7 @@ quality metrics и compatibility policy.
 from __future__ import annotations
 
 import logging
+import re
 from typing import TYPE_CHECKING, Dict, Iterable, Optional, Set, TypedDict
 
 if TYPE_CHECKING:  # pragma: no cover - only for typing
@@ -36,6 +37,15 @@ log = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 #: KG schema contract version. Bump rules — см. docs/KG_SCHEMA_CONTRACT.md.
+#: 2.7 = db-узлы из secret_hint привязаны к realm (`<realm>-shared`) вместо
+#: схлопывания по имени. До этого `db:postgres:config` был ОДНИМ узлом в
+#: `preprod-kingdom1` с 1430 рёбрами из 106 namespace — при 41 физической базе.
+#: Граф отвечал, что прод ходит в базу препрода, причём в blast radius.
+#: Breaking для консьюмеров, считавших такой узел одной сущностью; рёбра на
+#: старый узел уйдут сами через edge_decay.
+#: 2.6 = `kg_services.owner_source` (миграция 20260814_0100): провенанс
+#: владельца перестал быть неразличимым. Бамп версии при этом забыли — в коде
+#: на 2.6 ссылались комментарии, а константа оставалась 2.5 до 15.08.2026.
 #: 2.1 = после Wave 7 (PodEvent corr / Service+Ingress topology / NATS subjects).
 #: 2.2 = после PR #82 (k8s_jobs_sync), #84 (k8s_storage_sync) и #86
 #: (kg_services.stale_class column + multi-signal owner inference).
@@ -50,7 +60,7 @@ log = logging.getLogger(__name__)
 #: без expected_stale-инфры) + единый источник `compute_orphan_stats`; все
 #: consumer'ы (STARTUP_CONTRACT_CHECK, quality_report, stats_digest) считают
 #: orphan через него. EDGE_KINDS не менялись.
-KG_SCHEMA_VERSION: str = "2.5"
+KG_SCHEMA_VERSION: str = "2.7"
 
 
 # ---------------------------------------------------------------------------
@@ -484,6 +494,51 @@ ENV_PREFIXES: tuple[tuple[str, str], ...] = (
     ("squad-", "squad"),
 )
 ENV_OTHER: str = "infra/other"
+
+
+#: Хвосты namespace, за которыми стоит «этот realm, но другая роль». Данные
+#: кластера на 15.08.2026: `prod-kingdom1`, `preprod-qa-kingdom2`,
+#: `squad-37-kingdom2` — у всех БД лежит в `<realm>-shared`.
+_REALM_TAIL_RE = re.compile(r"-(?:kingdom\d+|shared)$")
+
+#: Имя namespace, где живут БД realm'а.
+SHARED_SUFFIX: str = "-shared"
+
+
+def shared_namespace_of(namespace: Optional[str]) -> Optional[str]:
+    """`<realm>-shared` для namespace, или None если правило не применимо.
+
+        prod-kingdom1        → prod-shared
+        preprod-qa-kingdom2  → preprod-qa-shared
+        squad-37-kingdom2    → squad-37-shared
+        prod-shared          → prod-shared      (сам себе)
+        sre-ai               → None             (не realm-namespace)
+
+    Зачем. `db:<driver>:<host>`-узлы из secret_hint строятся эвристикой, и
+    раньше дедуп сводил их в ОДИН узел на весь кластер — «канонический»
+    выбирался лексикографическим минимумом среди уже существующих. Замер
+    15.08.2026: `db:postgres:config` жил в `preprod-kingdom1` и собрал 1430
+    рёбер из 106 namespace, тогда как физически таких баз 41 — по одной в
+    каждом `*-shared`. Граф утверждал, что `prod-kingdom1` ходит в базу
+    препрода: не потеря точности, а неверный факт о проде, причём ровно в
+    том запросе, ради которого граф существует (blast radius).
+
+    Правило выведено из кластера, а не угадано, но применять его вслепую всё
+    равно нельзя — вызывающий код обязан проверить, что такой namespace
+    существует (см. `kg_sync._db_namespace_for_client`). Неизвестное имя
+    лучше оставить в own_namespace, чем сослаться на выдуманный.
+    """
+    ns = (namespace or "").strip().lower()
+    if not ns:
+        return None
+    if ns.endswith(SHARED_SUFFIX):
+        return ns
+    realm = _REALM_TAIL_RE.sub("", ns)
+    if realm == ns:
+        # Хвост не распознан: `sre-ai`, `monitoring`, `prod-lo-legal`.
+        # Придумывать им shared-пару не на чем.
+        return None
+    return f"{realm}{SHARED_SUFFIX}"
 
 
 def env_of_namespace(namespace: Optional[str]) -> str:
