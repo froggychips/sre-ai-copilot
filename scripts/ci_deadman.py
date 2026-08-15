@@ -23,9 +23,21 @@
 приучать игнорировать канал. Ошибки самой проверки (сеть/токен) тоже идут
 в Discord — молчащая канарейка бесполезна.
 
-Env: GITHUB_TOKEN (read-only PAT: repo/actions:read), GITHUB_REPO,
+Токен не обязателен. Репозиторий публичный, и три проверки из четырёх ходят
+в анонимный API (очередь, PR-ы, ветка). Токена требует только список
+раннеров: `/actions/runners` отдаёт 401 даже на публичном репозитории.
+Работать без него — осознанный размен: канарейка не видит статус раннера
+напрямую, но ту же аварию ловит по очереди и по отменённым прогонам, а
+взамен в кластере не лежит секрет с доступом к чужим репозиториям.
+Появится read-only PAT (fine-grained, `Administration: Read`) — проверка
+раннеров включится сама, менять ничего не нужно.
+
+Анонимный лимит GitHub — 60 запросов в час на IP, поэтому число PR-ов,
+у которых опрашиваются check-runs, ограничено MAX_PR_CHECKS.
+
+Env: [GITHUB_TOKEN] (read-only; без него — ограниченный режим), GITHUB_REPO,
      DISCORD_WEBHOOK_URL, [RUNNER_NAME], [QUEUE_MINUTES=30],
-     [STALE_PR_DAYS=3], [DRY_RUN=1].
+     [STALE_PR_DAYS=3], [MAX_PR_CHECKS=15], [DRY_RUN=1].
 """
 import datetime
 import os
@@ -40,6 +52,9 @@ WEBHOOK = os.environ.get("DISCORD_WEBHOOK_URL", "")
 RUNNER_NAME = os.environ.get("RUNNER_NAME", "")  # пусто → проверяем все раннеры репо
 QUEUE_MINUTES = int(os.environ.get("QUEUE_MINUTES", "30"))
 STALE_PR_DAYS = int(os.environ.get("STALE_PR_DAYS", "3"))
+# Анонимный лимит GitHub — 60 запросов/час на IP, а check-runs стоят по
+# запросу на PR. Потолок оставляет запас остальным проверкам.
+MAX_PR_CHECKS = int(os.environ.get("MAX_PR_CHECKS", "15"))
 DRY_RUN = os.environ.get("DRY_RUN") == "1"
 TIMEOUT = float(os.environ.get("HTTP_TIMEOUT", "20"))
 
@@ -66,18 +81,39 @@ def parse_ts(value):
         return None
 
 
+class RateLimited(RuntimeError):
+    """Упёрлись в лимит GitHub — это не «CI сломан», а «мы ослепли».
+
+    Разделено намеренно: без токена лимит 60/час на IP, и общий IP кластера
+    может его выбрать. Молча посчитать это отсутствием проблем — худший
+    исход для канарейки.
+    """
+
+
 def gh(path, params=None):
     """GET к GitHub API. Бросает наверх — обработка в main (см. run_checks)."""
+    headers = {
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+    # Без токена — анонимный запрос: на публичном репозитории этого хватает
+    # всем проверкам, кроме списка раннеров.
+    if TOKEN:
+        headers["Authorization"] = f"Bearer {TOKEN}"
+
     r = requests.get(
         f"{GITHUB_API}{path}",
-        headers={
-            "Authorization": f"Bearer {TOKEN}",
-            "Accept": "application/vnd.github+json",
-            "X-GitHub-Api-Version": "2022-11-28",
-        },
+        headers=headers,
         params=params or {},
         timeout=TIMEOUT,
     )
+    # 403/429 с исчерпанным остатком — именно лимит, а не запрет доступа.
+    if r.status_code in (403, 429) and r.headers.get("X-RateLimit-Remaining") == "0":
+        reset = r.headers.get("X-RateLimit-Reset", "?")
+        raise RateLimited(
+            f"лимит GitHub исчерпан (limit={r.headers.get('X-RateLimit-Limit')}, "
+            f"reset={reset}){' — анонимный режим' if not TOKEN else ''}"
+        )
     r.raise_for_status()
     return r.json()
 
@@ -86,8 +122,18 @@ def gh(path, params=None):
 
 
 def check_runners():
-    """Раннеры репозитория: хотя бы один online, и именно нужный, если задан."""
+    """Раннеры репозитория: хотя бы один online, и именно нужный, если задан.
+
+    Единственная проверка, которой нужен токен: `/actions/runners` отдаёт 401
+    и на публичном репозитории. Без токена — тихо пропускаем, а не сыпем
+    находкой каждый час: ежечасная жалоба на известное ограничение приучает
+    игнорировать канал, то есть ломает канарейку вернее, чем её отсутствие.
+    Офлайн-раннер при этом всё равно виден — по `check_queue` и по отменённым
+    прогонам в `check_default_branch_red`.
+    """
     problems = []
+    if not TOKEN:
+        return []
     data = gh(f"/repos/{REPO}/actions/runners")
     runners = data.get("runners") or []
     if not runners:
@@ -138,12 +184,20 @@ def check_stale_green_prs():
     prs = gh(f"/repos/{REPO}/pulls", {"state": "open", "per_page": 50})
     cutoff = now_utc() - datetime.timedelta(days=STALE_PR_DAYS)
     stale = []
+    checked = 0
+    skipped = 0
     for pr in prs:
         if pr.get("draft"):
             continue
         created = parse_ts(pr.get("created_at"))
         if not created or created >= cutoff:
             continue
+        # Каждый PR — отдельный запрос check-runs; в анонимном режиме их
+        # столько же, сколько всего доступно за час.
+        if checked >= MAX_PR_CHECKS:
+            skipped += 1
+            continue
+        checked += 1
         sha = (pr.get("head") or {}).get("sha")
         if not sha:
             continue
@@ -164,11 +218,24 @@ def check_stale_green_prs():
             f"**зелёные PR-ы висят** ({len(stale)} шт, > {STALE_PR_DAYS} дн):\n  · "
             + "\n  · ".join(stale[:8])
         )
+    # Срез не должен выглядеть как «проверено всё и чисто».
+    if skipped:
+        problems.append(
+            f"проверены не все PR-ы: {skipped} пропущено сверх лимита "
+            f"MAX_PR_CHECKS={MAX_PR_CHECKS}"
+        )
     return problems
 
 
 def check_default_branch_red():
-    """Последний завершённый прогон CI на дефолтной ветке — не failure."""
+    """Последний завершённый прогон CI на дефолтной ветке — не failure.
+
+    `cancelled` считается наравне с `failure`, и это не придирка к формальному
+    статусу: офлайн-раннер именно так и выглядит снаружи — прогон висит в
+    очереди, а потом GitHub его отменяет. Никто руками master не отменяет,
+    поэтому отмена на дефолтной ветке — сигнал, а не шум. Для режима без
+    токена это заменяет прямую проверку раннера.
+    """
     branch = DEFAULT_BRANCH
     if not branch:
         branch = gh(f"/repos/{REPO}").get("default_branch") or "master"
@@ -183,13 +250,25 @@ def check_default_branch_red():
     if not ci_runs:
         return []
     last = ci_runs[0]
-    if last.get("conclusion") == "failure":
-        return [
-            f"**{branch} красный** — [{last.get('name')} #{last.get('run_number')}]"
-            f"({last.get('html_url')}), {last.get('updated_at')}"
-        ]
-    return []
+    conclusion = last.get("conclusion")
+    if conclusion not in ("failure", "cancelled"):
+        return []
 
+    headline = (
+        f"**{branch} красный**"
+        if conclusion == "failure"
+        else f"**на {branch} отменён последний прогон** — типичный след офлайн-раннера"
+    )
+    return [
+        f"{headline} — [{last.get('name')} #{last.get('run_number')}]"
+        f"({last.get('html_url')}), {last.get('updated_at')}"
+    ]
+
+
+# Единственная проверка, которой нужен токен (`/actions/runners` → 401 даже на
+# публичном репозитории). Флаг читает run_checks, чтобы пропуск был виден
+# в логе, а не выглядел как успешная проверка.
+check_runners.needs_token = True
 
 CHECKS = (
     ("runners", check_runners),
@@ -203,6 +282,12 @@ def run_checks():
     """Все проверки; падение одной не отменяет остальные — она сама становится находкой."""
     problems = []
     for name, fn in CHECKS:
+        # «OK» у проверки, которая не выполнялась, — ровно тот ложный зелёный,
+        # ради которого канарейка и написана. Требование токена помечено на
+        # самой функции, а не на её имени в наборе: имя — деталь конфигурации.
+        if getattr(fn, "needs_token", False) and not TOKEN:
+            log(f"  {name}: ПРОПУЩЕНО (нужен токен; офлайн ловится по очереди)")
+            continue
         try:
             found = fn()
         except Exception as e:  # noqa: BLE001 — любая ошибка проверки это находка
@@ -240,10 +325,9 @@ def post_discord(problems):
 
 
 def main():
-    if not TOKEN:
-        log("нет GITHUB_TOKEN — проверять нечем")
-        return 2
-    log(f"ci-deadman: {REPO} (runner={RUNNER_NAME or 'любой'}, queue>{QUEUE_MINUTES}м, prs>{STALE_PR_DAYS}д)")
+    mode = "с токеном" if TOKEN else "анонимно, без проверки раннеров"
+    log(f"ci-deadman: {REPO} ({mode}; runner={RUNNER_NAME or 'любой'}, "
+        f"queue>{QUEUE_MINUTES}м, prs>{STALE_PR_DAYS}д)")
     problems = run_checks()
     if not problems:
         log("всё чисто — молчим")
