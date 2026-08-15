@@ -36,14 +36,33 @@ _SOURCE_PRECEDENCE: Dict[str, float] = {
     # будущих OTEL / VM metrics источников.
     "kg_sync/otel_runtime": 1.0,
     "kg_sync/vm_runtime": 1.0,
+    "kg_sync/runtime_seen": 1.0,    # зарезервировано под L7-источники
     "kg_sync/runtime_corr": 0.95,   # PodEvent ↔ ServiceEdge correlation
     # Tier 2: declarative k8s resources (0.85). Manifest существует физически.
     "kg_sync/ingress": 0.85,
     "kg_sync/service": 0.85,
     "kg_sync/network_policy": 0.85,
+    # Те же declarative-источники под именами, которые РЕАЛЬНО пишет
+    # k8s_topology_resources_sync (DISCOVERED_BY_SVC / DISCOVERED_BY_INGRESS).
+    # Префикс здесь разъехался с таблицей, и до 15.08.2026 эти источники были
+    # ей неизвестны: 7209 рёбер (5547 serves_traffic + 1662 routes_to)
+    # получали default 0.40 — то есть k8s-манифест, прочитанный напрямую,
+    # оценивался НИЖЕ хоста, угаданного по имени секрета (0.65).
+    # Граф считал догадку достовернее наблюдения; тест
+    # `test_every_producer_source_is_known` не даёт этому повториться.
+    "k8s_topology_resources/service": 0.85,
+    "k8s_topology_resources/ingress": 0.85,
+    # Job/CronJob и storage — тоже прочитанные k8s-манифесты.
+    "k8s_jobs_sync/job": 0.85,
+    "k8s_jobs_sync/cronjob": 0.85,
+    "k8s_storage/pod_volumes": 0.85,
+    "k8s_storage/pvc_spec": 0.85,
     # Tier 3: strong inference (0.65). Имя secret key явно говорит про DB.
     "kg_sync/secret_hint": 0.65,
     "kg_sync/dsn_env": 0.65,
+    # Парсер исходников монорепы: код прямо называет subject, который сервис
+    # публикует. Сильный вывод, но всё же объявление, а не наблюдение вызова.
+    "kg_sync/nats_subjects_parser": 0.65,
     # Tier 4: weak inference (0.50). Env-vars с URL/HOST в имени.
     "kg_sync/env_url_v2": 0.50,
     "kg_sync/env_vars": 0.50,
