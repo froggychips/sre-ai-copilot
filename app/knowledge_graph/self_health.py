@@ -564,6 +564,92 @@ def check_edge_kind_freshness(db: Session) -> CheckResult:
     )
 
 
+def check_schema_version(db: Session) -> CheckResult:
+    """Схема БД совпадает с той, которую ожидает выкаченный код.
+
+    Прецедент 14.08.2026: образ rc.19 нёс код с колонкой `owner_source`, а
+    миграции в проде не применили — рецепт релиза их просто не содержал.
+    kg_topology_sync падал на ВСЕХ 129 namespace с
+    `column "owner_source" does not exist`, за тик писал ноль узлов и ноль
+    рёбер. Заметили это не по алерту, а случайно: единственным «сигналом»
+    была подозрительная скорость тика (40 секунд вместо минут).
+
+    Спасло тогда то, что deadman у edge_decay увидел fetch-ошибки и не стал
+    удалять 17 тысяч рёбер, решив, что топология исчезла. То есть данные
+    уцелели по счастливой случайности архитектуры, а не потому, что кто-то
+    следил за версией схемы.
+
+    Проверка сравнивает `alembic_version` в БД со списком ревизий, которые
+    знает код. Отставание — fail: код ожидает объекты, которых в БД нет.
+    Опережение — warn: БД новее кода, это бывает при откате образа и само по
+    себе не ломает (новые колонки просто не используются).
+    """
+    from sqlalchemy import text
+
+    try:
+        current = db.execute(text("SELECT version_num FROM alembic_version")).scalar()
+    except Exception as e:  # noqa: BLE001 — таблицы может не быть в тестовой БД
+        return CheckResult(
+            name="schema_version",
+            status="warn",
+            detail={"reason": f"alembic_version недоступна: {type(e).__name__}"},
+        )
+
+    expected = _expected_head_revision()
+    entry: Dict[str, Any] = {"db_revision": current, "code_head": expected}
+
+    if expected is None:
+        entry["reason"] = "не удалось прочитать ревизии из alembic/versions"
+        return CheckResult(name="schema_version", status="warn", detail=entry)
+    if current == expected:
+        return CheckResult(name="schema_version", status="ok", detail=entry)
+
+    known = _known_revisions()
+    if current in known and expected in known:
+        behind = known.index(current) < known.index(expected)
+    else:
+        behind = True
+    entry["direction"] = "БД отстаёт от кода" if behind else "БД новее кода"
+    return CheckResult(
+        name="schema_version",
+        status="fail" if behind else "warn",
+        detail=entry,
+    )
+
+
+def _revision_files() -> List[Any]:
+    from pathlib import Path
+    versions = Path(__file__).resolve().parents[2] / "alembic" / "versions"
+    return sorted(versions.glob("*.py")) if versions.exists() else []
+
+
+def _known_revisions() -> List[str]:
+    """Ревизии в порядке имён файлов — они датированы, значит хронологичны."""
+    import re
+    out: List[str] = []
+    for f in _revision_files():
+        m = re.search(r'^revision = "([^"]+)"', f.read_text(encoding="utf-8"), re.MULTILINE)
+        if m:
+            out.append(m.group(1))
+    return out
+
+
+def _expected_head_revision() -> Optional[str]:
+    """Ревизия, на которую не ссылается ни один down_revision, — это head."""
+    import re
+    revisions, downs = [], set()
+    for f in _revision_files():
+        text_ = f.read_text(encoding="utf-8")
+        m = re.search(r'^revision = "([^"]+)"', text_, re.MULTILINE)
+        d = re.search(r'^down_revision = "([^"]+)"', text_, re.MULTILINE)
+        if m:
+            revisions.append(m.group(1))
+        if d:
+            downs.add(d.group(1))
+    heads = [r for r in revisions if r not in downs]
+    return heads[0] if len(heads) == 1 else None
+
+
 def _run_coro_blocking(coro):
     """Выполнить корутину из СИНХРОННОГО чека, где бы он ни вызывался.
 
@@ -847,6 +933,7 @@ _ALL_CHECKS = (
     check_edge_kind_freshness,
     check_deploy_stream_ingestion,
     check_graph_integrity,
+    check_schema_version,
 )
 
 
