@@ -11,7 +11,7 @@ version: "0.1.0"
 # синхронность проверяется автоматически (tests/test_version_consistency.py
 # сверяет это значение с app.__version__) — вручную помнить больше не нужно.
 # В футере алертов версия берётся НЕ отсюда, а из env BUILD_VERSION.
-appVersion: "1.0.0-rc.24"
+appVersion: "1.0.0-rc.25"
 keywords:
   - sre
   - ai
