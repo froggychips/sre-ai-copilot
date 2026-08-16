@@ -113,6 +113,16 @@ if not settings.CELERY_TASK_ALWAYS_EAGER:
     celery_app.conf.update(
         worker_prefetch_multiplier=settings.CELERY_WORKER_PREFETCH_MULTIPLIER,
         worker_max_tasks_per_child=settings.CELERY_WORKER_MAX_TASKS_PER_CHILD,
+        # Recycle по ПАМЯТИ, а не только по счётчику задач. До 16.08.2026
+        # этой настройки не было вовсе, и форк жил до 50 задач независимо от
+        # того, во что вырос: замер показал базу 306/242/213/175 МБ у четырёх
+        # форков в покое, при том что каждая тяжёлая задача добавляет сверху
+        # ещё 200-250 МБ. Итог — 14 OOMKill за двое суток при лимите 3Gi.
+        #
+        # Ни одна задача сама по себе не тяжёлая (максимум 244 МБ пика);
+        # проблема в том, что Python не возвращает память ОС, и база
+        # долгоживущего форка только растёт.
+        worker_max_memory_per_child=settings.CELERY_WORKER_MAX_MEMORY_PER_CHILD_KB,
         task_time_limit=settings.CELERY_TASK_TIME_LIMIT_SECONDS,
         task_soft_time_limit=settings.CELERY_TASK_SOFT_TIME_LIMIT_SECONDS,
         # Celery 6 deprecation — без этого warning на старте worker'а.

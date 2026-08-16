@@ -126,6 +126,16 @@ class Settings(BaseSettings):
     # `process_incident_rate_limit` — не больше N в минуту (LLM budget guard).
     CELERY_WORKER_PREFETCH_MULTIPLIER: int = Field(1, description="Fair scheduling: 1 task per worker at a time")
     CELERY_WORKER_MAX_TASKS_PER_CHILD: int = Field(50, description="Worker restart after N tasks (memory leak protection)")
+    # Потолок RSS форка в КИЛОБАЙТАХ (единица celery). Превысив его, форк
+    # заменяется после текущей задачи.
+    #
+    # 350 МБ — из арифметики лимита пода (3Gi): 4 форка × (350 базы + 250 пика
+    # тяжёлой задачи) + 172 мастера ≈ 2.5 Гб, то есть с запасом. Замер
+    # 16.08.2026: без этой настройки база форков доходила до 306 МБ и держалась,
+    # потому что recycle шёл только по счётчику задач.
+    CELERY_WORKER_MAX_MEMORY_PER_CHILD_KB: int = Field(
+        350 * 1024, description="Потолок RSS форка (КБ); превысив — recycle"
+    )
     CELERY_TASK_TIME_LIMIT_SECONDS: int = Field(1800, description="Hard task timeout (30 min)")
     CELERY_TASK_SOFT_TIME_LIMIT_SECONDS: int = Field(1500, description="Soft task timeout (25 min)")
     # Late ack: сообщение подтверждается ПОСЛЕ выполнения, поэтому задача,
