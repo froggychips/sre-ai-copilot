@@ -138,8 +138,20 @@ def sync_endpoints(db: Session, now: Optional[datetime] = None) -> Dict[str, Any
         "empty_services": [],
     }
 
-    nodes = (
-        db.query(Service)
+    # Обход батчами по id вместо `.all()` на 6441 узел: держать их всех в
+    # identity map незачем, каждый обрабатывается независимо. Пик самого синка
+    # невелик (122 МБ), но worker запущен с `--concurrency=4`, и такие
+    # «невеликие» пики складываются — 11 OOMKill за 19 часов при лимите 3Gi.
+    #
+    # Почему НЕ `yield_per`: внутри цикла идёт `commit()`, а он закрывает
+    # серверный курсор — `psycopg2.ProgrammingError: named cursor isn't valid
+    # anymore` на первом же батче. Проверено на живых данных 16.08.2026;
+    # unit-тесты этого не ловят, потому что в SQLite серверных курсоров нет.
+    #
+    # Список id — это ~6 тысяч int, порядка 50 КБ: цена пренебрежимая.
+    node_ids: List[int] = [
+        nid for (nid,) in
+        db.query(Service.id)
         .filter(Service.node_kind == NODE_KIND_SERVICE, Service.synthetic.is_(False))
         # Детерминированный порядок: два писателя, идущие по строкам в разном
         # порядке, блокируют друг друга крест-накрест. `id` монотонен и
@@ -147,7 +159,46 @@ def sync_endpoints(db: Session, now: Optional[datetime] = None) -> Dict[str, Any
         # возникало по вине самого обхода.
         .order_by(Service.id)
         .all()
+    ]
+
+    for offset in range(0, len(node_ids), _COMMIT_BATCH):
+        chunk = node_ids[offset:offset + _COMMIT_BATCH]
+        nodes = (
+            db.query(Service)
+            .filter(Service.id.in_(chunk))
+            .order_by(Service.id)
+            .all()
+        )
+        _process_batch(db, nodes, idx, stamp, stats)
+        # Коммит на батч, а не на весь проход. Первый плановый прогон
+        # (15.08.2026, 11:15) упал с `DeadlockDetected`: транзакция держала
+        # блокировки на тысячах строк, пока рядом писал соседний синк.
+        # Правило не новое — `kg_sync` коммитит после КАЖДОГО namespace по
+        # следам инцидента 08.08.2026.
+        db.commit()
+
+    db.commit()
+    log.info(
+        "endpoints_sync.done matched=%s with_pods=%s empty=%s corroborated=%s",
+        stats["matched"], stats["with_pods"], stats["empty"],
+        stats["edges_corroborated"],
     )
+    if stats["empty"]:
+        log.warning(
+            "endpoints_sync.services_without_pods count=%s sample=%s",
+            stats["empty"], stats["empty_services"][:5],
+        )
+    return stats
+
+
+def _process_batch(
+    db: Session,
+    nodes: List[Service],
+    idx: Dict[Tuple[str, str], int],
+    stamp: str,
+    stats: Dict[str, Any],
+) -> None:
+    """Обработать один батч узлов. Коммит — на вызывающей стороне."""
     for node in nodes:
         key = (str(node.namespace), str(node.name))
         if key not in idx:
@@ -189,28 +240,3 @@ def sync_endpoints(db: Session, now: Optional[datetime] = None) -> Dict[str, Any
                 extras={"endpoints_ready": ready},
             )
             stats["edges_corroborated"] += 1
-
-        # Коммит батчами, а не один на весь проход. Первый плановый прогон
-        # (15.08.2026, 11:15) упал с `DeadlockDetected`: транзакция держала
-        # блокировки на тысячах строк kg_services и kg_service_edges, пока
-        # рядом писал соседний синк. Вручную тот же код отработал — конкурента
-        # просто не было.
-        #
-        # Правило в этом проекте не новое: `kg_sync` коммитит после КАЖДОГО
-        # namespace по следам инцидента 08.08.2026, где одна многоминутная
-        # транзакция держала row-locks весь проход.
-        if stats["matched"] % _COMMIT_BATCH == 0:
-            db.commit()
-
-    db.commit()
-    log.info(
-        "endpoints_sync.done matched=%s with_pods=%s empty=%s corroborated=%s",
-        stats["matched"], stats["with_pods"], stats["empty"],
-        stats["edges_corroborated"],
-    )
-    if stats["empty"]:
-        log.warning(
-            "endpoints_sync.services_without_pods count=%s sample=%s",
-            stats["empty"], stats["empty_services"][:5],
-        )
-    return stats
