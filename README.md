@@ -4,7 +4,7 @@
 [![Python](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/)
 [![Tests](https://img.shields.io/badge/tests-1622%20pass-brightgreen.svg)](tests)
 [![Checks](https://img.shields.io/badge/ruff%20%2B%20mypy-clean-brightgreen.svg)](.github/workflows)
-[![Release](https://img.shields.io/badge/release-v1.0.0--rc.24-blue)](CHANGELOG.md)
+[![Release](https://img.shields.io/badge/release-v1.0.0--rc.25-blue)](CHANGELOG.md)
 
 **Homepage:** [sre.froggychips.xyz](https://sre.froggychips.xyz) · **Stack:** FastAPI + Celery + Postgres-KG + LLM + MCP
 
