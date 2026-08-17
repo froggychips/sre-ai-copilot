@@ -89,3 +89,60 @@ def test_expires_shorter_than_interval(name, cfg):
         f"{name}: expires={expires}s не меньше интервала {interval}s — "
         "два тика смогут одновременно ждать в очереди"
     )
+
+
+# --- залп на ровном часе --------------------------------------------------
+#
+# Замер 17.08.2026: в `:00` стартовали ОДНОВРЕМЕННО 20 задач из 30, в `:30`
+# — 15. Отсюда 14 OOMKill за трое суток: ни одна задача не тяжелее 244 МБ,
+# но при `--concurrency=4` залп занимает все форки разом, и пик cgroup
+# доходил до 2978 МБ при лимите 3072.
+#
+# Лечится расписанием: `*/10` у пяти задач означает, что все пять стартуют в
+# одну и ту же минуту. Смещения делают из залпа поток.
+
+_MAX_TASKS_PER_MINUTE = 8
+
+
+def _tasks_by_minute():
+    import collections
+    import re
+    slots = collections.defaultdict(list)
+    for name, cfg in _beat_schedule().items():
+        m = re.search(r"<crontab: ([^ ]+) ([^ ]+)", repr(cfg.get("schedule")))
+        if not m:
+            continue
+        minute = m.group(1)
+        if minute == "*":
+            minutes = set(range(60))
+        elif minute.startswith("*/"):
+            minutes = set(range(0, 60, int(minute[2:])))
+        else:
+            minutes = {int(x) for x in minute.split(",") if x.isdigit()}
+        for mm in minutes:
+            slots[mm].append(name)
+    return slots
+
+
+def test_no_minute_starts_a_stampede():
+    """Ни одна минута не должна собирать залп задач.
+
+    Воркер работает с `--concurrency=4`: всё, что не влезло, ждёт, а то, что
+    влезло, складывает свои пики памяти.
+    """
+    slots = _tasks_by_minute()
+    worst = max(slots.items(), key=lambda kv: len(kv[1]))
+    assert len(worst[1]) <= _MAX_TASKS_PER_MINUTE, (
+        f"в минуту :{worst[0]:02d} стартуют {len(worst[1])} задач: "
+        f"{sorted(worst[1])}. Разведи смещениями — `*/N` у нескольких задач "
+        "означает старт в одну и ту же минуту."
+    )
+
+
+def test_hourly_tasks_are_spread_across_the_hour():
+    """Задачи с шагом в час не должны липнуть к `:00`."""
+    slots = _tasks_by_minute()
+    assert len(slots[0]) <= _MAX_TASKS_PER_MINUTE, (
+        f"на ровном часе {len(slots[0])} задач — именно так выглядел залп, "
+        "приводивший к OOM"
+    )
