@@ -13,8 +13,9 @@
 мака. Проверяет через GitHub API:
 
   1. раннер онлайн (status != "online" → CI не на чем гонять);
-  2. очередь не стоит (прогоны в queued дольше QUEUE_MINUTES — верный признак
-     офлайн-раннера даже когда API ещё рапортует online);
+  2. очередь не стоит — прогоны ждут, а НИЧЕГО не выполняется. Просто
+     длинная очередь при работающем раннере авария не составляет: он здесь
+     один, и три PR подряд штатно дают сорок минут ожидания;
   3. нет зелёных PR-ов, висящих дольше STALE_PR_DAYS (dependabot-дедлок:
      PR прошёл проверки и никем не смержен — сам по себе не алертится);
   4. master не красный (последний прогон CI Pipeline на master).
@@ -37,7 +38,7 @@
 
 Env: [GITHUB_TOKEN] (read-only; без него — ограниченный режим), GITHUB_REPO,
      DISCORD_WEBHOOK_URL, [RUNNER_NAME], [QUEUE_MINUTES=30],
-     [STALE_PR_DAYS=3], [MAX_PR_CHECKS=15], [DRY_RUN=1].
+     [STUCK_HOURS=2], [STALE_PR_DAYS=3], [MAX_PR_CHECKS=15], [DRY_RUN=1].
 """
 import datetime
 import os
@@ -52,6 +53,10 @@ WEBHOOK = os.environ.get("DISCORD_WEBHOOK_URL", "")
 RUNNER_NAME = os.environ.get("RUNNER_NAME", "")  # пусто → проверяем все раннеры репо
 QUEUE_MINUTES = int(os.environ.get("QUEUE_MINUTES", "30"))
 STALE_PR_DAYS = int(os.environ.get("STALE_PR_DAYS", "3"))
+#: Сколько часов прогон может ждать, прежде чем это станет находкой ДАЖЕ при
+#: работающем раннере. Обычная очередь на одном раннере рассасывается за
+#: десятки минут; часы означают, что он занят чем-то, что не заканчивается.
+STUCK_HOURS = float(os.environ.get("STUCK_HOURS", "2"))
 # Анонимный лимит GitHub — 60 запросов/час на IP, а check-runs стоят по
 # запросу на PR. Потолок оставляет запас остальным проверкам.
 MAX_PR_CHECKS = int(os.environ.get("MAX_PR_CHECKS", "15"))
@@ -151,25 +156,63 @@ def check_runners():
 
 
 def check_queue():
-    """Прогоны, застрявшие в queued дольше QUEUE_MINUTES.
+    """Очередь СТОИТ — то есть никто её не разбирает.
 
-    Раннер, у которого умер сам процесс, а регистрация ещё жива, GitHub какое-то
-    время показывает online — очередь при этом уже стоит. Поэтому очередь важнее
-    статуса и проверяется отдельно.
+    Раннер, у которого умер процесс, а регистрация ещё жива, GitHub какое-то
+    время показывает online — очередь при этом уже не движется. Поэтому она
+    проверяется отдельно от статуса раннера.
+
+    Но «в очереди есть задачи» и «очередь стоит» — разные вещи, и до
+    17.08.2026 канарейка их путала. Раннер здесь ОДИН: три PR подряд, каждый
+    со сборкой образа на ~10 минут, легко дают сорокаминутное ожидание —
+    и это нормальная работа, а не авария. Такие срабатывания приучают
+    игнорировать канал, то есть ломают канарейку вернее, чем её отсутствие.
+
+    Отличаем по простому признаку: если что-то ВЫПОЛНЯЕТСЯ, очередь движется
+    и раннер жив — молчим. Тревога, только когда прогоны ждут, а не делает
+    никто. На этот случай порога по времени почти не нужно: простаивающая
+    очередь при свободном раннере — уже неправильно.
+
+    Страховка от вечного ожидания оставлена: если прогон висит дольше
+    STUCK_HOURS даже при работающем раннере, что-то не так с ним самим.
     """
     problems = []
-    data = gh(f"/repos/{REPO}/actions/runs", {"status": "queued", "per_page": 20})
+    queued = gh(
+        f"/repos/{REPO}/actions/runs", {"status": "queued", "per_page": 20}
+    ).get("workflow_runs") or []
+    if not queued:
+        return []
+
+    running = gh(
+        f"/repos/{REPO}/actions/runs", {"status": "in_progress", "per_page": 5}
+    ).get("workflow_runs") or []
+
     cutoff = now_utc() - datetime.timedelta(minutes=QUEUE_MINUTES)
-    stuck = []
-    for run in data.get("workflow_runs") or []:
+    hard_cutoff = now_utc() - datetime.timedelta(hours=STUCK_HOURS)
+    waiting, stuck_hard = [], []
+    for run in queued:
         created = parse_ts(run.get("created_at"))
-        if created and created < cutoff:
-            age_min = int((now_utc() - created).total_seconds() // 60)
-            stuck.append(f"[{run.get('name')} #{run.get('run_number')}]({run.get('html_url')}) — {age_min} мин")
-    if stuck:
+        if not created:
+            continue
+        age_min = int((now_utc() - created).total_seconds() // 60)
+        item = (f"[{run.get('name')} #{run.get('run_number')}]"
+                f"({run.get('html_url')}) — {age_min} мин")
+        if created < hard_cutoff:
+            stuck_hard.append(item)
+        elif created < cutoff:
+            waiting.append(item)
+
+    if stuck_hard:
         problems.append(
-            f"**очередь стоит** ({len(stuck)} прогон(ов) в queued > {QUEUE_MINUTES} мин):\n  · "
-            + "\n  · ".join(stuck[:5])
+            f"**прогоны висят дольше {STUCK_HOURS} ч** — раннер занят, но не "
+            f"этим:\n  · " + "\n  · ".join(stuck_hard[:5])
+        )
+    elif waiting and not running:
+        # Никто не выполняется, а очередь ждёт — вот это и есть «встала».
+        problems.append(
+            f"**очередь стоит** — ничего не выполняется, а {len(waiting)} "
+            f"прогон(ов) ждут дольше {QUEUE_MINUTES} мин:\n  · "
+            + "\n  · ".join(waiting[:5])
         )
     return problems
 
