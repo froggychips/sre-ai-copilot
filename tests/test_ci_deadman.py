@@ -98,12 +98,22 @@ def test_watched_runner_missing_is_a_finding(token, monkeypatch):
 
 
 def test_stuck_queue_is_a_finding(dm, monkeypatch):
+    """Очередь ждёт, и НИКТО ничего не выполняет — раннер не разбирает её.
+
+    Второй запрос (in_progress) отдаёт пусто намеренно: именно отсутствие
+    работы отличает вставшую очередь от занятого раннера.
+    """
     monkeypatch.setattr(dm, "QUEUE_MINUTES", 30)
-    monkeypatch.setattr(dm, "gh", lambda *a, **k: {
-        "workflow_runs": [
-            {"name": "CI Pipeline", "run_number": 7, "html_url": "u", "created_at": _iso(minutes_ago=90)}
-        ]
-    })
+
+    def fake_gh(path, params=None):
+        if (params or {}).get("status") == "queued":
+            return {"workflow_runs": [{
+                "name": "CI Pipeline", "run_number": 7, "html_url": "u",
+                "created_at": _iso(minutes_ago=90),
+            }]}
+        return {"workflow_runs": []}
+
+    monkeypatch.setattr(dm, "gh", fake_gh)
     problems = dm.check_queue()
     assert problems and "очередь стоит" in problems[0]
 
@@ -403,3 +413,89 @@ def test_only_runners_check_requires_a_token(dm):
     assert not any(getattr(fn, "needs_token", False) for fn in others), (
         "анонимный режим сломается: проверка требует токен, но не помечена"
     )
+
+
+# --- очередь: «есть задачи» ≠ «стоит» -------------------------------------
+#
+# 17.08.2026 канарейка дважды подряд сообщила «очередь стоит» на трёх
+# прогонах, ждавших 36-38 минут, — при живом раннере, который в этот момент
+# честно собирал образ. Раннер здесь ОДИН, и такая очередь нормальна.
+#
+# Ложные срабатывания приучают игнорировать канал, то есть ломают канарейку
+# вернее, чем её отсутствие.
+
+
+def _queued(dm, minutes_ago, n=1):
+    return {"workflow_runs": [
+        {"name": "CI Pipeline", "run_number": 800 + i, "html_url": "u",
+         "created_at": _iso(minutes_ago=minutes_ago)}
+        for i in range(n)
+    ]}
+
+
+def test_long_queue_is_silent_while_something_runs(dm, monkeypatch):
+    """Раннер занят — очередь движется, это не авария."""
+    monkeypatch.setattr(dm, "QUEUE_MINUTES", 30)
+
+    def fake_gh(path, params=None):
+        if (params or {}).get("status") == "queued":
+            return _queued(dm, 38, n=3)
+        return {"workflow_runs": [{"name": "CI Pipeline", "run_number": 855}]}
+
+    monkeypatch.setattr(dm, "gh", fake_gh)
+    assert dm.check_queue() == [], "очередь при работающем раннере — норма"
+
+
+def test_queue_with_nothing_running_is_a_finding(dm, monkeypatch):
+    """Никто не выполняется, а прогоны ждут — вот это встало."""
+    monkeypatch.setattr(dm, "QUEUE_MINUTES", 30)
+
+    def fake_gh(path, params=None):
+        if (params or {}).get("status") == "queued":
+            return _queued(dm, 38, n=2)
+        return {"workflow_runs": []}
+
+    monkeypatch.setattr(dm, "gh", fake_gh)
+    problems = dm.check_queue()
+    assert problems and "очередь стоит" in problems[0]
+    assert "ничего не выполняется" in problems[0]
+
+
+def test_hours_long_wait_is_a_finding_even_with_a_busy_runner(dm, monkeypatch):
+    """Часы ожидания при занятом раннере — он занят чем-то, что не кончается."""
+    monkeypatch.setattr(dm, "STUCK_HOURS", 2)
+
+    def fake_gh(path, params=None):
+        if (params or {}).get("status") == "queued":
+            return _queued(dm, 200)          # 3 с лишним часа
+        return {"workflow_runs": [{"name": "CI Pipeline", "run_number": 855}]}
+
+    monkeypatch.setattr(dm, "gh", fake_gh)
+    problems = dm.check_queue()
+    assert problems and "висят дольше" in problems[0]
+
+
+def test_empty_queue_skips_the_second_request(dm, monkeypatch):
+    """Нет очереди — не тратим лимит на запрос про выполняющиеся."""
+    calls = []
+
+    def fake_gh(path, params=None):
+        calls.append((params or {}).get("status"))
+        return {"workflow_runs": []}
+
+    monkeypatch.setattr(dm, "gh", fake_gh)
+    assert dm.check_queue() == []
+    assert calls == ["queued"], "лишний запрос при пустой очереди"
+
+
+def test_fresh_queue_stays_silent_even_with_idle_runner(dm, monkeypatch):
+    """Прогон, ждущий пару минут, — норма при любом состоянии раннера."""
+    monkeypatch.setattr(dm, "QUEUE_MINUTES", 30)
+
+    def fake_gh(path, params=None):
+        if (params or {}).get("status") == "queued":
+            return _queued(dm, 3)
+        return {"workflow_runs": []}
+
+    monkeypatch.setattr(dm, "gh", fake_gh)
+    assert dm.check_queue() == []
