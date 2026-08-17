@@ -162,7 +162,7 @@ celery_app.conf.beat_schedule = {
     # builds из TC за 24h и upsert-ит в kg_deployments по (service, sha).
     "tc-deploys-to-kg": {
         "task": "tc_deploys_to_kg",
-        "schedule": crontab(minute="*/15"),
+        "schedule": crontab(minute="14,29,44,59"),
         "options": {"expires": 810},
     },
     # L5 (alert-fatigue): chronic-alerts digest в канал #stats каждые 6h.
@@ -170,7 +170,7 @@ celery_app.conf.beat_schedule = {
     # которые тлеют под suppress. Управляется CHRONIC_DIGEST_ENABLED.
     "chronic-alerts-digest": {
         "task": "chronic_alerts_digest",
-        "schedule": crontab(minute=0, hour="*/6"),
+        "schedule": crontab(minute=33, hour="*/6"),
         "options": {"expires": 10800},
     },
     # A4: k8s pod-events → kg_pod_events. Каждые 10 мин тянем Warning-events
@@ -178,7 +178,7 @@ celery_app.conf.beat_schedule = {
     # OOMKilled / FailedScheduling / ImagePullBackOff / Unhealthy / etc.
     "k8s-pod-events-sync": {
         "task": "k8s_pod_events_sync",
-        "schedule": crontab(minute="*/10"),
+        "schedule": crontab(minute="1,11,21,31,41,51"),
         "options": {"expires": 540},
     },
     # D2-auto: drift cleanup. Раз в час пересинхронизирует kg_services со
@@ -227,7 +227,7 @@ celery_app.conf.beat_schedule = {
     # годами (см. etcdMembersDown от 10 апреля).
     "kg-alerts-resolve-sync": {
         "task": "kg_alerts_resolve_sync",
-        "schedule": crontab(minute="*/15"),
+        "schedule": crontab(minute="5,20,35,50"),
         "options": {"expires": 810},
     },
     # Phase 3-B: k8s Ingress → external entrypoint edges. Раз в час
@@ -245,7 +245,7 @@ celery_app.conf.beat_schedule = {
     # в kg_fragile_top для «истинного» ранжирования и в digest «🩺 Unhealthy».
     "kg-health-recompute": {
         "task": "kg_health_recompute",
-        "schedule": crontab(minute="*/20"),
+        "schedule": crontab(minute="15,35,55"),
         "options": {"expires": 1080},
     },
     # External probe: DNS+TCP+HTTPS на synthetic `ingress:<host>` узлы. Каждую
@@ -268,7 +268,7 @@ celery_app.conf.beat_schedule = {
     # idempotent. Если VICTORIA_METRICS_URL пустой — task no-op.
     "kg-metrics-sync": {
         "task": "kg_metrics_sync",
-        "schedule": crontab(minute="*/10"),
+        "schedule": crontab(minute="8,18,28,38,48,58"),
         # expires < интервал: если воркер не подхватил тик за 9 мин (backlog),
         # дропаем его вместо накопления параллельных прогонов — наложение
         # перегружало одиночный vmsingle (recon 2026-06-05, см. metrics_sync).
@@ -286,7 +286,7 @@ celery_app.conf.beat_schedule = {
     # exporter. host/path берутся из k8s Ingress resources (kubectl get -A).
     "kg-ingress-observations-sync": {
         "task": "kg_ingress_observations_sync",
-        "schedule": crontab(minute="*/10"),
+        "schedule": crontab(minute="6,16,26,36,46,56"),
         "options": {"expires": 540},
     },
     # Pre-compute per-service агрегаты сигналов из САМОГО KG (deploys/alerts/
@@ -302,7 +302,7 @@ celery_app.conf.beat_schedule = {
     # Идемпотентно по (service_id, ts, metric). Discord-уведомление — фаза 2.
     "kg-anomaly-detection-task": {
         "task": "kg_anomaly_detection_task",
-        "schedule": crontab(minute="*/10"),
+        "schedule": crontab(minute="4,14,24,34,44,54"),
         "options": {"expires": 540},
     },
     # Runtime correlation: подтверждает existing edges через co-occurrence
@@ -311,7 +311,7 @@ celery_app.conf.beat_schedule = {
     # Управляется RUNTIME_CORRELATION_ENABLED.
     "kg-runtime-correlation-sync": {
         "task": "kg_runtime_correlation_sync",
-        "schedule": crontab(minute="*/30"),
+        "schedule": crontab(minute="18,48"),
         "options": {"expires": 1620},
     },
     # Per-team daily digest — один embed per team_owner (squad-N / infra /
@@ -329,7 +329,7 @@ celery_app.conf.beat_schedule = {
     # ON CONFLICT DO UPDATE. Если SEQ_* пусто — no-op.
     "kg-seq-logs-sync-task": {
         "task": "kg_seq_logs_sync",
-        "schedule": crontab(minute="*/10"),
+        "schedule": crontab(minute="9,19,29,39,49,59"),
         "options": {"expires": 540},
     },
     # KG self-health canary (Wave 5 retrospective): «monitoring of the
@@ -339,7 +339,7 @@ celery_app.conf.beat_schedule = {
     # (отдельный dev-канал, не #infra-error). Idempotency: 6h dedup window.
     "kg-self-health-check": {
         "task": "kg_self_health_check",
-        "schedule": crontab(minute="*/30"),
+        "schedule": crontab(minute="21,51"),
         "options": {"expires": 1620},
     },
     # Stuck-alerts escalation (KG TTR-analytics, 2026-05-23): alerts firing
@@ -362,7 +362,7 @@ celery_app.conf.beat_schedule = {
     # нагрузки. См. k8s_topology_resources_sync.py.
     "kg-topology-resources-sync": {
         "task": "kg_topology_resources_sync",
-        "schedule": crontab(minute="*/15"),
+        "schedule": crontab(minute="12,27,42,57"),
         "options": {"expires": 810},
     },
     # KG Coverage #1: k8s Job + CronJob → kg_k8s_jobs. Каждые 15 мин
@@ -371,7 +371,7 @@ celery_app.conf.beat_schedule = {
     # blind-spot на backup CronJob'ах и failed alembic-миграциях.
     "kg-jobs-sync": {
         "task": "kg_jobs_sync",
-        "schedule": crontab(minute="*/15"),
+        "schedule": crontab(minute="10,25,40,55"),
         "options": {"expires": 810},
     },
     # KG Coverage #2: PVC/PV/storage signals → kg_storage_volumes + uses_volume/
@@ -381,7 +381,7 @@ celery_app.conf.beat_schedule = {
     # (default OFF — kubelet_volume_stats_* может быть не настроен).
     "kg-storage-sync": {
         "task": "kg_storage_sync",
-        "schedule": crontab(minute="*/30"),
+        "schedule": crontab(minute="26,56"),
         "options": {"expires": 1620},
     },
     # Wave 7-Z: парсер NATS subjects из исходников WO monorepo. Раз в 6h
@@ -421,7 +421,7 @@ celery_app.conf.beat_schedule = {
     # STATICS_* не настроен. Лёгкий — 4 быстрых pg_database-запроса.
     "kg-statics-versions-sync": {
         "task": "kg_statics_versions_sync",
-        "schedule": crontab(minute="*/5"),
+        "schedule": crontab(minute="2,7,12,17,22,27,32,37,42,47,52,57"),
         "options": {"expires": 270},
     },
 }
