@@ -192,6 +192,25 @@ class IncidentRecord(Base):
     trace = Column(JSON, nullable=True)
     user_feedback = Column(JSON, nullable=True)  # {score: 1-5, comment: str}
     is_accepted = Column(String, nullable=True)  # "ACCEPTED", "REJECTED"
+
+    # --- состояние обработки (миграция 20260819_0200) --------------------
+    #
+    # Вынесено из `analysis` потому, что это координация, а не данные: по
+    # `report_state` решают, кому досылать отчёт, по `executor_state` — не
+    # выполняется ли действие прямо сейчас в соседнем воркере. И то и другое
+    # нужно искать (индекс) и обновлять без read-modify-write по JSON.
+    #
+    # Payload остался в `analysis`: поля embed и результат исполнения — это
+    # данные, и там им место. Линия раздела — «по чему координируются»
+    # против «что показываем».
+    #
+    # NULL значит «стадии не было», и это не то же самое, что «была и
+    # завершилась». В JSON различение давало наличие ключа.
+    report_state = Column(String, nullable=True, index=True)      # pending|sent|failed
+    report_attempts = Column(Integer, nullable=True)
+    report_updated_at = Column(DateTime, nullable=True)
+    executor_state = Column(String, nullable=True, index=True)    # in_flight|applied|…
+    executor_claimed_at = Column(DateTime, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
 
 

@@ -34,6 +34,8 @@ import structlog
 from app.config import settings
 from app.core.execution_dsl import ExecutionIntent
 from app.services.audit_logger import audit_service
+from app.services.incident_state import (REPORT_FAILED, REPORT_SENT,
+                                         set_report_state)
 from app.services.discord_service import discord_service
 
 logger = structlog.get_logger()
@@ -233,6 +235,12 @@ class ReportDelivery:
             analysis[self.SENT_KEY] = {"sent_at": _now_iso(), "attempts": attempts}
 
         self.pending = None
+        # Колонка ставится ДО `_update_analysis`, чтобы уехать тем же коммитом:
+        # два отдельных commit'а дали бы окно, где JSON говорит «отправлено»,
+        # а колонка ещё нет. Колонка — источник истины для поиска «кому
+        # досылать», JSON остаётся носителем payload'а
+        # (см. app/services/incident_state.py).
+        self._set_state_column(REPORT_SENT, attempts)
         self._update_analysis(_mutate, self.SENT_KEY)
 
     def mark_failed(self, attempts: int, reason: str) -> None:
@@ -245,7 +253,24 @@ class ReportDelivery:
             }
 
         self.pending = None
+        self._set_state_column(REPORT_FAILED, attempts)
         self._update_analysis(_mutate, self.FAILED_KEY)
+
+    def _set_state_column(self, state: str, attempts: int) -> None:
+        """Проставить состояние в индексируемую колонку (без коммита).
+
+        Коммитит следом `_update_analysis` — так JSON и колонка меняются одной
+        транзакцией. Отдельный commit давал бы окно, в котором они говорят
+        разное, а «отчёт отправлен» — ровно тот факт, который нельзя потерять
+        из-за вторичной записи.
+        """
+        if self.record is None:
+            return
+        try:
+            set_report_state(self.record, state, attempts=attempts)
+        except Exception as e:  # noqa: BLE001 — колонка вторична по отношению к факту
+            logger.debug("pipeline.report_state_column_skipped",
+                         incident_id=self.incident_id, error=str(e))
 
     def bump_attempts(self, args: Dict[str, Any], attempts: int) -> None:
         """Зафиксировать номер попытки в маркере ДО броска ReportDeliveryPending."""
