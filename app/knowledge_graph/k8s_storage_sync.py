@@ -173,6 +173,140 @@ def _kubectl_get_all(resource: str) -> List[Dict[str, Any]]:
     return items if isinstance(items, list) else []
 
 
+# ── проекция полей: почему листы pods/replicasets нельзя тянуть целиком ─────
+#
+# 19.08.2026: `copilot-worker` OOMKilled (exit 137) 57 раз за 48 часов, ровно
+# 1-2 раза в час, при limits memory=3Gi. Виновник — этот синк: смерти
+# кластеризовались в :27-:28 и :57-:58, т.е. через 1-2 минуты после его старта
+# (`crontab(minute="26,56")`), а память пода скакала с ~550 MiB до 2.1-2.4 GiB
+# за одну минуту и упиралась в лимит. В покое воркер держит 290-600 MiB, так
+# что это не утечка, а пиковая аллокация одного тика.
+#
+# Замер на этом кластере (19.08.2026):
+#   kubectl get pods -A -o json          =  95.8 МБ   (4 919 объектов)
+#   kubectl get replicasets -A -o json   = 209.3 МБ  (11 279 объектов)
+#   persistentvolumeclaims / -volumes    = 2.1 / 2.7 МБ (мелочь)
+# `subprocess.run(capture_output=True, text=True)` держит весь stdout строкой,
+# `json.loads` поверх этого даёт ещё в разы больше на dict/list-объекты — вот
+# и 2+ GiB на 305 МБ входа. Причём RS в 2 раза тяжелее подов: 11 279 RS при
+# 4 919 подах — это хвост старых ревизий (revisionHistoryLimit не подрезан).
+#
+# При этом синку нужны ЧЕТЫРЕ поля: у пода — namespace, ownerReferences и
+# claimName из spec.volumes; у RS — namespace, name, ownerReferences. Поэтому
+# листы идут постранично через kube API (limit/continue) и каждая страница
+# СРАЗУ сжимается до этих полей — в памяти живёт одна страница, а не кластер.
+_PAGE_LIMIT = 500
+
+
+def _project_pod(item: Dict[str, Any]) -> Dict[str, Any]:
+    """Оставить от пода только то, что читают `_pod_pvc_claims` и owner-chain."""
+    meta = item.get("metadata") or {}
+    vols = []
+    for vol in (item.get("spec") or {}).get("volumes") or []:
+        claim = (vol.get("persistentVolumeClaim") or {}).get("claimName")
+        if claim:
+            vols.append({"persistentVolumeClaim": {"claimName": claim}})
+    return {
+        "metadata": {
+            "namespace": meta.get("namespace"),
+            "name": meta.get("name"),
+            "ownerReferences": meta.get("ownerReferences") or [],
+        },
+        "spec": {"volumes": vols},
+    }
+
+
+def _project_replicaset(item: Dict[str, Any]) -> Dict[str, Any]:
+    """Оставить от RS только то, что читает `_build_rs_to_deployment_index`."""
+    meta = item.get("metadata") or {}
+    return {
+        "metadata": {
+            "namespace": meta.get("namespace"),
+            "name": meta.get("name"),
+            "ownerReferences": meta.get("ownerReferences") or [],
+        },
+    }
+
+
+# resource → (путь листа в kube API, проекция страницы)
+_PAGED: Dict[str, Tuple[str, Any]] = {
+    "pods": ("/api/v1/pods", _project_pod),
+    "replicasets": ("/apis/apps/v1/replicasets", _project_replicaset),
+}
+
+
+def _list_paged_projected(resource: str) -> List[Dict[str, Any]]:
+    """Постраничный лист через kube API с проекцией каждой страницы.
+
+    Raises `KubectlFetchError` при любом сбое — вызывающий (`_fetch_items`)
+    трактует его так же, как отказ kubectl: beat-loop не валим, но и молчать
+    об отказе нельзя.
+
+    Идёт напрямую по REST-пути с `_preload_content=False`: так страница
+    парсится из сырого JSON apiserver-а (тот же camelCase, что у `kubectl -o
+    json`), без построения V1Pod/V1ReplicaSet-моделей — они на 500 объектов
+    стоят дороже, чем сам dict.
+    """
+    path, project = _PAGED[resource]
+    # Локальный импорт — kubernetes-client не нужен на путях, где этот модуль
+    # только парсит уже готовые dict-ы (тесты, CLI над фикстурами).
+    try:
+        from kubernetes import client as k8s_client
+
+        from app.context.deployments import _load_k8s_once
+    except Exception as e:
+        raise KubectlFetchError(f"kubernetes client unavailable: {e}") from e
+
+    if not _load_k8s_once():
+        raise KubectlFetchError("kube-config unavailable")
+
+    api = k8s_client.ApiClient()
+    items: List[Dict[str, Any]] = []
+    token: Optional[str] = None
+    pages = 0
+    while True:
+        params = [("limit", _PAGE_LIMIT)]
+        if token:
+            params.append(("continue", token))
+        try:
+            resp = api.call_api(
+                path, "GET",
+                query_params=params,
+                header_params={"Accept": "application/json"},
+                auth_settings=["BearerToken"],
+                _preload_content=False,
+                _request_timeout=_KUBECTL_TIMEOUT_S,
+            )
+            raw = resp[0].data if isinstance(resp, tuple) else resp.data
+            page = json.loads(raw)
+        except Exception as e:
+            raise KubectlFetchError(f"list {resource} page={pages} failed: {e}") from e
+
+        for item in page.get("items") or []:
+            items.append(project(item))
+        pages += 1
+        token = ((page.get("metadata") or {}).get("continue")) or None
+        if not token:
+            break
+    logger.debug(
+        "k8s_storage.listed resource=%s items=%d pages=%d", resource, len(items), pages,
+    )
+    return items
+
+
+def _get_all(resource: str) -> List[Dict[str, Any]]:
+    """Единая точка фетча листа: постранично+проекция там, где лист тяжёлый.
+
+    pods/replicasets — через `_list_paged_projected` (см. комментарий выше про
+    OOM). pvc/pv остаются на `kubectl`: вместе они дают ~5 МБ, а их
+    `_extract_*_fields` читают много полей — проецировать нечего, риск
+    потерять поле есть.
+    """
+    if resource in _PAGED:
+        return _list_paged_projected(resource)
+    return _kubectl_get_all(resource)
+
+
 def _fetch_items(
     resource: str,
     stats: Dict[str, Any],
@@ -185,7 +319,7 @@ def _fetch_items(
     что-то чистить по этому снимку.
     """
     try:
-        return _kubectl_get_all(resource), True
+        return _get_all(resource), True
     except KubectlFetchError as e:
         stats["errors"] = int(stats.get("errors") or 0) + 1
         stats["fetch_failed"] = True
