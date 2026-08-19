@@ -35,6 +35,7 @@ from sqlalchemy.orm import Session
 from app.knowledge_graph.edge_decay_guard import (
     SOURCE_INGRESS_SYNC, record_source_run)
 from app.knowledge_graph.populator import upsert_edge, upsert_service
+from app.knowledge_graph.kubectl_breaker import (guard_kubectl)
 from app.knowledge_graph.schema import (NODE_KIND_INGRESS, NODE_KIND_SERVICE,
                                         Service)
 
@@ -71,6 +72,7 @@ def _kubectl_get_ingresses_all(*, strict: bool = False) -> List[Dict[str, Any]]:
     `ingress_observations_sync`, который ждёт список и сам логирует
     `no_ingresses`.
     """
+    guard_kubectl("get ingresses")
     try:
         out = subprocess.run(
             ["kubectl", "get", "ingresses", "-A", "-o", "json"],
