@@ -165,6 +165,19 @@ except ImportError:  # окружение без celery (например, ча�
 
 
 class IncidentRecord(Base):
+    """Инцидент: входные данные, разбор и состояние обработки.
+
+    `analysis` — не просто результат разбора, а ещё и машина состояний:
+    в нём живут `executor_applied`, `executor_in_flight` (claim исполнителя),
+    `executor_state_unknown`, `report_pending`, `report_sent`, `report_failed`
+    и другие. Это осознанный компромисс ранней стадии, у которого есть цена:
+    состояния не типизированы, а поиск по ним возможен только через GIN
+    (миграция 20260819_0100 перевела колонки json → jsonb ради этого).
+
+    Следующим шагом такие состояния стоит вынести в отдельные колонки —
+    тогда их станет видно в схеме, а не только в коде, который их пишет.
+    """
+
     __tablename__ = "incidents"
     id = Column(Integer, primary_key=True, index=True)
     incident_id = Column(String, unique=True, index=True)
