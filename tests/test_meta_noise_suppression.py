@@ -161,3 +161,75 @@ async def test_real_critical_still_loud() -> None:
     assert embed["title"].startswith("🚨 ")
     assert "META-AGGREGATE" not in embed["title"]
     assert embed["color"] != _COLOR_UNKNOWN
+
+
+# ── _detect_cp_down_noise (health-gated, прецедент 19.08.2026) ────────────────
+#
+# Kube{API,Scheduler,ControllerManager}Down = absent(up{job=...}): фаерится и на
+# падении компонента, и на слепоте мониторинга. Подавляем ТОЛЬКО при доказанной
+# живости control-plane; «не знаю» оставляет алёрт громким.
+
+
+@pytest.mark.parametrize(
+    "alertname,component",
+    [
+        ("KubeAPIDown", "apiserver"),
+        ("KubeSchedulerDown", "kube-scheduler"),
+        ("KubeControllerManagerDown", "kube-controller-manager"),
+    ],
+)
+def test_cp_down_noise_true_when_component_alive(
+    alertname: str, component: str
+) -> None:
+    """Компонент жив → это scrape-gap, глушим пинг (карточка остаётся)."""
+    from app.services import alert_enrichment as ae
+
+    with patch(
+        "app.context.deployments.control_plane_component_alive", return_value=True
+    ) as probe:
+        assert ae._detect_cp_down_noise(_incident(alertname)) is True
+    assert probe.call_args.args[0] == component
+
+
+@pytest.mark.parametrize("alive", [False, None])
+def test_cp_down_noise_false_when_not_proven_alive(alive: Any) -> None:
+    """Компонент мёртв ИЛИ живость неизвестна → alert остаётся громким."""
+    from app.services import alert_enrichment as ae
+
+    with patch(
+        "app.context.deployments.control_plane_component_alive", return_value=alive
+    ):
+        assert ae._detect_cp_down_noise(_incident("KubeAPIDown")) is False
+
+
+def test_cp_down_noise_false_on_probe_exception() -> None:
+    """Проба упала — fail-safe loud, а не тихое подавление."""
+    from app.services import alert_enrichment as ae
+
+    with patch(
+        "app.context.deployments.control_plane_component_alive",
+        side_effect=RuntimeError("kube unreachable"),
+    ):
+        assert ae._detect_cp_down_noise(_incident("KubeAPIDown")) is False
+
+
+def test_cp_down_noise_respects_kill_switch() -> None:
+    """META_NOISE_CP_DOWN_ENABLED=False → не подавляем даже при живом API."""
+    from app.services import alert_enrichment as ae
+
+    with patch.object(ae.settings, "META_NOISE_CP_DOWN_ENABLED", False), patch(
+        "app.context.deployments.control_plane_component_alive", return_value=True
+    ) as probe:
+        assert ae._detect_cp_down_noise(_incident("KubeAPIDown")) is False
+    probe.assert_not_called()
+
+
+def test_cp_down_noise_ignores_other_alerts() -> None:
+    """Чужие alertname сюда не попадают и пробу не дёргают."""
+    from app.services import alert_enrichment as ae
+
+    with patch(
+        "app.context.deployments.control_plane_component_alive", return_value=True
+    ) as probe:
+        assert ae._detect_cp_down_noise(_incident("KubePodCrashLooping")) is False
+    probe.assert_not_called()

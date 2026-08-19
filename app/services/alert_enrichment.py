@@ -682,6 +682,52 @@ def _detect_meta_noise(incident: Incident) -> bool:
     return alertname.endswith("NewCriticalAlerts")
 
 
+# Control-plane deadman-алёрты: alertname → компонент для live-проверки.
+# Все три — `absent(up{job=...})`, поэтому неотличимы от scrape-gap по самой
+# метрике (см. config.META_NOISE_CP_DOWN_ENABLED).
+_CP_DOWN_COMPONENTS = {
+    "KubeAPIDown": "apiserver",
+    "KubeSchedulerDown": "kube-scheduler",
+    "KubeControllerManagerDown": "kube-controller-manager",
+}
+
+
+def _detect_cp_down_noise(incident: Incident) -> bool:
+    """True если Kube*Down пришёл при ЖИВОМ control-plane = слепота мониторинга.
+
+    Health-gated по образцу `_detect_gen_mismatch_noise`: подавляем только при
+    доказанной живости компонента (kube API отвечает / leader-election Lease
+    свежий). Любая неоднозначность — None от проверки, отсутствующий
+    kube-config, таймаут, исключение — оставляет alert ГРОМКИМ (fail-safe
+    loud). Не дропаем, помечаем для muted-render-а.
+    """
+    alertname = (incident.labels or {}).get("alertname", "")
+    component = _CP_DOWN_COMPONENTS.get(alertname)
+    if not component:
+        return False
+    if not getattr(settings, "META_NOISE_CP_DOWN_ENABLED", True):
+        return False
+    try:
+        # Локальный импорт — модуль тянет kubernetes-client, не хотим
+        # утаскивать его в чистые dry-run пути (тесты с mock-db).
+        from app.context.deployments import control_plane_component_alive
+        alive = control_plane_component_alive(
+            component,
+            timeout_sec=getattr(settings, "LIVE_K8S_TIMEOUT_SEC", 3.0),
+        )
+    except Exception as e:
+        log.warning("enrich.cp_liveness_import_failed", error=type(e).__name__)
+        return False
+    if alive is True:
+        log.info(
+            "enrich.cp_down_scrape_gap",
+            alertname=alertname,
+            component=component,
+        )
+        return True
+    return False
+
+
 def _detect_gen_mismatch_noise(
     incident: Incident, replicas_ready_desired: Optional[str]
 ) -> bool:
@@ -1093,8 +1139,11 @@ def enrich_alert(db: Session, incident: Incident) -> EnrichedContext:
 
     # 8. Meta-noise — агрегаты (`*NewCriticalAlerts`) и control-plane
     # scrape-gap. Приглушаем render, не дропаем (см. _detect_meta_noise).
+    # Сюда же попадает health-gated ветка Kube*Down: тот же muted-render
+    # (grey + 🔇, без 🚨/@mention), но подавление доказывается живостью
+    # control-plane через kube API (см. _detect_cp_down_noise).
     ctx.meta_noise = (
-        _detect_meta_noise(incident)
+        (_detect_meta_noise(incident) or _detect_cp_down_noise(incident))
         if getattr(settings, "META_NOISE_ENABLED", True)
         else False
     )
