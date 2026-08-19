@@ -265,7 +265,7 @@ def _list_paged_projected(resource: str) -> List[Dict[str, Any]]:
     token: Optional[str] = None
     pages = 0
     while True:
-        params = [("limit", _PAGE_LIMIT)]
+        params: List[Tuple[str, Any]] = [("limit", _PAGE_LIMIT)]
         if token:
             params.append(("continue", token))
         try:
