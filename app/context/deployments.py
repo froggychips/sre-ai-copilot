@@ -1,4 +1,4 @@
-"""K8s deployment/statefulset helpers — best-effort live lookups.
+"""K8s deployment/statefulset + control-plane helpers — best-effort live lookups.
 
 Используется alert_enrichment для fallback на live API когда KG не дал
 ready/desired. Все вызовы — best-effort, skip-on-error, **short timeout**:
@@ -7,6 +7,7 @@ flaky kube API.
 """
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
 import structlog
@@ -147,3 +148,74 @@ def fetch_last_log_line(
     """
     # Intentionally no-op. Скелет для будущей реализации.
     return None
+
+
+# ── control-plane liveness ────────────────────────────────────────────────────
+
+# scheduler и controller-manager держат leader-election Lease в kube-system и
+# продлевают его раз в ~1-2 с. apiserver отдельного Lease не имеет, зато сам
+# факт успешного ответа kube API и есть доказательство, что он жив.
+_CP_LEASES: Dict[str, str] = {
+    "kube-scheduler": "kube-scheduler",
+    "kube-controller-manager": "kube-controller-manager",
+}
+
+
+def control_plane_component_alive(
+    component: str,
+    *,
+    timeout_sec: float = 3.0,
+    max_lease_age_sec: float = 60.0,
+) -> Optional[bool]:
+    """Жив ли компонент control-plane ПРЯМО СЕЙЧАС: True / False / None.
+
+    `component`: "apiserver" | "kube-scheduler" | "kube-controller-manager".
+
+    Зачем: алёрты `Kube{API,Scheduler,ControllerManager}Down` — это правила
+    вида `absent(up{job=...})`, т.е. они срабатывают на ОТСУТСТВИЕ метрики.
+    Метрика отсутствует и когда компонент упал, и когда ослеп сам мониторинг
+    (vmagent потерял данные, scrape-gap). Различить эти два случая по самой
+    метрике нельзя — нужен независимый источник, которым и служит kube API.
+
+    `None` = «не знаю»: нет kube-config, таймаут, любая ошибка. Caller ОБЯЗАН
+    трактовать None как «не подавлять» (fail-safe loud) — проспать реальное
+    падение control-plane хуже лишнего пинга.
+
+    Никогда не пробрасывает исключение. Hard cap по сокету — `timeout_sec`
+    через `_request_timeout` (пер-вызов, не процесс-глобальный: почему именно
+    так — см. развёрнутый комментарий в `fetch_live_replicas`).
+    """
+    if not _load_k8s_once():
+        return None
+
+    if component == "apiserver":
+        try:
+            # Самый дешёвый эндпоинт: /version. Ответил — apiserver обслуживает
+            # запросы, значит `absent(up{job="apiserver"})` про слепоту скрейпа.
+            client.VersionApi().get_code(_request_timeout=timeout_sec)
+            return True
+        except Exception as e:
+            # Отличать «упал» от «сеть/RBAC» здесь нечем, поэтому не False, а
+            # None: пусть алёрт останется громким.
+            logger.warning("cp_liveness_apiserver_unknown", error=type(e).__name__)
+            return None
+
+    lease_name = _CP_LEASES.get(component)
+    if not lease_name:
+        return None
+    try:
+        lease = client.CoordinationV1Api().read_namespaced_lease(
+            name=lease_name, namespace="kube-system", _request_timeout=timeout_sec
+        )
+        renew = getattr(lease.spec, "renew_time", None)
+        if renew is None:
+            return None
+        age = (datetime.now(timezone.utc) - renew).total_seconds()
+        # Свежий renewTime = лидер работает. Порог с большим запасом: штатный
+        # интервал продления ~1-2 с, а leaseDurationSeconds по умолчанию 15.
+        return age <= max_lease_age_sec
+    except Exception as e:
+        logger.warning(
+            "cp_liveness_lease_unknown", component=component, error=type(e).__name__
+        )
+        return None

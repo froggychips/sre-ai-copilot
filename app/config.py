@@ -307,6 +307,21 @@ class Settings(BaseSettings):
     # производные scrape-gap, приглушаются всегда независимо от этого флага.
     META_NOISE_ETCD_ENABLED: bool = True
 
+    # Kube{API,Scheduler,ControllerManager}Down — УСЛОВНЫЙ шум, health-gated
+    # (прецедент 19.08.2026: три critical с пингом роли в #infra-error, все
+    # ложные). Правила — `absent(up{job=...})`, т.е. фаерятся на ОТСУТСТВИЕ
+    # метрики, а она отсутствует и при падении компонента, и когда ослеп сам
+    # мониторинг. 18-19.08 vmsingle стоял на CPU-полке, очередь vmagent упёрлась
+    # в maxDiskUsagePerURL и он выбрасывал 60-264 МБ метрик в час — control-plane
+    # при этом был полностью жив (/livez ok, поды Running 12 дней).
+    # Отличаем слепоту от падения независимым источником — самим kube API
+    # (apiserver: отвечает ли /version; scheduler/CM: свежесть их
+    # leader-election Lease в kube-system). Подавляем ТОЛЬКО когда компонент
+    # доказанно жив; «не знаю» (таймаут, нет kube-config, ошибка) оставляет
+    # алёрт ГРОМКИМ — проспать реальное падение control-plane хуже лишнего
+    # пинга. Выстави False, чтобы эти три алёрта всегда звенели как раньше.
+    META_NOISE_CP_DOWN_ENABLED: bool = True
+
     # KubeDeploymentGenerationMismatch — УСЛОВНЫЙ шум (alert-quality, прецедент
     # prod-kingdom7/town-service 2026-06-23). В отличие от meta-noise этот alert
     # шумный НЕ всегда: generation != observedGeneration штатно флапает, когда
