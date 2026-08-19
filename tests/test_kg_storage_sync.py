@@ -25,6 +25,8 @@
   `kg_storage_volumes`, которых нет в снимке кластера. Обе — только при
   здоровом источнике: иначе повторили бы «тихую эрозию рёбер».
 """
+import inspect
+import json
 import subprocess
 from datetime import datetime, timedelta
 from unittest.mock import patch
@@ -307,7 +309,7 @@ def test_sync_pvs_upserts_and_idempotent(db):
         _mk_pv("pv-2", capacity="100Gi", phase="Released"),
     ]
     with patch(
-        "app.knowledge_graph.k8s_storage_sync._kubectl_get_all",
+        "app.knowledge_graph.k8s_storage_sync._get_all",
         return_value=pvs,
     ):
         stats1 = sync_pvs(db)
@@ -334,7 +336,7 @@ def test_sync_pvcs_bound_creates_bound_to_edge(db):
 
     pvcs = [_mk_pvc("data-0", "prod-shared", volume_name="pv-1", phase="Bound")]
     with patch(
-        "app.knowledge_graph.k8s_storage_sync._kubectl_get_all",
+        "app.knowledge_graph.k8s_storage_sync._get_all",
         return_value=pvcs,
     ):
         stats = sync_pvcs(db)
@@ -353,7 +355,7 @@ def test_sync_pvcs_pending_no_edge(db):
     """Pending PVC (no volume_name) → не должен создавать bound_to."""
     pvcs = [_mk_pvc("orphan", "dev-1", phase="Pending", volume_name="")]
     with patch(
-        "app.knowledge_graph.k8s_storage_sync._kubectl_get_all",
+        "app.knowledge_graph.k8s_storage_sync._get_all",
         return_value=pvcs,
     ):
         stats = sync_pvcs(db)
@@ -365,7 +367,7 @@ def test_sync_pvcs_unknown_pv_counted(db):
     """PVC ссылается на PV которого нет в KG → skipped_unknown_pv ↑."""
     pvcs = [_mk_pvc("data-0", "prod-shared", volume_name="pv-ghost", phase="Bound")]
     with patch(
-        "app.knowledge_graph.k8s_storage_sync._kubectl_get_all",
+        "app.knowledge_graph.k8s_storage_sync._get_all",
         return_value=pvcs,
     ):
         stats = sync_pvcs(db)
@@ -381,7 +383,7 @@ def test_sync_pvcs_disk_pct_attached(db):
     ]
     disk_pct_map = {("prod-shared", "data-0"): 87.5}
     with patch(
-        "app.knowledge_graph.k8s_storage_sync._kubectl_get_all",
+        "app.knowledge_graph.k8s_storage_sync._get_all",
         return_value=pvcs,
     ):
         stats = sync_pvcs(db, disk_pct_map=disk_pct_map)
@@ -410,7 +412,7 @@ def test_sync_pod_pvc_edges_two_pvcs_two_edges(db):
         owner_kind="StatefulSet", owner_name="clickhouse",
     )
     with patch(
-        "app.knowledge_graph.k8s_storage_sync._kubectl_get_all",
+        "app.knowledge_graph.k8s_storage_sync._get_all",
         side_effect=lambda r: [pod] if r == "pods" else [],
     ):
         stats = sync_pod_pvc_edges(db)
@@ -431,7 +433,7 @@ def test_sync_pod_pvc_edges_standalone_pod_skipped(db):
     db.commit()
     pod = _mk_pod("debug", "default", pvc_claims=["data-0"], owner_name="")
     with patch(
-        "app.knowledge_graph.k8s_storage_sync._kubectl_get_all",
+        "app.knowledge_graph.k8s_storage_sync._get_all",
         side_effect=lambda r: [pod] if r == "pods" else [],
     ):
         stats = sync_pod_pvc_edges(db)
@@ -459,7 +461,7 @@ def test_sync_pod_pvc_edges_via_replicaset_resolves_deployment(db):
         return []
 
     with patch(
-        "app.knowledge_graph.k8s_storage_sync._kubectl_get_all",
+        "app.knowledge_graph.k8s_storage_sync._get_all",
         side_effect=fake_kubectl,
     ):
         stats = sync_pod_pvc_edges(db)
@@ -477,7 +479,7 @@ def test_sync_pod_pvc_edges_unknown_pvc_counted(db):
         owner_kind="StatefulSet", owner_name="ch",
     )
     with patch(
-        "app.knowledge_graph.k8s_storage_sync._kubectl_get_all",
+        "app.knowledge_graph.k8s_storage_sync._get_all",
         side_effect=lambda r: [pod] if r == "pods" else [],
     ):
         stats = sync_pod_pvc_edges(db)
@@ -515,7 +517,7 @@ def test_sync_storage_full_pipeline_idempotent(db, monkeypatch):
 
     # Disable disk_pct enrichment для теста (STORAGE_METRICS_ENABLED=False по default).
     with patch(
-        "app.knowledge_graph.k8s_storage_sync._kubectl_get_all",
+        "app.knowledge_graph.k8s_storage_sync._get_all",
         side_effect=fake_kubectl,
     ):
         r1 = sync_storage(db)
@@ -535,7 +537,7 @@ def test_sync_storage_full_pipeline_idempotent(db, monkeypatch):
 def test_sync_storage_kubectl_failure_does_not_raise(db):
     """Если kubectl даёт пустоту — sync не падает, возвращает stats с 0."""
     with patch(
-        "app.knowledge_graph.k8s_storage_sync._kubectl_get_all",
+        "app.knowledge_graph.k8s_storage_sync._get_all",
         return_value=[],
     ):
         result = sync_storage(db)
@@ -547,7 +549,7 @@ def test_sync_storage_kubectl_failure_does_not_raise(db):
 def test_sync_storage_disk_pct_disabled_default(db):
     """STORAGE_METRICS_ENABLED по умолчанию False — disk_pct_series=0."""
     with patch(
-        "app.knowledge_graph.k8s_storage_sync._kubectl_get_all",
+        "app.knowledge_graph.k8s_storage_sync._get_all",
         return_value=[],
     ):
         result = sync_storage(db)
@@ -572,7 +574,7 @@ def test_sync_storage_disk_pct_enabled_attaches(db, monkeypatch):
         return []
 
     with patch(
-        "app.knowledge_graph.k8s_storage_sync._kubectl_get_all",
+        "app.knowledge_graph.k8s_storage_sync._get_all",
         side_effect=fake_kubectl,
     ), patch(
         "app.knowledge_graph.k8s_storage_sync._fetch_disk_pct_map",
@@ -634,7 +636,7 @@ def test_kubectl_get_all_pages_the_list_and_waits_long_enough():
         "app.knowledge_graph.k8s_storage_sync.subprocess.run",
         side_effect=fake_run,
     ):
-        assert _kubectl_get_all("pods") == []
+        assert _kubectl_get_all("persistentvolumeclaims") == []
 
     assert any(str(a).startswith("--chunk-size=") for a in seen["cmd"]), (
         f"лист запрашивается без пагинации: {seen['cmd']}"
@@ -672,7 +674,7 @@ def test_kubectl_get_all_raises_instead_of_returning_empty(failure):
             return_value=_FakeProc(stdout="{not json"),
         )
     with run, pytest.raises(KubectlFetchError):
-        _kubectl_get_all("pods")
+        _kubectl_get_all("persistentvolumeclaims")
 
 
 def test_kubectl_get_all_empty_cluster_is_not_an_error():
@@ -681,7 +683,7 @@ def test_kubectl_get_all_empty_cluster_is_not_an_error():
         "app.knowledge_graph.k8s_storage_sync.subprocess.run",
         return_value=_FakeProc(stdout='{"items": []}'),
     ):
-        assert _kubectl_get_all("pods") == []
+        assert _kubectl_get_all("persistentvolumeclaims") == []
 
 
 # ── отказ fetch'а наблюдаем: errors + stats + record_source_run ─────────────
@@ -697,7 +699,7 @@ def test_pod_fetch_failure_counted_as_error_not_no_data(db):
         return []
 
     with patch(
-        "app.knowledge_graph.k8s_storage_sync._kubectl_get_all",
+        "app.knowledge_graph.k8s_storage_sync._get_all",
         side_effect=boom,
     ):
         stats = sync_pod_pvc_edges(db)
@@ -713,7 +715,7 @@ def test_pod_fetch_failure_counted_as_error_not_no_data(db):
 
 def test_pvc_fetch_failure_counted_as_error(db):
     with patch(
-        "app.knowledge_graph.k8s_storage_sync._kubectl_get_all",
+        "app.knowledge_graph.k8s_storage_sync._get_all",
         side_effect=KubectlFetchError("rc=1"),
     ):
         stats = sync_pvcs(db)
@@ -727,7 +729,7 @@ def test_pvc_fetch_failure_counted_as_error(db):
 def test_sync_storage_sums_fetch_errors_into_top_level_stats(db):
     """Все 4 листа (pv/pvc/pods/rs) упали → это видно в результате таска."""
     with patch(
-        "app.knowledge_graph.k8s_storage_sync._kubectl_get_all",
+        "app.knowledge_graph.k8s_storage_sync._get_all",
         side_effect=KubectlFetchError("timeout"),
     ):
         result = sync_storage(db)
@@ -868,7 +870,7 @@ def test_absent_pvc_is_removed_with_its_edges(db):
     snapshot = [_mk_pvc(f"data-{i}", "prod-shared") for i in range(3)]
 
     with patch(
-        "app.knowledge_graph.k8s_storage_sync._kubectl_get_all",
+        "app.knowledge_graph.k8s_storage_sync._get_all",
         return_value=snapshot,
     ):
         stats = sync_pvcs(db)
@@ -884,7 +886,7 @@ def test_absent_pvc_kept_when_fetch_failed(db):
     _seed_volume_edges(db, count=4)
 
     with patch(
-        "app.knowledge_graph.k8s_storage_sync._kubectl_get_all",
+        "app.knowledge_graph.k8s_storage_sync._get_all",
         side_effect=KubectlFetchError("timeout"),
     ):
         stats = sync_pvcs(db)
@@ -901,7 +903,7 @@ def test_absent_pvc_kept_on_empty_snapshot(db):
     _seed_volume_edges(db, count=4)
 
     with patch(
-        "app.knowledge_graph.k8s_storage_sync._kubectl_get_all",
+        "app.knowledge_graph.k8s_storage_sync._get_all",
         return_value=[],
     ):
         stats = sync_pvcs(db)
@@ -915,7 +917,7 @@ def test_volume_cleanup_respects_delete_pct_cap(db):
     _seed_volume_edges(db, count=4)
 
     with patch(
-        "app.knowledge_graph.k8s_storage_sync._kubectl_get_all",
+        "app.knowledge_graph.k8s_storage_sync._get_all",
         return_value=[_mk_pvc("data-0", "prod-shared")],
     ):
         stats = sync_pvcs(db)
@@ -949,7 +951,7 @@ def test_sync_storage_drops_deleted_pvc_end_to_end(db):
         return fake
 
     with patch(
-        "app.knowledge_graph.k8s_storage_sync._kubectl_get_all",
+        "app.knowledge_graph.k8s_storage_sync._get_all",
         side_effect=snapshot(4),
     ):
         first = sync_storage(db)
@@ -957,7 +959,7 @@ def test_sync_storage_drops_deleted_pvc_end_to_end(db):
     assert db.query(VolumeEdge).filter_by(kind=EDGE_USES_VOLUME).count() == 4
 
     with patch(
-        "app.knowledge_graph.k8s_storage_sync._kubectl_get_all",
+        "app.knowledge_graph.k8s_storage_sync._get_all",
         side_effect=snapshot(3),
     ):
         second = sync_storage(db)
@@ -965,3 +967,149 @@ def test_sync_storage_drops_deleted_pvc_end_to_end(db):
     assert second["errors"] == 0
     assert _pvc_names(db) == {"data-0", "data-1", "data-2"}
     assert db.query(VolumeEdge).filter_by(kind=EDGE_USES_VOLUME).count() == 3
+
+
+# ── постраничный лист с проекцией (фикс OOM воркера 19.08.2026) ──────────────
+#
+# pods/replicasets тянулись целиком (95.8 + 209.3 МБ на этом кластере) через
+# один `kubectl -o json`, и тик синка ронял воркер по памяти 1-2 раза в час.
+# Теперь лист идёт страницами по kube API и каждая страница сразу сжимается
+# до полей, которые синк реально читает.
+
+
+def _raw_pod_with_bulk():
+    """Под с реалистичным «весом»: статусы, контейнеры, аннотации."""
+    return {
+        "metadata": {
+            "name": "town-service-abc-123",
+            "namespace": "squad-33-shared",
+            "ownerReferences": [
+                {"controller": True, "kind": "ReplicaSet", "name": "town-service-abc"},
+            ],
+            "annotations": {"kubectl.kubernetes.io/last-applied-configuration": "x" * 5000},
+            "managedFields": [{"manager": "kube-controller-manager", "f": "y" * 5000}],
+        },
+        "spec": {
+            "volumes": [
+                {"name": "data", "persistentVolumeClaim": {"claimName": "town-pvc"}},
+                {"name": "data", "persistentVolumeClaim": {"claimName": "town-pvc"}},
+                {"name": "tmp", "emptyDir": {}},
+            ],
+            "containers": [{"name": "town-service", "env": [{"name": "E", "value": "z" * 5000}]}],
+        },
+        "status": {"containerStatuses": [{"name": "town-service", "restartCount": 7}]},
+    }
+
+
+def test_project_pod_keeps_only_what_sync_reads():
+    from app.knowledge_graph.k8s_storage_sync import _pod_pvc_claims, _project_pod
+
+    projected = _project_pod(_raw_pod_with_bulk())
+
+    # Поведение сохранено: claims и owner-chain читаются из проекции.
+    assert _pod_pvc_claims(projected) == ["town-pvc"]   # дедуп subPath-дубля
+    assert projected["metadata"]["namespace"] == "squad-33-shared"
+    assert projected["metadata"]["ownerReferences"][0]["name"] == "town-service-abc"
+    # Балласт отброшен — иначе смысла в проекции нет.
+    assert "status" not in projected
+    assert "containers" not in projected["spec"]
+    assert "managedFields" not in projected["metadata"]
+    assert "annotations" not in projected["metadata"]
+    assert len(json.dumps(projected)) < len(json.dumps(_raw_pod_with_bulk())) / 10
+
+
+def test_project_replicaset_feeds_owner_index():
+    from app.knowledge_graph.k8s_storage_sync import (
+        _build_rs_to_deployment_index, _project_replicaset,
+    )
+
+    raw = {
+        "metadata": {
+            "name": "town-service-abc",
+            "namespace": "squad-33-shared",
+            "ownerReferences": [
+                {"controller": True, "kind": "Deployment", "name": "town-service"},
+            ],
+            "managedFields": [{"manager": "x", "f": "y" * 5000}],
+        },
+        "spec": {"replicas": 3, "template": {"spec": {"containers": [{"name": "c"}]}}},
+        "status": {"replicas": 3},
+    }
+    projected = _project_replicaset(raw)
+
+    idx = _build_rs_to_deployment_index([projected])
+    assert idx[("squad-33-shared", "town-service-abc")] == "town-service"
+    assert "spec" not in projected and "status" not in projected
+
+
+def test_get_all_pods_pages_through_continue_tokens():
+    """Две страницы → один список; второй запрос несёт continue-токен."""
+    from app.knowledge_graph.k8s_storage_sync import _get_all
+
+    calls = []
+
+    class _Resp:
+        def __init__(self, payload):
+            self.data = json.dumps(payload)
+
+    def fake_call_api(path, method, **kwargs):
+        # Мок не должен прятать дрейф сигнатуры клиента: то, чем мы зовём
+        # call_api, обязано биндиться на РЕАЛЬНУЮ сигнатуру установленного
+        # kubernetes-client (ловит переименования вида
+        # response_type → response_types_map при апгрейде пакета).
+        from kubernetes.client import ApiClient
+        inspect.signature(ApiClient.call_api).bind(
+            None, path, method, **kwargs,
+        )
+        calls.append((path, dict(kwargs.get("query_params") or [])))
+        if len(calls) == 1:
+            return _Resp({
+                "items": [_raw_pod_with_bulk()],
+                "metadata": {"continue": "tok-2"},
+            })
+        return _Resp({"items": [_raw_pod_with_bulk()], "metadata": {}})
+
+    with patch("app.context.deployments._load_k8s_once", return_value=True), patch(
+        "kubernetes.client.ApiClient.call_api", side_effect=fake_call_api,
+    ):
+        items = _get_all("pods")
+
+    assert len(items) == 2
+    assert [c[0] for c in calls] == ["/api/v1/pods", "/api/v1/pods"]
+    assert calls[0][1].get("limit") == 500 and "continue" not in calls[0][1]
+    assert calls[1][1].get("continue") == "tok-2"
+    # Вернулись проекции, а не сырые объекты.
+    assert "status" not in items[0]
+
+
+def test_get_all_pvcs_still_goes_through_kubectl():
+    """Контроль: мелкие листы не переехали на пагинацию — их поля читаются
+    целиком, проецировать нечего."""
+    from app.knowledge_graph.k8s_storage_sync import _get_all
+
+    with patch(
+        "app.knowledge_graph.k8s_storage_sync.subprocess.run",
+        return_value=_FakeProc(stdout='{"items": []}'),
+    ) as run:
+        assert _get_all("persistentvolumeclaims") == []
+    assert run.called
+
+
+@pytest.mark.parametrize("boom", [RuntimeError("apiserver 500"), ValueError("bad json")])
+def test_get_all_paged_failure_raises_fetch_error(boom):
+    """Сбой страницы = отказ фетча (исключение), не молчаливый пустой лист."""
+    from app.knowledge_graph.k8s_storage_sync import _get_all
+
+    with patch("app.context.deployments._load_k8s_once", return_value=True), patch(
+        "kubernetes.client.ApiClient.call_api", side_effect=boom,
+    ), pytest.raises(KubectlFetchError):
+        _get_all("pods")
+
+
+def test_get_all_paged_without_kubeconfig_raises_fetch_error():
+    from app.knowledge_graph.k8s_storage_sync import _get_all
+
+    with patch("app.context.deployments._load_k8s_once", return_value=False), pytest.raises(
+        KubectlFetchError
+    ):
+        _get_all("pods")
