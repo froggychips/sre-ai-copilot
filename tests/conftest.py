@@ -2,6 +2,8 @@ import os
 import sys
 from pathlib import Path
 
+import warnings
+
 import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -60,6 +62,70 @@ requires_postgres = pytest.mark.skipif(
     not _has_live_postgres(),
     reason="требуется живой postgres (set DATABASE_URL на доступный инстанс)",
 )
+
+
+@pytest.fixture(scope="session", autouse=True)
+def no_lingering_threads():
+    """В конце прогона не должно оставаться незавершённых потоков.
+
+    Тот же инцидент 19.08.2026, но с другой стороны. Соединение к кластеру
+    держал фоновый ПОТОК, и потому `pytest` не мог выйти: главный поток ждал
+    его в `wait_for_thread_shutdown`. Снаружи это выглядело как «CI завис» —
+    хотя тесты давно прошли, а отчёт о покрытии был готов.
+
+    Проверка не роняет прогон: результаты тестов уже получены, и портить их
+    из-за уборки неправильно. Но предупреждение в конце делает причину
+    видимой сразу, а не через полтора часа простоя очереди.
+    """
+    import threading
+    yield
+
+    alive = [
+        t for t in threading.enumerate()
+        if t is not threading.main_thread() and t.is_alive() and not t.daemon
+    ]
+    if alive:
+        names = ", ".join(sorted(t.name for t in alive))
+        warnings.warn(
+            f"после тестов живы non-daemon потоки: {names}. "
+            "Процесс не завершится, пока они работают — так CI однажды встал "
+            "на полтора часа.",
+            stacklevel=1,
+        )
+
+
+@pytest.fixture(autouse=True)
+def no_cluster_connections(monkeypatch):
+    """Тест не должен открывать соединение к боевому кластеру.
+
+    Инцидент 19.08.2026: CI встал на полтора часа. Тесты при этом ПРОШЛИ —
+    процесс `pytest` висел в `wait_for_thread_shutdown`, ожидая фоновый
+    поток, который держал сокет на `51.158.156.40:6443`, то есть на
+    kube-apiserver прода. Не падение и не таймаут: просто незакрытое
+    соединение, удерживающее раннер. Очередь встала целиком, потому что
+    раннер здесь один.
+
+    Отдельно неприятно, что это был прод: `~/.kube/config` лежит рядом с
+    раннером, и `load_kube_config()` подхватывает его молча.
+
+    Фикстура подменяет обе точки входа клиента Kubernetes. Тесту, которому
+    действительно нужен кластер, придётся заявить это явно — через
+    monkeypatch внутри самого теста, и тогда видно, что он туда ходит.
+    """
+    def _refuse(*_args, **_kwargs):
+        raise RuntimeError(
+            "Тест пытается загрузить kube-config и пойти в кластер. "
+            "Замокай клиент: соединение с боевым apiserver из тестов "
+            "однажды подвесило CI на полтора часа."
+        )
+
+    try:
+        from kubernetes import config as k8s_config
+    except ImportError:  # pragma: no cover - окружение без клиента
+        return
+
+    monkeypatch.setattr(k8s_config, "load_kube_config", _refuse, raising=False)
+    monkeypatch.setattr(k8s_config, "load_incluster_config", _refuse, raising=False)
 
 
 @pytest.fixture(autouse=True)
