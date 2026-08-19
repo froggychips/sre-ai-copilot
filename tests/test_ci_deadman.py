@@ -104,6 +104,7 @@ def test_stuck_queue_is_a_finding(dm, monkeypatch):
     работы отличает вставшую очередь от занятого раннера.
     """
     monkeypatch.setattr(dm, "QUEUE_MINUTES", 30)
+    monkeypatch.setattr(dm, "STUCK_HOURS", 2)   # чтобы не попасть в hard-порог
 
     def fake_gh(path, params=None):
         if (params or {}).get("status") == "queued":
@@ -499,3 +500,23 @@ def test_fresh_queue_stays_silent_even_with_idle_runner(dm, monkeypatch):
 
     monkeypatch.setattr(dm, "gh", fake_gh)
     assert dm.check_queue() == []
+
+
+def test_hard_threshold_matches_a_real_ci_run_length(dm):
+    """Порог «висит слишком долго» должен быть кратен обычному прогону.
+
+    Инцидент 19.08.2026: pytest завис в `wait_for_thread_shutdown` (фоновый
+    поток держал сокет к kube-apiserver), раннер полтора часа числился busy,
+    очередь стояла — а канарейка молчала, потому что порог был 2 часа.
+
+    Полный прогон CI здесь занимает ~11 минут. Порог обязан оставлять запас
+    на очередь, но не превращаться в «полдня простоя — это нормально».
+    """
+    typical_run_minutes = 11
+    assert dm.STUCK_HOURS * 60 >= typical_run_minutes * 3, (
+        "порог меньше трёх обычных прогонов — будут ложные срабатывания "
+        "на честной очереди"
+    )
+    assert dm.STUCK_HOURS <= 1.0, (
+        "порог больше часа: столько CI уже не должен молчать при одном раннере"
+    )
