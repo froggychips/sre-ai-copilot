@@ -1,5 +1,6 @@
 import json
 import re
+from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Dict, List, Optional
 
@@ -22,6 +23,89 @@ class ActionType(str, Enum):
     GET_LOGS = "get_logs"
     DESCRIBE_RESOURCE = "describe_resource"
     GET_PODS = "get_pods"
+
+
+# ---------------------------------------------------------------------------
+# Реестр действий
+# ---------------------------------------------------------------------------
+
+class ConcurrencyPolicy(str, Enum):
+    """Что делать, если состояние изменилось между preview и применением.
+
+    Preview (dry-run) показывает человеку одно, а применяется команда позже —
+    иногда через минуты, после нажатия кнопки в Discord. За это время объект
+    мог изменить кто угодно: HPA, оператор, другой человек.
+
+    * `NONE` — читающее действие, менять нечего;
+    * `PRECONDITION` — команда несёт проверку текущего состояния и падает,
+      если оно разошлось (`kubectl scale --current-replicas`). Это то, что
+      apiserver умеет проверить сам;
+    * `UNGUARDED` — защиты нет, и это признано явно. Не «забыли», а «для этой
+      операции precondition сформулировать нечем». Такое значение обязано
+      быть редким и заметным.
+    """
+
+    NONE = "none"
+    PRECONDITION = "precondition"
+    UNGUARDED = "unguarded"
+
+
+@dataclass(frozen=True)
+class ActionSpec:
+    """Всё, что нужно знать о действии, — в одном объявлении.
+
+    До этого реестра знание о действии было размазано по трём местам:
+    `ActionType` (перечень), `DSLTranslator` (как выполнить) и
+    `executor_gate` (мутирующее ли, какой command_kind, какие поля проверять).
+    Связи между ними не было никакой: добавив действие в перечень и
+    транслятор, про guard можно было просто забыть — и новое мутирующее
+    действие прошло бы проверку риска как безвредное чтение.
+
+    Тест ловил такой рассинхрон постфактум. Реестр убирает саму возможность:
+    действие без спецификации не существует, а спецификация требует ответить
+    на все вопросы сразу.
+    """
+
+    action: "ActionType"
+    #: Меняет ли состояние кластера. От этого зависит вся политика допуска.
+    mutating: bool
+    #: Подсказка для risk_axes (reversibility/idempotency). None у чтения.
+    command_kind: Optional[str]
+    #: Как защищаемся от изменения состояния между preview и apply.
+    concurrency: ConcurrencyPolicy
+    #: Ресурс, с которым действие обязано работать. None — любой из
+    #: разрешённых. Раньше эта проверка была условием внутри guard.
+    requires_resource_type: Optional[str] = None
+    #: Параметры, без которых действие бессмысленно (проверяются guard'ом).
+    required_params: tuple = ()
+
+
+ACTION_SPECS: Dict["ActionType", ActionSpec] = {}
+
+
+def _spec(**kwargs) -> None:
+    spec = ActionSpec(**kwargs)
+    ACTION_SPECS[spec.action] = spec
+
+
+def action_spec(action: "ActionType") -> ActionSpec:
+    """Спецификация действия. Бросает, если её нет.
+
+    Отсутствие спецификации — не повод считать действие безопасным: это повод
+    отказаться его выполнять.
+    """
+    try:
+        return ACTION_SPECS[action]
+    except KeyError:
+        raise ValueError(
+            f"У действия {action!r} нет ActionSpec — оно не описано в реестре, "
+            "и решить, мутирующее ли оно, невозможно"
+        ) from None
+
+
+def is_mutating(action: "ActionType") -> bool:
+    """Меняет ли действие состояние кластера."""
+    return action_spec(action).mutating
 
 
 class ExecutionIntent(BaseModel):
@@ -165,15 +249,19 @@ class DSLTranslator:
             replicas = intent.params.get("replicas", 1)
             argv = ["kubectl", "scale", f"deployment/{intent.resource_name}", *ns,
                     f"--replicas={replicas}"]
-            # Optimistic concurrency: `--current-replicas` — это precondition
-            # на стороне kube-apiserver. Между preview (dry-run) и реальным
-            # применением деплоймент мог отмасштабировать кто-то ещё: HPA,
-            # соседний оператор, человек. Без precondition мы молча
-            # перезаписываем чужое решение состоянием, которое видели минуту
-            # назад; с ним — команда падает, и это правильный исход.
-            current = intent.params.get("current_replicas")
-            if current is not None:
-                argv.append(f"--current-replicas={current}")
+            # Optimistic concurrency: `--current-replicas` — precondition на
+            # стороне kube-apiserver. Между preview (dry-run) и применением
+            # деплоймент мог отмасштабировать кто-то ещё: HPA, оператор,
+            # человек. Без precondition мы молча перезаписываем чужое решение
+            # состоянием, которое видели минуту назад.
+            #
+            # Условие идёт от политики в реестре, а не от имени действия:
+            # добавив второе действие с PRECONDITION, здесь ничего менять не
+            # придётся, а забыв политику — не получится, реестр её требует.
+            if action_spec(intent.action).concurrency is ConcurrencyPolicy.PRECONDITION:
+                current = intent.params.get("current_replicas")
+                if current is not None:
+                    argv.append(f"--current-replicas={current}")
             return argv
         if intent.action == ActionType.GET_LOGS:
             return ["kubectl", "logs", intent.resource_name, *ns, "--tail=100"]
@@ -207,3 +295,52 @@ class DSLTranslator:
             intent_json=intent.model_dump_json(),
         ):
             return " ".join(DSLTranslator.to_argv(intent))
+
+
+# Реестр заполняется сразу после объявления ActionType: действие, не попавшее
+# сюда, не пройдёт `action_spec()` и не выполнится.
+_spec(
+    action=ActionType.RESTART_DEPLOYMENT,
+    mutating=True,
+    command_kind="restart",
+    # У `rollout restart` нет аналога `--current-replicas`: он не сверяется с
+    # состоянием, а всегда перезапускает. Признаём это явно, а не умалчиваем.
+    concurrency=ConcurrencyPolicy.UNGUARDED,
+    requires_resource_type="deployment",
+)
+_spec(
+    action=ActionType.SCALE_DEPLOYMENT,
+    mutating=True,
+    command_kind="scale",
+    concurrency=ConcurrencyPolicy.PRECONDITION,
+    requires_resource_type="deployment",
+    required_params=("replicas",),
+)
+_spec(
+    action=ActionType.GET_LOGS,
+    mutating=False,
+    command_kind=None,
+    concurrency=ConcurrencyPolicy.NONE,
+)
+_spec(
+    action=ActionType.DESCRIBE_RESOURCE,
+    mutating=False,
+    command_kind=None,
+    concurrency=ConcurrencyPolicy.NONE,
+)
+_spec(
+    action=ActionType.GET_PODS,
+    mutating=False,
+    command_kind=None,
+    concurrency=ConcurrencyPolicy.NONE,
+)
+
+# Полнота проверяется на импорте: забытое действие роняет процесс на старте,
+# а не тихо проходит проверку риска как безвредное чтение.
+_missing = set(ActionType) - set(ACTION_SPECS)
+if _missing:  # pragma: no cover - конфигурационная ошибка, ловится на импорте
+    raise RuntimeError(
+        f"Действия без ActionSpec: {sorted(a.value for a in _missing)}. "
+        "Опиши их в реестре: без спецификации неизвестно, мутирующие ли они."
+    )
+

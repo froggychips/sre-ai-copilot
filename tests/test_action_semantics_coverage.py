@@ -1,20 +1,23 @@
-"""Каждое действие должно быть известно и транслятору, и guard'у.
+"""Действие описано в одном месте — реестре ActionSpec.
 
-Семантика действия сегодня живёт в трёх местах:
+Раньше семантика жила в трёх: `ActionType` (перечень), `DSLTranslator` (как
+выполнить) и `executor_gate` (мутирующее ли, какой command_kind, какие поля
+проверять). Связи между ними не было: добавив действие в перечень и
+транслятор, про guard можно было забыть — и новое мутирующее действие
+прошло бы проверку риска как безвредное чтение.
 
-  * `ActionType` — перечень;
-  * `DSLTranslator.to_argv` — как выполнить;
-  * `executor_gate` — мутирующее оно или читающее (`_COMMAND_KIND` и условие
-    рядом с ним).
+Тест ловил такой рассинхрон постфактум. Реестр убирает саму возможность:
+`ACTION_SPECS` проверяется на импорте, а `action_spec()` бросает на
+неописанном действии вместо того, чтобы считать его безопасным.
 
-Первое связано со вторым явно — незнакомое действие роняет `ValueError`.
-А вот забыть про третье можно молча: новое мутирующее действие тогда пройдёт
-через gate как безвредное чтение. Тестов на это не было.
+Здесь остались проверки самих свойств реестра — что он полон, что
+классификация осмысленна, и что argv по-прежнему защищает от инъекции.
 """
 import pytest
 
-from app.core.execution_dsl import ActionType, DSLTranslator, ExecutionIntent
-from app.remediation.executor_gate import _COMMAND_KIND
+from app.core.execution_dsl import (ACTION_SPECS, ActionType,
+                                    ConcurrencyPolicy, DSLTranslator,
+                                    ExecutionIntent, action_spec, is_mutating)
 
 #: Действия, меняющие состояние кластера. Список ведётся здесь намеренно:
 #: чтобы добавить сюда новое действие, о его последствиях нужно подумать
@@ -50,19 +53,75 @@ def test_every_action_is_classified():
     )
 
 
-def test_every_mutating_action_is_known_to_the_gate():
-    """`_COMMAND_KIND` кормит risk_axes — без записи риск считается вслепую."""
-    missing = [a.value for a in MUTATING if a not in _COMMAND_KIND]
-    assert not missing, (
-        f"мутирующие действия неизвестны executor_gate: {missing}. "
-        "Они пройдут проверку риска как обычное чтение."
-    )
+def test_registry_agrees_with_the_expected_classification():
+    """Реестр — источник истины; список выше сторожит его от тихой правки."""
+    for action in MUTATING:
+        assert is_mutating(action), f"{action.value} перестало быть мутирующим"
+    for action in READ_ONLY:
+        assert not is_mutating(action), f"{action.value} стало мутирующим"
 
 
-def test_read_only_actions_are_not_marked_as_commands():
-    """Чтение не должно попадать в реестр мутаций — иначе риск завышен."""
-    extra = [a.value for a in READ_ONLY if a in _COMMAND_KIND]
-    assert not extra, f"читающие действия помечены как мутации: {extra}"
+def test_every_action_has_a_spec():
+    """Действие без спецификации не должно существовать.
+
+    Полнота проверяется и на импорте модуля — здесь дублируем ради понятного
+    сообщения в отчёте тестов.
+    """
+    missing = [a.value for a in ActionType if a not in ACTION_SPECS]
+    assert not missing, f"действия без ActionSpec: {missing}"
+
+
+def test_unknown_action_is_refused_not_assumed_safe():
+    """Отсутствие спецификации — повод отказаться, а не счесть безвредным."""
+    class Fake(str):
+        pass
+
+    with pytest.raises(ValueError, match="ActionSpec"):
+        action_spec(Fake("delete_everything"))
+
+
+def test_mutating_actions_declare_a_command_kind():
+    """command_kind кормит risk_axes: без него риск считается вслепую."""
+    for action in MUTATING:
+        assert action_spec(action).command_kind, (
+            f"{action.value} мутирует, но не сообщает command_kind"
+        )
+
+
+def test_read_only_actions_have_no_command_kind():
+    """У чтения нет вида команды — иначе риск завышается на пустом месте."""
+    for action in READ_ONLY:
+        assert action_spec(action).command_kind is None
+
+
+# --- concurrency policy на каждое мутирующее действие ---------------------
+
+
+def test_every_mutating_action_declares_concurrency_policy():
+    """«Забыли подумать» и «защиты нет» должны выглядеть по-разному.
+
+    Читающие действия — NONE. Мутирующие обязаны выбрать: PRECONDITION, если
+    apiserver может проверить состояние сам, или UNGUARDED — но это осознанное
+    признание, а не умолчание.
+    """
+    for action in MUTATING:
+        policy = action_spec(action).concurrency
+        assert policy in (ConcurrencyPolicy.PRECONDITION,
+                          ConcurrencyPolicy.UNGUARDED), (
+            f"{action.value}: политика {policy} не годится для мутации"
+        )
+
+
+def test_read_only_actions_need_no_concurrency_policy():
+    for action in READ_ONLY:
+        assert action_spec(action).concurrency is ConcurrencyPolicy.NONE
+
+
+def test_scale_uses_a_precondition_not_a_promise():
+    """У scale precondition возможен — и обязан быть выбран."""
+    assert action_spec(
+        ActionType.SCALE_DEPLOYMENT
+    ).concurrency is ConcurrencyPolicy.PRECONDITION
 
 
 @pytest.mark.parametrize("action", list(ActionType))

@@ -27,7 +27,7 @@ import re
 from dataclasses import replace
 from typing import Any, Dict
 
-from app.core.execution_dsl import ActionType, ExecutionIntent
+from app.core.execution_dsl import ExecutionIntent, action_spec
 from app.remediation.playbook import Playbook
 from app.remediation.policy import PolicyDecision, PolicyMode, evaluate_policy
 from app.remediation.risk_axes import (Confidence, DataPlane, Reversibility,
@@ -36,11 +36,14 @@ from app.remediation.risk_axes import (Confidence, DataPlane, Reversibility,
 __all__ = ["evaluate_intent_gate", "PolicyDecision", "PolicyMode"]
 
 
-# command_kind hint для reversibility/idempotency-инференса в risk_axes.
-_COMMAND_KIND: Dict[ActionType, str] = {
-    ActionType.RESTART_DEPLOYMENT: "restart",
-    ActionType.SCALE_DEPLOYMENT: "scale",
-}
+# command_kind, «мутирующее ли», требуемый resource_type и обязательные
+# параметры берутся из ЕДИНОГО реестра `execution_dsl.ACTION_SPECS`.
+#
+# Раньше здесь лежала своя копия этого знания: словарь `_COMMAND_KIND` на два
+# действия плюс условия ниже, перечислявшие те же действия ещё раз. Реестра не
+# было, связи с транслятором — тоже: добавив действие в перечень и в
+# `to_argv`, про guard можно было просто забыть, и новое мутирующее действие
+# прошло бы проверку риска как безвредное чтение.
 
 
 # Серверная safety-policy для human-approved direct-intent applies:
@@ -127,6 +130,7 @@ def _apply_fail_closed_axes(axes: RiskAxes, intent: ExecutionIntent) -> RiskAxes
     НИКОГДА не срабатывали в block.any (`kubectl scale deployment/postgres`
     проходил как safe). Правило: неизвестный сигнал = риск, не «нет риска».
     """
+    spec = action_spec(intent.action)
     data_plane = axes.data_plane
     reversibility = axes.reversibility
     confidence = axes.confidence
@@ -147,11 +151,13 @@ def _apply_fail_closed_axes(axes: RiskAxes, intent: ExecutionIntent) -> RiskAxes
     # 3) confidence: внутренне противоречивый intent (LLM перепутал поля) —
     #    action оперирует deployment-ом, а resource_type другой; или scale
     #    без валидного replicas. Такое = слабая уверенность → WEAK (block.any).
-    if intent.action in (ActionType.RESTART_DEPLOYMENT, ActionType.SCALE_DEPLOYMENT):
-        if intent.resource_type.lower() != "deployment":
-            confidence = Confidence.WEAK
-    if intent.action == ActionType.SCALE_DEPLOYMENT:
+    if spec.requires_resource_type and (
+        intent.resource_type.lower() != spec.requires_resource_type
+    ):
+        confidence = Confidence.WEAK
+    if "replicas" in spec.required_params:
         replicas = intent.params.get("replicas")
+        # bool — подкласс int в Python: `True` прошло бы как «1 реплика».
         if isinstance(replicas, bool) or not isinstance(replicas, int):
             confidence = Confidence.WEAK
 
@@ -172,7 +178,8 @@ def evaluate_intent_gate(intent: ExecutionIntent) -> PolicyDecision:
     fail-closed (см. _apply_fail_closed_axes).
     """
     target = _intent_to_target(intent)
-    hint = {"command_kind": _COMMAND_KIND.get(intent.action, "unknown")}
+    spec = action_spec(intent.action)
+    hint = {"command_kind": spec.command_kind or "unknown"}
     axes = compute_risk_axes(target, classification_signals=None, playbook_hint=hint)
     axes = _apply_fail_closed_axes(axes, intent)
     return evaluate_policy(_EXECUTOR_GATE_POLICY, axes, target=target)
