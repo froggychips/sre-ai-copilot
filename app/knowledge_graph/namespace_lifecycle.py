@@ -30,6 +30,7 @@ from typing import Any, Dict, Optional
 import structlog
 from sqlalchemy.orm import Session
 
+from app.knowledge_graph.kubectl_breaker import (guard_kubectl)
 from app.knowledge_graph.schema import (NS_STATE_ACTIVE, NS_STATE_MISSING,
                                         Namespace)
 from app.services.audit_logger import audit_service
@@ -50,6 +51,7 @@ class K8sNamespaceFetchError(RuntimeError):
 
 def _fetch_namespaces() -> Dict[str, Dict[str, Any]]:
     """{name: {uid, created_at}} из кластера. Бросает при сбое."""
+    guard_kubectl("get ns")
     try:
         out = subprocess.run(
             ["kubectl", "get", "ns", "-o", "json"],

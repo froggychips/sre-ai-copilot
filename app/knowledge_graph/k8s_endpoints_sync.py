@@ -40,6 +40,8 @@ from typing import Any, Dict, List, Optional, Tuple
 from sqlalchemy.orm import Session
 from sqlalchemy.orm.attributes import flag_modified
 
+from app.knowledge_graph.kubectl_breaker import (guard_kubectl, record_failure,
+                                                 record_success)
 from app.knowledge_graph.populator import upsert_edge
 from app.knowledge_graph.schema import NODE_KIND_SERVICE, Service, ServiceEdge
 
@@ -69,15 +71,23 @@ class EndpointsFetchError(RuntimeError):
 
 
 def _fetch_endpoints() -> List[Dict[str, Any]]:
-    """`kubectl get endpoints -A -o json` → items. Бросает при сбое."""
+    """`kubectl get endpoints -A -o json` → items. Бросает при сбое.
+
+    Перед вызовом спрашиваем circuit breaker: если apiserver уже не отвечал
+    подряд, идти к нему снова незачем — тридцать задач из расписания только
+    добавят нагрузки больному API и займут форки ожиданием таймаутов.
+    """
+    guard_kubectl("get endpoints")
     try:
         out = subprocess.run(
             ["kubectl", "get", "endpoints", "-A", "-o", "json"],
             capture_output=True, text=True, check=False, timeout=_KUBECTL_TIMEOUT_S,
         )
     except Exception as e:  # noqa: BLE001
+        record_failure("get endpoints")
         raise EndpointsFetchError(f"kubectl get endpoints: {e}") from e
     if out.returncode != 0:
+        record_failure("get endpoints")
         raise EndpointsFetchError(
             f"kubectl get endpoints rc={out.returncode}: {out.stderr.strip()[:200]}"
         )
@@ -87,6 +97,7 @@ def _fetch_endpoints() -> List[Dict[str, Any]]:
         raise EndpointsFetchError(f"невалидный JSON от kubectl: {e}") from e
     if not items:
         raise EndpointsFetchError("kubectl вернул ноль endpoints — это сбой, а не факт")
+    record_success("get endpoints")
     return items
 
 
