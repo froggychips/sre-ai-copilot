@@ -1,7 +1,7 @@
 import json
 import re
 from enum import Enum
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 import structlog
 from pydantic import BaseModel, Field, ValidationError, field_validator
@@ -138,8 +138,66 @@ class ExecutionIntent(BaseModel):
 
 class DSLTranslator:
     @staticmethod
+    def to_argv(intent: ExecutionIntent) -> List[str]:
+        """Собрать kubectl-команду сразу как argv, без промежуточной строки.
+
+        Почему это важнее, чем кажется. Историческая цепочка была такой:
+        типизированный `ExecutionIntent` → f-строка → `command.split()` в
+        `k8s_service._run_kubectl` → argv. Каждый переход терял структуру, и
+        безопасность держалась на charset-регулярках у `namespace`,
+        `resource_name` и `params` — их валидаторы прямо ссылаются на
+        `split()` как на причину своего существования.
+
+        Такая защита работает ровно до первого нового поля, у которого
+        валидатор забыли: значение вроде `squad-1 -n kube-system` снова
+        станет двумя аргументами. Здесь же элемент списка остаётся одним
+        аргументом, что бы в нём ни было, — flag-инъекция перестаёт быть
+        возможной структурно, а не по договорённости.
+
+        Регулярки при этом остаются: они ловят мусор раньше и дают понятную
+        ошибку вместо `kubectl` с непонятным именем.
+        """
+        ns = ["-n", intent.namespace]
+        if intent.action == ActionType.RESTART_DEPLOYMENT:
+            return ["kubectl", "rollout", "restart",
+                    f"deployment/{intent.resource_name}", *ns]
+        if intent.action == ActionType.SCALE_DEPLOYMENT:
+            replicas = intent.params.get("replicas", 1)
+            argv = ["kubectl", "scale", f"deployment/{intent.resource_name}", *ns,
+                    f"--replicas={replicas}"]
+            # Optimistic concurrency: `--current-replicas` — это precondition
+            # на стороне kube-apiserver. Между preview (dry-run) и реальным
+            # применением деплоймент мог отмасштабировать кто-то ещё: HPA,
+            # соседний оператор, человек. Без precondition мы молча
+            # перезаписываем чужое решение состоянием, которое видели минуту
+            # назад; с ним — команда падает, и это правильный исход.
+            current = intent.params.get("current_replicas")
+            if current is not None:
+                argv.append(f"--current-replicas={current}")
+            return argv
+        if intent.action == ActionType.GET_LOGS:
+            return ["kubectl", "logs", intent.resource_name, *ns, "--tail=100"]
+        if intent.action == ActionType.DESCRIBE_RESOURCE:
+            return ["kubectl", "describe",
+                    f"{intent.resource_type}/{intent.resource_name}", *ns]
+        if intent.action == ActionType.GET_PODS:
+            argv = ["kubectl", "get", "pods", *ns]
+            label = intent.params.get("label")
+            if label:
+                # Отдельным элементом: значение с пробелом не расщепится.
+                argv += ["-l", str(label)]
+            return argv
+        raise ValueError(f"Unknown action type: {intent.action!r}")
+
+    @staticmethod
     def to_kubectl(intent: ExecutionIntent) -> str:
-        """Generate kubectl command from intent and record an audit span."""
+        """Строковая форма команды — для логов, аудита и Discord-превью.
+
+        Собирается из `to_argv`, а не отдельным набором f-строк: две
+        независимые копии одной команды разъезжались бы, и расхождение
+        всплыло бы там, где строка показывается человеку («мы применим вот
+        это»), а argv делает другое.
+        """
         with execution_intent_span(
             action=intent.action.value,
             resource_type=intent.resource_type,
@@ -148,29 +206,4 @@ class DSLTranslator:
             risk=intent.risk,
             intent_json=intent.model_dump_json(),
         ):
-            mapping = {
-                ActionType.RESTART_DEPLOYMENT: (
-                    f"kubectl rollout restart deployment/{intent.resource_name} "
-                    f"-n {intent.namespace}"
-                ),
-                ActionType.SCALE_DEPLOYMENT: (
-                    f"kubectl scale deployment/{intent.resource_name} "
-                    f"-n {intent.namespace} "
-                    f"--replicas={intent.params.get('replicas', 1)}"
-                ),
-                ActionType.GET_LOGS: (
-                    f"kubectl logs {intent.resource_name} -n {intent.namespace} --tail=100"
-                ),
-                ActionType.DESCRIBE_RESOURCE: (
-                    f"kubectl describe {intent.resource_type}/{intent.resource_name} "
-                    f"-n {intent.namespace}"
-                ),
-                ActionType.GET_PODS: (
-                    f"kubectl get pods -n {intent.namespace}"
-                    + (f" -l {intent.params['label']}" if intent.params.get("label") else "")
-                ),
-            }
-            cmd = mapping.get(intent.action)
-            if cmd is None:
-                raise ValueError(f"Unknown action type: {intent.action!r}")
-            return cmd
+            return " ".join(DSLTranslator.to_argv(intent))

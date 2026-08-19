@@ -17,7 +17,7 @@
 from __future__ import annotations
 
 import subprocess
-from typing import Any, Dict, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from app.config import settings
 from app.core.execution_dsl import ActionType, DSLTranslator, ExecutionIntent
@@ -110,12 +110,16 @@ class K8sService:
                 "dry_run": dry_run,
             }
 
-        command = DSLTranslator.to_kubectl(intent)
+        # argv собирается из intent напрямую; строка идёт рядом только для
+        # аудита и человекочитаемого вывода. Раньше строка была единственной
+        # формой, и `.split()` восстанавливал аргументы наугад.
+        argv = DSLTranslator.to_argv(intent)
         return self._run_kubectl(
-            command,
+            " ".join(argv),
             dry_run=dry_run,
             post_approval=post_approval,
             risk=intent.risk,
+            argv=argv,
         )
 
     def _run_kubectl(
@@ -124,6 +128,7 @@ class K8sService:
         dry_run: bool,
         post_approval: bool,
         risk: str = "medium",
+        argv: Optional[List[str]] = None,
     ) -> Dict[str, Any]:
         """Запустить kubectl-команду (с возможным --dry-run=server)."""
         if not command.startswith("kubectl"):
@@ -143,7 +148,12 @@ class K8sService:
                 "dry_run": False,
             }
 
-        full_cmd = command.split()
+        # argv по возможности приходит готовым (DSLTranslator.to_argv) — тогда
+        # расщепления не происходит вовсе. `command.split()` остаётся только
+        # для legacy-вызовов со строкой: он не понимает кавычек и превращает
+        # любое значение с пробелом в лишние аргументы, из-за чего у полей
+        # ExecutionIntent и стоят charset-валидаторы.
+        full_cmd = list(argv) if argv else command.split()
         if dry_run and not any(flag.startswith("--dry-run") for flag in full_cmd):
             full_cmd.append("--dry-run=server")
 
