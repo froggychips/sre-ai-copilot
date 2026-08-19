@@ -1,3 +1,18 @@
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: postgres-backup-data
+  labels:
+    app.kubernetes.io/part-of: sre-ai-copilot
+spec:
+  accessModes: ["ReadWriteOnce"]
+  resources:
+    requests:
+      # Дамп 330 МБ при базе 5.5 ГБ (замер 19.08.2026). 20 ГБ — это 7 дампов
+      # ретеншена с запасом на рост базы.
+      storage: 20Gi
+
+---
 # pg_dump CronJob для single-replica Postgres из postgres.yaml.
 #
 # Если используется CloudNativePG (postgres.cnpg.yaml.example), бэкапы уже
@@ -88,6 +103,16 @@ spec:
               # Имя файла для upload-контейнера (basename, без пути).
               basename "${dump_file}" > /backup/LATEST
               echo "Dump complete: $(basename "${dump_file}")"
+
+              # Ретеншен: держим последние KEEP дампов. Без него том заполнится
+              # молча, и первым сломается именно бэкап — то, что должно
+              # работать, когда сломалось всё остальное.
+              KEEP=${BACKUP_KEEP:-7}
+              ls -1t /backup/sre-ai-*.sql.gz 2>/dev/null | tail -n +$((KEEP + 1)) | while read -r old; do
+                echo "Retention: removing $(basename "$old")"
+                rm -f "$old"
+              done
+              echo "Kept: $(ls -1 /backup/sre-ai-*.sql.gz 2>/dev/null | wc -l) dumps, free: $(df -h /backup | tail -1 | awk '{print $4}')"
             resources:
               limits:
                 cpu: 500m
@@ -117,26 +142,46 @@ spec:
                 secretKeyRef:
                   name: postgres-backup-s3
                   key: BUCKET
+                  optional: true
             - name: AWS_ACCESS_KEY_ID
               valueFrom:
                 secretKeyRef:
                   name: postgres-backup-s3
                   key: ACCESS_KEY_ID
+                  optional: true
             - name: AWS_SECRET_ACCESS_KEY
               valueFrom:
                 secretKeyRef:
                   name: postgres-backup-s3
                   key: SECRET_ACCESS_KEY
+                  optional: true
             - name: AWS_DEFAULT_REGION
               valueFrom:
                 secretKeyRef:
                   name: postgres-backup-s3
                   key: REGION
+                  optional: true
             command:
             - /bin/sh
             - -ec
             - |
               dump_name="$(cat /backup/LATEST)"
+
+              # Выгрузка наружу — ВТОРАЯ линия защиты, а не единственная.
+              # Локальный дамп уже сделан init-контейнером и лежит на
+              # постоянном томе. Если секрета postgres-backup-s3 нет, ронять
+              # Job нельзя: это превратило бы работающий локальный бэкап в
+              # «бэкапа нет» — ровно то состояние, в котором система прожила
+              # год до 19.08.2026.
+              if [ -z "${S3_BUCKET:-}" ]; then
+                echo "S3_BUCKET не задан — выгрузка пропущена."
+                echo "Локальный дамп: /backup/${dump_name} (том postgres-backup-data)."
+                echo "ВНИМАНИЕ: том привязан к ноде, потеря ноды = потеря дампа."
+                echo "Чтобы включить выгрузку, создай секрет postgres-backup-s3"
+                echo "с ключами BUCKET / AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY / REGION."
+                exit 0
+              fi
+
               echo "Uploading /backup/${dump_name} -> s3://${S3_BUCKET}/postgres/"
               aws s3 cp "/backup/${dump_name}" "s3://${S3_BUCKET}/postgres/${dump_name}"
               echo "Backup complete: ${dump_name}"
@@ -154,8 +199,20 @@ spec:
               mountPath: /tmp
           volumes:
           - name: backup
-            emptyDir:
-              sizeLimit: 5Gi
+            # ПОСТОЯННЫЙ том вместо emptyDir. Схема здесь двухступенчатая:
+            # init-контейнер pg-dump пишет дамп, основной s3-upload выгружает
+            # его наружу. При emptyDir дамп жил только между этими шагами — и
+            # если S3-секрета нет (а его нет), не оставалось ничего.
+            #
+            # Проверено 19.08.2026: pg_dump отработал за 5.5 минут, дамп 330 МБ
+            # при базе 5.5 ГБ. Теперь он сохраняется независимо от выгрузки.
+            #
+            # Ограничение: StorageClass local-path привязывает том к ноде.
+            # Это защита от повреждения базы, ошибочного DROP и неудачной
+            # миграции, но НЕ от потери ноды. Выгрузка в S3 остаётся нужной —
+            # для неё не хватает секрета postgres-backup-s3.
+            persistentVolumeClaim:
+              claimName: postgres-backup-data
           - name: tmp
             emptyDir:
               sizeLimit: 128Mi
