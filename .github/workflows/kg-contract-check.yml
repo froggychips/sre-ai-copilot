@@ -37,6 +37,24 @@ jobs:
   contract-check:
     name: KG contract drift gate
     runs-on: [self-hosted, macOS, ARM64]
+    # Изоляция self-hosted раннера от чужого кода (security finding 19.08.2026).
+    #
+    # Раннер здесь persistent и работает под пользователем разработчика: рядом
+    # с ним лежат ~/.kube/config с доступом к прод-кластеру, ~/.ssh/id_rsa,
+    # ~/.aws/credentials и токены. Выполнить на нём PR из чужого форка —
+    # значит отдать всё это автору PR.
+    #
+    # Approval-политика (all_external_contributors) — процедурная защита: она
+    # держится на внимательности человека, нажимающего кнопку. Это условие —
+    # структурная: job с форка не стартует вовсе, независимо от того, что
+    # кто-то одобрил.
+    #
+    # Цена размена: PR из форков не получают автоматических проверок. Для
+    # репозитория, чей CI живёт на личной машине с доступом к боевому
+    # кластеру, это правильная сторона размена.
+    if: >-
+      github.event_name != 'pull_request' ||
+      github.event.pull_request.head.repo.full_name == github.repository
     # Warning-only gate. Перевести в blocker когда thresholds стабилизируются.
     continue-on-error: true
     env:

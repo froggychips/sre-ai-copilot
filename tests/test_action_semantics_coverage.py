@@ -143,3 +143,42 @@ def test_scale_without_known_current_state_has_no_precondition():
     """Не знаем текущее число реплик — не выдумываем его."""
     argv = DSLTranslator.to_argv(_intent(ActionType.SCALE_DEPLOYMENT, replicas=5))
     assert not [a for a in argv if a.startswith("--current-replicas")]
+
+
+# --- строковый путь исполнения закрыт навсегда ----------------------------
+#
+# `_run_kubectl` раньше принимал `command: str` и восстанавливал аргументы
+# через `command.split()`. К 19.08.2026 у него остался единственный
+# вызывающий, уже передававший argv, — то есть fallback стал мёртвым кодом,
+# существующим только как путь атаки. Достаточно одного нового вызывающего,
+# собравшего команду строкой, чтобы он ожил.
+
+
+def test_executor_never_splits_a_string_into_argv():
+    """В исполнителе не должно остаться расщепления строки на аргументы."""
+    import pathlib
+    src = (pathlib.Path(__file__).parent.parent
+           / "app" / "services" / "k8s_service.py").read_text(encoding="utf-8")
+    code = "\n".join(
+        line for line in src.splitlines()
+        if not line.lstrip().startswith("#")
+    )
+    # Докстринг объясняет историю и содержит `command.split()` текстом —
+    # ищем именно исполняемое присваивание.
+    assert "= command.split()" not in code, (
+        "строковый путь исполнения вернулся: argv снова собирается split(), "
+        "и charset-валидаторы опять становятся единственной защитой"
+    )
+
+
+def test_run_kubectl_requires_argv_list():
+    """Сигнатура обязана принимать список, а не строку."""
+    import inspect
+
+    from app.services.k8s_service import K8sService
+
+    sig = inspect.signature(K8sService._run_kubectl)
+    assert "argv" in sig.parameters, "argv перестал быть параметром"
+    assert "command" not in sig.parameters, (
+        "строковый параметр вернулся — вместе с ним вернётся и split()"
+    )
