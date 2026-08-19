@@ -17,7 +17,7 @@
 from __future__ import annotations
 
 import subprocess
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Tuple
 
 from app.config import settings
 from app.core.execution_dsl import ActionType, DSLTranslator, ExecutionIntent
@@ -113,26 +113,39 @@ class K8sService:
         # argv собирается из intent напрямую; строка идёт рядом только для
         # аудита и человекочитаемого вывода. Раньше строка была единственной
         # формой, и `.split()` восстанавливал аргументы наугад.
-        argv = DSLTranslator.to_argv(intent)
         return self._run_kubectl(
-            " ".join(argv),
+            DSLTranslator.to_argv(intent),
             dry_run=dry_run,
             post_approval=post_approval,
             risk=intent.risk,
-            argv=argv,
         )
 
     def _run_kubectl(
         self,
-        command: str,
+        argv: List[str],
         dry_run: bool,
         post_approval: bool,
         risk: str = "medium",
-        argv: Optional[List[str]] = None,
     ) -> Dict[str, Any]:
-        """Запустить kubectl-команду (с возможным --dry-run=server)."""
-        if not command.startswith("kubectl"):
+        """Запустить kubectl (с возможным --dry-run=server). Принимает ТОЛЬКО argv.
+
+        Строковой формы здесь больше нет намеренно. Раньше метод брал
+        `command: str` и восстанавливал аргументы через `command.split()` —
+        наивно, без понимания кавычек. Именно поэтому у полей
+        `ExecutionIntent` стоят charset-регулярки: их докстринги прямо
+        ссылаются на `split()` как на причину.
+
+        Пока такой путь существует, он остаётся путём атаки — даже если
+        сегодня по нему никто не ходит: достаточно одного нового вызывающего,
+        собравшего команду строкой. Поэтому fallback убран целиком, а не
+        помечен deprecated.
+
+        `command` для аудита и вывода собирается здесь же из argv: одна форма
+        порождает другую, разъехаться нечему.
+        """
+        if not argv or argv[0] != "kubectl":
             return {"success": False, "error": "Invalid command. Must be kubectl."}
+        command = " ".join(argv)
 
         # SAFE_MODE-блок на реальный write без явного post_approval=True.
         # Это последний рубеж: даже если кто-то вызвал dry_run=False вне
@@ -148,12 +161,7 @@ class K8sService:
                 "dry_run": False,
             }
 
-        # argv по возможности приходит готовым (DSLTranslator.to_argv) — тогда
-        # расщепления не происходит вовсе. `command.split()` остаётся только
-        # для legacy-вызовов со строкой: он не понимает кавычек и превращает
-        # любое значение с пробелом в лишние аргументы, из-за чего у полей
-        # ExecutionIntent и стоят charset-валидаторы.
-        full_cmd = list(argv) if argv else command.split()
+        full_cmd = list(argv)
         if dry_run and not any(flag.startswith("--dry-run") for flag in full_cmd):
             full_cmd.append("--dry-run=server")
 
