@@ -403,15 +403,33 @@ def test_team_digest_render_embed_hides_stuck_section_when_empty(db):
 
 
 @pytest.mark.asyncio
-async def test_kg_stuck_alerts_task_dedup_in_window(db):
+async def test_kg_stuck_alerts_task_dedup_in_window(db, monkeypatch):
     """Двойной вызов с тем же set stuck-alerts → второй раз dedup=deduped."""
     from app.workers import tasks as tasks_module
 
     sa = _mk_service(db, name="a", ns="squad-1", team="squad-1")
     _mk_alert(db, sa, alertname="StuckOne", fired_hours_ago=30, fingerprint_str="a")
 
-    # Чистим state между прогонами теста
-    tasks_module._STUCK_ALERTS_LAST_FIRE.clear()
+    # Подавление живёт в Redis (app.core.fire_dedup), общее для всех форков.
+    # Подменяем клиент словарём: тест проверяет саму логику окна, а не сеть.
+    from app.core import fire_dedup
+
+    store: dict = {}
+
+    class FakeRedis:
+        def exists(self, k):
+            return 1 if k in store else 0
+
+        def setex(self, k, _ttl, v):
+            store[k] = v
+
+        def delete(self, k):
+            store.pop(k, None)
+
+        def scan_iter(self, match=None, count=None):
+            return iter(list(store))
+
+    monkeypatch.setattr(fire_dedup, "_redis", lambda: FakeRedis())
 
     # Подменяем SessionLocal → наш in-memory session
     def session_factory():
