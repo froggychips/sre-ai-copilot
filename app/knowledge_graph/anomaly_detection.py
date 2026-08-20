@@ -43,9 +43,9 @@ import statistics
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Tuple, cast
 
-from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
+from app.knowledge_graph.populator import insert_idempotent
 from app.knowledge_graph.schema import (NODE_KIND_SERVICE, AnomalyObservation,
                                         LogObservation, Service, ServiceHealth)
 
@@ -278,12 +278,7 @@ def _insert_idempotent(
         notified=False,
         extras=extras,
     )
-    try:
-        with db.begin_nested():
-            db.add(row)
-        return True
-    except IntegrityError:
-        return False
+    return insert_idempotent(db, row)
 
 
 def _detect_for_service(
