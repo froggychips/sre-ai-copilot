@@ -49,13 +49,53 @@ def _merge_extras(dst: Dict[str, Any] | None, src: Dict[str, Any] | None) -> Dic
     return out
 
 
-def collapse_phantom_db_nodes(db: Session, apply: bool = False) -> Dict[str, Any]:
-    """Схлопнуть per-namespace дубли `db:%`-узлов в канонические.
+class PhantomDbCleanupRetired(RuntimeError):
+    """Этот backfill больше нельзя применять: его правило оказалось неверным."""
 
-    Returns dict-stats:
-        distinct_db_names, total_db_nodes, duplicate_names,
-        nodes_to_delete, edges_repointed, edges_merged, nodes_deleted, applied.
-    При apply=False (dry-run) пишущие счётчики = 0, applied=False.
+
+def collapse_phantom_db_nodes(db: Session, apply: bool = False) -> Dict[str, Any]:
+    """ОТКЛЮЧЕНО. Схлопывало дубли `db:%`-узлов в лексикографически минимальный.
+
+    Правило «канонический узел = в лексикографически минимальном namespace»
+    неверно. Физически таких баз столько, сколько окружений: у каждого сквада
+    своё, замер 20.08.2026 — `db:postgres:message` в 56 namespace, и каждый
+    узел собирает рёбра только своего окружения. Схлопывание сводило 56
+    РАЗНЫХ баз в одну, а минимумом среди `preprod-*`, `prod-*`, `squad-*`
+    оказывался `preprod-kingdom1` — так граф начинал утверждать, что прод
+    ходит в базу препрода.
+
+    Последствия этого прогона разгребает `db_edge_rehome`: 3676 рёбер
+    `uses_db` из живых namespace вели в db-узлы `preprod-kingdom1`, которого
+    в кластере нет с 15.08.2026.
+
+    Функция оставлена, а не удалена, ровно затем, чтобы её вызов падал с
+    объяснением: она доступна из CLI `app/scripts/cleanup_phantom_db_nodes.py`
+    с флагом `--apply`, и молчаливое удаление превратило бы заряженное ружьё
+    в ImportError без причины. Правильная операция — `db_edge_rehome`.
+
+    Raises:
+        PhantomDbCleanupRetired: всегда, при любом значении `apply` — включая
+            dry-run: его отчёт называл дублями 56 законных узлов и подталкивал
+            запустить перенос.
+    """
+    raise PhantomDbCleanupRetired(
+        "collapse_phantom_db_nodes отключена: правило «канонический = "
+        "лексикографически минимальный namespace» сводило разные физические "
+        "базы разных окружений в одну и породило 3676 ложных рёбер "
+        "(prod → база удалённого preprod-kingdom1). Используй "
+        "app.knowledge_graph.db_edge_rehome.rehome_db_edges — он переносит "
+        "рёбра на узел в <realm>-shared окружения источника."
+    )
+
+
+def _collapse_phantom_db_nodes_historical(
+    db: Session, apply: bool = False,
+) -> Dict[str, Any]:
+    """Тело отключённого backfill'а. Сохранено для чтения истории графа.
+
+    Не вызывается. Понять, как именно рёбра оказались на узле
+    `preprod-kingdom1`, без этого кода нельзя, а понимать это нужно: тот же
+    класс ошибки легко повторить в следующем дедупликаторе.
     """
     rows: List[Service] = db.query(Service).filter(Service.name.like("db:%")).all()
 

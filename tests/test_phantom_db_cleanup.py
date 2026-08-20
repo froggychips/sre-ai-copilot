@@ -1,10 +1,25 @@
-"""Тесты backfill-схлопывания фантомных db-узлов (C2)."""
+"""Тесты backfill-схлопывания фантомных db-узлов (C2) — ИСТОРИЧЕСКОГО.
+
+Публичная `collapse_phantom_db_nodes` отключена: её правило «канонический
+узел = в лексикографически минимальном namespace» сводило разные физические
+базы разных окружений в одну (замер 20.08.2026: `db:postgres:message` в 56
+namespace — 56 разных баз, каждая обслуживает своё окружение). Отказ функции
+проверяется в `test_db_edge_rehome.py`, разгребает последствия
+`app.knowledge_graph.db_edge_rehome`.
+
+Эти тесты переключены на сохранённое тело `_collapse_phantom_db_nodes_historical`
+и оставлены намеренно: они документируют, ЧТО именно делал backfill, а без
+этого нельзя понять, откуда в графе взялись 3676 рёбер «прод → база
+удалённого препрода». Тот же класс ошибки легко повторить в следующем
+дедупликаторе — пусть будет видно, как он выглядит.
+"""
 import pytest
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
 from app.database import Base
-from app.knowledge_graph.phantom_db_cleanup import collapse_phantom_db_nodes
+from app.knowledge_graph.phantom_db_cleanup import \
+    _collapse_phantom_db_nodes_historical as collapse_phantom_db_nodes
 from app.knowledge_graph.schema import Service, ServiceEdge
 
 
