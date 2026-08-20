@@ -25,9 +25,9 @@ from collections import Counter
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, cast
 
-from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
+from app.knowledge_graph.populator import insert_idempotent
 from app.knowledge_graph.schema import (AlertEvent, Deployment, PodEvent,
                                         Service, SignalAggregate)
 
@@ -150,12 +150,7 @@ def _insert_idempotent(
         window_hours=window_hours,
         **values,
     )
-    try:
-        with db.begin_nested():
-            db.add(row)
-        return True
-    except IntegrityError:
-        return False
+    return insert_idempotent(db, row)
 
 
 def compute_signal_aggregates(

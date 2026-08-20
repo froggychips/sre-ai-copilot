@@ -19,13 +19,13 @@ import logging
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 
-from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.config import settings
 from app.context.vm_client import VMClient
 from app.knowledge_graph.k8s_ingress_sync import (_extract_routes,
                                                   _kubectl_get_ingresses_all)
+from app.knowledge_graph.populator import insert_idempotent
 from app.knowledge_graph.schema import NODE_KIND_SERVICE, IngressObservation, Service
 
 log = logging.getLogger(__name__)
@@ -132,12 +132,7 @@ def _insert_idempotent(
         error_5xx_rate=metrics.get("error_5xx_rate"),
         error_4xx_rate=metrics.get("error_4xx_rate"),
     )
-    try:
-        with db.begin_nested():
-            db.add(row)
-        return True
-    except IntegrityError:
-        return False
+    return insert_idempotent(db, row)
 
 
 async def _sync_ingress_observations_async(db: Session) -> Dict[str, Any]:

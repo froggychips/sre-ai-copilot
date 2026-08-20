@@ -30,11 +30,11 @@ from collections import defaultdict
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple, cast
 
-from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.config import settings
 from app.context.vm_client import VMClient
+from app.knowledge_graph.populator import insert_idempotent
 from app.knowledge_graph.schema import (NODE_KIND_SERVICE, Service,
                                         ServiceHealth)
 
@@ -139,12 +139,7 @@ def _insert_idempotent(
         p95_latency_ms=metrics.get("p95_latency_ms"),
         source=source,
     )
-    try:
-        with db.begin_nested():
-            db.add(row)
-        return True
-    except IntegrityError:
-        return False
+    return insert_idempotent(db, row)
 
 
 async def _fetch_namespace(
