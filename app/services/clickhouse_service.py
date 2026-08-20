@@ -17,7 +17,8 @@ from __future__ import annotations
 
 import logging
 import re
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
+from app.core.timeutil import ensure_aware, parse_ts
 from typing import Any, Dict, List, Optional
 
 import httpx
@@ -60,27 +61,20 @@ _FRACTION_RE = re.compile(r"\.(\d+)")
 
 
 def _parse_ts(raw: str) -> Optional[datetime]:
-    """RFC3339/ISO-8601 → tz-aware datetime (naive считаем UTC).
+    """RFC3339/ISO-8601 → tz-aware UTC. Обёртка над общим разбором.
 
-    Прежняя реализация перебирала strptime-форматы БЕЗ %f, поэтому реальный
-    Alertmanager-овский startsAt с миллисекундами не парсился вообще → None →
-    blast radius молча выключался почти на каждом алерте. Плюс первый формат
-    ('…%SZ') был мёртвой ветвью: `replace("Z", "+0000")` убирал Z до strptime.
+    Здесь нужен именно AWARE: значения уходят в ClickHouse-запросы и
+    сравниваются с временем оттуда. Общий `parse_ts` отдаёт naive UTC (так
+    хранит Postgres), поэтому добавляем tzinfo явно — видно, что тип меняется
+    осознанно, а не по недосмотру.
+
+    Разбор больше не свой: обрезание дробной части до шести знаков, из-за
+    которого когда-то молча отключался blast radius (Alertmanager присылает
+    startsAt с миллисекундами), теперь живёт в app/core/timeutil.py вместе с
+    остальными четырьмя бывшими копиями.
     """
-    if not raw:
-        return None
-    s = raw.strip()
-    # fromisoformat не ест 'Z' до 3.11 — нормализуем к смещению.
-    if s[-1:] in ("Z", "z"):
-        s = s[:-1] + "+00:00"
-    s = _FRACTION_RE.sub(lambda m: "." + m.group(1)[:6], s)
-    try:
-        dt = datetime.fromisoformat(s)
-    except ValueError:
-        return None
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=timezone.utc)
-    return dt
+    parsed = parse_ts(raw)
+    return ensure_aware(parsed) if parsed is not None else None
 
 
 # Порты, на которых CH слушает HTTPS (8443 — то что стоит в .env.example).

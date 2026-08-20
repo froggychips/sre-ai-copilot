@@ -16,8 +16,8 @@ pipeline не должен падать, если populator упал.
 """
 from __future__ import annotations
 
-from datetime import datetime, timezone
-from typing import Any, Dict, Optional
+from app.core.timeutil import parse_ts
+from typing import Dict
 
 import structlog
 from sqlalchemy.orm import Session
@@ -28,16 +28,6 @@ from app.models.incident import Incident
 
 logger = structlog.get_logger()
 
-
-def _parse_ts(raw: Any) -> Optional[datetime]:
-    if isinstance(raw, datetime):
-        return raw if raw.tzinfo else raw.replace(tzinfo=timezone.utc)
-    if isinstance(raw, str):
-        try:
-            return datetime.fromisoformat(raw.replace("Z", "+00:00"))
-        except ValueError:
-            return None
-    return None
 
 
 def populate_from_incident(db: Session, incident: Incident) -> Dict[str, int]:
@@ -94,7 +84,7 @@ def populate_from_incident(db: Session, incident: Incident) -> Dict[str, int]:
     # Deployments из TeamCity context (если был enrichment).
     tc = incident.teamcity_context or {}
     for b in tc.get("recent_builds") or []:
-        started_at = _parse_ts(b.get("started_at") or b.get("finished_at"))
+        started_at = parse_ts(b.get("started_at") or b.get("finished_at"))
         if started_at is None:
             continue
         # SHA живёт в changes[0]["version"] — TC context не имеет поля "sha" напрямую
@@ -104,13 +94,17 @@ def populate_from_incident(db: Session, incident: Incident) -> Dict[str, int]:
         # finished_at у running-билдов) — тогда `.replace()` бросал AttributeError
         # и весь build молча терялся (ловился внешним except). Считаем через
         # промежуточную переменную и .replace() только если распарсилось.
-        _fin = _parse_ts(b.get("finished_at"))
+        _fin = parse_ts(b.get("finished_at"))
         try:
             with db.begin_nested():
                 record_deployment(
                     db,
                     service=svc,
-                    started_at=started_at.replace(tzinfo=None),
+                    # parse_ts уже вернул naive UTC (app/core/timeutil.py):
+                    # обрезать tzinfo второй раз не нужно, а голый
+                    # .replace() здесь был бы неверен для источника
+                    # со смещением.
+                    started_at=started_at,
                     finished_at=_fin.replace(tzinfo=None) if _fin else None,
                     sha=sha,
                     repo=b.get("repo"),
@@ -131,7 +125,7 @@ def populate_from_incident(db: Session, incident: Incident) -> Dict[str, int]:
             )
 
     # AlertEvent — идемпотентен по fingerprint.
-    fired_at = _parse_ts(incident.starts_at)
+    fired_at = parse_ts(incident.starts_at)
     if fired_at is not None:
         try:
             with db.begin_nested():

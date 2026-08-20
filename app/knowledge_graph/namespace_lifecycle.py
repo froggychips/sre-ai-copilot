@@ -25,12 +25,13 @@ from __future__ import annotations
 import json
 import subprocess
 from datetime import datetime
-from typing import Any, Dict, Optional
+from typing import Any, Dict
 
 import structlog
 from sqlalchemy.orm import Session
 
 from app.knowledge_graph.kubectl_breaker import (guard_kubectl)
+from app.core.timeutil import parse_ts
 from app.knowledge_graph.schema import (NS_STATE_ACTIVE, NS_STATE_MISSING,
                                         Namespace)
 from app.services.audit_logger import audit_service
@@ -76,7 +77,7 @@ def _fetch_namespaces() -> Dict[str, Dict[str, Any]]:
             continue
         result[name] = {
             "uid": meta.get("uid"),
-            "created_at": _parse_ts(meta.get("creationTimestamp")),
+            "created_at": parse_ts(meta.get("creationTimestamp")),
         }
     if not result:
         # Кластер без namespace невозможен: это сбой, а не «всё исчезло».
@@ -84,14 +85,6 @@ def _fetch_namespaces() -> Dict[str, Dict[str, Any]]:
     return result
 
 
-def _parse_ts(value: Optional[str]) -> Optional[datetime]:
-    if not value:
-        return None
-    try:
-        # Все timestamp'ы в БД — naive UTC (см. self_health._now).
-        return datetime.fromisoformat(value.replace("Z", "+00:00")).replace(tzinfo=None)
-    except (ValueError, AttributeError):
-        return None
 
 
 def sync_namespace_lifecycle(db: Session) -> Dict[str, Any]:

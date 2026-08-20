@@ -14,7 +14,7 @@ events) — их заполняет pipeline после enrichment-а.
 """
 from __future__ import annotations
 
-from datetime import datetime
+from app.core.timeutil import parse_ts
 from typing import Any, Dict, List, Optional
 
 from sqlalchemy.orm import Session
@@ -61,16 +61,6 @@ def _extract_deploys_from_tc(tc_ctx: Optional[Dict[str, Any]]) -> List[Dict[str,
     return out
 
 
-def _parse_ts(raw: Any) -> Optional[datetime]:
-    if isinstance(raw, datetime):
-        return raw
-    if not isinstance(raw, str):
-        return None
-    try:
-        return datetime.fromisoformat(raw.replace("Z", "+00:00"))
-    except ValueError:
-        return None
-
 
 def build_diagnostics_ctx(
     incident: Incident,
@@ -97,7 +87,7 @@ def build_diagnostics_ctx(
     labels = incident.labels or {}
     annotations = incident.annotations or {}
 
-    incident_starts_at = _parse_ts(incident.starts_at)
+    incident_starts_at = parse_ts(incident.starts_at)
 
     upstream_alerts: Optional[List[Dict[str, Any]]] = None
     if kg_session is not None and incident.namespace and labels.get("service"):

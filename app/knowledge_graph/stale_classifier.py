@@ -26,7 +26,8 @@
 """
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
+from app.core.timeutil import ensure_naive
 from typing import Any, Mapping, Optional
 
 # ── Константы (вынесены из stats_digest.py) ──────────────────────────────────
@@ -114,11 +115,6 @@ def _classify_stale(name: str, namespace: str) -> str:
     return "suspicious"
 
 
-def _ensure_naive(dt: datetime) -> datetime:
-    """Сравнения должны быть в одном tz-режиме (naive UTC)."""
-    if dt.tzinfo is not None:
-        return dt.astimezone(timezone.utc).replace(tzinfo=None)
-    return dt
 
 
 # ── Атрибуция деплоя: чей это деплой ────────────────────────────────────────
@@ -208,19 +204,19 @@ def classify_stale_with_deploys(
       деплоящихся namespace подозрительными — обвинение на масштабе. Тот,
       кто пишет колонку, обязан перейти на разделённые параметры.
     """
-    now_dt = _ensure_naive(now) if now is not None else datetime.utcnow()
+    now_dt = ensure_naive(now) if now is not None else datetime.utcnow()
     active_cutoff = now_dt - timedelta(days=active_window_days)
     infra_cutoff = now_dt - timedelta(days=infra_expected_days)
 
     svc_naive = (
-        _ensure_naive(last_service_deploy_at)
+        ensure_naive(last_service_deploy_at)
         if last_service_deploy_at is not None else None
     )
     ns_naive = (
-        _ensure_naive(last_ns_deploy_at) if last_ns_deploy_at is not None else None
+        ensure_naive(last_ns_deploy_at) if last_ns_deploy_at is not None else None
     )
     merged_naive = (
-        _ensure_naive(last_deploy_at) if last_deploy_at is not None else None
+        ensure_naive(last_deploy_at) if last_deploy_at is not None else None
     )
     # Caller разделил атрибуцию → сырому `last_deploy_at` больше не верим
     # как доказательству «катился сервис».
