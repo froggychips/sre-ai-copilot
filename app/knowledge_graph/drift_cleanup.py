@@ -16,12 +16,12 @@
 from __future__ import annotations
 
 import logging
-import subprocess
 from datetime import datetime, timezone
 from typing import Any, Dict, Set
 
 from sqlalchemy.orm import Session
 
+from app.knowledge_graph.kubectl_breaker import run_kubectl
 from app.knowledge_graph.nats_subjects_sync import NATS_SUBJECTS_NAMESPACE
 from app.knowledge_graph.schema import Service
 
@@ -45,10 +45,10 @@ def _k8s_live_namespaces() -> Set[str]:
     python subprocess может фейлиться на shell-escape. `-o name` даёт
     стабильный формат `namespace/<name>` per line.
     """
-    out = subprocess.run(
-        ["kubectl", "get", "ns", "-o", "name"],
-        capture_output=True, text=True, check=False, timeout=15,
-    )
+    out = run_kubectl(
+["kubectl", "get", "ns", "-o", "name"],
+timeout=15,
+)
     if out.returncode != 0:
         raise RuntimeError(
             f"kubectl get ns failed (rc={out.returncode}): "
