@@ -134,7 +134,7 @@ def test_empty_cluster_response_is_a_failure(monkeypatch):
         stdout = '{"items": []}'
         stderr = ""
 
-    monkeypatch.setattr(eps.subprocess, "run", lambda *a, **k: R())
+    monkeypatch.setattr(eps, "run_kubectl", lambda *a, **k: R())
     with pytest.raises(EndpointsFetchError):
         eps._fetch_endpoints()
 

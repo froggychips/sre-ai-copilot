@@ -55,6 +55,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.config import settings
+from app.knowledge_graph.kubectl_breaker import run_kubectl
 from app.knowledge_graph.edge_decay_guard import (
     SOURCE_STORAGE_PODS, SOURCE_STORAGE_PVCS, record_source_run,
     unhealthy_volume_sources, volume_edge_block_reason,
@@ -143,12 +144,11 @@ def _kubectl_get_all(resource: str) -> List[Dict[str, Any]]:
     валить нельзя, но и молчать об отказе тоже.
     """
     try:
-        out = subprocess.run(
-            ["kubectl", "get", resource, "-A", "-o", "json",
+        out = run_kubectl(
+["kubectl", "get", resource, "-A", "-o", "json",
              f"--chunk-size={_KUBECTL_CHUNK}"],
-            capture_output=True, text=True, check=False,
-            timeout=_KUBECTL_TIMEOUT_S,
-        )
+timeout=_KUBECTL_TIMEOUT_S,
+)
     except subprocess.TimeoutExpired as e:
         raise KubectlFetchError(
             f"kubectl get {resource} timeout={_KUBECTL_TIMEOUT_S}s",

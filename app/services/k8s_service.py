@@ -20,6 +20,7 @@ import subprocess
 from typing import Any, Dict, List, Tuple
 
 from app.config import settings
+from app.knowledge_graph.kubectl_breaker import run_kubectl
 from app.core.execution_dsl import ActionType, DSLTranslator, ExecutionIntent
 from app.services.audit_logger import audit_service
 from app.services.k8s_guard import K8sOperation, k8s_guard
@@ -176,8 +177,13 @@ class K8sService:
         )
 
         try:
-            result = subprocess.run(  # nosec B603 — full_cmd начинается с "kubectl" и собирается из ExecutionIntent (pydantic-валидирован)
-                full_cmd, capture_output=True, text=True, check=False, timeout=30
+            # respect_breaker=False: это путь ремедиации, и закрывать его
+            # из-за отказов read-синков нельзя (см. docstring run_kubectl).
+            # Результат в брейкер при этом пишется — мутирующий вызов даёт
+            # самый честный сигнал о том, жив ли apiserver.
+            result = run_kubectl(
+                full_cmd, timeout=30, respect_breaker=False,
+                operation=f"exec {full_cmd[1] if len(full_cmd) > 1 else ''}",
             )
             success = result.returncode == 0
             audit_service.log_event(

@@ -26,6 +26,7 @@ from typing import Any, Dict, List, Optional
 from sqlalchemy.orm import Session
 
 from app.config import settings
+from app.knowledge_graph.kubectl_breaker import run_kubectl
 from app.knowledge_graph.nats_subjects_sync import NATS_SUBJECTS_NAMESPACE
 from app.knowledge_graph.populator import record_pod_event
 from app.knowledge_graph.schema import NODE_KIND_SERVICE, Service
@@ -79,14 +80,14 @@ _BITNAMI_TMP_SUFFIX = "-tmp"
 def _kubectl_get_events_warning(namespace: str) -> List[Dict[str, Any]]:
     """`kubectl get events -n NS --field-selector type=Warning -o json`."""
     try:
-        out = subprocess.run(
-            [
+        out = run_kubectl(
+[
                 "kubectl", "get", "events", "-n", namespace,
                 "--field-selector", "type=Warning",
                 "-o", "json",
             ],
-            capture_output=True, text=True, timeout=30, check=False,
-        )
+timeout=30,
+)
     except subprocess.TimeoutExpired:
         logger.warning("k8s_events.timeout namespace=%s", namespace)
         return []
@@ -174,10 +175,10 @@ def _kubectl_get_pods_owner_map(namespace: str) -> Dict[str, str]:
     Пустой dict при ошибке — не валим sync.
     """
     try:
-        out = subprocess.run(
-            ["kubectl", "get", "pods", "-n", namespace, "-o", "json"],
-            capture_output=True, text=True, timeout=30, check=False,
-        )
+        out = run_kubectl(
+["kubectl", "get", "pods", "-n", namespace, "-o", "json"],
+timeout=30,
+)
     except subprocess.TimeoutExpired:
         logger.warning("k8s_events.pods_timeout namespace=%s", namespace)
         return {}

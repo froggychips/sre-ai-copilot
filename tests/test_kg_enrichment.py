@@ -362,7 +362,13 @@ def test_sync_namespace_calls_upsert_with_team_owner_and_nats_edges():
 # ── _discover_namespaces (после scrub DEFAULT_SCAN_NAMESPACES) ──────────────
 
 def _fake_kubectl_ns(stdout: str, returncode: int = 0):
-    """Helper для мока subprocess.run результата `kubectl get ns -o jsonpath=...`."""
+    """Helper для мока результата `kubectl get ns -o jsonpath=...`.
+
+    Подменяется `run_kubectl`, а не `subprocess.run`: с 20.08.2026 все вызовы
+    kubectl идут через обёртку с circuit breaker'ом (kubectl_breaker), и
+    мокать subprocess напрямую значило бы проверять путь, которым код больше
+    не ходит.
+    """
     fake = MagicMock()
     fake.stdout = stdout
     fake.stderr = ""
@@ -372,19 +378,19 @@ def _fake_kubectl_ns(stdout: str, returncode: int = 0):
 
 def test_discover_namespaces_excludes_system_prefixes():
     fake_out = "kube-system kube-public kube-node-lease default monitoring squad-a squad-b cert-manager"
-    with patch("app.knowledge_graph.kg_sync.subprocess.run", return_value=_fake_kubectl_ns(fake_out)):
+    with patch("app.knowledge_graph.kg_sync.run_kubectl", return_value=_fake_kubectl_ns(fake_out)):
         result = _discover_namespaces()
     # System namespaces (kube-*, default, monitoring, cert-manager) исключены.
     assert set(result) == {"squad-a", "squad-b"}
 
 
 def test_discover_namespaces_handles_kubectl_failure():
-    with patch("app.knowledge_graph.kg_sync.subprocess.run", return_value=_fake_kubectl_ns("", returncode=1)):
+    with patch("app.knowledge_graph.kg_sync.run_kubectl", return_value=_fake_kubectl_ns("", returncode=1)):
         assert _discover_namespaces() == []
 
 
 def test_discover_namespaces_handles_exception():
-    with patch("app.knowledge_graph.kg_sync.subprocess.run", side_effect=OSError("no kubectl")):
+    with patch("app.knowledge_graph.kg_sync.run_kubectl", side_effect=OSError("no kubectl")):
         assert _discover_namespaces() == []
 
 
@@ -924,7 +930,7 @@ def test_drift_cleanup_kubectl_failure_raises():
     from app.knowledge_graph.drift_cleanup import run_drift_cleanup
     import pytest
 
-    with patch("app.knowledge_graph.drift_cleanup.subprocess.run") as mr:
+    with patch("app.knowledge_graph.drift_cleanup.run_kubectl") as mr:
         mr.return_value = MagicMock(returncode=1, stderr="connection refused")
         with pytest.raises(RuntimeError, match="kubectl get ns failed"):
             run_drift_cleanup(MagicMock(), apply=True)

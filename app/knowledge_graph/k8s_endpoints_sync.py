@@ -33,15 +33,15 @@ from __future__ import annotations
 
 import json
 import logging
-import subprocess
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 
 from sqlalchemy.orm import Session
 from sqlalchemy.orm.attributes import flag_modified
 
-from app.knowledge_graph.kubectl_breaker import (guard_kubectl, record_failure,
-                                                 record_success)
+from app.knowledge_graph.kubectl_breaker import (record_failure,
+                                                 record_success,
+                                                 run_kubectl)
 from app.knowledge_graph.populator import upsert_edge
 from app.knowledge_graph.schema import NODE_KIND_SERVICE, Service, ServiceEdge
 
@@ -77,11 +77,10 @@ def _fetch_endpoints() -> List[Dict[str, Any]]:
     подряд, идти к нему снова незачем — тридцать задач из расписания только
     добавят нагрузки больному API и займут форки ожиданием таймаутов.
     """
-    guard_kubectl("get endpoints")
     try:
-        out = subprocess.run(
+        out = run_kubectl(
             ["kubectl", "get", "endpoints", "-A", "-o", "json"],
-            capture_output=True, text=True, check=False, timeout=_KUBECTL_TIMEOUT_S,
+            timeout=_KUBECTL_TIMEOUT_S,
         )
     except Exception as e:  # noqa: BLE001
         record_failure("get endpoints")

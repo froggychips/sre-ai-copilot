@@ -25,10 +25,15 @@ from __future__ import annotations
 
 import logging
 import os
+import subprocess
+from typing import List, Optional
 
 log = logging.getLogger(__name__)
 
-__all__ = ["KubectlCircuitOpen", "guard_kubectl", "record_failure", "record_success"]
+__all__ = [
+    "KubectlCircuitOpen", "guard_kubectl", "record_failure", "record_success",
+    "run_kubectl",
+]
 
 #: Сколько подряд неудач открывают брейкер. Три — компромисс: одиночный
 #: таймаут бывает при рестарте apiserver и лечится сам, три подряд означают,
@@ -128,3 +133,57 @@ def circuit_is_open() -> bool:
         return bool(r.get(_KEY_OPEN))
     except Exception:  # noqa: BLE001
         return False
+
+
+def run_kubectl(
+    args: List[str],
+    *,
+    timeout: float = 30.0,
+    operation: Optional[str] = None,
+    check: bool = False,
+    respect_breaker: bool = True,
+) -> "subprocess.CompletedProcess":
+    """Единственный способ позвать kubectl: со брейкером и учётом результата.
+
+    Заведена потому, что расставлять `guard_kubectl` руками по 24 вызовам
+    `subprocess.run` — значит однажды забыть. Защита должна быть свойством
+    самого вызова, а не дисциплины: модуль, который зовёт эту функцию,
+    защищён автоматически, а тот, что зовёт subprocess напрямую, виден
+    тестом `test_no_direct_kubectl_calls`.
+
+    Бросает `KubectlCircuitOpen`, если брейкер открыт — до похода в сеть.
+    Ненулевой код возврата и исключения subprocess считаются неудачей и
+    приближают открытие; успех обнуляет счётчик.
+
+    `check=False` по умолчанию намеренно: синки в этом проекте разбирают
+    stderr сами и деградируют, а не падают, — так guard'ы вроде
+    `edge_decay_guard` получают шанс не принять пустой ответ за факт.
+
+    `respect_breaker=False` — для мутирующих вызовов (`k8s_service`), то
+    есть для ремедиации. Асимметрия намеренная и в одну сторону: такой
+    вызов результат в брейкер ЗАПИСЫВАЕТ, но открытым брейкером не
+    останавливается. Причина в том, кто копит отказы. Счётчик наполняют
+    read-синки, которых тридцать в расписании; если их обращения к
+    больному apiserver закроют заодно и путь лечения, оператор нажмёт
+    «применить фикс» и получит отказ из-за чужой статистики — ровно в тот
+    момент, когда фикс нужен. Читателей отсекать полезно, они всё равно
+    получат неполные данные; единственный путь починки — нет.
+    """
+    if len(args) > 2:
+        op = operation or " ".join(args[1:3])
+    else:
+        op = operation or "kubectl"
+    if respect_breaker:
+        guard_kubectl(op)
+    try:
+        out = subprocess.run(
+            args, capture_output=True, text=True, check=check, timeout=timeout,
+        )
+    except Exception:
+        record_failure(op)
+        raise
+    if out.returncode != 0:
+        record_failure(op)
+    else:
+        record_success(op)
+    return out
