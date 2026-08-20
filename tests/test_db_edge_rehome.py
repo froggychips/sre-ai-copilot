@@ -11,7 +11,7 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
 from app.database import Base
-from app.knowledge_graph.db_edge_rehome import rehome_db_edges
+from app.knowledge_graph.db_edge_rehome import rehome_db_edges, undo_rehome
 from app.knowledge_graph.schema import Namespace, Service, ServiceEdge
 
 
@@ -172,3 +172,82 @@ def test_retired_collapse_refuses_to_run():
         with pytest.raises(PhantomDbCleanupRetired) as exc:
             collapse_phantom_db_nodes(None, apply=apply)  # type: ignore[arg-type]
         assert "db_edge_rehome" in str(exc.value)
+
+
+# ── откат ─────────────────────────────────────────────────────────────────
+#
+# Перенос меняет dst_id на месте, и без журнала прежнего адреса он был бы
+# необратим. Поэтому в extras пишется rehomed_from — на проде эта операция
+# затрагивает 3612 рёбер, и «откатить нечем» там неприемлемый ответ.
+
+
+def test_repointed_edge_records_where_it_came_from(db):
+    client, dead_db, live_db, edge = _scene(db)
+    rehome_db_edges(db, apply=True)
+    db.refresh(edge)
+    assert edge.extras["rehomed_from"] == "preprod-kingdom1"
+    assert edge.extras.get("rehomed_at")
+
+
+def test_round_trip_returns_the_graph_to_its_original_state(db):
+    """Перенёс → вернул → ребро смотрит туда же, куда до начала."""
+    client, dead_db, live_db, edge = _scene(db)
+    before = edge.dst_id
+
+    rehome_db_edges(db, apply=True)
+    db.refresh(edge)
+    assert edge.dst_id == live_db.id
+
+    stats = undo_rehome(db, apply=True)
+    assert stats["restored"] == 1
+    db.refresh(edge)
+    assert edge.dst_id == before
+    assert "rehomed_from" not in (edge.extras or {}), "журнал не убран за собой"
+
+
+def test_undo_dry_run_writes_nothing(db):
+    client, dead_db, live_db, edge = _scene(db)
+    rehome_db_edges(db, apply=True)
+    stats = undo_rehome(db, apply=False)
+    assert stats["marked_edges"] == 1
+    assert stats["restored"] == 0
+    db.refresh(edge)
+    assert edge.dst_id == live_db.id, "dry-run отката изменил граф"
+
+
+def test_undo_leaves_edge_alone_when_origin_node_is_gone(db):
+    """Retention снёс мёртвое окружение — возвращать некуда.
+
+    Выдумывать узел ради отката значило бы делать ровно то, чего избегает
+    сам перенос.
+    """
+    client, dead_db, live_db, edge = _scene(db)
+    rehome_db_edges(db, apply=True)
+    db.delete(dead_db)
+    db.commit()
+
+    stats = undo_rehome(db, apply=True)
+    assert stats["target_gone"] == 1
+    assert stats["restored"] == 0
+    db.refresh(edge)
+    assert edge.dst_id == live_db.id
+
+
+def test_undo_skips_when_old_address_is_occupied(db):
+    """На прежнем адресе уже есть ребро — возврат нарушил бы UNIQUE."""
+    client, dead_db, live_db, edge = _scene(db)
+    rehome_db_edges(db, apply=True)
+    _edge(db, client, dead_db)     # кто-то создал ребро на старый узел
+    db.commit()
+
+    stats = undo_rehome(db, apply=True)
+    assert stats["conflict"] == 1
+    assert stats["restored"] == 0
+
+
+def test_undo_is_a_noop_without_a_journal(db):
+    """Рёбра, которых перенос не касался, откат не трогает."""
+    _scene(db)
+    stats = undo_rehome(db, apply=True)
+    assert stats["marked_edges"] == 0
+    assert stats["restored"] == 0

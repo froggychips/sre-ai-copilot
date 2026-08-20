@@ -31,6 +31,11 @@ namespace'а, которого в кластере нет с 15.08. Граф у�
     — не ложь о работающей системе.
 
 Безопасность:
+  * перенос обратим. В `extras` ребра записывается прежний адрес —
+    `rehomed_from` (namespace исходного db-узла) и `rehomed_at`. Без этого
+    операция необратима: `dst_id` перезаписывается, и восстановить, куда
+    ребро смотрело, потом нечем. Ключи с префиксом `rehomed_` и есть
+    журнал отката, `scripts/rehome_db_edges.py --undo` читает именно их.
   * dry-run по умолчанию (`apply=False`) — считает и показывает план;
   * SAVEPOINT на батч: сбой одного не откатывает уже перенесённое;
   * коммит на батч, а не на весь проход — иначе транзакция держит блокировки
@@ -44,13 +49,15 @@ import logging
 from typing import Any, Dict, List, Optional, Tuple, cast
 
 from sqlalchemy.orm import Session, aliased
+from sqlalchemy.orm.attributes import flag_modified
 
+from app.core.timeutil import utcnow
 from app.knowledge_graph.contract import shared_namespace_of
 from app.knowledge_graph.schema import Namespace, Service, ServiceEdge
 
 log = logging.getLogger(__name__)
 
-__all__ = ["rehome_db_edges", "DB_EDGE_KINDS"]
+__all__ = ["rehome_db_edges", "undo_rehome", "DB_EDGE_KINDS"]
 
 #: Виды рёбер, которые ведут НА базу. Замер 20.08.2026: из живых namespace в
 #: db-узлы мёртвых шли только `uses_db` (3676 штук) и только в этом
@@ -60,6 +67,11 @@ DB_EDGE_KINDS = ("uses_db",)
 
 #: Рёбер на коммит. Того же порядка, что `_COMMIT_BATCH` в endpoints-синке.
 _BATCH = 200
+
+
+def _stamp() -> str:
+    """Метка времени переноса. Один формат с остальными metadata графа."""
+    return utcnow().isoformat()
 
 
 def _target_node(
@@ -224,6 +236,94 @@ def _rehome_batch(
             db.delete(edge)
             stats["merged"] += 1
         else:
+            extras = dict(cast(Optional[Dict[str, Any]], edge.extras) or {})
+            # Прежний адрес — чтобы перенос можно было отменить. Пишем
+            # namespace, а не id: id узла может исчезнуть вместе с узлом, а
+            # (name, namespace) остаётся читаемым и без него.
+            extras["rehomed_from"] = dst.namespace
+            extras["rehomed_at"] = _stamp()
+            edge.extras = extras  # type: ignore[assignment]
+            flag_modified(edge, "extras")
             edge.dst_id = target.id  # type: ignore[assignment]
             stats["repointed"] += 1
         db.flush()   # чтобы следующий lookup existing видел изменение
+
+
+def undo_rehome(db: Session, apply: bool = False) -> Dict[str, Any]:
+    """Вернуть перенесённые рёбра на прежние узлы по журналу в `extras`.
+
+    Читает `rehomed_from` — namespace, где db-узел лежал до переноса, — и
+    ищет узел с тем же именем там. Узел мог быть удалён за это время
+    (retention снёс мёртвое окружение): такое ребро оставляем на месте и
+    считаем в `target_gone`. Возвращать его некуда, и выдумывать узел ради
+    отката — то же самое, чего избегает сам перенос.
+
+    Слитые рёбра (`merged`) откату не подлежат: устаревший дубль удалён, а
+    в существующее правильное ребро перенос не писал ничего, кроме веса.
+    Их и не должно быть много — на проде 20.08.2026 слияний ожидалось ноль,
+    потому что going-forward синк создал только 36 правильных рёбер.
+    """
+    rows: List[ServiceEdge] = (
+        db.query(ServiceEdge)
+        .filter(ServiceEdge.kind.in_(DB_EDGE_KINDS))
+        .order_by(ServiceEdge.id)
+        .all()
+    )
+    marked = [
+        e for e in rows
+        if isinstance(e.extras, dict) and e.extras.get("rehomed_from")
+    ]
+    stats: Dict[str, Any] = {
+        "marked_edges": len(marked),
+        "restored": 0,
+        "target_gone": 0,
+        "conflict": 0,
+        "applied": False,
+    }
+    if not marked or not apply:
+        log.info("db_edge_rehome.undo_dry_run marked=%d", len(marked))
+        return stats
+
+    for edge in marked:
+        extras = dict(cast(Dict[str, Any], edge.extras))
+        origin_ns = extras.get("rehomed_from")
+        current = db.get(Service, edge.dst_id)
+        if current is None:
+            continue
+        origin = (
+            db.query(Service)
+            .filter(Service.name == current.name,
+                    Service.namespace == origin_ns,
+                    Service.node_kind == current.node_kind)
+            .first()
+        )
+        if origin is None:
+            stats["target_gone"] += 1
+            continue
+        clash = (
+            db.query(ServiceEdge)
+            .filter(ServiceEdge.src_id == edge.src_id,
+                    ServiceEdge.dst_id == origin.id,
+                    ServiceEdge.kind == edge.kind)
+            .first()
+        )
+        if clash is not None and clash.id != edge.id:
+            # На прежнем адресе уже есть ребро — вернуть значило бы нарушить
+            # UNIQUE(src,dst,kind). Оставляем как есть.
+            stats["conflict"] += 1
+            continue
+        extras.pop("rehomed_from", None)
+        extras.pop("rehomed_at", None)
+        edge.extras = extras  # type: ignore[assignment]
+        flag_modified(edge, "extras")
+        edge.dst_id = origin.id  # type: ignore[assignment]
+        stats["restored"] += 1
+        db.flush()
+
+    db.commit()
+    stats["applied"] = True
+    log.info(
+        "db_edge_rehome.undone restored=%d target_gone=%d conflict=%d",
+        stats["restored"], stats["target_gone"], stats["conflict"],
+    )
+    return stats
