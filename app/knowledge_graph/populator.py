@@ -16,6 +16,7 @@ from datetime import datetime
 from typing import Any, Dict, Optional
 
 import structlog
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.knowledge_graph.contract import (UQ_KG_SERVICE_NS_NAME_KIND,
@@ -30,6 +31,31 @@ logger = structlog.get_logger()
 def _is_postgresql(db: Session) -> bool:
     return db.get_bind().dialect.name == "postgresql"
 
+
+
+def insert_idempotent(db: Session, row: Any) -> bool:
+    """INSERT, защищённый UNIQUE-констрейнтом. True — строка вставилась.
+
+    Собран из четырёх идентичных копий (`metrics_sync`, `anomaly_detection`,
+    `ingress_observations_sync`, `signal_aggregates`): каждая вставляла свою
+    таблицу, но обработка была одна и та же, буква в букву.
+
+    Почему SAVEPOINT, а не просто try/except. `IntegrityError` переводит
+    Session в aborted-состояние: без вложенной транзакции все последующие
+    операции в этой сессии падают с `PendingRollbackError`, и один дубль
+    ронял бы весь проход синка. `begin_nested()` откатывает только вставку.
+
+    Дубль здесь — нормальный ход событий, а не ошибка: синки идемпотентны и
+    перезапускаются, повторная вставка той же точки просто отбрасывается.
+    Поэтому False возвращается молча, без лога: писать в лог на каждый
+    повтор значит утопить в них настоящие сбои.
+    """
+    try:
+        with db.begin_nested():
+            db.add(row)
+        return True
+    except IntegrityError:
+        return False
 
 def upsert_service(
     db: Session,
