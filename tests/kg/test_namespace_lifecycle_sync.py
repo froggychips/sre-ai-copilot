@@ -194,7 +194,7 @@ def test_empty_cluster_response_is_treated_as_failure(monkeypatch):
         stdout = '{"items": []}'
         stderr = ""
 
-    monkeypatch.setattr(nl.subprocess, "run", lambda *a, **k: R())
+    monkeypatch.setattr(nl, "run_kubectl", lambda *a, **k: R())
     with pytest.raises(K8sNamespaceFetchError):
         nl._fetch_namespaces()
 
@@ -205,6 +205,6 @@ def test_nonzero_rc_is_a_failure(monkeypatch):
         stdout = ""
         stderr = "connection refused"
 
-    monkeypatch.setattr(nl.subprocess, "run", lambda *a, **k: R())
+    monkeypatch.setattr(nl, "run_kubectl", lambda *a, **k: R())
     with pytest.raises(K8sNamespaceFetchError):
         nl._fetch_namespaces()
