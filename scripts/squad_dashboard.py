@@ -628,7 +628,9 @@ def render(rows, gen_date, jira_statuses=None, today=None):
         task = f'<a href="{jira}{esc(r["task"])}">{esc(r["task"])}</a>' if r["task"] else ""
         owner = esc(human(r["owner"])) if r["owner"] else loz("нет лейбла")
         reserved = reserved_cell(r.get("reserved"))
-        age = esc(r["age"]) if r["age"] is not None else loz("нет в KG")
+        # age=None означает «нет namespace squad-N-shared», то есть слот пуст,
+        # а не «нет записи в KG» (так это читалось, пока возраст брался из kg_services)
+        age = esc(r["age"]) if r["age"] is not None else loz("нет стенда")
         alerts = loz(str(r["al"]), "Red") if r["al"] else (esc(r["al"]) if r["al"] is not None else "")
         ev24 = (loz(str(r["ev24h"]), "Yellow") if (r["ev24h"] and r["ev24h"] > 20)
                 else (esc(r["ev24h"]) if r["ev24h"] is not None else ""))
