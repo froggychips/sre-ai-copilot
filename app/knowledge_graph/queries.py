@@ -7,6 +7,7 @@ hypothesis/critic-агенты могли сериализовать в JSON-п�
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+from app.core.timeutil import ensure_aware, ensure_naive
 from typing import Any, Dict, List, Optional
 
 from sqlalchemy import and_, func, or_
@@ -20,23 +21,8 @@ from app.knowledge_graph.schema import (NODE_KIND_SERVICE, NODE_KIND_WORKLOAD,
                                         PodEvent, Service, ServiceEdge)
 
 
-def _ensure_aware(dt: datetime) -> datetime:
-    return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
 
 
-def _ensure_naive(dt: datetime) -> datetime:
-    """Naive **UTC** — в таком виде лежат все timestamp-колонки KG.
-
-    Голый ``.replace(tzinfo=None)`` был корректен только для UTC-aware
-    входа: AlertManager-webhook отдаёт `startsAt` с реальным offset'ом
-    (`+03:00` у наших рантаймов), и обрезание tzinfo превращало 12:00+03:00
-    в naive 12:00, то есть сдвигало ВСЁ окно на 3 часа — deploy-атрибуция и
-    pod trail молча смотрели не туда. Зеркалит
-    ``stale_classifier._ensure_naive``.
-    """
-    if dt.tzinfo is not None:
-        return dt.astimezone(timezone.utc).replace(tzinfo=None)
-    return dt
 
 
 # ── ns-level deploy attribution: как не считать один билд K×2 раза ──────────
@@ -132,14 +118,14 @@ def recent_deploys_for(
     svc = _service_by_namespace_name(db, namespace, service_name)
     if svc is None:
         return []
-    before_aware = _ensure_aware(before)
+    before_aware = ensure_aware(before)
     since = before_aware - timedelta(minutes=lookback_minutes)
     rows = (
         db.query(Deployment)
         .filter(
             Deployment.service_id == svc.id,
-            Deployment.started_at >= _ensure_naive(since),
-            Deployment.started_at <= _ensure_naive(before_aware),
+            Deployment.started_at >= ensure_naive(since),
+            Deployment.started_at <= ensure_naive(before_aware),
         )
         .order_by(Deployment.started_at.desc())
         .all()
@@ -188,7 +174,7 @@ def recent_deploys_for_namespaces(
     """
     if not namespaces:
         return []
-    before_aware = _ensure_aware(before)
+    before_aware = ensure_aware(before)
     since = before_aware - timedelta(minutes=lookback_minutes)
     rows = (
         db.query(Deployment, Service)
@@ -196,8 +182,8 @@ def recent_deploys_for_namespaces(
         .filter(
             Service.namespace.in_(namespaces),
             Service.node_kind == NODE_KIND_SERVICE,
-            Deployment.started_at >= _ensure_naive(since),
-            Deployment.started_at <= _ensure_naive(before_aware),
+            Deployment.started_at >= ensure_naive(since),
+            Deployment.started_at <= ensure_naive(before_aware),
         )
         .order_by(Deployment.started_at.desc())
         .limit(_NS_DEPLOY_SCAN_CAP)
@@ -256,10 +242,10 @@ def deploy_stream_freshness(
     Порог 6h умышленно щедрый: ночью деплоев штатно нет, ложный «stale» хуже
     молчания.
     """
-    before_aware = _ensure_aware(before or datetime.now(timezone.utc))
+    before_aware = ensure_aware(before or datetime.now(timezone.utc))
     last_at = (
         db.query(func.max(Deployment.started_at))
-        .filter(Deployment.started_at <= _ensure_naive(before_aware))
+        .filter(Deployment.started_at <= ensure_naive(before_aware))
         .scalar()
     )
     if last_at is None:
@@ -311,7 +297,7 @@ def cluster_deploy_activity(
     prefixes = [p for p in (sibling_prefixes or []) if p]
     if not prefixes:
         return {}
-    before_aware = _ensure_aware(before)
+    before_aware = ensure_aware(before)
     since = before_aware - timedelta(minutes=lookback_minutes)
     rows = (
         db.query(Deployment, Service)
@@ -320,8 +306,8 @@ def cluster_deploy_activity(
             or_(*[Service.namespace.like(f"{p}%") for p in prefixes]),
             Service.namespace != exclude_namespace,
             Service.node_kind == NODE_KIND_SERVICE,
-            Deployment.started_at >= _ensure_naive(since),
-            Deployment.started_at <= _ensure_naive(before_aware),
+            Deployment.started_at >= ensure_naive(since),
+            Deployment.started_at <= ensure_naive(before_aware),
         )
         .order_by(Deployment.started_at.desc())
         .all()
@@ -440,8 +426,8 @@ def incidents_on(
         db.query(AlertEvent)
         .filter(
             AlertEvent.service_id == svc.id,
-            AlertEvent.fired_at >= _ensure_naive(since),
-            AlertEvent.fired_at <= _ensure_naive(until),
+            AlertEvent.fired_at >= ensure_naive(since),
+            AlertEvent.fired_at <= ensure_naive(until),
         )
         .order_by(AlertEvent.fired_at.desc())
         .all()
@@ -472,7 +458,7 @@ def nearby_alerts(
         for u in upstream:
             alerts += incidents_on(u, around - W, around + W)
     """
-    around_aware = _ensure_aware(around)
+    around_aware = ensure_aware(around)
     since = around_aware - timedelta(minutes=window_minutes)
     until = around_aware + timedelta(minutes=window_minutes)
 
@@ -481,7 +467,7 @@ def nearby_alerts(
     for u in upstream:
         alerts = incidents_on(db, u["namespace"], u["service"], since, until)
         for a in alerts:
-            fired_aware = _ensure_aware(a["fired_at"])
+            fired_aware = ensure_aware(a["fired_at"])
             delta_min = int((around_aware - fired_aware).total_seconds() // 60)
             out.append({
                 "service": u["service"],
@@ -749,8 +735,8 @@ def _pod_event_last_activity():
 def _pod_event_in_window(since: datetime, until: datetime):
     """Предикат пересечения события с окном [since, until] (naive UTC)."""
     return and_(
-        PodEvent.first_seen <= _ensure_naive(until),
-        _pod_event_last_activity() >= _ensure_naive(since),
+        PodEvent.first_seen <= ensure_naive(until),
+        _pod_event_last_activity() >= ensure_naive(since),
     )
 
 
@@ -777,7 +763,7 @@ def pod_event_summary_for(
     svc = _service_by_namespace_name(db, namespace, service_name)
     if svc is None:
         return {"total": 0, "by_reason": []}
-    around_aware = _ensure_aware(around)
+    around_aware = ensure_aware(around)
     since = around_aware - timedelta(minutes=window_minutes)
     until = around_aware + timedelta(minutes=window_minutes)
 
@@ -835,7 +821,7 @@ def latest_pod_event_for(
     if row is None:
         return None
     now = datetime.now(timezone.utc)
-    first_aware = _ensure_aware(row.first_seen)
+    first_aware = ensure_aware(row.first_seen)
     minutes_ago = int((now - first_aware).total_seconds() // 60)
     return {
         "pod_name": row.pod_name,
@@ -914,7 +900,7 @@ def recent_pod_events_for(
     svc = _service_by_namespace_name(db, namespace, service_name)
     if svc is None:
         return []
-    around_aware = _ensure_aware(around)
+    around_aware = ensure_aware(around)
     since = around_aware - timedelta(minutes=window_minutes)
     until = around_aware + timedelta(minutes=window_minutes)
 
@@ -930,8 +916,8 @@ def recent_pod_events_for(
     )
     out: List[Dict[str, Any]] = []
     for r in rows:
-        first_aware = _ensure_aware(r.first_seen)
-        last_aware = _ensure_aware(r.last_seen or r.first_seen)
+        first_aware = ensure_aware(r.first_seen)
+        last_aware = ensure_aware(r.last_seen or r.first_seen)
         delta_min = int((around_aware - first_aware).total_seconds() // 60)
         out.append({
             "reason": r.reason,
@@ -1013,7 +999,7 @@ def log_error_rate_for(
         return None
 
     use_levels = list(levels) if levels else list(_LOG_ERROR_LEVELS)
-    ref = _ensure_naive(now or datetime.utcnow())
+    ref = ensure_naive(now or datetime.utcnow())
     since = ref - timedelta(minutes=window_minutes)
 
     total, buckets = (
@@ -1085,7 +1071,7 @@ def ingress_health_for(
     if svc is None:
         return {}
 
-    now = _ensure_naive(now) if now is not None else datetime.utcnow()
+    now = ensure_naive(now) if now is not None else datetime.utcnow()
     cutoff = now - timedelta(minutes=window_minutes)
     rows = (
         db.query(IngressObservation)
