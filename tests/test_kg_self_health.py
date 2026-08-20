@@ -93,16 +93,19 @@ def test_materialization_zero_rate_wave5_reproducer_mem_all_zero(db):
     assert result.status == "fail"
     per_metric = result.detail["per_metric"]
     assert per_metric["mem_pct"]["status"] == "fail"
-    assert per_metric["mem_pct"]["zero_or_null_pct"] == 100.0
+    assert per_metric["mem_pct"]["missing_pct"] == 100.0
     # cpu_pct норм — 0 нулей
     assert per_metric["cpu_pct"].get("status") == "ok"
 
 
 def test_materialization_zero_rate_known_zero_metric_is_ok(db):
-    """http_5xx_rate/p95_latency_ms в allowlist — 100% нулей всё равно ok.
+    """http_5xx_rate/p95_latency_ms в allowlist — 100% пропусков всё равно ok.
 
-    Остальные метрики ставим в нормальные значения, чтобы изолировать
-    эффект allowlist'а.
+    Значения именно NULL, а не 0. Это то, что происходит на проде: обе
+    колонки не заполняются вовсе (362 677 NULL из 362 677 строк за сутки),
+    потому что WO scrape config не отдаёт nginx_ingress-метрики. С нулями
+    тест ничего бы не проверял: для счётчика событий ноль — законное
+    значение, и он прошёл бы как ok даже без allowlist'а.
     """
     svc = _mk_service(db)
     now = datetime.utcnow()
@@ -113,8 +116,8 @@ def test_materialization_zero_rate_known_zero_metric_is_ok(db):
             cpu_pct=15.0,
             mem_pct=30.0,
             restarts_rate=0.5,
-            http_5xx_rate=0.0,   # allowlisted, не алёртим
-            p95_latency_ms=0.0,  # allowlisted
+            http_5xx_rate=None,   # allowlisted: не собирается вовсе
+            p95_latency_ms=None,  # allowlisted
         )
 
     result = check_materialization_zero_rate(db)
@@ -123,7 +126,7 @@ def test_materialization_zero_rate_known_zero_metric_is_ok(db):
     assert pm["http_5xx_rate"]["allowlisted"] is True
     assert pm["p95_latency_ms"]["allowlisted"] is True
     # cpu_pct — не в allowlist, но нулей мало
-    assert pm["cpu_pct"]["zero_or_null_pct"] == 0.0
+    assert pm["cpu_pct"]["missing_pct"] == 0.0
 
 
 def test_materialization_zero_rate_warn_threshold(db):
@@ -148,6 +151,66 @@ def test_materialization_zero_rate_warn_threshold(db):
     result = check_materialization_zero_rate(db)
     assert result.status == "warn"
     assert result.detail["per_metric"]["cpu_pct"]["status"] == "warn"
+
+
+def test_event_rate_metric_full_of_zeros_is_not_a_failure(db):
+    """99% нулей в restarts_rate — это здоровый кластер, а не поломка.
+
+    Регрессия на ложное срабатывание, которое держало самопроверку в fail
+    постоянно. Замер на проде за сутки 20.08.2026: у `restarts_rate` было
+    358 995 нулей, 3 668 положительных значений и 14 NULL. Метрика писалась
+    исправно и ловила настоящие рестарты, но правило «>90% нулей = fail»
+    объявляло её несуществующей — потому что ноль в счётчике событий
+    означает «событий не было», а не «значение потеряно».
+
+    `restarts_rate` НЕ в allowlist'е: он и не должен там быть, метрика
+    рабочая и по ней надо алёртить, если она реально пропадёт.
+    """
+    svc = _mk_service(db)
+    now = datetime.utcnow()
+    for i in range(100):
+        _mk_health_row(
+            db, svc,
+            ts=now - timedelta(minutes=10 * i),
+            cpu_pct=15.0,
+            mem_pct=30.0,
+            # 99 нулей и одно положительное — пропорция как на проде
+            restarts_rate=0.5 if i == 0 else 0.0,
+        )
+
+    result = check_materialization_zero_rate(db)
+    assert result.status == "ok", (
+        "нули в счётчике событий снова читаются как поломка материализации"
+    )
+    pm = result.detail["per_metric"]["restarts_rate"]
+    assert pm["criterion"] == "null_only"
+    assert pm["missing_pct"] == 0.0
+    assert pm["allowlisted"] is False
+
+
+def test_event_rate_metric_stops_being_written_is_a_failure(db):
+    """А вот если счётчик перестали писать — это fail, и он должен звучать.
+
+    Обратная сторона предыдущего теста: смягчив критерий для счётчиков, мы
+    обязаны сохранить способность увидеть настоящий отказ сбора. Отличие
+    ровно одно — NULL вместо нуля.
+    """
+    svc = _mk_service(db)
+    now = datetime.utcnow()
+    for i in range(100):
+        _mk_health_row(
+            db, svc,
+            ts=now - timedelta(minutes=10 * i),
+            cpu_pct=15.0,
+            mem_pct=30.0,
+            restarts_rate=None,   # значение не записано вовсе
+        )
+
+    result = check_materialization_zero_rate(db)
+    assert result.status == "fail"
+    pm = result.detail["per_metric"]["restarts_rate"]
+    assert pm["status"] == "fail"
+    assert pm["missing_pct"] == 100.0
 
 
 def test_materialization_zero_rate_no_data_returns_ok(db):
