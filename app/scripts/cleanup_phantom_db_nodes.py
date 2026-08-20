@@ -1,42 +1,33 @@
-"""Разовый backfill: схлопывание фантомных db-узлов (C2). См. модуль
-`app.knowledge_graph.phantom_db_cleanup`.
+"""ОТКЛЮЧЕНО. Схлопывало db-узлы в лексикографически минимальный namespace.
 
-#185 остановил рост фантомов going-forward; это — чистка уже накопленного.
-Dry-run по умолчанию; реальная запись только с --apply.
+Правило было неверным: физически таких баз столько, сколько окружений — у
+каждого сквада своя, — и схлопывание сводило разные базы в одну. Минимумом
+среди `preprod-*`, `prod-*`, `squad-*` оказывался `preprod-kingdom1`, так что
+после прогона граф утверждал, будто прод ходит в базу препрода.
 
-CLI:
-    python -m app.scripts.cleanup_phantom_db_nodes          # dry-run (отчёт)
-    python -m app.scripts.cleanup_phantom_db_nodes --apply  # схлопнуть
+Скрипт оставлен заглушкой, а не удалён, потому что его звали с `--apply`:
+пусть тот, кто повторит команду, прочитает причину, а не `No module named`.
+
+Нужную операцию делает `python -m app.scripts.rehome_db_edges`.
 """
-import argparse
-import json
 import sys
 
-from app.database import SessionLocal
-from app.knowledge_graph.phantom_db_cleanup import collapse_phantom_db_nodes
+MESSAGE = """\
+cleanup_phantom_db_nodes отключён.
+
+Он схлопывал `db:%`-узлы в узел с лексикографически минимальным namespace.
+Замер 20.08.2026: `db:postgres:message` живёт в 56 namespace, и каждый узел
+обслуживает только своё окружение — это 56 РАЗНЫХ баз, а не 56 копий одной.
+Прошлый прогон породил 3676 рёбер вида «prod-сервис → база удалённого
+preprod-kingdom1».
+
+Разгребает это:  python -m app.scripts.rehome_db_edges [--apply]
+"""
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--apply", action="store_true",
-                        help="реально схлопнуть (без флага — dry-run)")
-    args = parser.parse_args()
-
-    db = SessionLocal()
-    try:
-        result = collapse_phantom_db_nodes(db, apply=args.apply)
-    finally:
-        db.close()
-
-    print(json.dumps(result, indent=2, ensure_ascii=False, default=str))
-    if not args.apply and result.get("nodes_to_delete"):
-        print(
-            f"\nℹ️  dry-run: {result['total_db_nodes']} db-узлов → "
-            f"{result['distinct_db_names']} канонических "
-            f"(удалится {result['nodes_to_delete']}). Запусти с --apply.",
-            file=sys.stderr,
-        )
-    return 0
+    print(MESSAGE, file=sys.stderr)
+    return 2
 
 
 if __name__ == "__main__":
