@@ -171,7 +171,16 @@ def test_no_direct_kubectl_calls_in_syncs():
             continue
         src = path.read_text(encoding="utf-8")
         # subprocess.run(["kubectl", ...]) — прямой вызов в обход брейкера.
-        for m in re.finditer(r"subprocess\.run\(\s*\n?\s*\[\s*[\"']kubectl[\"']", src):
+        #
+        # `[^)\n]*` после скобки: первая версия regex'а требовала литерал
+        # сразу за `subprocess.run(`, и вызов в `k8s_service` с `# nosec`-
+        # комментарием на той же строке проходил мимо теста незамеченным.
+        # Ловим и argv-переменную: `full_cmd`, собранный из ActionSpec, к
+        # моменту вызова уже начинается с "kubectl".
+        for m in re.finditer(
+            r"subprocess\.run\([^)\n]*\n?\s*(\[\s*[\"']kubectl[\"']|full_cmd|argv)",
+            src,
+        ):
             line = src[:m.start()].count("\n") + 1
             offenders.append(f"{path.relative_to(root)}:{line}")
 

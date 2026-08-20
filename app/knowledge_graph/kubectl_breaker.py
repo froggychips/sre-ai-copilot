@@ -141,6 +141,7 @@ def run_kubectl(
     timeout: float = 30.0,
     operation: Optional[str] = None,
     check: bool = False,
+    respect_breaker: bool = True,
 ) -> "subprocess.CompletedProcess":
     """Единственный способ позвать kubectl: со брейкером и учётом результата.
 
@@ -157,9 +158,23 @@ def run_kubectl(
     `check=False` по умолчанию намеренно: синки в этом проекте разбирают
     stderr сами и деградируют, а не падают, — так guard'ы вроде
     `edge_decay_guard` получают шанс не принять пустой ответ за факт.
+
+    `respect_breaker=False` — для мутирующих вызовов (`k8s_service`), то
+    есть для ремедиации. Асимметрия намеренная и в одну сторону: такой
+    вызов результат в брейкер ЗАПИСЫВАЕТ, но открытым брейкером не
+    останавливается. Причина в том, кто копит отказы. Счётчик наполняют
+    read-синки, которых тридцать в расписании; если их обращения к
+    больному apiserver закроют заодно и путь лечения, оператор нажмёт
+    «применить фикс» и получит отказ из-за чужой статистики — ровно в тот
+    момент, когда фикс нужен. Читателей отсекать полезно, они всё равно
+    получат неполные данные; единственный путь починки — нет.
     """
-    op = operation or " ".join(args[1:3]) if len(args) > 2 else "kubectl"
-    guard_kubectl(op)
+    if len(args) > 2:
+        op = operation or " ".join(args[1:3])
+    else:
+        op = operation or "kubectl"
+    if respect_breaker:
+        guard_kubectl(op)
     try:
         out = subprocess.run(
             args, capture_output=True, text=True, check=check, timeout=timeout,
