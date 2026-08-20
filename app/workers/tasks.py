@@ -1216,16 +1216,16 @@ def kg_self_health_check_task():
     return asyncio.run(_kg_self_health_logic())
 
 
-# In-memory dedup state — переживает только worker-процесс. Worker max
-# tasks per child перезапускается часто, так что fingerprint живёт максимум
-# ~часы. Это сознательный trade-off (см. docstring task'а).
-_SELF_HEALTH_LAST_FIRE: dict[str, float] = {}
+# Окно подавления — в Redis, общее для всех форков (app.core.fire_dedup).
+# Раньше состояние жило в словаре модуля, и шестичасовое окно на практике
+# держалось десятки минут: четыре форка вели независимые копии, а recycle по
+# worker_max_memory_per_child обнулял их постоянно.
+_SELF_HEALTH_DEDUP_CHANNEL = "self_health"
 _SELF_HEALTH_DEDUP_SECONDS = 6 * 3600
 
 
 async def _kg_self_health_logic() -> dict:
-    import time
-
+    from app.core.fire_dedup import mark_fired, should_fire
     from app.knowledge_graph.self_health import (aggregate_status,
                                                  fingerprint,
                                                  run_self_health_checks)
@@ -1255,13 +1255,8 @@ async def _kg_self_health_logic() -> dict:
     failed = [r for r in results if r.status == "fail"]
     warned = [r for r in results if r.status == "warn"]
     fp = fingerprint(results)
-    now = time.time()
-    last = _SELF_HEALTH_LAST_FIRE.get(fp, 0.0)
-    if now - last < _SELF_HEALTH_DEDUP_SECONDS:
-        logger.info(
-            "kg_self_health.discord_deduped fp=%s age=%.0fs",
-            fp, now - last,
-        )
+    if not should_fire(_SELF_HEALTH_DEDUP_CHANNEL, fp):
+        logger.info("kg_self_health.discord_deduped fp=%s", fp)
         return {
             "status": "fail",
             "checks": len(results),
@@ -1276,7 +1271,10 @@ async def _kg_self_health_logic() -> dict:
             failed_checks=[r.as_dict() for r in failed],
             warn_checks=[r.as_dict() for r in warned],
         )
-        _SELF_HEALTH_LAST_FIRE[fp] = now
+        # Отмечаем ПОСЛЕ успешной отправки: упавший вебхук не должен
+        # закрывать окно на шесть часов — иначе сбой доставки читается как
+        # «уже сообщили».
+        mark_fired(_SELF_HEALTH_DEDUP_CHANNEL, fp, _SELF_HEALTH_DEDUP_SECONDS)
         sent = True
     except Exception as e:
         logger.warning("kg_self_health.discord_failed: %s", e)
@@ -1306,13 +1304,12 @@ def kg_stuck_alerts_check_task():
     return asyncio.run(_kg_stuck_alerts_logic())
 
 
-# In-memory dedup state — переживает только worker-процесс (как и self-health).
-_STUCK_ALERTS_LAST_FIRE: dict[str, float] = {}
+# Подавление — в Redis, как и у self-health: см. app.core.fire_dedup.
+_STUCK_ALERTS_DEDUP_CHANNEL = "stuck_alerts"
 
 
 async def _kg_stuck_alerts_logic() -> dict:
-    import time
-
+    from app.core.fire_dedup import mark_fired, should_fire
     from app.knowledge_graph.stuck_alerts import (find_stuck_alerts,
                                                    fingerprint, group_by_team)
     from app.services.audit_logger import audit_service
@@ -1352,14 +1349,9 @@ async def _kg_stuck_alerts_logic() -> dict:
         }
 
     fp = fingerprint(stuck)
-    now = time.time()
     dedup_seconds = settings.STUCK_ALERTS_DEDUP_WINDOW_HOURS * 3600
-    last = _STUCK_ALERTS_LAST_FIRE.get(fp, 0.0)
-    if now - last < dedup_seconds:
-        logger.info(
-            "kg_stuck_alerts.discord_deduped fp=%s age=%.0fs",
-            fp, now - last,
-        )
+    if not should_fire(_STUCK_ALERTS_DEDUP_CHANNEL, fp):
+        logger.info("kg_stuck_alerts.discord_deduped fp=%s", fp)
         return {
             "status": "found",
             "stuck_count": len(stuck),
@@ -1375,7 +1367,7 @@ async def _kg_stuck_alerts_logic() -> dict:
             total_count=len(stuck),
             min_duration_hours=min_hours,
         )
-        _STUCK_ALERTS_LAST_FIRE[fp] = now
+        mark_fired(_STUCK_ALERTS_DEDUP_CHANNEL, fp, dedup_seconds)
         sent = True
     except Exception as e:
         logger.warning("kg_stuck_alerts.discord_failed: %s", e)
