@@ -6,8 +6,9 @@ on-call SRE проверяет первым. Делаем его structured fact
 """
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, List, Optional
+from datetime import timedelta
+from app.core.timeutil import parse_ts
+from typing import Any, Dict, List
 
 from app.diagnostics.facts import Fact, FactKind
 from app.diagnostics.rules.base import Rule
@@ -15,28 +16,12 @@ from app.diagnostics.rules.base import Rule
 _LOOKBACK_MINUTES = 60
 
 
-def _parse_ts(raw: Any) -> Optional[datetime]:
-    """Принимает datetime / ISO-строку / None. Возвращает aware-datetime в UTC."""
-    if raw is None:
-        return None
-    if isinstance(raw, datetime):
-        return raw if raw.tzinfo else raw.replace(tzinfo=timezone.utc)
-    if isinstance(raw, str):
-        # Поддержка "Z" в конце (стандарт alertmanager).
-        s = raw.replace("Z", "+00:00")
-        try:
-            dt = datetime.fromisoformat(s)
-            return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
-        except ValueError:
-            return None
-    return None
-
 
 class RecentDeployRule(Rule):
     name = "RecentDeployRule"
 
     def evaluate(self, ctx: Dict[str, Any]) -> List[Fact]:
-        incident_at = _parse_ts(ctx.get("incident_starts_at"))
+        incident_at = parse_ts(ctx.get("incident_starts_at"))
         deploys = ctx.get("recent_deployments") or []
 
         if not deploys or incident_at is None:
@@ -54,7 +39,7 @@ class RecentDeployRule(Rule):
         window = timedelta(minutes=_LOOKBACK_MINUTES)
         nearby: List[Dict[str, Any]] = []
         for d in deploys:
-            d_ts = _parse_ts(d.get("ts") or d.get("finished_at") or d.get("at"))
+            d_ts = parse_ts(d.get("ts") or d.get("finished_at") or d.get("at"))
             if d_ts is None:
                 continue
             delta = incident_at - d_ts
