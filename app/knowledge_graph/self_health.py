@@ -79,6 +79,35 @@ _SERVICE_HEALTH_METRICS = (
     "p95_latency_ms",
 )
 
+# Что для колонки значит ноль. Замер на проде 20.08.2026 за 24 часа:
+#
+#     метрика          NULL     нулей   положительных
+#     restarts_rate      14    358 995           3 668
+#     cpu_pct         1 377        135         361 165
+#     http_5xx_rate 362 677          —               —
+#     p95_latency_ms 362 677         —               —
+#
+# `restarts_rate` — счётчик событий, и 99% нулей у него означают, что поды
+# не перезапускались. Правило «>90% нулей = fail» объявляло это поломкой
+# материализации, хотя метрика писалась исправно и 3668 раз поймала
+# настоящие рестарты: проверка постоянно висела в fail на здоровых данных.
+# Настоящая поломка счётчика выглядит иначе — как NULL, то есть «значение
+# не записали вовсе», и NULL'ов там ровно 14 из 362 677.
+#
+# Для gauge (cpu/mem) ноль по-прежнему подозрителен: сервис, потребляющий
+# ровно ноль процессора, — это скорее сбой сбора, чем факт. Поэтому колонки
+# разделены по смыслу, а не проверяются одним правилом.
+#
+# 5xx и p95 не пишутся вообще (NULL во всех строках) — они в allowlist
+# `KG_SELF_HEALTH_KNOWN_ZERO_METRICS`, пока WO scrape config не подключит
+# nginx_ingress-метрики. С разделением по классу allowlist для них
+# продолжает работать: NULL-доля 100% дала бы fail без него.
+_EVENT_RATE_METRICS = frozenset({
+    "restarts_rate",
+    "http_5xx_rate",
+    "p95_latency_ms",
+})
+
 # Beat task → (timestamp column factory, expected interval minutes).
 # Каждая enrty задаёт «когда последняя запись и какой нормальный период».
 # Используется sync_lag check.
@@ -224,15 +253,20 @@ def check_materialization_zero_rate(db: Session) -> CheckResult:
 
     for metric in _SERVICE_HEALTH_METRICS:
         col = getattr(ServiceHealth, metric)
-        zero_or_null = (
+        # Для счётчика событий «пропало» значит NULL: ноль там — законный
+        # ответ «ничего не произошло». Для gauge ноль тоже подозрителен.
+        is_event_rate = metric in _EVENT_RATE_METRICS
+        criterion = col.is_(None) if is_event_rate else or_(col.is_(None), col == 0)
+        missing = (
             db.query(func.count(ServiceHealth.id))
             .filter(ServiceHealth.ts >= since)
-            .filter(or_(col.is_(None), col == 0))
+            .filter(criterion)
             .scalar()
         ) or 0
-        rate = zero_or_null / total_rows if total_rows else 0.0
+        rate = missing / total_rows if total_rows else 0.0
         per_metric[metric] = {
-            "zero_or_null_pct": round(rate * 100, 1),
+            "missing_pct": round(rate * 100, 1),
+            "criterion": "null_only" if is_event_rate else "null_or_zero",
             "rows": total_rows,
             "allowlisted": metric in known_zero,
         }
