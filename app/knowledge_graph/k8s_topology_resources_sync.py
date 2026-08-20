@@ -46,6 +46,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from sqlalchemy.orm import Session
 
+from app.knowledge_graph.kubectl_breaker import run_kubectl
 from app.knowledge_graph.edge_decay_guard import (
     SOURCE_TOPOLOGY_INGRESSES, SOURCE_TOPOLOGY_SERVICES, record_source_run)
 from app.knowledge_graph.populator import upsert_edge, upsert_service
@@ -99,12 +100,11 @@ DISCOVERED_BY_INGRESS = "k8s_topology_resources/ingress"
 def _kubectl_namespaces() -> List[str]:
     """Список namespace'ов кластера (или [] при ошибке)."""
     try:
-        out = subprocess.run(
-            ["kubectl", "get", "namespaces", "-o",
+        out = run_kubectl(
+["kubectl", "get", "namespaces", "-o",
              "jsonpath={range .items[*]}{.metadata.name}{'\\n'}{end}"],
-            capture_output=True, text=True, check=False,
-            timeout=_KUBECTL_TIMEOUT_NS_S,
-        )
+timeout=_KUBECTL_TIMEOUT_NS_S,
+)
     except Exception as e:
         logger.warning("k8s_topology_resources.ns_list_failed err=%s", e)
         return []
@@ -132,12 +132,11 @@ def _kubectl_get_per_namespace(resource: str) -> List[Dict[str, Any]]:
     failed = 0
     for ns in namespaces:
         try:
-            out = subprocess.run(
-                ["kubectl", "get", resource, "-n", ns, "-o", "json",
+            out = run_kubectl(
+["kubectl", "get", resource, "-n", ns, "-o", "json",
                  f"--chunk-size={_KUBECTL_CHUNK}"],
-                capture_output=True, text=True, check=False,
-                timeout=_KUBECTL_TIMEOUT_NS_S,
-            )
+timeout=_KUBECTL_TIMEOUT_NS_S,
+)
             if out.returncode != 0:
                 failed += 1
                 continue
@@ -163,12 +162,11 @@ def _kubectl_get_all(resource: str) -> List[Dict[str, Any]]:
     apiserver'а обнулял весь тик (см. комментарий к _KUBECTL_TIMEOUT_S).
     """
     try:
-        out = subprocess.run(
-            ["kubectl", "get", resource, "-A", "-o", "json",
+        out = run_kubectl(
+["kubectl", "get", resource, "-A", "-o", "json",
              f"--chunk-size={_KUBECTL_CHUNK}"],
-            capture_output=True, text=True, check=False,
-            timeout=_KUBECTL_TIMEOUT_S,
-        )
+timeout=_KUBECTL_TIMEOUT_S,
+)
     except subprocess.TimeoutExpired:
         logger.warning(
             "k8s_topology_resources.kubectl_timeout resource=%s → per-namespace fallback",

@@ -14,7 +14,6 @@ from __future__ import annotations
 
 import logging
 import re
-import subprocess
 import json
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Set, Tuple, cast
@@ -23,6 +22,7 @@ from sqlalchemy import cast as sa_cast
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Session
 
+from app.knowledge_graph.kubectl_breaker import run_kubectl
 from app.knowledge_graph.contract import (
     OWNER_SOURCE_NAMESPACE_PREFIX, OWNER_SOURCE_PLATFORM_STATIC,
     shared_namespace_of,
@@ -278,10 +278,10 @@ def _kubectl_get_deployments(namespace: str) -> List[Dict[str, Any]]:
     Пустой список = namespace реально без deployments.
     """
     try:
-        result = subprocess.run(
-            ["kubectl", "get", "deployments", "-n", namespace, "-o", "json"],
-            capture_output=True, text=True, timeout=15,
-        )
+        result = run_kubectl(
+["kubectl", "get", "deployments", "-n", namespace, "-o", "json"],
+timeout=15,
+)
     except Exception as e:
         logger.warning("kg_sync.kubectl_failed ns=%s: %s", namespace, e)
         raise KubectlFetchError(
@@ -1030,10 +1030,10 @@ def _discover_namespaces() -> List[str]:
     System-namespaces (kube-*, monitoring, cert-manager и т.п.) исключаются.
     """
     try:
-        result = subprocess.run(
-            ["kubectl", "get", "namespaces", "-o", "jsonpath={.items[*].metadata.name}"],
-            capture_output=True, text=True, timeout=15,
-        )
+        result = run_kubectl(
+["kubectl", "get", "namespaces", "-o", "jsonpath={.items[*].metadata.name}"],
+timeout=15,
+)
         if result.returncode != 0:
             logger.warning("kg_sync.discover_failed: %s", result.stderr[:200])
             return []

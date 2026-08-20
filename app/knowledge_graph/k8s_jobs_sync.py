@@ -47,6 +47,7 @@ from typing import Any, Dict, List, Optional, Tuple, cast
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
+from app.knowledge_graph.kubectl_breaker import run_kubectl
 from app.knowledge_graph.schema import NODE_KIND_SERVICE, K8sJob, Service
 
 logger = logging.getLogger(__name__)
@@ -242,11 +243,10 @@ def _kubectl_get_all(resource: str) -> List[Dict[str, Any]]:
     эти sync-модули должны быть максимально независимы.
     """
     try:
-        out = subprocess.run(
-            ["kubectl", "get", resource, "-A", "-o", "json"],
-            capture_output=True, text=True, check=False,
-            timeout=_KUBECTL_TIMEOUT_S,
-        )
+        out = run_kubectl(
+["kubectl", "get", resource, "-A", "-o", "json"],
+timeout=_KUBECTL_TIMEOUT_S,
+)
     except subprocess.TimeoutExpired:
         logger.warning("k8s_jobs_sync.kubectl_timeout resource=%s", resource)
         return []
@@ -293,8 +293,8 @@ def _kubectl_get_pod_exit_code(namespace: str, job_name: str) -> Optional[int]:
     без 2-3 KB JSON-парсинга per-job. На 200+ jobs в cluster это economy.
     """
     try:
-        out = subprocess.run(
-            [
+        out = run_kubectl(
+[
                 "kubectl", "get", "pod",
                 "-n", namespace,
                 "-l", f"job-name={job_name}",
@@ -302,9 +302,8 @@ def _kubectl_get_pod_exit_code(namespace: str, job_name: str) -> Optional[int]:
                 "-o",
                 "jsonpath={.items[-1].status.containerStatuses[0].state.terminated.exitCode}",
             ],
-            capture_output=True, text=True, check=False,
-            timeout=_KUBECTL_TIMEOUT_S,
-        )
+timeout=_KUBECTL_TIMEOUT_S,
+)
     except Exception as e:
         logger.warning(
             "k8s_jobs_sync.pod_exit_code_failed ns=%s job=%s err=%s",

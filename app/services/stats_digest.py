@@ -49,7 +49,6 @@ from __future__ import annotations
 
 import json
 import re
-import subprocess
 import sys
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
@@ -60,6 +59,7 @@ import structlog
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
+from app.knowledge_graph.kubectl_breaker import run_kubectl
 from app.config import settings
 from app.context.vm_client import VMClient
 from app.services.digest.failures import (failed_sections as _failed_sections,
@@ -1538,9 +1538,9 @@ def kg_quality_section(db: Session) -> str:
 def _kubectl_get_deployments_json(namespace: str) -> List[Dict[str, Any]]:
     """Helper для stale-deployments. Изолирован чтобы мокать в тестах."""
     try:
-        out = subprocess.run(
+        out = run_kubectl(
             ["kubectl", "get", "deployments", "-n", namespace, "-o", "json"],
-            capture_output=True, text=True, timeout=15,
+            timeout=15,
         )
         if out.returncode != 0:
             return []
