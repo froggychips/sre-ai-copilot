@@ -119,6 +119,19 @@ def fetch_kg():
 
 
 # ---------- 2. ns labels (in-cluster k8s API; fallback local kubectl) ----------
+def _parse_k8s_ts(v):
+    """creationTimestamp / annotation → naive UTC datetime (как остальные даты здесь)."""
+    if not v:
+        return None
+    try:
+        dt = datetime.datetime.fromisoformat(str(v).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if dt.tzinfo is not None:
+        dt = dt.astimezone(datetime.timezone.utc).replace(tzinfo=None)
+    return dt
+
+
 def fetch_ns_labels():
     out = {}
     sa = "/var/run/secrets/kubernetes.io/serviceaccount"
@@ -146,7 +159,18 @@ def fetch_ns_labels():
             tm = re.search(r"WO-([0-9]+)", branch.upper())
             if tm:
                 task = f"WO-{tm.group(1)}"
-        out[m.group(1)] = {"owner": labels.get("deployed-by"), "branch": branch, "task": task}
+        annotations = it["metadata"].get("annotations", {}) or {}
+        out[m.group(1)] = {
+            "owner": labels.get("deployed-by"),
+            "branch": branch,
+            "task": task,
+            # возраст занятия = creationTimestamp самого ns, а НЕ min(created_at) сервисов в KG
+            "created": _parse_k8s_ts(it["metadata"].get("creationTimestamp")),
+            "claim": labels.get("squad-claim"),
+            "claimed_at": _parse_k8s_ts(annotations.get("squad-claimed-at")),
+            # for-ai-agent=do-not-delete / used-by=rnd-squad — стенд снимать нельзя
+            "guard": (labels.get("for-ai-agent") or labels.get("used-by") or None),
+        }
     return out
 
 
@@ -295,10 +319,13 @@ def build_rows():
     labels = fetch_ns_labels()
     one = fetch_oneservice()
     rows = []
+    now = datetime.datetime.utcnow()
     for n in SQUAD_NUMS:
         s = f"squad-{n}"
-        k = kg.get(s, {})
         lbl = labels.get(s, {})
+        # ns в кластере нет → записи в KG стухшие (kg_services не чистится при сносе
+        # сквада): NS/Svc/Health/краши от снесённого стенда выглядят как живые.
+        k = kg.get(s, {}) if lbl else {}
         ov = one.get(s, {})
         lb = ov.get("last_build")
         inst = fetch_install(s)
@@ -306,13 +333,20 @@ def build_rows():
         act = fetch_ch_activity(s)
         # Все сквады в пределах SQUAD_NUMS — реальные провизионированные слоты,
         # поэтому показываем и пустые: classify() даёт им «свободен» (доступная ёмкость).
+        ns_created = lbl.get("created")
+        if ns_created:
+            age = int(round((now - ns_created).total_seconds() / 86400.0))
+        else:
+            age = None
         rows.append(dict(
-            squad=s, age=k.get("age_days"), ns=k.get("ns"), svcs=k.get("svcs"),
+            squad=s, age=age, ns=k.get("ns"), svcs=k.get("svcs"),
             wh=(float(k["worst_health"]) if k.get("worst_health") is not None else None),
             ev24h=k.get("ev24h"), bo7=k.get("backoff7d"), ev7=k.get("evict7d"),
             un7=k.get("unhlth7d"), al=k.get("alerts"),
             owner=owner, task=lbl.get("task"), branch=lbl.get("branch"),
             reserved=RESERVED.get(s),
+            alive=bool(lbl), claim=lbl.get("claim"), claimed_at=lbl.get("claimed_at"),
+            guard=lbl.get("guard"),
             lb=lb, inst=inst, act=act))
     return rows
 
@@ -384,7 +418,7 @@ def activity_cell(act, today):
         return ""                       # нет CH / кред / ошибка — сигнал недоступен
     last = act.get("last")
     if not last:
-        return loz("тихо", "Green")     # CH есть, живых логинов нет
+        return loz("не входили", "Green")   # CH есть, логинов не было ни разу
     hours = (today - last).total_seconds() / 3600.0
     if hours < 0.5:
         ago = "только что"
@@ -393,6 +427,9 @@ def activity_cell(act, today):
     else:
         ago = f"{int(round(hours / 24.0))}д"
     n = act.get("users_7d") or 0
+    if not n:
+        # логины были, но не в 7-дневном окне — показываем давность, а не «тихо»
+        return f'{loz("тихо", "Yellow")} · {ago}'
     return f'{esc(n)} чел · {ago}'
 
 
@@ -447,7 +484,10 @@ def classify(r, jira_statuses, today):
     Сигналы: ветка/задача (заявка), свежесть деплоя (TC), статус Jira-тикета,
     старый+крашащийся стенд. Порядок приоритетов снизу вверх в коде.
     """
-    busy_label = is_busy(r["branch"], r["task"])
+    # squad-claim: ready — стенд занят кнопкой claim, даже если ветка базовая (preprod).
+    # Без этого «свободен» показывался на живом чужом стенде (перехват squad-32 в июле).
+    claimed = (r.get("claim") == "ready")
+    busy_label = is_busy(r["branch"], r["task"]) or claimed
     # живая игровая активность (ExtLogin без автоплея) — самый честный сигнал использования
     act = r.get("act")
     act_days = None
@@ -455,7 +495,13 @@ def classify(r, jira_statuses, today):
         act_days = (today - act["last"]).total_seconds() / 86400.0
     recent_act = act_days is not None and act_days <= ACTIVE_DAYS
     quiet_act = act_days is not None and act_days > STALE_DAYS   # CH есть, давно тихо
+    # CH отвечает, но логинов не было НИ РАЗУ, а стенд старше порога — тоже «не используется»
+    if act is not None and not act.get("last") and (r.get("age") or 0) > STALE_DAYS:
+        quiet_act = True
 
+    # защитные лейблы (for-ai-agent=do-not-delete / used-by=rnd-squad) — снимать нельзя
+    if r.get("guard"):
+        return ("защищён", "Blue", "#deebff")
     # свободен: никем не заявлен И не используется живыми логинами
     if not busy_label and not recent_act:
         return ("свободен", "Green", "#e3fcef")
@@ -513,9 +559,14 @@ def _parse_ch_ts(s):
 # боты-автоплея пишут в server-side CreateUserSessionFact, но НЕ в клиентский ExtLoginFact;
 # Autoplay=false отсекает автотест-клиентов → остаётся реальная живая активность тестеров
 CH_ACTIVITY_SQL = (
+    # ВАЖНО: окно только внутри агрегатов. Фильтр `Timestamp > now()-7d` в WHERE
+    # обрезал max(Timestamp) — «молчит 8 дней» и «не логинились ни разу» давали
+    # одинаковый last=None, из-за чего правило «протух при молчании >STALE_DAYS»
+    # было математически недостижимо.
     "SELECT uniqExactIf(DynUserId, Timestamp > now()-interval 24 hour) users_24h, "
-    "uniqExact(DynUserId) users_7d, max(Timestamp) last "
-    "FROM ExtLoginFact WHERE Autoplay=false AND Timestamp > now()-interval 7 day "
+    "uniqExactIf(DynUserId, Timestamp > now()-interval 7 day) users_7d, "
+    "max(Timestamp) last "
+    "FROM ExtLoginFact WHERE Autoplay=false "
     "FORMAT JSONCompact"
 )
 
@@ -609,10 +660,14 @@ def render(rows, gen_date, jira_statuses=None, today=None):
         f'<h2>Как читать — расшифровка колонок</h2><ul>'
         f'<li><strong>Статус</strong> — '
         f'{loz("свободен", "Green")} не заявлен (базовая ветка / нет лейбла) И нет живых логинов — можно занимать; '
-        f'{loz("занят", "Red")} заявлен (WO-задача / фиче-ветка) ИЛИ есть живая активность ≤{int(ACTIVE_DAYS)}д '
+        f'{loz("занят", "Red")} заявлен (WO-задача / фиче-ветка / лейбл <code>squad-claim: ready</code>) '
+        f'ИЛИ есть живая активность ≤{int(ACTIVE_DAYS)}д '
         f'(в т.ч. preprod-стенд, который реально тестируют); '
         f'{loz("протух", "Yellow")} заявлен, но без свежей активности И похож на брошенный: тикет закрыт (Done/Closed), '
-        f'либо известный деплой &gt;{STALE_DAYS}д назад, либо живых логинов нет &gt;{STALE_DAYS}д — кандидат на возврат. '
+        f'либо известный деплой &gt;{STALE_DAYS}д назад, либо живых логинов нет &gt;{STALE_DAYS}д (в т.ч. стенд '
+        f'старше {STALE_DAYS}д, куда не входили ни разу) — кандидат на возврат. '
+        f'{loz("защищён", "Blue")} на namespace стоит защитный лейбл '
+        f'(<code>for-ai-agent: do-not-delete</code> / <code>used-by: rnd-squad</code>) — не снимать. '
         f'(Нет данных о деплое/активности — «не знаю», оставляем «занят».) '
         f'Ячейка <strong>Squad</strong> подсвечена тем же цветом.</li>'
         f'<li><strong>Занявший</strong> — кто задеплоил: лейбл namespace <code>deployed-by</code> (TC-логин), '
@@ -626,24 +681,29 @@ def render(rows, gen_date, jira_statuses=None, today=None):
         f'<li><strong>Ветка</strong> — <code>deployed-branch</code> из лейбла namespace.</li>'
         f'<li><strong>Активность</strong> — живые игровые логины из ClickHouse сквада '
         f'(<code>ExtLoginFact</code>, боты-автоплея отфильтрованы): «<em>N чел · Xч/д</em>» = уникальных '
-        f'тестеров за 7д и давность последнего логина; «тихо» = CH есть, логинов нет; пусто = нет CH/данных. '
-        f'Самый честный сигнал реального использования стенда.</li>'
+        f'тестеров за 7д и давность последнего логина; «<em>тихо · Xд</em>» = логины были, но не в последние 7 дней; '
+        f'«<em>не входили</em>» = CH отвечает, логинов не было ни разу; пусто = CH недоступен (нет кред / упал / '
+        f'разошёлся пароль). Самый честный сигнал реального использования стенда.</li>'
         f'<li><strong>Последняя сборка (OneService)</strong> — последний '
         f'OneServiceBuildAndUpdate в окне; idle = сборок в окне не было.</li>'
         f'<li><strong>Установка / Rebuild</strong> — последний Install/Rebuild стенда '
         f'(TC-билд #, кто, дата).</li>'
-        f'<li><strong>Возраст, дн</strong> — дней с создания первого сервиса сквада '
-        f'(обрезано baseline KG, floor 2026-05-15).</li>'
-        f'<li><strong>NS</strong> — число namespace’ов сквада (shared + kingdom).</li>'
+        f'<li><strong>Возраст, дн</strong> — дней с <code>creationTimestamp</code> namespace '
+        f'<code>squad-N-shared</code>, то есть сколько сквад реально занят. Пусто = стенда в кластере нет.</li>'
+        f'<li><strong>NS</strong> — число namespace’ов сквада (shared + kingdom). Для слота без '
+        f'<code>squad-N-shared</code> колонки KG (NS/Svc/Health/Краши/Alerts) пустые: записи снесённого '
+        f'стенда остаются в <code>kg_services</code> и раньше показывались как живые.</li>'
         f'<li><strong>Svc</strong> — число сервисов сквада в Knowledge Graph.</li>'
         f'<li><strong>Health</strong> — worst health_score (дискретный; триаж лучше по «Краши 7д»).</li>'
         f'<li><strong>Краши 7д</strong> — pod_events за 7д: BackOff (CrashLoop) / Unhealthy (фейл проб) / Evicted. «чисто» = пусто.</li>'
         f'<li><strong>Ev 24ч</strong> — всего pod_events за последние 24 часа.</li>'
         f'<li><strong>Alerts</strong> — открытые (неразрешённые) алерты по сервисам сквада.</li></ul>'
         f'<ac:structured-macro ac:name="note"><ac:rich-text-body>'
-        f'<p><strong>Пробелы данных:</strong> squad без лейблов ns → занявший/задача пусты; возраст обрезан baseline KG '
-        f'(floor 2026-05-15); свежие/частичные стенды — мало сервисов; last build тянется из TeamCity (deploy→squad '
-        f'attribution в KG сломана: squad — runtime-параметр TC-билда).</p></ac:rich-text-body></ac:structured-macro>'
+        f'<p><strong>Пробелы данных:</strong> squad без лейблов ns → занявший/задача пусты (стенд ещё '
+        f'разворачивается или занят вне кнопки claim); свежие/частичные стенды — мало сервисов; '
+        f'Svc/Health/Краши берутся из KG и на только что переустановленном стенде могут относиться к его '
+        f'прошлой инкарнации; last build тянется из TeamCity (deploy→squad attribution в KG сломана: '
+        f'squad — runtime-параметр TC-билда).</p></ac:rich-text-body></ac:structured-macro>'
         f'<ac:structured-macro ac:name="tip"><ac:rich-text-body>'
         f'<p>Страница генерируется автоматически. Ручные правки будут перезаписаны следующим прогоном. См. WO-11335.</p>'
         f'</ac:rich-text-body></ac:structured-macro>'
