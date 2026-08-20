@@ -49,7 +49,7 @@ from sqlalchemy.orm import Session, aliased
 from app.config import settings
 from app.knowledge_graph.schema import (AlertEvent, AnomalyObservation,
                                         ClusterObservation, Deployment,
-                                        LogObservation,
+                                        LogObservation, Namespace,
                                         PodEvent, Service, ServiceEdge,
                                         ServiceHealth, SignalAggregate)
 
@@ -78,6 +78,35 @@ _SERVICE_HEALTH_METRICS = (
     "http_5xx_rate",
     "p95_latency_ms",
 )
+
+# Что для колонки значит ноль. Замер на проде 20.08.2026 за 24 часа:
+#
+#     метрика          NULL     нулей   положительных
+#     restarts_rate      14    358 995           3 668
+#     cpu_pct         1 377        135         361 165
+#     http_5xx_rate 362 677          —               —
+#     p95_latency_ms 362 677         —               —
+#
+# `restarts_rate` — счётчик событий, и 99% нулей у него означают, что поды
+# не перезапускались. Правило «>90% нулей = fail» объявляло это поломкой
+# материализации, хотя метрика писалась исправно и 3668 раз поймала
+# настоящие рестарты: проверка постоянно висела в fail на здоровых данных.
+# Настоящая поломка счётчика выглядит иначе — как NULL, то есть «значение
+# не записали вовсе», и NULL'ов там ровно 14 из 362 677.
+#
+# Для gauge (cpu/mem) ноль по-прежнему подозрителен: сервис, потребляющий
+# ровно ноль процессора, — это скорее сбой сбора, чем факт. Поэтому колонки
+# разделены по смыслу, а не проверяются одним правилом.
+#
+# 5xx и p95 не пишутся вообще (NULL во всех строках) — они в allowlist
+# `KG_SELF_HEALTH_KNOWN_ZERO_METRICS`, пока WO scrape config не подключит
+# nginx_ingress-метрики. С разделением по классу allowlist для них
+# продолжает работать: NULL-доля 100% дала бы fail без него.
+_EVENT_RATE_METRICS = frozenset({
+    "restarts_rate",
+    "http_5xx_rate",
+    "p95_latency_ms",
+})
 
 # Beat task → (timestamp column factory, expected interval minutes).
 # Каждая enrty задаёт «когда последняя запись и какой нормальный период».
@@ -224,15 +253,20 @@ def check_materialization_zero_rate(db: Session) -> CheckResult:
 
     for metric in _SERVICE_HEALTH_METRICS:
         col = getattr(ServiceHealth, metric)
-        zero_or_null = (
+        # Для счётчика событий «пропало» значит NULL: ноль там — законный
+        # ответ «ничего не произошло». Для gauge ноль тоже подозрителен.
+        is_event_rate = metric in _EVENT_RATE_METRICS
+        criterion = col.is_(None) if is_event_rate else or_(col.is_(None), col == 0)
+        missing = (
             db.query(func.count(ServiceHealth.id))
             .filter(ServiceHealth.ts >= since)
-            .filter(or_(col.is_(None), col == 0))
+            .filter(criterion)
             .scalar()
         ) or 0
-        rate = zero_or_null / total_rows if total_rows else 0.0
+        rate = missing / total_rows if total_rows else 0.0
         per_metric[metric] = {
-            "zero_or_null_pct": round(rate * 100, 1),
+            "missing_pct": round(rate * 100, 1),
+            "criterion": "null_only" if is_event_rate else "null_or_zero",
             "rows": total_rows,
             "allowlisted": metric in known_zero,
         }
@@ -794,14 +828,51 @@ def check_deploy_stream_ingestion(db: Session) -> CheckResult:
 # Структурная целостность графа — порог dangling, выше которого fail (а не warn).
 _GRAPH_INTEGRITY_FAIL_DANGLING = 50
 
+# Порог для рёбер «живой сервис → база в отсутствующем namespace». Единицы
+# ожидаемы в момент удаления окружения: sync успел записать ребро, а
+# namespace уже пропал — до следующего прохода lifecycle это гонка, а не
+# порча. Сотни означают, что консолидация db-узлов не доехала (20.08.2026
+# таких было 3614).
+_GRAPH_INTEGRITY_FAIL_STALE_DB_EDGES = 100
+
 
 def check_graph_integrity(db: Session) -> CheckResult:
     """Структурные инварианты графа — regression-watch для багов, вычищенных
     в rc.2 (2026-06-26). Эти величины ДОЛЖНЫ быть 0 по построению:
 
-      * db_phantom_dup_names — `db:%`-узлы с одним именем в >1 namespace.
-        #185 (sync-guard) + #189 (backfill) свели 288→16. >0 = guard-регрессия
-        (один физический кластер БД снова размножается в per-ns копии).
+      * db_dup_names_within_ns — `db:%`-узлы с одним именем в ОДНОМ namespace.
+        Строго говоря, это проверка того, что констрейнт на месте:
+        `UniqueConstraint("namespace", "name", "node_kind")` делает такой
+        дубль невозможным на уровне БД. Счётчик оставлен именно поэтому —
+        >0 означает, что констрейнт сняли миграцией, а не что синк
+        сломался. Стоит он один GROUP BY.
+
+        Раньше здесь считались узлы с одним именем в >1 namespace, и проверка
+        держала fail постоянно: 16 имён, которые #185/#189 «не смогли
+        добить». Убирать было нечего. Замер 20.08.2026: `db:postgres:message`
+        существует в 56 namespace — по одному на окружение, и каждый узел
+        собирает рёбра только своего: узел в `squad-1-shared` обслуживает
+        `squad-1-*`, узел в `prod-shared` — `prod-*`. Это 56 разных физических
+        баз, а не 56 копий одной. В мультитенантной инфраструктуре, где у
+        каждого сквада полный набор БД, глобальная уникальность имени БД не
+        инвариант, а ошибка модели.
+
+      * live_edges_into_missing_ns_db — рёбра из ЖИВОГО namespace в `db:%`-узел
+        namespace'а, помеченного `missing`. Это ложь о работающей системе:
+        граф утверждает, что прод ходит в базу удалённого окружения.
+
+        Замер 20.08.2026: 3614 таких рёбер, все в `preprod-kingdom1` —
+        namespace, которого нет в кластере с 15.08. Происхождение известно:
+        `phantom_db_cleanup` схлопывал копии в узел с лексикографически
+        МИНИМАЛЬНЫМ namespace, и `preprod-kingdom1` оказался минимумом среди
+        всех окружений. Фикс 15.08 (`contract.shared_namespace_of`) исправил
+        going-forward — новые рёбра идут в `*-shared`, — но накопленные 5366
+        остались на старом узле. Проверка их не видела, потому что искала
+        совсем другое.
+
+        Рёбра мёртвое→мёртвое сюда НЕ входят: у снесённых сквадов свои базы и
+        свои сервисы, ~102 ребра внутри собственного окружения. Это мусор для
+        retention в `namespace_lifecycle`, а не неверный факт.
       * serves_traffic_self_loops — рёбра src_id==dst_id kind='serves_traffic'.
         #190 guard (`dep_node.id==svc_node.id → skip`) гарантирует 0. >0 =
         регрессия (Service≡Deployment снова плодит петлю → шум в blast-radius).
@@ -815,11 +886,30 @@ def check_graph_integrity(db: Session) -> CheckResult:
     dup_sub = (
         db.query(Service.name)
         .filter(Service.name.like("db:%"))
-        .group_by(Service.name)
+        # Группировка по (name, namespace), а не по name: одно имя в разных
+        # окружениях — норма, два узла с одним именем в одном namespace — нет.
+        .group_by(Service.name, Service.namespace)
         .having(func.count(Service.id) > 1)
         .subquery()
     )
-    db_phantom_dup_names = db.query(func.count()).select_from(dup_sub).scalar() or 0
+    db_dup_names_within_ns = db.query(func.count()).select_from(dup_sub).scalar() or 0
+
+    # Рёбра из живого namespace в базу, лежащую в отсутствующем.
+    src_s = aliased(Service)
+    dst_s = aliased(Service)
+    ns_src = aliased(Namespace)
+    ns_dst = aliased(Namespace)
+    live_edges_into_missing_ns_db = (
+        db.query(func.count(ServiceEdge.id))
+        .join(dst_s, ServiceEdge.dst_id == dst_s.id)
+        .join(src_s, ServiceEdge.src_id == src_s.id)
+        .join(ns_dst, ns_dst.namespace == dst_s.namespace)
+        .join(ns_src, ns_src.namespace == src_s.namespace)
+        .filter(dst_s.name.like("db:%"),
+                ns_dst.state == "missing",
+                ns_src.state == "active")
+        .scalar()
+    ) or 0
 
     self_loops_any = (
         db.query(func.count(ServiceEdge.id))
@@ -843,10 +933,11 @@ def check_graph_integrity(db: Session) -> CheckResult:
         .scalar()
     ) or 0
 
-    if (db_phantom_dup_names > 0 or self_loops_any > 0
+    if (db_dup_names_within_ns > 0 or self_loops_any > 0
+            or live_edges_into_missing_ns_db > _GRAPH_INTEGRITY_FAIL_STALE_DB_EDGES
             or dangling_edges > _GRAPH_INTEGRITY_FAIL_DANGLING):
         status = "fail"
-    elif dangling_edges > 0:
+    elif dangling_edges > 0 or live_edges_into_missing_ns_db > 0:
         status = "warn"
     else:
         status = "ok"
@@ -855,7 +946,8 @@ def check_graph_integrity(db: Session) -> CheckResult:
         name="graph_integrity",
         status=status,
         detail={
-            "db_phantom_dup_names": db_phantom_dup_names,
+            "db_dup_names_within_ns": db_dup_names_within_ns,
+            "live_edges_into_missing_ns_db": live_edges_into_missing_ns_db,
             "self_loops_any": self_loops_any,
             "serves_traffic_self_loops": serves_traffic_self_loops,
             "dangling_edges": dangling_edges,

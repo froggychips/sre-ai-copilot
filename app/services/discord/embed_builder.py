@@ -36,8 +36,12 @@ def _summarize_self_health_detail(name: str, detail: Dict[str, Any]) -> str:
         offenders = []
         for metric, info in (detail.get("per_metric") or {}).items():
             if info.get("status") in {"warn", "fail"}:
-                offenders.append(f"{metric}={info.get('zero_or_null_pct')}%")
-        return f"zero/null rate too high: {', '.join(offenders) or '—'}"
+                # Критерий печатаем рядом с числом: для счётчиков событий это
+                # доля NULL, для gauge — доля NULL-или-нуля. Без пометки «99%»
+                # читается одинаково в обоих случаях, а значит по-разному.
+                crit = "null" if info.get("criterion") == "null_only" else "null/0"
+                offenders.append(f"{metric}={info.get('missing_pct')}% {crit}")
+        return f"метрика не материализуется: {', '.join(offenders) or '—'}"
     if name == "sync_lag":
         offenders = []
         for task, info in (detail.get("per_task") or {}).items():
