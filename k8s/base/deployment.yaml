@@ -70,6 +70,42 @@ spec:
           value: "production"
         - name: SAFE_MODE
           value: "true"
+        # ── дальше: то, что жило ТОЛЬКО в кластере ────────────────────────
+        #
+        # 21.08.2026 выяснилось, что этот манифест и работающий Deployment
+        # разошлись полностью: в git было две переменные и ни одного тома, в
+        # кластере — три других переменные, ConfigMap с ownership и emptyDir
+        # под /tmp. Ни одна не совпадала. Применение манифеста роняло поды на
+        # старте и попутно снесло бы рабочую конфигурацию, которой нет больше
+        # нигде. Прод жил на ревизии, воспроизвести которую из репозитория
+        # было нельзя.
+        #
+        # Подписывать вебхук AlertManager нечем: стоковый
+        # AlertManager/VMAlertmanager не умеет считать HMAC от body (подробно
+        # в k8s/vmalertmanagerconfig.yaml). Выбран второй вариант из двух
+        # описанных там — изоляция трафика NetworkPolicy без секрета, — и
+        # опт-аут обязан быть явным, иначе config.py откажется стартовать.
+        - name: ALERTMANAGER_ALLOW_UNAUTHENTICATED
+          value: "true"
+        # Пустой список, а не ["*"]: браузерных клиентов у этого API нет
+        # (Ingress выставлен на плейсхолдер, обращений к защищённым
+        # эндпоинтам ноль), а wildcard в проде запрещён гвардом в
+        # app/main.py. Пустой список — самое строгое из возможного: ни один
+        # cross-origin запрос не проходит.
+        - name: ALLOWED_ORIGINS
+          value: "[]"
+        # Ручной override владельцев сервисов. Файл приезжает из ConfigMap
+        # sre-ai-copilot-ownership (том ниже); без переменной и тома
+        # ownership_suggester теряет manual-источник и откатывается на
+        # inference.
+        - name: OWNERSHIP_MANIFEST_PATH
+          value: /config/ownership.yaml
+        # Тег РЕАЛЬНО задеплоенного образа — попадает в Discord-сообщения.
+        # Подставляется deploy.sh из IMAGE_TAG: в кластере значение застыло
+        # на 1.0.0-rc.29, потому что ставилось руками и при выкатах не
+        # обновлялось.
+        - name: BUILD_VERSION
+          value: "BUILD_VERSION_PLACEHOLDER"
         livenessProbe:
           httpGet:
             path: /healthz
@@ -103,6 +139,24 @@ spec:
           requests:
             cpu: 200m
             memory: 256Mi
+        volumeMounts:
+        # subPath: монтируется ОДИН файл, а не каталог — иначе /config
+        # затенил бы всё остальное содержимое каталога в образе.
+        - name: ownership
+          mountPath: /config/ownership.yaml
+          subPath: ownership.yaml
+          readOnly: true
+        # readOnlyRootFilesystem: true выше означает, что писать некуда
+        # вообще. Без этого тома любая запись в /tmp — а её делают tempfile,
+        # matplotlib-кэш и сам Python при сборке .pyc — падает с EROFS.
+        - name: tmp
+          mountPath: /tmp
+      volumes:
+      - name: ownership
+        configMap:
+          name: sre-ai-copilot-ownership
+      - name: tmp
+        emptyDir: {}
 ---
 apiVersion: policy/v1
 kind: PodDisruptionBudget

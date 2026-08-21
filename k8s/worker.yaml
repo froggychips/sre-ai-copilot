@@ -64,6 +64,34 @@ spec:
           value: "production"
         - name: SAFE_MODE
           value: "true"
+        # ── дальше: то, что жило ТОЛЬКО в кластере ────────────────────────
+        #
+        # 21.08.2026: манифест и работающий Deployment разошлись полностью. В
+        # git было две переменные и ни одного тома у воркера, в кластере —
+        # пять других переменных, ConfigMap с ownership и emptyDir под /tmp.
+        # Применение манифеста роняло поды на старте (config.py требовал
+        # HMAC-секрет) и попутно отключило бы дайджест и ownership-backfill:
+        # их дефолты в app/config.py — False.
+        - name: ALERTMANAGER_ALLOW_UNAUTHENTICATED
+          value: "true"
+        - name: OWNERSHIP_MANIFEST_PATH
+          value: /config/ownership.yaml
+        # Подставляется deploy.sh из IMAGE_TAG; в кластере значение застыло
+        # на 1.0.0-rc.29, потому что ставилось руками.
+        - name: BUILD_VERSION
+          value: "BUILD_VERSION_PLACEHOLDER"
+        # Дефолт False — без явного true ежедневный дайджест выключится.
+        - name: STATS_DIGEST_ENABLED
+          value: "true"
+        # Тоже дефолт False: periodic backfill team_owner через
+        # multi-signal inference.
+        - name: OWNERSHIP_BACKFILL_ENABLED
+          value: "true"
+        # Значение совпадает с дефолтом, но фиксируется явно: «боту можно
+        # писать в Discord» — не та настройка, которую стоит оставлять на
+        # усмотрение дефолта в конфиге.
+        - name: DISCORD_DRY_RUN
+          value: "false"
         # ── Liveness ─────────────────────────────────────────────────────────
         # До этого у воркера НЕ БЫЛО ни одной пробы (у api — все три). OOM ловит
         # kubelet сам, но всё, что НЕ OOM — CPU-троттлинг, залипший
@@ -172,6 +200,23 @@ spec:
           requests:
             cpu: 600m
             memory: 3Gi
+        volumeMounts:
+        # subPath: монтируется ОДИН файл, иначе /config затенил бы каталог.
+        - name: ownership
+          mountPath: /config/ownership.yaml
+          subPath: ownership.yaml
+          readOnly: true
+        # readOnlyRootFilesystem: true выше означает, что писать некуда
+        # вообще: без этого тома падает любая запись в /tmp, а её делают и
+        # tempfile, и сборка .pyc. У beat такой том был, у воркера — нет.
+        - name: tmp
+          mountPath: /tmp
+      volumes:
+      - name: ownership
+        configMap:
+          name: sre-ai-copilot-ownership
+      - name: tmp
+        emptyDir: {}
 ---
 apiVersion: policy/v1
 kind: PodDisruptionBudget
@@ -247,6 +292,10 @@ spec:
           capabilities:
             drop: ["ALL"]
         volumeMounts:
+        - name: ownership
+          mountPath: /config/ownership.yaml
+          subPath: ownership.yaml
+          readOnly: true
         - name: tmp
           mountPath: /tmp
         envFrom:
@@ -258,6 +307,36 @@ spec:
         - name: ENV
           value: "production"
         - name: SAFE_MODE
+          value: "true"
+        # ── дальше: то, что жило ТОЛЬКО в кластере ────────────────────────
+        #
+        # 21.08.2026: манифест и работающий Deployment разошлись полностью. В
+        # git было две переменные и ни одного тома у воркера, в кластере —
+        # пять других переменных, ConfigMap с ownership и emptyDir под /tmp.
+        # Применение манифеста роняло поды на старте (config.py требовал
+        # HMAC-секрет) и попутно отключило бы дайджест и ownership-backfill:
+        # их дефолты в app/config.py — False.
+        - name: ALERTMANAGER_ALLOW_UNAUTHENTICATED
+          value: "true"
+        - name: OWNERSHIP_MANIFEST_PATH
+          value: /config/ownership.yaml
+        # Подставляется deploy.sh из IMAGE_TAG; в кластере значение застыло
+        # на 1.0.0-rc.29, потому что ставилось руками.
+        - name: BUILD_VERSION
+          value: "BUILD_VERSION_PLACEHOLDER"
+        # Явный список namespace для kg_topology_sync. Дефолт в
+        # app/config.py пустой, а пустой = auto-discovery: потеря этой
+        # переменной сменила бы область сканирования целиком.
+        #
+        # Список зафиксирован из кластера 21.08.2026 как есть, чтобы
+        # применение манифеста ничего не меняло. Он УСТАРЕЛ: preprod-kingdom1
+        # в кластере не существует с 15.08 (именно на его db-узлах повисли
+        # 3612 рёбер, см. db_edge_rehome), а часть squad-* снесена. Ревизия
+        # списка — отдельная задача, не для коммита про дрейф.
+        - name: KG_SCAN_NAMESPACES
+          value: "preprod-kingdom1,preprod-kingdom2,preprod-kingdom3,preprod-shared,preupdate-kingdom1,preupdate-kingdom2,preupdate-kingdom3,preupdate-kingdom5,preupdate-shared,prod-kingdom1,prod-kingdom2,prod-kingdom3,prod-kingdom4,prod-kingdom5,prod-lo-legal,prod-shared,squad-2-kingdom2,squad-3-kingdom5,squad-3-shared,squad-9-kingdom2,squad-9-shared,squad-11-kingdom2,squad-13-kingdom5,squad-13-shared,squad-19-shared"
+        # Дефолт False: periodic backfill team_owner.
+        - name: OWNERSHIP_BACKFILL_ENABLED
           value: "true"
         # ── Liveness ─────────────────────────────────────────────────────────
         # У beat пробы тоже не было. Смерть процесса контейнер переживёт сам
@@ -333,6 +412,9 @@ spec:
             cpu: 50m
             memory: 128Mi
       volumes:
+      - name: ownership
+        configMap:
+          name: sre-ai-copilot-ownership
       # Writable /tmp под celerybeat-schedule (см. --schedule выше).
       - name: tmp
         emptyDir:
