@@ -221,6 +221,66 @@ class TestConfiguration:
         )
         assert settings.is_production is True
 
+    def test_cluster_config_deploys_without_an_idp(self):
+        """Конфигурация, которая РЕАЛЬНО стоит в кластере, должна разворачиваться.
+
+        Прецедент 20.08.2026: с ENV=production все три компонента уходили в
+        CrashLoopBackOff на старте, потому что инварианты требовали
+        HMAC-секрет и целый IdP. Прод при этом жил на ревизии без ENV — то
+        есть на конфигурации, которой нет в git, и задеплоить проект по его
+        же инструкции было нельзя.
+
+        Ни секрета, ни JWT-ключей здесь нет, и это законно: подписывать
+        вебхук нечем (стоковый AlertManager не умеет), а JWT-эндпоинты
+        недостижимы — Ingress выставлен на плейсхолдер `sre-ai.example.com`,
+        обращений к /replay и /approvals ноль, заявок в kg_action_approvals
+        ноль за всё время.
+        """
+        settings = Settings(
+            ENV="production",
+            SAFE_MODE=True,
+            ANTHROPIC_API_KEY="test-key",
+            ALERTMANAGER_ALLOW_UNAUTHENTICATED=True,
+            DATABASE_URL="postgresql://copilot:secret@db:5432/copilot",
+        )
+        assert settings.is_production is True
+
+    def test_webhook_secret_still_required_without_the_explicit_opt_out(self):
+        """Опт-аут обязан быть ЯВНЫМ, а не «забыл заполнить переменную»."""
+        with pytest.raises(ValidationError, match="ALERTMANAGER_WEBHOOK_SECRET"):
+            Settings(
+                ENV="production",
+                SAFE_MODE=True,
+                ANTHROPIC_API_KEY="test-key",
+                ALERTMANAGER_ALLOW_UNAUTHENTICATED=False,
+                DATABASE_URL="postgresql://copilot:secret@db:5432/copilot",
+            )
+
+    def test_missing_jwt_key_closes_endpoints_instead_of_opening_them(self):
+        """Без ключа защищённые эндпоинты отвечают 401 — fail-closed.
+
+        Именно поэтому JWT_PUBLIC_KEY перестал быть обязательным в проде:
+        его отсутствие закрывает /replay и /approvals, а не открывает. Тест
+        проверяет это на самой зависимости, а не на словах.
+        """
+        import asyncio
+        from unittest.mock import MagicMock
+
+        from fastapi import HTTPException
+
+        from app import auth
+        from app.config import settings as live_settings
+
+        saved = live_settings.JWT_PUBLIC_KEY
+        live_settings.JWT_PUBLIC_KEY = None
+        try:
+            creds = MagicMock(credentials="eyJhbGciOiJSUzI1NiJ9.eyJzdWIiOiJhIn0.s")
+            with pytest.raises(HTTPException) as exc:
+                asyncio.run(auth.get_current_user(creds))
+            assert exc.value.status_code == 401
+        finally:
+            live_settings.JWT_PUBLIC_KEY = saved
+
     def test_is_production_excludes_non_prod_envs(self):
         """staging/development — НЕ прод: инварианты не должны душить dev.
 
