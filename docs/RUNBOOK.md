@@ -1099,6 +1099,29 @@ IMAGE_REPO=ghcr.io/froggychips/sre-ai-copilot \
   IMAGE_TAG=<git-sha> ./deploy.sh                      # image from CI
 ```
 
+### 0. Bump the version BEFORE building the image
+
+Order matters, and getting it wrong is silent. On 2026-08-21 the image was
+built first and `__version__` bumped afterwards: the tag `v1.0.0-rc.35` then
+pointed at a commit that was not inside the `rc.35` image, and the running pod
+reported `__version__=1.0.0-rc.29` next to `BUILD_VERSION=1.0.0-rc.35`.
+
+Rebuilding under the same tag does not fix it — `imagePullPolicy: IfNotPresent`
+means nodes that already hold the tag will not re-pull it. The only real fix is
+another release, so it is cheaper to get the order right.
+
+One commit, four places, all checked by `tests/test_version_consistency.py`:
+
+```bash
+# app/__init__.py, helm/sre-ai-copilot/Chart.yaml (appVersion),
+# README.md (badge), CHANGELOG.md (top release section)
+.venv/bin/pytest tests/test_version_consistency.py -q   # must pass BEFORE build
+```
+
+Those tests catch the mismatch — but only between the four files. Nothing
+checks that the image contains the bump, which is exactly how the miss above
+happened.
+
 ### 1. Build and push the image
 
 `--platform linux/amd64` is mandatory: the nodes are amd64, and a build on an
