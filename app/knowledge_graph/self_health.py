@@ -47,6 +47,7 @@ from sqlalchemy import func, or_
 from sqlalchemy.orm import Session, aliased
 
 from app.config import settings
+from app.knowledge_graph.contract import shared_namespace_of
 from app.knowledge_graph.schema import (AlertEvent, AnomalyObservation,
                                         ClusterObservation, Deployment,
                                         LogObservation, Namespace,
@@ -927,6 +928,46 @@ def check_graph_integrity(db: Session) -> CheckResult:
         .scalar()
     ) or 0
 
+    # Рёбра `uses_db` в базу ЧУЖОГО окружения, у которого есть свой узел.
+    #
+    # Инвариант выше ловил только удалённые namespace, и этого оказалось
+    # мало. Замер 21.08.2026, сразу после переноса 3740 рёбер: в графе
+    # осталось 1900 кросс-окруженческих, из них у 1800 правильный узел в
+    # своём окружении СУЩЕСТВОВАЛ. Двенадцать были прямой ложью о проде —
+    # все семь `bot-service` из prod-kingdom1..7 указывали на
+    # `preprod-kingdom2/db:postgres:map-coordinator`, при живом
+    # `prod-shared/db:postgres:map-coordinator`. Живой получатель делал
+    # ложь незаметной для проверки, которая смотрела на `state='missing'`.
+    #
+    # Условие «есть свой узел» здесь не педантизм: остальные 100 рёбер шли
+    # из снесённого `squad-20-shared`, у которого db-узлов в графе нет ни
+    # одного. Переносить их некуда, и держать проверку в fail из-за
+    # намеченного к удалению сквада значит снова получить сигнал, на
+    # который нельзя ответить.
+    own_db = aliased(Service)
+    cross_realm_db_edges = 0
+    for (edge_id, src_ns, dst_ns, db_name, db_kind) in (
+        db.query(ServiceEdge.id, src_s.namespace, dst_s.namespace,
+                 dst_s.name, dst_s.node_kind)
+        .join(dst_s, ServiceEdge.dst_id == dst_s.id)
+        .join(src_s, ServiceEdge.src_id == src_s.id)
+        .filter(dst_s.name.like("db:%"), ServiceEdge.kind == "uses_db")
+        .all()
+    ):
+        src_realm = shared_namespace_of(src_ns)
+        dst_realm = shared_namespace_of(dst_ns)
+        if not src_realm or not dst_realm or src_realm == dst_realm:
+            continue
+        has_own = (
+            db.query(own_db.id)
+            .filter(own_db.name == db_name,
+                    own_db.namespace == src_realm,
+                    own_db.node_kind == db_kind)
+            .first()
+        )
+        if has_own is not None:
+            cross_realm_db_edges += 1
+
     self_loops_any = (
         db.query(func.count(ServiceEdge.id))
         .filter(ServiceEdge.src_id == ServiceEdge.dst_id)
@@ -949,11 +990,12 @@ def check_graph_integrity(db: Session) -> CheckResult:
         .scalar()
     ) or 0
 
+    stale_db_edges = live_edges_into_missing_ns_db + cross_realm_db_edges
     if (db_dup_names_within_ns > 0 or self_loops_any > 0
-            or live_edges_into_missing_ns_db > _GRAPH_INTEGRITY_FAIL_STALE_DB_EDGES
+            or stale_db_edges > _GRAPH_INTEGRITY_FAIL_STALE_DB_EDGES
             or dangling_edges > _GRAPH_INTEGRITY_FAIL_DANGLING):
         status = "fail"
-    elif dangling_edges > 0 or live_edges_into_missing_ns_db > 0:
+    elif dangling_edges > 0 or stale_db_edges > 0:
         status = "warn"
     else:
         status = "ok"
@@ -964,6 +1006,7 @@ def check_graph_integrity(db: Session) -> CheckResult:
         detail={
             "db_dup_names_within_ns": db_dup_names_within_ns,
             "live_edges_into_missing_ns_db": live_edges_into_missing_ns_db,
+            "cross_realm_db_edges": cross_realm_db_edges,
             "self_loops_any": self_loops_any,
             "serves_traffic_self_loops": serves_traffic_self_loops,
             "dangling_edges": dangling_edges,
