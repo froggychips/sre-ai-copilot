@@ -182,7 +182,16 @@ _SYNC_LAG_TARGETS: Dict[str, Dict[str, Any]] = {
     # и есть интересный случай (ходит, но ничего не пишет).
     "kg_nats_subjects_sync": {
         "heartbeat_task": "kg_nats_subjects_sync",
-        "interval_minutes": 60,
+        # Расписание задачи — crontab(minute=43, hour="*/6"), то есть раз в
+        # шесть часов. Здесь стояло 60, и проверка ждала прогона каждый час:
+        # порог warn = 2×interval, fail = 5×interval, так что при реальном
+        # периоде 360 минут warn держался почти постоянно, а fail приходил
+        # при любой задержке. Замер 21.08.2026 показал lag=150.6 при
+        # совершенно здоровом синке.
+        #
+        # Расхождение теперь ловится тестом
+        # `test_sync_lag_intervals_match_beat_schedule`, а не сверкой глазами.
+        "interval_minutes": 360,
     },
     "kg_topology_resources_sync": {
         "heartbeat_task": "kg_topology_resources_sync",
