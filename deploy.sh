@@ -33,7 +33,13 @@ echo "Namespace: ${NAMESPACE}"
 
 apply_with_image() {
     local manifest="$1"
-    sed "s|IMAGE_PLACEHOLDER|${IMAGE}|g" "${manifest}" \
+    # BUILD_VERSION вместе с образом: это тег РЕАЛЬНО задеплоенного образа,
+    # он уходит в Discord-сообщения. Раньше переменную ставили руками, и в
+    # кластере она застыла на 1.0.0-rc.29 — то есть сообщения ссылались на
+    # версию, которой в поде уже не было. Подставляем из того же IMAGE_TAG,
+    # чтобы разъехаться стало нечем.
+    sed -e "s|IMAGE_PLACEHOLDER|${IMAGE}|g" \
+        -e "s|BUILD_VERSION_PLACEHOLDER|${IMAGE_TAG}|g" "${manifest}" \
         | kubectl -n "${NAMESPACE}" apply -f -
 }
 
