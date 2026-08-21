@@ -760,13 +760,27 @@ def kg_namespace_lifecycle_task():
     namespace кластера, а не только те, что синк обходит; именно расхождение
     между этими списками и было слепой зоной (25 обходимых против 139 живых).
 
-    Ничего не удаляет: только помечает присутствие и считает инкарнации.
+    Помечает присутствие и считает инкарнации, а затем убирает рёбра,
+    не подтверждённые после пересоздания стенда. Второе — шаг B5, который
+    раньше был отложен «до недели наблюдений»: за эту неделю стало видно,
+    что рёбра прежнего воплощения оживают вместе с именем namespace. Замер
+    21.08.2026: 1033 таких ребра в 22 пересозданных namespace, из них 636
+    `uses_db`, 388 `routes_to`, 374 `uses_nats`.
+
+    Узлы по-прежнему не удаляются: они переиспользуются новым воплощением
+    (upsert по namespace+name), и их судьба — забота `drift_cleanup`.
     """
-    from app.knowledge_graph.namespace_lifecycle import sync_namespace_lifecycle
+    from app.knowledge_graph.namespace_lifecycle import (
+        purge_stale_edges_after_reincarnation, sync_namespace_lifecycle)
 
     db = SessionLocal()
     try:
-        return sync_namespace_lifecycle(db)
+        stats = sync_namespace_lifecycle(db)
+        if settings.KG_REINCARNATION_PURGE_ENABLED:
+            stats["reincarnation_purge"] = purge_stale_edges_after_reincarnation(
+                db, apply=True,
+            )
+        return stats
     except Exception as e:
         logger.warning("kg_namespace_lifecycle.failed: %s", e)
         db.rollback()
