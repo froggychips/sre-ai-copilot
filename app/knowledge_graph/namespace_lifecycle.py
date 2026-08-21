@@ -23,16 +23,18 @@
 from __future__ import annotations
 
 import json
-from datetime import datetime
-from typing import Any, Dict
+from datetime import datetime, timedelta
+from typing import Any, Dict, Optional, cast
 
 import structlog
+from sqlalchemy import func, or_
 from sqlalchemy.orm import Session
 
 from app.core.timeutil import parse_ts
 from app.knowledge_graph.kubectl_breaker import run_kubectl
 from app.knowledge_graph.schema import (NS_STATE_ACTIVE, NS_STATE_MISSING,
-                                        Namespace)
+                                        Namespace, Service,
+                                        ServiceEdge)
 from app.services.audit_logger import audit_service
 
 log = structlog.get_logger()
@@ -80,6 +82,125 @@ def _fetch_namespaces() -> Dict[str, Dict[str, Any]]:
     return result
 
 
+
+
+#: Сколько ждать после пересоздания стенда, прежде чем считать рёбра
+#: устаревшими. Смысл в том, что рёбра подтверждают синки, и самый редкий из
+#: них ходит раз в час (`kg_topology_sync`, `kg_ingress_sync`). Удалять
+#: сразу после смены инкарнации значило бы снести то, что синк ещё не успел
+#: увидеть, — и граф терял бы связи живого стенда.
+#:
+#: Два часа = два прогона самого редкого синка. Одного мало: тик может
+#: совпасть с окном пересоздания и пройти по полупустому namespace.
+_REINCARNATION_GRACE = timedelta(hours=2)
+
+#: Доля рёбер namespace, выше которой чистка НЕ выполняется. Если после
+#: grace-периода неподтверждённым оказалось почти всё, объяснение скорее в
+#: сломанном синке, чем в том, что стенд действительно потерял все связи, —
+#: а массовое удаление по такой причине уже случалось в этом проекте
+#: (`edge_decay_guard` заведён ровно после него).
+_REINCARNATION_MAX_PURGE_SHARE = 0.9
+
+
+def purge_stale_edges_after_reincarnation(
+    db: Session, now: Optional[datetime] = None, apply: bool = False,
+) -> Dict[str, Any]:
+    """Убрать рёбра, не подтверждённые после пересоздания namespace.
+
+    Зачем. Пересоздание стенда не трогало ни узлы, ни рёбра — шаг B2
+    намеренно только наблюдал. Из-за этого рёбра прежнего воплощения
+    оживали вместе с именем: замер 21.08.2026 показал 1033 таких ребра в 22
+    пересозданных namespace, и 636 из них — `uses_db`.
+
+    Самый показательный случай: `squad-10-kingdom2` пересоздали (incarnation
+    3), и его рёбра от 08.08 на базы удалённого `preprod-kingdom1` снова
+    стали утверждением о работающем окружении. Их подчищал перенос
+    `db_edge_rehome`, но это лечение симптома: рёбра `routes_to` и
+    `uses_nats` того же происхождения (388 и 374) не подчищает никто.
+
+    Критерий — `last_seen_at < first_seen_at` текущего воплощения: ребро не
+    подтверждено ни одним синком после того, как стенд появился заново.
+
+    Возвращает статистику; при `apply=False` ничего не пишет.
+    """
+    stamp = now or datetime.utcnow()
+    stats: Dict[str, Any] = {
+        "namespaces_checked": 0, "namespaces_purged": 0,
+        "edges_deleted": 0, "skipped_in_grace": 0, "skipped_guard": 0,
+        "applied": False,
+    }
+
+    rows = (
+        db.query(Namespace)
+        .filter(Namespace.incarnation > 1,
+                Namespace.state == NS_STATE_ACTIVE,
+                Namespace.first_seen_at.isnot(None))
+        .all()
+    )
+    for ns_row in rows:
+        stats["namespaces_checked"] += 1
+        born = cast(datetime, ns_row.first_seen_at)
+        if stamp - born < _REINCARNATION_GRACE:
+            stats["skipped_in_grace"] += 1
+            continue
+
+        node_ids = [
+            nid for (nid,) in
+            db.query(Service.id).filter(Service.namespace == ns_row.namespace).all()
+        ]
+        if not node_ids:
+            continue
+
+        total = (
+            db.query(func.count(ServiceEdge.id))
+            .filter(or_(ServiceEdge.src_id.in_(node_ids),
+                        ServiceEdge.dst_id.in_(node_ids)))
+            .scalar()
+        ) or 0
+        stale_ids = [
+            eid for (eid,) in
+            db.query(ServiceEdge.id)
+            .filter(or_(ServiceEdge.src_id.in_(node_ids),
+                        ServiceEdge.dst_id.in_(node_ids)),
+                    ServiceEdge.last_seen_at < born)
+            .all()
+        ]
+        if not stale_ids:
+            continue
+        if total and len(stale_ids) / total > _REINCARNATION_MAX_PURGE_SHARE:
+            stats["skipped_guard"] += 1
+            log.warning(
+                "kg_namespace.purge_skipped_guard",
+                namespace=ns_row.namespace,
+                stale=len(stale_ids), total=total,
+            )
+            continue
+
+        stats["namespaces_purged"] += 1
+        stats["edges_deleted"] += len(stale_ids)
+        if not apply:
+            continue
+
+        # Батчами: удаление тысяч строк одной транзакцией держит блокировки,
+        # пока рядом пишут синки (авария 15.08.2026 с DeadlockDetected).
+        for offset in range(0, len(stale_ids), 200):
+            chunk = stale_ids[offset:offset + 200]
+            db.query(ServiceEdge).filter(ServiceEdge.id.in_(chunk)).delete(
+                synchronize_session=False
+            )
+            db.commit()
+        audit_service.log_event("KG_NAMESPACE_EDGES_PURGED", {
+            "namespace": ns_row.namespace,
+            "incarnation": ns_row.incarnation,
+            "edges_deleted": len(stale_ids),
+            "edges_total": total,
+        })
+
+    if apply:
+        db.commit()
+        stats["applied"] = True
+    log.info("kg_namespace.reincarnation_purge", **stats)
+    return stats
 
 
 def sync_namespace_lifecycle(db: Session) -> Dict[str, Any]:

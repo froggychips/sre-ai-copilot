@@ -53,7 +53,7 @@ from sqlalchemy.orm.attributes import flag_modified
 
 from app.core.timeutil import utcnow
 from app.knowledge_graph.contract import shared_namespace_of
-from app.knowledge_graph.schema import Namespace, Service, ServiceEdge
+from app.knowledge_graph.schema import Service, ServiceEdge
 
 log = logging.getLogger(__name__)
 
@@ -105,27 +105,54 @@ def _target_node(
 
 
 def _stale_db_edges(db: Session) -> List[int]:
-    """id рёбер `uses_db` из active-namespace в db-узел missing-namespace."""
+    """id рёбер `uses_db`, ведущих в базу ЧУЖОГО окружения.
+
+    Два случая, и оба — один и тот же неверный факт:
+
+      * db-узел лежит в удалённом namespace. Замер 21.08.2026: 3740 рёбер
+        вели в `preprod-kingdom1`, которого нет в кластере с 15.08.
+      * db-узел лежит в ЖИВОМ, но чужом окружении. Первый прогон переноса
+        этот случай не покрывал, и после него в графе осталось 1900 таких
+        рёбер, включая двенадцать вида «прод-сервис ходит в базу
+        препрода» — например все семь `bot-service` из prod-kingdom1..7
+        указывали на `preprod-kingdom2/db:postgres:map-coordinator`, при
+        том что `prod-shared/db:postgres:map-coordinator` существует.
+        Живой namespace-получатель делал ложь незаметной для проверки,
+        которая смотрела только на `missing`.
+
+    Источник у обоих один: `phantom_db_cleanup` сводил разные физические
+    базы в узел с лексикографически минимальным namespace. Отбор поэтому
+    идёт не по состоянию namespace, а по несовпадению окружений: так
+    попадают и те рёбра, чей получатель ещё жив.
+
+    Фильтрация по `shared_namespace_of` идёт в Python, а не в SQL: правило
+    выделения realm — регулярка в `contract.py`, и дублировать её в
+    SQL-выражении значит завести второе место, где оно живёт.
+    """
     src_s = aliased(Service)
     dst_s = aliased(Service)
-    ns_src = aliased(Namespace)
-    ns_dst = aliased(Namespace)
     rows = (
-        db.query(ServiceEdge.id)
+        db.query(ServiceEdge.id, src_s.namespace, dst_s.namespace)
         .join(dst_s, ServiceEdge.dst_id == dst_s.id)
         .join(src_s, ServiceEdge.src_id == src_s.id)
-        .join(ns_dst, ns_dst.namespace == dst_s.namespace)
-        .join(ns_src, ns_src.namespace == src_s.namespace)
         .filter(dst_s.name.like("db:%"),
-                ServiceEdge.kind.in_(DB_EDGE_KINDS),
-                ns_dst.state == "missing",
-                ns_src.state == "active")
+                ServiceEdge.kind.in_(DB_EDGE_KINDS))
         # Детерминированный порядок: два писателя, идущие по строкам в разном
         # порядке, блокируют друг друга крест-накрест.
         .order_by(ServiceEdge.id)
         .all()
     )
-    return [r[0] for r in rows]
+    out: List[int] = []
+    for edge_id, src_ns, dst_ns in rows:
+        src_realm = shared_namespace_of(src_ns)
+        dst_realm = shared_namespace_of(dst_ns)
+        if not src_realm or not dst_realm:
+            # Namespace без распознаваемого realm (`sre-ai`, `monitoring`):
+            # судить о «своём» и «чужом» окружении для них не на чем.
+            continue
+        if src_realm != dst_realm:
+            out.append(edge_id)
+    return out
 
 
 def rehome_db_edges(db: Session, apply: bool = False) -> Dict[str, Any]:
