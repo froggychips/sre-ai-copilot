@@ -344,27 +344,55 @@ async def _sync_seq_logs_async(
     # tick'и в пределах окна писали в ту же строку через ON CONFLICT.
     ts_bucket = _window_bucket(until, window_minutes)
 
-    totals = {"instances": len(instances), "rows": 0, "matched": 0, "unmatched": 0}
+    totals: Dict[str, Any] = {
+        "instances": len(instances), "rows": 0, "matched": 0, "unmatched": 0,
+        # Сколько инстансов реально ответили. Без этого счётчика «rows=0»
+        # означает одновременно «в логах тихо» и «спросить не удалось».
+        "reached": 0, "failed": 0,
+    }
     for inst in instances:
         try:
             stats = await _sync_instance(db, inst, since, until, ts_bucket)
         except Exception as e:
+            totals["failed"] += 1
             log.warning(
                 "seq_logs_sync.instance_failed name=%s err=%s",
                 inst.get("name"), e,
             )
             continue
+        totals["reached"] += 1
         totals["rows"] += stats["rows"]
         totals["matched"] += stats["matched"]
         totals["unmatched"] += stats["unmatched"]
 
     db.commit()
     log.info(
-        "seq_logs_sync.done instances=%d rows=%d matched=%d unmatched=%d "
-        "window=%dm bucket=%s",
-        totals["instances"], totals["rows"], totals["matched"],
-        totals["unmatched"], window_minutes, ts_bucket.isoformat(),
+        "seq_logs_sync.done instances=%d reached=%d failed=%d rows=%d "
+        "matched=%d unmatched=%d window=%dm bucket=%s",
+        totals["instances"], totals["reached"], totals["failed"],
+        totals["rows"], totals["matched"], totals["unmatched"],
+        window_minutes, ts_bucket.isoformat(),
     )
+    if totals["reached"] == 0:
+        # Ни один инстанс не ответил — состояние логов НЕИЗВЕСТНО, и
+        # «ошибок за окно нет» утверждать нельзя. Возвращаем error-маркер:
+        # `_record_beat_heartbeat` не пишет heartbeat для таких прогонов, и
+        # self-health увидит отставание вместо тишины.
+        #
+        # Ровно этого не хватило 20.08.2026: NetworkPolicy перекрыла доступ
+        # ко всем восьми инстансам, задача завершалась SUCCESS с rows=0,
+        # heartbeat писался, и 12,8 часа никто не знал, что синк ослеп.
+        log.error(
+            "seq_logs_sync.all_instances_unreachable count=%d — "
+            "состояние логов неизвестно",
+            totals["failed"],
+        )
+        totals["error"] = f"все {totals['failed']} инстансов Seq недоступны"
+    elif totals["failed"]:
+        log.warning(
+            "seq_logs_sync.partial reached=%d failed=%d — часть логов вне обзора",
+            totals["reached"], totals["failed"],
+        )
     return totals
 
 
