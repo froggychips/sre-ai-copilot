@@ -134,10 +134,23 @@ kubectl -n "${NAMESPACE}" apply -f k8s/networkpolicy.yaml
 # провалы копятся в rollout_failed, а exit — после цикла. `|| true` осталось
 # только на диагностических kubectl-вызовах: их отказ не должен подменять
 # причину падения (например, при отозванных правах на describe).
+# 600s, а не 300s. Замер 21.08.2026: три выката подряд (rc.32, rc.33, rc.34)
+# отчитывались «Deploy FAILED: sre-ai-api», хотя rollout доезжал через минуту
+# после таймаута — то есть скрипт врал об исправном выкате. Причина в
+# арифметике: при двух репликах maxUnavailable=25% округляется ВНИЗ до нуля,
+# так что k8s обязан поднять новый под и дождаться его готовности прежде чем
+# гасить старый, и обновление идёт строго последовательно. На пода уходит до
+# 60s одного startupProbe (12 попыток × 5s), плюс терминация 30s.
+#
+# Ложное «FAILED» здесь не безобиднее ложного «OK»: оператор перестаёт верить
+# и тому, и другому.
+ROLLOUT_TIMEOUT="${ROLLOUT_TIMEOUT:-600s}"
+
 rollout_failed=""
 for d in sre-ai-api copilot-worker copilot-beat; do
-    if ! kubectl -n "${NAMESPACE}" rollout status "deploy/${d}" --timeout=300s; then
-        echo "ERROR: rollout deploy/${d} не сошёлся за 300s." >&2
+    if ! kubectl -n "${NAMESPACE}" rollout status "deploy/${d}" \
+            --timeout="${ROLLOUT_TIMEOUT}"; then
+        echo "ERROR: rollout deploy/${d} не сошёлся за ${ROLLOUT_TIMEOUT}." >&2
         # Причина почти всегда видна тут же: ImagePullBackOff (тег/registry),
         # CrashLoopBackOff (fail-closed валидаторы config.py на пустых секретах),
         # Unhealthy от liveness-пробы воркера (см. k8s/worker.yaml).

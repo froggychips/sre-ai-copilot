@@ -178,3 +178,97 @@ def test_all_edge_kinds_are_cleaned_not_just_db(db):
     assert stats["edges_deleted"] == 4
     remaining = {e.kind for e in db.query(ServiceEdge).all()}
     assert not {"uses_db", "routes_to", "uses_nats", "calls"} & remaining
+
+
+# ── health-точки: baseline детектора аномалий ─────────────────────────────
+#
+# Важнее рёбер. Детектор строит baseline по семи дням kg_service_health, и
+# после пересоздания стенда в окно попадают замеры ПРЕЖНЕГО — другого по
+# составу и нагрузке. Замер 21.08.2026: 262 657 таких точек внутри окна, 797
+# затронутых сервисов; всего в базе 1 393 632 при 8 634 615 точках (10,7%).
+# Следствие видно в аномалиях: 133 сервиса из 859 аномальны больше двадцати
+# часов из двадцати четырёх — «аномалия» стала их постоянным состоянием.
+
+
+def _health(db, svc, *, hours_ago):
+    from app.knowledge_graph.schema import ServiceHealth
+
+    row = ServiceHealth(service_id=svc.id, ts=NOW - timedelta(hours=hours_ago),
+                        cpu_pct=10.0, source="vm")
+    db.add(row)
+    db.flush()
+    return row
+
+
+def test_health_points_from_previous_incarnation_are_deleted(db):
+    from app.knowledge_graph.namespace_lifecycle import \
+        purge_stale_health_after_reincarnation
+    from app.knowledge_graph.schema import ServiceHealth
+
+    _ns(db, "squad-10-shared", incarnation=3, born_hours_ago=5)
+    svc = _svc(db, "town-service", "squad-10-shared")
+    _health(db, svc, hours_ago=100)   # прежнее воплощение
+    _health(db, svc, hours_ago=50)    # прежнее воплощение
+    _health(db, svc, hours_ago=1)     # текущее — доказательство, что метрики идут
+    db.commit()
+
+    stats = purge_stale_health_after_reincarnation(db, now=NOW, apply=True)
+    assert stats["points_deleted"] == 2
+    assert db.query(ServiceHealth).count() == 1
+
+
+def test_health_purge_requires_proof_that_new_stand_writes_metrics(db):
+    """Нет ни одной свежей точки — либо метрики не идут, либо first_seen_at врёт.
+
+    Это guard вместо долевого: у пересозданного стенда естественно, что почти
+    вся история относится к прежней инкарнации (метрики раз в десять минут,
+    история тридцать дней). Долевой порог в пробе 21.08.2026 отсёк 11
+    namespace из 22 — ровно те, где baseline загрязнён сильнее всего.
+    """
+    from app.knowledge_graph.namespace_lifecycle import \
+        purge_stale_health_after_reincarnation
+    from app.knowledge_graph.schema import ServiceHealth
+
+    _ns(db, "squad-10-shared", incarnation=3, born_hours_ago=5)
+    svc = _svc(db, "town-service", "squad-10-shared")
+    for h in (100, 80, 60, 40):
+        _health(db, svc, hours_ago=h)   # всё старое, свежих нет
+    db.commit()
+
+    stats = purge_stale_health_after_reincarnation(db, now=NOW, apply=True)
+    assert stats["skipped_guard"] == 1
+    assert stats["points_deleted"] == 0
+    assert db.query(ServiceHealth).count() == 4
+
+
+def test_health_purge_respects_grace_period(db):
+    from app.knowledge_graph.namespace_lifecycle import \
+        purge_stale_health_after_reincarnation
+    from app.knowledge_graph.schema import ServiceHealth
+
+    _ns(db, "squad-10-shared", incarnation=3, born_hours_ago=1)   # < 2 часов
+    svc = _svc(db, "town-service", "squad-10-shared")
+    _health(db, svc, hours_ago=100)
+    _health(db, svc, hours_ago=0)
+    db.commit()
+
+    stats = purge_stale_health_after_reincarnation(db, now=NOW, apply=True)
+    assert stats["skipped_in_grace"] == 1
+    assert db.query(ServiceHealth).count() == 2
+
+
+def test_health_purge_dry_run_writes_nothing(db):
+    from app.knowledge_graph.namespace_lifecycle import \
+        purge_stale_health_after_reincarnation
+    from app.knowledge_graph.schema import ServiceHealth
+
+    _ns(db, "squad-10-shared", incarnation=2, born_hours_ago=5)
+    svc = _svc(db, "town-service", "squad-10-shared")
+    _health(db, svc, hours_ago=100)
+    _health(db, svc, hours_ago=1)
+    db.commit()
+
+    stats = purge_stale_health_after_reincarnation(db, now=NOW, apply=False)
+    assert stats["applied"] is False
+    assert stats["points_deleted"] == 1
+    assert db.query(ServiceHealth).count() == 2
