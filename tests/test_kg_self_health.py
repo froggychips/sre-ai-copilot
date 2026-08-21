@@ -232,21 +232,20 @@ def test_sync_lag_fails_when_no_data_at_all(db):
     assert result.detail["per_task"]["kg_metrics_sync"]["status"] == "fail"
 
 
-def test_sync_lag_seq_30min_gap_fails(db):
-    """Seq не пишет 30 мин при ожидаемом 10 мин → lag 3× → warn,
-    но в 30 мин ещё не >5× (=50 мин), значит warn. Проверим оба порога."""
+def test_sync_lag_seq_quiet_window_is_ok(db, monkeypatch):
+    """Тихое окно в логах — не поломка синка.
+
+    Запись в kg_log_observations появляется только когда в окне были
+    Error/Fatal/Warning. Замер на проде 21.08.2026: за час на shared-инстансе
+    7 таких событий, но в двух 10-минутных окнах подряд — ноль. При пороге
+    fail = 5×interval = 50 минут тихая ночь давала ложный fail, ровно как
+    было у kg_anomaly_detection_task до перевода на heartbeat.
+    """
     svc = _mk_service(db)
     now = datetime.utcnow()
+    _patch_heartbeat(monkeypatch, minutes_ago=3)   # синк опросил 3 минуты назад
 
-    # Seq последний раз писал 30 мин назад — 3× interval (=10 мин)
-    db.add(LogObservation(
-        service_id=svc.id,
-        ts=now - timedelta(minutes=30),
-        level="Error",
-        count=1,
-        source="prod",
-    ))
-    # Заполним остальные таски свежими данными, чтобы изолировать seq
+    # Данных нет вообще — в логах было тихо.
     db.add(ServiceHealth(service_id=svc.id, ts=now, cpu_pct=10.0, source="vm"))
     db.add(ClusterObservation(ts=now))
     db.add(AnomalyObservation(
@@ -254,27 +253,26 @@ def test_sync_lag_seq_30min_gap_fails(db):
     ))
     db.add(SignalAggregate(service_id=svc.id, window_end=now, window_hours=24))
     db.commit()
-    # Service.updated_at — onupdate=datetime.utcnow(), при первом commit заполнен
-    # default'ом, который тоже now.
 
-    result = check_sync_lag(db)
-    seq = result.detail["per_task"]["kg_seq_logs_sync"]
-    assert seq["status"] == "warn"
-    assert seq["lag_minutes"] >= 29.0  # допуск на округление
+    seq = check_sync_lag(db).detail["per_task"]["kg_seq_logs_sync"]
+    assert seq["source"] == "heartbeat"
+    assert seq["status"] == "ok", "тишина в логах снова читается как поломка синка"
 
-    # Теперь поставим Seq lag = 60 мин (6× → fail)
-    db.query(LogObservation).delete()
-    db.add(LogObservation(
-        service_id=svc.id,
-        ts=now - timedelta(minutes=60),
-        level="Error",
-        count=1,
-        source="prod",
-    ))
-    db.commit()
-    result2 = check_sync_lag(db)
-    assert result2.detail["per_task"]["kg_seq_logs_sync"]["status"] == "fail"
-    assert result2.status == "fail"
+
+def test_sync_lag_seq_fails_when_sync_stops_running(db, monkeypatch):
+    """А если синк не отчитывался — fail, и тут heartbeat ничего не прячет.
+
+    Обратная сторона: heartbeat пишется только для прогонов без
+    error-маркера, а `sync_seq_logs` возвращает error, когда не ответил ни
+    один инстанс Seq. Так ловится 20.08.2026 — NetworkPolicy перекрыла
+    доступ ко всем восьми инстансам, задача завершалась SUCCESS с rows=0, и
+    отсутствие данных 12,8 часа никого не тревожило.
+    """
+    _mk_service(db)
+    _patch_heartbeat(monkeypatch, minutes_ago=120)   # молчит два часа
+    seq = check_sync_lag(db).detail["per_task"]["kg_seq_logs_sync"]
+    assert seq["status"] == "fail"
+    assert seq["lag_minutes"] >= 119.0
 
 
 def _patch_heartbeat(monkeypatch, minutes_ago=None):

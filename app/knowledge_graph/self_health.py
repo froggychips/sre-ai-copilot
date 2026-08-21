@@ -133,8 +133,24 @@ _SYNC_LAG_TARGETS: Dict[str, Dict[str, Any]] = {
         "interval_minutes": 5,
     },
     "kg_seq_logs_sync": {
-        "column": lambda: func.max(LogObservation.ts),
+        # Свежесть — по ФАКТУ ОПРОСА, а не по наличию записей, той же
+        # логикой, что у kg_anomaly_detection_task. Запись появляется только
+        # когда в окне были Error/Fatal/Warning, а замер на проде
+        # 21.08.2026 показал, что примерно половина 10-минутных окон пусты:
+        # за час на shared-инстансе 7 событий, но в двух окнах подряд ноль.
+        # Порог fail здесь 5×interval = 50 минут, и тихая ночь дала бы
+        # ложный fail.
+        #
+        # Heartbeat при этом не прячет настоящую слепоту: синк возвращает
+        # error-маркер, когда не ответил ни один инстанс, а
+        # `_record_beat_heartbeat` для таких прогонов heartbeat не пишет.
+        # Именно так ловится случай 20.08.2026 — NetworkPolicy перекрыла
+        # доступ ко всем восьми инстансам, и данных не было 12,8 часа.
+        "heartbeat_task": "kg_seq_logs_sync",
         "interval_minutes": 10,
+        # Информационно (в статус не входит): когда последний раз ЧТО-ТО
+        # записали.
+        "column": lambda: func.max(LogObservation.ts),
     },
     "kg_anomaly_detection_task": {
         # Свежесть — по ФАКТУ ПРОГОНА (redis-heartbeat), а не по наличию

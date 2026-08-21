@@ -192,3 +192,63 @@ async def test_count_events_handles_events_envelope():
 
     assert total == 3
     assert len(calls) == 1  # 3 < page_size ⇒ хвост
+
+
+# ---------- отказ Seq не должен выглядеть как тишина ----------------------
+#
+# Прецедент 20.08.2026: NetworkPolicy перекрыла доступ ко всем восьми
+# инстансам Seq. `top_messages` возвращала пустой список и писала причину в
+# debug, синк отчитывался `rows=0`, и 12,8 часа никто не знал, что логи вне
+# обзора — отставание доросло до 751 минуты. Пустота это факт, отказ —
+# отсутствие факта, и смешивать их нельзя.
+
+
+@pytest.mark.asyncio
+async def test_top_messages_raises_on_transport_error():
+    """Сетевой отказ — исключение, а не пустой список."""
+    import httpx
+
+    from app.context.seq_client import SeqQueryError
+
+    mock_client = AsyncMock()
+    mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+    mock_client.__aexit__ = AsyncMock(return_value=False)
+    mock_client.get = AsyncMock(side_effect=httpx.ConnectTimeout("timed out"))
+
+    with patch("httpx.AsyncClient", MagicMock(return_value=mock_client)):
+        c = SeqClient(base_url="https://seq.example", api_key="k")
+        with pytest.raises(SeqQueryError) as exc:
+            await c.top_messages(level="Error", since=_SINCE, until=_UNTIL)
+    assert "ConnectTimeout" in str(exc.value)
+
+
+@pytest.mark.asyncio
+async def test_top_messages_raises_on_http_error():
+    """401/403/500 тоже отказ: «токен не тот» неотличимо от «ошибок нет»."""
+    import httpx
+
+    from app.context.seq_client import SeqQueryError
+
+    resp = MagicMock()
+    resp.raise_for_status = MagicMock(
+        side_effect=httpx.HTTPStatusError("401", request=MagicMock(), response=MagicMock())
+    )
+    mock_client = AsyncMock()
+    mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+    mock_client.__aexit__ = AsyncMock(return_value=False)
+    mock_client.get = AsyncMock(return_value=resp)
+
+    with patch("httpx.AsyncClient", MagicMock(return_value=mock_client)):
+        c = SeqClient(base_url="https://seq.example", api_key="k")
+        with pytest.raises(SeqQueryError):
+            await c.top_messages(level="Error", since=_SINCE, until=_UNTIL)
+
+
+@pytest.mark.asyncio
+async def test_top_messages_empty_result_is_not_an_error():
+    """А вот честно пустое окно — просто пустой список, без исключения."""
+    mock_cls, _ = _paged_client([[]])
+    with patch("httpx.AsyncClient", mock_cls):
+        c = SeqClient(base_url="https://seq.example", api_key="k")
+        events = await c.top_messages(level="Error", since=_SINCE, until=_UNTIL)
+    assert events == []

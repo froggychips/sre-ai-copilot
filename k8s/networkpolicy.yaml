@@ -88,3 +88,39 @@ spec:
     ports:
     - protocol: TCP
       port: 443
+  # Свои же сервисы, доступные ТОЛЬКО через публичный VIP своего ingress:
+  # Seq (wo-api*-prod.lastoasisgame.com) и TeamCity (wo-teamcity...).
+  #
+  # Правило выше их не пропускает, хотя адреса публичные. Обращение к
+  # собственному VIP кластера заворачивается на месте, и DNAT подменяет
+  # получателя на приватный адрес пода ingress-контроллера — а приватные
+  # сети из ipBlock исключены. Итог: пакет уходит в DROP, соединение
+  # висит до таймаута.
+  #
+  # Прецедент 20.08.2026. Политику применили в 18:08; последняя запись
+  # kg_log_observations — 17:50. Три синка ослепли одновременно и молча:
+  # `kg_seq_logs_sync` (8 инстансов Seq → rows=0, отставание доросло до
+  # 751 минуты), `kg_nats_subjects_sync` и `deploy_stream_ingestion`
+  # (TeamCity «вернул 0 deploy-билдов за 24h»). Проверено из пода:
+  # api.anthropic.com:443 и discord.com:443 доступны, а 195.154.208.49 и
+  # 195.154.204.76 — TimeoutError. То есть политика пускала воркер в любой
+  # адрес интернета и запрещала ровно свои источники данных.
+  #
+  # Селекторы вместо IP намеренно: VIP переезжают между
+  # ingress-контроллерами (у prod их пять), а метка на поде не меняется.
+  - to:
+    - namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: cattle-system
+      podSelector:
+        matchLabels:
+          app: ingress-prod-controller
+    - namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: infra-2
+      podSelector:
+        matchLabels:
+          app: nginx-ingress
+    ports:
+    - protocol: TCP
+      port: 443
