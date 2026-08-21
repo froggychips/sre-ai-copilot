@@ -213,6 +213,34 @@ def test_event_rate_metric_stops_being_written_is_a_failure(db):
     assert pm["missing_pct"] == 100.0
 
 
+def test_materialization_share_never_exceeds_one_hundred_percent(db):
+    """Доля пропусков физически не может быть больше 100%.
+
+    Регрессия на прод-замер 21.08.2026: `http_5xx_rate missing=100.5%`.
+    Знаменатель считался отдельным запросом и раньше числителей, а
+    metrics_sync успевал вставить строки между ними. Само число безобидное,
+    но проверка, печатающая невозможную величину, перестаёт быть
+    свидетельством. Теперь всё берётся одним запросом — одним снимком.
+    """
+    svc = _mk_service(db)
+    now = datetime.utcnow()
+    for i in range(30):
+        _mk_health_row(
+            db, svc,
+            ts=now - timedelta(minutes=5 * i),
+            cpu_pct=0.0, mem_pct=0.0,
+            restarts_rate=None, http_5xx_rate=None, p95_latency_ms=None,
+        )
+    db.commit()
+
+    result = check_materialization_zero_rate(db)
+    for name, info in result.detail["per_metric"].items():
+        assert 0.0 <= info["missing_pct"] <= 100.0, f"{name}: {info['missing_pct']}%"
+        assert info["rows"] == result.detail["total_rows"], (
+            f"{name}: знаменатель разъехался с общим числом строк"
+        )
+
+
 def test_materialization_zero_rate_no_data_returns_ok(db):
     """Нет записей — это вотчина sync_lag, тут не плодим дубли."""
     result = check_materialization_zero_rate(db)
