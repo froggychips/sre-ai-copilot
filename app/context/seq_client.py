@@ -49,6 +49,15 @@ def _iso(ts: datetime) -> str:
     return ts.isoformat(timespec="seconds")
 
 
+class SeqQueryError(RuntimeError):
+    """Seq не ответил. Это НЕ то же самое, что «событий не найдено».
+
+    Вызывающий обязан различать: пустой результат означает тихое окно и
+    записывать нечего, а исключение — что состояние логов неизвестно и
+    делать вывод «ошибок нет» неправомерно.
+    """
+
+
 class SeqClient:
     """Тонкая обёртка над Seq `/api/events` для count + top-messages.
 
@@ -202,11 +211,15 @@ class SeqClient:
                 r.raise_for_status()
                 data = r.json()
         except Exception as e:
-            logger.debug(
-                "seq_client.top_failed url=%s level=%s err=%s",
-                self._url, level, e,
-            )
-            return []
+            # Раньше здесь возвращался пустой список, а сообщение уходило в
+            # debug. Отказ становился неотличим от «событий нет»: 20.08.2026
+            # NetworkPolicy перекрыла доступ к Seq, и синк 12,8 часа честно
+            # отчитывался `rows=0`, пока отставание не доросло до 751 минуты.
+            # Пустота — это факт, отказ — отсутствие факта; смешивать их
+            # нельзя, иначе слепота выглядит как тишина.
+            raise SeqQueryError(
+                f"seq {self._url} level={level}: {type(e).__name__}: {e}"
+            ) from e
         # Seq REST возвращает list[Event] или {"Events": [...]} в зависимости
         # от endpoint-режима. Нормализуем.
         if isinstance(data, dict) and "Events" in data:
