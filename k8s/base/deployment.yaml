@@ -16,6 +16,20 @@ metadata:
   name: sre-ai-api
 spec:
   replicas: 2
+  # Явные числа вместо дефолтных 25%. При двух репликах 25% даёт maxSurge=1
+  # (округление вверх) и maxUnavailable=0 (округление вниз), то есть k8s
+  # обязан поднять новый под и дождаться его готовности, прежде чем гасить
+  # старый. Обновление выходит строго последовательным: до 60s startupProbe
+  # на пода плюс 30s терминации — три выката подряд 21.08.2026 не укладывались
+  # в 300s таймаута deploy.sh и отчитывались ложным «Deploy FAILED».
+  #
+  # maxUnavailable=1 допустим: PodDisruptionBudget ниже требует minAvailable=1,
+  # и при двух репликах одна остаётся обслуживать запросы.
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 1
   selector:
     matchLabels:
       app: sre-ai-api

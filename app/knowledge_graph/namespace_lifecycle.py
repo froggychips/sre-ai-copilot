@@ -34,7 +34,7 @@ from app.core.timeutil import parse_ts
 from app.knowledge_graph.kubectl_breaker import run_kubectl
 from app.knowledge_graph.schema import (NS_STATE_ACTIVE, NS_STATE_MISSING,
                                         Namespace, Service,
-                                        ServiceEdge)
+                                        ServiceEdge, ServiceHealth)
 from app.services.audit_logger import audit_service
 
 log = structlog.get_logger()
@@ -200,6 +200,140 @@ def purge_stale_edges_after_reincarnation(
         db.commit()
         stats["applied"] = True
     log.info("kg_namespace.reincarnation_purge", **stats)
+    return stats
+
+
+def purge_stale_health_after_reincarnation(
+    db: Session, now: Optional[datetime] = None, apply: bool = False,
+) -> Dict[str, Any]:
+    """Убрать health-точки, снятые с прежнего воплощения стенда.
+
+    Зачем это важнее, чем кажется. Детектор аномалий строит baseline по
+    последним семи дням `kg_service_health`. Если стенд пересоздали, в это
+    окно попадают замеры ПРЕЖНЕГО стенда — другого по составу и нагрузке, —
+    и новый сравнивается со старым.
+
+    Замер 21.08.2026: 262 657 точек прежних инкарнаций внутри baseline-окна
+    (12% от 2 135 538 за семь дней), затронуто 797 сервисов. Всего таких
+    точек в базе 1 393 632. Для сравнения: аномалий за сутки 21 303 на 859
+    сервисов, и 133 из них аномальны больше двадцати часов из двадцати
+    четырёх — то есть «аномалия» стала их постоянным состоянием, что для
+    аномалии само по себе противоречие.
+
+    Проблема названа ещё в docstring теста инкарнаций: «squad-1-shared имеет
+    узлы на 82 дня старше самого namespace, к ним прилипло 39 775
+    health-точек прошлой инкарнации, и детектор аномалий сравнивает новый
+    стенд со старым». Здесь это наконец убирается.
+
+    Защиты те же, что у чистки рёбер, и по тем же причинам: grace-период
+    (метрики пишутся раз в десять минут, но `kg_metrics_sync` мог не успеть
+    пройти) и guard на долю — если под удаление попало почти всё, объяснение
+    скорее в сломанной таблице `kg_namespaces`, чем в реальности.
+    """
+    stamp = now or datetime.utcnow()
+    stats: Dict[str, Any] = {
+        "namespaces_checked": 0, "namespaces_purged": 0,
+        "points_deleted": 0, "skipped_in_grace": 0, "skipped_guard": 0,
+        "applied": False,
+    }
+
+    rows = (
+        db.query(Namespace)
+        .filter(Namespace.incarnation > 1,
+                Namespace.state == NS_STATE_ACTIVE,
+                Namespace.first_seen_at.isnot(None))
+        .all()
+    )
+    for ns_row in rows:
+        stats["namespaces_checked"] += 1
+        born = cast(datetime, ns_row.first_seen_at)
+        if stamp - born < _REINCARNATION_GRACE:
+            stats["skipped_in_grace"] += 1
+            continue
+
+        node_ids = [
+            nid for (nid,) in
+            db.query(Service.id).filter(Service.namespace == ns_row.namespace).all()
+        ]
+        if not node_ids:
+            continue
+
+        total = (
+            db.query(func.count(ServiceHealth.id))
+            .filter(ServiceHealth.service_id.in_(node_ids))
+            .scalar()
+        ) or 0
+        stale = (
+            db.query(func.count(ServiceHealth.id))
+            .filter(ServiceHealth.service_id.in_(node_ids),
+                    ServiceHealth.ts < born)
+            .scalar()
+        ) or 0
+        if not stale:
+            continue
+
+        # Guard здесь НЕ долевой, в отличие от чистки рёбер, и это разница
+        # по существу. У пересозданного стенда естественно, что почти вся
+        # история относится к прежней инкарнации: метрики пишутся раз в
+        # десять минут, а история живёт тридцать дней. Долевой порог
+        # (проба 21.08.2026 с ним) отсёк 11 namespace из 22 — ровно те, где
+        # baseline загрязнён сильнее всего и чистка нужнее.
+        #
+        # Опасность здесь другая: неверный `first_seen_at`. Если lifecycle
+        # ошибочно пометит стенд заново рождённым, под удаление уйдёт вся
+        # история. Защита от этого — потребовать доказательство, что НОВЫЙ
+        # стенд действительно пишет метрики: хотя бы одна точка новее
+        # рождения. Нет таких — значит либо метрики не идут, либо
+        # `first_seen_at` врёт, и в обоих случаях удалять нечего.
+        fresh = (
+            db.query(func.count(ServiceHealth.id))
+            .filter(ServiceHealth.service_id.in_(node_ids),
+                    ServiceHealth.ts >= born)
+            .scalar()
+        ) or 0
+        if fresh == 0:
+            stats["skipped_guard"] += 1
+            log.warning(
+                "kg_namespace.health_purge_skipped_no_fresh_points",
+                namespace=ns_row.namespace, stale=stale, total=total,
+            )
+            continue
+
+        stats["namespaces_purged"] += 1
+        stats["points_deleted"] += stale
+        if not apply:
+            continue
+
+        # Удаляем порциями по времени, а не по списку id: точек бывает
+        # десятки тысяч на namespace, и держать их идентификаторы в памяти
+        # незачем — воркер уже ловил OOM на списках такого порядка.
+        deleted = 0
+        while True:
+            batch_ids = [
+                hid for (hid,) in
+                db.query(ServiceHealth.id)
+                .filter(ServiceHealth.service_id.in_(node_ids),
+                        ServiceHealth.ts < born)
+                .limit(2000).all()
+            ]
+            if not batch_ids:
+                break
+            db.query(ServiceHealth).filter(
+                ServiceHealth.id.in_(batch_ids)
+            ).delete(synchronize_session=False)
+            db.commit()
+            deleted += len(batch_ids)
+        audit_service.log_event("KG_NAMESPACE_HEALTH_PURGED", {
+            "namespace": ns_row.namespace,
+            "incarnation": ns_row.incarnation,
+            "points_deleted": deleted,
+            "points_total": total,
+        })
+
+    if apply:
+        db.commit()
+        stats["applied"] = True
+    log.info("kg_namespace.health_purge", **stats)
     return stats
 
 

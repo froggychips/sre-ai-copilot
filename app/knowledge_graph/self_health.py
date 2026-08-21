@@ -416,11 +416,40 @@ def check_sync_lag(db: Session) -> CheckResult:
     )
 
 
+#: Доля сервисов, для которых аномалия стала ПОСТОЯННЫМ состоянием, выше
+#: которой детектор считается зашумлённым. «Постоянное» — аномалии больше
+#: чем в 20 часах из 24: такой сервис не отклоняется от нормы, у него
+#: сменилась норма, а baseline об этом не знает.
+_ANOMALY_ALWAYS_ON_SHARE_WARN = 0.25
+
+#: Сколько часов из 24 достаточно, чтобы счесть аномальность постоянной.
+_ANOMALY_ALWAYS_ON_HOURS = 20
+
+
 def check_anomaly_signal_health(db: Session) -> CheckResult:
     """Зрелость anomaly-detector'а за последние 24h.
 
-    0 observations → warn (либо threshold mute-ит всё, либо детектор не работает).
-    >500 → warn (overload, нужно поднимать threshold).
+    Абсолютный порог «>500 наблюдений = детектор шумит» здесь стоял с эпохи,
+    когда сервисов было в разы меньше. Замер 21.08.2026: 11 325 сервисов в
+    графе, аномалии за сутки у 859 из них — 7,6%, вполне здоровая доля, — а
+    наблюдений 21 303. Проверка держалась в warn постоянно и ничего этим не
+    сообщала: пятьсот стало недостижимым числом, а не признаком болезни.
+
+    Что действительно отличает шум от работы — не количество, а сервисы, у
+    которых аномалия перестала быть событием. Тот же замер: 133 сервиса
+    аномальны больше двадцати часов из двадцати четырёх. У такого сервиса не
+    «отклонение от нормы», а сменившаяся норма, о которой baseline не знает.
+
+    Главная причина этого известна и лечится отдельно: детектор строит
+    baseline по семи дням `kg_service_health`, а после пересоздания стенда в
+    окно попадают замеры ПРЕЖНЕГО — 262 657 точек, 797 затронутых сервисов
+    (см. `namespace_lifecycle.purge_stale_health_after_reincarnation`).
+
+    Поэтому проверка смотрит на два признака:
+      * ноль наблюдений за сутки → warn: либо порог глушит всё, либо
+        детектор не ходит;
+      * доля постоянно-аномальных среди аномальных выше 25% → warn:
+        детектор сообщает не о событиях, а о своём отставании от реальности.
     """
     since = _now() - timedelta(hours=24)
     count = (
@@ -429,18 +458,54 @@ def check_anomaly_signal_health(db: Session) -> CheckResult:
         .scalar()
     ) or 0
     if count == 0:
-        status = "warn"
-        reason = "no anomaly observations in 24h (detector silent?)"
-    elif count > 500:
-        status = "warn"
-        reason = "anomaly observations >500 in 24h (threshold too sensitive?)"
-    else:
-        status = "ok"
-        reason = "in healthy range [1, 500]"
+        return CheckResult(
+            name="anomaly_signal_health",
+            status="warn",
+            detail={"count_24h": 0,
+                    "reason": "no anomaly observations in 24h (detector silent?)"},
+        )
+
+    # Сколько РАЗНЫХ часов сервис был аномален. Часы, а не наблюдения:
+    # volume guard и так режет до трёх наблюдений в час, и считать их значило
+    # бы мерить настройку guard'а, а не поведение метрики.
+    hours_per_service = (
+        db.query(
+            AnomalyObservation.service_id,
+            func.count(func.distinct(
+                func.strftime("%Y-%m-%d %H", AnomalyObservation.ts)
+                if db.bind and db.bind.dialect.name == "sqlite"
+                else func.date_trunc("hour", AnomalyObservation.ts)
+            )).label("hours"),
+        )
+        .filter(AnomalyObservation.ts >= since)
+        .group_by(AnomalyObservation.service_id)
+        .all()
+    )
+    services_with_anomalies = len(hours_per_service)
+    always_on = sum(
+        1 for (_sid, hours) in hours_per_service
+        if (hours or 0) > _ANOMALY_ALWAYS_ON_HOURS
+    )
+    share = always_on / services_with_anomalies if services_with_anomalies else 0.0
+
+    status = "warn" if share > _ANOMALY_ALWAYS_ON_SHARE_WARN else "ok"
+    reason = (
+        f"{always_on} из {services_with_anomalies} сервисов аномальны "
+        f">{_ANOMALY_ALWAYS_ON_HOURS}ч из 24 — у них сменилась норма, "
+        "а baseline об этом не знает"
+    ) if status == "warn" else "детектор сообщает о событиях, а не о своём отставании"
+
     return CheckResult(
         name="anomaly_signal_health",
         status=status,
-        detail={"count_24h": count, "reason": reason},
+        detail={
+            "count_24h": count,
+            "services_with_anomalies": services_with_anomalies,
+            "always_on_services": always_on,
+            "always_on_share": round(share, 3),
+            "always_on_share_warn": _ANOMALY_ALWAYS_ON_SHARE_WARN,
+            "reason": reason,
+        },
     )
 
 
