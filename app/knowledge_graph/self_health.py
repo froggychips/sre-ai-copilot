@@ -43,7 +43,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Sequence
 
 import structlog
-from sqlalchemy import func, or_
+from sqlalchemy import case, func, or_
 from sqlalchemy.orm import Session, aliased
 
 from app.config import settings
@@ -252,11 +252,36 @@ def check_materialization_zero_rate(db: Session) -> CheckResult:
     per_metric: Dict[str, Dict[str, Any]] = {}
     worst_status = "ok"
 
-    total_rows = (
-        db.query(func.count(ServiceHealth.id))
-        .filter(ServiceHealth.ts >= since)
-        .scalar()
-    ) or 0
+    # Знаменатель и все числители — ОДНИМ запросом, одним снимком данных.
+    # Раньше total_rows считался отдельно и раньше остальных, а метрики —
+    # по одному запросу на колонку. Между запросами metrics_sync успевал
+    # вставить строки, и доля выходила больше 100%: замер на проде
+    # 21.08.2026 показал `http_5xx_rate missing=100.5%`. Число само по себе
+    # безобидное, но проверка, печатающая невозможную величину, перестаёт
+    # быть свидетельством.
+    row = db.query(
+        func.count(ServiceHealth.id),
+        *[
+            func.sum(
+                case(
+                    (
+                        getattr(ServiceHealth, m).is_(None)
+                        if m in _EVENT_RATE_METRICS
+                        else or_(getattr(ServiceHealth, m).is_(None),
+                                 getattr(ServiceHealth, m) == 0),
+                        1,
+                    ),
+                    else_=0,
+                )
+            )
+            for m in _SERVICE_HEALTH_METRICS
+        ],
+    ).filter(ServiceHealth.ts >= since).one()
+
+    total_rows = int(row[0] or 0)
+    missing_by_metric = {
+        m: int(row[i + 1] or 0) for i, m in enumerate(_SERVICE_HEALTH_METRICS)
+    }
 
     if total_rows == 0:
         # Нет данных вообще — это вотчина sync_lag check'а, тут возвращаем ok
@@ -268,17 +293,10 @@ def check_materialization_zero_rate(db: Session) -> CheckResult:
         )
 
     for metric in _SERVICE_HEALTH_METRICS:
-        col = getattr(ServiceHealth, metric)
         # Для счётчика событий «пропало» значит NULL: ноль там — законный
         # ответ «ничего не произошло». Для gauge ноль тоже подозрителен.
         is_event_rate = metric in _EVENT_RATE_METRICS
-        criterion = col.is_(None) if is_event_rate else or_(col.is_(None), col == 0)
-        missing = (
-            db.query(func.count(ServiceHealth.id))
-            .filter(ServiceHealth.ts >= since)
-            .filter(criterion)
-            .scalar()
-        ) or 0
+        missing = missing_by_metric[metric]
         rate = missing / total_rows if total_rows else 0.0
         per_metric[metric] = {
             "missing_pct": round(rate * 100, 1),
