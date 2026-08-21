@@ -395,6 +395,15 @@ class Settings(BaseSettings):
     # audit-log + опциональный Discord embed в отдельный dev-канал (НЕ в
     # #infra-error чтоб не плодить шум). Default ON — проверки read-only,
     # дешёвые, ничего не ломают.
+    # Периодический ремонт рёбер uses_db, ведущих в базу чужого окружения.
+    # Разовым прогоном не закрывается: 21.08.2026 перенос 3740 рёбер вышел в
+    # ok, а через сорок минут в отборе снова было 64 — пересоздание сквада
+    # (squad-10, incarnation 3) вернуло его namespace в active, и старые
+    # рёбра от 08.08 снова стали ложью о работающем окружении.
+    KG_DB_EDGE_REHOME_ENABLED: bool = Field(
+        True,
+        description="Включить периодический перенос uses_db-рёбер в своё окружение",
+    )
     KG_SELF_HEALTH_ENABLED: bool = Field(True, description="Включить KG self-health canary task")
     # Метрики, которые легально могут быть = 0 (TODO в metrics_sync до тех пор
     # пока WO scrape config не подключит nginx_ingress/application-метрики во

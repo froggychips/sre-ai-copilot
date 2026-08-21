@@ -332,3 +332,34 @@ def test_namespace_without_a_realm_is_out_of_scope(db):
     assert stats["stale_edges"] == 0
     db.refresh(edge)
     assert edge.dst_id == prod_db.id
+
+
+# ── периодическая задача ──────────────────────────────────────────────────
+
+
+def test_task_is_scheduled_after_namespace_lifecycle():
+    """Отбор опирается на состояние namespace — считать его надо по свежей таблице.
+
+    `kg_namespace_lifecycle` идёт на :3,13,23,33,43,53, перенос — на :07.
+    Порядок важен: 21.08.2026 в отборе появились 64 ребра только потому, что
+    lifecycle перевёл пересозданный `squad-10-kingdom2` из missing в active.
+    """
+    from app.workers.tasks import celery_app
+
+    sched = celery_app.conf.beat_schedule
+    assert "kg-db-edge-rehome" in sched
+    entry = sched["kg-db-edge-rehome"]
+    assert entry["task"] == "kg_db_edge_rehome"
+    # crontab(minute="7") — раз в час, заведомо позже ближайшего :3
+    assert 7 in entry["schedule"].minute
+    lifecycle_minutes = sched["kg-namespace-lifecycle"]["schedule"].minute
+    assert min(m for m in (7,)) > min(lifecycle_minutes)
+
+
+def test_task_respects_the_disable_flag(monkeypatch):
+    """Задача пишет в граф — выключатель на такое обязателен."""
+    from app.config import settings
+    from app.workers.tasks import kg_db_edge_rehome_task
+
+    monkeypatch.setattr(settings, "KG_DB_EDGE_REHOME_ENABLED", False)
+    assert kg_db_edge_rehome_task() == {"status": "disabled"}

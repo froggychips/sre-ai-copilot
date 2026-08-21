@@ -216,6 +216,17 @@ celery_app.conf.beat_schedule = {
         "schedule": crontab(minute="3,13,23,33,43,53"),
         "options": {"expires": 540},
     },
+    "kg-db-edge-rehome": {
+        "task": "kg_db_edge_rehome",
+        # Раз в час и на :07 — заведомо ПОСЛЕ kg_namespace_lifecycle
+        # (:3,13,23,...): отбор опирается на состояние namespace, и считать
+        # его надо по свежей таблице. Чаще незачем — источник пополняется
+        # только при пересоздании окружений.
+        "schedule": crontab(minute="7"),
+        # Меньше часового интервала: иначе в очереди могли бы жить два тика
+        # одной задачи, а она пишет в граф.
+        "options": {"expires": 1800},
+    },
     "kg-drift-cleanup": {
         "task": "kg_drift_cleanup",
         "schedule": crontab(minute=17),  # ежечасно в 17 мин
@@ -758,6 +769,47 @@ def kg_namespace_lifecycle_task():
         return sync_namespace_lifecycle(db)
     except Exception as e:
         logger.warning("kg_namespace_lifecycle.failed: %s", e)
+        db.rollback()
+        return {"error": str(e)}
+    finally:
+        db.close()
+
+
+@celery_app.task(name="kg_db_edge_rehome")
+@single_instance(ttl_seconds=1800)
+def kg_db_edge_rehome_task():
+    """Вернуть рёбра `uses_db` в базы своего окружения.
+
+    Разовым скриптом это не закрывается, и вот почему. 21.08.2026 перенос
+    3740 рёбер прошёл, проверка вышла в ok — а через сорок минут в графе
+    снова оказалось 64 таких ребра. Разбор: рёбра созданы 08.08 и никуда не
+    появлялись, изменилось СОСТОЯНИЕ источника. `squad-10-kingdom2`
+    пересоздали (incarnation 3, namespace в кластере моложе получаса), он
+    перешёл из missing в active, и его старые рёбра на базы удалённого
+    preprod-kingdom1 снова стали ложью о работающем окружении.
+
+    Пока сквады пересоздаются, а старые рёбра переживают смену инкарнации,
+    отбор будет пополняться сам. Поэтому задача периодическая, а не
+    одноразовая.
+
+    Идемпотентна: на исправленном графе — no-op. Ничего не создаёт: если
+    правильного узла в своём окружении нет, ребро остаётся на месте (так
+    ведут себя, например, рёбра снесённого squad-20-shared, у которого
+    db-узлов в графе нет вовсе).
+
+    Отключается `KG_DB_EDGE_REHOME_ENABLED=false`: задача пишет в граф, и
+    выключатель на такое нужен.
+    """
+    if not settings.KG_DB_EDGE_REHOME_ENABLED:
+        return {"status": "disabled"}
+
+    from app.knowledge_graph.db_edge_rehome import rehome_db_edges
+
+    db = SessionLocal()
+    try:
+        return rehome_db_edges(db, apply=True)
+    except Exception as e:
+        logger.warning("kg_db_edge_rehome.failed: %s", e)
         db.rollback()
         return {"error": str(e)}
     finally:
