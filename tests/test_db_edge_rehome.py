@@ -251,3 +251,115 @@ def test_undo_is_a_noop_without_a_journal(db):
     stats = undo_rehome(db, apply=True)
     assert stats["marked_edges"] == 0
     assert stats["restored"] == 0
+
+
+# ── чужое окружение, но ЖИВОЕ ─────────────────────────────────────────────
+#
+# Первый прогон переноса 21.08.2026 закрыл только рёбра в удалённые
+# namespace. После него в графе осталось 1900 кросс-окруженческих рёбер,
+# включая двенадцать вида «прод-сервис ходит в базу препрода»: все семь
+# bot-service из prod-kingdom1..7 указывали на
+# preprod-kingdom2/db:postgres:map-coordinator, хотя
+# prod-shared/db:postgres:map-coordinator существует. Живой
+# namespace-получатель делал эту ложь незаметной для проверки, которая
+# смотрела только на state='missing'.
+
+
+def test_prod_service_pointing_at_preprod_db_is_rehomed(db):
+    """Прод не ходит в базу препрода — даже если препрод жив и здоров."""
+    _ns(db, "prod-kingdom1", "active")
+    _ns(db, "prod-shared", "active")
+    _ns(db, "preprod-kingdom2", "active")
+    wrong = _svc(db, "db:postgres:map-coordinator", "preprod-kingdom2")
+    right = _svc(db, "db:postgres:map-coordinator", "prod-shared")
+    bot = _svc(db, "bot-service", "prod-kingdom1")
+    edge = _edge(db, bot, wrong)
+    db.commit()
+
+    stats = rehome_db_edges(db, apply=True)
+    assert stats["repointed"] == 1
+    db.refresh(edge)
+    assert edge.dst_id == right.id
+    assert edge.extras["rehomed_from"] == "preprod-kingdom2"
+
+
+def test_edge_within_the_same_realm_is_left_alone(db):
+    """Своё окружение — не трогаем: kingdom и shared одного realm это одно."""
+    _ns(db, "prod-kingdom1", "active")
+    _ns(db, "prod-shared", "active")
+    own_db = _svc(db, "db:postgres:town", "prod-shared")
+    svc = _svc(db, "town-service", "prod-kingdom1")
+    edge = _edge(db, svc, own_db)
+    db.commit()
+
+    stats = rehome_db_edges(db, apply=True)
+    assert stats["stale_edges"] == 0
+    db.refresh(edge)
+    assert edge.dst_id == own_db.id
+
+
+def test_dead_squad_without_its_own_db_is_left_alone(db):
+    """Снесённый сквад без своих БД: переносить некуда, и это не ошибка.
+
+    Замер 21.08.2026: 100 таких рёбер, все из squad-20-shared — namespace
+    в кластере отсутствует, а db-узлов у него в графе нет ни одного (280
+    узлов, из них db: 0). Их уберёт retention вместе с самим сквадом.
+    """
+    _ns(db, "squad-20-shared", "missing")
+    _ns(db, "preprod-shared", "active")
+    shared_db = _svc(db, "db:postgres:config", "preprod-shared")
+    dead_svc = _svc(db, "config-service", "squad-20-shared")
+    edge = _edge(db, dead_svc, shared_db)
+    db.commit()
+
+    stats = rehome_db_edges(db, apply=True)
+    assert stats["no_target"] == 1
+    assert stats["repointed"] == 0
+    db.refresh(edge)
+    assert edge.dst_id == shared_db.id
+
+
+def test_namespace_without_a_realm_is_out_of_scope(db):
+    """`sre-ai`, `monitoring` — судить о «своём окружении» для них не на чем."""
+    _ns(db, "sre-ai", "active")
+    _ns(db, "prod-shared", "active")
+    prod_db = _svc(db, "db:postgres:town", "prod-shared")
+    own = _svc(db, "copilot-worker", "sre-ai")
+    edge = _edge(db, own, prod_db)
+    db.commit()
+
+    stats = rehome_db_edges(db, apply=True)
+    assert stats["stale_edges"] == 0
+    db.refresh(edge)
+    assert edge.dst_id == prod_db.id
+
+
+# ── периодическая задача ──────────────────────────────────────────────────
+
+
+def test_task_is_scheduled_after_namespace_lifecycle():
+    """Отбор опирается на состояние namespace — считать его надо по свежей таблице.
+
+    `kg_namespace_lifecycle` идёт на :3,13,23,33,43,53, перенос — на :07.
+    Порядок важен: 21.08.2026 в отборе появились 64 ребра только потому, что
+    lifecycle перевёл пересозданный `squad-10-kingdom2` из missing в active.
+    """
+    from app.workers.tasks import celery_app
+
+    sched = celery_app.conf.beat_schedule
+    assert "kg-db-edge-rehome" in sched
+    entry = sched["kg-db-edge-rehome"]
+    assert entry["task"] == "kg_db_edge_rehome"
+    # crontab(minute="7") — раз в час, заведомо позже ближайшего :3
+    assert 7 in entry["schedule"].minute
+    lifecycle_minutes = sched["kg-namespace-lifecycle"]["schedule"].minute
+    assert min(m for m in (7,)) > min(lifecycle_minutes)
+
+
+def test_task_respects_the_disable_flag(monkeypatch):
+    """Задача пишет в граф — выключатель на такое обязателен."""
+    from app.config import settings
+    from app.workers.tasks import kg_db_edge_rehome_task
+
+    monkeypatch.setattr(settings, "KG_DB_EDGE_REHOME_ENABLED", False)
+    assert kg_db_edge_rehome_task() == {"status": "disabled"}

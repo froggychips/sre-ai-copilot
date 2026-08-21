@@ -328,13 +328,25 @@ spec:
         # app/config.py пустой, а пустой = auto-discovery: потеря этой
         # переменной сменила бы область сканирования целиком.
         #
-        # Список зафиксирован из кластера 21.08.2026 как есть, чтобы
-        # применение манифеста ничего не меняло. Он УСТАРЕЛ: preprod-kingdom1
-        # в кластере не существует с 15.08 (именно на его db-узлах повисли
-        # 3612 рёбер, см. db_edge_rehome), а часть squad-* снесена. Ревизия
-        # списка — отдельная задача, не для коммита про дрейф.
+        # Ревизия 21.08.2026: из 25 записей девять указывали на namespace,
+        # которых в кластере нет. Убраны:
+        #
+        #   preprod-kingdom1, preprod-kingdom3, preupdate-kingdom1, preupdate-kingdom2, preupdate-kingdom3,
+        #   squad-3-kingdom5, squad-11-kingdom2, squad-13-kingdom5, squad-19-shared
+        #
+        # Держать их в списке — не безобидно: синк ходит в несуществующий
+        # namespace каждый тик, а `preprod-kingdom1` вдобавок оставался в
+        # графе как namespace с db-узлами, на которые ссылались 3740 рёбер
+        # (см. db_edge_rehome).
+        #
+        # Осталось 16 записей. Отдельный вопрос, который этой правкой
+        # НЕ закрыт: в кластере 98 прикладных namespace (79 из них squad-*),
+        # то есть 82 остаются вне обзора синка. Это та же слепая зона,
+        # что описана в docstring namespace_lifecycle. Расширение охвата в
+        # четыре раза требует замера — kg_topology_sync ходит per-namespace,
+        # и OOM-и воркера в этом проекте уже случались.
         - name: KG_SCAN_NAMESPACES
-          value: "preprod-kingdom1,preprod-kingdom2,preprod-kingdom3,preprod-shared,preupdate-kingdom1,preupdate-kingdom2,preupdate-kingdom3,preupdate-kingdom5,preupdate-shared,prod-kingdom1,prod-kingdom2,prod-kingdom3,prod-kingdom4,prod-kingdom5,prod-lo-legal,prod-shared,squad-2-kingdom2,squad-3-kingdom5,squad-3-shared,squad-9-kingdom2,squad-9-shared,squad-11-kingdom2,squad-13-kingdom5,squad-13-shared,squad-19-shared"
+          value: "preprod-kingdom2,preprod-shared,preupdate-kingdom5,preupdate-shared,prod-kingdom1,prod-kingdom2,prod-kingdom3,prod-kingdom4,prod-kingdom5,prod-lo-legal,prod-shared,squad-2-kingdom2,squad-3-shared,squad-9-kingdom2,squad-9-shared,squad-13-shared"
         # Дефолт False: periodic backfill team_owner.
         - name: OWNERSHIP_BACKFILL_ENABLED
           value: "true"

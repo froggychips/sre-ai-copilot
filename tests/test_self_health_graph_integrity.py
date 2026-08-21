@@ -159,3 +159,63 @@ def test_mass_dangling_edges_fail(db):
     r = check_graph_integrity(db)
     assert r.status == "fail"
     assert r.detail["dangling_edges"] == 60
+
+
+def test_cross_realm_db_edge_with_an_own_node_is_a_failure(db):
+    """Прод ходит в базу препрода — ложь, даже когда препрод жив.
+
+    Первая версия инварианта смотрела только на `state='missing'`, и после
+    переноса 3740 рёбер в графе осталось 1900 кросс-окруженческих, из них у
+    1800 правильный узел в своём окружении существовал. Двенадцать были
+    прямой ложью о проде: все семь `bot-service` из prod-kingdom1..7
+    указывали на `preprod-kingdom2/db:postgres:map-coordinator` при живом
+    `prod-shared/db:postgres:map-coordinator`.
+    """
+    _ns(db, "prod-kingdom1", "active")
+    _ns(db, "prod-shared", "active")
+    _ns(db, "preprod-kingdom2", "active")
+    _svc(db, "db:postgres:map-coordinator", "prod-shared")      # свой узел ЕСТЬ
+    wrong = _svc(db, "db:postgres:map-coordinator", "preprod-kingdom2")
+    for i in range(150):     # выше порога fail
+        bot = _svc(db, f"bot-service-{i}", "prod-kingdom1")
+        _edge(db, bot.id, wrong.id, kind="uses_db")
+    db.commit()
+
+    r = check_graph_integrity(db)
+    assert r.status == "fail"
+    assert r.detail["cross_realm_db_edges"] == 150
+    assert r.detail["live_edges_into_missing_ns_db"] == 0
+
+
+def test_cross_realm_edge_without_an_own_node_is_not_counted(db):
+    """Нет своего узла — переносить некуда, и держать fail не за что.
+
+    Замер 21.08.2026: 100 таких рёбер, все из снесённого `squad-20-shared`,
+    у которого db-узлов в графе нет ни одного. Их уберёт retention вместе
+    со сквадом; сигнал, на который нельзя ответить, — это шум.
+    """
+    _ns(db, "squad-20-shared", "missing")
+    _ns(db, "preprod-shared", "active")
+    shared_db = _svc(db, "db:postgres:config", "preprod-shared")
+    for i in range(150):
+        svc = _svc(db, f"config-service-{i}", "squad-20-shared")
+        _edge(db, svc.id, shared_db.id, kind="uses_db")
+    db.commit()
+
+    r = check_graph_integrity(db)
+    assert r.detail["cross_realm_db_edges"] == 0
+    assert r.status == "ok"
+
+
+def test_same_realm_kingdom_to_shared_is_normal(db):
+    """kingdom и shared одного realm — одно окружение, а не разные."""
+    _ns(db, "prod-kingdom1", "active")
+    _ns(db, "prod-shared", "active")
+    own = _svc(db, "db:postgres:town", "prod-shared")
+    svc = _svc(db, "town-service", "prod-kingdom1")
+    _edge(db, svc.id, own.id, kind="uses_db")
+    db.commit()
+
+    r = check_graph_integrity(db)
+    assert r.detail["cross_realm_db_edges"] == 0
+    assert r.status == "ok"
