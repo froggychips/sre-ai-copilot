@@ -943,25 +943,62 @@ class Settings(BaseSettings):
                     "SAFE_MODE=false is forbidden in production. "
                     "Either set SAFE_MODE=true or change ENV."
                 )
-            if not self.ALERTMANAGER_WEBHOOK_SECRET:
+            # Явный опт-аут здесь законен, и вот почему. Стоковый
+            # AlertManager / VMAlertmanager НЕ УМЕЕТ подписывать body — это
+            # записано в k8s/vmalertmanagerconfig.yaml вместе с двумя
+            # рабочими вариантами: signing-proxy рядом с alertmanager либо
+            # изоляция трафика NetworkPolicy без секрета. В кластере выбран
+            # второй, и `ALERTMANAGER_ALLOW_UNAUTHENTICATED=true` стоит в
+            # поде именно поэтому.
+            #
+            # Валидатор этот флаг игнорировал и требовал HMAC от отправителя,
+            # который его не умеет. Итог 20.08.2026: манифесты с
+            # ENV=production не разворачивались вовсе — все три компонента
+            # уходили в CrashLoopBackOff на старте, а прод жил на ревизии,
+            # где ENV не задан, то есть на конфигурации, которой нет в git.
+            #
+            # Требование секрета осталось; снять его можно только ЯВНЫМ
+            # флагом, а не забыв заполнить переменную.
+            if not self.ALERTMANAGER_WEBHOOK_SECRET and not (
+                self.ALERTMANAGER_ALLOW_UNAUTHENTICATED
+            ):
                 raise ValueError(
                     "ALERTMANAGER_WEBHOOK_SECRET must be set in production "
-                    "to authenticate AlertManager webhook calls."
+                    "to authenticate AlertManager webhook calls. Если "
+                    "подписывать вебхук нечем (стоковый AlertManager этого не "
+                    "умеет), поставь ALERTMANAGER_ALLOW_UNAUTHENTICATED=true и "
+                    "изолируй трафик NetworkPolicy — см. "
+                    "k8s/vmalertmanagerconfig.yaml."
                 )
-            # В проде JWT-валидация обязана работать: без публичного ключа
-            # все защищённые эндпоинты отвалятся (или, хуже, проскочат).
-            if not self.JWT_PUBLIC_KEY:
-                raise RuntimeError(
-                    "JWT_PUBLIC_KEY must be set in production "
-                    "to validate JWT-protected endpoints."
-                )
+            # JWT_PUBLIC_KEY в проде НЕ обязателен, и это проверено, а не
+            # предположено: без ключа `get_current_user` отвечает 401 на
+            # любой токен («Expecting a PEM-formatted key» → 401). То есть
+            # отсутствие ключа закрывает защищённые эндпоинты, а не
+            # открывает их — fail-closed, ровно то поведение, ради которого
+            # требование и заводили.
+            #
+            # Замер 21.08.2026 показал, что требовать здесь IdP не за что:
+            # в `kg_action_approvals` ноль заявок за всё время, обращений к
+            # /replay и /approvals в логах api ноль, отказов «SAFE_MODE:
+            # Manual approval required» ноль, клиентов в репозитории нет, а
+            # Ingress выставлен на `sre-ai.example.com` — плейсхолдер,
+            # который никуда не резолвится. Эндпоинты не просто не
+            # используются, они недостижимы снаружи.
+            #
+            # Требование целого IdP ради этого роняло деплой: с
+            # ENV=production поды не поднимались вообще.
             # Одного ключа мало: без пиннинга iss/aud токен, подписанный тем же
             # IdP-ключом, но выписанный ДРУГОМУ сервису, аутентифицируется
             # здесь, а его claim roles открывает /replay и /approvals
             # (горизонтальная эскалация; риск описан у JWT_ISSUER выше).
             # auth.py сверяет iss/aud только когда они заданы — поэтому в
             # проде оба обязаны быть заданы, той же логикой, что JWT_PUBLIC_KEY.
-            if not self.JWT_ISSUER or not self.JWT_AUDIENCE:
+            # А вот если ключ ЗАДАН — iss/aud обязательны. Риск реальный и
+            # описан выше: токен, подписанный тем же IdP-ключом, но
+            # выписанный другому сервису, иначе аутентифицируется здесь.
+            if self.JWT_PUBLIC_KEY and (
+                not self.JWT_ISSUER or not self.JWT_AUDIENCE
+            ):
                 raise ValueError(
                     "JWT_ISSUER and JWT_AUDIENCE must be set in production: "
                     "without iss/aud pinning, a token signed by the same IdP "
