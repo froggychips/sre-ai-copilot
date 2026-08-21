@@ -771,13 +771,23 @@ def kg_namespace_lifecycle_task():
     (upsert по namespace+name), и их судьба — забота `drift_cleanup`.
     """
     from app.knowledge_graph.namespace_lifecycle import (
-        purge_stale_edges_after_reincarnation, sync_namespace_lifecycle)
+        purge_stale_edges_after_reincarnation,
+        purge_stale_health_after_reincarnation, sync_namespace_lifecycle)
 
     db = SessionLocal()
     try:
         stats = sync_namespace_lifecycle(db)
         if settings.KG_REINCARNATION_PURGE_ENABLED:
             stats["reincarnation_purge"] = purge_stale_edges_after_reincarnation(
+                db, apply=True,
+            )
+            # Health-точки прежнего воплощения важнее рёбер: по ним детектор
+            # аномалий строит baseline, и после пересоздания стенда он
+            # сравнивает новый с прежним. Замер 21.08.2026 — 262 657 точек
+            # прежних инкарнаций внутри семидневного окна, 797 затронутых
+            # сервисов, и 133 сервиса аномальны больше двадцати часов из
+            # двадцати четырёх.
+            stats["health_purge"] = purge_stale_health_after_reincarnation(
                 db, apply=True,
             )
         return stats

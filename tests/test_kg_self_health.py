@@ -423,21 +423,63 @@ def test_anomaly_signal_health_ok_in_range(db):
     assert result.detail["count_24h"] == 5
 
 
-def test_anomaly_signal_health_overload_warns(db):
-    svc = _mk_service(db)
+def test_anomaly_signal_health_many_observations_alone_is_not_a_problem(db):
+    """Большое число наблюдений само по себе не признак болезни.
+
+    Абсолютный порог «>500 = шумит» стоял с эпохи, когда сервисов было в разы
+    меньше. Замер 21.08.2026: 11 325 сервисов в графе, аномалии у 859 (7,6%),
+    наблюдений 21 303 — проверка держалась в warn постоянно и ничего этим не
+    сообщала. Здесь 600 наблюдений размазаны по 60 сервисам, каждый аномален
+    в считанные часы: это работающий детектор, а не захлебнувшийся.
+    """
     now = datetime.utcnow()
-    # 600 observations за 24h → warn (overload)
-    for i in range(600):
-        db.add(AnomalyObservation(
-            service_id=svc.id,
-            ts=now - timedelta(minutes=i % 1000),
-            metric=f"metric_{i % 5}",
-            severity="warning",
-        ))
+    for i in range(60):
+        svc = _mk_service(db, name=f"svc-{i}")
+        for j in range(10):
+            db.add(AnomalyObservation(
+                service_id=svc.id,
+                ts=now - timedelta(hours=j % 3, minutes=j * 7),
+                metric=f"metric_{j % 5}",
+                severity="warning",
+            ))
     db.commit()
     result = check_anomaly_signal_health(db)
+    assert result.status == "ok", result.detail
+    assert result.detail["count_24h"] == 600
+    assert result.detail["always_on_services"] == 0
+
+
+def test_anomaly_signal_health_warns_on_permanently_anomalous_services(db):
+    """А вот сервис, аномальный круглые сутки, — это сменившаяся норма.
+
+    У такого нет «отклонения»: baseline отстал от реальности. Замер
+    21.08.2026: 133 сервиса из 859 аномальны больше двадцати часов из
+    двадцати четырёх, и главная причина известна — после пересоздания стенда
+    в baseline-окно попадают замеры прежнего (262 657 точек, 797 сервисов).
+    """
+    now = datetime.utcnow()
+    # 4 сервиса аномальны почти круглосуточно, 6 — эпизодически:
+    # доля постоянных 40% > порога 25%.
+    for i in range(4):
+        svc = _mk_service(db, name=f"always-{i}")
+        for h in range(24):
+            db.add(AnomalyObservation(
+                service_id=svc.id, ts=now - timedelta(hours=h),
+                metric="cpu_pct", severity="critical",
+            ))
+    for i in range(6):
+        svc = _mk_service(db, name=f"rare-{i}")
+        db.add(AnomalyObservation(
+            service_id=svc.id, ts=now - timedelta(minutes=5),
+            metric="cpu_pct", severity="warning",
+        ))
+    db.commit()
+
+    result = check_anomaly_signal_health(db)
     assert result.status == "warn"
-    assert result.detail["count_24h"] > 500
+    assert result.detail["always_on_services"] == 4
+    assert result.detail["services_with_anomalies"] == 10
+    assert result.detail["always_on_share"] == 0.4
 
 
 # ── check_alerts_resolve_freshness ────────────────────────────────────────
