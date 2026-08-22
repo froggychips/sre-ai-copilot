@@ -963,6 +963,8 @@ async def _tc_deploys_to_kg_logic() -> dict:
 
     db = SessionLocal()
     added = 0
+    stats_skipped_no_realm = 0
+    by_attribution: dict[str, int] = {"build_param": 0, "vcs_branch": 0}
     try:
         # Map branch → list of namespaces в KG. Реализуется через обратное
         # отображение `branch_for_namespace`: проходим distinct namespaces
@@ -998,7 +1000,39 @@ async def _tc_deploys_to_kg_logic() -> dict:
                 branch_full = "prod"
             elif branch_full == "<default>":
                 branch_full = "preprod"
-            target_namespaces = ns_by_branch.get(branch_full, [])
+            # Цель из параметров билда точнее ветки, и ветка здесь просто
+            # врала. Замер 22.08.2026: `BuildAndDeploy #2917` деплоил squad-1
+            # (NAMESPACE=squad-1), а по ветке `<default>`→preprod осел на
+            # preprod-* и squad-gd-* — 596 записей, среди которых сервисов
+            # squad-1 не было НИ ОДНОГО. `MigrateAndUpdateService #103`
+            # деплоил chat-message-service в squad-27 и разошёлся по тем же
+            # 596. Граф указывал не на те окружения, и в нужных деплоев не
+            # было видно вообще.
+            target_realm = b.get("target_realm")
+            if target_realm:
+                # NAMESPACE в TC — это РЕАЛЬМ: «squad-27», «preprod», «prod».
+                # Разворачиваем в конкретные namespace графа по префиксу:
+                # squad-27 → squad-27-shared, squad-27-kingdom2, ...
+                prefix = f"{target_realm}-"
+                target_namespaces = [
+                    ns for ns in all_ns
+                    if ns == target_realm or ns.startswith(prefix)
+                ]
+                attribution = "build_param"
+                if not target_namespaces:
+                    # Реальм есть, а namespace в графе нет — стенд снесён или
+                    # ещё не отсканирован. Падать на ветку НЕЛЬЗЯ: она
+                    # приписала бы деплой чужому окружению, а это хуже
+                    # отсутствия записи.
+                    logger.info(
+                        "tc_deploys_to_kg.realm_not_in_graph realm=%s build=#%s",
+                        target_realm, b.get("number"),
+                    )
+                    stats_skipped_no_realm += 1
+                    continue
+            else:
+                target_namespaces = ns_by_branch.get(branch_full, [])
+                attribution = "vcs_branch"
             if not target_namespaces:
                 continue
 
@@ -1030,11 +1064,15 @@ async def _tc_deploys_to_kg_logic() -> dict:
                 # имели deploy-истории. RecentDeployRule работает per-service,
                 # значит каждый сервис в ns должен видеть тот же deploy event.
                 # Dedup защищён уникальностью (service_id, buildtype_id, build_number).
-                ns_services = (
-                    db.query(Service)
-                    .filter_by(namespace=ns, synthetic=False)
-                    .all()
-                )
+                q = db.query(Service).filter_by(namespace=ns, synthetic=False)
+                target_service = b.get("target_service")
+                if target_service:
+                    # Конфиг деплоит ОДИН сервис — писать деплой на все 596
+                    # значит утверждать 595 небылиц. Имя из SERVICE_NAME
+                    # сверяется точно: если такого сервиса в namespace нет,
+                    # записей просто не будет, и это честнее выдумки.
+                    q = q.filter(Service.name == target_service)
+                ns_services = q.all()
                 for svc in ns_services:
                     try:
                         record_deployment(
@@ -1060,6 +1098,7 @@ async def _tc_deploys_to_kg_logic() -> dict:
                             },
                         )
                         added += 1
+                        by_attribution[attribution] += 1
                     except Exception as e:
                         logger.warning(
                             "tc_deploys_to_kg.record_failed ns=%s svc=%s build=#%s: %s",
@@ -1075,10 +1114,26 @@ async def _tc_deploys_to_kg_logic() -> dict:
 
     now_unix = datetime.now(timezone.utc).timestamp()
     logger.info(
-        "tc_deploys_to_kg.done builds=%d added=%d at=%.0f",
-        len(builds), added, now_unix,
+        "tc_deploys_to_kg.done builds=%d rows=%d by_param=%d by_branch=%d "
+        "skipped_no_realm=%d at=%.0f",
+        len(builds), added, by_attribution["build_param"],
+        by_attribution["vcs_branch"], stats_skipped_no_realm, now_unix,
     )
-    return {"builds_fetched": len(builds), "kg_deployments_added": added}
+    return {
+        "builds_fetched": len(builds),
+        # `rows_written`, а не `added`: record_deployment делает
+        # on_conflict_do_update, и на неизменном наборе билдов счётчик
+        # показывал одно и то же большое число каждые 15 минут (4768 при
+        # восьми билдах). По нему нельзя было понять, пополняется граф или
+        # просто перезаписывается — а именно этот вопрос и задают, когда
+        # спрашивают «почему пайплайн не пополняет KG».
+        "rows_written": added,
+        "by_attribution": dict(by_attribution),
+        "skipped_no_realm": stats_skipped_no_realm,
+        # Оставлено для совместимости с потребителями старого ключа
+        # (dashboard, digest): то же число, честное имя рядом.
+        "kg_deployments_added": added,
+    }
 
 
 @celery_app.task(name="chronic_alerts_digest")
