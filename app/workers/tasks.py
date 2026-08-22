@@ -1094,6 +1094,22 @@ async def _tc_deploys_to_kg_logic() -> dict:
                                 "buildtype_name": b.get("buildtype_name"),
                                 "url": b.get("url"),
                                 "namespace_scope": True,  # маркер ns-wide attribution
+                                # ОТКУДА взялась привязка. Без этого поля
+                                # счётчик by_attribution виден только в логах
+                                # прогона, а по самим данным точную запись не
+                                # отличить от догадки по ветке — потребителю
+                                # приходится читать код, чтобы понять, можно
+                                # ли доверять строке.
+                                #
+                                # `build_param` — цель из параметров билда
+                                # (NAMESPACE/SERVICE_NAME), доверять можно.
+                                # `vcs_branch` — вывод из ветки, а у
+                                # deploy-конфигов она литеральный `<default>`:
+                                # 22.08.2026 такая привязка отправила деплой
+                                # squad-1 в preprod-* и squad-gd-*.
+                                "attribution": attribution,
+                                "target_realm": b.get("target_realm"),
+                                "target_service": b.get("target_service"),
                                 "all_revisions": b.get("all_revisions"),  # monorepo: все VCS root
                             },
                         )

@@ -169,3 +169,46 @@ def test_rows_written_is_named_honestly(db):
     assert first["rows_written"] == 1
     assert second["rows_written"] == 1          # столько же — это перезапись
     assert db.query(Deployment).count() == 1    # а строк по-прежнему одна
+
+
+def test_record_carries_where_its_attribution_came_from(db):
+    """По данным должно быть видно, точная это привязка или догадка.
+
+    Счётчик `by_attribution` живёт только в логах прогона. Без маркера в
+    самой записи потребителю пришлось бы читать код, чтобы понять, можно ли
+    ей доверять: `build_param` — цель из параметров билда, `vcs_branch` —
+    вывод из ветки, которая у deploy-конфигов литеральный `<default>`.
+    """
+    _svc(db, "town-service", "squad-1-shared")
+    _svc(db, "town-service", "preprod-shared")
+    db.commit()
+
+    _run(db, [
+        _build(target_realm="squad-1"),
+        _build(number="995", branch="preprod", target_realm=None),
+    ])
+
+    rows = db.query(Deployment).all()
+    by_marker = {}
+    for d in rows:
+        svc = db.get(Service, d.service_id)
+        by_marker[(svc.namespace, d.build_number)] = d.extras.get("attribution")
+
+    assert by_marker[("squad-1-shared", "2917")] == "build_param"
+    assert by_marker[("preprod-shared", "995")] == "vcs_branch"
+
+
+def test_target_is_recorded_for_later_verification(db):
+    """Цель сохраняется в записи — иначе проверить привязку нечем."""
+    _svc(db, "chat-message-service", "squad-27-shared")
+    db.commit()
+
+    _run(db, [_build(
+        buildtype_id="Wo_Backend_K8sNewCluster_MigrateAndUpdateService",
+        number="103", target_realm="squad-27",
+        target_service="chat-message-service",
+    )])
+
+    d = db.query(Deployment).one()
+    assert d.extras["target_realm"] == "squad-27"
+    assert d.extras["target_service"] == "chat-message-service"
