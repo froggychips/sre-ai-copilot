@@ -10,9 +10,10 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
 from app.database import Base
-from app.knowledge_graph.schema import (AlertEvent, AnomalyObservation,
+from app.knowledge_graph.schema import (NS_STATE_ACTIVE, NS_STATE_MISSING,
+                                        AlertEvent, AnomalyObservation,
                                         ClusterObservation, Deployment,
-                                        LogObservation,
+                                        LogObservation, Namespace,
                                         PodEvent, Service, ServiceEdge,
                                         ServiceHealth, SignalAggregate)
 from app.knowledge_graph.self_health import (aggregate_status,
@@ -42,6 +43,12 @@ def db():
 def _mk_service(db, name="svc-a", ns="squad-1") -> Service:
     s = Service(name=name, namespace=ns, team_owner="squad-1")
     db.add(s)
+    # Запись о namespace нужна проверкам, которые считают только живые
+    # окружения (edges_freshness): без неё join не находит ничего.
+    if not db.query(Namespace).filter_by(namespace=ns).first():
+        db.add(Namespace(namespace=ns, state=NS_STATE_ACTIVE, incarnation=1,
+                         first_seen_at=datetime.utcnow(),
+                         last_seen_at=datetime.utcnow()))
     db.commit()
     db.refresh(s)
     return s
@@ -608,6 +615,34 @@ def test_edges_freshness_warn_when_30_pct_stale(db):
     result = check_edges_freshness(db)
     assert result.status == "warn"
     assert result.detail["stale_pct"] >= 50.0
+
+
+def test_edges_freshness_ignores_edges_of_removed_environments(db):
+    """Рёбра снесённого окружения устаревают законно — это retention.
+
+    Замер 22.08.2026: из 7583 устаревших рёбер 6811 (90%) принадлежали
+    missing-namespace, и доля 30,8% при пороге 30% дала warn на исправном
+    контуре. Среди живых окружений устаревших было 772 из 17 408 — 4,4%.
+    """
+    live = _mk_service(db, "live-svc", "prod-shared")
+    dead = _mk_service(db, "dead-svc", "squad-20-shared")
+    db.query(Namespace).filter_by(namespace="squad-20-shared").update(
+        {"state": NS_STATE_MISSING}
+    )
+    now = datetime.utcnow()
+    # живое окружение: одно ребро, свежее
+    db.add(ServiceEdge(src_id=live.id, dst_id=dead.id, kind="calls",
+                       last_seen_at=now))
+    # снесённое: двадцать устаревших — они не должны влиять на статус
+    for i in range(20):
+        db.add(ServiceEdge(src_id=dead.id, dst_id=live.id, kind=f"stale-{i}",
+                           last_seen_at=now - timedelta(days=5)))
+    db.commit()
+
+    result = check_edges_freshness(db)
+    assert result.status == "ok", result.detail
+    assert result.detail["total"] == 1
+    assert result.detail["scope"] == "active_namespaces_only"
 
 
 def test_edges_freshness_ok_when_all_fresh(db):

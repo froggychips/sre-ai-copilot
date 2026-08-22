@@ -48,7 +48,8 @@ from sqlalchemy.orm import Session, aliased
 
 from app.config import settings
 from app.knowledge_graph.contract import shared_namespace_of
-from app.knowledge_graph.schema import (AlertEvent, AnomalyObservation,
+from app.knowledge_graph.schema import (NS_STATE_ACTIVE, AlertEvent,
+                                        AnomalyObservation,
                                         ClusterObservation, Deployment,
                                         LogObservation, Namespace,
                                         PodEvent, Service, ServiceEdge,
@@ -575,22 +576,45 @@ def check_pod_events_link_rate(db: Session) -> CheckResult:
 
 
 def check_edges_freshness(db: Session) -> CheckResult:
-    """% рёбер с last_seen_at < now()-24h или NULL.
+    """% рёбер ЖИВЫХ окружений с last_seen_at < now()-24h или NULL.
 
     >30% → warn. Это regression watch для kg_sync UPSERT — если он перестал
     апдейтить last_seen_at, мы не видим распада топологии до недель.
+
+    Считаются только рёбра, чей источник в `active`-namespace, и это
+    принципиально. Рёбра снесённого окружения обновляться НЕ должны: их
+    убирает retention, а до тех пор они лежат честно устаревшими. Замер
+    22.08.2026: из 7583 устаревших рёбер 6811 (90%) принадлежали
+    missing-namespace, и проверка мерила скорость retention вместо работы
+    синка — 30,8% при пороге 30% дали warn на исправном контуре.
+
+    Среди живых окружений устаревших было 772 из 17 408, то есть 4,4%.
+
+    Это третий случай той же ошибки в этом модуле — после
+    `materialization_zero_rate`, где нули счётчика событий читались как
+    отсутствие метрики, и `graph_integrity`, где одноимённые базы разных
+    окружений считались дублями. Общее у всех трёх: проверка считала всё
+    подряд там, где смысл имеет только часть.
     """
     cutoff = _now() - timedelta(hours=24)
-    total = db.query(func.count(ServiceEdge.id)).scalar() or 0
+    src = aliased(Service)
+    ns = aliased(Namespace)
+    live = (
+        db.query(func.count(ServiceEdge.id))
+        .join(src, ServiceEdge.src_id == src.id)
+        .join(ns, ns.namespace == src.namespace)
+        .filter(ns.state == NS_STATE_ACTIVE)
+    )
+    total = live.scalar() or 0
     if total == 0:
         return CheckResult(
             name="edges_freshness",
             status="ok",
-            detail={"total": 0, "reason": "no edges in graph"},
+            detail={"total": 0, "reason": "no edges from active namespaces"},
         )
     stale = (
-        db.query(func.count(ServiceEdge.id))
-        .filter(or_(ServiceEdge.last_seen_at.is_(None), ServiceEdge.last_seen_at < cutoff))
+        live.filter(or_(ServiceEdge.last_seen_at.is_(None),
+                        ServiceEdge.last_seen_at < cutoff))
         .scalar()
     ) or 0
     rate = stale / total if total else 0.0
@@ -599,7 +623,10 @@ def check_edges_freshness(db: Session) -> CheckResult:
     return CheckResult(
         name="edges_freshness",
         status=status,
-        detail={"total": total, "stale": stale, "stale_pct": pct},
+        detail={
+            "total": total, "stale": stale, "stale_pct": pct,
+            "scope": "active_namespaces_only",
+        },
     )
 
 
