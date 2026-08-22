@@ -324,29 +324,29 @@ spec:
         # на 1.0.0-rc.29, потому что ставилось руками.
         - name: BUILD_VERSION
           value: "BUILD_VERSION_PLACEHOLDER"
-        # Явный список namespace для kg_topology_sync. Дефолт в
-        # app/config.py пустой, а пустой = auto-discovery: потеря этой
-        # переменной сменила бы область сканирования целиком.
+        # KG_SCAN_NAMESPACES здесь БОЛЬШЕ НЕ ЗАДАЁТСЯ, и это осознанно.
         #
-        # Ревизия 21.08.2026: из 25 записей девять указывали на namespace,
-        # которых в кластере нет. Убраны:
+        # Переменная стояла у beat, а `kg_topology_sync` выполняет worker —
+        # он её не видел, и синк всё это время шёл через auto-discovery.
+        # Замер 22.08.2026: обходится 198 namespace за 219 секунд, и в графе
+        # за последний час обновлено ровно 198 (175 из них прикладные).
         #
-        #   preprod-kingdom1, preprod-kingdom3, preupdate-kingdom1, preupdate-kingdom2, preupdate-kingdom3,
-        #   squad-3-kingdom5, squad-11-kingdom2, squad-13-kingdom5, squad-19-shared
+        # То есть охват давно полный, а список в манифесте вводил в
+        # заблуждение: по нему я сам записал в CHANGELOG ограничение
+        # «сканируется 16 из 98 прикладных», которого не существовало.
+        # Конфигурация, которую никто не читает, хуже отсутствующей — она
+        # выглядит как факт.
         #
-        # Держать их в списке — не безобидно: синк ходит в несуществующий
-        # namespace каждый тик, а `preprod-kingdom1` вдобавок оставался в
-        # графе как namespace с db-узлами, на которые ссылались 3740 рёбер
-        # (см. db_edge_rehome).
+        # Ограничивать охват незачем: 3,7 минуты при часовом расписании и
+        # пике 537Mi из 3Gi. Auto-discovery сам отсекает системные
+        # namespace (kube-*, cattle-*, monitoring, cert-manager — см.
+        # `_SYSTEM_NAMESPACES` в kg_sync) и подхватывает новые сквады без
+        # правки манифеста, что для среды, где стенды создают и сносят
+        # ежедневно, единственный работающий вариант.
         #
-        # Осталось 16 записей. Отдельный вопрос, который этой правкой
-        # НЕ закрыт: в кластере 98 прикладных namespace (79 из них squad-*),
-        # то есть 82 остаются вне обзора синка. Это та же слепая зона,
-        # что описана в docstring namespace_lifecycle. Расширение охвата в
-        # четыре раза требует замера — kg_topology_sync ходит per-namespace,
-        # и OOM-и воркера в этом проекте уже случались.
-        - name: KG_SCAN_NAMESPACES
-          value: "preprod-kingdom2,preprod-shared,preupdate-kingdom5,preupdate-shared,prod-kingdom1,prod-kingdom2,prod-kingdom3,prod-kingdom4,prod-kingdom5,prod-lo-legal,prod-shared,squad-2-kingdom2,squad-3-shared,squad-9-kingdom2,squad-9-shared,squad-13-shared"
+        # Если ограничение когда-нибудь понадобится, задавать его нужно
+        # WORKER'у, а не beat — за этим следит
+        # tests/test_scan_scope_config.py.
         # Дефолт False: periodic backfill team_owner.
         - name: OWNERSHIP_BACKFILL_ENABLED
           value: "true"
