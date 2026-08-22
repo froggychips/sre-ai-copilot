@@ -467,9 +467,19 @@ def _fetch_recent_deploys_direct(
     try:
         # revisions(...) даёт commit SHA каждого VCS root в билде. Нужен для
         # корреляции «новый коммит → новый инцидент» в kg_deployments.sha.
+        # properties: НАСТОЯЩАЯ цель деплоя. Атрибуция по VCS-ветке врала —
+        # замер 22.08.2026: `BuildAndDeploy #2917` деплоил squad-1, а в графе
+        # оказался записан на preprod-* и squad-gd-*, причём сервисов squad-1
+        # среди 596 записей не было НИ ОДНОГО. Ветка у таких конфигов
+        # литеральный `<default>`, из неё окружение не выводится.
+        #
+        # В параметрах билда лежит точный ответ: NAMESPACE есть у всех
+        # deploy-конфигов, SERVICE_NAME — у тех, что деплоят один сервис
+        # (`MigrateAndUpdateService`, часть `OneServiceBuildAndUpdate`).
         fields = (
             "build(id,number,status,state,branchName,buildTypeId,"
             "buildType(name),startDate,finishDate,"
+            "properties(property(name,value)),"
             "triggered(type,date,user(username,name)),"
             "revisions(revision(version,vcs-root-instance(name,vcs-root-id))))"
         )
@@ -502,6 +512,11 @@ def _fetch_recent_deploys_direct(
 
             for b in raw:
                 btype_name = (b.get("buildType") or {}).get("name")
+                props = {
+                    pr.get("name"): pr.get("value")
+                    for pr in ((b.get("properties") or {}).get("property") or [])
+                    if pr.get("name")
+                }
                 if not _is_deploy_buildtype_name(btype_name):
                     continue
                 triggered = b.get("triggered") or {}
@@ -534,6 +549,12 @@ def _fetch_recent_deploys_direct(
                     "triggered_type": triggered.get("type"),
                     "sha": sha,
                     "all_revisions": all_revs,
+                    # Точная цель деплоя из параметров билда. NAMESPACE тут —
+                    # РЕАЛЬМ («squad-27», «preprod»), а не полное имя
+                    # namespace: разворачивать его в конкретные namespace —
+                    # дело вызывающего.
+                    "target_realm": props.get("NAMESPACE") or None,
+                    "target_service": props.get("SERVICE_NAME") or None,
                     "url": (
                         f"{settings.TEAMCITY_WEB_URL.rstrip('/')}/viewLog.html?buildId={b.get('id')}"
                         if settings.TEAMCITY_WEB_URL and b.get("id") else None
