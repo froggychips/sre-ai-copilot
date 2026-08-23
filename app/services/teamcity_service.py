@@ -419,6 +419,15 @@ def teamcity_context_to_prompt(tc_ctx: Optional[dict]) -> str:
 # deploy / Shared deploy / Backup all db), не «buildtype per service».
 # Поэтому показываем top deploy-builds глобально.
 
+class TeamCitySourceUnavailable(RuntimeError):
+    """Ни один проект TC не ответил. Это НЕ то же самое, что «деплоев нет».
+
+    Пустой список от `recent_deploys` означает факт: спросили и в окне ничего
+    нет. Исключение означает отсутствие факта — состояние деплоев неизвестно,
+    и делать вывод «деплоев не было» неправомерно.
+    """
+
+
 _DEPLOY_NAME_TOKENS = ("deploy", "update", "backup")
 _DEPLOY_NAME_EXCLUDE = ("set client min", "set ab test", "update terrain",
                         "update secret", "delete namespace")
@@ -642,12 +651,24 @@ async def recent_deploys(
     # Все проекты отвалились — это отказ источника, а не тихий период.
     # Без отдельной ветки такой случай выглядел как «деплоев не было»:
     # per-project warning тонул в логах воркера (там же metrics_sync).
+    #
+    # Раньше различение оставалось В ЛОГЕ, а вызывающему в обоих случаях
+    # приходил пустой список — и `deploy_stream_ingestion` вынужденно
+    # считала любой ноль отказом. Ложная цена такого выбора видна на
+    # выходных: 23.08.2026 проверка сообщила «ослепший синк: проверь
+    # TC_TOKEN», хотя TC отвечал, а деплоев просто не было с 21.08.
+    #
+    # Теперь отказ источника — исключение. Пустой список означает ровно
+    # «спросили, деплоев нет», и проверять его отдельно больше не нужно.
     if failed and not combined:
         logger.error(
             "teamcity.recent_deploys_all_projects_failed",
             projects=projects,
             failed=failed,
             lookback_hours=lookback_hours,
+        )
+        raise TeamCitySourceUnavailable(
+            f"все проекты TC не ответили: {', '.join(sorted(failed))}"
         )
     elif not combined:
         logger.info(
