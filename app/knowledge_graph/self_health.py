@@ -202,6 +202,58 @@ _SYNC_LAG_TARGETS: Dict[str, Dict[str, Any]] = {
         "heartbeat_task": "kg_ingress_sync",
         "interval_minutes": 60,
     },
+    # ── источники, добавленные ревизией 23.08.2026 ─────────────────────
+    #
+    # До неё все восемь были в расписании, но ни здесь, ни в
+    # `_BEAT_HEARTBEAT_TASKS`: смерть любого из них не замечал никто. Две
+    # проверки её вдобавок маскировали — `pod_events_link_rate` при нуле
+    # событий отвечает ok («нечего связывать»), а
+    # `alerts_resolve_freshness` считает только открытые алерты старше
+    # недели, и от остановки притока их число не растёт. Каждая честно
+    # отвечала на свой вопрос; вопроса «источник вообще жив» не задавал
+    # никто.
+    #
+    # Свежесть — по heartbeat, а не по данным, и это принципиально: у
+    # событий, endpoints и алертов пустое окно бывает законным (в кластере
+    # тихо), а вот отсутствие прогона законным не бывает никогда. Ровно
+    # эту разницу пришлось вводить для `kg_seq_logs_sync` после 20.08.2026,
+    # когда NetworkPolicy рубила запросы, синк отчитывался «rows=0», и 12,8
+    # часа это выглядело нормально.
+    #
+    # Интервалы взяты из расписания beat; расхождение ловит
+    # `test_sync_lag_intervals_match_beat_schedule`.
+    "k8s_pod_events_sync": {
+        "heartbeat_task": "k8s_pod_events_sync",
+        "interval_minutes": 10,
+    },
+    "kg_endpoints_sync": {
+        "heartbeat_task": "kg_endpoints_sync",
+        "interval_minutes": 15,
+    },
+    "kg_jobs_sync": {
+        "heartbeat_task": "kg_jobs_sync",
+        "interval_minutes": 15,
+    },
+    "kg_storage_sync": {
+        "heartbeat_task": "kg_storage_sync",
+        "interval_minutes": 30,
+    },
+    "kg_statics_versions_sync": {
+        "heartbeat_task": "kg_statics_versions_sync",
+        "interval_minutes": 5,
+    },
+    "kg_runtime_correlation_sync": {
+        "heartbeat_task": "kg_runtime_correlation_sync",
+        "interval_minutes": 30,
+    },
+    "kg_ingress_observations_sync": {
+        "heartbeat_task": "kg_ingress_observations_sync",
+        "interval_minutes": 10,
+    },
+    "kg_alerts_resolve_sync": {
+        "heartbeat_task": "kg_alerts_resolve_sync",
+        "interval_minutes": 15,
+    },
 }
 
 

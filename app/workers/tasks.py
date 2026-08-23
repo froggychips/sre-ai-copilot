@@ -1697,6 +1697,27 @@ _BEAT_HEARTBEAT_TASKS = frozenset({
     "kg_nats_subjects_sync",
     "kg_topology_resources_sync",
     "kg_ingress_sync",
+    # Остальные источники данных, добавлены 23.08.2026 после ревизии
+    # проверок. До неё все восемь были в расписании, но ни в sync_lag, ни
+    # здесь: смерть любого из них не замечал никто.
+    #
+    # Хуже того, две проверки её активно маскировали:
+    # `pod_events_link_rate` при нуле событий возвращает ok («нечего
+    # связывать»), а `alerts_resolve_freshness` считает только открытые
+    # алерты старше недели — если алерты перестанут приходить вовсе, их
+    # число не вырастет. Обе честно отвечали на свой вопрос; вопроса
+    # «а источник вообще жив» не задавал никто.
+    #
+    # Прецедент того же класса — `kg_seq_logs_sync` 20.08.2026: синк ходил,
+    # NetworkPolicy рубила запросы, и 12,8 часа отчёт был «rows=0».
+    "k8s_pod_events_sync",
+    "kg_endpoints_sync",
+    "kg_jobs_sync",
+    "kg_storage_sync",
+    "kg_statics_versions_sync",
+    "kg_runtime_correlation_sync",
+    "kg_ingress_observations_sync",
+    "kg_alerts_resolve_sync",
 })
 
 
