@@ -69,13 +69,47 @@ def _patch_tc(monkeypatch, builds, *, configured: bool):
 
 # ── watchdog: молчание настроенного источника = fail ─────────────────────
 
-def test_ingestion_fails_when_configured_but_tc_returns_nothing(db, monkeypatch):
-    """Ровно случай 10–11.08: интеграция настроена, а билдов ноль."""
+def test_quiet_period_without_deploys_is_not_a_failure(db, monkeypatch):
+    """TC ответил, деплоев в окне нет — это факт, а не слепота синка.
+
+    Раньше здесь стоял fail: `recent_deploys` отдавала пустой список и при
+    отказе источника, и при тишине, так что чек вынужденно считал отказом
+    любой ноль. Цена приближения — 23.08.2026 самопроверка подняла «ослепший
+    синк: проверь TC_TOKEN», хотя TC отвечал, а последний деплой был 21.08 в
+    16:14, за 36 часов до срабатывания. У проекта бывают выходные.
+
+    Отказ источника теперь приходит исключением и проверяется отдельно
+    (`test_ingestion_fails_when_source_is_unavailable`).
+    """
     _mk_service(db)
     _patch_tc(monkeypatch, [], configured=True)
     r = check_deploy_stream_ingestion(db)
+    assert r.status == "ok", r.detail
+    assert r.detail["should_ingest"] == 0
+
+
+def test_ingestion_fails_when_source_is_unavailable(db, monkeypatch):
+    """А вот если TC не ответил — состояние деплоев неизвестно, это fail.
+
+    Защита от инцидента 11.08.2026 сохранена: тогда поток деплоев стоял
+    сутки, а чек докладывал ok, и Discord писал «деплоев не было — вряд ли
+    связано с деплоем» на алерте через 20 секунд после прод-раскатки.
+    """
+    from app.services.teamcity_service import TeamCitySourceUnavailable
+
+    _mk_service(db)
+
+    async def _boom(*a, **kw):
+        raise TeamCitySourceUnavailable("все проекты TC не ответили: Wo_Backend")
+
+    monkeypatch.setattr("app.services.teamcity_service.recent_deploys", _boom)
+    monkeypatch.setattr(
+        "app.services.teamcity_service.tc_sync_config_status",
+        lambda: {"configured": True, "reason": ""},
+    )
+    r = check_deploy_stream_ingestion(db)
     assert r.status == "fail"
-    assert "0 deploy-builds" in r.detail["reason"]
+    assert "TeamCitySourceUnavailable" in r.detail["error"]
 
 
 def test_ingestion_warns_when_tc_not_configured(db, monkeypatch):
