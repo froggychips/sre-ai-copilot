@@ -18,11 +18,15 @@ namespace что-то каталось», разосланное всем его
 изменении спеки, и образы контейнеров. Идея — из Coroot, который так же
 отслеживает rollout'ы напрямую в Kubernetes, а не через интеграцию с CI.
 
-**Что считается деплоем.** Рост `generation` или смена набора образов.
-Первого мало: `kubectl scale` тоже двигает generation, а это не выкат кода —
-поэтому в записи хранится, что именно изменилось, и потребитель может
-отличить одно от другого. Второго мало тоже: откат на предыдущий тег меняет
-образ, но это ровно тот случай, который знать и нужно.
+**Что считается деплоем.** Смена набора образов или смена `spec.template`
+(хэш). НЕ рост `metadata.generation`: он растёт при ЛЮБОМ изменении spec,
+включая `replicas`, — то есть каждый тик HPA и каждый `kubectl scale`. Первая
+версия этого модуля (1.0.4, 05.09.2026) брала generation как признак и за 40
+минут записала 6968 ложных «деплоев» на 776 сервисов — образы при этом не
+менялись ни у одного. `RecentDeployRule` верила каждому. Хэш `spec.template`
+свободен от этого: replicas лежит в `spec`, а не в `spec.template`, и
+меняется без изменения шаблона пода. Откат на предыдущий тег меняет образ —
+это ровно тот случай, который знать и нужно.
 
 **Первый прогон ничего не пишет.** Снимка нет — сравнивать не с чем, и
 единственное, что можно сделать честно, это запомнить текущее состояние.
@@ -38,6 +42,7 @@ RecentDeployRule не увидела бы). Если одноимённого Se
 """
 from __future__ import annotations
 
+import hashlib
 import json
 from datetime import datetime
 from typing import Any, Dict, List, Optional
@@ -62,8 +67,8 @@ ATTRIBUTION = "k8s_rollout"
 
 #: `buildtype_id` для записей этого источника. Дедуп `record_deployment`
 #: идёт по (service_id, buildtype_id, build_number), а номером служит
-#: `<uid>:<generation>` — то есть повторное обнаружение того же поколения
-#: не создаёт второй строки, сколько бы раз задача ни прошла.
+#: `<uid>:<template_hash>` — повторное обнаружение того же шаблона пода не
+#: создаёт второй строки, сколько бы раз задача ни прошла.
 BUILDTYPE_ID = "k8s_rollout"
 
 #: Сколько живёт снимок. Больше любого разумного простоя задачи и меньше
@@ -86,8 +91,27 @@ def _workload_key(ns: str, kind: str, name: str) -> str:
     return f"{ns}/{kind}/{name}"
 
 
+def _template_hash(spec: Dict[str, Any]) -> Optional[str]:
+    """sha256 от `spec.template` — того, что описывает под.
+
+    Сюда входят образы, env, аргументы, ресурсы, тома, аннотации шаблона.
+    НЕ входит `spec.replicas` — он лежит уровнем выше, и это единственное,
+    что отличает «выкатили» от «отскейлили». `sort_keys` — чтобы порядок
+    ключей в ответе API не считался изменением.
+    """
+    template = spec.get("template")
+    if not isinstance(template, dict):
+        return None
+    payload = json.dumps(template, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
+
+
 def _current_state(obj: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    """(uid, generation, images) из объекта kubectl или None если не разобрать."""
+    """(uid, template_hash, images) из объекта kubectl или None если не разобрать.
+
+    `generation` сохраняется только как справка для записи — критерием
+    выката он не является (см. докстринг модуля).
+    """
     meta = obj.get("metadata") or {}
     name = meta.get("name")
     if not name:
@@ -100,23 +124,32 @@ def _current_state(obj: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         "kind": obj.get("kind") or "Deployment",
         "uid": meta.get("uid"),
         "generation": meta.get("generation"),
+        "template_hash": _template_hash(spec),
         "images": sorted(c.get("image") for c in containers if c.get("image")),
     }
 
 
 def _rollout_reason(prev: Dict[str, Any], cur: Dict[str, Any]) -> Optional[str]:
-    """Что изменилось: 'image' | 'generation' | None.
+    """Что изменилось: 'image' | 'template' | None.
+
+    `image` — сменился хотя бы один образ: это выкат или откат кода.
+    `template` — образы те же, но изменился `spec.template` (env, args,
+    ресурсы, тома): конфигурационный выкат, поды пересоздаются.
+    Рост `generation` без изменения шаблона (scale, HPA) — не деплой.
+
+    Снимок без `template_hash` (записан версией до этого критерия) — с ним
+    сравнивать нечего: по образам да, по шаблону — нет. Иначе первый прогон
+    после обновления объявил бы «template» всему кластеру.
 
     Смена `uid` — не rollout, а пересоздание объекта: у нового workload'а
-    generation снова 1, и сравнивать его с историей предыдущего нечего.
-    Такой случай отдаётся отдельно (см. вызывающий), чтобы «пересоздали
-    стенд» не выглядело как «выкатили новую версию».
+    история предыдущего к нему не относится. Такой случай отдаётся отдельно
+    (см. вызывающий), чтобы «пересоздали стенд» не выглядело как «выкатили».
     """
     if prev.get("images") != cur.get("images"):
         return "image"
-    prev_gen, cur_gen = prev.get("generation"), cur.get("generation")
-    if isinstance(prev_gen, int) and isinstance(cur_gen, int) and cur_gen > prev_gen:
-        return "generation"
+    prev_h, cur_h = prev.get("template_hash"), cur.get("template_hash")
+    if prev_h and cur_h and prev_h != cur_h:
+        return "template"
     return None
 
 
@@ -223,7 +256,7 @@ def watch_k8s_rollouts(
     stats: Dict[str, Any] = {
         "workloads": len(states),
         "recorded": 0,
-        "by_reason": {"image": 0, "generation": 0},
+        "by_reason": {"image": 0, "template": 0},
         "reincarnated": 0,
         "no_node": 0,
         "first_run": not previous,
@@ -266,7 +299,10 @@ def watch_k8s_rollouts(
                 finished_at=stamp,
                 status="SUCCESS",
                 buildtype_id=BUILDTYPE_ID,
-                build_number=f"{cur.get('uid')}:{cur.get('generation')}",
+                # Ключ дедупа — uid + хэш шаблона, а не generation: у
+                # автоскейлящегося workload'а generation даёт новый номер на
+                # каждый тик HPA, и одна и та же версия писалась бы снова.
+                build_number=f"{cur.get('uid')}:{cur.get('template_hash')}",
                 extras={
                     "attribution": ATTRIBUTION,
                     # Наблюдение за КОНКРЕТНЫМ объектом — не ns-broadcast.
@@ -276,7 +312,10 @@ def watch_k8s_rollouts(
                     "rollout_reason": reason,
                     "workload_kind": cur.get("kind"),
                     "workload_uid": cur.get("uid"),
+                    # Справочно — критерием не является (см. докстринг модуля).
                     "generation": cur.get("generation"),
+                    "template_hash": cur.get("template_hash"),
+                    "previous_template_hash": prev.get("template_hash"),
                     "images": cur.get("images"),
                     "previous_images": prev.get("images"),
                 },
