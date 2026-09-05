@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import time
 
 import httpx
 from celery import Celery
@@ -1385,6 +1386,14 @@ async def _kg_self_health_logic() -> dict:
         db.close()
 
     overall = aggregate_status(results)
+    # Снимок для экспортёра метрик. Проверки считает worker, а `/metrics`
+    # отдаёт api — снимок в Redis это единственный общий для них канал.
+    # Ошибка записи не должна валить прогон: метрики — следствие проверок.
+    try:
+        from app.knowledge_graph.self_health_metrics import publish_snapshot
+        publish_snapshot(overall, results, time.time())
+    except Exception as e:  # noqa: BLE001
+        logger.warning("kg_self_health.metrics_publish_failed: %s", e)
     payload = {
         "overall": overall,
         "results": [r.as_dict() for r in results],
