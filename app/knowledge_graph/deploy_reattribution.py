@@ -209,7 +209,9 @@ def reattribute_deployments(
                     if apply:
                         # JSON-колонку переприсваиваем целиком: мутацию dict
                         # на месте SQLAlchemy не увидит и UPDATE не сделает.
-                        r.extras = {**r.extras, "namespace_scope": False}
+                        updated: Dict[str, Any] = dict(r.extras)
+                        updated["namespace_scope"] = False
+                        r.extras = updated  # type: ignore[assignment]
             else:
                 wrong.append(r)
 
