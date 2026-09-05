@@ -62,6 +62,40 @@ def test_observed_counts_collections_and_bools():
     assert status_from_counts({"items": []}, ("items",)) is SourceStatus.EMPTY
 
 
+def test_counters_are_found_in_nested_sections():
+    """Составные синки кладут статистику по секциям — плоский поиск дал бы EMPTY.
+
+    Сверено с живыми результатами 05.09.2026: kg_jobs_sync, kg_storage_sync,
+    kg_topology_resources_sync.
+    """
+    nested = {
+        "cronjobs": {"cronjobs_fetched": 26, "errors": 0},
+        "jobs": {"jobs_fetched": 0, "errors": 0},
+        "transitive_linked": 4,
+    }
+    assert status_from_counts(
+        nested, ("cronjobs_fetched", "jobs_fetched"),
+    ) is SourceStatus.SUCCESS
+    assert status_from_counts(
+        {"pvs": {"pvs_fetched": 0}, "pvcs": {"pvcs_fetched": 0}}, ("pvs_fetched", "pvcs_fetched"),
+    ) is SourceStatus.EMPTY
+
+
+def test_nested_errors_make_it_partial():
+    nested = {"services": {"services_fetched": 6021, "errors": 3}}
+    assert status_from_counts(nested, ("services_fetched",)) is SourceStatus.PARTIAL
+
+
+def test_numeric_skipped_is_a_counter_not_a_flag():
+    """`k8s_pod_events_sync` считает пропущенные события в `skipped` —
+    число там статистика, а не «источник выключен».
+    """
+    assert status_from_counts({"fetched": 40, "skipped": 5}, ("fetched",)) is SourceStatus.SUCCESS
+    assert status_from_counts({"fetched": 0, "skipped": 0}, ("fetched",)) is SourceStatus.EMPTY
+    assert status_from_counts({"skipped": "disabled"}, ("fetched",)) is SourceStatus.UNAVAILABLE
+    assert status_from_counts({"skipped": True}, ("fetched",)) is SourceStatus.UNAVAILABLE
+
+
 def test_non_dict_result_is_invalid():
     assert status_from_counts(None, ("fetched",)) is SourceStatus.INVALID
     assert status_from_counts("ok", ("fetched",)) is SourceStatus.INVALID
