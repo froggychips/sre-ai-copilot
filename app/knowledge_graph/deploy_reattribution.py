@@ -21,6 +21,9 @@ deploy-конфигов, `SERVICE_NAME` — у тех, что деплоят о�
   * цель известна и запись в правильном namespace → оставляет;
   * цель известна, запись в чужом → удаляет;
   * целевой сервис задан и запись не на него → удаляет;
+  * целевой сервис задан и запись на него → снимает маркер
+    `namespace_scope`: это доказательство деплоя ЭТОГО сервиса, а не
+    «в namespace что-то каталось»;
   * записи для правильных сервисов, которых нет → создаёт.
 
 Чего НЕ делает:
@@ -116,6 +119,7 @@ def reattribute_deployments(
         "builds_seen": 0, "builds_resolved": 0, "builds_unknown": 0,
         "builds_without_target": 0,
         "rows_deleted": 0, "rows_created": 0, "rows_kept": 0,
+        "rows_unmarked": 0,
         "applied": False,
     }
 
@@ -195,6 +199,17 @@ def reattribute_deployments(
             if ns_ok and svc_ok:
                 present.add((str(svc.namespace), str(svc.name)))
                 stats["rows_kept"] += 1
+                # Билд деплоил один сервис, и запись стоит именно на нём —
+                # значит это доказательство ЕГО деплоя, а не «в namespace
+                # что-то каталось». Пока маркер висит, `stale_classifier`
+                # обязан считать запись broadcast'ом и не может выдать
+                # `active`.
+                if service_name and r.extras.get("namespace_scope"):
+                    stats["rows_unmarked"] += 1
+                    if apply:
+                        # JSON-колонку переприсваиваем целиком: мутацию dict
+                        # на месте SQLAlchemy не увидит и UPDATE не сделает.
+                        r.extras = {**r.extras, "namespace_scope": False}
             else:
                 wrong.append(r)
 
@@ -223,6 +238,10 @@ def reattribute_deployments(
                 extras = dict(template.extras or {})
                 extras["reattributed_from_branch"] = extras.get("branch")
                 extras["attribution"] = "build_param"
+                # Шаблон взят с broadcast-записи и несёт её маркер. Для
+                # билда с известным целевым сервисом копировать его нельзя —
+                # создаём ровно то доказательство, которого не хватало.
+                extras["namespace_scope"] = service_name is None
                 try:
                     record_deployment(
                         db, service=svc,

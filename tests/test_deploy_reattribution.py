@@ -186,3 +186,56 @@ def test_realm_prefix_does_not_swallow_similar_names(db):
     }
     assert owners == {"squad-27-shared"}
     assert right.id
+
+
+def test_correct_row_of_single_service_build_loses_broadcast_marker(db):
+    """Запись стоит на целевом сервисе — она доказательство его деплоя.
+
+    Пока на ней висит `namespace_scope`, `stale_classifier` обязан читать её
+    как «в namespace что-то каталось» и не может выдать `active`. Замер
+    05.09.2026: 36 записей с известным `target_service`, и все с маркером.
+    """
+    svc = _svc(db, "chat-message-service", "squad-27-shared")
+    _dep(db, svc, bt="Wo_Backend_K8sNewCluster_MigrateAndUpdateService",
+         num="103")
+    db.commit()
+
+    with _target("squad-27", "chat-message-service"):
+        stats = reattribute_deployments(db, apply=True)
+
+    assert stats["rows_kept"] == 1
+    assert stats["rows_unmarked"] == 1
+    assert db.query(Deployment).one().extras["namespace_scope"] is False
+
+
+def test_ns_wide_build_keeps_marker_on_its_rows(db):
+    """Целевого сервиса у билда нет — записи остаются broadcast'ом."""
+    a = _svc(db, "town-service", "squad-1-shared")
+    b = _svc(db, "chat-message-service", "squad-1-shared")
+    _dep(db, a)
+    _dep(db, b)
+    db.commit()
+
+    with _target("squad-1"):
+        stats = reattribute_deployments(db, apply=True)
+
+    assert stats["rows_unmarked"] == 0
+    assert all(d.extras["namespace_scope"] is True
+               for d in db.query(Deployment))
+
+
+def test_created_row_of_single_service_build_is_not_a_broadcast(db):
+    """Дозаписанной строке маркер из broadcast-шаблона не копируется."""
+    _svc(db, "chat-message-service", "preprod-shared")
+    right = _svc(db, "chat-message-service", "squad-27-shared")
+    _dep(db, db.query(Service).filter_by(namespace="preprod-shared").one(),
+         bt="Wo_Backend_K8sNewCluster_MigrateAndUpdateService", num="103")
+    db.commit()
+
+    with _target("squad-27", "chat-message-service"):
+        stats = reattribute_deployments(db, apply=True)
+
+    assert stats["rows_created"] == 1
+    created = db.query(Deployment).one()
+    assert created.service_id == right.id
+    assert created.extras["namespace_scope"] is False
