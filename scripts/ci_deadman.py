@@ -383,7 +383,12 @@ def main():
         return 0
     log(f"находок: {len(problems)}")
     post_discord(problems)
-    return 1
+    # Находка — сигнал, и он уже ушёл в Discord. Возвращать здесь 1 значило
+    # объявлять Job упавшим: k8s держал по failedJobsHistoryLimit Error-подов
+    # в namespace (05.09.2026 — десять штук за 18 суток), а любое правило на
+    # kube_job_status_failed видело в стороже сломанную джобу. Ненулевой
+    # код — только за сбой самого опроса: исключение выше по стеку.
+    return 0
 
 
 if __name__ == "__main__":
