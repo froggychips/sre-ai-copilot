@@ -117,19 +117,53 @@ def status_from_counts(
     if result.get("error") is not None or result.get("status") == "error":
         return SourceStatus.FAILED
     for key in unavailable_keys:
-        if result.get(key):
+        if _is_flag(result.get(key)):
             return SourceStatus.UNAVAILABLE
-    observed = 0
-    for key in observed_keys:
-        value = result.get(key)
-        if isinstance(value, bool):
-            observed += int(value)
-        elif isinstance(value, (int, float)):
-            observed += int(value)
-        elif isinstance(value, (list, tuple, set, dict)):
-            observed += len(value)
+    observed = sum(_count(v) for v in _find_all(result, tuple(observed_keys)))
     if observed <= 0:
         return SourceStatus.EMPTY
-    if errors_key and result.get(errors_key):
+    if errors_key and any(_count(v) for v in _find_all(result, (errors_key,))):
         return SourceStatus.PARTIAL
     return SourceStatus.SUCCESS
+
+
+def _is_flag(value: Any) -> bool:
+    """Маркер недоступности — строка-причина или True, но НЕ счётчик.
+
+    У `k8s_pod_events_sync` в результате лежит `"skipped": 0` — сколько
+    событий пропущено. Число здесь — статистика, а не «источник выключен»;
+    иначе пять пропущенных дубликатов делали бы задачу UNAVAILABLE.
+    """
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return bool(value)
+    return False
+
+
+def _count(value: Any) -> int:
+    if isinstance(value, bool):
+        return int(value)
+    if isinstance(value, (int, float)):
+        return int(value)
+    if isinstance(value, (list, tuple, set, dict)):
+        return len(value)
+    return 0
+
+
+def _find_all(result: Mapping[str, Any], keys: tuple) -> Iterable[Any]:
+    """Значения ключей на любом уровне вложенности.
+
+    Результаты составных синков вложены по секциям:
+    `kg_jobs_sync` → `{'cronjobs': {'cronjobs_fetched': 26, …}, 'jobs': {…}}`,
+    `kg_storage_sync` → `{'pvs': {'pvs_fetched': 1211, …}, 'pvcs': {…}}`,
+    `kg_topology_resources_sync` → `{'services': {'services_fetched': …}}`.
+    Плоский поиск объявил бы их EMPTY после первого же деплоя — и три
+    источника потеряли бы heartbeat ровно из-за проверки, которая должна
+    была его защищать. Сверено с живыми результатами 05.09.2026.
+    """
+    for k, v in result.items():
+        if k in keys:
+            yield v
+        elif isinstance(v, Mapping):
+            yield from _find_all(v, keys)
