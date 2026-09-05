@@ -98,9 +98,11 @@ class Service(Base):
     """
     __tablename__ = "kg_services"
 
-    id = Column(Integer, primary_key=True, index=True)
+    id = Column(Integer, primary_key=True)
     name = Column(String, nullable=False, index=True)
-    namespace = Column(String, nullable=False, index=True)
+    # Без `index=True`: uq_kg_service_ns_name_kind (namespace, name,
+    # node_kind) покрывает эту колонку как префикс.
+    namespace = Column(String, nullable=False)
     # Тип узла. Существующие строки мигрированы в 'service' — то есть смысл
     # старых данных не меняется, а k8s-workload'ы теперь заводятся отдельными
     # узлами и перестают конфликтовать с одноимённым Service.
@@ -162,8 +164,10 @@ class Deployment(Base):
     """
     __tablename__ = "kg_deployments"
 
-    id = Column(Integer, primary_key=True, index=True)
-    service_id = Column(Integer, ForeignKey("kg_services.id"), nullable=False, index=True)
+    id = Column(Integer, primary_key=True)
+    # Без `index=True`: (service_id, started_at) ниже покрывает его как
+    # префикс — отдельный индекс делал бы ту же работу второй раз.
+    service_id = Column(Integer, ForeignKey("kg_services.id"), nullable=False)
     sha = Column(String, nullable=True)
     repo = Column(String, nullable=True)
     buildtype_id = Column(String, nullable=True)  # TeamCity build type
@@ -199,8 +203,9 @@ class AlertEvent(Base):
     """
     __tablename__ = "kg_alerts"
 
-    id = Column(Integer, primary_key=True, index=True)
-    service_id = Column(Integer, ForeignKey("kg_services.id"), nullable=True, index=True)
+    id = Column(Integer, primary_key=True)
+    # Без `index=True`: ix_kg_alert_service_time (service_id, fired_at) покрывает эту колонку как префикс.
+    service_id = Column(Integer, ForeignKey("kg_services.id"), nullable=True)
     alertname = Column(String, nullable=False, index=True)
     severity = Column(String, nullable=True)
     fingerprint = Column(String, nullable=True, unique=True, index=True)
@@ -234,9 +239,12 @@ class PodEvent(Base):
     """
     __tablename__ = "kg_pod_events"
 
-    id = Column(Integer, primary_key=True, index=True)
-    service_id = Column(Integer, ForeignKey("kg_services.id"), nullable=True, index=True)
-    namespace = Column(String, nullable=False, index=True)
+    id = Column(Integer, primary_key=True)
+    # Без `index=True`: ix_kg_pod_event_service_time (service_id, first_seen) покрывает эту колонку как префикс.
+    service_id = Column(Integer, ForeignKey("kg_services.id"), nullable=True)
+    # Без `index=True`: ix_kg_pod_event_ns_reason_time (namespace, reason,
+    # first_seen) покрывает эту колонку как префикс.
+    namespace = Column(String, nullable=False)
     pod_name = Column(String, nullable=False, index=True)
     reason = Column(String, nullable=False, index=True)   # OOMKilled / FailedScheduling / ...
     message = Column(String, nullable=True)
@@ -265,9 +273,10 @@ class ServiceHealth(Base):
     """
     __tablename__ = "kg_service_health"
 
-    id = Column(Integer, primary_key=True, index=True)
+    id = Column(Integer, primary_key=True)
     service_id = Column(
-        Integer, ForeignKey("kg_services.id"), nullable=False, index=True,
+    # Без `index=True`: uq_kg_service_health_service_ts (service_id, ts) покрывает эту колонку как префикс.
+        Integer, ForeignKey("kg_services.id"), nullable=False,
     )
     ts = Column(DateTime, nullable=False)
     cpu_pct = Column(Float, nullable=True)
@@ -283,7 +292,11 @@ class ServiceHealth(Base):
         UniqueConstraint(
             "service_id", "ts", name="uq_kg_service_health_service_ts",
         ),
-        Index("ix_kg_service_health_service_ts", "service_id", "ts"),
+        # (service_id, ts) отдельным индексом не объявляем: ровно этот
+        # состав уже держит UniqueConstraint выше, и обычная копия стоила
+        # 928 МБ и одного лишнего обновления на каждую из 377 тысяч строк в
+        # сутки. По той же причине у `service_id` нет `index=True` — он
+        # префикс уникального.
         Index("ix_kg_service_health_ts", "ts"),
     )
 
@@ -297,7 +310,7 @@ class ClusterObservation(Base):
     """
     __tablename__ = "kg_cluster_observations"
 
-    id = Column(Integer, primary_key=True, index=True)
+    id = Column(Integer, primary_key=True)
     ts = Column(DateTime, nullable=False)
     cpu_pct = Column(Float, nullable=True)
     mem_pct = Column(Float, nullable=True)
@@ -316,7 +329,7 @@ class ClusterObservation(Base):
 
     __table_args__ = (
         UniqueConstraint("ts", name="uq_kg_cluster_obs_ts"),
-        Index("ix_kg_cluster_obs_ts", "ts"),
+        # `ts` уже уникален (см. UniqueConstraint выше) — копии не нужно.
     )
 
 
@@ -330,7 +343,7 @@ class IngressObservation(Base):
     """
     __tablename__ = "kg_ingress_observations"
 
-    id = Column(Integer, primary_key=True, index=True)
+    id = Column(Integer, primary_key=True)
     ts = Column(DateTime, nullable=False)
     ingress_name = Column(String, nullable=False)
     host = Column(String, nullable=False)
@@ -365,9 +378,10 @@ class SignalAggregate(Base):
     """
     __tablename__ = "kg_signal_aggregates"
 
-    id = Column(Integer, primary_key=True, index=True)
+    id = Column(Integer, primary_key=True)
     service_id = Column(
-        Integer, ForeignKey("kg_services.id"), nullable=False, index=True,
+    # Без `index=True`: uq_kg_signal_aggregates_service_window (service_id, window_end) покрывает эту колонку как префикс.
+        Integer, ForeignKey("kg_services.id"), nullable=False,
     )
     window_end = Column(DateTime, nullable=False)
     window_hours = Column(Integer, nullable=True)
@@ -386,10 +400,7 @@ class SignalAggregate(Base):
             "service_id", "window_end",
             name="uq_kg_signal_aggregates_service_window",
         ),
-        Index(
-            "ix_kg_signal_aggregates_service_window",
-            "service_id", "window_end",
-        ),
+        # (service_id, window_end) держит UniqueConstraint выше.
     )
 
 
@@ -406,9 +417,10 @@ class AnomalyObservation(Base):
     """
     __tablename__ = "kg_anomaly_observations"
 
-    id = Column(Integer, primary_key=True, index=True)
+    id = Column(Integer, primary_key=True)
     service_id = Column(
-        Integer, ForeignKey("kg_services.id"), nullable=False, index=True,
+    # Без `index=True`: uq_kg_anomaly_obs_service_ts_metric (service_id, ts, metric) покрывает эту колонку как префикс.
+        Integer, ForeignKey("kg_services.id"), nullable=False,
     )
     ts = Column(DateTime, nullable=False)
     metric = Column(String, nullable=False)
@@ -433,7 +445,8 @@ class AnomalyObservation(Base):
             "service_id", "ts", "metric",
             name="uq_kg_anomaly_obs_service_ts_metric",
         ),
-        Index("ix_kg_anomaly_obs_service_ts", "service_id", "ts"),
+        # (service_id, ts) — префикс уникального (service_id, ts, metric),
+        # b-tree обслуживает такие запросы им же.
         Index("ix_kg_anomaly_obs_severity_ts", "severity", "ts"),
     )
 
@@ -470,9 +483,10 @@ class LogObservation(Base):
     """
     __tablename__ = "kg_log_observations"
 
-    id = Column(Integer, primary_key=True, index=True)
+    id = Column(Integer, primary_key=True)
     service_id = Column(
-        Integer, ForeignKey("kg_services.id"), nullable=True, index=True,
+    # Без `index=True`: ix_kg_log_obs_service_ts (service_id, ts) покрывает эту колонку как префикс.
+        Integer, ForeignKey("kg_services.id"), nullable=True,
     )
     ts = Column(DateTime, nullable=False)
     # Error / Fatal / Warning — Seq использует эти строковые уровни.
@@ -523,8 +537,10 @@ class ActionApproval(Base):
     """
     __tablename__ = "kg_action_approvals"
 
-    id = Column(Integer, primary_key=True, index=True)
-    incident_id = Column(String, nullable=False, index=True)
+    id = Column(Integer, primary_key=True)
+    # Без `index=True`: uq_kg_action_approvals_incident_intent
+    # (incident_id, intent_signature) покрывает эту колонку как префикс.
+    incident_id = Column(String, nullable=False)
     action = Column(String, nullable=True)            # ActionType value, для quick-filter
     intent_signature = Column(String, nullable=False)
     status = Column(String, nullable=False)           # "approved" | "declined"
@@ -573,12 +589,16 @@ class K8sJob(Base):
     """
     __tablename__ = "kg_k8s_jobs"
 
-    id = Column(Integer, primary_key=True, index=True)
-    namespace = Column(String, nullable=False, index=True)
+    id = Column(Integer, primary_key=True)
+    # Без `index=True`: uq_kg_k8s_job_ns_name_kind (namespace, name, kind)
+    # покрывает эту колонку как префикс.
+    namespace = Column(String, nullable=False)
     name = Column(String, nullable=False, index=True)
     # 'job' | 'cronjob'. Hard-coded enum как и в discovery_sources —
     # валидация на app-уровне, сейчас плоская string.
-    kind = Column(String, nullable=False, index=True)
+    # Без `index=True`: ix_kg_k8s_job_kind_ns (kind, namespace) покрывает
+    # эту колонку как префикс.
+    kind = Column(String, nullable=False)
 
     # Owner-label attribution. `owner_service_name` — name из k8s label
     # (`app.kubernetes.io/part-of` или `app`); `owner_service_id` живёт в
@@ -631,7 +651,7 @@ class ServiceEdge(Base):
     """
     __tablename__ = "kg_service_edges"
 
-    id = Column(Integer, primary_key=True, index=True)
+    id = Column(Integer, primary_key=True)
     src_id = Column(Integer, ForeignKey("kg_services.id"), nullable=False, index=True)
     dst_id = Column(Integer, ForeignKey("kg_services.id"), nullable=False, index=True)
     kind = Column(String, nullable=False)
@@ -689,8 +709,10 @@ class StorageVolume(Base):
     """
     __tablename__ = "kg_storage_volumes"
 
-    id = Column(Integer, primary_key=True, index=True)
-    kind = Column(String, nullable=False, index=True)
+    id = Column(Integer, primary_key=True)
+    # Без `index=True`: ix_kg_storage_volumes_kind_ns (kind, namespace)
+    # покрывает эту колонку как префикс.
+    kind = Column(String, nullable=False)
     namespace = Column(
         String, nullable=False, server_default="", index=True,
     )
@@ -713,7 +735,7 @@ class StorageVolume(Base):
             "kind", "namespace", "name",
             name="uq_kg_storage_volumes_kind_ns_name",
         ),
-        Index("ix_kg_storage_volumes_kind_ns", "kind", "namespace"),
+        # (kind, namespace) — префикс уникального (kind, namespace, name).
     )
 
 
@@ -736,12 +758,14 @@ class VolumeEdge(Base):
     """
     __tablename__ = "kg_volume_edges"
 
-    id = Column(Integer, primary_key=True, index=True)
+    id = Column(Integer, primary_key=True)
     # `src_kind` ∈ {'service', 'pvc', 'pv'}. Без FK — это namespacing,
     # не reference. Проверка валидности — на app-уровне (populator).
-    src_kind = Column(String, nullable=False, index=True)
+    # Без `index=True` у *_kind: ix_kg_volume_edges_src (src_kind, src_id)
+    # и ix_kg_volume_edges_dst (dst_kind, dst_id) покрывают их как префикс.
+    src_kind = Column(String, nullable=False)
     src_id = Column(Integer, nullable=False, index=True)
-    dst_kind = Column(String, nullable=False, index=True)
+    dst_kind = Column(String, nullable=False)
     dst_id = Column(Integer, nullable=False, index=True)
     kind = Column(String, nullable=False, index=True)
     discovered_by = Column(String, nullable=True)
