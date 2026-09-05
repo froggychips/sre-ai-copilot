@@ -87,6 +87,10 @@ async def lifespan(app: FastAPI):
     # addr берётся из settings.METRICS_BIND_ADDR (default "0.0.0.0", чтобы
     # in-cluster scraping продолжал работать). В PROD порт :8001 ОБЯЗАТЕЛЬНО
     # ограничивать через NetworkPolicy — иначе метрики доступны всему поду/сети.
+    # Экспортёр self-health подключаем ДО старта сервера: иначе первый
+    # скрейп попадёт в реестр без него и вернёт метрики без проверок.
+    from app.knowledge_graph.self_health_metrics import register_collector
+    register_collector()
     start_http_server(port=8001, addr=settings.METRICS_BIND_ADDR)
     log.info("application_startup", prometheus_port=8001)
     # KG contract drift guard — read-only diagnostic, не блокирует boot.
