@@ -250,6 +250,15 @@ _SYNC_LAG_TARGETS: Dict[str, Dict[str, Any]] = {
         "heartbeat_task": "kg_ingress_observations_sync",
         "interval_minutes": 10,
     },
+    "kg_deploy_watch": {
+        "heartbeat_task": "kg_deploy_watch",
+        "interval_minutes": 5,
+        "reason": (
+            "выкаты из кластера — второй источник kg_deployments. Его "
+            "остановку не видно по данным: записи из TeamCity продолжают "
+            "идти, и таблица выглядит живой"
+        ),
+    },
     "kg_alerts_resolve_sync": {
         "heartbeat_task": "kg_alerts_resolve_sync",
         "interval_minutes": 15,
