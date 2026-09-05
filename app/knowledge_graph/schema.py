@@ -144,6 +144,30 @@ class Service(Base):
     # Реализация эвристики — `app/knowledge_graph/stale_classifier.py`.
     stale_class = Column(String, nullable=True, index=True)
 
+    # ── Идентичность объекта, а не его имени ─────────────────────────────
+    #
+    # До 05.09.2026 узел графа опознавался тройкой (namespace, name,
+    # node_kind), и этого хватало ровно до первого пересоздания. Снесённый и
+    # заведённый заново Deployment — другой объект k8s с другим `uid`, но для
+    # графа он неотличим от прежнего: к нему прирастает вся старая история —
+    # деплои, алерты, health, рёбра.
+    #
+    # У namespace эта проблема решена с 14.08.2026 (`kg_namespaces.k8s_uid` +
+    # `incarnation` + `namespace_lifecycle`); у workload'ов — нет, хотя
+    # пересоздают их на порядок чаще: каждый `--wipe` сквада, каждая смена
+    # селектора, каждый helm uninstall/install.
+    #
+    # NULL здесь — «источник не сообщил uid», а не «объект без uid»: узлы из
+    # алертов и ingress-синтетики заводятся без обхода k8s API.
+    k8s_uid = Column(String, nullable=True)
+    # Порядковый номер воплощения. Растёт, когда под тем же именем появился
+    # объект с другим `k8s_uid`. Смысл тот же, что у `kg_namespaces`.
+    incarnation = Column(Integer, nullable=False, default=1, server_default="1")
+    # Когда инкарнация сменилась в последний раз. Без метки факт пересоздания
+    # виден только как «число стало 2» — без ответа, когда именно, а значит
+    # и без возможности связать его с инцидентом.
+    incarnation_changed_at = Column(DateTime, nullable=True)
+
     __table_args__ = (
         # node_kind в ключе: Service и workload с одинаковым именем — это
         # РАЗНЫЕ узлы, иначе serves_traffic снова схлопнется в self-loop.
