@@ -690,11 +690,11 @@ def kg_deploy_watch_task():
     try:
         result = watch_k8s_rollouts(db)
         logger.info("kg_deploy_watch.done result=%s", result)
-        return result
+        return _src_status(result, observed=('workloads',), unavailable=('skipped',))
     except Exception as e:
         logger.warning("kg_deploy_watch.failed: %s", e)
         db.rollback()
-        return {"error": str(e)}
+        return _src_status({"error": str(e)}, observed=('workloads',), unavailable=('skipped',))
     finally:
         db.close()
 
