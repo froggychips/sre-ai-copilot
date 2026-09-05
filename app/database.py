@@ -179,7 +179,7 @@ class IncidentRecord(Base):
     """
 
     __tablename__ = "incidents"
-    id = Column(Integer, primary_key=True, index=True)
+    id = Column(Integer, primary_key=True)
     incident_id = Column(String, unique=True, index=True)
     status = Column(String)
     data = Column(JSON)
