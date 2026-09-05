@@ -23,7 +23,7 @@ on:
 jobs:
   analyze:
     name: Analyze
-    runs-on: [self-hosted, macOS, ARM64]
+    runs-on: ubuntu-latest
     # Изоляция self-hosted раннера от чужого кода (security finding 19.08.2026).
     #
     # Раннер здесь persistent и работает под пользователем разработчика: рядом
