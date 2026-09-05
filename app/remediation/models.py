@@ -11,7 +11,7 @@ from __future__ import annotations
 
 from datetime import datetime
 
-from sqlalchemy import (JSON, Column, DateTime, Index, Integer, String, Text,
+from sqlalchemy import (JSON, Column, DateTime, Integer, String, Text,
                         UniqueConstraint)
 
 from app.database import Base
@@ -41,8 +41,10 @@ class RemediationDecision(Base):
     """
     __tablename__ = "kg_remediation_decisions"
 
-    id = Column(Integer, primary_key=True, index=True)
-    incident_id = Column(String, nullable=True, index=True)
+    id = Column(Integer, primary_key=True)
+    # Без `index=True`: uq_kg_remediation_decisions_incident_idem
+    # (incident_id, idempotency_key) покрывает эту колонку как префикс.
+    incident_id = Column(String, nullable=True)
     alert_fingerprint = Column(String, nullable=True, index=True)
     target_ref = Column(JSON, nullable=True)
     classification = Column(String, nullable=True, index=True)
@@ -62,8 +64,6 @@ class RemediationDecision(Base):
             "incident_id", "idempotency_key",
             name="uq_kg_remediation_decisions_incident_idem",
         ),
-        Index(
-            "ix_kg_remediation_decisions_incident_idem",
-            "incident_id", "idempotency_key",
-        ),
+        # Отдельного индекса по (incident_id, idempotency_key) нет
+        # намеренно: ровно этот состав держит UniqueConstraint выше.
     )
