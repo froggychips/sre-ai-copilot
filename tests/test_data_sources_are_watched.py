@@ -142,14 +142,10 @@ def _run_statics_sync(observe_result):
 
 
 def _heartbeat_would_be_written(retval) -> bool:
-    """Тот же предикат, что в `_record_beat_heartbeat` для SUCCESS-прогона."""
-    from app.workers.task_lock import is_skipped
+    """Тот же предикат, что в `_record_beat_heartbeat`: контракт источника."""
+    from app.knowledge_graph.source_status import HEARTBEAT_STATUSES, status_of
 
-    if isinstance(retval, dict) and (
-        retval.get("error") is not None or retval.get("status") == "error"
-    ):
-        return False
-    return not is_skipped(retval)
+    return status_of(retval) in HEARTBEAT_STATUSES
 
 
 def test_statics_sync_without_a_single_answer_is_not_a_success():
@@ -157,18 +153,67 @@ def test_statics_sync_without_a_single_answer_is_not_a_success():
 
     Иначе единственный надзор за источником (heartbeat + sync_lag поверх
     него) подтверждает здоровье ровно в тот момент, когда источник мёртв.
+    В #350 это делалось error-маркером; теперь — статусом EMPTY: это не
+    сбой задачи, а ответ источника, и называть его надо своим именем.
     """
+    from app.knowledge_graph.source_status import SourceStatus, status_of
+
     res = _run_statics_sync(None)
 
     assert res["observed"] == 0
-    assert res["error"] == "no_env_observed"
+    assert status_of(res) is SourceStatus.EMPTY
     assert not _heartbeat_would_be_written(res)
 
 
 def test_statics_sync_with_answers_still_writes_heartbeat():
     """Источник ответил — прогон успешный, поведение прежнее."""
+    from app.knowledge_graph.source_status import SourceStatus, status_of
+
     res = _run_statics_sync({"version": 10175, "prev_version": None})
 
     assert res["observed"] == 2
-    assert "error" not in res
+    assert status_of(res) is SourceStatus.SUCCESS
     assert _heartbeat_would_be_written(res)
+
+
+# ── Контракт ответа источника ───────────────────────────────────────────────
+#
+# Heartbeat отвечает на вопрос «прогон был». Он ничего не знает про то,
+# получил ли прогон данные, — и до 05.09.2026 писался на любой SUCCESS без
+# error-маркера. Задача, которая ходит и каждый раз возвращается с пустыми
+# руками, для надзора выглядела здоровой.
+#
+# Теперь каждая задача-источник обязана вернуть `source_status`
+# (see source_status.py), а heartbeat пишется только на SUCCESS/PARTIAL.
+# Проверка статическая: если у задачи нет вызова одной из трёх обёрток,
+# её retval уйдёт без статуса и heartbeat запишется по старому правилу.
+
+_STATUS_WRAPPERS = ("_src_status(", "_src_polled(", "_src_seq(")
+
+
+def _task_source(task_name: str) -> str:
+    import inspect
+
+    from app.workers import tasks as m
+
+    for obj in vars(m).values():
+        name = getattr(obj, "name", None)
+        if name == task_name and callable(obj):
+            fn = getattr(obj, "run", None) or getattr(obj, "__wrapped__", None) or obj
+            try:
+                return inspect.getsource(fn)
+            except (OSError, TypeError):
+                continue
+    raise AssertionError(f"задача {task_name} не найдена в app.workers.tasks")
+
+
+@pytest.mark.parametrize("task", sorted(_DATA_SOURCES))
+def test_every_data_source_declares_its_status(task):
+    """retval без `source_status` — heartbeat по старому правилу, то есть
+    источник снова может пятнадцать суток отдавать пустоту и считаться живым.
+    """
+    src = _task_source(task)
+    assert any(w in src for w in _STATUS_WRAPPERS), (
+        f"{task} не проставляет source_status: оберни return в _src_status / "
+        "_src_polled / _src_seq (см. source_status.py)"
+    )
