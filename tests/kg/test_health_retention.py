@@ -134,3 +134,117 @@ def test_second_run_finishes_the_tail(db):
 
     assert stats["deleted"] == 10
     assert db.query(ServiceHealth).count() == 0
+
+
+# --- политика распространяется на все наблюдательные таблицы ---------------
+#
+# Политику написали для kg_service_health и на ней же оставили, хотя рядом
+# росли ещё пять таблиц той же природы. Замер 05.09.2026, строк старше 30
+# дней: kg_anomaly_observations 908 148 (68% таблицы), kg_signal_aggregates
+# 412 167, kg_ingress_observations 350 196, kg_log_observations 106 141,
+# kg_cluster_observations 21 724.
+
+def test_every_sampling_table_has_a_retention_target():
+    """Наблюдательная таблица без срока хранения растёт вечно.
+
+    Список сверяется явно: новая таблица сэмплов должна попасть в реестр
+    осознанно, а не быть забытой до следующего разбора «почему база 6 ГБ».
+    """
+    from app.knowledge_graph.health_retention import RETENTION_TARGETS
+
+    covered = {t for t, _, _ in RETENTION_TARGETS}
+    assert covered == {
+        "kg_service_health",
+        "kg_anomaly_observations",
+        "kg_signal_aggregates",
+        "kg_ingress_observations",
+        "kg_log_observations",
+        "kg_cluster_observations",
+    }
+
+
+def test_event_tables_are_not_in_retention():
+    """События со смыслом сроком жизни метрик не чистятся.
+
+    Деплой полугодовой давности отвечает на вопрос «когда это сломалось»,
+    и его срок — отдельное решение, а не побочный эффект уборки сэмплов.
+    """
+    from app.knowledge_graph.health_retention import RETENTION_TARGETS
+
+    covered = {t for t, _, _ in RETENTION_TARGETS}
+    for table in ("kg_deployments", "kg_alerts", "kg_pod_events",
+                  "kg_k8s_jobs", "kg_services", "kg_service_edges"):
+        assert table not in covered, f"{table} — события, а не сэмплы"
+
+
+def test_unknown_table_is_refused(db):
+    """Имя таблицы подставляется в SQL текстом — брать его снаружи нельзя."""
+    from app.knowledge_graph.health_retention import purge_table
+
+    with pytest.raises(ValueError, match="RETENTION_TARGETS"):
+        purge_table(db, table="kg_services", ts_column="updated_at", now=NOW)
+
+
+def test_column_must_match_the_registry(db):
+    """Колонка тоже из реестра: по чужой колонке cutoff означал бы другое."""
+    from app.knowledge_graph.health_retention import purge_table
+
+    with pytest.raises(ValueError):
+        purge_table(db, table="kg_service_health", ts_column="id", now=NOW)
+
+
+def test_purge_observations_cleans_a_second_table(db):
+    """Уборка доходит до соседних таблиц, а не только до метрик."""
+    from app.knowledge_graph.health_retention import purge_observations
+    from app.knowledge_graph.schema import AnomalyObservation
+
+    _add_points(db, [40, 1])
+    for i, age in enumerate([40, 35, 1]):
+        db.add(AnomalyObservation(
+            service_id=1, ts=NOW - timedelta(days=age) - timedelta(minutes=i),
+            metric="cpu_pct", severity="warning",
+        ))
+    db.commit()
+
+    stats = purge_observations(db, now=NOW)
+
+    assert stats["per_table"]["kg_anomaly_observations"]["deleted"] == 2
+    assert stats["per_table"]["kg_service_health"]["deleted"] == 1
+    assert db.query(AnomalyObservation).count() == 1
+
+
+def test_one_broken_table_does_not_stop_the_rest(db, monkeypatch):
+    """Отказ на одной таблице не отменяет уборку остальных.
+
+    Иначе одна кривая настройка останавливает политику целиком — а именно
+    так эти таблицы и выросли.
+    """
+    from app.knowledge_graph import health_retention as hr
+
+    _add_points(db, [40])
+    real = hr.purge_table
+
+    def boom(db_, *, table, **kw):
+        if table == "kg_anomaly_observations":
+            raise RuntimeError("нет такой колонки")
+        return real(db_, table=table, **kw)
+
+    monkeypatch.setattr(hr, "purge_table", boom)
+    stats = hr.purge_observations(db, now=NOW)
+
+    assert "error" in stats["per_table"]["kg_anomaly_observations"]
+    assert stats["per_table"]["kg_service_health"]["deleted"] == 1
+
+
+def test_override_still_respects_the_floor(db):
+    """Настройка из конфига не отменяет пол ретеншена."""
+    from app.knowledge_graph.health_retention import purge_observations
+
+    _add_points(db, [40])
+    stats = purge_observations(
+        db, overrides={"kg_service_health": 1}, now=NOW,
+    )
+
+    assert stats["per_table"]["kg_service_health"]["deleted"] == 0
+    assert stats["per_table"]["kg_service_health"]["skipped"]
+    assert db.query(ServiceHealth).count() == 1
