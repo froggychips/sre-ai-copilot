@@ -224,8 +224,12 @@ def purge_table(
         result = cast(
             CursorResult,
             db.execute(
+                # nosec B608 — имя таблицы и колонки не приходят снаружи: оба
+                # сверены с RETENTION_TARGETS выше (ValueError на чужое), а
+                # параметризовать идентификаторы в SQL нельзя. Значения
+                # (cutoff, lim) идут bind-параметрами.
                 text(
-                    f"DELETE FROM {table} WHERE id IN ("
+                    f"DELETE FROM {table} WHERE id IN ("  # nosec B608
                     f"  SELECT id FROM {table}"
                     f"  WHERE {ts_column} < :cutoff"
                     f"  ORDER BY {ts_column} LIMIT :lim"
