@@ -118,3 +118,57 @@ def test_classification_lists_do_not_overlap():
     """Задача либо источник, либо обслуживание — не то и другое сразу."""
     both = sorted(_DATA_SOURCES & _MAINTENANCE)
     assert not both, both
+
+
+# ── Прогон без единого ответа источника — не успех ──────────────────────────
+#
+# Надзор выше отвечает на вопрос «прогон был». Он ничего не знает про то,
+# получил ли прогон данные, а `_record_beat_heartbeat` пишет heartbeat на
+# любой SUCCESS без error-маркера в retval. Значит источник, который ходит и
+# каждый раз возвращает пустоту, для всего надзора выглядит здоровым.
+#
+# Замер 05.09.2026: `kg_statics_versions_sync` пятнадцатые сутки отдавал
+# `observed=0` (NetworkPolicy не пускала на порт statics-Postgres), heartbeat
+# писался каждые 5 минут, `check_sync_lag` показывал `ok`.
+
+def _run_statics_sync(observe_result):
+    from unittest.mock import patch
+    from app.workers import tasks as m
+
+    with patch("app.services.statics_service.observe_statics_version",
+               return_value=observe_result), \
+         patch.object(m.settings, "STATICS_TRACK_ENVS", "prod,preprod"):
+        return m.kg_statics_versions_sync_task()
+
+
+def _heartbeat_would_be_written(retval) -> bool:
+    """Тот же предикат, что в `_record_beat_heartbeat` для SUCCESS-прогона."""
+    from app.workers.task_lock import is_skipped
+
+    if isinstance(retval, dict) and (
+        retval.get("error") is not None or retval.get("status") == "error"
+    ):
+        return False
+    return not is_skipped(retval)
+
+
+def test_statics_sync_without_a_single_answer_is_not_a_success():
+    """Ни один env не ответил — heartbeat писать нельзя.
+
+    Иначе единственный надзор за источником (heartbeat + sync_lag поверх
+    него) подтверждает здоровье ровно в тот момент, когда источник мёртв.
+    """
+    res = _run_statics_sync(None)
+
+    assert res["observed"] == 0
+    assert res["error"] == "no_env_observed"
+    assert not _heartbeat_would_be_written(res)
+
+
+def test_statics_sync_with_answers_still_writes_heartbeat():
+    """Источник ответил — прогон успешный, поведение прежнее."""
+    res = _run_statics_sync({"version": 10175, "prev_version": None})
+
+    assert res["observed"] == 2
+    assert "error" not in res
+    assert _heartbeat_would_be_written(res)
