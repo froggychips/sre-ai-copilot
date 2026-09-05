@@ -30,6 +30,16 @@ class TargetRef:
     `explicit_facts`.
 
     `unknown` — true если даже namespace+kind+name определить не удалось.
+
+    `uid`/`incarnation` — идентичность самого объекта, а не его имени. Тройки
+    (kind, namespace, name) хватает ровно до первого пересоздания: снесённый
+    и заведённый заново Deployment носит то же имя и для всех проверок
+    выглядит прежним. Между планированием действия и его исполнением проходят
+    секунды, но и их достаточно — а verify после ремедиации без uid не может
+    отличить «под поднялся» от «это уже другой Deployment».
+
+    NULL означает «источник не сообщил», а не «объекта нет»: uid приходит из
+    синка топологии, и узлы, заведённые алертом, его пока не имеют.
     """
     kind: str | None = None
     namespace: str | None = None
@@ -38,6 +48,8 @@ class TargetRef:
     owner_name: str | None = None
     labels: dict[str, str] = field(default_factory=dict)
     replicas: int | None = None
+    uid: str | None = None
+    incarnation: int | None = None
     resolved_via: list[str] = field(default_factory=list)
     unknown: bool = False
 
@@ -50,6 +62,8 @@ class TargetRef:
             "owner_name": self.owner_name,
             "labels": dict(self.labels),
             "replicas": self.replicas,
+            "uid": self.uid,
+            "incarnation": self.incarnation,
             "resolved_via": list(self.resolved_via),
             "unknown": self.unknown,
         }
@@ -141,7 +155,9 @@ def _enrich_from_kg(ref: TargetRef, kg_session: Any) -> None:
     # Lazy import — позволяет тестам подсовывать mock без перетаскивания
     # всего KG schema.
     try:
-        from app.knowledge_graph.schema import NODE_KIND_SERVICE, K8sJob, PodEvent, Service
+        from app.knowledge_graph.schema import (NODE_KIND_SERVICE,
+                                                NODE_KIND_WORKLOAD, K8sJob,
+                                                PodEvent, Service)
     except Exception:  # pragma: no cover - safety net
         return
 
@@ -221,6 +237,24 @@ def _enrich_from_kg(ref: TargetRef, kg_session: Any) -> None:
                     except (TypeError, ValueError):
                         pass
             ref.resolved_via.append("kg_service")
+
+    # 4) Идентичность объекта берём с workload-узла: у k8s Service выше свой
+    # uid, и подставлять его как uid Deployment'а — та же подмена, ради
+    # которой узлы и разделили на два node_kind.
+    if ref.name and ref.kind in ("Deployment", "StatefulSet", "DaemonSet"):
+        workload = (
+            kg_session.query(Service)
+            .filter(
+                Service.namespace == ref.namespace,
+                Service.name == ref.name,
+                Service.node_kind == NODE_KIND_WORKLOAD,
+            )
+            .first()
+        )
+        if workload is not None and workload.k8s_uid:
+            ref.uid = str(workload.k8s_uid)
+            ref.incarnation = int(workload.incarnation or 1)
+            ref.resolved_via.append("kg_workload_uid")
 
 
 def resolve_target(

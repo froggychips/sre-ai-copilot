@@ -477,6 +477,9 @@ def _sync_one_service(
         namespace=ns,
         name=name,
         metadata={"k8s_service": meta_json},
+        # uid объекта был в руках всё это время — синк держит полный JSON.
+        # Без него пересозданный Service неотличим от прежнего по имени.
+        k8s_uid=meta.get("uid"),
     )
     stats["nodes_upserted"] += 1
 
@@ -511,6 +514,7 @@ def _sync_one_service(
             team_owner=str(svc_node.team_owner) if svc_node.team_owner else None,
             node_kind=NODE_KIND_WORKLOAD,
             metadata={"k8s_workload": _extract_workload_meta(dep)},
+            k8s_uid=(dep.get("metadata") or {}).get("uid"),
         )
         stats["workload_nodes_upserted"] += 1
         if dep_node.id == svc_node.id:
