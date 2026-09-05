@@ -31,6 +31,10 @@ from app.workers.tasks import _BEAT_HEARTBEAT_TASKS, celery_app
 #: просто неполными, поэтому за фактом прогона нужен надзор.
 _DATA_SOURCES = frozenset({
     "k8s_pod_events_sync",
+    # Выкаты, замеченные в самом кластере. Второй источник kg_deployments —
+    # и потому особенно незаметный при остановке: записи из TeamCity
+    # продолжают идти, и таблица выглядит живой.
+    "kg_deploy_watch",
     "kg_alerts_resolve_sync",
     "kg_cluster_health_sync",
     "kg_endpoints_sync",

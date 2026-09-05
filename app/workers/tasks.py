@@ -376,6 +376,18 @@ celery_app.conf.beat_schedule = {
         "schedule": crontab(minute="12,27,42,57"),
         "options": {"expires": 810},
     },
+    # Второй, независимый от TeamCity источник деплоев: сам кластер.
+    # Сравнивает generation/образы workload'ов с прошлым прогоном и пишет
+    # выкат туда, где его прочтёт RecentDeployRule. Замер 05.09.2026: из
+    # 137 423 записей kg_deployments точную цель имели 36 — всё остальное
+    # приходило ns-broadcast'ом от TeamCity. Пять минут — компромисс между
+    # «успеть до алерта» (RecentDeployRule смотрит на 60 минут назад) и
+    # весом `kubectl get deploy,sts,ds -A -o json`.
+    "kg-deploy-watch": {
+        "task": "kg_deploy_watch",
+        "schedule": crontab(minute="3,8,13,18,23,28,33,38,43,48,53,58"),
+        "options": {"expires": 270},
+    },
     # KG Coverage #1: k8s Job + CronJob → kg_k8s_jobs. Каждые 15 мин
     # `kubectl get jobs,cronjobs -A` + upsert. Сигналы: last_successful_time
     # / last_schedule_time / failed_count / last_pod_exit_code. Закрывает
@@ -649,6 +661,38 @@ def kg_topology_resources_sync_task():
         return result
     except Exception as e:
         logger.warning("kg_topology_resources_sync.failed: %s", e)
+        return {"error": str(e)}
+    finally:
+        db.close()
+
+
+@celery_app.task(name="kg_deploy_watch")
+@single_instance(ttl_seconds=600)
+def kg_deploy_watch_task():
+    """Выкаты, замеченные в кластере, а не рассказанные TeamCity.
+
+    До 05.09.2026 `kg_deployments` наполнялся из одного источника, и 99,97%
+    его записей были ns-broadcast'ом — утверждением «в namespace что-то
+    каталось», разосланным всем сервисам. Точную цель имели 36 записей из
+    137 423.
+
+    Здесь источник другой: `metadata.generation` и образы контейнеров,
+    которые кластер ведёт сам. Записи получают `namespace_scope=False`,
+    то есть служат доказательством деплоя КОНКРЕТНОГО сервиса — на таком
+    входе `stale_classifier` наконец может выдать `active`.
+
+    Первый прогон только запоминает состояние: сравнивать не с чем.
+    """
+    from app.knowledge_graph.k8s_deploy_watch import watch_k8s_rollouts
+
+    db = SessionLocal()
+    try:
+        result = watch_k8s_rollouts(db)
+        logger.info("kg_deploy_watch.done result=%s", result)
+        return result
+    except Exception as e:
+        logger.warning("kg_deploy_watch.failed: %s", e)
+        db.rollback()
         return {"error": str(e)}
     finally:
         db.close()
@@ -1718,6 +1762,9 @@ _BEAT_HEARTBEAT_TASKS = frozenset({
     "kg_runtime_correlation_sync",
     "kg_ingress_observations_sync",
     "kg_alerts_resolve_sync",
+    # Источник деплоев из кластера. Его молчание особенно незаметно: записи
+    # из TeamCity продолжают идти, и kg_deployments выглядит живым.
+    "kg_deploy_watch",
 })
 
 
