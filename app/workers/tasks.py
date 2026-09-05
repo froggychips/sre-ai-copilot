@@ -1148,7 +1148,23 @@ async def _tc_deploys_to_kg_logic() -> dict:
                                 "branch": branch_full,
                                 "buildtype_name": b.get("buildtype_name"),
                                 "url": b.get("url"),
-                                "namespace_scope": True,  # маркер ns-wide attribution
+                                # Маркер ns-wide attribution — «в namespace
+                                # что-то каталось», а не «катился ЭТОТ
+                                # сервис». Ставить его на запись с известным
+                                # `target_service` нельзя: она привязана к
+                                # одному сервису и как раз является
+                                # доказательством его деплоя.
+                                #
+                                # Стоял литеральным True с самого A3-рерайта.
+                                # Из-за этого `is_ns_broadcast_deploy` считала
+                                # broadcast'ом ВСЁ, `last_service_deploy_at` в
+                                # `_refresh_stale_class_for_namespace` не
+                                # набирался никогда, и правило 1
+                                # `classify_stale_with_deploys` не срабатывало
+                                # ни разу: замер 05.09.2026 — 137 423 записи,
+                                # все с маркером, и ноль сервисов в классе
+                                # `active` при 8539 в `suspicious_stale`.
+                                "namespace_scope": not target_service,
                                 # ОТКУДА взялась привязка. Без этого поля
                                 # счётчик by_attribution виден только в логах
                                 # прогона, а по самим данным точную запись не
