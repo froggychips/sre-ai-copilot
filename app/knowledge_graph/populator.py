@@ -15,6 +15,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any, Dict, Optional
 
+import sqlalchemy as sa
 import structlog
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
@@ -67,6 +68,7 @@ def upsert_service(
     node_kind: str = NODE_KIND_SERVICE,
     stale_class: Optional[str] = None,
     owner_source: Optional[str] = None,
+    k8s_uid: Optional[str] = None,
 ) -> Service:
     """Idempotent upsert узла графа — ЕДИНСТВЕННЫЙ путь записи kg_services.
 
@@ -87,6 +89,14 @@ def upsert_service(
     вызовы сохраняют поведение, а узлы workload заводятся только там, где
     это явно нужно (синк топологии).
 
+    `k8s_uid` — идентичность самого объекта. Если под тем же именем пришёл
+    объект с ДРУГИМ uid, это пересоздание: `incarnation` увеличивается, а
+    `incarnation_changed_at` фиксирует момент. Инкремент считается в SQL
+    (`CASE` в `set_`), а не в Python: узлов 17 938, и выяснять предыдущий uid
+    отдельным SELECT'ом на каждый — это 17 938 лишних запросов за прогон.
+    NULL не перетирает известный uid: источник, который его не знает
+    (алерты, ingress-синтетика), не должен стирать то, что видел синк.
+
     На PostgreSQL использует INSERT ON CONFLICT DO UPDATE — атомарно, без
     race condition при параллельных worker'ах.
     На других диалектах (SQLite в тестах) — старый SELECT+INSERT.
@@ -100,11 +110,11 @@ def upsert_service(
     if _is_postgresql(db):
         return _upsert_service_pg(
             db, namespace, name, team_owner, metadata, synthetic, node_kind,
-            stale_class, owner_source,
+            stale_class, owner_source, k8s_uid,
         )
     return _upsert_service_fallback(
         db, namespace, name, team_owner, metadata, synthetic, node_kind,
-        stale_class, owner_source,
+        stale_class, owner_source, k8s_uid,
     )
 
 
@@ -118,6 +128,7 @@ def _upsert_service_pg(
     node_kind: str = NODE_KIND_SERVICE,
     stale_class: Optional[str] = None,
     owner_source: Optional[str] = None,
+    k8s_uid: Optional[str] = None,
 ) -> Service:
     from sqlalchemy.dialects.postgresql import insert as pg_insert
 
@@ -131,6 +142,8 @@ def _upsert_service_pg(
         "metadata_json": metadata,
         "synthetic": bool(synthetic) if synthetic is not None else False,
         "stale_class": stale_class,
+        "k8s_uid": k8s_uid,
+        "incarnation": 1,
         "created_at": now,
         "updated_at": now,
     }
@@ -152,6 +165,22 @@ def _upsert_service_pg(
     # владеет своими ключами, чужие не трогает.
     if synthetic is not None:
         set_clause["synthetic"] = bool(synthetic)
+    if k8s_uid is not None:
+        # Пересоздание видно только здесь: в момент upsert'а обе версии uid
+        # рядом — старая в строке, новая в EXCLUDED. Условие «известный и
+        # ДРУГОЙ»: первое присвоение uid узлу, заведённому без него, — это
+        # не реинкарнация, а дозаполнение.
+        tbl = Service.__table__
+        reincarnated = sa.and_(
+            tbl.c.k8s_uid.isnot(None), tbl.c.k8s_uid != k8s_uid,
+        )
+        set_clause["k8s_uid"] = k8s_uid
+        set_clause["incarnation"] = sa.case(
+            (reincarnated, tbl.c.incarnation + 1), else_=tbl.c.incarnation,
+        )
+        set_clause["incarnation_changed_at"] = sa.case(
+            (reincarnated, now), else_=tbl.c.incarnation_changed_at,
+        )
 
     stmt = (
         pg_insert(Service.__table__)
@@ -195,6 +224,7 @@ def _upsert_service_fallback(
     node_kind: str = NODE_KIND_SERVICE,
     stale_class: Optional[str] = None,
     owner_source: Optional[str] = None,
+    k8s_uid: Optional[str] = None,
 ) -> Service:
     svc = (
         db.query(Service)
@@ -215,6 +245,8 @@ def _upsert_service_fallback(
             metadata_json=metadata,
             synthetic=bool(synthetic) if synthetic is not None else False,
             stale_class=stale_class,
+            k8s_uid=k8s_uid,
+            incarnation=1,
         )
         db.add(svc)
         db.flush()
@@ -242,6 +274,21 @@ def _upsert_service_fallback(
                 changed = True
         if synthetic is not None and svc.synthetic != synthetic:
             svc.synthetic = synthetic
+            changed = True
+        if k8s_uid is not None and svc.k8s_uid != k8s_uid:
+            # Тот же критерий, что в PG-ветке: реинкарнация — это смена
+            # ИЗВЕСТНОГО uid, а не первое его появление у узла, заведённого
+            # алертом.
+            if svc.k8s_uid is not None:
+                svc.incarnation = (svc.incarnation or 1) + 1
+                svc.incarnation_changed_at = datetime.utcnow()
+                logger.info(
+                    "kg.service_reincarnated",
+                    namespace=namespace, name=name, node_kind=node_kind,
+                    incarnation=svc.incarnation,
+                    previous_uid=svc.k8s_uid, uid=k8s_uid,
+                )
+            svc.k8s_uid = k8s_uid
             changed = True
         if changed:
             db.flush()
