@@ -1,4 +1,4 @@
-"""Ретеншен `kg_service_health` — история метрик не должна расти вечно.
+"""Ретеншен наблюдательных таблиц — история сэмплов не должна расти вечно.
 
 Замер 15.08.2026: 18.2 млн строк, таблица 4.2 ГБ из 5.3 ГБ всей базы (79%).
 Данные копятся с 22.05.2026, темп — около 330 тысяч точек в сутки. Политики
@@ -31,6 +31,28 @@ per-table у этой БД нет.
 ACCESS EXCLUSIVE-подобную нагрузку на автовакуум и раздул бы WAL. Каждый батч
 коммитится отдельно, прогон ограничен `max_batches` — задача обязана
 укладываться в свой тик, а не догонять всё за раз.
+
+**Почему теперь не одна таблица.** Политика была написана для
+`kg_service_health` и на ней же и осталась, хотя рядом растут ещё пять
+таблиц ровно той же природы — периодические сэмплы, которые читают на
+глубину часов. Замер 05.09.2026, строк старше 30 дней:
+
+    kg_anomaly_observations    908 148  (68% таблицы, 638 МБ)
+    kg_signal_aggregates       412 167  (50%,          190 МБ)
+    kg_ingress_observations    350 196  (73%,          212 МБ)
+    kg_log_observations        106 141  (67%,           62 МБ)
+    kg_cluster_observations     21 724  (73%,           15 МБ)
+
+При том что самые глубокие потребители смотрят на 1 час
+(`VOLUME_GUARD_WINDOW`), 24 часа (self-health, team-digest) и 7 дней
+(`BASELINE_DAYS`). `kg_cluster_observations` живёт дольше остальных: она
+копеечная по объёму, а поквартальный тренд по кластеру — единственное, из
+чего его вообще можно восстановить.
+
+**Чего эта политика НЕ касается.** `kg_deployments`, `kg_alerts`,
+`kg_pod_events`, `kg_k8s_jobs` — это события со смыслом, а не сэмплы:
+деплой полугодовой давности отвечает на вопрос «когда это сломалось», и
+срок его жизни — отдельное решение, не побочный эффект уборки метрик.
 """
 from __future__ import annotations
 
@@ -43,7 +65,10 @@ from sqlalchemy.orm import Session
 
 logger = logging.getLogger(__name__)
 
-__all__ = ["purge_old_health", "DEFAULT_RETENTION_DAYS", "MIN_RETENTION_DAYS"]
+__all__ = [
+    "purge_old_health", "purge_observations", "RETENTION_TARGETS",
+    "DEFAULT_RETENTION_DAYS", "MIN_RETENTION_DAYS",
+]
 
 #: Сколько истории храним. 30 дней = 4× самое глубокое окно потребителя (7д).
 DEFAULT_RETENTION_DAYS = 30
@@ -62,6 +87,62 @@ DEFAULT_BATCH_SIZE = 50_000
 DEFAULT_MAX_BATCHES = 40
 
 
+#: Наблюдательные таблицы: (таблица, колонка времени, срок хранения).
+#: Срок — свойство данных, а не текущего размера таблицы: см. рассуждение
+#: про доли в докстринге модуля.
+RETENTION_TARGETS: tuple[tuple[str, str, int], ...] = (
+    # Самый глубокий потребитель — baseline детектора аномалий (7 дней).
+    ("kg_service_health", "ts", DEFAULT_RETENTION_DAYS),
+    # Читают на 1 час (VOLUME_GUARD_WINDOW) и 24 часа (self-health).
+    ("kg_anomaly_observations", "ts", DEFAULT_RETENTION_DAYS),
+    # Читают на _SIGNAL_AGG_FRESHNESS_HOURS и окно team-digest (24 часа).
+    ("kg_signal_aggregates", "window_end", DEFAULT_RETENTION_DAYS),
+    # Читают на минуты (_INGRESS_RECENT_WINDOW_MINUTES).
+    ("kg_ingress_observations", "ts", DEFAULT_RETENTION_DAYS),
+    # Окно вокруг инцидента (часы) плюс BASELINE_DAYS для log_error_rate.
+    ("kg_log_observations", "ts", DEFAULT_RETENTION_DAYS),
+    # 15 МБ на три месяца: дешевле хранить, чем потом не иметь тренда.
+    ("kg_cluster_observations", "ts", 90),
+)
+
+
+def purge_observations(
+    db: Session,
+    *,
+    overrides: Dict[str, int] | None = None,
+    batch_size: int = DEFAULT_BATCH_SIZE,
+    max_batches: int = DEFAULT_MAX_BATCHES,
+    now: datetime | None = None,
+) -> Dict[str, Any]:
+    """Прогнать ретеншен по всем таблицам из `RETENTION_TARGETS`.
+
+    `overrides` — сроки из настроек по имени таблицы (сейчас так приходит
+    `KG_HEALTH_RETENTION_DAYS`). Пол `MIN_RETENTION_DAYS` действует и на них.
+
+    Таблицы обрабатываются по очереди и независимо: отказ или ошибка на
+    одной не отменяет уборку остальных — иначе одна кривая настройка
+    остановила бы политику целиком, а именно так эти таблицы и росли.
+    """
+    per_table: Dict[str, Any] = {}
+    deleted = 0
+    for table, ts_column, days in RETENTION_TARGETS:
+        try:
+            stats = purge_table(
+                db, table=table, ts_column=ts_column,
+                retention_days=(overrides or {}).get(table, days),
+                batch_size=batch_size, max_batches=max_batches, now=now,
+            )
+        except Exception as e:  # noqa: BLE001 — соседние таблицы не виноваты
+            logger.error("retention.table_failed table=%s: %s", table, e)
+            db.rollback()
+            per_table[table] = {"error": str(e)}
+            continue
+        per_table[table] = stats
+        deleted += stats["deleted"]
+    logger.info("retention.done deleted=%s tables=%s", deleted, len(per_table))
+    return {"deleted": deleted, "per_table": per_table}
+
+
 def purge_old_health(
     db: Session,
     *,
@@ -71,6 +152,34 @@ def purge_old_health(
     now: datetime | None = None,
 ) -> Dict[str, Any]:
     """Удалить точки `kg_service_health` старше `retention_days`.
+
+    Частный случай `purge_table` — оставлен как есть ради вызывающих,
+    которые знают только про метрики.
+    """
+    return purge_table(
+        db, table="kg_service_health", ts_column="ts",
+        retention_days=retention_days, batch_size=batch_size,
+        max_batches=max_batches, now=now,
+    )
+
+
+#: Имена таблиц и колонок подставляются в SQL текстом (параметризовать
+#: идентификаторы нельзя), поэтому берутся только из `RETENTION_TARGETS` и
+#: сверяются с ним же: снаружи произвольное имя таблицы сюда не попадёт.
+_ALLOWED_TABLES = {t: c for t, c, _ in RETENTION_TARGETS}
+
+
+def purge_table(
+    db: Session,
+    *,
+    table: str,
+    ts_column: str,
+    retention_days: int = DEFAULT_RETENTION_DAYS,
+    batch_size: int = DEFAULT_BATCH_SIZE,
+    max_batches: int = DEFAULT_MAX_BATCHES,
+    now: datetime | None = None,
+) -> Dict[str, Any]:
+    """Удалить строки `table` старше `retention_days` по колонке `ts_column`.
 
     Возвращает статистику прогона:
       * `deleted` — сколько строк удалено;
@@ -82,10 +191,16 @@ def purge_old_health(
     Отказ (ничего не удаляя) при `retention_days < MIN_RETENTION_DAYS`:
     такой запрос почти наверняка ошибка, а последствия необратимы.
     """
+    if _ALLOWED_TABLES.get(table) != ts_column:
+        raise ValueError(
+            f"{table}.{ts_column} нет в RETENTION_TARGETS: срок хранения "
+            "таблицы — решение, которое принимают явно, а не аргументом "
+            "вызова"
+        )
     if retention_days < MIN_RETENTION_DAYS:
         logger.error(
-            "health_retention.refused retention_days=%s < min=%s",
-            retention_days, MIN_RETENTION_DAYS,
+            "retention.refused table=%s retention_days=%s < min=%s",
+            table, retention_days, MIN_RETENTION_DAYS,
         )
         return {
             "deleted": 0, "batches": 0, "truncated": False, "cutoff": None,
@@ -110,9 +225,10 @@ def purge_old_health(
             CursorResult,
             db.execute(
                 text(
-                    "DELETE FROM kg_service_health WHERE id IN ("
-                    "  SELECT id FROM kg_service_health"
-                    "  WHERE ts < :cutoff ORDER BY ts LIMIT :lim"
+                    f"DELETE FROM {table} WHERE id IN ("
+                    f"  SELECT id FROM {table}"
+                    f"  WHERE {ts_column} < :cutoff"
+                    f"  ORDER BY {ts_column} LIMIT :lim"
                     ")"
                 ),
                 {"cutoff": cutoff, "lim": batch_size},
@@ -130,6 +246,7 @@ def purge_old_health(
 
     truncated = batches >= max_batches and deleted >= max_batches * batch_size
     stats: Dict[str, Any] = {
+        "table": table,
         "deleted": deleted,
         "batches": batches,
         "truncated": truncated,
@@ -139,8 +256,9 @@ def purge_old_health(
     if truncated:
         # Молча оставленный хвост выглядел бы как «убрано всё».
         logger.warning(
-            "health_retention.truncated deleted=%s — упёрлись в max_batches=%s, "
-            "остаток уйдёт следующим тиком", deleted, max_batches,
+            "retention.truncated table=%s deleted=%s — упёрлись в "
+            "max_batches=%s, остаток уйдёт следующим тиком",
+            table, deleted, max_batches,
         )
-    logger.info("health_retention.done %s", stats)
+    logger.info("retention.table_done %s", stats)
     return stats

@@ -868,20 +868,30 @@ def kg_endpoints_sync_task():
 @celery_app.task(name="kg_health_retention")
 @single_instance(ttl_seconds=3600)
 def kg_health_retention_task():
-    """Удалить точки kg_service_health старше срока хранения.
+    """Удалить старые сэмплы из наблюдательных таблиц KG.
 
-    Политики хранения у таблицы не было вообще: к 15.08.2026 она выросла до
-    18.2 млн строк и 4.2 ГБ — 79% всей базы, при том что самый глубокий
-    потребитель (baseline детектора аномалий) смотрит на 7 дней.
+    Политики хранения не было вообще: к 15.08.2026 `kg_service_health`
+    выросла до 18.2 млн строк и 4.2 ГБ — 79% всей базы, при том что самый
+    глубокий потребитель (baseline детектора аномалий) смотрит на 7 дней.
+
+    Политику написали для неё одной, и на ней она и осталась, хотя рядом
+    росли ещё пять таблиц той же природы. Замер 05.09.2026 — строк старше
+    30 дней: kg_anomaly_observations 908 148 (68% таблицы),
+    kg_signal_aggregates 412 167, kg_ingress_observations 350 196,
+    kg_log_observations 106 141, kg_cluster_observations 21 724. Список и
+    сроки — в `RETENTION_TARGETS`.
 
     Раз в сутки и ночью: удаление батчами всё равно нагружает автовакуум, а
     срочности в нём никакой.
     """
-    from app.knowledge_graph.health_retention import purge_old_health
+    from app.knowledge_graph.health_retention import purge_observations
 
     db = SessionLocal()
     try:
-        return purge_old_health(db, retention_days=settings.KG_HEALTH_RETENTION_DAYS)
+        return purge_observations(
+            db,
+            overrides={"kg_service_health": settings.KG_HEALTH_RETENTION_DAYS},
+        )
     except Exception as e:
         logger.warning("kg_health_retention.failed: %s", e)
         db.rollback()
