@@ -5,25 +5,37 @@
 1. Через `kubectl get ns` собирает live-namespace set.
 2. Сравнивает с `kg_services.namespace` distinct — БЕЗ синтетических ns
    (см. `_SYNTHETIC_NAMESPACES`): их в кластере нет по построению.
-3. **Safety threshold**: если drift > max_drift_pct (default 20%) — no-op,
-   возвращает skipped=True. Защита от kubectl-failure / временной недоступности
-   API server, когда вернётся пустой set и все ns "drift".
-4. Если apply=True — UPDATE kg_services в drift-ns: `synthetic=true` +
-   `metadata.drift_marked_at` + `metadata.drift_reason`.
+3. Оставляет только те, чьё отсутствие подтверждено вторым, независимым
+   наблюдателем: `kg_namespaces.state='missing'` дольше `_MISSING_GRACE`.
+   Это и есть защита от kubectl-failure — разовый пустой ответ отметку не
+   создаёт, а `namespace_lifecycle` снимает её сразу, как ns вернулся.
+4. **Safety threshold**: если live-набор УСОХ относительно активного в графе
+   больше чем на max_drift_pct — no-op, `skipped_threshold=True`.
+5. Если apply=True — UPDATE kg_services в подтверждённых ns: `synthetic=true`
+   + `metadata.drift_marked_at` + `metadata.drift_reason`.
+
+ИСТОРИЯ: порог считался по доле дрейфа от размера графа и потому блокировал
+сам себя — доля растёт именно оттого, что чистка не идёт. Перевалив 20%
+однажды, чистка выключалась навсегда. Замер 05.09.2026: `drift_pct=39.39`,
+`marked_services=0`, 4275 живых записей в 91 снесённом namespace, 2325 из
+них попадали в отчёты как `suspicious_stale`. Усадка live-набора отвечает
+на тот вопрос, который порог и должен был задавать: «а kubectl вообще
+ответил правду?»
 
 Возвращает dict-stats для logging/celery.
 """
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timezone
-from typing import Any, Dict, Set
+from datetime import datetime, timedelta, timezone
+from typing import Any, Dict, Optional, Set
 
 from sqlalchemy.orm import Session
 
 from app.knowledge_graph.kubectl_breaker import run_kubectl
 from app.knowledge_graph.nats_subjects_sync import NATS_SUBJECTS_NAMESPACE
-from app.knowledge_graph.schema import Service
+from app.knowledge_graph.schema import (NS_STATE_ACTIVE, NS_STATE_MISSING,
+                                        Namespace, Service)
 
 log = logging.getLogger(__name__)
 
@@ -32,6 +44,12 @@ log = logging.getLogger(__name__)
 # kg_ns vs live-ns они попадали в drift КАЖДЫЙ прогон: subject-узлы получали
 # `drift_reason`/`drift_marked_at`, а drift_pct был постоянно завышен.
 _SYNTHETIC_NAMESPACES = frozenset({NATS_SUBJECTS_NAMESPACE})
+
+#: Сколько namespace должен числиться `missing` в `kg_namespaces`, прежде чем
+#: его сервисы можно помечать. Сутки — заведомо больше любого флапа kubectl
+#: (lifecycle ходит каждые 10 минут и снимает отметку сразу же), и заведомо
+#: меньше срока, за который снесённый стенд успевает испортить отчёты.
+_MISSING_GRACE = timedelta(hours=24)
 
 
 class DriftCleanupSkipped(Exception):
@@ -61,40 +79,88 @@ timeout=15,
     }
 
 
+def _confirmed_missing(db: Session, grace: timedelta, now: datetime) -> Set[str]:
+    """Namespace, отсутствие которых подтверждено lifecycle дольше `grace`.
+
+    `kg_namespaces` ведёт независимое наблюдение: `namespace_lifecycle`
+    ставит `state=missing` + `missing_since` и снимает их, как только ns
+    появляется снова. Разовый сбой kubectl такую отметку не переживает — она
+    снимется на следующем же прогоне, и до конца grace-периода ns сюда не
+    попадёт.
+
+    Ns, которого lifecycle не видел вовсе (строки нет), не подтверждён — и
+    помечать по нему нечего.
+    """
+    rows = (
+        db.query(Namespace.namespace, Namespace.missing_since)
+        .filter(Namespace.state == NS_STATE_MISSING,
+                Namespace.missing_since.isnot(None))
+        .all()
+    )
+    return {ns for ns, since in rows if since is not None and now - since >= grace}
+
+
 def run_drift_cleanup(
     db: Session,
     max_drift_pct: float = 20.0,
     apply: bool = True,
+    grace: timedelta = _MISSING_GRACE,
+    now: Optional[datetime] = None,
 ) -> Dict[str, Any]:
     """Drift cleanup с safety.
 
-    max_drift_pct: если drift > N% от kg-ns — abort (защита от false-wipe
-    при kubectl-failure). Default 20% — нормальная гранулярность ns в WO
-    (drift обычно 1-3 ns из 47).
+    Помечаются только namespace, отсутствие которых подтверждено дважды:
+    их нет в `kubectl get ns` СЕЙЧАС и `kg_namespaces` держит их
+    `state=missing` дольше `grace`. Второе условие и есть защита от
+    kubectl-failure: одного пустого ответа мало, чтобы lifecycle
+    продержал отметку сутки.
+
+    max_drift_pct остался страховкой от абсурда, но считается по УСАДКЕ
+    live-набора относительно того, что граф считает живым, а не по доле
+    накопленного мусора. Прежняя формулировка блокировала сама себя: доля
+    дрейфа растёт ровно потому, что чистка не идёт, и, перевалив порог
+    однажды, выключала чистку навсегда. Замер 05.09.2026 —
+    `drift_pct=39.39 > 20.00, marked_services=0`: 4275 живых записей в 91
+    снесённом namespace, из них 2325 в отчётах как `suspicious_stale`.
 
     Returns:
         {
           "kg_ns_count": int,
           "k8s_ns_count": int,
-          "drift_ns": List[str],
+          "drift_ns": List[str],          # нет в кластере сейчас
+          "unconfirmed_ns": List[str],    # из них ещё не подтверждены lifecycle
           "drift_pct": float,
+          "shrink_pct": float,            # усадка live-набора vs active в графе
           "skipped_threshold": bool,
           "marked_services": int,  # 0 если apply=False или skipped
           "applied": bool,
         }
     """
+    stamp = now or datetime.now(timezone.utc).replace(tzinfo=None)
     k8s_ns = _k8s_live_namespaces()
     kg_ns = {
         ns for (ns,) in db.query(Service.namespace).distinct().all()
         if ns not in _SYNTHETIC_NAMESPACES
     }
     drift = sorted(kg_ns - k8s_ns)
+    confirmed = _confirmed_missing(db, grace, stamp)
+    to_mark = sorted(set(drift) & confirmed)
+
+    active_in_graph = (
+        db.query(Namespace).filter(Namespace.state == NS_STATE_ACTIVE).count()
+    )
+    shrink_pct = (
+        round(100.0 * max(active_in_graph - len(k8s_ns), 0) / active_in_graph, 2)
+        if active_in_graph else 0.0
+    )
 
     stats: Dict[str, Any] = {
         "kg_ns_count": len(kg_ns),
         "k8s_ns_count": len(k8s_ns),
         "drift_ns": drift,
+        "unconfirmed_ns": sorted(set(drift) - confirmed),
         "drift_pct": round(100.0 * len(drift) / max(len(kg_ns), 1), 2),
+        "shrink_pct": shrink_pct,
         "skipped_threshold": False,
         "marked_services": 0,
         "applied": False,
@@ -104,16 +170,27 @@ def run_drift_cleanup(
         log.info("drift_cleanup.no_drift kg_ns=%d", len(kg_ns))
         return stats
 
-    if stats["drift_pct"] > max_drift_pct:
-        # Защита от false-positive (kubectl вернул пусто из-за временной
-        # ошибки — все ns стали бы "drift"). В норме drift 1-5%, threshold
-        # 20% это широкая страховка с большим room для растущей инфры.
+    if shrink_pct > max_drift_pct:
+        # kubectl недосчитался живых namespace относительно того, что граф
+        # считает активным. Это признак сбоя запроса, а не сноса стендов:
+        # столько окружений разом не исчезает.
         stats["skipped_threshold"] = True
         log.warning(
-            "drift_cleanup.threshold_exceeded drift_pct=%.2f max=%.2f drift_ns=%s",
-            stats["drift_pct"], max_drift_pct, drift,
+            "drift_cleanup.live_set_shrank shrink_pct=%.2f max=%.2f "
+            "k8s_ns=%d active_in_graph=%d",
+            shrink_pct, max_drift_pct, len(k8s_ns), active_in_graph,
         )
         return stats
+
+    if not to_mark:
+        log.info(
+            "drift_cleanup.nothing_confirmed drift=%d unconfirmed=%d grace_h=%.0f",
+            len(drift), len(stats["unconfirmed_ns"]),
+            grace.total_seconds() / 3600,
+        )
+        return stats
+
+    drift = to_mark
 
     if not apply:
         return stats
