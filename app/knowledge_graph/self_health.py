@@ -282,6 +282,15 @@ def _now() -> datetime:
     return datetime.utcnow()
 
 
+def _last_source_status(task_name: str) -> Optional[str]:
+    """Последний `source_status` задачи из redis или None. Fail-open."""
+    try:
+        from app.services.digest.state import get_beat_last_status
+        return get_beat_last_status(task_name)
+    except Exception:  # pragma: no cover — defensive
+        return None
+
+
 def _last_heartbeat(task_name: str) -> Optional[datetime]:
     """Время последнего успешного прогона beat-задачи (naive UTC) или None.
 
@@ -426,6 +435,13 @@ def check_sync_lag(db: Session) -> CheckResult:
         last_ts: Optional[datetime]
         if hb_task:
             last_ts = _last_heartbeat(hb_task)
+            # Последний статус ответа источника (source_status.py). Heartbeat
+            # говорит «прогон с данными был»; статус добавляет, чем
+            # закончились прогоны после него. «heartbeat 40 минут назад,
+            # last_status=empty» читается иначе, чем просто «40 минут назад».
+            last_status = _last_source_status(hb_task)
+            if last_status is not None:
+                entry["last_status"] = last_status
             col_factory = cfg.get("column")
             if col_factory is not None:
                 # Информационно: когда задача последний раз что-то материализовала.
@@ -467,6 +483,11 @@ def check_sync_lag(db: Session) -> CheckResult:
             "lag_minutes": round(lag, 1),
             "status": this_status,
         })
+        if this_status != "ok" and entry.get("last_status"):
+            entry["reason"] = (
+                f"heartbeat отстаёт, последний ответ источника — "
+                f"{entry['last_status']}"
+            )
         per_task[task_name] = entry
         if this_status == "fail" or (this_status == "warn" and worst_status != "fail"):
             worst_status = this_status
