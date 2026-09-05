@@ -254,11 +254,18 @@ def test_clean_run_posts_nothing(dm, monkeypatch):
 
 
 def test_findings_are_posted(dm, monkeypatch):
+    """Находки уходят в Discord, а код возврата остаётся нулевым.
+
+    Находка — сигнал, и он уже доставлен. Ненулевой код здесь означал бы
+    Job Failed: k8s держал Error-поды по failedJobsHistoryLimit (десять за
+    18 суток к 05.09.2026), а правила на kube_job_status_failed видели в
+    стороже сломанную джобу. Падать джоба должна только за сбой опроса.
+    """
     monkeypatch.setattr(dm, "TOKEN", "t")
     monkeypatch.setattr(dm, "CHECKS", (("runners", lambda: ["раннер offline"]),))
     posted = []
     monkeypatch.setattr(dm, "post_discord", lambda p: posted.append(p))
-    assert dm.main() == 1
+    assert dm.main() == 0
     assert posted == [["раннер offline"]]
 
 
