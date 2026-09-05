@@ -873,55 +873,146 @@ def test_upsert_edge_idempotent_for_same_source():
 # ── D2-auto: drift cleanup safety threshold ───────────────────────────────
 
 
-def test_drift_cleanup_skipped_threshold():
-    """Когда drift > max_drift_pct — no-op, защита от false-wipe."""
+def _drift_db():
+    """Настоящая сессия: чистка теперь читает `kg_namespaces`, а не только ns.
+
+    На MagicMock эти тесты проверяли арифметику долей и ничего не знали про
+    подтверждение отсутствия — то есть ровно про ту часть, которой чистка и
+    держится.
+    """
+    from sqlalchemy import create_engine
+    from sqlalchemy.orm import sessionmaker
+    from app.database import Base
+
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    return sessionmaker(bind=engine, autocommit=False, autoflush=False)()
+
+
+def _ns_row(db, name, *, state, missing_hours=None):
+    from datetime import datetime, timedelta
+    from app.knowledge_graph.schema import Namespace
+
+    now = datetime(2026, 9, 5, 3, 0, 0)
+    db.add(Namespace(
+        namespace=name, state=state, incarnation=1,
+        first_seen_at=now - timedelta(days=30), last_seen_at=now,
+        missing_since=(now - timedelta(hours=missing_hours)
+                       if missing_hours is not None else None),
+    ))
+
+
+def _svc_row(db, name, ns):
+    from app.knowledge_graph.schema import Service
+
+    s = Service(name=name, namespace=ns, synthetic=False)
+    db.add(s)
+    return s
+
+
+def _run_drift(db, live, **kw):
+    from datetime import datetime
     from unittest.mock import patch
     from app.knowledge_graph.drift_cleanup import run_drift_cleanup
 
-    # Mock: k8s has 1 ns, kg has 5 ns (4 drift = 80% > 20% threshold).
+    kw.setdefault("now", datetime(2026, 9, 5, 3, 0, 0))
     with patch("app.knowledge_graph.drift_cleanup._k8s_live_namespaces",
-               return_value={"only-this"}):
-        db = MagicMock()
-        db.query.return_value.distinct.return_value.all.return_value = [
-            ("ns-a",), ("ns-b",), ("ns-c",), ("ns-d",), ("only-this",),
-        ]
-        result = run_drift_cleanup(db, max_drift_pct=20.0, apply=True)
+               return_value=set(live)):
+        return run_drift_cleanup(db, **kw)
+
+
+def test_drift_cleanup_skips_when_live_set_shrank():
+    """kubectl недосчитался живых ns — это сбой запроса, а не снос стендов.
+
+    Порог отвечает именно на этот вопрос. По доле накопленного мусора он
+    отвечать не может: она растёт оттого, что чистка не идёт, и однажды
+    перевалив порог, выключала чистку навсегда.
+    """
+    from app.knowledge_graph.schema import NS_STATE_ACTIVE
+
+    db = _drift_db()
+    for n in ("a", "b", "c", "d", "only-this"):
+        _ns_row(db, n, state=NS_STATE_ACTIVE)
+        _svc_row(db, "svc", n)
+    db.commit()
+
+    result = _run_drift(db, {"only-this"}, max_drift_pct=20.0, apply=True)
 
     assert result["skipped_threshold"] is True
-    assert result["drift_pct"] == 80.0
+    assert result["shrink_pct"] == 80.0
     assert result["marked_services"] == 0
     assert result["applied"] is False
-    # UPDATE не должен быть вызван
-    db.commit.assert_not_called()
 
 
-def test_drift_cleanup_within_threshold_apply():
-    """Когда drift ≤ threshold — UPDATE применяется."""
-    from unittest.mock import patch, MagicMock
-    from app.knowledge_graph.drift_cleanup import run_drift_cleanup
-    from app.knowledge_graph.schema import Service
+def test_drift_cleanup_marks_confirmed_missing():
+    """Отсутствие подтверждено lifecycle дольше grace — можно помечать."""
+    from app.knowledge_graph.schema import (NS_STATE_ACTIVE, NS_STATE_MISSING,
+                                            Service)
 
-    # Mock: 5 ns в KG, 4 в k8s → drift 1/5 = 20% (на границе, проходит).
-    svc = MagicMock(spec=Service)
-    svc.synthetic = False
-    svc.metadata_json = None
+    db = _drift_db()
+    for n in ("a", "b", "c", "d"):
+        _ns_row(db, n, state=NS_STATE_ACTIVE)
+    _ns_row(db, "drift-ns", state=NS_STATE_MISSING, missing_hours=48)
+    _svc_row(db, "svc", "drift-ns")
+    db.commit()
 
-    with patch("app.knowledge_graph.drift_cleanup._k8s_live_namespaces",
-               return_value={"a", "b", "c", "d"}):
-        db = MagicMock()
-        db.query.return_value.distinct.return_value.all.return_value = [
-            ("a",), ("b",), ("c",), ("d",), ("drift-ns",),
-        ]
-        db.query.return_value.filter.return_value.all.return_value = [svc]
-        result = run_drift_cleanup(db, max_drift_pct=25.0, apply=True)
+    result = _run_drift(db, {"a", "b", "c", "d"}, max_drift_pct=25.0, apply=True)
 
     assert result["skipped_threshold"] is False
-    assert result["drift_pct"] == 20.0
     assert result["applied"] is True
     assert result["marked_services"] == 1
+    svc = db.query(Service).one()
     assert svc.synthetic is True
     assert svc.metadata_json["drift_reason"] == "ns_not_in_k8s"
-    db.commit.assert_called_once()
+
+
+def test_drift_cleanup_waits_for_confirmation():
+    """Из кластера пропал, но lifecycle ещё не выдержал grace — не трогаем.
+
+    Это и есть защита от kubectl-failure: разовый пустой ответ не создаёт
+    отметку `missing`, а вернувшийся ns снимает её на следующем прогоне.
+    """
+    from app.knowledge_graph.schema import (NS_STATE_ACTIVE, NS_STATE_MISSING,
+                                            Service)
+
+    db = _drift_db()
+    for n in ("a", "b", "c", "d"):
+        _ns_row(db, n, state=NS_STATE_ACTIVE)
+    _ns_row(db, "just-gone", state=NS_STATE_MISSING, missing_hours=1)
+    _svc_row(db, "svc", "just-gone")
+    db.commit()
+
+    result = _run_drift(db, {"a", "b", "c", "d"}, max_drift_pct=25.0, apply=True)
+
+    assert result["marked_services"] == 0
+    assert result["unconfirmed_ns"] == ["just-gone"]
+    assert db.query(Service).one().synthetic is False
+
+
+def test_drift_cleanup_survives_the_share_that_used_to_block_it():
+    """39% мусора больше не блокируют чистку — именно так она и стояла.
+
+    Замер 05.09.2026: drift_pct=39.39 при пороге 20, marked_services=0.
+    """
+    from app.knowledge_graph.schema import (NS_STATE_ACTIVE, NS_STATE_MISSING,
+                                            Service)
+
+    db = _drift_db()
+    live = {f"live-{i}" for i in range(6)}
+    for n in live:
+        _ns_row(db, n, state=NS_STATE_ACTIVE)
+        _svc_row(db, "svc", n)
+    for i in range(4):
+        _ns_row(db, f"gone-{i}", state=NS_STATE_MISSING, missing_hours=72)
+        _svc_row(db, "svc", f"gone-{i}")
+    db.commit()
+
+    result = _run_drift(db, live, max_drift_pct=20.0, apply=True)
+
+    assert result["drift_pct"] == 40.0
+    assert result["skipped_threshold"] is False
+    assert result["marked_services"] == 4
+    assert db.query(Service).filter(Service.synthetic.is_(True)).count() == 4
 
 
 def test_drift_cleanup_kubectl_failure_raises():
@@ -937,25 +1028,21 @@ def test_drift_cleanup_kubectl_failure_raises():
 
 
 def test_drift_cleanup_already_marked_idempotent():
-    """Services с drift_reason уже помечены — skip повтор."""
-    from unittest.mock import patch, MagicMock
-    from app.knowledge_graph.drift_cleanup import run_drift_cleanup
-    from app.knowledge_graph.schema import Service
+    """Сервис уже помечен — повторный прогон его не считает заново."""
+    from app.knowledge_graph.schema import (NS_STATE_ACTIVE, NS_STATE_MISSING)
 
-    already = MagicMock(spec=Service)
-    already.synthetic = True
-    already.metadata_json = {"drift_reason": "ns_not_in_k8s"}
+    db = _drift_db()
+    for n in ("a", "b", "c", "d"):
+        _ns_row(db, n, state=NS_STATE_ACTIVE)
+    _ns_row(db, "drift-ns", state=NS_STATE_MISSING, missing_hours=48)
+    svc = _svc_row(db, "svc", "drift-ns")
+    svc.synthetic = True
+    svc.metadata_json = {"drift_reason": "ns_not_in_k8s"}
+    db.commit()
 
-    with patch("app.knowledge_graph.drift_cleanup._k8s_live_namespaces",
-               return_value={"a", "b", "c", "d"}):
-        db = MagicMock()
-        db.query.return_value.distinct.return_value.all.return_value = [
-            ("a",), ("b",), ("c",), ("d",), ("drift-ns",),
-        ]
-        db.query.return_value.filter.return_value.all.return_value = [already]
-        result = run_drift_cleanup(db, max_drift_pct=25.0, apply=True)
+    result = _run_drift(db, {"a", "b", "c", "d"}, max_drift_pct=25.0, apply=True)
 
-    assert result["marked_services"] == 0  # уже помечен, skip
+    assert result["marked_services"] == 0
 
 
 # ── ChatGPT review #3.1: precedence-based confidence_score ─────────────────
