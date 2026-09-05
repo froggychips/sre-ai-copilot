@@ -9,6 +9,11 @@ apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
   name: copilot-network-policy
+  # namespace ЯВНО: без него `kubectl apply -f` кладёт политику в namespace
+  # текущего контекста. 05.09.2026 так и вышло — политика уехала в `default`
+  # (там её селектор не выбирает ничего), а в `sre-ai` осталась прежняя, и
+  # apply отрапортовал `created`, то есть успех.
+  namespace: sre-ai
 spec:
   podSelector:
     matchExpressions:
