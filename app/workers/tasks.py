@@ -1559,6 +1559,20 @@ def kg_statics_versions_sync_task():
     statics_service.observe_statics_version). Держит «до»-снимок, чтобы
     enrichment мог отличить накат статики от cross-ns collateral. No-op
     если STATICS_* не настроен. Не raise — сбой tick'а не валит beat-loop.
+
+    Ноль наблюдений при настроенных env — это `{"error": ...}`, а не успех.
+    Задача стоит в `_BEAT_HEARTBEAT_TASKS` и в `check_sync_lag` со
+    `source: heartbeat`, то есть весь надзор за источником сводится к
+    «прогон завершился». Пока прогон без единого ответа считался успешным,
+    heartbeat писался и sync_lag показывал `ok` на полностью мёртвом
+    источнике.
+
+    Замер 05.09.2026: `observed=0` на всех четырёх env, соединение с
+    `STATICS_HOST:STATICS_PORT` из пода — TimeoutError (NetworkPolicy не
+    пускала на этот порт), ключей `statics:seen:*` в Redis нет вообще, и при
+    этом sync_lag рапортовал `ok` пятнадцатые сутки. Тот же класс, что
+    `kg_seq_logs_sync` 20.08.2026 — см. комментарий у
+    `_BEAT_HEARTBEAT_TASKS`.
     """
     from app.services.statics_service import observe_statics_version
 
@@ -1581,6 +1595,16 @@ def kg_statics_versions_sync_task():
         # зафиксирована смена версии (для observability лога).
         if state.get("prev_version") is not None:
             changed += 1
+    if observed == 0:
+        logger.error(
+            "kg_statics_versions_sync.blind envs=%d host=%s:%s — "
+            "ни одного ответа, heartbeat не пишем",
+            len(envs), settings.STATICS_HOST, settings.STATICS_PORT,
+        )
+        return {
+            "envs": len(envs), "observed": 0, "with_prev": 0,
+            "error": "no_env_observed",
+        }
     logger.info(
         "kg_statics_versions_sync.done envs=%d observed=%d with_prev=%d",
         len(envs), observed, changed,

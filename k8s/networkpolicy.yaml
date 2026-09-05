@@ -60,6 +60,43 @@ spec:
     ports:
     - protocol: TCP
       port: 6379
+  # Statics-Postgres (statics-db-postgresql в ns statics). Отсюда
+  # `statics_service.observe_statics_version` читает номер накатанной версии
+  # статики: на нём стоит `STATICS_RESTART_ATTRIB_ENABLED` — атрибуция
+  # рестартов на накат статики вместо «сервис упал сам по себе».
+  #
+  # Прецедент 21.08.2026, тот же класс, что Seq/TeamCity ниже, только не
+  # пойманный сразу: правило на 443 statics не покрывает — соединение идёт
+  # PostgreSQL-протоколом. `kg_statics_versions_sync` крутил 3 ретрая на
+  # каждый из 4 env (66 с на прогон каждые 5 минут), возвращал
+  # `observed=0` и считался успешным. Замер 05.09.2026: ключей
+  # `statics:seen:*` в Redis нет ни одного, при этом `check_sync_lag`
+  # пятнадцатые сутки показывал `ok`.
+  - to:
+    - namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: statics
+      podSelector:
+        matchLabels:
+          app.kubernetes.io/name: postgresql
+          app.kubernetes.io/instance: statics-db
+    ports:
+    - protocol: TCP
+      port: 5432
+  # Тот же Postgres, но так, как он прописан в конфиге сейчас: NodePort
+  # 31700 на публичном адресе (STATICS_HOST/STATICS_PORT). Правило выше
+  # его не покрывает — kube-proxy не делает DNAT для чужого node-IP, и
+  # политика видит исходный публичный адрес.
+  #
+  # Адрес зафиксирован /32 намеренно: открывать 31700 в весь интернет ради
+  # одного хоста не за чем. Когда STATICS_HOST переведут на внутренний
+  # `statics-db-postgresql.statics.svc:5432`, это правило удаляется целиком.
+  - to:
+    - ipBlock:
+        cidr: 212.83.153.1/32
+    ports:
+    - protocol: TCP
+      port: 31700
   # Kubernetes API server (diagnostics/remediation, kg_*_sync).
   - to:
     - ipBlock:
