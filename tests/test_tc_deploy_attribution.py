@@ -212,3 +212,72 @@ def test_target_is_recorded_for_later_verification(db):
     d = db.query(Deployment).one()
     assert d.extras["target_realm"] == "squad-27"
     assert d.extras["target_service"] == "chat-message-service"
+
+
+def test_single_service_deploy_is_not_marked_ns_broadcast(db):
+    """Запись с известной целью — доказательство деплоя, а не broadcast.
+
+    `namespace_scope` стоял литеральным True даже здесь, и
+    `is_ns_broadcast_deploy` объявляла broadcast'ом запись, привязанную к
+    одному сервису. Ниже по течению это единственное доказательство, по
+    которому `classify_stale_with_deploys` выдаёт `active`.
+    """
+    from app.knowledge_graph.stale_classifier import is_ns_broadcast_deploy
+
+    _svc(db, "chat-message-service", "squad-27-shared")
+    _svc(db, "town-service", "squad-27-shared")
+    db.commit()
+
+    _run(db, [_build(
+        buildtype_id="Wo_Backend_K8sNewCluster_MigrateAndUpdateService",
+        number="103", target_realm="squad-27",
+        target_service="chat-message-service",
+    )])
+
+    d = db.query(Deployment).one()
+    assert d.extras["namespace_scope"] is False
+    assert is_ns_broadcast_deploy(d.extras) is False
+
+
+def test_ns_wide_deploy_keeps_broadcast_marker(db):
+    """Цели нет — запись разослана всему namespace, и это надо помнить.
+
+    Без маркера ns-broadcast стал бы доказательством деплоя КАЖДОГО сервиса
+    окружения, то есть вернулась бы ровно та беда, от которой маркер и завели.
+    """
+    from app.knowledge_graph.stale_classifier import is_ns_broadcast_deploy
+
+    _svc(db, "town-service", "squad-1-shared")
+    _svc(db, "chat-message-service", "squad-1-shared")
+    db.commit()
+
+    _run(db, [_build(target_realm="squad-1")])
+
+    rows = db.query(Deployment).all()
+    assert len(rows) == 2
+    assert all(d.extras["namespace_scope"] is True for d in rows)
+    assert all(is_ns_broadcast_deploy(d.extras) for d in rows)
+
+
+def test_targeted_deploy_makes_service_active(db):
+    """Сквозная проверка: цель билда доходит до stale_class.
+
+    Смысл маркера виден только на конце цепочки — свой деплой обязан давать
+    `active`, а соседу по namespace от него не должно достаться ничего.
+    """
+    from app.knowledge_graph.kg_sync import _refresh_stale_class_for_namespace
+
+    _svc(db, "chat-message-service", "squad-27-shared")
+    _svc(db, "town-service", "squad-27-shared")
+    db.commit()
+
+    _run(db, [_build(
+        buildtype_id="Wo_Backend_K8sNewCluster_MigrateAndUpdateService",
+        number="103", target_realm="squad-27",
+        target_service="chat-message-service",
+    )])
+    _refresh_stale_class_for_namespace(db, "squad-27-shared")
+
+    by_name = {s.name: s.stale_class for s in db.query(Service)}
+    assert by_name["chat-message-service"] == "active"
+    assert by_name["town-service"] != "active"
