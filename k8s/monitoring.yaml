@@ -1,0 +1,198 @@
+# Алертинг на сам копилот.
+#
+# ПОЧЕМУ НЕ prometheus-rules.yaml. Тот файл лежит в репо с 2026-05 и в
+# кластере не применён ни разу: `kubectl get vmrule -A` — 61 правило и ни
+# одного про sre-ai. Кластер живёт на VictoriaMetrics, где правила описывает
+# VMRule, а не PrometheusRule — то есть даже применённый, тот файл был бы
+# подобран только при включённом prometheusRulesConverter.
+#
+# Вдобавок он говорит не о том: восемь правил из одиннадцати про LLM
+# (`llm_request_duration_seconds`), а LLM-пайплайн выключен флагом
+# `LLM_PIPELINE_ENABLED=false` и метрик не отдаёт. Ни одно из его правил не
+# поймало бы находки 05.09.2026 — мёртвый пятнадцать суток источник statics,
+# 96 недоставленных алертов в сутки и чистку графа, заблокированную
+# собственным порогом.
+#
+# Здесь — правила по тем сигналам, которые копилот действительно отдаёт.
+apiVersion: operator.victoriametrics.com/v1beta1
+kind: VMRule
+metadata:
+  name: sre-ai-copilot
+  namespace: sre-ai
+  # Лейблов-селекторов намеренно нет: у VMAlert этого кластера
+  # `selectAllByDefault: true` и оба селектора пустые — он берёт все VMRule
+  # во всех namespace. Ставить `release: prometheus` «на всякий случай»
+  # вредно: этот лейбл в WO уже цеплял чужие объекты при uninstall.
+spec:
+  groups:
+  - name: sre-ai-copilot.self-health
+    rules:
+    # Самое важное правило файла: оно ловит остановку САМИХ проверок.
+    # Без него мёртвый watchdog неотличим от здоровой системы — ровно то,
+    # из-за чего sync_lag пятнадцать суток показывал `ok` на источнике,
+    # которого не было.
+    - alert: CopilotSelfHealthStale
+      expr: |
+        time() - copilot_self_health_last_run_timestamp > 3600
+      for: 15m
+      labels:
+        severity: warning
+        team: platform
+      annotations:
+        summary: "self-health копилота не обновлялся {{ $value | humanizeDuration }}"
+        description: >-
+          Задача `kg_self_health_check` ходит каждые 30 минут и кладёт снимок
+          в Redis. Снимок не обновляется — проверки не идут, и любое их
+          заключение сейчас устарело.
+
+    # Отсутствие метрики — тоже сигнал: снимка нет вовсе (задача не ходила
+    # ни разу с рестарта Redis) либо экспортёр не подключился.
+    - alert: CopilotSelfHealthAbsent
+      expr: absent(copilot_self_health_last_run_timestamp)
+      for: 30m
+      labels:
+        severity: warning
+        team: platform
+      annotations:
+        summary: "копилот не отдаёт self-health вообще"
+
+    - alert: CopilotSelfHealthFailing
+      expr: copilot_self_health_check_status >= 2
+      for: 30m
+      labels:
+        severity: warning
+        team: platform
+      annotations:
+        summary: "проверка {{ $labels.check }} в состоянии fail"
+        description: >-
+          Полчаса в fail — это не флап источника. Разбор:
+          `kubectl -n sre-ai exec deploy/sre-ai-api -c api -- python -c
+          "from app.database import SessionLocal;
+          from app.knowledge_graph.self_health import run_self_health_checks;
+          [print(r.status, r.name, r.detail) for r in run_self_health_checks(SessionLocal())]"`
+
+    # warn держится сутки — значит это не «моргнуло», а состояние, которое
+    # никто не разбирает.
+    - alert: CopilotSelfHealthWarnStuck
+      expr: copilot_self_health_check_status == 1
+      for: 24h
+      labels:
+        severity: info
+        team: platform
+      annotations:
+        summary: "проверка {{ $labels.check }} сутки в warn"
+
+  - name: sre-ai-copilot.availability
+    rules:
+    # Перенесено из prometheus-rules.yaml — эти четыре правила стоят на
+    # kube-state-metrics, то есть работают независимо от того, отдаёт ли
+    # копилот собственные метрики. Проверено 05.09.2026:
+    # `kube_deployment_status_replicas_available{namespace="sre-ai"}` в VM
+    # есть, три серии.
+    - alert: CopilotApiDown
+      expr: kube_deployment_status_replicas_available{namespace="sre-ai", deployment="sre-ai-api"} == 0
+      for: 5m
+      labels:
+        severity: critical
+        team: platform
+      annotations:
+        summary: "sre-ai-api: ноль доступных реплик"
+        description: >-
+          Вебхуки alertmanager'а идут прямо в этот Service — пока реплик нет,
+          обогащение алертов не происходит и события теряются безвозвратно.
+
+    - alert: CopilotWorkerDown
+      expr: kube_deployment_status_replicas_available{namespace="sre-ai", deployment="copilot-worker"} == 0
+      for: 5m
+      labels:
+        severity: critical
+        team: platform
+      annotations:
+        summary: "copilot-worker: ноль доступных реплик"
+        description: "Все синки графа стоят: данные устаревают молча."
+
+    - alert: CopilotPodCrashLooping
+      expr: |
+        rate(kube_pod_container_status_restarts_total{namespace="sre-ai"}[15m]) > 0
+      for: 15m
+      labels:
+        severity: warning
+        team: platform
+      annotations:
+        summary: "{{ $labels.pod }} перезапускается"
+        description: >-
+          У copilot-beat нет ни проб, ни трейсбека при OOM — крашлуп виден
+          только отсюда. Прецедент: 1565 рестартов за раз, лимит 128Mi не
+          вмещал import-футпринт стека.
+
+    - alert: CopilotPostgresBackupFailed
+      expr: kube_job_status_failed{namespace="sre-ai", job_name=~"postgres-backup-.+"} > 0
+      for: 5m
+      labels:
+        severity: warning
+        team: platform
+      annotations:
+        summary: "бэкап sre_copilot упал"
+
+    - alert: CopilotPostgresBackupMissing
+      expr: |
+        time() - max(kube_cronjob_status_last_successful_time{namespace="sre-ai", cronjob="postgres-backup"}) > 93600
+        or absent(kube_cronjob_status_last_successful_time{namespace="sre-ai", cronjob="postgres-backup"})
+      for: 30m
+      labels:
+        severity: warning
+        team: platform
+      annotations:
+        summary: "бэкапа sre_copilot нет больше суток"
+        description: >-
+          Дамп кладётся на local-path том (S3 не настроен), то есть привязан
+          к ноде. Пропущенный бэкап здесь — не «наверстаем завтра».
+
+  - name: sre-ai-copilot.pipeline
+    rules:
+    - alert: CopilotCeleryBacklog
+      expr: celery_queue_length > 100
+      for: 15m
+      labels:
+        severity: warning
+        team: platform
+      annotations:
+        summary: "очередь Celery {{ $value }} задач"
+        description: >-
+          Синки не успевают за расписанием: часть данных графа устареет
+          молча, без единой ошибки в логах.
+
+---
+# Скрейп метрик копилота.
+#
+# На 05.09.2026 в ns sre-ai не было ни одного scrape-объекта, и в
+# VictoriaMetrics отсутствовали ВСЕ метрики сервиса — включая
+# `celery_queue_length`, на которую ссылалось правило в
+# `prometheus-rules.yaml`. То есть алерт был написан на метрику, которой
+# никогда не существовало в этом кластере.
+#
+# NetworkPolicy пускает на :8001 только из ns monitoring — этот объект и
+# есть тот, ради кого правило заводили.
+apiVersion: operator.victoriametrics.com/v1beta1
+kind: VMPodScrape
+metadata:
+  name: sre-ai-copilot
+  namespace: sre-ai
+spec:
+  selector:
+    matchExpressions:
+    - key: app
+      operator: In
+      # beat метрик не отдаёт (сервер поднимает только api), но перечисляем
+      # его явно: молчащий таргет в списке честнее отсутствия строки, из
+      # которой не видно, обошли его намеренно или забыли.
+      values: ["sre-ai-api", "copilot-worker"]
+  podMetricsEndpoints:
+  - port: metrics
+    path: /metrics
+    interval: 30s
+    honorLabels: true
+    # targetPort числом — страховка на время, пока в кластере крутятся поды
+    # старой ревизии, где порт 8001 в спеке не объявлен и имени `metrics`
+    # у них нет.
+    targetPort: 8001

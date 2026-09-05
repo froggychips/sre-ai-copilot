@@ -69,6 +69,13 @@ spec:
         imagePullPolicy: IfNotPresent
         ports:
         - containerPort: 8000
+          name: http
+        # Порт метрик объявлен, хотя приложение слушает его и без этого:
+        # без имени порта VMPodScrape приходится целить числом, а число в
+        # scrape-объекте расходится с кодом молча. NetworkPolicy пускает
+        # сюда только ns monitoring.
+        - containerPort: 8001
+          name: metrics
         securityContext:
           readOnlyRootFilesystem: true
           allowPrivilegeEscalation: false
