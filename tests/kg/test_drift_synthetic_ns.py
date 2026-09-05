@@ -12,6 +12,7 @@ nats_subjects_sync). В k8s такого namespace нет по построен�
 """
 from __future__ import annotations
 
+from datetime import datetime
 from unittest.mock import patch
 
 import pytest
@@ -21,7 +22,7 @@ from sqlalchemy.orm import sessionmaker
 from app.database import Base
 from app.knowledge_graph.drift_cleanup import run_drift_cleanup
 from app.knowledge_graph.nats_subjects_sync import NATS_SUBJECTS_NAMESPACE
-from app.knowledge_graph.schema import Service
+from app.knowledge_graph.schema import NS_STATE_MISSING, Namespace, Service
 
 
 @pytest.fixture
@@ -68,6 +69,13 @@ def test_subject_nodes_do_not_get_drift_metadata(db):
     """Subject-узлы не получают drift_reason даже когда есть реальный дрейф."""
     _seed(db)
     db.add(Service(namespace="squad-gone", name="ghost", synthetic=False))
+    # Пометка ставится только по подтверждённому отсутствию: ns должен
+    # числиться `missing` в lifecycle дольше grace-периода.
+    db.add(Namespace(
+        namespace="squad-gone", state=NS_STATE_MISSING, incarnation=1,
+        first_seen_at=datetime(2026, 8, 1), last_seen_at=datetime(2026, 8, 20),
+        missing_since=datetime(2026, 8, 20),
+    ))
     db.commit()
 
     with patch(
