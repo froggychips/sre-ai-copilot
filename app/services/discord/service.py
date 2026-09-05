@@ -102,6 +102,26 @@ _RATELIMIT_DEFAULT_WAIT = 1.0
 _EMBED_TOTAL_LIMIT = 6000
 _EMBED_SAFE_MARGIN = 5900
 
+# Поштучные лимиты Discord. Суммарный 6000 их НЕ подменяет: embed на 3000
+# символов из 30 полей отвергается ровно так же, как embed на 7000 из трёх, и
+# ответ приходит один и тот же — 400 с телом вида
+# `embeds.0.fields: BASE_TYPE_MAX_LENGTH`.
+#
+# Учитывался только один из них и только в team-digest'е («не больше 25 полей
+# на embed — лимит Discord»), а enriched-путь, где полей набирается ровно 25
+# `fields.append`, не проверял ничего кроме суммы.
+#
+# Пустое `value` — отдельный случай той же природы: Discord считает поле с
+# пустым name или value невалидным (BASE_TYPE_REQUIRED), а собирается такое
+# поле само собой, из `"\n".join(lines)` по пустому списку.
+_EMBED_MAX_FIELDS = 25
+_EMBED_MAX_TITLE = 256
+_EMBED_MAX_DESCRIPTION = 4096
+_EMBED_MAX_FOOTER = 2048
+_EMBED_MAX_AUTHOR = 256
+_EMBED_MAX_FIELD_NAME = 256
+_EMBED_MAX_FIELD_VALUE = 1024
+
 # Поля-«излишества» enrichment-а в порядке дропа: СНАЧАЛА самые нижние по
 # приоритету (pod-trail/ingress/similar-past/blast-radius), потом остальное.
 # Root-cause («🎯 Скорее всего»), TL;DR, Namespaces/Owner и title/description/
@@ -282,6 +302,68 @@ def _embed_total_len(embed: Dict[str, Any]) -> int:
     return total
 
 
+def _drop_by_priority(embed: Dict[str, Any], keep_going) -> None:
+    """Дропать поля-излишества по `_EMBED_DROP_ORDER`, пока `keep_going()`.
+
+    Общий шаг для двух ограничений — суммарной длины и числа полей: порядок
+    приоритетов один и тот же, отличается только условие остановки.
+    """
+    fields = list(embed.get("fields") or [])
+    for marker in _EMBED_DROP_ORDER:
+        if not keep_going():
+            return
+        fields = [f for f in fields if marker not in (f.get("name") or "")]
+        embed["fields"] = fields
+
+
+def _enforce_embed_shape(embed: Dict[str, Any]) -> Dict[str, Any]:
+    """Привести embed к поштучным лимитам Discord.
+
+    Отвечает на другой вопрос, чем `_fit_embed_to_limit`: не «влезаем ли в
+    6000 суммарно», а «валиден ли каждый элемент по отдельности». Оба
+    нарушения дают одинаковый 400, и до 05.09.2026 проверялось только первое.
+
+    Порядок: сначала выбрасываем пустые поля (их не спасти обрезкой), потом
+    режем длины, и только затем сокращаем число полей — сперва по
+    приоритету дропа, потом отрезая хвост незащищённых.
+    """
+    if embed.get("title"):
+        embed["title"] = embed["title"][:_EMBED_MAX_TITLE]
+    if embed.get("description"):
+        embed["description"] = embed["description"][:_EMBED_MAX_DESCRIPTION]
+    footer = embed.get("footer")
+    if isinstance(footer, dict) and footer.get("text"):
+        footer["text"] = footer["text"][:_EMBED_MAX_FOOTER]
+    author = embed.get("author")
+    if isinstance(author, dict) and author.get("name"):
+        author["name"] = author["name"][:_EMBED_MAX_AUTHOR]
+
+    fields = [
+        f for f in (embed.get("fields") or [])
+        if (f.get("name") or "").strip() and (f.get("value") or "").strip()
+    ]
+    for f in fields:
+        f["name"] = f["name"][:_EMBED_MAX_FIELD_NAME]
+        f["value"] = f["value"][:_EMBED_MAX_FIELD_VALUE]
+    embed["fields"] = fields
+
+    if len(fields) > _EMBED_MAX_FIELDS:
+        _drop_by_priority(
+            embed, lambda: len(embed.get("fields") or []) > _EMBED_MAX_FIELDS,
+        )
+    fields = list(embed.get("fields") or [])
+    if len(fields) > _EMBED_MAX_FIELDS:
+        # Излишества кончились, а полей всё ещё больше лимита. Режем хвост
+        # незащищённых: root-cause и header переживают любую обрезку.
+        protected = [
+            f for f in fields
+            if any(p in (f.get("name") or "") for p in _EMBED_PROTECTED_FIELDS)
+        ]
+        rest = [f for f in fields if f not in protected]
+        embed["fields"] = (protected + rest)[:_EMBED_MAX_FIELDS]
+    return embed
+
+
 def _fit_embed_to_limit(
     embed: Dict[str, Any],
     limit: int = _EMBED_TOTAL_LIMIT,
@@ -296,17 +378,17 @@ def _fit_embed_to_limit(
       3. в крайнем случае усекаем/удаляем самое длинное НЕзащищённое поле.
     Alert НИКОГДА не дропается целиком — title + root-cause + header остаются.
     Мутирует и возвращает тот же dict.
+
+    Поштучные лимиты (`_enforce_embed_shape`) применяются ВСЕГДА, даже когда
+    сумма укладывается в margin: короткий embed из тридцати полей Discord
+    отвергает так же, как длинный.
     """
+    _enforce_embed_shape(embed)
     if _embed_total_len(embed) <= margin:
         return embed
 
     # (1) Дропаем излишества по drop-order.
-    fields = list(embed.get("fields") or [])
-    for marker in _EMBED_DROP_ORDER:
-        if _embed_total_len(embed) <= margin:
-            break
-        fields = [f for f in fields if marker not in (f.get("name") or "")]
-        embed["fields"] = fields
+    _drop_by_priority(embed, lambda: _embed_total_len(embed) > margin)
 
     # (2) Усекаем description.
     if _embed_total_len(embed) > margin and embed.get("description"):
@@ -2092,15 +2174,17 @@ class DiscordService:
                         client, "post", url, json=payload
                     )
                     if r.status_code >= 400:
-                        logging.error(
-                            "discord_enriched_alert_compact_failed",
-                            extra={"status": r.status_code, "body": r.text[:200]},
+                        _log.error(
+                            "discord.enriched_compact_failed",
+                            alertname=alertname, severity=severity,
+                            status=r.status_code, body=r.text[:400],
                         )
                         return False
             except Exception as e:
-                logging.error(
-                    "discord_enriched_alert_compact_exception",
-                    extra={"error": str(e)},
+                _log.error(
+                    "discord.enriched_compact_exception",
+                    alertname=alertname, severity=severity,
+                    error=type(e).__name__, message=str(e)[:200],
                 )
                 return False
             return True
@@ -2192,9 +2276,23 @@ class DiscordService:
                     client, "post", post_url, json=payload
                 )
                 if r.status_code >= 400:
-                    logging.error(
-                        "discord_enriched_alert_failed",
-                        extra={"status": r.status_code, "body": r.text[:200]},
+                    # Через structlog, а не `logging.error(..., extra=...)`:
+                    # stdlib-форматтер `extra` не печатает, и в kubectl logs
+                    # оставалась одна строка `ERROR:root:...` без кода и тела
+                    # ответа. Замер 05.09.2026: 96 недоставок за сутки, все по
+                    # одному алерту, и причина не диагностировалась в принципе.
+                    #
+                    # Тело Discord отдаёт с точным именем поля
+                    # (`embeds.0.fields.25`, `BASE_TYPE_MAX_LENGTH`) — режем
+                    # его на 400 символов, а не на 200: 200 обрывались ровно
+                    # перед этой частью.
+                    _log.error(
+                        "discord.enriched_post_failed",
+                        alertname=alertname, severity=severity,
+                        namespace=namespace, service=service,
+                        status=r.status_code, body=r.text[:400],
+                        fields=len(embed.get("fields") or []),
+                        embed_len=_embed_total_len(embed),
                     )
                     # POST не случился — отпускаем claim.
                     dedup_store.release(key)
@@ -2205,7 +2303,12 @@ class DiscordService:
                     except (ValueError, TypeError):
                         msg_id = None
         except Exception as e:
-            logging.error("discord_enriched_alert_exception", extra={"error": str(e)})
+            _log.error(
+                "discord.enriched_post_exception",
+                alertname=alertname, severity=severity,
+                namespace=namespace, service=service,
+                error=type(e).__name__, message=str(e)[:200],
+            )
             dedup_store.release(key)
             return False
 
