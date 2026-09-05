@@ -60,12 +60,18 @@ def db():
 
 
 def _workload(*, name="town-service", ns="squad-1-shared", uid="uid-a",
-              generation=7, image="nexus/town:1.0.0", kind="Deployment"):
+              generation=7, image="nexus/town:1.0.0", kind="Deployment",
+              env=None, replicas=2):
+    """Объект kubectl. `replicas` лежит в spec, а не в template — как в k8s."""
+    container = {"image": image}
+    if env is not None:
+        container["env"] = [{"name": k, "value": v} for k, v in env.items()]
     return {
         "kind": kind,
         "metadata": {"name": name, "namespace": ns, "uid": uid,
                      "generation": generation},
-        "spec": {"template": {"spec": {"containers": [{"image": image}]}}},
+        "spec": {"replicas": replicas,
+                 "template": {"spec": {"containers": [container]}}},
     }
 
 
@@ -139,10 +145,29 @@ def test_recreated_object_is_not_a_rollout(db):
     assert stats["recorded"] == 0
 
 
-def test_scale_down_does_not_look_like_a_rollout(db):
-    """generation убывать не может, но снимок мог протухнуть — не выдумываем."""
-    stats = _run(db, [_workload(generation=3)],
-                 _FakeRedis(_snapshot_of(_workload(generation=9))))
+def test_scale_is_not_a_rollout(db):
+    """HPA и `kubectl scale` двигают generation — это не выкат.
+
+    Прецедент 1.0.4, 05.09.2026: критерий «generation вырос» за 40 минут
+    записал 6968 ложных «деплоев» на 776 автоскейлящихся сервисов; образы
+    не менялись ни у одного. `replicas` лежит в spec, а не в spec.template,
+    и хэш шаблона от него не зависит.
+    """
+    stats = _run(db, [_workload(generation=2158201, replicas=7)],
+                 _FakeRedis(_snapshot_of(_workload(generation=2158200, replicas=5))))
+
+    assert stats["recorded"] == 0
+    assert db.query(Deployment).count() == 0
+
+
+def test_snapshot_without_template_hash_compares_images_only(db):
+    """Снимок старого формата (до template_hash) не объявляет выкатом весь кластер."""
+    old_state = dw._current_state(_workload())
+    old_state.pop("template_hash")
+    redis = _FakeRedis({dw._workload_key("squad-1-shared", "Deployment", "town-service"):
+                        json.dumps(old_state)})
+
+    stats = _run(db, [_workload(env={"A": "1"})], redis)
 
     assert stats["recorded"] == 0
 
@@ -163,13 +188,15 @@ def test_image_change_is_recorded_as_a_deploy(db):
     assert d.extras["images"] == ["nexus/town:1.1.0"]
 
 
-def test_generation_bump_alone_is_recorded_but_labelled(db):
-    """`kubectl scale` тоже двигает generation — потребитель должен различать."""
-    stats = _run(db, [_workload(generation=8)],
-                 _FakeRedis(_snapshot_of(_workload(generation=7))))
+def test_template_change_without_image_change_is_a_config_rollout(db):
+    """Сменили env/args/ресурсы — поды пересоздаются, это выкат конфигурации."""
+    stats = _run(db, [_workload(env={"FEATURE": "on"})],
+                 _FakeRedis(_snapshot_of(_workload(env={"FEATURE": "off"}))))
 
-    assert stats["by_reason"]["generation"] == 1
-    assert db.query(Deployment).one().extras["rollout_reason"] == "generation"
+    assert stats["by_reason"]["template"] == 1
+    d = db.query(Deployment).one()
+    assert d.extras["rollout_reason"] == "template"
+    assert d.extras["template_hash"] != d.extras["previous_template_hash"]
 
 
 def test_record_is_not_a_namespace_broadcast(db):
@@ -224,11 +251,17 @@ def test_unknown_service_is_counted_not_guessed(db):
     assert db.query(Deployment).count() == 0
 
 
-def test_same_generation_is_not_recorded_twice(db):
-    """Дедуп по (service, buildtype, build_number) — на случай повторов."""
+def test_same_template_is_not_recorded_twice(db):
+    """Дедуп по (service, buildtype, uid:template_hash) — на случай повторов.
+
+    Ключ намеренно без generation: у автоскейлящегося workload'а он даёт
+    новый номер на каждый тик HPA, и одна и та же версия писалась бы снова.
+    """
     redis = _FakeRedis(_snapshot_of(_workload()))
     _run(db, [_workload(image="nexus/town:2.0.0", generation=8)], redis)
-    # Снимок обновился, повторный прогон с тем же состоянием — тишина.
-    _run(db, [_workload(image="nexus/town:2.0.0", generation=8)], redis)
+    # Снимок обновился; тот же шаблон при другом generation — тишина.
+    _run(db, [_workload(image="nexus/town:2.0.0", generation=9)], redis)
 
     assert db.query(Deployment).count() == 1
+    assert db.query(Deployment).one().build_number.endswith(
+        ":" + dw._template_hash(_workload(image="nexus/town:2.0.0")["spec"]))
