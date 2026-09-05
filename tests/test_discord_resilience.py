@@ -525,3 +525,115 @@ async def test_rate_limited_log_has_no_token(caplog):
     logged_url = rl_records[0].url
     assert "TOPSECRET" not in logged_url
     assert "987654321" in logged_url
+
+
+# ── Поштучные лимиты Discord ────────────────────────────────────────────────
+#
+# Суммарные 6000 — не единственное, за что Discord отвечает 400. Embed из
+# тридцати коротких полей, поле с пустым value, description на 5000 символов
+# отвергаются так же, и в enriched-пути это не проверялось: там ровно 25
+# `fields.append`, то есть полностью обогащённый alert стоит на самой границе.
+
+def test_short_embed_with_too_many_fields_is_cut_to_25():
+    """Сумма укладывается в лимит, а полей больше 25 — это всё равно 400."""
+    from app.services.discord_service import _embed_total_len, _fit_embed_to_limit
+
+    embed = {
+        "title": "t",
+        "fields": (
+            [{"name": "🎯 Скорее всего", "value": "rc"}]
+            + [{"name": f"поле {i}", "value": "v"} for i in range(29)]
+        ),
+        "footer": {"text": "f"},
+    }
+    assert _embed_total_len(embed) < 6000  # по сумме проблемы нет
+
+    _fit_embed_to_limit(embed)
+
+    assert len(embed["fields"]) == 25
+    # Root-cause переживает обрезку по числу полей так же, как по длине.
+    assert any("Скорее всего" in f["name"] for f in embed["fields"])
+
+
+def test_fields_over_limit_drop_by_priority_first():
+    """Лишние поля уходят в порядке `_EMBED_DROP_ORDER`, а не как попало."""
+    from app.services.discord_service import _fit_embed_to_limit
+
+    embed = {
+        "title": "t",
+        "fields": (
+            [{"name": "🎯 Скорее всего", "value": "rc"},
+             {"name": "Namespaces", "value": "`prod-shared`"},
+             {"name": "🕒 Pod trail (Wave 7, 1h)", "value": "trail"},
+             {"name": "🎯 Blast radius (Wave 7)", "value": "blast"}]
+            + [{"name": f"поле {i}", "value": "v"} for i in range(24)]
+        ),
+    }
+
+    _fit_embed_to_limit(embed)
+
+    names = [f["name"] for f in embed["fields"]]
+    assert len(names) == 25
+    assert not any("Pod trail" in n for n in names)
+    assert not any("Blast radius" in n for n in names)
+    assert any("Скорее всего" in n for n in names)
+    assert any("Namespaces" in n for n in names)
+
+
+def test_empty_field_value_is_dropped_not_sent():
+    """Поле с пустым value невалидно для Discord (BASE_TYPE_REQUIRED).
+
+    Собирается само собой: `"\\n".join(lines)` по пустому списку даёт "".
+    """
+    from app.services.discord_service import _fit_embed_to_limit
+
+    embed = {
+        "title": "t",
+        "fields": [
+            {"name": "🎯 Скорее всего", "value": "rc"},
+            {"name": "Upstream сейчас (KG)", "value": ""},
+            {"name": "   ", "value": "осиротевшее значение"},
+        ],
+    }
+
+    _fit_embed_to_limit(embed)
+
+    names = [f["name"] for f in embed["fields"]]
+    assert names == ["🎯 Скорее всего"]
+
+
+def test_long_description_is_cut_to_4096_even_when_total_fits():
+    """description длиннее 4096 — 400, даже если сумма ниже 6000."""
+    from app.services.discord_service import _embed_total_len, _fit_embed_to_limit
+
+    embed = {"title": "t", "description": "d" * 5000, "fields": []}
+    assert _embed_total_len(embed) < 6000
+
+    _fit_embed_to_limit(embed)
+
+    assert len(embed["description"]) == 4096
+
+
+def test_long_footer_is_cut_to_2048():
+    """То же для footer: свой лимит, свой 400."""
+    from app.services.discord_service import _fit_embed_to_limit
+
+    embed = {"title": "t", "fields": [], "footer": {"text": "f" * 3000}}
+
+    _fit_embed_to_limit(embed)
+
+    assert len(embed["footer"]["text"]) == 2048
+
+
+def test_oversized_field_value_is_cut_to_1024():
+    """`[:1024]` расставлен по вызовам вручную и местами забыт — страхуем."""
+    from app.services.discord_service import _fit_embed_to_limit
+
+    embed = {
+        "title": "t",
+        "fields": [{"name": "Inbound callers (KG)", "value": "c" * 2000}],
+    }
+
+    _fit_embed_to_limit(embed)
+
+    assert len(embed["fields"][0]["value"]) == 1024
