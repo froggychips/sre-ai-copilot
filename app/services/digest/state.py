@@ -228,6 +228,39 @@ def record_task_heartbeat(task_name: str, ts: Optional[datetime] = None) -> None
         )
 
 
+def beat_status_key(task_name: str) -> str:
+    return f"{BEAT_HEARTBEAT_REDIS_PREFIX}:status:{task_name}"
+
+
+def record_task_status(task_name: str, status: str) -> None:
+    """Последний статус ответа источника (см. `source_status.SourceStatus`).
+
+    Пишется на КАЖДЫЙ завершённый прогон, включая те, что heartbeat не
+    получили: именно так `check_sync_lag` может сказать не только «прогона
+    не было 40 минут», но и «прогоны были, источник каждый раз отдавал
+    EMPTY». Fail-open, как и heartbeat.
+    """
+    try:
+        client = _get_beat_redis()
+        client.set(beat_status_key(task_name), status, ex=BEAT_HEARTBEAT_REDIS_TTL)
+    except Exception as e:
+        log.warning(
+            "stats_digest.beat_status_write_failed", task=task_name, error=str(e),
+        )
+
+
+def get_beat_last_status(task_name: str) -> Optional[str]:
+    """Последний статус источника или None (не писался / redis недоступен)."""
+    try:
+        client = _get_beat_redis()
+        raw = client.get(beat_status_key(task_name))
+    except Exception:
+        return None
+    if raw is None:
+        return None
+    return raw.decode("utf-8", "replace") if isinstance(raw, bytes) else str(raw)
+
+
 def get_beat_last_run(task_name: str) -> Optional[datetime]:
     """last_run beat-таска. None если ключа нет (таск ещё не отработал)."""
     try:

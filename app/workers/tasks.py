@@ -605,7 +605,7 @@ def kg_topology_sync_task():
     try:
         result = sync_topology(db)
         logger.info("kg_topology_sync.done result=%s", result)
-        return result
+        return _src_status(result, observed=('services',), unavailable=('skipped',))
     except Exception as e:
         logger.error("kg_topology_sync.failed: %s", e)
         raise
@@ -624,7 +624,7 @@ def k8s_pod_events_sync_task():
         result = sync_all_events(db)
     finally:
         db.close()
-    return result
+    return _src_status(result, observed=('fetched', 'events'), unavailable=('skipped',))
 
 
 @celery_app.task(name="kg_ingress_sync")
@@ -635,10 +635,10 @@ def kg_ingress_sync_task():
 
     db = SessionLocal()
     try:
-        return sync_all_ingresses(db)
+        return _src_status(sync_all_ingresses(db), observed=('ingresses_fetched',), unavailable=('skipped',))
     except Exception as e:
         logger.warning("kg_ingress_sync.failed: %s", e)
-        return {"error": str(e)}
+        return _src_status({"error": str(e)}, observed=('ingresses_fetched',), unavailable=('skipped',))
     finally:
         db.close()
 
@@ -659,10 +659,10 @@ def kg_topology_resources_sync_task():
     try:
         result = sync_topology_resources(db)
         logger.info("kg_topology_resources_sync.done result=%s", result)
-        return result
+        return _src_status(result, observed=('services_fetched', 'ingresses_fetched'), unavailable=('skipped',))
     except Exception as e:
         logger.warning("kg_topology_resources_sync.failed: %s", e)
-        return {"error": str(e)}
+        return _src_status({"error": str(e)}, observed=('services_fetched', 'ingresses_fetched'), unavailable=('skipped',))
     finally:
         db.close()
 
@@ -713,10 +713,10 @@ def kg_jobs_sync_task():
     try:
         result = sync_k8s_jobs(db)
         logger.info("kg_jobs_sync.done result=%s", result)
-        return result
+        return _src_status(result, observed=('jobs_fetched', 'cronjobs_fetched'), unavailable=('skipped',))
     except Exception as e:
         logger.warning("kg_jobs_sync.failed: %s", e)
-        return {"error": str(e)}
+        return _src_status({"error": str(e)}, observed=('jobs_fetched', 'cronjobs_fetched'), unavailable=('skipped',))
     finally:
         db.close()
 
@@ -735,10 +735,10 @@ def kg_storage_sync_task():
     try:
         result = sync_storage(db)
         logger.info("kg_storage_sync.done result=%s", result)
-        return result
+        return _src_status(result, observed=('pods_scanned', 'claim_refs_seen'), unavailable=('skipped',))
     except Exception as e:
         logger.warning("kg_storage_sync.failed: %s", e)
-        return {"error": str(e)}
+        return _src_status({"error": str(e)}, observed=('pods_scanned', 'claim_refs_seen'), unavailable=('skipped',))
     finally:
         db.close()
 
@@ -787,10 +787,10 @@ def kg_alerts_resolve_sync_task():
 
     db = SessionLocal()
     try:
-        return _aio.run(run_alerts_resolve_sync(db))
+        return _src_polled(_aio.run(run_alerts_resolve_sync(db)))
     except Exception as e:
         logger.warning("kg_alerts_resolve_sync.failed: %s", e)
-        return {"error": str(e)}
+        return _src_polled({"error": str(e)})
     finally:
         db.close()
 
@@ -901,11 +901,11 @@ def kg_endpoints_sync_task():
 
     db = SessionLocal()
     try:
-        return sync_endpoints(db)
+        return _src_status(sync_endpoints(db), observed=('endpoints_seen',), unavailable=('skipped',))
     except Exception as e:
         logger.warning("kg_endpoints_sync.failed: %s", e)
         db.rollback()
-        return {"error": str(e)}
+        return _src_status({"error": str(e)}, observed=('endpoints_seen',), unavailable=('skipped',))
     finally:
         db.close()
 
@@ -1254,10 +1254,10 @@ def kg_metrics_sync_task():
 
     db = SessionLocal()
     try:
-        return sync_service_health(db)
+        return _src_status(sync_service_health(db), observed=('fetched',), unavailable=('skipped',))
     except Exception as e:
         logger.warning("kg_metrics_sync.failed: %s", e)
-        return {"error": str(e)}
+        return _src_status({"error": str(e)}, observed=('fetched',), unavailable=('skipped',))
     finally:
         db.close()
 
@@ -1269,10 +1269,10 @@ def kg_cluster_health_sync_task():
 
     db = SessionLocal()
     try:
-        return sync_cluster_health(db)
+        return _src_status(sync_cluster_health(db), observed=('inserted', 'skipped_dup'), unavailable=('skipped', 'data_unavailable', 'no_vm_url'))
     except Exception as e:
         logger.warning("kg_cluster_health_sync.failed: %s", e)
-        return {"error": str(e)}
+        return _src_status({"error": str(e)}, observed=('inserted', 'skipped_dup'), unavailable=('skipped', 'data_unavailable', 'no_vm_url'))
     finally:
         db.close()
 
@@ -1285,10 +1285,10 @@ def kg_ingress_observations_sync_task():
 
     db = SessionLocal()
     try:
-        return sync_ingress_observations(db)
+        return _src_status(sync_ingress_observations(db), observed=('fetched',), unavailable=('skipped',))
     except Exception as e:
         logger.warning("kg_ingress_observations_sync.failed: %s", e)
-        return {"error": str(e)}
+        return _src_status({"error": str(e)}, observed=('fetched',), unavailable=('skipped',))
     finally:
         db.close()
 
@@ -1300,10 +1300,10 @@ def kg_signal_aggregates_compute_task():
 
     db = SessionLocal()
     try:
-        return compute_signal_aggregates(db, window_hours=24)
+        return _src_status(compute_signal_aggregates(db, window_hours=24), observed=('real_services',), unavailable=('skipped',))
     except Exception as e:
         logger.warning("kg_signal_aggregates_compute.failed: %s", e)
-        return {"error": str(e)}
+        return _src_status({"error": str(e)}, observed=('real_services',), unavailable=('skipped',))
     finally:
         db.close()
 
@@ -1320,7 +1320,7 @@ def kg_anomaly_detection_task():
 
     db = SessionLocal()
     try:
-        return detect_anomalies(db)
+        return _src_status(detect_anomalies(db), observed=('real_services',), unavailable=('skipped',))
     except Exception as e:
         logger.warning("kg_anomaly_detection_task.failed: %s", e)
     finally:
@@ -1339,24 +1339,24 @@ def kg_runtime_correlation_sync_task():
     """
     if not settings.RUNTIME_CORRELATION_ENABLED:
         logger.info("kg_runtime_correlation_sync.skipped: disabled by config")
-        return {"skipped": "disabled"}
+        return _src_polled({"skipped": "disabled"})
 
     import asyncio
     from app.knowledge_graph.runtime_correlation import run_runtime_correlation_sync
 
     db = SessionLocal()
     try:
-        return asyncio.run(
+        return _src_polled(asyncio.run(
             run_runtime_correlation_sync(
                 db,
                 window_minutes=settings.RUNTIME_CORRELATION_WINDOW_MINUTES,
                 min_correlation_count=settings.RUNTIME_CORRELATION_MIN_COUNT,
                 lookback_days=settings.RUNTIME_CORRELATION_LOOKBACK_DAYS,
             )
-        )
+        ))
     except Exception as e:
         logger.warning("kg_runtime_correlation_sync.failed: %s", e)
-        return {"error": str(e)}
+        return _src_polled({"error": str(e)})
     finally:
         db.close()
 
@@ -1621,10 +1621,10 @@ def kg_seq_logs_sync_task():
 
     db = SessionLocal()
     try:
-        return sync_seq_logs(db, window_minutes=10)
+        return _src_seq(sync_seq_logs(db, window_minutes=10))
     except Exception as e:
         logger.warning("kg_seq_logs_sync.failed: %s", e)
-        return {"error": str(e)}
+        return _src_seq({"error": str(e)})
     finally:
         db.close()
 
@@ -1658,7 +1658,7 @@ def kg_statics_versions_sync_task():
     raw = getattr(settings, "STATICS_TRACK_ENVS", "") or ""
     envs = [e.strip() for e in raw.split(",") if e.strip()]
     if not envs:
-        return {"skipped": "no_envs"}
+        return _src_status({"skipped": "no_envs"}, observed=('observed',), unavailable=('skipped',))
     observed = 0
     changed = 0
     for env in envs:
@@ -1675,20 +1675,19 @@ def kg_statics_versions_sync_task():
         if state.get("prev_version") is not None:
             changed += 1
     if observed == 0:
+        # Статус EMPTY (observed=0) сам удержит heartbeat — костыль с
+        # `error` из #350 больше не нужен: это не сбой задачи, а ответ
+        # источника, и называть его надо своим именем.
         logger.error(
             "kg_statics_versions_sync.blind envs=%d host=%s:%s — "
             "ни одного ответа, heartbeat не пишем",
             len(envs), settings.STATICS_HOST, settings.STATICS_PORT,
         )
-        return {
-            "envs": len(envs), "observed": 0, "with_prev": 0,
-            "error": "no_env_observed",
-        }
     logger.info(
         "kg_statics_versions_sync.done envs=%d observed=%d with_prev=%d",
         len(envs), observed, changed,
     )
-    return {"envs": len(envs), "observed": observed, "with_prev": changed}
+    return _src_status({"envs": len(envs), "observed": observed, "with_prev": changed}, observed=('observed',), unavailable=('skipped',))
 
 
 @celery_app.task(name="kg_nats_subjects_sync")
@@ -1708,16 +1707,16 @@ def kg_nats_subjects_sync_task():
     """
     if not getattr(settings, "NATS_SUBJECTS_PARSER_ENABLED", False):
         logger.info("kg_nats_subjects_sync.skipped reason=disabled")
-        return {"skipped": True, "reason": "NATS_SUBJECTS_PARSER_ENABLED=false"}
+        return _src_status({"skipped": True, "reason": "NATS_SUBJECTS_PARSER_ENABLED=false"}, observed=('subjects_found',), unavailable=('skipped',))
 
     from app.knowledge_graph.nats_subjects_sync import sync_nats_subjects
 
     db = SessionLocal()
     try:
-        return sync_nats_subjects(db)
+        return _src_status(sync_nats_subjects(db), observed=('subjects_found',), unavailable=('skipped',))
     except Exception as e:
         logger.warning("kg_nats_subjects_sync.failed: %s", e)
-        return {"error": str(e)}
+        return _src_status({"error": str(e)}, observed=('subjects_found',), unavailable=('skipped',))
     finally:
         db.close()
 
@@ -1769,6 +1768,60 @@ def kg_ownership_backfill_task():
         return {"error": str(e)}
     finally:
         db.close()
+
+
+# ── Контракт ответа источника (source_status.py) ────────────────────────────
+#
+# Каждая задача-источник отдаёт retval с `source_status`, и heartbeat пишется
+# только на SUCCESS/PARTIAL. Три обёртки ниже — единственное место, где
+# retval получает статус: правило одно, а исключений из него нет.
+
+def _src_status(result, *, observed, unavailable=("skipped",)):
+    """Статус по счётчикам того, что источник ОТДАЛ (см. status_from_counts)."""
+    from app.knowledge_graph.source_status import mark, status_from_counts
+    return mark(result, status_from_counts(
+        result, observed, unavailable_keys=unavailable,
+    ))
+
+
+def _src_polled(result):
+    """Источник опрошен, а ноль результатов — норма.
+
+    Resolve-sync без зависших алертов и корреляция без кандидатов — это
+    SUCCESS с нулём, а не EMPTY: статус описывает ответ источника, а не
+    число найденного.
+    """
+    from app.knowledge_graph.source_status import SourceStatus, mark
+    if not isinstance(result, dict):
+        return mark(result, SourceStatus.INVALID)
+    if result.get("error") is not None or result.get("status") == "error":
+        return mark(result, SourceStatus.FAILED)
+    if result.get("skipped"):
+        return mark(result, SourceStatus.UNAVAILABLE)
+    return mark(result, SourceStatus.SUCCESS)
+
+
+def _src_seq(result):
+    """Seq: статус по числу достигнутых инстансов, а не по числу строк.
+
+    `rows=0` при `reached == instances` — законная тишина в логах.
+    `reached=0` — до Seq не дошли (прецедент 20.08.2026: NetworkPolicy).
+    Достигнуты не все — PARTIAL: данные есть, но часть окружений слепа.
+    """
+    from app.knowledge_graph.source_status import SourceStatus, mark
+    if not isinstance(result, dict):
+        return mark(result, SourceStatus.INVALID)
+    if result.get("error") is not None:
+        return mark(result, SourceStatus.FAILED)
+    instances = result.get("instances") or 0
+    reached = result.get("reached") or 0
+    if instances and not reached:
+        return mark(result, SourceStatus.UNAVAILABLE)
+    if instances and reached < instances:
+        return mark(result, SourceStatus.PARTIAL)
+    if not instances:
+        return mark(result, SourceStatus.UNAVAILABLE)
+    return mark(result, SourceStatus.SUCCESS)
 
 
 # ── Beat heartbeat tracking (для stats_digest.pipeline_health_section) ──────
@@ -1850,17 +1903,43 @@ def _record_beat_heartbeat(sender=None, task_id=None, task=None, state=None, **k
         if state != "SUCCESS":
             return
         retval = kwargs.get("retval")
-        if isinstance(retval, dict) and (
-            retval.get("error") is not None or retval.get("status") == "error"
-        ):
-            return
         # Прогон пропущен singleton-локом (предыдущий экземпляр ещё идёт) —
-        # это НЕ выполнение. Записать heartbeat означало бы отрапортовать
-        # «синк живой» ровно в тот момент, когда он завис: deadman в
-        # self_health смотрит именно на этот ключ.
+        # это НЕ выполнение и не ответ источника: ни heartbeat, ни статуса.
         from app.workers.task_lock import is_skipped
         if is_skipped(retval):
             return
+
+        from app.knowledge_graph.source_status import (HEARTBEAT_STATUSES,
+                                                       status_of)
+        from app.services.digest.state import record_task_status
+        status = status_of(retval)
+        if status is not None:
+            # Контракт источника (см. source_status.py): heartbeat — только
+            # подтверждение, что источник ЖИВ, то есть SUCCESS или PARTIAL.
+            # EMPTY / UNAVAILABLE / FAILED / INVALID — прогон был, ответа
+            # по существу нет, и «свежий запуск» надзору обещать нельзя.
+            # Статус пишем всегда: по нему sync_lag отличит «не ходил» от
+            # «ходил и каждый раз возвращался с пустыми руками».
+            record_task_status(task_name, status.value)
+            if status not in HEARTBEAT_STATUSES:
+                logger.warning(
+                    "beat_heartbeat.withheld task=%s source_status=%s",
+                    task_name, status.value,
+                )
+                return
+        else:
+            # Задача контракт ещё не соблюдает — старое правило по
+            # error-маркерам. Предупреждаем: такой задаче ничто не мешает
+            # пятнадцать суток отдавать пустоту и считаться живой.
+            if isinstance(retval, dict) and (
+                retval.get("error") is not None or retval.get("status") == "error"
+            ):
+                return
+            logger.warning(
+                "beat_heartbeat.no_source_status task=%s — retval без "
+                "source_status, heartbeat пишется по старому правилу",
+                task_name,
+            )
         # Lazy import — stats_digest тяжеловат на boot.
         from app.services.stats_digest import _record_task_heartbeat
         _record_task_heartbeat(task_name)
