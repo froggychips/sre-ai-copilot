@@ -29,6 +29,9 @@ REPORT_FAILED = "failed"
 EXECUTOR_IN_FLIGHT = "in_flight"
 EXECUTOR_APPLIED = "applied"
 EXECUTOR_STATE_UNKNOWN = "state_unknown"
+# Верификация исхода (remediation/verification.py): применили И проверили.
+EXECUTOR_VERIFIED = "verified"
+EXECUTOR_VERIFY_FAILED = "verification_failed"
 EXECUTOR_DISABLED = "disabled"
 
 #: Соответствие «старый ключ в analysis» → «значение колонки». Порядок важен:

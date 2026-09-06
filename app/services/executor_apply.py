@@ -82,6 +82,9 @@ from app.config import settings
 from app.core.execution_dsl import ExecutionIntent
 from app.database import IncidentRecord, SessionLocal
 from app.observability.ai_metrics import track_executor_applied
+from app.remediation.verification import (expected_identity, identity_check,
+                                          identity_mismatch,
+                                          schedule_verification, snapshot_target)
 from app.services.audit_logger import audit_service
 from app.services.intent_signature import intent_recorded_at, parse_utc_ts
 from app.services.k8s_service import k8s_service
@@ -452,6 +455,26 @@ def apply_intent(
         # конкурент/ретрай в окне выполнения видит свежий executor_in_flight
         # и получает apply_in_flight. Commit также отпускает row-lock —
         # дальше от гонок защищает сам claim.
+        # Верификация, шаг 1: та же ли цель. Снимок живого объекта до записи
+        # и сверка uid с target_ref из графа (kg_remediation_decisions). Не
+        # совпал — объект пересоздан после инцидента, действие отказано:
+        # «починили Deployment, которого уже нет» выглядит успехом, и потому
+        # хуже любого отказа. Сверить нечем (uid не записан, kubectl
+        # недоступен) — идём дальше, но identity_check честно говорит unknown.
+        expected_target = expected_identity(db, incident_id)
+        target_before = snapshot_target(intent)
+        mismatch = identity_mismatch(expected_target, target_before)
+        if mismatch:
+            audit_service.log_event(
+                "EXECUTOR_APPLY_REFUSED_TARGET_REINCARNATED",
+                {
+                    "incident_id": incident_id,
+                    "applied_by": applied_by,
+                    "expected": expected_target,
+                    "live": target_before.to_dict(),
+                },
+            )
+            return _refuse(incident_id, f"target_reincarnated:{mismatch}", applied_by)
         analysis["executor_in_flight"] = {
             "claimed_at": datetime.now(timezone.utc).isoformat(),
             "claimed_by": applied_by,
@@ -466,6 +489,8 @@ def apply_intent(
 
         # ── Фаза 2: выполнение ─────────────────────────────────────────
         result = k8s_service.execute_intent(intent, dry_run=False, post_approval=True)
+        # Верификация, шаг 2: сработало ли — снимок сразу после записи.
+        target_after = snapshot_target(intent)
 
         # ── Финализация: persist результата, claim снимается ───────────
         applied_entry = {
@@ -491,6 +516,20 @@ def apply_intent(
             },
             "policy_decision": gate_dict,
         }
+        applied_entry["target_expected"] = expected_target
+        applied_entry["target_before"] = target_before.to_dict()
+        applied_entry["target_after"] = target_after.to_dict()
+        applied_entry["identity_check"] = identity_check(expected_target, target_before)
+        # Верификация, шаг 3: стало ли лучше — отложенная проверка (Celery,
+        # через 5 и 15 минут). Ставится до финализирующего commit'а, чтобы
+        # запись осталась двухфазной (claim → финал); задержка в сотни секунд
+        # делает гонку с commit'ом теоретической, а если commit всё же упадёт,
+        # задача честно ответит nothing_applied → unknown.
+        applied_entry["verification"] = (
+            schedule_verification(incident_id, attempt=1)
+            if result.get("success", False)
+            else {"scheduled": False, "reason": "apply_failed"}
+        )
         analysis["executor_applied"] = applied_entry
         analysis.pop("executor_in_flight", None)
         record.analysis = analysis

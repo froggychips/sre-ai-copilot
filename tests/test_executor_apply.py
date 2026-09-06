@@ -47,6 +47,19 @@ def mock_session(monkeypatch):
     # apply_intent грузит record с row-lock: .filter(...).with_for_update().first()
     query.with_for_update.return_value = query
     monkeypatch.setattr(executor_apply, "SessionLocal", lambda: session)
+    # Верификация (remediation/verification.py) ходит в kubectl и в брокер.
+    # В юнит-тестах ни того ни другого: снимок «недоступен», планирование
+    # выключено. Поведение самой верификации — в tests/remediation/.
+    from app.remediation.verification import TargetSnapshot
+    monkeypatch.setattr(
+        executor_apply, "snapshot_target",
+        lambda intent, **kw: TargetSnapshot.unavailable("test", intent),
+    )
+    monkeypatch.setattr(executor_apply, "expected_identity", lambda db, incident_id: None)
+    monkeypatch.setattr(
+        executor_apply, "schedule_verification",
+        lambda incident_id, **kw: {"scheduled": False, "reason": "test"},
+    )
     return session, query
 
 

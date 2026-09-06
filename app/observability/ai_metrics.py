@@ -227,6 +227,17 @@ def track_fact_verdict(kind: str, verdict: str) -> None:
     FACTS_VERDICT.labels(kind=kind, verdict=verdict).inc()
 
 
+REMEDIATION_VERIFICATION = Counter(
+    "remediation_verification_total",
+    "Remediation verification outcomes (verified/failed/pending/unknown)",
+    ["outcome"],
+)
+
+
+def track_remediation_verification(outcome: str) -> None:
+    REMEDIATION_VERIFICATION.labels(outcome=outcome).inc()
+
+
 def track_grounded(perspective: str) -> None:
     HYPOTHESES_GROUNDED.labels(perspective=perspective).inc()
 

@@ -733,6 +733,26 @@ def kg_incidents_lifecycle_task():
         db.close()
 
 
+@celery_app.task(name="remediation_verify")
+def remediation_verify_task(incident_id: str, attempt: int = 1):
+    """Отложенная верификация применённого remediation-действия.
+
+    Ставится из executor_apply через apply_async(countdown=…), не из beat:
+    у неё есть конкретный инцидент и момент. Исход pending с оставшимися
+    попытками — ставит себя же на следующую задержку.
+    """
+    from app.remediation.verification import (OUTCOME_PENDING,
+                                              verify_remediation)
+
+    result = verify_remediation(incident_id, attempt)
+    logger.info("remediation_verify.done incident=%s attempt=%s outcome=%s",
+                incident_id, attempt, result.get("outcome"))
+    next_delay = result.get("next_delay_sec")
+    if result.get("outcome") == OUTCOME_PENDING and next_delay:
+        remediation_verify_task.apply_async(args=[incident_id, attempt + 1], countdown=next_delay)
+    return result
+
+
 @celery_app.task(name="kg_jobs_sync")
 def kg_jobs_sync_task():
     """KG Coverage #1: k8s Job + CronJob → kg_k8s_jobs (per 15 мин).
