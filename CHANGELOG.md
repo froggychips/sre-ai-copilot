@@ -4,7 +4,58 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
-_Ничего в очереди — см. [1.0.5] ниже._
+_Ничего в очереди — см. [1.0.6] ниже._
+
+## [1.0.6] — 2026-09-06 — Надзор различает «выключен» и «сломан»
+
+Сутки на 1.0.5 без единой ошибки и первое боевое срабатывание нового
+алертинга — по источнику, который выключен настройкой. Плюс хвосты,
+накопившиеся за релизный день.
+
+### Исправлено
+
+- **Выключенный настройкой источник — `disabled`, а не `warn`.** Ночью
+  06.09 `copilot_self_health_status` ушёл в 1, `CopilotSelfHealthWarnStuck
+  {check=sync_lag}` встал в pending. Причина — `kg_nats_subjects_sync`:
+  парсер за `NATS_SUBJECTS_PARSER_ENABLED=false`, по контракту
+  `source_status` задача честно возвращает UNAVAILABLE, heartbeat не
+  пишется, и через 2×interval `sync_lag` поднимает warn. Цепочка
+  контракт → метрика → правило сработала как задумана — но тревога о
+  состоянии конфига бессмысленна: оно известно без надзора. Теперь
+  `_SYNC_LAG_TARGETS[...]["enabled_setting"]` — задача за выключенным
+  флагом получает `disabled`, не участвует в worst и остаётся в отчёте.
+  Флаг включён, а прогонов нет — warn остаётся. (#362)
+
+- **`last_status` виден у всех задач `sync_lag`**, включая четыре со
+  свежестью по данным (`kg_metrics_sync`, `kg_cluster_health_sync`,
+  `kg_signal_aggregates_compute`, `kg_topology_sync`): статус пишется под
+  именем задачи для всего heartbeat-allowlist, а подтягивался только в
+  heartbeat-ветке. (#362)
+
+- **`incidents` получает PRIMARY KEY.** `pg_constraint` для таблицы был
+  пуст — ни одного констрейнта, включая PK; `id` — integer с sequence.
+  Пока таблица пуста, миграция мгновенна; наполненной она стоила бы
+  ACCESS EXCLUSIVE с полным сканом. (#361)
+
+- **ci-deadman: находка ≠ упавшая джоба.** Скрипт возвращал 1, найдя
+  проблемы и уже отправив их в Discord; k8s держал по этому поводу
+  Error-поды по `failedJobsHistoryLimit` — десять за 18 суток. Ненулевой
+  код теперь только за сбой самого опроса. (#361)
+
+- **Keyless-подпись образа не краснит master.** На self-hosted Mac
+  `fulcio.sigstore.dev` резолвится в sinkhole-адрес с недоверенным
+  сертификатом — DNS-фильтр машины раннера. Подпись не в контракте деплоя
+  (кластер тянет образ из Nexus); шаги cosign под `continue-on-error`. (#361)
+
+### Инфраструктура
+
+- CodeQL переведён на `ubuntu-latest`, но GitHub-hosted раннеры на аккаунте
+  недоступны (job'ы падают за секунды без раннера и логов; default-setup
+  Code Scanning — так же). Workflow отключён до починки аккаунта; файл
+  оставлен с `ubuntu-latest`, заработает сразу после.
+- Зависимости: uvicorn 0.52.4, cryptography 50.0.1, anthropic 1.2.0
+  (единственный клиент `AsyncAnthropic(api_key, timeout=float)` и обработка
+  `APIStatusError`/`RateLimitError` совместимы с 1.x; LLM в проде выключен).
 
 ## [1.0.5] — 2026-09-05 — Scale — не деплой
 
