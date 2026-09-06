@@ -8,7 +8,8 @@ from __future__ import annotations
 from datetime import datetime
 
 from sqlalchemy import (JSON, BigInteger, Boolean, Column, DateTime, Float,
-                        ForeignKey, Index, Integer, String, UniqueConstraint)
+                        ForeignKey, Index, Integer, String, UniqueConstraint,
+                        text)
 from sqlalchemy.orm import relationship
 
 from app.database import Base
@@ -804,4 +805,69 @@ class VolumeEdge(Base):
         ),
         Index("ix_kg_volume_edges_src", "src_kind", "src_id"),
         Index("ix_kg_volume_edges_dst", "dst_kind", "dst_id"),
+    )
+
+
+class KGIncident(Base):
+    """Инцидент как объект графа: один на сервис, пока он открыт.
+
+    До 06.09.2026 инцидента в графе не было. `kg_alerts.incident_id` во всех
+    3766 строках равнялся `fingerprint` — то есть «инцидент» был синонимом
+    одного алерта, а таблица `incidents` (артефакт LLM-пайплайна, который в
+    проде выключен) стояла пустой. Триаж при этом думает не алертами: у
+    сервиса «что-то случилось» — и к этому событию относятся все его алерты
+    за окно, деплой перед ним, события подов, аномалии и ошибки в логах.
+
+    Правило простое и детерминированное, без LLM:
+      * у пары (namespace, service_name) в каждый момент не больше одного
+        ОТКРЫТОГО инцидента — это гарантирует частичный уникальный индекс,
+        а не проверка в коде;
+      * новый алерт сервиса присоединяется к открытому инциденту, иначе
+        заводит новый; алерт, пришедший вскоре после закрытия
+        (`REOPEN_WINDOW_MIN`), переоткрывает прежний — флаппинг не должен
+        плодить инциденты;
+      * инцидент закрывается, когда все его алерты resolved (`kg_alerts.
+        resolved_at`), или старится, если давно нет ни алертов, ни резолвов.
+
+    `incident_key` — человекочитаемый стабильный ключ `ns/service@время`; на
+    него ссылается `kg_alerts.incident_id`. Целочисленный `id` — для URL и FK.
+    `fingerprints`/`alertnames` — JSON-списки: набор небольшой (медиана —
+    один алерт), а отдельная таблица связей ради него — лишний join.
+    """
+
+    __tablename__ = "kg_incidents"
+
+    id = Column(Integer, primary_key=True)
+    incident_key = Column(String, nullable=False, unique=True)
+    namespace = Column(String, nullable=False)
+    service_name = Column(String, nullable=False)
+    # NULL = сервис в момент первого алерта в графе не нашёлся (см.
+    # Known Unknowns в timeline: без service_id деплои/поды/аномалии не
+    # опросить).
+    service_id = Column(Integer, ForeignKey("kg_services.id"), nullable=True, index=True)
+    status = Column(String, nullable=False, default="open")   # open | resolved
+    severity = Column(String, nullable=True)                   # максимум по алертам
+    opened_at = Column(DateTime, nullable=False, index=True)   # fired_at первого алерта
+    last_alert_at = Column(DateTime, nullable=False)
+    resolved_at = Column(DateTime, nullable=True)
+    resolve_reason = Column(String, nullable=True)   # all_alerts_resolved | aged_out
+    alert_count = Column(Integer, nullable=False, default=0)
+    alertnames = Column(JSON, nullable=True)
+    fingerprints = Column(JSON, nullable=True)
+    reopened_count = Column(Integer, nullable=False, default=0)
+    extras = Column(JSON, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    __table_args__ = (
+        Index("ix_kg_incidents_ns_service_status", "namespace", "service_name", "status"),
+        # Инвариант «один открытый инцидент на сервис» — на уровне БД.
+        # Гонка двух реплик API на одном алерт-шторме иначе завела бы два.
+        Index(
+            "uq_kg_incidents_one_open_per_service",
+            "namespace", "service_name",
+            unique=True,
+            postgresql_where=text("status = 'open'"),
+            sqlite_where=text("status = 'open'"),
+        ),
     )

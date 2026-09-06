@@ -364,7 +364,9 @@ def test_populate_one_bad_deploy_does_not_kill_batch(db, monkeypatch):
     assert stats["alerts_added"] == 1
     assert db.query(AlertEvent).count() == 1
     # SAVEPOINT на service + 3 build'а + alert = 5 раз.
-    assert nested_calls["n"] == 5
+    # 1 сервис + 3 деплоя + 1 алерт + 1 attach инцидента (kg_incidents,
+    # отдельный SAVEPOINT: его сбой не должен отменять записанный алерт).
+    assert nested_calls["n"] == 6
 
     # Главное: Session НЕ отравлена — финальный commit проходит без
     # PendingRollbackError. До фикса упал бы здесь.

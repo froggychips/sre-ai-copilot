@@ -12,7 +12,8 @@ from prometheus_client import start_http_server
 from sqlalchemy import text
 
 from app import repository
-from app.api import approvals, discord_interactions, rate_limit, replay, webhooks
+from app.api import (approvals, discord_interactions, incidents, rate_limit,
+                     replay, webhooks)
 from app.evaluation import feedback
 from app.auth import User, get_current_user
 from app.celery_worker import celery_app, generate_reply, redis_client, resilience
@@ -205,6 +206,14 @@ app.include_router(
     dependencies=[Depends(get_current_user)],
 )
 app.include_router(feedback.router, prefix="/evaluation", tags=["evaluation"])
+# Инциденты графа (kg_incidents): список, карточка, timeline. Читающее API,
+# тот же router-level auth, что у /replay.
+app.include_router(
+    incidents.router,
+    prefix="/kg/incidents",
+    tags=["incidents"],
+    dependencies=[Depends(get_current_user)],
+)
 app.include_router(discord_interactions.router, prefix="/discord", tags=["discord"])
 
 
