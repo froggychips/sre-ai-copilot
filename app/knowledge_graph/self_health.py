@@ -183,6 +183,12 @@ _SYNC_LAG_TARGETS: Dict[str, Dict[str, Any]] = {
     # и есть интересный случай (ходит, но ничего не пишет).
     "kg_nats_subjects_sync": {
         "heartbeat_task": "kg_nats_subjects_sync",
+        # Источник за флагом. Выключенный настройкой источник — не поломка:
+        # с контрактом source_status (#358) задача честно возвращает
+        # UNAVAILABLE, heartbeat не пишется, и через 2×interval sync_lag
+        # поднимал warn — первое же ночное срабатывание
+        # CopilotSelfHealthWarnStuck 06.09.2026 было ровно про это.
+        "enabled_setting": "NATS_SUBJECTS_PARSER_ENABLED",
         # Расписание задачи — crontab(minute=43, hour="*/6"), то есть раз в
         # шесть часов. Здесь стояло 60, и проверка ждала прогона каждый час:
         # порог warn = 2×interval, fail = 5×interval, так что при реальном
@@ -432,16 +438,34 @@ def check_sync_lag(db: Session) -> CheckResult:
             "expected_interval_minutes": interval,
             "source": "heartbeat" if hb_task else "data_ts",
         }
+        flag = cfg.get("enabled_setting")
+        if flag and getattr(settings, flag, True) is False:
+            # Выключен настройкой — ждать от него прогонов нечего, и тревога
+            # здесь говорила бы не о состоянии источника, а о состоянии
+            # конфига, который и так известен. В worst не участвует; в
+            # detail остаётся, чтобы «источник молчит» читалось как «выключен»,
+            # а не терялось из отчёта.
+            entry.update({
+                "status": "disabled",
+                "reason": f"источник выключен настройкой {flag}=false",
+                "last_ts": None,
+                "lag_minutes": None,
+            })
+            per_task[task_name] = entry
+            continue
+        # Последний статус ответа источника (source_status.py). Heartbeat
+        # говорит «прогон с данными был»; статус добавляет, чем закончились
+        # прогоны после него. «heartbeat 40 минут назад, last_status=empty»
+        # читается иначе, чем просто «40 минут назад». Статус пишется под
+        # именем задачи для всех из heartbeat-allowlist — в том числе для
+        # тех, чью свежесть здесь считают по данным (data_ts), поэтому
+        # берём его до ветвления, а не только в heartbeat-ветке.
+        last_status = _last_source_status(hb_task or task_name)
+        if last_status is not None:
+            entry["last_status"] = last_status
         last_ts: Optional[datetime]
         if hb_task:
             last_ts = _last_heartbeat(hb_task)
-            # Последний статус ответа источника (source_status.py). Heartbeat
-            # говорит «прогон с данными был»; статус добавляет, чем
-            # закончились прогоны после него. «heartbeat 40 минут назад,
-            # last_status=empty» читается иначе, чем просто «40 минут назад».
-            last_status = _last_source_status(hb_task)
-            if last_status is not None:
-                entry["last_status"] = last_status
             col_factory = cfg.get("column")
             if col_factory is not None:
                 # Информационно: когда задача последний раз что-то материализовала.
