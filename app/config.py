@@ -852,6 +852,16 @@ class Settings(BaseSettings):
     EXECUTOR_IN_FLIGHT_TTL_SECONDS: int = Field(
         600, description="TTL (сек) для незавершённого in_flight claim в executor"
     )
+    # Верификация исхода после apply (remediation/verification.py): снимок
+    # цели до/после и отложенные проверки «та же цель, сошёлся rollout,
+    # ready==desired, алерт resolved, новых CrashLoop/OOM нет».
+    REMEDIATION_VERIFY_ENABLED: bool = Field(
+        True, description="Ставить отложенную верификацию после успешного apply"
+    )
+    REMEDIATION_VERIFY_DELAYS_SEC: str = Field(
+        "300,900",
+        description="CSV задержек (сек) попыток верификации после apply; число попыток = длина списка",
+    )
 
     # Approve/Decline whitelist (PR #12 executor track, security hardening).
     # CSV строки с Discord IDs. Минимум ОДИН из двух должен быть непуст,

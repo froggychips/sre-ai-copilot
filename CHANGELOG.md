@@ -6,6 +6,26 @@ All notable changes to this project are documented in this file.
 
 ### Добавлено
 
+- **Верификация remediation: та же ли цель, сработало ли, стало ли лучше.**
+  `apply_intent` заканчивался на exit code kubectl — «команда прошла»
+  считалось результатом, хотя команда проходит и над Deployment, который
+  пересоздали под тем же именем, и над тем, что после рестарта так и
+  крашится. Теперь перед записью снимается живой объект (uid, generation,
+  hash `spec.template`, реплики; read-only `kubectl get` через
+  `run_kubectl`), и если uid не совпадает с `target_ref` из графа —
+  действие отказано (`target_reincarnated`): «починили Deployment, которого
+  уже нет» выглядит успехом и потому хуже любого отказа. После записи —
+  второй снимок; оба в `executor_applied`. Через 5 и 15 минут Celery-задача
+  `remediation_verify` проверяет: тот же uid, rollout сошёлся, ready ==
+  desired, алерт инцидента resolved, новых CrashLoop/OOM у подов нет —
+  исход `verified` / `failed` / `pending` / `unknown` с причинами, состояние
+  исполнителя `verified` или `verification_failed`. Каждая проверка —
+  True / False / None, и None значит «не смогли проверить», а не «ок».
+  Верификация не роняет apply: kubectl недоступен → `unknown`, брокер лёг →
+  `scheduled=false`. Настройки `REMEDIATION_VERIFY_ENABLED`,
+  `REMEDIATION_VERIFY_DELAYS_SEC`; метрика `remediation_verification_total`.
+  Контракт §13.
+
 - **Blast radius с доказательствами: «что сломается, если X сломается».**
   Прежний `blast_radius_for` отвечал на соседний вопрос — через какие точки
   входа (Service, ingress-хосты) ко мне ходят, — одним шагом и числом
