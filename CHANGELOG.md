@@ -4,7 +4,30 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
-_Ничего в очереди — см. [1.0.6] ниже._
+### Исправлено
+
+- **Снята ingress-заглушка `sre-ai.example.com`.** Из ревью 1.0.6 остался
+  вопрос, почему `kubectl rollout status deploy/sre-ai-api` в deploy.sh
+  виснет на «Waiting for deployment spec update to be observed»:
+  `metadata.generation` у sre-ai-api дошёл до ~25 000 и рос на единицу
+  каждые пару минут при неизменном pod-template-hash. Diff двух снимков spec
+  показал единственное отличие — аннотацию `field.cattle.io/publicEndpoints`,
+  адрес в которой скакал между VIP двух ingress-контроллеров.
+
+  Источник — `Ingress sre-ai-ingress` из `k8s/base/deployment.yaml`: host
+  `sre-ai.example.com`, класс через устаревшую аннотацию
+  `kubernetes.io/ingress.class: nginx`. В кластере пять ingress-nginx с одним
+  `controller: k8s.io/ingress-nginx`, все матчат такой Ingress и по очереди
+  переписывают его `.status.loadBalancer` (49 682 события «Scheduled for
+  sync» за 16 дней), а Rancher на каждый скачок обновляет publicEndpoints на
+  Deployment. Заодно cert-manager 16 дней пытался выпустить сертификат на
+  example.com.
+
+  Alertmanager ходит в `sre-ai-api.sre-ai.svc.cluster.local:8000` напрямую,
+  снаружи копилот не публикуется — Ingress никому не нужен. Убран из
+  манифеста и из кластера (Certificate `sre-ai-tls` уходит каскадно по
+  ownerReference). Rollout в этом кластере надёжнее проверять по образам
+  подов, чем по observedGeneration.
 
 ## [1.0.6] — 2026-09-06 — Надзор различает «выключен» и «сломан»
 
