@@ -45,6 +45,10 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from app.diagnostics.facts import Fact, FactKind
 from app.diagnostics.rules.base import Rule, same_workload
+from app.knowledge_graph.epistemic import Epistemic
+
+_SOURCE = "k8s_events"
+_PROVENANCE = "k8s_event"
 
 # (reason_lower_prefix, fact_kind, confidence)
 _REASON_MAP: List[Tuple[str, str, float]] = [
@@ -109,13 +113,31 @@ def _attribution(obj: str, target: Optional[str]) -> str:
 
 class PodEventsRule(Rule):
     name = "PodEventsRule"
+    sources = (_SOURCE,)
 
     def evaluate(self, ctx: Dict[str, Any]) -> List[Fact]:
-        events = ctx.get("k8s_events") or []
-        if not events:
-            return []
-
+        events = ctx.get(_SOURCE) or []
         target = ctx.get("pod") or ctx.get("service")
+        if not events:
+            # Known Unknowns: пустой список при живом источнике — по-прежнему
+            # тишина (отсутствие события не доказывает отсутствие факта, см.
+            # докстринг). Но если источник событий недоступен, молчать
+            # нельзя: критик прочтёт «anchor oom_killed NOT observed» как
+            # опровержение, а мы событий даже не видели. На каждый kind, о
+            # котором правило умеет говорить, — явный ?.
+            problem = self.source_problem(ctx, _SOURCE)
+            if not problem:
+                return []
+            seen: List[str] = []
+            for _prefix, kind, _conf in _REASON_MAP:
+                if kind not in seen:
+                    seen.append(kind)
+            subject = target or ctx.get("namespace")
+            return [
+                Fact.unknown(kind, problem, subject=subject,
+                             source_rule=self.name, provenance="kg_pod_events")
+                for kind in seen
+            ]
 
         # Агрегируем по (класс привязки, kind): берём максимальную confidence
         # среди событий. Один OOMKilling-ивент target-workload-а достаточен.
@@ -153,6 +175,8 @@ class PodEventsRule(Rule):
                     subject=evidence.get("object") or fallback_subject,
                     evidence=evidence,
                     source_rule=self.name,
+                    epistemic=Epistemic.OBSERVED.value,
+                    provenance=_PROVENANCE,
                 )
             )
 
@@ -174,6 +198,9 @@ class PodEventsRule(Rule):
                         ),
                     },
                     source_rule=self.name,
+                    # Событие наблюдали, но принадлежность target-у — догадка.
+                    epistemic=Epistemic.INFERRED.value,
+                    provenance=_PROVENANCE,
                 )
             )
 
@@ -195,6 +222,8 @@ class PodEventsRule(Rule):
                         ),
                     },
                     source_rule=self.name,
+                    epistemic=Epistemic.OBSERVED.value,
+                    provenance=_PROVENANCE,
                 )
             )
 

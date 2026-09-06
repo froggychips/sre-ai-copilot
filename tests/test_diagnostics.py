@@ -210,9 +210,18 @@ def test_recent_deploy_iso_string_timestamps():
 
 
 def test_recent_deploy_no_data():
+    """Без времени инцидента окно не построить — это UNKNOWN, не «не было».
+
+    Раньше: observed=False с conf 0.7 и общим reason
+    «no_deploys_or_no_timestamp» — пустой список и отсутствие timestamp
+    неразличимы. Пустой список при живом источнике теперь ABSENT
+    (см. test_recent_deploy_outside_window), отсутствие времени — UNKNOWN.
+    """
     facts = RecentDeployRule().evaluate({})
     assert facts[0].observed is False
-    assert facts[0].evidence["reason"] == "no_deploys_or_no_timestamp"
+    assert facts[0].is_unknown
+    assert facts[0].confidence == 0.0
+    assert facts[0].evidence["reason"] == "no_incident_timestamp"
 
 
 # ---------- ResourcePressureRule -----------------------------------------
