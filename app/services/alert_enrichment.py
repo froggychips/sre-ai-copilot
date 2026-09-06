@@ -24,8 +24,8 @@ from app.config import settings
 from app.diagnostics.facts import Fact
 from app.diagnostics.rules.recent_deploy import RecentDeployRule
 from app.diagnostics.rules.upstream_degraded import UpstreamDegradedRule
-from app.knowledge_graph.queries import (blast_radius_for,
-                                         cluster_deploy_activity,
+from app.knowledge_graph.blast_radius import blast_radius_v2
+from app.knowledge_graph.queries import (cluster_deploy_activity,
                                          current_replicas_from_kg,
                                          deploy_stream_freshness,
                                          incidents_on, ingress_health_for,
@@ -1036,7 +1036,9 @@ def enrich_alert(db: Session, incident: Incident) -> EnrichedContext:
     is_critical = (incident.severity or "").lower() == "critical"
     if is_critical:
         try:
-            ctx.blast_radius = blast_radius_for(db, namespace, service, top_n=3)
+            # v2 = blast_radius_for (точки входа) + пострадавшие с эпистемикой
+            # и Known Unknowns; старые ключи сохранены для рендера.
+            ctx.blast_radius = blast_radius_v2(db, namespace, service, top_n=3)
         except Exception as e:
             log.warning("enrich.blast_radius_failed", error=str(e))
         try:

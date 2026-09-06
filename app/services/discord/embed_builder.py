@@ -266,7 +266,8 @@ def _build_blast_radius_field(
     urls = blast.get("urls") or []
     services_total = blast.get("services_total") or 0
     urls_total = blast.get("urls_total") or 0
-    if services_total == 0 and urls_total == 0:
+    if (services_total == 0 and urls_total == 0
+            and not blast.get("impact") and not blast.get("unknowns")):
         return None
 
     parts: List[str] = []
@@ -279,6 +280,31 @@ def _build_blast_radius_field(
         suffix = f" (+{urls_total - len(urls)})" if urls_total > len(urls) else ""
         parts.append(f"{urls_total} URL → {url_names}{suffix}")
 
+    # blast_radius_v2: кто именно пострадает (обход против зависимостей, до
+    # двух шагов) с эпистемикой на каждом пути. Значки — из общего словаря
+    # EPISTEMIC_BADGE: ✓ наблюдалось, ◇ объявлено в k8s, ≈ выведено,
+    # ⌛ устарело, ⚠ источники спорят. Известные пробелы — отдельной строкой:
+    # «вызывающих не видно» и «вызывающих нет» — разные ответы.
+    impact = blast.get("impact") or []
+    if impact:
+        summary = blast.get("summary") or {}
+        by_ep = summary.get("by_epistemic") or {}
+        badge_of = {"observed": "✓", "corroborated": "✓", "declared": "◇", "inferred": "≈",
+                    "stale": "⌛", "contradicted": "⚠", "unknown": "?"}
+        legend = " ".join(
+            f"{badge_of.get(ep, '?')}{n}" for ep, n in sorted(by_ep.items(), key=lambda kv: -kv[1])
+        )
+        parts.append(f"{len(impact)} зависимых ({legend})")
+        for e in impact[:3]:
+            hop = f" ·{e.get('hops')}h" if (e.get("hops") or 1) > 1 else ""
+            parts.append(f"  {e.get('badge', '?')} `{e.get('service')}` ← {e.get('via')}{hop}")
+        if len(impact) > 3:
+            parts.append(f"  … ещё {len(impact) - 3}")
+    for u in (blast.get("unknowns") or [])[:2]:
+        parts.append(f"❔ _{u.get('reason', '')}_")
+
+    if not parts:
+        return None
     return {
         "name": "🎯 Blast radius (Wave 7)",
         "value": "\n".join(parts)[:1024],
