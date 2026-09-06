@@ -250,7 +250,7 @@ async def test_send_enriched_alert_critical_skips_empty_wave7_sections():
 
 @patch("app.services.alert_enrichment.pod_event_summary_for")
 @patch("app.services.alert_enrichment.nats_impact_for")
-@patch("app.services.alert_enrichment.blast_radius_for")
+@patch("app.services.alert_enrichment.blast_radius_v2")
 @patch("app.services.alert_enrichment.recent_pod_events_for", return_value=[])
 @patch("app.services.alert_enrichment.recent_deploys_for", return_value=[])
 @patch("app.services.alert_enrichment.nearby_alerts", return_value=[])
@@ -281,7 +281,7 @@ def test_enrich_alert_calls_wave7_queries_when_critical(
 
 @patch("app.services.alert_enrichment.pod_event_summary_for")
 @patch("app.services.alert_enrichment.nats_impact_for")
-@patch("app.services.alert_enrichment.blast_radius_for")
+@patch("app.services.alert_enrichment.blast_radius_v2")
 @patch("app.services.alert_enrichment.recent_pod_events_for", return_value=[])
 @patch("app.services.alert_enrichment.recent_deploys_for", return_value=[])
 @patch("app.services.alert_enrichment.nearby_alerts", return_value=[])
