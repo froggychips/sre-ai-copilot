@@ -1,8 +1,46 @@
-"""Структуры данных deterministic-уровня."""
+"""Структуры данных deterministic-уровня.
+
+Контракт Evidence (06.09.2026). У факта три исхода, а не два:
+
+    FOUND    — правило искало и нашло (`observed=True`);
+    ABSENT   — правило искало в живом источнике и не нашло. Это
+               доказательство отсутствия, на него можно опираться;
+    UNKNOWN  — правило не смогло проверить: источник упал, устарел,
+               сервиса нет в графе, у алерта нет времени. Это отсутствие
+               доказательств, и опираться на него нельзя ни в одну сторону.
+
+До этого «не нашли» и «не смогли проверить» выглядели одинаково —
+`observed=False`, разница пряталась в `confidence` (0.3 против 0.9) и в
+`evidence["reason"]`, которые каждый потребитель читал по-своему. На живых
+данных это давало уверенные ложные вердикты: пустой `kg_deployments` при
+упавшем пайплайне рендерился как «деплоев не было — вряд ли связано».
+
+Рядом с вердиктом факт несёт, откуда он взялся:
+
+    epistemic   — словарь `app.knowledge_graph.epistemic.Epistemic`: факт
+                  наблюдали, прочитали из манифеста или вывели косвенно;
+    provenance  — источник данных («kg_deployments/service», «k8s_event»);
+    window_min  — окно, в котором искали; без него ABSENT ничего не значит;
+    data_age_min — возраст последней записи источника, если известен.
+
+Все новые поля со значениями по умолчанию: `Fact(kind, observed, confidence)`
+из старого кода остаётся валидным и получает вердикт по `observed`.
+"""
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
+from enum import Enum
 from typing import Any, Dict, FrozenSet, List, Optional, Tuple
+
+from app.knowledge_graph.epistemic import Epistemic
+
+
+class Verdict(str, Enum):
+    """Исход проверки. См. докстринг модуля."""
+
+    FOUND = "found"
+    ABSENT = "absent"
+    UNKNOWN = "unknown"
 
 
 @dataclass
@@ -12,15 +50,78 @@ class Fact:
     Принципиально: `observed=False` тоже значимо. Если правило OOMKilledRule
     отработало и нашло «событий OOMKilled нет в окне» — мы фиксируем это
     как явный факт, чтобы LLM не выдвигал гипотезу «возможно OOM» без
-    оснований.
+    оснований. Но только когда правило ДЕЙСТВИТЕЛЬНО проверило: для этого
+    есть `verdict` — ABSENT против UNKNOWN.
     """
 
     kind: str                      # стабильный slug, см. FactKind ниже
-    observed: bool                 # True = факт зафиксирован; False = явное «нет»
+    observed: bool                 # True = факт зафиксирован; False = явное «нет» или «не знаем»
     confidence: float              # 0..1, насколько правило уверено в своём наблюдении
     evidence: Dict[str, Any] = field(default_factory=dict)
     subject: Optional[str] = None  # service/pod/namespace, к которому факт относится
     source_rule: Optional[str] = None  # имя правила-источника (для отладки)
+    # ── Evidence-контракт ────────────────────────────────────────────────
+    verdict: str = ""              # Verdict.*; пустое → выводится из observed
+    epistemic: Optional[str] = None    # Epistemic.* — как узнали
+    provenance: Optional[str] = None   # откуда данные
+    window_min: Optional[int] = None   # окно проверки, минут
+    data_age_min: Optional[int] = None  # возраст последней записи источника
+    unknown_reason: Optional[str] = None  # почему UNKNOWN; только для него
+
+    def __post_init__(self) -> None:
+        if not self.verdict:
+            self.verdict = (Verdict.FOUND if self.observed else Verdict.ABSENT).value
+        self.verdict = Verdict(self.verdict).value
+        if self.verdict == Verdict.UNKNOWN.value:
+            # «Не знаем» не может быть наблюдением и не может быть уверенным.
+            self.observed = False
+            self.confidence = 0.0
+            if self.epistemic is None:
+                self.epistemic = Epistemic.UNKNOWN.value
+            if not self.unknown_reason:
+                self.unknown_reason = str(self.evidence.get("reason") or "unknown")
+            self.evidence.setdefault("reason", self.unknown_reason)
+        elif self.verdict == Verdict.FOUND.value and not self.observed:
+            raise ValueError("Fact(verdict=found) требует observed=True")
+        elif self.verdict == Verdict.ABSENT.value and self.observed:
+            raise ValueError("Fact(verdict=absent) требует observed=False")
+        if self.epistemic is not None:
+            self.epistemic = Epistemic(self.epistemic).value
+
+    @classmethod
+    def unknown(
+        cls,
+        kind: str,
+        reason: str,
+        *,
+        subject: Optional[str] = None,
+        source_rule: Optional[str] = None,
+        provenance: Optional[str] = None,
+        window_min: Optional[int] = None,
+        evidence: Optional[Dict[str, Any]] = None,
+    ) -> "Fact":
+        """Факт «проверить не удалось». Единственный способ породить UNKNOWN."""
+        return cls(
+            kind=kind,
+            observed=False,
+            confidence=0.0,
+            evidence=dict(evidence or {}),
+            subject=subject,
+            source_rule=source_rule,
+            verdict=Verdict.UNKNOWN.value,
+            epistemic=Epistemic.UNKNOWN.value,
+            provenance=provenance,
+            window_min=window_min,
+            unknown_reason=reason,
+        )
+
+    @property
+    def is_unknown(self) -> bool:
+        return self.verdict == Verdict.UNKNOWN.value
+
+    @property
+    def is_absent(self) -> bool:
+        return self.verdict == Verdict.ABSENT.value
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -93,6 +194,15 @@ class FactStore:
         """kind-ы, у которых хотя бы один наблюдённый факт."""
         return {f.kind for f in self._facts if f.observed}
 
+    def unknown_kinds(self) -> set:
+        """kind-ы, которые не удалось проверить и которые НЕ наблюдались.
+
+        Если про kind есть и FOUND, и UNKNOWN (два правила, один источник
+        упал) — kind известен: наблюдение сильнее пробела.
+        """
+        observed = self.observed_kinds()
+        return {f.kind for f in self._facts if f.is_unknown} - observed
+
     def has_observed(self, kind: str) -> bool:
         return any(f.observed for f in self.by_kind(kind))
 
@@ -121,18 +231,37 @@ class FactStore:
         """JSON-подобный блок для подмеса в LLM-промпт.
 
         Формат стабильный, потому что hypothesis/critic-агенты будут на
-        него ссылаться по полям.
+        него ссылаться по полям. Три маркера: ✓ FOUND, ✗ ABSENT, ? UNKNOWN.
+        Для критика разница между ✗ и ? принципиальна: ✗ опровергает
+        гипотезу, ? — нет.
         """
         if not self._facts:
             return "<facts>no deterministic facts collected</facts>"
         lines = ["<facts>"]
+        has_unknown = False
         for f in self._facts:
-            marker = "✓" if f.observed else "✗"
-            ev_preview = ", ".join(f"{k}={v}" for k, v in f.evidence.items())
+            if f.is_unknown:
+                has_unknown = True
+                marker = "?"
+            else:
+                marker = "✓" if f.observed else "✗"
+            ev_preview = ", ".join(
+                f"{k}={v}" for k, v in f.evidence.items() if not (f.is_unknown and k == "reason")
+            )
             subj = f" subject={f.subject}" if f.subject else ""
+            epi = f" [{f.epistemic}]" if f.epistemic and not f.is_unknown else ""
+            head = (
+                f"  {marker} {f.kind} (unknown: {f.unknown_reason}){subj}"
+                if f.is_unknown
+                else f"  {marker} {f.kind} (conf={f.confidence:.2f}){epi}{subj}"
+            )
+            lines.append(head + (f" — {ev_preview}" if ev_preview else ""))
+
+        if has_unknown:
             lines.append(
-                f"  {marker} {f.kind} (conf={f.confidence:.2f}){subj}"
-                + (f" — {ev_preview}" if ev_preview else "")
+                "  NOTE: '?' means the check could not be performed (source "
+                "unavailable) — it is NOT evidence of absence and MUST NOT be "
+                "used to refute a hypothesis."
             )
 
         conflict_pairs = self.conflicts()

@@ -95,6 +95,16 @@ FACTS_OBSERVED = Counter(
     ["kind", "observed"],
 )
 
+# Evidence-контракт: found / absent / unknown. Отдельный счётчик, а не
+# третий лейбл у FACTS_OBSERVED — у того два значения observed и дашборды
+# на них завязаны. Доля unknown по kind — прямой измеритель Known Unknowns:
+# сколько проверок копилот не смог выполнить.
+FACTS_VERDICT = Counter(
+    "diagnostic_facts_verdict_total",
+    "Diagnostic facts emitted, by kind and evidence verdict (found/absent/unknown)",
+    ["kind", "verdict"],
+)
+
 # Сколько гипотез сгенерировал каждый perspective-агент ДО anchor-фильтра.
 # Разница с hypothesis_grounded_total{perspective} показывает, сколько
 # отсекает filter_grounded: если perspective генерирует много, но до
@@ -211,6 +221,10 @@ SURVIVORS_COUNT_PER_RUN = Histogram(
 
 def track_fact_observed(kind: str, observed: bool) -> None:
     FACTS_OBSERVED.labels(kind=kind, observed=str(observed).lower()).inc()
+
+
+def track_fact_verdict(kind: str, verdict: str) -> None:
+    FACTS_VERDICT.labels(kind=kind, verdict=verdict).inc()
 
 
 def track_grounded(perspective: str) -> None:

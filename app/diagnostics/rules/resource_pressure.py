@@ -16,6 +16,7 @@ _PRESSURE_PATTERN = re.compile(
 
 class ResourcePressureRule(Rule):
     name = "ResourcePressureRule"
+    sources = ("metrics_summary", "k8s_summary", "logs_summary")
 
     def evaluate(self, ctx: Dict[str, Any]) -> List[Fact]:
         text = self.text_haystack(ctx)

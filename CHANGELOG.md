@@ -4,6 +4,42 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+### Добавлено
+
+- **Evidence-контракт: у факта три исхода, не два.** `Fact.verdict` ∈
+  `found` / `absent` / `unknown`. До этого «проверили — пусто» и «проверить
+  не смогли» были одним `observed=False`, а разница пряталась в confidence
+  (0.3 против 0.9) и в `evidence["reason"]`, которые каждый потребитель
+  читал по-своему. Итог на живых данных: упавший `recent_deploys_for`
+  давал пустой список, `RecentDeployRule` — ✗ «деплоев не было» с 0.95, а
+  критик опровергал этим гипотезу о регрессе. Теперь такой ответ — `?` с
+  причиной (`unknown_reason`), confidence принудительно 0, и критик его не
+  использует ни за, ни против: `?` — отсутствие доказательств, `✗` —
+  доказательство отсутствия. Рядом с вердиктом факт несёт `epistemic`
+  (словарь `Epistemic`: наблюдали / вывели), `provenance` и `window_min`.
+
+- **Known Unknowns у правил.** Каждое правило объявляет `sources` — поля
+  ctx, от которых зависит ответ, — а `Rule.run()` понижает `absent` до
+  `unknown`, если любой из них помечен в `ctx["source_status"]`. Словарь
+  заполняет `enrich_alert`: исключение в запросе, `deploy_stream_freshness()`
+  со `stale=True` (раньше это проверялось только в NS-fallback ветке,
+  сервисный путь отвечал «не было» и при мёртвом потоке), сервис не найден
+  в графе. Тест `test_evidence_contract` не пустит в `DEFAULT_RULES` правило
+  без `sources` и правило, которое при упавших источниках отвечает `absent`.
+  Метрика `diagnostic_facts_verdict_total{kind, verdict}` — доля проверок,
+  которые копилот выполнить не смог.
+
+- **Привязка деплоя к сервису стала свидетельством, а не константой.**
+  `recent_deploys_for*` отдают `attribution_scope`: `service` (точная запись,
+  `namespace_scope=False`), `namespace` (ns-broadcast), `unknown` (legacy).
+  За 30 дней до 06.09 все топ-8 источников kg_deployments были
+  ns-broadcast, а правило приписывало сервису «возможный регресс» с 0.95 по
+  билду, который мог его не трогать. Теперь только точная запись даёт
+  `observed` 0.95; broadcast — `inferred` 0.6 с явной пометкой в embed
+  («в namespace — привязка к сервису не подтверждена»). Пустой список
+  `upstream_alerts` при опрошенном графе — `absent` 0.9, а не
+  «no_graph_data» 0.3: это была ABSENT под маской UNKNOWN.
+
 ### Исправлено
 
 - **Снята ingress-заглушка `sre-ai.example.com`.** Из ревью 1.0.6 остался

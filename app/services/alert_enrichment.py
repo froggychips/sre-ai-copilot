@@ -248,6 +248,14 @@ class EnrichedContext:
 
     rule_facts: List[Fact] = field(default_factory=list)
 
+    # Known Unknowns (Evidence-контракт, 06.09.2026): поле rule_ctx → причина,
+    # по которой источник НЕ опрошен: запрос упал, поток деплоев не
+    # пополняется, сервиса нет в графе. Раньше каждый такой сбой тихо
+    # превращался в пустой список, и правило выдавало ✗ «не было» с
+    # confidence 0.95 — уверенный вердикт из отсутствия данных. Правила
+    # читают этот словарь через Rule.run() и отвечают ? вместо ✗.
+    source_status: Dict[str, str] = field(default_factory=dict)
+
     # rollout-noise — выставляется heuristic-ом в enrich_alert ниже
     rollout_noise: bool = False
 
@@ -326,6 +334,13 @@ def _fact_to_short_text(fact: Fact) -> str:
             by = f" by {triggered}" if triggered else ""
             from app.utils.time_human import humanize_minutes_ago
             when = humanize_minutes_ago(mins)
+            if fact.epistemic == "inferred":
+                # ns-broadcast: билд раскатывал namespace, к сервису запись
+                # не привязана. Честная формулировка вместо «регресс».
+                return (
+                    f"Deploy #{build}{by} ({sha}) {when} в namespace — "
+                    f"привязка к сервису не подтверждена, возможен регресс"
+                )
             return f"Deploy #{build}{by} ({sha}) {when} — возможный регресс"
     if fact.source_rule == "UpstreamDegradedRule":
         cnt = ev.get("count", 0)
@@ -918,6 +933,24 @@ def enrich_alert(db: Session, incident: Incident) -> EnrichedContext:
             )
     except Exception as e:
         log.warning("enrich.recent_deploys_failed", error=str(e))
+        ctx.source_status["recent_deployments"] = f"kg_deployments недоступен: {type(e).__name__}"
+    if not ctx.recent_deploys and "recent_deployments" not in ctx.source_status:
+        # Пустой список двусмыслен (инцидент 2026-08-11): «деплоя не было»
+        # или «kg_deployments не пополняется». До сих пор это различали
+        # только в NS-fallback ветке; сервисный путь отвечал ✗ 0.95 и при
+        # мёртвом потоке. Если поток стоит — источник помечен, RecentDeployRule
+        # ответит ?, рендер скажет «не проверено».
+        try:
+            stream = deploy_stream_freshness(db, before=effective_at)
+            ctx.deploy_stream = stream
+            if stream.get("stale"):
+                age_h = stream.get("age_hours")
+                ctx.source_status["recent_deployments"] = (
+                    f"поток деплоев не пополняется: последняя запись {age_h}ч назад"
+                    if age_h is not None else "в kg_deployments нет ни одной записи"
+                )
+        except Exception as e:
+            log.warning("enrich.deploy_stream_freshness_failed", error=str(e))
 
     # 2. Upstream alerts (±15 мин)
     try:
@@ -927,6 +960,7 @@ def enrich_alert(db: Session, incident: Incident) -> EnrichedContext:
         )
     except Exception as e:
         log.warning("enrich.nearby_alerts_failed", error=str(e))
+        ctx.source_status["upstream_alerts"] = f"kg_alerts недоступен: {type(e).__name__}"
 
     # 3. Recurrence (24h окно)
     try:
@@ -993,6 +1027,7 @@ def enrich_alert(db: Session, incident: Incident) -> EnrichedContext:
             )
     except Exception as e:
         log.warning("enrich.pod_events_failed", error=str(e))
+        ctx.source_status["k8s_events"] = f"kg_pod_events недоступен: {type(e).__name__}"
 
     # 4e. Wave 7 enrichment: blast radius / NATS impact / pod trail.
     # Все три — best-effort, silent fail. Render в embed только при
@@ -1099,6 +1134,13 @@ def enrich_alert(db: Session, incident: Incident) -> EnrichedContext:
                 ctx.kg_data_age_sec = int(age.total_seconds())
     except Exception as e:
         log.warning("enrich.service_lookup_failed", error=str(e))
+    if not ctx.in_kg:
+        # Сервиса нет в графе: recent_deploys_for / nearby_alerts /
+        # recent_pod_events_for возвращают [] не потому, что пусто, а потому,
+        # что искать негде (см. докстринг recent_deploys_for: «эквивалентно
+        # "не знаем"»). Помечаем все три — правила ответят ?, не ✗.
+        for src in ("recent_deployments", "upstream_alerts", "k8s_events"):
+            ctx.source_status.setdefault(src, "сервис не найден в KG — источник не опрошен")
 
     # 6. Rule-based hypotheses — без LLM. Передаём в их интерфейс
     #    `recent_deployments` и `upstream_alerts`, как ожидают rules.
@@ -1110,26 +1152,36 @@ def enrich_alert(db: Session, incident: Incident) -> EnrichedContext:
         "alertname": incident.labels.get("alertname", ""),
         "description": incident.description or "",
         "recent_deployments": ctx.recent_deploys,
-        "upstream_alerts": ctx.upstream_alerts if ctx.upstream_alerts else None,
+        "deploy_provenance": "kg_deployments",
+        # Пустой список — это ABSENT («граф опрошен, соседи молчат»), а не
+        # UNKNOWN. Раньше [] превращался в None, и правило отвечало
+        # «no_graph_data» 0.3 при успешно опрошенном графе — ABSENT под
+        # маской UNKNOWN. None теперь только при помеченном сбое источника.
+        "upstream_alerts": (
+            None if "upstream_alerts" in ctx.source_status else ctx.upstream_alerts
+        ),
+        "upstream_window_min": settings.ENRICH_UPSTREAM_WINDOW_MIN,
         "incident_starts_at": incident_at,
         # Phase 3-A: pod_events для PodEventsRule (mapping reason→FactKind).
         # OOMKilled / CrashLoop / FailedScheduling — это и есть deterministic
         # «most likely cause» для AM-based alerts типа KubePodCrashLooping.
         "k8s_events": ctx.pod_events,
+        # Known Unknowns: Rule.run() понижает ABSENT → UNKNOWN по этому словарю.
+        "source_status": dict(ctx.source_status),
     }
     try:
-        ctx.rule_facts.extend(RecentDeployRule().evaluate(rule_ctx))
+        ctx.rule_facts.extend(RecentDeployRule().run(rule_ctx))
     except Exception as e:
         log.warning("enrich.recent_deploy_rule_failed", error=str(e))
     try:
-        ctx.rule_facts.extend(UpstreamDegradedRule().evaluate(rule_ctx))
+        ctx.rule_facts.extend(UpstreamDegradedRule().run(rule_ctx))
     except Exception as e:
         log.warning("enrich.upstream_rule_failed", error=str(e))
     # Phase 3-A: PodEventsRule даёт «причина из k8s» (OOM/CRASH/SCHED/...).
     # Это самый сильный root-cause signal на live alerts.
     try:
         from app.diagnostics.rules.pod_events import PodEventsRule
-        ctx.rule_facts.extend(PodEventsRule().evaluate(rule_ctx))
+        ctx.rule_facts.extend(PodEventsRule().run(rule_ctx))
     except Exception as e:
         log.warning("enrich.pod_events_rule_failed", error=str(e))
 

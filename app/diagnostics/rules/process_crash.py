@@ -56,6 +56,7 @@ def _signal_label(exit_code: int) -> str:
 
 class ProcessCrashRule(Rule):
     name = "ProcessCrashRule"
+    sources = ("k8s_pod_state", "k8s_summary", "logs_summary")
 
     def evaluate(self, ctx: Dict[str, Any]) -> List[Fact]:
         pod = ctx.get("pod") or ctx.get("service")

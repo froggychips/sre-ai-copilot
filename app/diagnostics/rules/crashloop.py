@@ -42,6 +42,7 @@ def _recent_backoff_events(events: List[Dict[str, Any]]) -> List[Dict[str, Any]]
 
 class CrashLoopBackOffRule(Rule):
     name = "CrashLoopBackOffRule"
+    sources = ("k8s_events", "k8s_summary", "logs_summary")
 
     def evaluate(self, ctx: Dict[str, Any]) -> List[Fact]:
         text = self.text_haystack(ctx)

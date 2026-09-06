@@ -48,6 +48,9 @@ _UNATTRIBUTED_HARD_CONFIDENCE = 0.45
 
 class OOMKilledRule(Rule):
     name = "OOMKilledRule"
+    # Структурный шлюз + текстовые источники haystack (alertname/description
+    # всегда при алерте, их в sources не включаем).
+    sources = ("k8s_pod_state", "k8s_summary", "logs_summary")
 
     def evaluate(self, ctx: Dict[str, Any]) -> List[Fact]:
         pod = ctx.get("pod") or ctx.get("service")

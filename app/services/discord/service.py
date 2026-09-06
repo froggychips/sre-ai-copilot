@@ -1671,6 +1671,27 @@ class DiscordService:
                 "value": "\n".join(lines)[:1024],
                 "inline": False,
             })
+        elif getattr(head, "deploy_scope", "service") == "service":
+            # Evidence-контракт: деплоев не показали — но «не было» или «не
+            # проверено»? Если RecentDeployRule ответил ? (kg_deployments
+            # упал, поток не пополняется, сервиса нет в графе), молчание
+            # embed-а читается как «деплоя не было». Говорим явно.
+            unknown_deploy = [
+                f for f in (getattr(head, "rule_facts", None) or [])
+                if getattr(f, "kind", None) == "recent_deploy"
+                and getattr(f, "verdict", "") == "unknown"
+            ]
+            if unknown_deploy:
+                reason = unknown_deploy[0].unknown_reason or "источник недоступен"
+                fields.append({
+                    "name": "❔ Deploy-связь не проверена",
+                    "value": (
+                        f"_{reason}. Не путать с «деплоя не было» — связь с "
+                        f"деплоем не установлена ни в одну сторону. Проверь "
+                        f"деплои в TeamCity вручную._"
+                    )[:1024],
+                    "inline": False,
+                })
 
         # NS-level deploy attribution (запрос on-call 2026-06-10): для
         # алертов без резолва сервиса отвечаем «деплой или нет» деплоями
