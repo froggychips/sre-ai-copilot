@@ -153,3 +153,14 @@ defaults naive UTC, no `timezone=True` column anywhere) and
 > this contract — values written to the DB must end up naive UTC. A migration
 > to aware-everywhere would have to flip the columns to `timestamptz` in the
 > same change; doing one half alone is a silent-offset bug.
+
+## 11. Incident Contract (`kg_incidents`)
+
+An **Incident** is a deterministic object built from a service's alerts — no LLM, no "roughly at the same time" heuristics. It exists because `kg_alerts.incident_id` used to equal `fingerprint` in every row, i.e. "incident" was another name for one alert.
+
+1. **Identity.** At most one `open` incident per `(namespace, service_name)`; enforced by the partial unique index `uq_kg_incidents_one_open_per_service`, not by application code. `incident_key = "<ns>/<service>@<opened_at:%Y%m%dT%H%M%S>"` is stable for the life of the row; the integer `id` is used in URLs.
+2. **Attach** (`incidents.attach_alert`, called from `auto_populator.populate_from_incident` after `record_alert_event`): a firing alert joins the open incident of its service; if none is open and one was resolved less than `REOPEN_WINDOW_MIN` (30) minutes before `fired_at`, that one is **reopened** (`reopened_count += 1`); otherwise a new incident is opened. Idempotent by `fingerprint`. `kg_alerts.incident_id` is set to the `incident_key`.
+3. **Aggregates.** `alert_count` = distinct fingerprints; `severity` = max over alerts (critical > warning > info); `opened_at` = min `fired_at` (a late alert widens the window but never changes the key); `last_alert_at` = max `fired_at`.
+4. **Resolve** (`incidents.reconcile_incidents`, beat task `kg_incidents_lifecycle` every 5 min): all linked alerts have `resolved_at` → `status=resolved`, `resolved_at = max(alert.resolved_at)`, `resolve_reason=all_alerts_resolved`. No new alert for `AGE_OUT_HOURS` (168) and still open → `resolve_reason=aged_out`. `resolved` is terminal except for reopening (rule 2).
+5. **Timeline** (`incident_timeline.build_timeline`, `GET /kg/incidents/{id}/timeline`): events from `kg_incidents`, `kg_alerts`, `kg_deployments`, `kg_pod_events`, `kg_anomaly_observations` (bucketed per metric·hour), `kg_log_observations` (error-level only) in `[opened_at − 60 min, (resolved_at | now) + 30 min]`, sorted by `ts` then causal kind order. Every event carries `evidence = {epistemic, provenance}` (§5.1): deploys are `observed` only for `attribution_scope=service`, otherwise `inferred`; anomalies are always `inferred`. `unknowns` lists sources that could **not** be queried (e.g. `service_id` is NULL) — an empty timeline is never silently equal to "nothing happened".
+6. **Cross-service correlation is out of scope here.** Linking incidents of different services (shared dependency, deploy in window, `calls` edge) is a later roadmap step and will be expressed as edges between incidents, never by relaxing rule 1.
