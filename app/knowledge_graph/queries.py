@@ -148,8 +148,31 @@ def recent_deploys_for(
             "triggered_by": d.triggered_by,
             "url": extras.get("url"),
             "minutes_before_incident": delta_min,
+            "attribution_scope": deploy_attribution_scope(extras),
+            "attribution": extras.get("attribution"),
         })
     return out
+
+
+def deploy_attribution_scope(extras: Dict[str, Any]) -> str:
+    """Насколько запись kg_deployments привязана к сервису.
+
+    `namespace_scope` пишут tasks.py / deploy_reattribution / k8s_deploy_watch:
+      * False → "service": точная запись (build_param TeamCity, k8s_rollout
+        самого workload-а);
+      * True  → "namespace": ns-broadcast — билд раскатывал namespace, к
+        этому сервису запись не привязана;
+      * нет маркера → "unknown": запись из эпохи до учёта скоупа.
+
+    RecentDeployRule по этому полю выбирает силу свидетельства: точная
+    запись — OBSERVED 0.95, остальное — INFERRED 0.6.
+    """
+    scope = extras.get("namespace_scope")
+    if scope is False:
+        return "service"
+    if scope is True:
+        return "namespace"
+    return "unknown"
 
 
 def recent_deploys_for_namespaces(
@@ -213,6 +236,8 @@ def recent_deploys_for_namespaces(
             "triggered_by": d.triggered_by,
             "url": extras.get("url"),
             "minutes_before_incident": delta_min,
+            "attribution_scope": deploy_attribution_scope(extras),
+            "attribution": extras.get("attribution"),
         })
         if len(out) >= limit:
             break

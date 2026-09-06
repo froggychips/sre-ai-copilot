@@ -16,6 +16,7 @@ _SCHEDULING_PATTERN = re.compile(
 
 class FailedSchedulingRule(Rule):
     name = "FailedSchedulingRule"
+    sources = ("k8s_summary", "logs_summary")
 
     def evaluate(self, ctx: Dict[str, Any]) -> List[Fact]:
         text = self.text_haystack(ctx)

@@ -16,24 +16,92 @@ incident):
     recent_deployments:     list[dict] — [{name, ts, repo, sha}, ...]
     metrics_summary:        dict | None — namespace health
     incident_starts_at:     datetime | None
+    source_status:          dict[str, str] — Known Unknowns: поле ctx →
+                            причина, по которой его НЕ удалось наполнить
+                            («failed: OperationalError», «stale: 27ч без
+                            записей», «сервис не найден в KG»). Поле,
+                            которого здесь нет, считается опрошенным
+                            успешно — пустой список тогда значит «пусто»,
+                            а не «не знаем».
+
+Каждое правило объявляет `sources` — поля ctx, от которых зависит его
+ответ. `Rule.run()` после `evaluate()` понижает ABSENT до UNKNOWN, если
+хоть один из источников правила помечен в `source_status`: «в логах нет
+OOM» при недоступных логах — не факт, а пробел. FOUND не трогается:
+найденное найдено, даже если соседний источник упал.
 """
 from __future__ import annotations
 
 import re
 from abc import ABC, abstractmethod
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional, Tuple
 
 from app.diagnostics.facts import Fact
 
+SOURCE_STATUS_KEY = "source_status"
+
 
 class Rule(ABC):
-    """Контракт правила. evaluate() — чистая функция от context → факты."""
+    """Контракт правила. evaluate() — чистая функция от context → факты.
+
+    `sources` обязательны: тест `test_evidence_contract` не пустит правило
+    без них в DEFAULT_RULES. Без декларации `run()` не знает, какой сбой
+    источника делает ответ правила пробелом.
+    """
 
     name: str = "abstract"
+    sources: Tuple[str, ...] = ()
 
     @abstractmethod
     def evaluate(self, ctx: Dict[str, Any]) -> List[Fact]:
         ...
+
+    def run(self, ctx: Dict[str, Any]) -> List[Fact]:
+        """evaluate() + понижение ABSENT → UNKNOWN по source_status.
+
+        Точка входа для движка и обогащения. Тесты правил зовут evaluate()
+        напрямую — там источники подставлены и заведомо «здоровы».
+        """
+        facts = self.evaluate(ctx)
+        return self.apply_source_status(ctx, facts)
+
+    # --- Known Unknowns ---------------------------------------------------
+
+    @staticmethod
+    def source_problem(ctx: Dict[str, Any], field: str) -> Optional[str]:
+        """Причина недоступности поля ctx или None, если источник в порядке."""
+        status = ctx.get(SOURCE_STATUS_KEY) or {}
+        if not isinstance(status, dict):
+            return None
+        problem = status.get(field)
+        return str(problem) if problem else None
+
+    def failed_sources(self, ctx: Dict[str, Any]) -> Dict[str, str]:
+        """Поля из `sources`, помеченные в source_status: {поле: причина}."""
+        out: Dict[str, str] = {}
+        for src in self.sources:
+            problem = self.source_problem(ctx, src)
+            if problem:
+                out[src] = problem
+        return out
+
+    def apply_source_status(self, ctx: Dict[str, Any], facts: List[Fact]) -> List[Fact]:
+        failed = self.failed_sources(ctx)
+        if not failed:
+            return facts
+        reason = "; ".join(f"{src}: {why}" for src, why in failed.items())
+        out: List[Fact] = []
+        for f in facts:
+            if isinstance(f, Fact) and f.is_absent:
+                out.append(Fact.unknown(
+                    f.kind, reason,
+                    subject=f.subject, source_rule=f.source_rule or self.name,
+                    provenance=f.provenance, window_min=f.window_min,
+                    evidence={"demoted_from": "absent", **f.evidence},
+                ))
+            else:
+                out.append(f)
+        return out
 
     # --- Хелперы для подклассов ----------------------------------------
 

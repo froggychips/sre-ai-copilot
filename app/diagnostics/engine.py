@@ -15,7 +15,7 @@ import structlog
 
 from app.diagnostics.facts import Fact, FactStore
 from app.diagnostics.rules import DEFAULT_RULES, Rule
-from app.observability.ai_metrics import track_fact_observed
+from app.observability.ai_metrics import track_fact_observed, track_fact_verdict
 
 logger = structlog.get_logger()
 
@@ -28,7 +28,9 @@ class DiagnosticEngine:
         store = FactStore()
         for rule in self.rules:
             try:
-                facts = rule.evaluate(ctx)
+                # run() = evaluate() + Known Unknowns: ABSENT правила, чей
+                # источник помечен в ctx["source_status"], становится UNKNOWN.
+                facts = rule.run(ctx)
             except Exception as e:
                 logger.error(
                     "diagnostic_rule_failed",
@@ -49,6 +51,7 @@ class DiagnosticEngine:
                     continue
                 store.add(f)
                 track_fact_observed(kind=f.kind, observed=f.observed)
+                track_fact_verdict(kind=f.kind, verdict=f.verdict)
 
         self._apply_conflict_signals(store)
         return store

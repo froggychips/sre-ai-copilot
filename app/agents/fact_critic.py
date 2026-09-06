@@ -99,8 +99,14 @@ def _algorithmic_refutations(h: Hypothesis, facts: FactStore) -> List[str]:
     """
     out: List[str] = []
     observed = facts.observed_kinds()
+    unknown = facts.unknown_kinds()
     for kind in h.anchored_facts:
         if kind not in observed:
+            # Evidence-контракт: ? — не ✗. Если проверку выполнить не удалось
+            # (источник упал, сервиса нет в графе), отсутствие факта ничего
+            # не опровергает — гипотеза остаётся непроверенной, не ложной.
+            if kind in unknown:
+                continue
             out.append(f"algo: anchor '{kind}' is NOT observed in fact store")
             continue
         relevant = [f for f in facts.by_kind(kind) if f.observed]
@@ -148,8 +154,10 @@ def _llm_refutation_prompt(
         "Rules:\n"
         "  1. A refutation MUST point to a specific fact_kind in <facts>. "
         "Quote the fact_kind verbatim.\n"
-        "  2. If a fact is marked ✗ (NOT observed), and the hypothesis "
-        "needs it to be true, that's a refutation.\n"
+        "  2. If a fact is marked ✗ (checked and NOT observed), and the "
+        "hypothesis needs it to be true, that's a refutation. A fact marked "
+        "? (unknown: the check could not be performed) is NOT a refutation "
+        "— never cite a ? fact as evidence against a hypothesis.\n"
         "  3. If an observed fact directly contradicts the cause "
         "(e.g. recent_deploy observed but hypothesis blames hardware), "
         "that's a refutation.\n"

@@ -104,6 +104,10 @@ def test_enrich_alert_builds_full_context(
         "buildtype_id": "WO_Build_Bot",
         "status": "SUCCESS",
         "minutes_before_incident": 4,
+        # Evidence-контракт: только точная запись (namespace_scope=False)
+        # даёт observed 0.95 и обходит upstream-алерт (0.85) в top-1.
+        # ns-broadcast без привязки к сервису — inferred 0.6 и уступает.
+        "attribution_scope": "service",
     }]
     mock_nearby.return_value = [{
         "service": "town-db-postgresql",

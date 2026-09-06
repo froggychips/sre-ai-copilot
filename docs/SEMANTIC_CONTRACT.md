@@ -68,6 +68,26 @@ Every remediation operation must satisfy two layers:
 
 `FactStore.to_prompt_context()` serialises facts as a `<facts>` XML block and appends `<conflicts>` when `conflicts()` is non-empty. Agents MUST NOT modify this; they only read it.
 
+### 5.1 Evidence Contract (verdict, epistemic, provenance)
+
+A fact has **three** outcomes, not two. `observed` alone cannot express the third:
+
+| `verdict` | meaning | `observed` | `confidence` |
+|---|---|---|---|
+| `found` | the rule looked and found it | `True` | rule-defined |
+| `absent` | the rule looked in a **live** source and found nothing — evidence of absence | `False` | rule-defined (high) |
+| `unknown` | the rule **could not check**: source failed, stale, service not in KG, no timestamp — absence of evidence | `False` | forced `0.0` |
+
+Rules:
+1. `Fact.unknown(kind, reason, ...)` is the only way to produce `unknown`; `unknown_reason` is mandatory and human-readable.
+2. Consumers MUST distinguish `absent` from `unknown`. `absent` may refute a hypothesis; `unknown` MUST NOT (`fact_critic._algorithmic_refutations` skips unknown anchors; the LLM critic prompt states the same). `to_prompt_context()` renders `✓` / `✗` / `?`.
+3. Every `Rule` declares `sources: tuple[str, ...]` — the ctx fields its answer depends on. `Rule.run(ctx)` (the engine and `alert_enrichment` entry point) demotes `absent` → `unknown` when any declared source is listed in `ctx["source_status"]`. `found` is never demoted.
+4. `ctx["source_status"]: dict[field → reason]` is filled by whoever builds the ctx (`alert_enrichment.enrich_alert`: query exception, `deploy_stream_freshness().stale`, service not in KG). A field absent from the dict is considered successfully queried: an empty list then means *empty*, not *unknown*.
+5. Optional evidence metadata: `epistemic` (`app.knowledge_graph.epistemic.Epistemic` value — observed / declared / inferred / …), `provenance` (data source, e.g. `kg_deployments/service`, `k8s_event`), `window_min` (search window; `absent` without a window is meaningless), `data_age_min`.
+6. Deployment attribution: `recent_deploys_for*` return `attribution_scope` ∈ `service` (exact record, `namespace_scope=False`) / `namespace` (ns-broadcast) / `unknown` (legacy). `RecentDeployRule` emits `epistemic=observed, confidence=0.95` only for `service`; otherwise `inferred, 0.6` with an explicit note. Discord renders the inferred case as "в namespace — привязка к сервису не подтверждена" and an `unknown` deploy fact as the field «❔ Deploy-связь не проверена».
+
+Guard: `tests/test_evidence_contract.py` — every rule in `DEFAULT_RULES` declares `sources`, and with all of them marked failed no rule emits an `absent` fact.
+
 ## 6. KG Quality Gate Contract
 
 `_is_quality_cause(cause, resolution_quality)` returns `False` for:
