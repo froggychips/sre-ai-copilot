@@ -778,3 +778,42 @@ def test_deploy_stream_ingestion_prod_default_not_remapped(db, monkeypatch):
     r = check_deploy_stream_ingestion(db)
     # prod '<default>' → ветка остаётся '<default>', на preprod-shared не маппится → нечего ингестить
     assert r.status == "ok"
+
+
+# ── источник, выключенный настройкой, — не тревога ─────────────────────────
+#
+# Первое ночное срабатывание CopilotSelfHealthWarnStuck (06.09.2026) было по
+# kg_nats_subjects_sync: парсер выключен NATS_SUBJECTS_PARSER_ENABLED=false,
+# задача по контракту source_status отдаёт UNAVAILABLE, heartbeat не пишется,
+# и через 2×interval sync_lag честно поднимал warn. Честно — но не о том:
+# состояние конфига известно и без надзора.
+
+
+def test_sync_lag_disabled_source_is_reported_not_alarmed(db, monkeypatch):
+    import app.knowledge_graph.self_health as sh
+
+    svc = _mk_service(db)  # noqa: F841 — таблицы для остальных задач
+    monkeypatch.setattr(sh.settings, "NATS_SUBJECTS_PARSER_ENABLED", False)
+    monkeypatch.setattr(sh, "_last_heartbeat", lambda task: None)   # никто не ходил
+
+    result = check_sync_lag(db)
+    nats = result.detail["per_task"]["kg_nats_subjects_sync"]
+
+    assert nats["status"] == "disabled"
+    assert "NATS_SUBJECTS_PARSER_ENABLED" in nats["reason"]
+    # Остальные задачи без heartbeat дают warn/fail — но не из-за nats.
+    others = {k: v["status"] for k, v in result.detail["per_task"].items()
+              if k != "kg_nats_subjects_sync"}
+    assert "disabled" not in others.values()
+
+
+def test_sync_lag_enabled_source_without_heartbeat_still_warns(db, monkeypatch):
+    """Флаг включён, а прогонов нет — это и есть тревога, её оставляем."""
+    import app.knowledge_graph.self_health as sh
+
+    _mk_service(db)
+    monkeypatch.setattr(sh.settings, "NATS_SUBJECTS_PARSER_ENABLED", True)
+    monkeypatch.setattr(sh, "_last_heartbeat", lambda task: None)
+
+    result = check_sync_lag(db)
+    assert result.detail["per_task"]["kg_nats_subjects_sync"]["status"] == "warn"
