@@ -17,7 +17,7 @@ pipeline не должен падать, если populator упал.
 from __future__ import annotations
 
 from app.core.timeutil import parse_ts
-from typing import Dict
+from typing import Dict, cast
 
 import structlog
 from sqlalchemy.orm import Session
@@ -136,6 +136,9 @@ def populate_from_incident(db: Session, incident: Incident) -> Dict[str, int]:
                     severity=labels.get("severity") or incident.severity,
                     fingerprint=incident.incident_id,  # fingerprint == incident_id
                     fired_at=fired_at.replace(tzinfo=None),
+                    # Временное значение: attach_alert ниже заменит его на
+                    # incident_key инцидента сервиса. Оставлено, чтобы строка
+                    # без инцидента (attach упал) не осталась с NULL.
                     incident_id=incident.incident_id,
                     raw={"description": incident.description},
                 )
@@ -146,6 +149,29 @@ def populate_from_incident(db: Session, incident: Incident) -> Dict[str, int]:
                 "kg.populate.alert_failed",
                 error=type(e).__name__, message=str(e),
             )
+        else:
+            # Incident как объект графа: алерт → открытый инцидент сервиса
+            # (или новый). Отдельный SAVEPOINT: сбой здесь не должен отменять
+            # уже записанный алерт.
+            try:
+                from app.knowledge_graph.incidents import attach_alert
+                with db.begin_nested():
+                    inc = attach_alert(
+                        db,
+                        namespace=namespace,
+                        service_name=service_name,
+                        service_id=cast(int, svc.id),
+                        fired_at=fired_at.replace(tzinfo=None),
+                        alertname=labels.get("alertname") or "unknown",
+                        severity=labels.get("severity") or incident.severity,
+                        fingerprint=incident.incident_id,
+                    )
+                stats["kg_incident_id"] = cast(int, inc.id)
+            except Exception as e:
+                logger.warning(
+                    "kg.populate.incident_attach_failed",
+                    error=type(e).__name__, message=str(e),
+                )
 
     logger.info(
         "kg.populate.done",

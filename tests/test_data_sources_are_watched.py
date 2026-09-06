@@ -64,6 +64,10 @@ _MAINTENANCE = frozenset({
     "kg_self_health_check",
     "kg_signal_aggregates_compute",
     "kg_stuck_alerts_check",
+    # Закрытие/старение kg_incidents — производное от kg_alerts.resolved_at;
+    # молчание задачи оставляет инциденты открытыми дольше, но данных не
+    # искажает: открытие происходит на приёме алерта, не здесь.
+    "kg_incidents_lifecycle",
     "kg_anomaly_detection_task",
     # tc_deploys_to_kg — источник, но за ним следит отдельная семантическая
     # проверка deploy_stream_ingestion: она сверяет, что отданное TC доехало

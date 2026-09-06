@@ -389,6 +389,16 @@ celery_app.conf.beat_schedule = {
         "schedule": crontab(minute="3,8,13,18,23,28,33,38,43,48,53,58"),
         "options": {"expires": 270},
     },
+    # Жизненный цикл инцидентов (kg_incidents): закрыть те, у которых все
+    # алерты resolved, состарить брошенные. Открытие происходит на приёме
+    # алерта (auto_populator), закрытие — здесь, потому что резолвы ставит
+    # kg_alerts_resolve_sync, а не вебхук. Раз в 5 минут, со сдвигом от
+    # resolve-синка.
+    "kg-incidents-lifecycle": {
+        "task": "kg_incidents_lifecycle",
+        "schedule": crontab(minute="4,9,14,19,24,29,34,39,44,49,54,59"),
+        "options": {"expires": 270},
+    },
     # KG Coverage #1: k8s Job + CronJob → kg_k8s_jobs. Каждые 15 мин
     # `kubectl get jobs,cronjobs -A` + upsert. Сигналы: last_successful_time
     # / last_schedule_time / failed_count / last_pod_exit_code. Закрывает
@@ -695,6 +705,30 @@ def kg_deploy_watch_task():
         logger.warning("kg_deploy_watch.failed: %s", e)
         db.rollback()
         return _src_status({"error": str(e)}, observed=('workloads',), unavailable=('skipped',))
+    finally:
+        db.close()
+
+
+@celery_app.task(name="kg_incidents_lifecycle")
+@single_instance(ttl_seconds=240)
+def kg_incidents_lifecycle_task():
+    """Закрыть инциденты, у которых все алерты resolved; состарить брошенные.
+
+    Ноль открытых инцидентов — норма (ночью их и должно быть ноль), поэтому
+    статус источника считается по факту опроса (`_src_polled`), а не по
+    числу изменённых строк.
+    """
+    from app.knowledge_graph.incidents import reconcile_incidents
+
+    db = SessionLocal()
+    try:
+        result = reconcile_incidents(db)
+        logger.info("kg_incidents_lifecycle.done result=%s", result)
+        return _src_polled(result)
+    except Exception as e:
+        logger.warning("kg_incidents_lifecycle.failed: %s", e)
+        db.rollback()
+        return _src_polled({"error": str(e)})
     finally:
         db.close()
 
