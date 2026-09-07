@@ -4,7 +4,28 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
-_Ничего в очереди — см. [1.0.8] ниже._
+### Добавлено
+
+- **Здоровье Orleans-силоса в графе.** С 27.08 чарт town-grainhost несёт
+  `VMPodScrape` на `/metrics`, и метер Microsoft.Orleans доезжает до
+  VictoriaMetrics pull'ом — в 24 namespace на 07.09 (preprod, preupdate,
+  сквады; prod ждёт раскатки чарта). До этого про ядро игрового бэкенда
+  граф знал только cpu / mem / restarts. Теперь `metrics_sync` раз в тик
+  находит namespace'ы с метером и добавляет шесть запросов только по ним:
+  в `kg_service_health` появились `orleans_latency_avg_ms` (средняя по
+  grain-вызовам, взвешенная по подам), `orleans_timedout_rate`,
+  `orleans_messaging_fault_rate` (rerouted + rejected + expired +
+  sent_failed + sent_dropped), `orleans_pings_missed_rate` (прокси
+  death-vote) и `orleans_activation_churn`, все в минуту. Это отдельная
+  семья, не подмена `http_5xx_rate` / `p95_latency_ms`: те по-прежнему
+  ждут WO-12483, а здесь гистограммы нет и латентность средняя. Семантика
+  нуля названа явно: prometheus-net не отдаёт счётчик до первого
+  инкремента, поэтому отсутствующая серия сбоев у сервиса с `latency_count`
+  пишется как 0.0, а `NULL` значит «силоса нет». Детектор аномалий
+  сканирует новые колонки с собственными полами разброса; critical-embed
+  получает поле «🧬 Orleans silo» с последним значением, суточной базой и
+  ⚠ при росте больше +50 %. Миграция `20260907_0200` (ADD COLUMN без
+  DEFAULT — только метаданные, таблица в 8 млн строк не переписывается).
 
 ## [1.0.8] — 2026-09-07 — Первые сутки инцидентов
 

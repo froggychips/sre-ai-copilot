@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 from app.core.timeutil import ensure_aware, ensure_naive
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from sqlalchemy import and_, func, or_
 from sqlalchemy.orm import Session
@@ -18,7 +18,8 @@ from app.knowledge_graph.confidence import (confidence_label,
 from app.knowledge_graph.schema import (NODE_KIND_SERVICE, NODE_KIND_WORKLOAD,
                                         AlertEvent, Deployment,
                                         IngressObservation, LogObservation,
-                                        PodEvent, Service, ServiceEdge)
+                                        PodEvent, Service, ServiceEdge,
+                                        ServiceHealth)
 
 
 
@@ -1156,3 +1157,92 @@ def ingress_health_for(
         for e in ranked[:top_n]
     ]
     return result
+
+
+# ── Orleans silo health (v1.0.9) ─────────────────────────────────────────────
+
+ORLEANS_METRICS: Tuple[str, ...] = (
+    "orleans_latency_avg_ms",
+    "orleans_timedout_rate",
+    "orleans_messaging_fault_rate",
+    "orleans_pings_missed_rate",
+    "orleans_activation_churn",
+)
+
+
+def orleans_health_for(
+    db: Session,
+    namespace: str,
+    service_name: str,
+    *,
+    window_minutes: int = 60,
+    baseline_hours: int = 24,
+    now: Optional[datetime] = None,
+) -> Dict[str, Any]:
+    """Здоровье Orleans-силоса сервиса: последний замер + суточная база.
+
+    Источник — колонки `orleans_*` в `kg_service_health` (metrics_sync,
+    pull-скрейп `/metrics` grainhost'а). Это НЕ HTTP RED: латентность —
+    средняя по grain-вызовам, остальное — membership и активации силоса.
+    Пустой ответ `{present: False}` означает «у сервиса нет Orleans-метрик»
+    (не grainhost, или чарт со скрейпом до него не доехал — так сегодня в
+    prod), а не «всё хорошо».
+
+    `deltas_pct` — отклонение последнего замера от суточного среднего в
+    процентах, по каждой метрике, где база > 0. Рендер подсвечивает рост
+    больше +50 %.
+    """
+    svc = _service_by_namespace_name(db, namespace, service_name)
+    empty: Dict[str, Any] = {"present": False, "service": service_name, "namespace": namespace}
+    if svc is None:
+        return empty
+    now_n = ensure_naive(now or datetime.now(timezone.utc))
+    since = now_n - timedelta(minutes=window_minutes)
+    latest = (
+        db.query(ServiceHealth)
+        .filter(
+            ServiceHealth.service_id == svc.id,
+            ServiceHealth.ts >= since,
+            ServiceHealth.orleans_latency_avg_ms.isnot(None),
+        )
+        .order_by(ServiceHealth.ts.desc())
+        .first()
+    )
+    if latest is None:
+        return empty
+    base_since = now_n - timedelta(hours=baseline_hours)
+    base_row = (
+        db.query(*[func.avg(getattr(ServiceHealth, m)) for m in ORLEANS_METRICS])
+        .filter(
+            ServiceHealth.service_id == svc.id,
+            ServiceHealth.ts >= base_since,
+            ServiceHealth.ts < latest.ts,
+            ServiceHealth.orleans_latency_avg_ms.isnot(None),
+        )
+        .one()
+    )
+    latest_vals: Dict[str, Optional[float]] = {
+        m: (float(v) if (v := getattr(latest, m)) is not None else None) for m in ORLEANS_METRICS
+    }
+    baseline: Dict[str, Optional[float]] = {
+        m: (round(float(v), 3) if v is not None else None) for m, v in zip(ORLEANS_METRICS, base_row)
+    }
+    deltas: Dict[str, Optional[float]] = {}
+    for m in ORLEANS_METRICS:
+        cur, base = latest_vals.get(m), baseline.get(m)
+        if cur is None or base is None or base <= 0:
+            deltas[m] = None
+        else:
+            deltas[m] = round((cur - base) / base * 100.0, 1)
+    return {
+        "present": True,
+        "service": service_name,
+        "namespace": namespace,
+        "ts": latest.ts,
+        "window_minutes": window_minutes,
+        "baseline_hours": baseline_hours,
+        "latest": latest_vals,
+        "baseline": baseline,
+        "deltas_pct": deltas,
+        "source": "kg_service_health/orleans",
+    }

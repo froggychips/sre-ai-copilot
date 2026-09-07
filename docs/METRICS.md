@@ -12,6 +12,7 @@ Map of the metrics flow: which signals exist in VictoriaMetrics, which of them a
 | `http_5xx_rate` / `p95_latency_ms` (per service) | `kg_service_health` | ASP.NET app `/metrics` | ❌ always 0 — blocked by WO-12483 |
 | `p95` / `p99` / `rps` / `error_4xx_rate` / `error_5xx_rate` (per ingress endpoint) | `kg_ingress_observations` | `nginx_ingress_controller_*` via VMPodScrape | ✅ live since 2026-06-10 |
 | Anomalies (robust-z) | `kg_anomaly_observations` | derived: `kg_service_health` + `kg_log_observations` | ✅ live |
+| `orleans_latency_avg_ms` / `orleans_timedout_rate` / `orleans_messaging_fault_rate` / `orleans_pings_missed_rate` / `orleans_activation_churn` (per grainhost service) | `kg_service_health` | `microsoft_orleans_*` via `VMPodScrape town-grainhost` (chart, port 8080) | ✅ live where the chart landed (24 ns on 2026-09-07; prod pending) — silo health, **not HTTP RED**; latency is an average (no histogram) |
 | `log_error_rate` | `kg_log_observations` | Seq REST API | ✅ live (log proxy, not HTTP) |
 | `health_score` | `kg_services.health_score` | composite of KG signals | ✅ live (infra proxy, not user-facing) |
 
@@ -31,6 +32,10 @@ Stack: vm-operator in ns `monitoring`, VMAgent with `selectAllByDefault` — any
 Per-service `cpu_pct` / `mem_pct` / `restarts_rate` from `kube_*` / cAdvisor. Namespace-aggregated PromQL (5 queries per namespace instead of 5 per service — ~385 queries total vs the old ~12300); pod → service resolution by longest-prefix match against known service names. Aggregation across pods of one service: cpu/mem — mean, restarts — sum. Fully-zero rows are not inserted (exporter does not cover the service). Idempotent on `UNIQUE(service_id, ts)`.
 
 `http_5xx_rate` and `p95_latency_ms` columns exist and the PromQL is valid, but they are **always 0 until WO-12483** — see §2.
+
+### `kg_service_health.orleans_*` ← `metrics_sync.py` (same beat, v1.0.9)
+
+Discovery once per tick — `count by (namespace) (microsoft_orleans_orleans_app_requests_latency_count)` — then six extra PromQL only for namespaces that have the Orleans meter (24 of 231 on 2026-09-07), grouped `by (pod)` and mapped to services like cpu/mem. Latency is call-weighted across pods (`Σ rate(sum) / Σ rate(count)`, ms); the four rates are per minute: `app_requests_timedout`, messaging faults (`rerouted|rejected|expired|sent_failed|sent_dropped`), `messaging_pings_reply_missed` (death-vote proxy), activation churn (`catalog_activation_created|destroyed|shutdown`). **Zero semantics:** prometheus-net does not export a counter until its first increment, so a missing fault series on a service that *has* `latency_count` is written as `0.0` (no faults) — `NULL` means the service has no silo at all. The anomaly detector scans these columns like the rest (`MIN_ABS_SPREAD_BY_METRIC`: 50 ms, 0.5, 1.0, 0.5, 50/min); critical embeds get a «🧬 Orleans silo» field with the latest value, the 24 h baseline and ⚠ for growth above +50 %. Consumers: `queries.orleans_health_for`.
 
 ### `kg_ingress_observations` ← `ingress_observations_sync.py` (beat: `kg_ingress_observations_sync`, ~10 min)
 
