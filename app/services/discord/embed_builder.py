@@ -346,6 +346,7 @@ def _build_orleans_field(
         _fmt("orleans_messaging_fault_rate", "msg faults", "/мин"),
         _fmt("orleans_pings_missed_rate", "pings missed", "/мин"),
         _fmt("orleans_activation_churn", "activation churn", "/мин", 1.0, 0),
+        _fmt("orleans_rerouted_rate", "rerouted", "/мин", 1.0, 0),
     ) if x]
     if not parts:
         return None

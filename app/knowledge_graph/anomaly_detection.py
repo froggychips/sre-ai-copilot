@@ -65,6 +65,7 @@ METRICS: Tuple[str, ...] = (
     "orleans_messaging_fault_rate",
     "orleans_pings_missed_rate",
     "orleans_activation_churn",
+    "orleans_rerouted_rate",
 )
 
 # Лог-производный app-сигнал (consumer для log_error_rate, см. queries.py).
@@ -124,6 +125,8 @@ MIN_ABS_SPREAD_BY_METRIC: Dict[str, float] = {
     "orleans_messaging_fault_rate": 1.0,
     "orleans_pings_missed_rate": 0.5,
     "orleans_activation_churn": 50.0,
+    # rerouted: фон 900–20 000/мин под ботами (07.09.2026) — пол выше churn.
+    "orleans_rerouted_rate": 100.0,
     LOG_ERROR_METRIC: 1.0,
 }
 DEFAULT_MIN_ABS_SPREAD = 1e-3
