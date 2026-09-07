@@ -172,6 +172,8 @@ def attach_alert(
         row.opened_at = fired_at
     if service_id and not inc.service_id:
         row.service_id = service_id
+    # Шум — свойство набора алертов: новый алерт без пометки шума снимает флаг.
+    row.noise = _all_noise(inc.extras, fps)
     db.flush()
 
     if fingerprint:
@@ -230,8 +232,56 @@ def reconcile_incidents(db: Session, *, now: Optional[datetime] = None) -> Dict[
     return stats
 
 
+def _all_noise(extras: Any, fps: List[str]) -> bool:
+    """True, если у КАЖДОГО алерта инцидента есть виды шума в extras."""
+    marked = (extras or {}).get("noise_fingerprints") if isinstance(extras, dict) else None
+    if not fps or not isinstance(marked, dict):
+        return False
+    return all(marked.get(fp) for fp in fps)
+
+
+def mark_incident_noise(
+    db: Session, *, fingerprint: str, kinds: List[str],
+) -> Optional[KGIncident]:
+    """Записать виды шума для алерта и пересчитать флаг инцидента.
+
+    Решение о шуме принимает обогащение (/enrich-and-forward) ПОСЛЕ приёма
+    алерта — поэтому пометка приходит отдельным шагом, а не в attach_alert.
+    Инцидент ищется через kg_alerts.incident_id (attach его проставил).
+    Нет алерта или инцидента — молча None: шум без инцидента не событие.
+    """
+    if not fingerprint or not kinds:
+        return None
+    key = (
+        db.query(AlertEvent.incident_id)
+        .filter(AlertEvent.fingerprint == fingerprint)
+        .scalar()
+    )
+    if not key:
+        return None
+    inc = db.query(KGIncident).filter(KGIncident.incident_key == key).one_or_none()
+    if inc is None:
+        return None
+    extras: Dict[str, Any] = dict(inc.extras) if isinstance(inc.extras, dict) else {}
+    marked: Dict[str, List[str]] = dict(extras.get("noise_fingerprints") or {})
+    prev = list(marked.get(fingerprint) or [])
+    marked[fingerprint] = sorted(set(prev) | set(kinds))
+    extras["noise_fingerprints"] = marked
+    extras["noise_marked_at"] = _now().isoformat()
+    row: Any = inc
+    row.extras = extras                      # новый dict — иначе JSON-мутацию не заметят
+    row.noise = _all_noise(extras, list(inc.fingerprints or []))
+    db.flush()
+    log.info("kg.incident.noise_marked", incident=inc.incident_key, kinds=kinds, noise=inc.noise)
+    return inc
+
+
 def incident_to_dict(inc: KGIncident) -> Dict[str, Any]:
+    extras: Dict[str, Any] = inc.extras if isinstance(inc.extras, dict) else {}
+    noise_kinds = sorted({k for ks in (extras.get("noise_fingerprints") or {}).values() for k in (ks or [])})
     return {
+        "noise": bool(inc.noise),
+        "noise_kinds": noise_kinds,
         "id": inc.id,
         "incident_key": inc.incident_key,
         "namespace": inc.namespace,

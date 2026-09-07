@@ -65,6 +65,22 @@ def _is_self_noise(alert: AlertManagerAlert) -> bool:
     return sev == "info" and service == "monitoring"
 
 
+def _mark_incidents_noise(db, incidents, kinds) -> None:
+    """Пометить инциденты алертов шумовыми. Best-effort: пометка не важнее
+    отправки embed'а, любая ошибка — warning и дальше."""
+    from app.knowledge_graph.incidents import mark_incident_noise
+    for inc in incidents:
+        try:
+            mark_incident_noise(db, fingerprint=inc.incident_id, kinds=list(kinds))
+            db.commit()
+        except Exception as e:
+            db.rollback()
+            log.warning(
+                "enrich_forward.incident_noise_mark_failed",
+                incident_id=inc.incident_id, error=type(e).__name__,
+            )
+
+
 def _filter_suppressed(
     alerts: List[AlertManagerAlert],
 ) -> tuple[List[AlertManagerAlert], int]:
@@ -739,6 +755,7 @@ async def alertmanager_webhook_enrich_and_forward(
                         "enrich_forward.suppress_rollout",
                         alertname=alertname, service=head_service,
                     )
+                    _mark_incidents_noise(db, incs, ["rollout"])
                     continue
 
                 # enrich_alert целиком синхронный и тяжёлый (10+ sync SQL,
@@ -751,6 +768,19 @@ async def alertmanager_webhook_enrich_and_forward(
                 # не потокобезопасна, конкурентные вызовы с одной и той же
                 # `db` рвут сессию.
                 ctxs = [await enrich_alert_async(db, inc) for inc in incs]
+                # Инцидент наследует решение о шуме: gen-mismatch при здоровых
+                # репликах, meta-агрегаты, rollout-в-процессе. Строка остаётся,
+                # флаг снимает список по умолчанию. См. kg_incidents.noise.
+                for inc, c in zip(incs, ctxs):
+                    kinds = [
+                        name for name, flag in (
+                            ("gen_mismatch", getattr(c, "gen_mismatch_noise", False)),
+                            ("meta", getattr(c, "meta_noise", False)),
+                            ("rollout", getattr(c, "rollout_noise", False)),
+                        ) if flag
+                    ]
+                    if kinds:
+                        _mark_incidents_noise(db, [inc], kinds)
                 env_hint = _env_hint(incs[0].namespace)
                 resurfaced = (decision == Decision.SEND_RESURFACED)
                 delivered = await discord_service.send_enriched_alert(

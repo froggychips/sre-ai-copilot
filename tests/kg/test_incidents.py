@@ -235,3 +235,55 @@ def test_populate_two_alerts_one_incident(db):
     populate_from_incident(db, _incoming("fp-y", "2026-09-06T10:05:00Z", "PodCrashLooping", "critical"))
     inc = db.query(KGIncident).one()
     assert inc.alert_count == 2 and inc.severity == "critical"
+
+
+# ── шум: свойство набора алертов ─────────────────────────────────────────
+
+from app.knowledge_graph.incidents import incident_to_dict, mark_incident_noise  # noqa: E402
+
+
+def test_new_incident_is_not_noise_by_default(db):
+    svc = _svc(db)
+    inc = _attach(db, svc, "fp-1", T0)
+    assert inc.noise is False and incident_to_dict(inc)["noise"] is False
+
+
+def test_marking_the_only_alert_makes_incident_noise(db):
+    svc = _svc(db)
+    inc = _attach(db, svc, "fp-1", T0, "KubeDeploymentGenerationMismatch")
+    out = mark_incident_noise(db, fingerprint="fp-1", kinds=["gen_mismatch"])
+    assert out is inc and inc.noise is True
+    assert inc.extras["noise_fingerprints"] == {"fp-1": ["gen_mismatch"]}
+    assert incident_to_dict(inc)["noise_kinds"] == ["gen_mismatch"]
+
+
+def test_real_alert_clears_noise_and_noise_alert_alone_does_not_restore_it(db):
+    svc = _svc(db)
+    inc = _attach(db, svc, "fp-1", T0, "KubeDeploymentGenerationMismatch")
+    mark_incident_noise(db, fingerprint="fp-1", kinds=["gen_mismatch"])
+    assert inc.noise is True
+    _attach(db, svc, "fp-2", T0 + timedelta(minutes=3), "KubePodCrashLooping", "critical")
+    assert inc.noise is False                       # настоящий алерт снимает флаг
+    mark_incident_noise(db, fingerprint="fp-1", kinds=["rollout"])
+    assert inc.noise is False                       # fp-2 не помечен — инцидент не шум
+    assert inc.extras["noise_fingerprints"]["fp-1"] == ["gen_mismatch", "rollout"]
+
+
+def test_all_alerts_noise_means_incident_noise(db):
+    svc = _svc(db)
+    inc = _attach(db, svc, "fp-1", T0, "KubeDeploymentGenerationMismatch")
+    _attach(db, svc, "fp-2", T0 + timedelta(minutes=1), "KubeDeploymentGenerationMismatch")
+    mark_incident_noise(db, fingerprint="fp-1", kinds=["gen_mismatch"])
+    assert inc.noise is False
+    mark_incident_noise(db, fingerprint="fp-2", kinds=["gen_mismatch"])
+    assert inc.noise is True
+
+
+def test_mark_noise_without_incident_or_kinds_is_a_noop(db):
+    svc = _svc(db)
+    _alert(db, svc, "fp-orphan", T0)               # алерт без инцидента
+    assert mark_incident_noise(db, fingerprint="fp-orphan", kinds=["meta"]) is None
+    assert mark_incident_noise(db, fingerprint="fp-none", kinds=["meta"]) is None
+    inc = _attach(db, svc, "fp-1", T0)
+    assert mark_incident_noise(db, fingerprint="fp-1", kinds=[]) is None
+    assert inc.noise is False
