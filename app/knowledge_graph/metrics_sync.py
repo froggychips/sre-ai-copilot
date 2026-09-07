@@ -103,6 +103,57 @@ def _q_ns_p95_by_service(namespace: str) -> str:
     )
 
 
+# ── Orleans silo health (v1.0.9) ──────────────────────────────────────────
+# Метер Microsoft.Orleans доезжает до VM pull'ом из чарта town-grainhost
+# (VMPodScrape, порт 8080). Запросы идут ТОЛЬКО по namespace'ам, где такие
+# серии есть (discovery — один запрос на тик): иначе 231 ns × 6 запросов
+# впустую. Гистограмм в keep-фильтре нет — латентность средняя (sum/count),
+# считается взвешенно по подам уже в Python. Счётчики сбоев prometheus-net
+# не отдаёт до первого инкремента: отсутствие серии у сервиса с latency_count
+# = 0, а не NULL (см. _aggregate_service_metrics).
+
+_ORLEANS = "microsoft_orleans_orleans_"
+_ORLEANS_FAULT_RE = "messaging_(rerouted|rejected|expired|sent_failed|sent_dropped)"
+_ORLEANS_CHURN_RE = "catalog_activation_(created|destroyed|shutdown)"
+
+
+def _q_orleans_namespaces() -> str:
+    return f'count by (namespace) ({_ORLEANS}app_requests_latency_count)'
+
+
+def _q_ns_orleans_latency_sum_by_pod(namespace: str) -> str:
+    return f'sum by (pod) (rate({_ORLEANS}app_requests_latency_sum{{namespace="{namespace}"}}[5m]))'
+
+
+def _q_ns_orleans_latency_count_by_pod(namespace: str) -> str:
+    return f'sum by (pod) (rate({_ORLEANS}app_requests_latency_count{{namespace="{namespace}"}}[5m]))'
+
+
+def _q_ns_orleans_timedout_by_pod(namespace: str) -> str:
+    return f'sum by (pod) (rate({_ORLEANS}app_requests_timedout{{namespace="{namespace}"}}[5m])) * 60'
+
+
+def _q_ns_orleans_faults_by_pod(namespace: str) -> str:
+    return (
+        f'sum by (pod) (rate({{__name__=~"{_ORLEANS}{_ORLEANS_FAULT_RE}",'
+        f'namespace="{namespace}"}}[5m])) * 60'
+    )
+
+
+def _q_ns_orleans_pings_missed_by_pod(namespace: str) -> str:
+    return f'sum by (pod) (rate({_ORLEANS}messaging_pings_reply_missed{{namespace="{namespace}"}}[5m])) * 60'
+
+
+def _q_ns_orleans_churn_by_pod(namespace: str) -> str:
+    return (
+        f'sum by (pod) (rate({{__name__=~"{_ORLEANS}{_ORLEANS_CHURN_RE}",'
+        f'namespace="{namespace}"}}[5m])) * 60'
+    )
+
+
+ORLEANS_QUERY_COUNT = 6
+
+
 def _map_pod_to_service(pod: str, service_names_by_len: List[str]) -> Optional[str]:
     """pod → имя сервиса по longest-prefix.
 
@@ -137,6 +188,11 @@ def _insert_idempotent(
         restarts_rate=metrics.get("restarts_rate"),
         http_5xx_rate=metrics.get("http_5xx_rate"),
         p95_latency_ms=metrics.get("p95_latency_ms"),
+        orleans_latency_avg_ms=metrics.get("orleans_latency_avg_ms"),
+        orleans_timedout_rate=metrics.get("orleans_timedout_rate"),
+        orleans_messaging_fault_rate=metrics.get("orleans_messaging_fault_rate"),
+        orleans_pings_missed_rate=metrics.get("orleans_pings_missed_rate"),
+        orleans_activation_churn=metrics.get("orleans_activation_churn"),
         source=source,
     )
     return insert_idempotent(db, row)
@@ -146,6 +202,7 @@ async def _fetch_namespace(
     sem: asyncio.Semaphore,
     vm: VMClient,
     namespace: str,
+    orleans: bool = False,
 ) -> Tuple[str, Optional[Dict[str, Dict[str, float]]], Optional[BaseException]]:
     """Собрать 5 агрегированных метрик для одного namespace.
 
@@ -162,17 +219,31 @@ async def _fetch_namespace(
                 vm.query_instant_by(_q_ns_5xx_by_service(namespace), "service"),
                 vm.query_instant_by(_q_ns_p95_by_service(namespace), "service"),
             )
-            return (
-                namespace,
-                {
-                    "cpu_pct": by_pod[0],
-                    "mem_pct": by_pod[1],
-                    "restarts_rate": by_pod[2],
-                    "http_5xx_rate": by_pod[3],
-                    "p95_latency_ms": by_pod[4],
-                },
-                None,
-            )
+            raw: Dict[str, Dict[str, float]] = {
+                "cpu_pct": by_pod[0],
+                "mem_pct": by_pod[1],
+                "restarts_rate": by_pod[2],
+                "http_5xx_rate": by_pod[3],
+                "p95_latency_ms": by_pod[4],
+            }
+            if orleans:
+                orl = await asyncio.gather(
+                    vm.query_instant_by(_q_ns_orleans_latency_sum_by_pod(namespace), "pod"),
+                    vm.query_instant_by(_q_ns_orleans_latency_count_by_pod(namespace), "pod"),
+                    vm.query_instant_by(_q_ns_orleans_timedout_by_pod(namespace), "pod"),
+                    vm.query_instant_by(_q_ns_orleans_faults_by_pod(namespace), "pod"),
+                    vm.query_instant_by(_q_ns_orleans_pings_missed_by_pod(namespace), "pod"),
+                    vm.query_instant_by(_q_ns_orleans_churn_by_pod(namespace), "pod"),
+                )
+                raw.update({
+                    "orleans_latency_sum": orl[0],
+                    "orleans_latency_count": orl[1],
+                    "orleans_timedout_rate": orl[2],
+                    "orleans_messaging_fault_rate": orl[3],
+                    "orleans_pings_missed_rate": orl[4],
+                    "orleans_activation_churn": orl[5],
+                })
+            return (namespace, raw, None)
         except BaseException as e:  # noqa: BLE001 — фиксируем всё, классифицируем выше
             return (namespace, None, e)
 
@@ -206,6 +277,21 @@ def _aggregate_service_metrics(
     svc_5xx = raw.get("http_5xx_rate", {})
     svc_p95 = raw.get("p95_latency_ms", {})
 
+    # Orleans: суммы по подам одного сервиса. Латентность — взвешенная по
+    # числу вызовов (Σsum/Σcount), а не среднее средних. Счётчики сбоев без
+    # серий у сервиса, у которого ЕСТЬ latency_count, = 0.0: prometheus-net не
+    # экспортирует счётчик до первого инкремента, и «нет серии» тут значит
+    # «сбоев не было», а не «не знаем».
+    orl_acc: Dict[str, Dict[str, float]] = defaultdict(lambda: defaultdict(float))
+    for metric_key in (
+        "orleans_latency_sum", "orleans_latency_count", "orleans_timedout_rate",
+        "orleans_messaging_fault_rate", "orleans_pings_missed_rate", "orleans_activation_churn",
+    ):
+        for pod, val in raw.get(metric_key, {}).items():
+            svc = _map_pod_to_service(pod, names_by_len)
+            if svc is not None:
+                orl_acc[svc][metric_key] += val
+
     out: List[Tuple[int, str, Dict[str, Optional[float]]]] = []
     for sid, name in services_in_ns:
         cpu = cpu_acc.get(name)
@@ -218,8 +304,29 @@ def _aggregate_service_metrics(
             "http_5xx_rate": svc_5xx.get(name),
             "p95_latency_ms": svc_p95.get(name),
         }
+        metrics.update(_orleans_metrics(orl_acc.get(name)))
         out.append((sid, name, metrics))
     return out
+
+
+def _orleans_metrics(acc: Optional[Dict[str, float]]) -> Dict[str, Optional[float]]:
+    """Пять колонок orleans_* из сумм по подам; всё None, если силоса нет."""
+    if not acc or acc.get("orleans_latency_count", 0.0) <= 0.0:
+        return {
+            "orleans_latency_avg_ms": None,
+            "orleans_timedout_rate": None,
+            "orleans_messaging_fault_rate": None,
+            "orleans_pings_missed_rate": None,
+            "orleans_activation_churn": None,
+        }
+    count = acc["orleans_latency_count"]
+    return {
+        "orleans_latency_avg_ms": round(1000.0 * acc.get("orleans_latency_sum", 0.0) / count, 3),
+        "orleans_timedout_rate": round(acc.get("orleans_timedout_rate", 0.0), 4),
+        "orleans_messaging_fault_rate": round(acc.get("orleans_messaging_fault_rate", 0.0), 4),
+        "orleans_pings_missed_rate": round(acc.get("orleans_pings_missed_rate", 0.0), 4),
+        "orleans_activation_churn": round(acc.get("orleans_activation_churn", 0.0), 3),
+    }
 
 
 async def _sync_service_health_async(db: Session) -> Dict[str, Any]:
@@ -251,6 +358,8 @@ async def _sync_service_health_async(db: Session) -> Dict[str, Any]:
         "fetched": 0,
         "with_signal": 0,
         "inserted": 0,
+        "orleans_namespaces": 0,
+        "orleans_queries": 0,
         "skipped_empty": 0,
         "skipped_dup": 0,
         "errors": 0,
@@ -269,6 +378,17 @@ async def _sync_service_health_async(db: Session) -> Dict[str, Any]:
     stats["namespaces"] = len(namespaces)
     stats["queries"] = len(namespaces) * 5
 
+    # Orleans discovery: где вообще есть метер силоса (07.09.2026 — 24 ns из
+    # 231). Сбой discovery не роняет тик — просто без Orleans в этот раз.
+    orleans_ns: set = set()
+    try:
+        found = await vm.query_instant_by(_q_orleans_namespaces(), "namespace")
+        orleans_ns = {ns for ns in found if ns in by_ns}
+    except Exception as e:  # noqa: BLE001
+        log.warning("metrics_sync.orleans_discovery_failed err=%s", e)
+    stats["orleans_namespaces"] = len(orleans_ns)
+    stats["orleans_queries"] = len(orleans_ns) * ORLEANS_QUERY_COUNT
+
     # Read-транзакция от db.query(Service) выше обязана закончиться ДО
     # fetch-фазы: gather по VM занимает минуты, а PG убивает соединение,
     # висящее idle-in-transaction дольше 120с (database.py). Без commit
@@ -280,7 +400,7 @@ async def _sync_service_health_async(db: Session) -> Dict[str, Any]:
     sem = asyncio.Semaphore(concurrency)
     t0 = time.monotonic()
     results = await asyncio.gather(
-        *[_fetch_namespace(sem, vm, ns) for ns in namespaces],
+        *[_fetch_namespace(sem, vm, ns, orleans=(ns in orleans_ns)) for ns in namespaces],
         return_exceptions=False,
     )
     fetch_elapsed = time.monotonic() - t0

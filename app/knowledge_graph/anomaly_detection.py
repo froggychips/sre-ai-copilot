@@ -58,6 +58,13 @@ METRICS: Tuple[str, ...] = (
     "restarts_rate",
     "http_5xx_rate",
     "p95_latency_ms",
+    # Здоровье Orleans-силоса (v1.0.9): есть только у grainhost-сервисов,
+    # NULL у остальных — детектор их просто пропускает.
+    "orleans_latency_avg_ms",
+    "orleans_timedout_rate",
+    "orleans_messaging_fault_rate",
+    "orleans_pings_missed_rate",
+    "orleans_activation_churn",
 )
 
 # Лог-производный app-сигнал (consumer для log_error_rate, см. queries.py).
@@ -109,6 +116,14 @@ MIN_ABS_SPREAD_BY_METRIC: Dict[str, float] = {
     "restarts_rate": 0.05,
     "http_5xx_rate": 0.1,
     "p95_latency_ms": 5.0,
+    # Orleans: замер preprod-kingdom2 07.09.2026 — latency avg ~7 с,
+    # activation churn ~800/мин; сбои обычно 0. Полы держат микрошевеления
+    # от статуса critical.
+    "orleans_latency_avg_ms": 50.0,
+    "orleans_timedout_rate": 0.5,
+    "orleans_messaging_fault_rate": 1.0,
+    "orleans_pings_missed_rate": 0.5,
+    "orleans_activation_churn": 50.0,
     LOG_ERROR_METRIC: 1.0,
 }
 DEFAULT_MIN_ABS_SPREAD = 1e-3
