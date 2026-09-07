@@ -1190,7 +1190,11 @@ FROM pg_stat_activity WHERE datname=current_database() AND state<>'\''idle'\''
 ORDER BY xact_start LIMIT 5;"'
 ```
 
-Если транзакции старше пары минут — заглушить писателей на время наката:
+Если транзакции старше пары минут — заглушить писателей на время наката. Для `kg_service_health` и
+`kg_anomaly_observations` глушить **всегда**, не глядя на `pg_stat_activity`: урок 1.0.9 (07.09.2026) — долгих
+транзакций не было, а `ADD COLUMN` не взял ACCESS EXCLUSIVE за 15 с из-за постоянного потока коротких запросов
+metrics_sync и детектора; Job упал по BackoffLimit, схема осталась прежней. `deploy.sh` после scale-to-0 сам
+вернёт реплики при apply манифестов.
 
 ```bash
 kubectl -n sre-ai scale deploy copilot-worker copilot-beat --replicas=0

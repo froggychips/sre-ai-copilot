@@ -37,6 +37,7 @@ def test_latency_is_call_weighted_across_pods_and_rates_are_summed():
         orleans_timedout_rate={"town-grainhost-a": 0.5, "town-grainhost-b": 0.25},
         orleans_messaging_fault_rate={"town-grainhost-a": 2.0},
         orleans_activation_churn={"town-grainhost-a": 400.0, "town-grainhost-b": 380.0},
+        orleans_rerouted_rate={"town-grainhost-a": 6000.0, "town-grainhost-b": 4000.5},
     )
     out = {name: m for _sid, name, m in ms._aggregate_service_metrics(raw, SVC)}
     g = out["town-grainhost"]
@@ -45,6 +46,7 @@ def test_latency_is_call_weighted_across_pods_and_rates_are_summed():
     assert g["orleans_messaging_fault_rate"] == 2.0
     assert g["orleans_pings_missed_rate"] == 0.0            # серии нет, силос есть → 0, не None
     assert g["orleans_activation_churn"] == 780.0
+    assert g["orleans_rerouted_rate"] == 10000.5          # своя колонка, в сумму сбоев не входит
     assert g["cpu_pct"] == 20.0                             # старые метрики не задеты
 
 
@@ -89,6 +91,7 @@ def test_fetch_namespace_adds_orleans_queries_only_when_asked():
     assert {k for k in raw if k.startswith("orleans_")} == {
         "orleans_latency_sum", "orleans_latency_count", "orleans_timedout_rate",
         "orleans_messaging_fault_rate", "orleans_pings_missed_rate", "orleans_activation_churn",
+        "orleans_rerouted_rate",
     }
     assert sum("microsoft_orleans" in q for q in vm.queries) == ms.ORLEANS_QUERY_COUNT
     vm2 = _VM()
@@ -101,6 +104,7 @@ def test_promql_uses_regex_sums_and_per_minute_rates():
     q = ms._q_ns_orleans_faults_by_pod("preprod-kingdom2")
     assert '__name__=~"microsoft_orleans_orleans_messaging_(rejected|expired|sent_failed|sent_dropped)"' in q
     assert "rerouted" not in q, "rerouted — пересылка, не сбой доставки"
+    assert "microsoft_orleans_orleans_messaging_rerouted{" in ms._q_ns_orleans_rerouted_by_pod("x")
     assert q.endswith("* 60")
     assert "catalog_activation_(created|destroyed|shutdown)" in ms._q_ns_orleans_churn_by_pod("x")
     assert ms._q_orleans_namespaces() == (
@@ -121,6 +125,7 @@ def test_promql_selects_pull_series_only():
             ms._q_ns_orleans_faults_by_pod,
             ms._q_ns_orleans_pings_missed_by_pod,
             ms._q_ns_orleans_churn_by_pod,
+            ms._q_ns_orleans_rerouted_by_pod,
         )
     ]
     assert len(queries) == 1 + ms.ORLEANS_QUERY_COUNT
@@ -211,3 +216,15 @@ def test_embed_field_marks_growth_over_50_percent_and_skips_absent():
                                 "baseline": {"orleans_latency_avg_ms": 6000.0},
                                 "deltas_pct": {"orleans_latency_avg_ms": 100.0}})
     assert "⚠" in hot["value"]
+
+
+def test_embed_field_shows_rerouted_apart_from_faults():
+    field = _build_orleans_field({
+        "present": True,
+        "latest": {"orleans_messaging_fault_rate": 12258.0, "orleans_rerouted_rate": 19809.4},
+        "baseline": {"orleans_messaging_fault_rate": 0.0, "orleans_rerouted_rate": 900.0},
+        "deltas_pct": {"orleans_messaging_fault_rate": None, "orleans_rerouted_rate": 2100.0},
+    })
+    v = field["value"]
+    assert "msg faults 12258.0/мин (24ч 0.0)" in v
+    assert "rerouted 19809/мин (24ч 900) ⚠" in v

@@ -1167,6 +1167,7 @@ ORLEANS_METRICS: Tuple[str, ...] = (
     "orleans_messaging_fault_rate",
     "orleans_pings_missed_rate",
     "orleans_activation_churn",
+    "orleans_rerouted_rate",
 )
 
 
