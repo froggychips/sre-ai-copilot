@@ -1217,7 +1217,11 @@ ORDER BY xact_start LIMIT 5;"'
 ```
 
 If transactions are older than a couple of minutes, silence the writers for
-the duration:
+the duration. For `kg_service_health` and `kg_anomaly_observations` silence them **always**, whatever
+`pg_stat_activity` says: the 1.0.9 lesson (2026-09-07) — no long transactions, yet `ADD COLUMN` could not take
+ACCESS EXCLUSIVE within 15 s because of the constant stream of short metrics_sync / detector queries; the Job hit
+BackoffLimit and the schema stayed as it was. After scale-to-0, `deploy.sh` restores the replicas itself when it
+applies the manifests.
 
 ```bash
 kubectl -n sre-ai scale deploy copilot-worker copilot-beat --replicas=0

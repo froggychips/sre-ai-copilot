@@ -127,7 +127,7 @@ _ORLEANS_PULL = 'job=~".+/.+"'
 # на другой силос (активация переехала, кэш директории устарел) — сообщение
 # доставлено, это стоимость, а не отказ. В preprod реранов 10–14 тыс./мин при
 # нуле настоящих сбоев; с ними в сумме 12 тыс. sent_failed в squad-14 были
-# неотличимы от фона.
+# неотличимы от фона. Рераны — своя колонка orleans_rerouted_rate (1.0.11).
 _ORLEANS_FAULT_RE = "messaging_(rejected|expired|sent_failed|sent_dropped)"
 _ORLEANS_CHURN_RE = "catalog_activation_(created|destroyed|shutdown)"
 
@@ -178,7 +178,14 @@ def _q_ns_orleans_churn_by_pod(namespace: str) -> str:
     )
 
 
-ORLEANS_QUERY_COUNT = 6
+def _q_ns_orleans_rerouted_by_pod(namespace: str) -> str:
+    return (
+        f'sum by (pod) (rate({_ORLEANS}messaging_rerouted'
+        f'{{namespace="{namespace}",{_ORLEANS_PULL}}}[5m])) * 60'
+    )
+
+
+ORLEANS_QUERY_COUNT = 7
 
 
 def _map_pod_to_service(pod: str, service_names_by_len: List[str]) -> Optional[str]:
@@ -220,6 +227,7 @@ def _insert_idempotent(
         orleans_messaging_fault_rate=metrics.get("orleans_messaging_fault_rate"),
         orleans_pings_missed_rate=metrics.get("orleans_pings_missed_rate"),
         orleans_activation_churn=metrics.get("orleans_activation_churn"),
+        orleans_rerouted_rate=metrics.get("orleans_rerouted_rate"),
         source=source,
     )
     return insert_idempotent(db, row)
@@ -261,6 +269,7 @@ async def _fetch_namespace(
                     vm.query_instant_by(_q_ns_orleans_faults_by_pod(namespace), "pod"),
                     vm.query_instant_by(_q_ns_orleans_pings_missed_by_pod(namespace), "pod"),
                     vm.query_instant_by(_q_ns_orleans_churn_by_pod(namespace), "pod"),
+                    vm.query_instant_by(_q_ns_orleans_rerouted_by_pod(namespace), "pod"),
                 )
                 raw.update({
                     "orleans_latency_sum": orl[0],
@@ -269,6 +278,7 @@ async def _fetch_namespace(
                     "orleans_messaging_fault_rate": orl[3],
                     "orleans_pings_missed_rate": orl[4],
                     "orleans_activation_churn": orl[5],
+                    "orleans_rerouted_rate": orl[6],
                 })
             return (namespace, raw, None)
         except BaseException as e:  # noqa: BLE001 — фиксируем всё, классифицируем выше
@@ -313,6 +323,7 @@ def _aggregate_service_metrics(
     for metric_key in (
         "orleans_latency_sum", "orleans_latency_count", "orleans_timedout_rate",
         "orleans_messaging_fault_rate", "orleans_pings_missed_rate", "orleans_activation_churn",
+        "orleans_rerouted_rate",
     ):
         for pod, val in raw.get(metric_key, {}).items():
             svc = _map_pod_to_service(pod, names_by_len)
@@ -337,7 +348,7 @@ def _aggregate_service_metrics(
 
 
 def _orleans_metrics(acc: Optional[Dict[str, float]]) -> Dict[str, Optional[float]]:
-    """Пять колонок orleans_* из сумм по подам; всё None, если силоса нет."""
+    """Шесть колонок orleans_* из сумм по подам; всё None, если силоса нет."""
     if not acc or acc.get("orleans_latency_count", 0.0) <= 0.0:
         return {
             "orleans_latency_avg_ms": None,
@@ -345,6 +356,7 @@ def _orleans_metrics(acc: Optional[Dict[str, float]]) -> Dict[str, Optional[floa
             "orleans_messaging_fault_rate": None,
             "orleans_pings_missed_rate": None,
             "orleans_activation_churn": None,
+            "orleans_rerouted_rate": None,
         }
     count = acc["orleans_latency_count"]
     return {
@@ -353,6 +365,7 @@ def _orleans_metrics(acc: Optional[Dict[str, float]]) -> Dict[str, Optional[floa
         "orleans_messaging_fault_rate": round(acc.get("orleans_messaging_fault_rate", 0.0), 4),
         "orleans_pings_missed_rate": round(acc.get("orleans_pings_missed_rate", 0.0), 4),
         "orleans_activation_churn": round(acc.get("orleans_activation_churn", 0.0), 3),
+        "orleans_rerouted_rate": round(acc.get("orleans_rerouted_rate", 0.0), 3),
     }
 
 

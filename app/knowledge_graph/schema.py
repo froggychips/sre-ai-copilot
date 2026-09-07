@@ -320,6 +320,7 @@ class ServiceHealth(Base):
     orleans_timedout_rate = Column(Float, nullable=True)        # /мин
     orleans_messaging_fault_rate = Column(Float, nullable=True)  # rejected+expired+sent_failed+sent_dropped, /мин (rerouted — не сбой, см. metrics_sync)
     orleans_pings_missed_rate = Column(Float, nullable=True)     # pings_reply_missed, /мин — прокси death-vote
+    orleans_rerouted_rate = Column(Float, nullable=True)         # messaging_rerouted, /мин — пересылка на другой силос: не сбой, но растёт раньше сбоев (1.0.11)
     orleans_activation_churn = Column(Float, nullable=True)      # created+destroyed+shutdown, /мин
     source = Column(String, nullable=True)
 
