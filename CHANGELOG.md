@@ -35,6 +35,20 @@ All notable changes to this project are documented in this file.
   скрывает шум по умолчанию (`include_noise=true` показывает). Миграция
   `20260907_0100`.
 
+- **Алерты про Job атрибутируются владельцу, а не источнику метрики.**
+  `KubeJobFailed` несёт цель в `job_name`, а `service` у него —
+  `vm-kube-state-metrics`, откуда метрика приехала. Store-путь резолвил
+  цель только по deployment/statefulset/daemonset, и за 30 дней все 66
+  таких алертов легли на KSM; инциденты 1.0.7 это унаследовали
+  (`mcp/vm-kube-state-metrics` с шестью `KubeJobFailed`). Теперь владелец
+  берётся из графа (`kg_k8s_jobs.owner_service_name`: строка Job, затем
+  CronJob по имени `<cronjob>-<unix-минуты>`), без графа — имя CronJob,
+  и только для ad-hoc Job — его собственное имя; KSM не возвращается
+  никогда. Правило одно для store-пути, обогащения и resolved-notice.
+  `app/scripts/reattribute_job_alerts.py` переносит накопленное:
+  алерт на сервис-владелец, снятие с KSM-инцидента (пустой удаляется),
+  attach к инциденту владельца.
+
 ## [1.0.7] — 2026-09-07 — Доказательства, а не флаги
 
 Первая серия roadmap после ревью 05.09: граф перестаёт отвечать флагами и
