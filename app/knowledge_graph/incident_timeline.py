@@ -15,6 +15,19 @@ Known Unknowns — часть ответа, а не его отсутствие.
 `service_id` (сервис не нашёлся в графе), деплои, события подов, аномалии и
 логи опросить негде: в `unknowns` это сказано явно, вместо пустой ленты,
 которая читалась бы как «ничего не происходило».
+
+Операционная память (roadmap п.7, 07.09.2026). Та же лента продолжается
+тем, что копилот СДЕЛАЛ с инцидентом: собранные свидетельства
+(`incidents.analysis.facts`), диагноз (`cause` / `triage_note`), решения
+плейбуков (`kg_remediation_decisions`), применённое действие
+(`executor_applied` со снимками идентичности) и верификация исхода
+(`executor_verification`). Это не новая таблица — цепочка
+Incident → Evidence → Diagnosis → Decision → Action → Verification уже
+записана в трёх местах, ей не хватало одной оси времени и связи с
+`kg_incidents` (через fingerprint: LLM-путь пишет `incident_id ==
+fingerprint`). Сводка — в `memory`. Если разбор по алертам инцидента не
+запускался (записей в `incidents` нет), это названо в `unknowns`: «действий
+не было» и «путь выключен» — разные ответы.
 """
 from __future__ import annotations
 
@@ -31,6 +44,7 @@ from app.knowledge_graph.queries import deploy_attribution_scope
 from app.knowledge_graph.schema import (AlertEvent, AnomalyObservation,
                                         Deployment, KGIncident, LogObservation,
                                         PodEvent)
+from app.remediation.models import RemediationDecision
 
 #: Сколько смотреть ДО первого алерта: деплой, который его вызвал, обычно
 #: в пределах часа (RecentDeployRule живёт тем же окном).
@@ -41,7 +55,10 @@ LOOKAHEAD_MIN = 30
 #: Порядок событий с одинаковым ts: причина раньше следствия.
 _KIND_ORDER = {
     "incident.opened": 0, "deploy": 1, "pod_event": 2, "anomaly": 3,
-    "log_errors": 4, "alert.fired": 5, "alert.resolved": 6, "incident.resolved": 7,
+    "log_errors": 4, "alert.fired": 5,
+    # операционная память: что копилот сделал — после того, что он увидел
+    "evidence": 6, "diagnosis": 7, "decision": 8, "action.applied": 9, "verification": 10,
+    "alert.resolved": 11, "incident.resolved": 12,
 }
 
 _LOG_LEVELS_OF_INTEREST = ("error", "fatal", "critical")
@@ -115,6 +132,11 @@ def build_timeline(
         events.extend(_anomaly_events(db, sid, start, end))
         events.extend(_log_events(db, sid, start, end))
 
+    memory_events, memory, memory_unknown = _operational_memory(db, incident)
+    events.extend(memory_events)
+    if memory_unknown:
+        unknowns.append(memory_unknown)
+
     if resolved_at is not None:
         events.append(_ev(
             resolved_at, "incident.resolved",
@@ -129,6 +151,7 @@ def build_timeline(
     for e in events:
         counts[e["kind"]] += 1
 
+    memory["outcome"] = _outcome(memory, incident)
     return {
         "incident": incident_to_dict(incident),
         "window": {"start": start, "end": end,
@@ -136,6 +159,7 @@ def build_timeline(
         "events": events,
         "counts": dict(counts),
         "unknowns": unknowns,
+        "memory": memory,
     }
 
 
@@ -250,3 +274,161 @@ def _log_events(db: Session, sid: int, start: datetime, end: datetime) -> List[D
         for r in rows
         if (r.level or "").lower() in _LOG_LEVELS_OF_INTEREST and (r.count or 0) > 0
     ]
+
+
+# ── операционная память ─────────────────────────────────────────────────
+
+def _naive(dt: Any) -> Optional[datetime]:
+    """ISO-строка или datetime → naive UTC (ось времени ленты — naive UTC, §10)."""
+    if dt is None:
+        return None
+    if isinstance(dt, str):
+        try:
+            dt = datetime.fromisoformat(dt)
+        except ValueError:
+            return None
+    if not isinstance(dt, datetime):
+        return None
+    return ensure_naive(dt)
+
+
+def _operational_memory(db: Session, incident: KGIncident):
+    """События «что копилот сделал» + сводка + Known Unknown, если разбора не было."""
+    from app.database import IncidentRecord
+
+    fps = list(incident.fingerprints or [])
+    memory: Dict[str, Any] = {
+        "records": 0, "diagnosis": None, "resolution_quality": None,
+        "decisions": 0, "actions": 0, "verification": None, "identity_check": None,
+    }
+    events: List[Dict[str, Any]] = []
+    if not fps:
+        return events, memory, None
+
+    records: List[Any] = (
+        db.query(IncidentRecord).filter(IncidentRecord.incident_id.in_(fps)).all()
+    )
+    decisions: List[RemediationDecision] = (
+        db.query(RemediationDecision)
+        .filter(RemediationDecision.incident_id.in_(fps))
+        .order_by(RemediationDecision.created_at)
+        .all()
+    )
+    memory["records"] = len(records)
+    memory["decisions"] = len(decisions)
+
+    for rec in records:
+        analysis: Dict[str, Any] = rec.analysis if isinstance(rec.analysis, dict) else {}
+        base_ts = _naive(getattr(rec, "created_at", None)) or incident.opened_at
+
+        facts = [f for f in (analysis.get("facts") or []) if isinstance(f, dict)]
+        if facts:
+            by_verdict: Dict[str, int] = defaultdict(int)
+            for f in facts:
+                verdict = f.get("verdict") or ("found" if f.get("observed") else "absent")
+                by_verdict[verdict] += 1
+            found = [f for f in facts if f.get("observed")]
+            found.sort(key=lambda f: -(f.get("confidence") or 0))
+            events.append(_ev(
+                base_ts, "evidence",
+                "Свидетельства: " + ", ".join(f"{k} {v}" for k, v in sorted(by_verdict.items())),
+                epistemic=Epistemic.OBSERVED if found else Epistemic.INFERRED,
+                provenance="incidents.analysis.facts",
+                details={
+                    "by_verdict": dict(by_verdict),
+                    "found": [{"kind": f.get("kind"), "confidence": f.get("confidence"),
+                               "epistemic": f.get("epistemic"), "subject": f.get("subject")}
+                              for f in found[:5]],
+                    "unknown": [{"kind": f.get("kind"), "reason": f.get("unknown_reason")}
+                                for f in facts if f.get("verdict") == "unknown"][:5],
+                },
+            ))
+
+        cause = analysis.get("cause")
+        triage = analysis.get("triage_note")
+        quality = analysis.get("resolution_quality")
+        if cause or triage:
+            memory["diagnosis"] = cause or triage
+            memory["resolution_quality"] = quality
+            events.append(_ev(
+                base_ts, "diagnosis",
+                f"Диагноз: {cause}" if cause else f"Диагноз не поставлен: {triage}",
+                # Вывод гипотез над свидетельствами — заключение, не наблюдение.
+                epistemic=Epistemic.INFERRED, provenance="incidents.analysis",
+                details={"cause": cause, "triage_note": triage, "resolution_quality": quality,
+                         "fact_conflicts": analysis.get("fact_conflicts") or [],
+                         "is_recurrence": analysis.get("is_recurrence")},
+            ))
+
+        applied = analysis.get("executor_applied")
+        if isinstance(applied, dict):
+            intent = analysis.get("execution_intent") or {}
+            result = applied.get("result") or {}
+            before = applied.get("target_before") or {}
+            after = applied.get("target_after") or {}
+            memory["actions"] += 1
+            memory["identity_check"] = applied.get("identity_check")
+            events.append(_ev(
+                _naive(applied.get("applied_at")) or base_ts, "action.applied",
+                f"Действие: {intent.get('action', '?')} {intent.get('resource_type', '')}/"
+                f"{intent.get('resource_name', '?')} — "
+                f"{'ok' if result.get('success') else 'ошибка'}",
+                epistemic=Epistemic.OBSERVED, provenance="incidents.analysis.executor_applied",
+                details={
+                    "action": intent.get("action"), "resource": intent.get("resource_name"),
+                    "applied_by": applied.get("applied_by"), "success": result.get("success"),
+                    "command": result.get("command"), "identity_check": applied.get("identity_check"),
+                    "uid_before": before.get("uid"), "uid_after": after.get("uid"),
+                    "generation_before": before.get("generation"),
+                    "generation_after": after.get("generation"),
+                    "verification_scheduled": (applied.get("verification") or {}).get("scheduled"),
+                },
+            ))
+
+        ver = analysis.get("executor_verification")
+        if isinstance(ver, dict):
+            outcome = ver.get("outcome")
+            memory["verification"] = outcome
+            events.append(_ev(
+                _naive(ver.get("checked_at")) or base_ts, "verification",
+                f"Верификация: {outcome}" + (f" — {ver['reasons'][0]}" if ver.get("reasons") else ""),
+                epistemic=(Epistemic.OBSERVED if outcome in ("verified", "failed")
+                           else Epistemic.UNKNOWN),
+                provenance="incidents.analysis.executor_verification",
+                details={"outcome": outcome, "attempt": ver.get("attempt"),
+                         "checks": ver.get("checks") or {}, "reasons": ver.get("reasons") or []},
+            ))
+
+    for d in decisions:
+        events.append(_ev(
+            _naive(getattr(d, "created_at", None)) or incident.opened_at, "decision",
+            f"Решение: {d.decision or '?'}" + (f" · {d.selected_playbook}" if d.selected_playbook else ""),
+            # Политика применена к осям риска — объявленный результат правил.
+            epistemic=Epistemic.DECLARED, provenance="kg_remediation_decisions",
+            details={"decision": d.decision, "playbook": d.selected_playbook,
+                     "classification": d.classification,
+                     "reasons": d.decision_reasons or [],
+                     "command_preview": d.command_preview,
+                     "target_uid": (d.target_ref or {}).get("uid") if isinstance(d.target_ref, dict) else None},
+        ))
+
+    unknown = None
+    if not records and not decisions:
+        unknown = {
+            "scope": "evidence,diagnosis,decision,action,verification",
+            "reason": "разбор по алертам инцидента не запускался (записей в incidents и "
+                      "kg_remediation_decisions нет) — действий не было не потому, что "
+                      "нечего было делать, а потому, что путь не включён",
+        }
+    return events, memory, unknown
+
+
+def _outcome(memory: Dict[str, Any], incident: KGIncident) -> str:
+    """Итог операционной памяти одной строкой."""
+    if memory.get("verification"):
+        return f"action_{memory['verification']}"
+    if memory.get("actions"):
+        return "action_applied_unverified"
+    if incident.status == "resolved":
+        return "resolved_without_action" if memory.get("records") else "resolved_without_analysis"
+    return "open_without_action" if memory.get("records") else "open_without_analysis"

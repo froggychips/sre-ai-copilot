@@ -96,7 +96,9 @@ def test_timeline_endpoint(db):
     body = _app(db).get(f"/kg/incidents/{inc.id}/timeline").json()
     assert [e["kind"] for e in body["events"]] == ["incident.opened", "alert.fired"]
     assert body["events"][1]["evidence"] == {"epistemic": "observed", "provenance": "kg_alerts"}
-    assert body["unknowns"] == []
+    # Разбора по алерту не было — это названо, а не промолчано.
+    assert [u["scope"] for u in body["unknowns"]] == ["evidence,diagnosis,decision,action,verification"]
+    assert body["memory"]["outcome"] == "open_without_analysis"
 
 
 def test_unknown_incident_is_404(db):

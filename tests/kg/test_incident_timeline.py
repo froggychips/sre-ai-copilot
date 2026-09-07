@@ -72,7 +72,8 @@ def test_timeline_puts_five_sources_on_one_axis_in_causal_order(db):
     assert tl["counts"] == {"deploy": 2, "pod_event": 1, "anomaly": 1, "log_errors": 1,
                             "incident.opened": 1, "alert.fired": 1}
     assert tl["window"]["start"] == T0 - LOOKBACK_MIN * M
-    assert tl["unknowns"] == []
+    # Единственный пробел — операционная память: разбор по алертам не запускался.
+    assert [u["scope"] for u in tl["unknowns"]] == ["evidence,diagnosis,decision,action,verification"]
 
 
 def test_deploy_events_carry_attribution_as_evidence(db):
@@ -122,9 +123,9 @@ def test_incident_without_service_in_graph_reports_known_unknowns(db):
                        fired_at=T0, alertname="X", severity="warning", fingerprint="fp-9")
     tl = build_timeline(db, inc, now=T0 + M)
     assert [e["kind"] for e in tl["events"]] == ["incident.opened", "alert.fired"]
-    assert len(tl["unknowns"]) == 1
-    assert "service_id" in tl["unknowns"][0]["reason"]
-    assert "deploy" in tl["unknowns"][0]["scope"]
+    graph_unknowns = [u for u in tl["unknowns"] if "service_id" in u["reason"]]
+    assert len(graph_unknowns) == 1
+    assert "deploy" in graph_unknowns[0]["scope"]
 
 
 def test_incident_payload_is_included(db):
