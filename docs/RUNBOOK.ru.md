@@ -287,6 +287,8 @@ Audit log events (фильтр по `event`):
 | `K8S_BLOCKED_NO_APPROVAL` | `dry_run=False` вызван без `post_approval=True` |
 | `EXECUTOR_APPLIED` | Apply успешно |
 | `EXECUTOR_APPLY_REFUSED` | Apply ineligible |
+| `EXECUTOR_APPLY_REFUSED_TARGET_REINCARNATED` | Живой `uid` отличается от `target_ref` графа — объект пересоздан, запись отказана (v1.0.7) |
+| `EXECUTOR_VERIFY_VERIFIED` / `_FAILED` / `_PENDING` / `_UNKNOWN` | Отложенная проверка исхода (`remediation_verify`, +5/+15 мин) с `checks` и `reasons` (v1.0.7) |
 | `EXECUTOR_APPLY_EXCEPTION` | Неожиданная exception в apply-service |
 | `EXECUTOR_DRY_RUN_FAILED` | Exception в `stage_executor` |
 
@@ -312,6 +314,8 @@ Allowlist: `http_5xx_rate` и `p95_latency_ms` по-прежнему ожида�
 4. Жив ли celery-worker, который крутит `kg_metrics_sync`? `celery -A app.celery_worker inspect active`.
 
 ### `sync_lag` fail на `kg_seq_logs_sync` (или любой другой sync)
+
+> **v1.0.4+:** у каждой записи есть `last_status` — `SourceStatus` последнего прогона (`success / partial / empty / unavailable / failed / invalid`). Heartbeat пишется только на `success` / `partial`, поэтому задача, которая отработала и ничего не увидела, показывает и лаг, и статус — «источник мёртв» и «источник вернул пусто» стали разными строками. Источник, выключенный настройкой (например `NATS_SUBJECTS_PARSER_ENABLED=false`), отдаёт `status=disabled` и на общий вердикт не влияет.
 
 Что значит: последний write timestamp для этого источника старше 5× ожидаемого интервала.
 
@@ -349,6 +353,16 @@ Generic check: tail логов celery-worker, grep по имени задачи;
 
 Поднять `KG_ANOMALY_ROBUST_Z_WARN` / `_CRIT` вверх или сузить baseline window. Volume guard кэпит на 3/час на (service, metric), так что >500 за 24 ч означает распыление по многим сервисам — скорее всего global threshold issue, а не один горячий сервис.
 
+
+### `anomaly_signal_health: N из M сервисов аномальны >20ч из 24` (v1.0.4+)
+
+Абсолютный порог «>500 наблюдений» выше снят: при 11 000+ сервисов в графе он перестал быть сигналом здоровья. Проверка теперь меряет **зрелость**: долю сервисов, аномальных более 20 из последних 24 часов, среди всех сервисов с аномалиями. Выше 25 % → `warn` — детектор сообщает о своём отставании от реальности (baseline не знает новую норму), а не о событиях.
+
+Что делать:
+1. Смотреть, какие namespace доминируют — один стенд под длительной нагрузкой (например сквад с ботами, 30 из 59 «always-on» сервисов 06.09.2026) — **легитимный** сигнал и сам пройдёт за дни, когда 7-дневный baseline впитает новый уровень. Порог под него не крутить.
+2. Если always-on сервисы разбросаны и дельты крохотные (`cpu_pct` 0,3 % → 0,8 % при `|z| ≈ 7`), виноват пол разброса по метрике (`MIN_ABS_SPREAD_BY_METRIC["cpu_pct"] = 0.02` п.п. против `1.0` у `mem_pct`). Замер 06.09.2026: пол 1,0 п.п. убирает 76 % cpu-аномалий, не меняя долю always-on — это продуктовое решение, не инцидент.
+3. Namespace, пересозданные под тем же именем, наследуют в baseline историю прежнего стенда — за это отвечает `namespace_lifecycle.purge_stale_health_after_reincarnation`.
+
 ### `pod_events_link_rate <50%`
 
 Что значит: больше половины `kg_pod_events` за последние 24 ч имеют `service_id IS NULL`.
@@ -362,6 +376,41 @@ Generic check: tail логов celery-worker, grep по имени задачи;
 Самая вероятная причина: `kg_topology_sync` не запускается, не refresh'ит `last_seen_at` или upsert'ит под не той identity. Проверить celery beat logs на hourly run, и убедиться в БД что `max(last_seen_at)` сдвигается с каждым прогоном.
 
 ---
+
+## Инциденты в графе (`kg_incidents`, v1.0.6+)
+
+Инцидент — детерминированный объект: не больше одного **открытого** на `(namespace, service)`, инвариант держит частичный уникальный индекс. Алерты присоединяются на приёме (`/store`, `/enrich-and-forward`), закрывает beat-задача `kg_incidents_lifecycle`.
+
+```bash
+# открытые инциденты, шум скрыт (по умолчанию)
+curl -s -H "Authorization: Bearer $JWT" "$API/kg/incidents?status=open" | jq '.incidents[] | {id, namespace, service, alert_count, severity, opened_at}'
+# вместе с шумом (KubeDeploymentGenerationMismatch при здоровых репликах, мета-агрегаты, rollout-в-процессе)
+curl -s -H "Authorization: Bearer $JWT" "$API/kg/incidents?status=open&include_noise=true" | jq '.count'
+# timeline одного инцидента — шесть таблиц + операционная память + unknowns
+curl -s -H "Authorization: Bearer $JWT" "$API/kg/incidents/42/timeline" | jq '{counts, unknowns, memory}'
+```
+
+Как читать ответ:
+- `unknowns` перечисляет, что проверить **не удалось** (сервиса нет в графе → нет деплоев / событий подов / аномалий / логов; нет строк `incidents` → пайплайн разбора по этим алертам не запускался). Пустая лента с непустым `unknowns` — не «ничего не было».
+- `memory.outcome`: `action_verified` / `action_failed` / `action_pending` / `action_applied_unverified` / `resolved_without_action` / `resolved_without_analysis` / `open_without_*`.
+- `noise=true` — обогащение сочло **все** алерты инцидента шумом; настоящий алерт снимает флаг. Шумовые инциденты остаются в таблице и доступны по id.
+- Инцидент, который переоткрывается снова и снова (`reopened_count`), — флаппинг: один инцидент, а не N; смотреть на алерт, а не на число инцидентов.
+
+Гигиена данных: после релиза, меняющего атрибуцию, один раз запустить соответствующий скрипт из воркера, например `python -m app.scripts.reattribute_job_alerts --apply` (переносит `KubeJobFailed` с `vm-kube-state-metrics` на владельца Job и перестраивает затронутые инциденты). Сначала всегда dry-run (без флага).
+
+## Верификация remediation (v1.0.7+)
+
+`apply_intent` больше не заканчивается на exit code kubectl. Читать `analysis` инцидента:
+
+| Поле | Значение |
+|---|---|
+| `executor_applied.identity_check` | `same` — живой `uid` совпал с `target_ref` графа; `unknown:no_expected_uid` — сверять нечем; `unknown:no_live_snapshot` — kubectl недоступен до записи |
+| `executor_applied.target_before` / `target_after` | живые снимки (`uid`, `generation`, `observed_generation`, `template_hash`, реплики); `unknown=true, reason`, если снять не удалось |
+| `executor_applied.verification` | `{scheduled, attempt, delay_sec}` или `{scheduled: false, reason}` (`disabled`, `broker:*`, `apply_failed`) |
+| `executor_verification` | последняя проверка: `outcome`, `attempt`, `checks` (`same_identity`, `action_took_effect`, `converged`, `healthy`, `alert_resolved`, `new_crash_events`), `reasons`, `snapshot` |
+| `executor_state` | `applied` → `verified` / `verification_failed`; `pending` и `unknown` состояние не меняют |
+
+Отказ `target_reincarnated:*` значит, что объект пересоздан после инцидента (`uid` графа ≠ живой) — перезапускать разбор по текущему объекту, а не переодобрять. Каждая проверка — `True / False / None`; `None` — «не смогли проверить», никогда не «ок». Audit-события: `EXECUTOR_APPLY_REFUSED_TARGET_REINCARNATED`, `EXECUTOR_VERIFY_VERIFIED / _FAILED / _PENDING / _UNKNOWN`. Настройки: `REMEDIATION_VERIFY_ENABLED`, `REMEDIATION_VERIFY_DELAYS_SEC` (по умолчанию `300,900`).
 
 ## Setting up Discord approvers
 

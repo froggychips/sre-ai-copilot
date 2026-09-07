@@ -29,6 +29,26 @@
 
 ### What's new
 
+- **v1.0.4 → v1.0.8 — evidence instead of flags, incidents instead of alerts**
+  (2026-09-05…07, PRs #349–#374): a deep review against the live cluster
+  turned into one roadmap series. **Evidence contract** — a fact has three
+  outcomes (`found` / `absent` / `unknown`), every rule declares its
+  `sources`, and a failed source demotes "not found" to "could not check";
+  the critic never refutes a hypothesis with an `unknown`. **SourceStatus**
+  — a sync task that observed nothing no longer writes a heartbeat.
+  **Incident** as a graph object (`kg_incidents`: one open incident per
+  service, enforced by a partial unique index, flapping re-opens instead of
+  multiplying) with a **timeline** across six tables and Known Unknowns.
+  **Blast radius** walks against dependency edges two hops deep and labels
+  every path with its weakest epistemic link. **Remediation verification**
+  snapshots the target's `uid` before writing, refuses a re-created object,
+  and re-checks the outcome 5 and 15 minutes later. **Operational memory**
+  — evidence → diagnosis → decision → action → verification on the same
+  timeline. Plus: k8s-side deploy watcher (`kg_deploy_watch`), self-health
+  exported to VictoriaMetrics, 1.7 GB of duplicate indexes dropped, noise
+  incidents flagged, `KubeJobFailed` attributed to the Job's owner instead of
+  kube-state-metrics. Contracts: [`docs/SEMANTIC_CONTRACT.md`](docs/SEMANTIC_CONTRACT.md)
+  §5.1, §11–§13; details per release in [`CHANGELOG.md`](CHANGELOG.md).
 - **v1.0.0-rc.14 / rc.15 — the two-day silent digest outage, dissected**:
   after the rc.10–13 wave the daily digest silently vanished for two days.
   Two independent killers: (1) workers OOM-looped every ~1.5–2h (1536Mi
@@ -159,6 +179,13 @@
 - **Approve / Decline buttons** are gated by the *same* `EXECUTOR_APPROVAL_ENABLED` flag. Previously the green «Approve & Run» button rendered whenever an `execution_intent` existed and the bot could post, and its handler dispatched the real write on `EXECUTOR_ENABLED` alone — so a deployment that set only `EXECUTOR_ENABLED=true` (documented here as dry-run validation) got a one-click real `kubectl`, bypassing both the two-step confirmation and the documented prod opt-in. `EXECUTOR_ENABLED=true` now means dry-run only, as described above.
 - **Approval freshness + in-flight claim**: a recorded `ActionApproval` expires after `EXECUTOR_APPROVAL_MAX_AGE_SECONDS` (default 1h), so a stale approval cannot authorize a later write; and the apply path commits an `in_flight` claim *before* invoking kubectl, so a worker dying mid-mutation can't leave the cluster changed with the idempotency marker unwritten.
 - Full **OTEL audit trail**: `sre.copilot.incident.process` root span, per-stage child spans, `execution_intent_parsed` / `executor_status` attributes, `guardrail.blocked` events emitted when the guard rejects an operation, `EXECUTOR_APPLIED` / `EXECUTOR_APPLY_REFUSED` audit events.
+- **Evidence, not flags** (v1.0.4): every rule fact carries `verdict` (`found` / `absent` / `unknown`), `epistemic` (observed / declared / inferred …), `provenance` and the search window; a source that failed marks its fields in `source_status`, and the rule answers `?` instead of a confident «not found». Deploy attribution is evidence too: an exact record (`namespace_scope=false`) is `observed 0.95`, a namespace-wide broadcast is `inferred 0.6`.
+- **Incidents as graph objects** (v1.0.6): `kg_incidents` — one open incident per service (partial unique index), alerts attach, flapping re-opens within 30 min, lifecycle closes when every alert is resolved; `noise=true` when enrichment classified all of its alerts as noise (`GET /kg/incidents` hides those by default).
+- **Incident timeline** (`GET /kg/incidents/{id}/timeline`): deploys, pod events, anomalies (bucketed per metric·hour), error logs, alerts and the copilot's own operational memory (evidence → diagnosis → decision → action → verification) on one axis, each event with `evidence = {epistemic, provenance}`, plus `unknowns` for sources that could not be queried.
+- **Blast radius with evidence** (`GET /kg/blast-radius`): who breaks if X breaks — a walk against `calls` / `uses_db` / `uses_nats` / `serves_traffic` up to two hops; each path inherits its weakest epistemic link; «callers unknown» and «no callers» are different answers.
+- **Remediation verification** (v1.0.7): before `kubectl` the live target is snapshotted (`uid`, `generation`, template hash, replicas) and compared with the graph's `target_ref` — a re-created object refuses the write (`target_reincarnated`); after the write a Celery task re-checks at +5 and +15 min: same identity, rollout converged, ready == desired, alert resolved, no new CrashLoop/OOM → `verified` / `failed` / `pending` / `unknown`.
+- **Deploy watcher from the cluster** (`kg_deploy_watch`, every 5 min): rollouts detected from image / `spec.template` changes, not from `metadata.generation` (which HPA bumps every tick) — the second, exact source of `kg_deployments`.
+- **Self-health in metrics**: `copilot_self_health_*` scraped by VictoriaMetrics, `VMRule sre-ai-copilot` alerts on stale / failing checks; a source disabled by config reports `disabled`, not `warn`.
 
 ### Tech stack
 
@@ -276,6 +303,10 @@ Fill secrets before installing — see `helm/sre-ai-copilot/templates/secret.yam
 | `POST /approvals/{id}/approve\|reject` | Human approval |
 | `POST /replay/{incident_id}` | Re-run historical incident |
 | `POST /evaluation/{id}/submit` | Feedback submission |
+| `GET /kg/incidents` | Incidents from the graph (`status`, `namespace`, `service`, `include_noise`) |
+| `GET /kg/incidents/{id}` | Incident with its alerts |
+| `GET /kg/incidents/{id}/timeline` | Timeline across six tables + operational memory + `unknowns` |
+| `GET /kg/blast-radius?namespace=&service=` | Who breaks if X breaks, with epistemic evidence per path |
 | `GET /healthz`, `GET /readyz` | Liveness / readiness |
 
 ### Combat runs (accuracy history)
@@ -325,6 +356,7 @@ The executor track is **delivered and gated behind explicit opt-in flags** as of
 | 2 | `executor` stage after `risk` with `dry_run=True` + `K8sSecurityGuard.validate` | ✅ v0.7.0 (PR #26) |
 | 3 | Discord Apply consumer with two-click confirm → real `kubectl` under guard | ✅ v0.7.0 (PR #27) |
 | 4 | End-to-end smoke on non-prod `squad-*` cluster + production ramp-up plan | 🟡 Operational ramp-up — advisory mode is the production default; opt-in apply (`EXECUTOR_APPROVAL_ENABLED`) not yet enabled on shared clusters |
+| 5 | Remediation verification — target identity snapshot before/after, delayed outcome check (`verified` / `failed` / `pending` / `unknown`) | ✅ v1.0.7 (PR #369) |
 
 **Ramp-up plan:**
 
@@ -336,6 +368,19 @@ The executor track is **delivered and gated behind explicit opt-in flags** as of
 
 See [docs/RUNBOOK.md → Executor incidents](docs/RUNBOOK.md#executor-incidents) for operational procedures.
 
+### Roadmap — Knowledge graph
+
+| # | Step | Status |
+|---|---|---|
+| 1 | Evidence semantics: `verdict` / `epistemic` / `provenance` on facts, `sources` on rules, Known Unknowns via `source_status` | ✅ v1.0.7 (PR #365) |
+| 2 | Incident as a first-class graph object (`kg_incidents`) | ✅ v1.0.7 (PR #366) |
+| 3 | Incident timeline across deploys / pod events / anomalies / logs / alerts | ✅ v1.0.7 (PR #366) |
+| 4 | Blast radius with evidence per path | ✅ v1.0.7 (PR #368) |
+| 5 | Operational memory: evidence → diagnosis → decision → action → verification on the timeline | ✅ v1.0.8 (PR #371) |
+| 6 | Incident correlation across services (shared dependency, deploy in window, `calls` edge) — as edges between incidents | 🟡 after a month of `kg_incidents` data (from 2026-09-07) |
+| 7 | Deterministic, evidence-backed RCA | 🟡 after 6 |
+| 8 | LLM on top of a deterministic `IncidentContext` (planner → KG → evidence → model), never on raw tables | ⬜ |
+
 ### Documentation
 
 | Document | EN | RU |
@@ -345,6 +390,8 @@ See [docs/RUNBOOK.md → Executor incidents](docs/RUNBOOK.md#executor-incidents)
 | Module docs | [MODULE_DOCS.md](docs/MODULE_DOCS.md) | [MODULE_DOCS.ru.md](docs/MODULE_DOCS.ru.md) |
 | Audit trail (OTEL) | [AUDIT.md](docs/AUDIT.md) | — |
 | Semantic contract | [SEMANTIC_CONTRACT.md](docs/SEMANTIC_CONTRACT.md) | — |
+| KG schema / quality contract | — | [KG_SCHEMA_CONTRACT.md](docs/KG_SCHEMA_CONTRACT.md) |
+| Metrics (signals, self-health) | [METRICS.md](docs/METRICS.md) | [METRICS.ru.md](docs/METRICS.ru.md) |
 | FAQ | [FAQ.md](docs/FAQ.md) | [FAQ.ru.md](docs/FAQ.ru.md) |
 | DR plan | [DR.md](docs/DR.md) | — |
 | Golden eval set | [tests/golden/README.md](tests/golden/README.md) | — |
@@ -375,6 +422,26 @@ See [docs/RUNBOOK.md → Executor incidents](docs/RUNBOOK.md#executor-incidents)
 
 ### Что нового
 
+- **v1.0.4 → v1.0.8 — доказательства вместо флагов, инциденты вместо алертов**
+  (05–07.09.2026, PR #349–#374): глубокое ревью по живому кластеру
+  превратилось в серию roadmap. **Evidence-контракт** — у факта три исхода
+  (`found` / `absent` / `unknown`), каждое правило объявляет `sources`, а
+  упавший источник понижает «не нашли» до «не смогли проверить»; критик
+  никогда не опровергает гипотезу по `unknown`. **SourceStatus** — синк,
+  который ничего не наблюдал, больше не пишет heartbeat. **Incident** как
+  объект графа (`kg_incidents`: один открытый инцидент на сервис, инвариант
+  держит частичный уникальный индекс, флаппинг переоткрывает, а не плодит) с
+  **timeline** по шести таблицам и Known Unknowns. **Blast radius** идёт
+  против рёбер зависимости на два шага и помечает каждый путь слабейшим
+  звеном. **Верификация remediation** снимает `uid` цели до записи,
+  отказывает пересозданному объекту и перепроверяет исход через 5 и 15
+  минут. **Операционная память** — свидетельства → диагноз → решение →
+  действие → верификация на той же ленте. Плюс: k8s-watcher выкатов
+  (`kg_deploy_watch`), self-health в VictoriaMetrics, снято 1,7 ГБ
+  дублирующих индексов, шумовые инциденты помечены, `KubeJobFailed`
+  атрибутируется владельцу Job, а не kube-state-metrics. Контракты:
+  [`docs/SEMANTIC_CONTRACT.md`](docs/SEMANTIC_CONTRACT.md) §5.1, §11–§13;
+  подробности по релизам — в [`CHANGELOG.md`](CHANGELOG.md).
 - **v1.0.0-rc.14 / rc.15 — разбор двухдневного молчания дайджеста**: после
   волны rc.10–13 ежедневный дайджест два дня молча не приходил. Два
   независимых убийцы: (1) воркеры OOM-петлились каждые ~1.5–2ч (лимит
@@ -504,6 +571,13 @@ See [docs/RUNBOOK.md → Executor incidents](docs/RUNBOOK.md#executor-incidents)
 - **Кнопки Approve / Decline** закрыты тем же флагом `EXECUTOR_APPROVAL_ENABLED`. Раньше зелёная «Approve & Run» рисовалась при любом распарсенном `execution_intent`, а её хендлер запускал реальный write по одному лишь `EXECUTOR_ENABLED` — то есть стенд, включивший «безопасную» dry-run-валидацию, получал реальный `kubectl` в один клик мимо двухшагового подтверждения. Теперь `EXECUTOR_ENABLED=true` означает ровно dry-run, как и заявлено выше.
 - **Срок годности одобрения + in-flight claim**: запись `ActionApproval` протухает через `EXECUTOR_APPROVAL_MAX_AGE_SECONDS` (по умолчанию 1 час) — старое одобрение больше не авторизует поздний write; claim `in_flight` коммитится ДО вызова kubectl, поэтому смерть воркера в момент мутации не оставит кластер изменённым с незаписанным маркером идемпотентности.
 - Полный **OTEL audit trail**: root span `sre.copilot.incident.process`, child-спан на стадию, атрибуты `execution_intent_parsed` / `executor_status`, events `guardrail.blocked` при отказе guard-а, audit-события `EXECUTOR_APPLIED` / `EXECUTOR_APPLY_REFUSED`.
+- **Доказательства, а не флаги** (v1.0.4): у каждого факта правил есть `verdict` (`found` / `absent` / `unknown`), `epistemic` (observed / declared / inferred …), `provenance` и окно поиска; упавший источник помечает свои поля в `source_status`, и правило отвечает `?`, а не уверенным «не нашли». Привязка деплоя — тоже свидетельство: точная запись (`namespace_scope=false`) даёт `observed 0.95`, ns-broadcast — `inferred 0.6`.
+- **Инциденты как объекты графа** (v1.0.6): `kg_incidents` — один открытый инцидент на сервис (частичный уникальный индекс), алерты присоединяются, флаппинг переоткрывает в окне 30 мин, жизненный цикл закрывает, когда все алерты resolved; `noise=true`, если обогащение сочло все его алерты шумом (`GET /kg/incidents` такие скрывает по умолчанию).
+- **Timeline инцидента** (`GET /kg/incidents/{id}/timeline`): деплои, события подов, аномалии (по метрике и часу), ошибки логов, алерты и собственная операционная память копилота (свидетельства → диагноз → решение → действие → верификация) на одной оси; у каждого события `evidence = {epistemic, provenance}`, плюс `unknowns` — источники, которые опросить было нечем.
+- **Blast radius с доказательствами** (`GET /kg/blast-radius`): что сломается, если X сломается — обход против `calls` / `uses_db` / `uses_nats` / `serves_traffic` до двух шагов; путь наследует слабейшее звено; «вызывающие неизвестны» и «вызывающих нет» — разные ответы.
+- **Верификация remediation** (v1.0.7): перед `kubectl` снимается живая цель (`uid`, `generation`, hash шаблона, реплики) и сверяется с `target_ref` из графа — пересозданный объект получает отказ (`target_reincarnated`); после записи Celery-задача перепроверяет через 5 и 15 минут: та же идентичность, rollout сошёлся, ready == desired, алерт resolved, новых CrashLoop/OOM нет → `verified` / `failed` / `pending` / `unknown`.
+- **Watcher выкатов из кластера** (`kg_deploy_watch`, каждые 5 мин): выкат определяется по смене образа или `spec.template`, а не по `metadata.generation` (его крутит HPA каждый тик) — второй, точный источник `kg_deployments`.
+- **Self-health в метриках**: `copilot_self_health_*` скрейпит VictoriaMetrics, `VMRule sre-ai-copilot` алертит на протухшие/упавшие проверки; источник, выключенный настройкой, отдаёт `disabled`, а не `warn`.
 
 ### Быстрый старт
 
@@ -610,6 +684,10 @@ helm install sre-ai-copilot helm/sre-ai-copilot/ \
 | `POST /approvals/{id}/approve\|reject` | Human approval |
 | `POST /replay/{incident_id}` | Перезапуск исторического инцидента |
 | `POST /evaluation/{id}/submit` | Ручная отправка фидбека |
+| `GET /kg/incidents` | Инциденты графа (`status`, `namespace`, `service`, `include_noise`) |
+| `GET /kg/incidents/{id}` | Инцидент с его алертами |
+| `GET /kg/incidents/{id}/timeline` | Timeline по шести таблицам + операционная память + `unknowns` |
+| `GET /kg/blast-radius?namespace=&service=` | Что сломается, если X сломается, с эпистемикой на каждом пути |
 | `GET /healthz`, `GET /readyz` | Liveness / readiness |
 
 ### Боевые прогоны (история точности)
@@ -659,6 +737,7 @@ Executor-трек **сделан и закрыт за явные opt-in флаг
 | 2 | `executor`-стадия после `risk` с `dry_run=True` + `K8sSecurityGuard.validate` | ✅ v0.7.0 (PR #26) |
 | 3 | Discord Apply consumer с двухшаговым confirm → реальный `kubectl` под guard | ✅ v0.7.0 (PR #27) |
 | 4 | End-to-end smoke на non-prod `squad-*` кластере + production ramp-up план | 🟡 Операционная раскатка — advisory-режим уже дефолт в проде; opt-in apply (`EXECUTOR_APPROVAL_ENABLED`) на shared-кластерах пока не включён |
+| 5 | Верификация remediation — снимок идентичности цели до/после, отложенная проверка исхода (`verified` / `failed` / `pending` / `unknown`) | ✅ v1.0.7 (PR #369) |
 
 **Ramp-up план:**
 
@@ -670,6 +749,19 @@ Executor-трек **сделан и закрыт за явные opt-in флаг
 
 См. [docs/RUNBOOK.md → Executor incidents](docs/RUNBOOK.md#executor-incidents) для операционных процедур.
 
+### Roadmap — Knowledge graph
+
+| # | Шаг | Статус |
+|---|---|---|
+| 1 | Семантика свидетельств: `verdict` / `epistemic` / `provenance` у фактов, `sources` у правил, Known Unknowns через `source_status` | ✅ v1.0.7 (PR #365) |
+| 2 | Incident как объект графа (`kg_incidents`) | ✅ v1.0.7 (PR #366) |
+| 3 | Timeline инцидента по деплоям / событиям подов / аномалиям / логам / алертам | ✅ v1.0.7 (PR #366) |
+| 4 | Blast radius с доказательствами на каждом пути | ✅ v1.0.7 (PR #368) |
+| 5 | Операционная память: свидетельства → диагноз → решение → действие → верификация на ленте | ✅ v1.0.8 (PR #371) |
+| 6 | Корреляция инцидентов между сервисами (общая зависимость, деплой в окне, ребро `calls`) — рёбрами между инцидентами | 🟡 после месяца данных `kg_incidents` (с 07.09.2026) |
+| 7 | Детерминированный RCA на доказательствах | 🟡 после п.6 |
+| 8 | LLM поверх детерминированного `IncidentContext` (планировщик → граф → свидетельства → модель), никогда поверх сырых таблиц | ⬜ |
+
 ### Документация
 
 | Документ | EN | RU |
@@ -679,6 +771,8 @@ Executor-трек **сделан и закрыт за явные opt-in флаг
 | Модули | [MODULE_DOCS.md](docs/MODULE_DOCS.md) | [MODULE_DOCS.ru.md](docs/MODULE_DOCS.ru.md) |
 | Audit trail (OTEL) | [AUDIT.md](docs/AUDIT.md) | — |
 | Semantic Contract | [SEMANTIC_CONTRACT.md](docs/SEMANTIC_CONTRACT.md) | — |
+| KG schema / quality contract | — | [KG_SCHEMA_CONTRACT.md](docs/KG_SCHEMA_CONTRACT.md) |
+| Метрики (сигналы, self-health) | [METRICS.md](docs/METRICS.md) | [METRICS.ru.md](docs/METRICS.ru.md) |
 | FAQ | [FAQ.md](docs/FAQ.md) | [FAQ.ru.md](docs/FAQ.ru.md) |
 | DR Plan | [DR.md](docs/DR.md) | — |
 | Golden eval set | [tests/golden/README.md](tests/golden/README.md) | — |

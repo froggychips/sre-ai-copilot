@@ -126,3 +126,18 @@ real services minus `expected_stale` infrastructure across all environments,
 including dev/preprod where topology is knowingly incomplete. A missing edge
 means "the relationship is unknown", not "there is no relationship" (see §7 in
 `KG_SCHEMA_CONTRACT.md`).
+
+## 7. Copilot self-health and diagnostics metrics (v1.0.4+)
+
+Exported on the API pod (`:8001/metrics`), scraped by `VMPodScrape sre-ai-copilot` (`k8s/monitoring.yaml`); alert rules live in `VMRule sre-ai-copilot`.
+
+| Metric | Type | Meaning |
+|---|---|---|
+| `copilot_self_health_status` | gauge | Overall verdict of the last self-health run: 0 ok, 1 warn, 2 fail |
+| `copilot_self_health_check_status{check}` | gauge | Per-check verdict (`sync_lag`, `schema_version`, `anomaly_signal_health`, `materialization_zero_rate`, …); `disabled` sources are excluded from the worst-of |
+| `copilot_self_health_last_run_timestamp` | gauge | Unix time of the last snapshot in Redis (`stats:self_health:last`) |
+| `diagnostic_facts_verdict_total{kind, verdict}` | counter | Facts by evidence verdict — the `unknown` share per kind is the direct measure of Known Unknowns (sources the copilot could not query) |
+| `diagnostic_facts_observed_total{kind, observed}` | counter | Legacy two-state counter, kept for dashboards |
+| `remediation_verification_total{outcome}` | counter | Outcomes of `remediation_verify`: `verified` / `failed` / `pending` / `unknown` |
+
+Alerts (`VMRule sre-ai-copilot`): `CopilotSelfHealthStale` (snapshot older than 2 intervals), `CopilotSelfHealthAbsent`, `CopilotSelfHealthFailing` (status 2), `CopilotSelfHealthWarnStuck` (status 1 for 6 h — its first real firing on 2026-09-06 was `anomaly_signal_health` on a stand under sustained load: legitimate), `CopilotApiDown` / `CopilotWorkerDown`, `CopilotPodCrashLooping`, `CopilotPostgresBackupFailed` / `Missing`, `CopilotCeleryBacklog`.

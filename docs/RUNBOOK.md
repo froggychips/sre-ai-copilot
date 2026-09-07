@@ -288,6 +288,8 @@ Audit log event types (filter by `event` field):
 | `K8S_BLOCKED_NO_APPROVAL` | `dry_run=False` called without `post_approval=True` |
 | `EXECUTOR_APPLIED` | Apply succeeded |
 | `EXECUTOR_APPLY_REFUSED` | Apply ineligible |
+| `EXECUTOR_APPLY_REFUSED_TARGET_REINCARNATED` | Live `uid` differs from the graph's `target_ref` — the object was re-created, write refused (v1.0.7) |
+| `EXECUTOR_VERIFY_VERIFIED` / `_FAILED` / `_PENDING` / `_UNKNOWN` | Delayed outcome check (`remediation_verify`, +5/+15 min) with `checks` and `reasons` (v1.0.7) |
 | `EXECUTOR_APPLY_EXCEPTION` | Unexpected exception in apply-service |
 | `EXECUTOR_DRY_RUN_FAILED` | Exception in `stage_executor` |
 
@@ -313,6 +315,8 @@ Diagnose in this order:
 4. Is the celery worker that runs `kg_metrics_sync` healthy? `celery -A app.celery_worker inspect active`.
 
 ### `sync_lag` fail for `kg_seq_logs_sync` (or any sync task)
+
+> **v1.0.4+:** every entry carries `last_status` — the `SourceStatus` of the task's last run (`success / partial / empty / unavailable / failed / invalid`). A heartbeat is written only on `success` / `partial`, so a task that ran and saw nothing shows lag *and* its status — «the source is dead» and «the source returned nothing» are different rows. A source switched off by configuration (e.g. `NATS_SUBJECTS_PARSER_ENABLED=false`) reports `status=disabled` and does not affect the overall verdict.
 
 What it means: the latest write timestamp for that source is more than 5× the expected interval old.
 
@@ -350,6 +354,16 @@ What it means: thresholds are too loose, or a new metric was added that's inhere
 
 Tune `KG_ANOMALY_ROBUST_Z_WARN` / `_CRIT` upward, or narrow the baseline window. The volume guard caps at 3/hour per (service, metric), so >500 over 24h implies the count is spread across many services — likely a global threshold issue, not a single hot service.
 
+
+### `anomaly_signal_health: N of M services anomalous >20h of 24` (v1.0.4+)
+
+The absolute «>500 observations» threshold above is retired: with 11 000+ services in the graph it was unreachable as a health signal. The check now measures **maturity**: the share of services that have been anomalous for more than 20 of the last 24 hours among all services with anomalies. Above 25 % → `warn` — the detector reports its own lag behind reality (the baseline does not know the new norm), not events.
+
+What to do:
+1. Look at which namespaces dominate — one stand under sustained load (e.g. a squad running bots, 30 of 59 «always-on» services on 2026-09-06) is a **legitimate** signal and resolves itself in days as the 7-day baseline absorbs the new level. Do not tune the threshold for it.
+2. If the always-on services are scattered and their deltas are tiny (`cpu_pct` 0.3 % → 0.8 % with `|z| ≈ 7`), the culprit is the per-metric spread floor (`MIN_ABS_SPREAD_BY_METRIC["cpu_pct"] = 0.02` p.p. vs `1.0` for `mem_pct`). Measured 2026-09-06: a floor of 1.0 p.p. removes 76 % of `cpu_pct` anomaly rows without changing the always-on share — a product decision, not an incident.
+3. Namespaces re-created under the same name inherit the previous stand's health history in the baseline — `namespace_lifecycle.purge_stale_health_after_reincarnation` handles that.
+
 ### `pod_events_link_rate <50%`
 
 What it means: more than half of `kg_pod_events` over the last 24h have `service_id IS NULL`.
@@ -363,6 +377,41 @@ What it means: too many `kg_service_edges` have `last_seen_at` older than 24h or
 Most likely cause: `kg_topology_sync` isn't running, isn't refreshing `last_seen_at`, or is upserting under a wrong identity. Check celery beat logs for the hourly run, and verify in DB that the latest `last_seen_at` advances on each run.
 
 ---
+
+## Incidents in the graph (`kg_incidents`, v1.0.6+)
+
+An incident is a deterministic object: at most one **open** incident per `(namespace, service)`, enforced by a partial unique index. Alerts attach on receipt (`/store`, `/enrich-and-forward`), the beat task `kg_incidents_lifecycle` closes them.
+
+```bash
+# open incidents, noise hidden (default)
+curl -s -H "Authorization: Bearer $JWT" "$API/kg/incidents?status=open" | jq '.incidents[] | {id, namespace, service, alert_count, severity, opened_at}'
+# include noise (KubeDeploymentGenerationMismatch with healthy replicas, meta-aggregates, rollout-in-progress)
+curl -s -H "Authorization: Bearer $JWT" "$API/kg/incidents?status=open&include_noise=true" | jq '.count'
+# timeline of one incident — six tables + operational memory + unknowns
+curl -s -H "Authorization: Bearer $JWT" "$API/kg/incidents/42/timeline" | jq '{counts, unknowns, memory}'
+```
+
+Reading the answer:
+- `unknowns` lists what could **not** be checked (service not in the graph → no deploys / pod events / anomalies / logs; no `incidents` rows → the analysis pipeline never ran for these alerts). An empty timeline with a non-empty `unknowns` is not «nothing happened».
+- `memory.outcome`: `action_verified` / `action_failed` / `action_pending` / `action_applied_unverified` / `resolved_without_action` / `resolved_without_analysis` / `open_without_*`.
+- `noise=true` means enrichment classified **every** alert of the incident as noise; a real alert clears the flag. Noise incidents stay in the table and are reachable by id.
+- An incident that keeps re-opening (`reopened_count`) is flapping — one incident, not N; look at the alert, not at the incident count.
+
+Data hygiene: after a release that changes attribution, run the matching script once from the worker, e.g. `python -m app.scripts.reattribute_job_alerts --apply` (moves `KubeJobFailed` from `vm-kube-state-metrics` to the Job's owner and rebuilds the affected incidents). Always dry-run first (no flag).
+
+## Remediation verification (v1.0.7+)
+
+`apply_intent` no longer ends at the kubectl exit code. Read `analysis` of the incident:
+
+| Field | Meaning |
+|---|---|
+| `executor_applied.identity_check` | `same` — live `uid` matched the graph's `target_ref`; `unknown:no_expected_uid` — nothing to compare with; `unknown:no_live_snapshot` — kubectl unavailable before the write |
+| `executor_applied.target_before` / `target_after` | live snapshots (`uid`, `generation`, `observed_generation`, `template_hash`, replicas); `unknown=true, reason` when unavailable |
+| `executor_applied.verification` | `{scheduled, attempt, delay_sec}` or `{scheduled: false, reason}` (`disabled`, `broker:*`, `apply_failed`) |
+| `executor_verification` | last check: `outcome`, `attempt`, `checks` (`same_identity`, `action_took_effect`, `converged`, `healthy`, `alert_resolved`, `new_crash_events`), `reasons`, `snapshot` |
+| `executor_state` | `applied` → `verified` / `verification_failed`; `pending` and `unknown` leave it unchanged |
+
+Refusal `target_reincarnated:*` means the object was re-created since the incident (graph `uid` ≠ live `uid`) — re-run the analysis on the current object rather than re-approving. Every check is `True / False / None`; `None` is «could not check», never «ok». Audit events: `EXECUTOR_APPLY_REFUSED_TARGET_REINCARNATED`, `EXECUTOR_VERIFY_VERIFIED / _FAILED / _PENDING / _UNKNOWN`. Settings: `REMEDIATION_VERIFY_ENABLED`, `REMEDIATION_VERIFY_DELAYS_SEC` (default `300,900`).
 
 ## Setting up Discord approvers
 

@@ -347,6 +347,26 @@ change. Baseline at v0.12.0: `docs/quality_report_baseline_2026_05_24.md`.
 
 ---
 
+## Why does a fact show `?` instead of `✓` or `✗`?
+
+Since v1.0.4 a fact has three outcomes. `✓` (`found`) — the rule found it. `✗` (`absent`) — the rule looked in a **live** source and found nothing, which is evidence of absence. `?` (`unknown`) — the rule **could not check**: the source failed, the deploy stream is stale, the service is not in the graph, the alert has no timestamp. Consumers treat `?` as «no evidence either way»: the critic never refutes a hypothesis with it, and Discord shows «❔ Deploy-связь не проверена» instead of staying silent. See `docs/SEMANTIC_CONTRACT.md` §5.1.
+
+## What is an incident in the graph, and why is mine marked `noise`?
+
+`kg_incidents` holds at most one open incident per `(namespace, service)`; alerts of that service attach to it, flapping re-opens it within 30 minutes instead of creating a new one, and it closes when every alert is resolved. `noise=true` means enrichment classified **all** of its alerts as noise — typically `KubeDeploymentGenerationMismatch` with healthy replicas (327 of ~390 weekly alerts on the live cluster), meta-aggregates or a rollout in progress. `GET /kg/incidents` hides those by default (`include_noise=true` shows them); a real alert on the same service clears the flag.
+
+## What do ✓ ◇ ≈ ⌛ ⚠ mean in the «Blast radius» field?
+
+They are epistemic labels from `app/knowledge_graph/epistemic.py`: ✓ observed (endpoints with ready pods, runtime), ◇ declared (read from a k8s manifest — Service, Ingress), ≈ inferred (env variable, secret name, naming convention), ⌛ stale (not confirmed for 7+ days), ⚠ contradicted (sources disagree — e.g. topology says «serves», endpoints say «zero ready pods»). An impacted service inherits the weakest link of its path. Note that every `calls` edge in the graph today is declared or inferred — there is no runtime observation of calls yet, so the field also says «callers may be incomplete».
+
+## Why was my Apply refused with `target_reincarnated`?
+
+Before writing, the executor snapshots the live object and compares its `uid` with the `target_ref` recorded in the graph at analysis time. A different `uid` means the Deployment was deleted and re-created under the same name after the incident — the analysis describes an object that no longer exists. Re-run the analysis on the current object; do not re-approve. If there was nothing to compare with, the write proceeds and `executor_applied.identity_check` says `unknown:*`. After the write a Celery task re-checks the outcome at +5 and +15 minutes (`executor_verification`).
+
+## Where do `KubeJobFailed` alerts land now?
+
+On the Job's owner, not on `vm-kube-state-metrics`. The `service` label of kube alerts is the metric exporter; the target is in `job_name`. Since v1.0.8 `resolve_store_service` looks the Job up in `kg_k8s_jobs` (owner of the Job, then of its CronJob by the `<cronjob>-<unix-minutes>` name pattern), falls back to the CronJob name, and only for ad-hoc Jobs keeps the Job name. Historical rows are moved by `python -m app.scripts.reattribute_job_alerts --apply`.
+
 ## Where do I report a bug?
 
 [GitHub Issues](https://github.com/froggychips/sre-ai-copilot/issues) or Telegram [@froggychips](https://t.me/froggychips).

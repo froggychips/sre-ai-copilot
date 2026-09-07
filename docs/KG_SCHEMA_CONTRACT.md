@@ -386,6 +386,27 @@ per-service метрику без взвешивания по `rps` и не пу
 
 ---
 
+## 6.7. Инциденты (`kg_incidents`, v1.0.6+)
+
+Инцидент — не узел графа и не ребро, а объект поверх `kg_alerts`: один
+открытый на `(namespace, service_name)`, инвариант держит частичный
+уникальный индекс `uq_kg_incidents_one_open_per_service`
+(`WHERE status = 'open'`). `incident_key = "<ns>/<service>@<opened_at>"`
+стабилен и хранится в `kg_alerts.incident_id` (до 1.0.6 эта колонка везде
+равнялась `fingerprint`, то есть «инцидент» был синонимом одного алерта).
+
+Колонки: `service_id` (FK `kg_services`, NULL = сервис в момент первого
+алерта в графе не нашёлся — timeline скажет об этом в `unknowns`), `status`
+(`open` / `resolved`), `severity` (максимум по алертам), `opened_at`,
+`last_alert_at`, `resolved_at`, `resolve_reason` (`all_alerts_resolved` /
+`aged_out`), `alert_count`, `alertnames` / `fingerprints` (JSON-списки),
+`reopened_count`, `noise` (все алерты классифицированы обогащением как шум;
+виды per-алерт в `extras.noise_fingerprints`), `extras`.
+
+На quality-метрики §7 инциденты не влияют и в `KG_SCHEMA_VERSION` не
+входят: это производный слой, а не топология. Контракт поведения — в
+`SEMANTIC_CONTRACT.md` §11.
+
 ## 7. Quality metrics
 
 `QUALITY_THRESHOLDS` фиксирует что считается «good KG»:

@@ -1,6 +1,6 @@
 # Semantic Contract
 
-This document describes the actual contract of the current implementation (v0.5.x) to synchronise the API, workers, and operations.
+This document describes the actual contract of the current implementation (v1.0.8) to synchronise the API, workers, and operations.
 
 ## 1. Incident Lifecycle Contract
 
