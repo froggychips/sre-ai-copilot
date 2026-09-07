@@ -12,6 +12,7 @@
 | `http_5xx_rate` / `p95_latency_ms` (per service) | `kg_service_health` | ASP.NET app `/metrics` | ❌ всегда 0 — блокировано WO-12483 |
 | `p95` / `p99` / `rps` / `error_4xx_rate` / `error_5xx_rate` (per ingress endpoint) | `kg_ingress_observations` | `nginx_ingress_controller_*` через VMPodScrape | ✅ live с 2026-06-10 |
 | Аномалии (robust-z) | `kg_anomaly_observations` | derived: `kg_service_health` + `kg_log_observations` | ✅ live |
+| `orleans_latency_avg_ms` / `orleans_timedout_rate` / `orleans_messaging_fault_rate` / `orleans_pings_missed_rate` / `orleans_activation_churn` (per grainhost-сервис) | `kg_service_health` | `microsoft_orleans_*` через `VMPodScrape town-grainhost` (в чарте, порт 8080) | ✅ live там, куда доехал чарт (24 ns на 07.09.2026; prod ждёт) — здоровье силоса, **не HTTP RED**; латентность средняя (гистограммы нет) |
 | `log_error_rate` | `kg_log_observations` | Seq REST API | ✅ live (лог-прокси, не HTTP) |
 | `health_score` | `kg_services.health_score` | composite из KG-сигналов | ✅ live (инфра-прокси, не user-facing) |
 
@@ -31,6 +32,10 @@
 Per-service `cpu_pct` / `mem_pct` / `restarts_rate` из `kube_*` / cAdvisor. Namespace-агрегированный PromQL (5 запросов на namespace вместо 5 на сервис — ~385 запросов суммарно против старых ~12300); резолв pod → service по longest-prefix-матчу против известных имён сервисов. Агрегация по нескольким pod одного сервиса: cpu/mem — mean, restarts — sum. Полностью нулевые ряды не вставляются (экспортёр не покрывает сервис). Идемпотентность по `UNIQUE(service_id, ts)`.
 
 Колонки `http_5xx_rate` и `p95_latency_ms` существуют и PromQL валиден, но они **всегда 0 до WO-12483** — см. §2.
+
+### `kg_service_health.orleans_*` ← `metrics_sync.py` (тот же beat, v1.0.9)
+
+Discovery раз в тик — `count by (namespace) (microsoft_orleans_orleans_app_requests_latency_count)` — затем шесть дополнительных PromQL только по namespace'ам с метером Orleans (24 из 231 на 07.09.2026), `by (pod)` и маппинг на сервисы как у cpu/mem. Латентность взвешена по числу вызовов между подами (`Σ rate(sum) / Σ rate(count)`, мс); четыре rate — в минуту: `app_requests_timedout`, сбои сообщений (`rerouted|rejected|expired|sent_failed|sent_dropped`), `messaging_pings_reply_missed` (прокси death-vote), churn активаций (`catalog_activation_created|destroyed|shutdown`). **Семантика нуля:** prometheus-net не отдаёт счётчик до первого инкремента, поэтому отсутствующая серия сбоев у сервиса, у которого *есть* `latency_count`, пишется как `0.0` (сбоев не было), а `NULL` значит «силоса нет вовсе». Детектор аномалий сканирует эти колонки как остальные (`MIN_ABS_SPREAD_BY_METRIC`: 50 мс, 0.5, 1.0, 0.5, 50/мин); critical-embed получает поле «🧬 Orleans silo» с последним значением, суточной базой и ⚠ при росте больше +50 %. Потребители: `queries.orleans_health_for`.
 
 ### `kg_ingress_observations` ← `ingress_observations_sync.py` (beat: `kg_ingress_observations_sync`, ~10 мин)
 

@@ -41,6 +41,7 @@ from .embed_builder import (
     _build_blast_radius_field,
     _build_deploy_correlation_field,
     _build_ingress_health_field,
+    _build_orleans_field,
     _build_log_error_rate_field,
     _build_nats_impact_field,
     _build_pod_trail_field,
@@ -2036,6 +2037,9 @@ class DiscordService:
             ingress_field = _build_ingress_health_field(head.ingress_health)
             if ingress_field:
                 fields.append(ingress_field)
+            orleans_field = _build_orleans_field(getattr(head, "orleans_health", None))
+            if orleans_field:
+                fields.append(orleans_field)
 
         # Generator link (Grafana) — если есть
         if incident.generator_url:

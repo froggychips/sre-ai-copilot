@@ -309,6 +309,18 @@ class ServiceHealth(Base):
     restarts_rate = Column(Float, nullable=True)
     http_5xx_rate = Column(Float, nullable=True)
     p95_latency_ms = Column(Float, nullable=True)
+    # Здоровье Orleans-силоса (v1.0.9). Источник — pull-скрейп `/metrics`
+    # town-grainhost'а (VMPodScrape в чарте, метер Microsoft.Orleans через
+    # prometheus-net). Отдельная семья колонок, а не подмена http_*/p95:
+    # это grain-вызовы и membership силоса, а не HTTP RED, и латентность
+    # здесь средняя (count+sum), гистограммы в скрейпе нет. NULL — у сервиса
+    # нет Orleans-метрик вовсе; 0.0 у счётчиков сбоев — «есть силос, сбоев
+    # не было» (prometheus-net не отдаёт счётчик до первого инкремента).
+    orleans_latency_avg_ms = Column(Float, nullable=True)
+    orleans_timedout_rate = Column(Float, nullable=True)        # /мин
+    orleans_messaging_fault_rate = Column(Float, nullable=True)  # rerouted+rejected+expired+sent_failed+sent_dropped, /мин
+    orleans_pings_missed_rate = Column(Float, nullable=True)     # pings_reply_missed, /мин — прокси death-vote
+    orleans_activation_churn = Column(Float, nullable=True)      # created+destroyed+shutdown, /мин
     source = Column(String, nullable=True)
 
     service = relationship("Service")

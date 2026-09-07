@@ -312,6 +312,50 @@ def _build_blast_radius_field(
     }
 
 
+def _build_orleans_field(
+    orleans: Optional[Dict[str, Any]],
+) -> Optional[Dict[str, Any]]:
+    """🧬 Orleans silo — здоровье силоса для critical embed (v1.0.9).
+
+    Принимает результат `queries.orleans_health_for(...)`: последний замер и
+    суточная база по пяти `orleans_*` метрикам. Рендерит одну строку
+    «сейчас (24ч)», рост больше +50 % помечает ⚠. Это grain-вызовы и
+    membership силоса, не HTTP RED — заголовок так и говорит. None, если у
+    сервиса нет Orleans-метрик: отсутствие поля честнее нулей.
+    """
+    if not orleans or not orleans.get("present"):
+        return None
+    latest = orleans.get("latest") or {}
+    base = orleans.get("baseline") or {}
+    deltas = orleans.get("deltas_pct") or {}
+
+    def _fmt(metric: str, label: str, unit: str, scale: float = 1.0, digits: int = 1) -> Optional[str]:
+        cur = latest.get(metric)
+        if cur is None:
+            return None
+        b = base.get(metric)
+        d = deltas.get(metric)
+        cur_s = f"{cur * scale:.{digits}f}"
+        base_s = f" (24ч {b * scale:.{digits}f})" if b is not None else ""
+        warn = " ⚠" if d is not None and d > 50.0 else ""
+        return f"{label} {cur_s}{unit}{base_s}{warn}"
+
+    parts = [x for x in (
+        _fmt("orleans_latency_avg_ms", "latency avg", " с", 0.001, 2),
+        _fmt("orleans_timedout_rate", "timeouts", "/мин"),
+        _fmt("orleans_messaging_fault_rate", "msg faults", "/мин"),
+        _fmt("orleans_pings_missed_rate", "pings missed", "/мин"),
+        _fmt("orleans_activation_churn", "activation churn", "/мин", 1.0, 0),
+    ) if x]
+    if not parts:
+        return None
+    return {
+        "name": "🧬 Orleans silo (grain-вызовы, не HTTP)",
+        "value": " · ".join(parts)[:1024],
+        "inline": False,
+    }
+
+
 def _build_ingress_health_field(
     ingress: Optional[Dict[str, Any]],
 ) -> Optional[Dict[str, Any]]:
