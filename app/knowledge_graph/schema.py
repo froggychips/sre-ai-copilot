@@ -855,6 +855,13 @@ class KGIncident(Base):
     alertnames = Column(JSON, nullable=True)
     fingerprints = Column(JSON, nullable=True)
     reopened_count = Column(Integer, nullable=False, default=0)
+    # Все алерты инцидента классифицированы обогащением как шум
+    # (gen-mismatch при здоровых репликах, meta-агрегаты, rollout-в-процессе).
+    # Инцидент остаётся — он честно случился, — но списки по умолчанию его
+    # скрывают. Замер 07.09.2026 в первые минуты после релиза: 7 из 13
+    # инцидентов — KubeDeploymentGenerationMismatch, 327 из ~390 алертов за
+    # неделю. Виды шума — в extras["noise_fingerprints"] по каждому алерту.
+    noise = Column(Boolean, nullable=False, default=False, server_default="false", index=True)
     extras = Column(JSON, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
