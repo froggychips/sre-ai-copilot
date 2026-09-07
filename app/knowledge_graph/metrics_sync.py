@@ -103,7 +103,7 @@ def _q_ns_p95_by_service(namespace: str) -> str:
     )
 
 
-# ── Orleans silo health (v1.0.9) ──────────────────────────────────────────
+# ── Orleans silo health (v1.0.9, уточнено в 1.0.10) ───────────────────────
 # Метер Microsoft.Orleans доезжает до VM pull'ом из чарта town-grainhost
 # (VMPodScrape, порт 8080). Запросы идут ТОЛЬКО по namespace'ам, где такие
 # серии есть (discovery — один запрос на тик): иначе 231 ns × 6 запросов
@@ -111,43 +111,70 @@ def _q_ns_p95_by_service(namespace: str) -> str:
 # считается взвешенно по подам уже в Python. Счётчики сбоев prometheus-net
 # не отдаёт до первого инкремента: отсутствие серии у сервиса с latency_count
 # = 0, а не NULL (см. _aggregate_service_metrics).
+#
+# ТОЛЬКО pull-серии. Тот же метер силосы ещё и пушат в push-gateway
+# (ns monitoring), и там он схлопывается: namespace = monitoring, pod =
+# push-gateway-*, job = имя пушера (`prod-kingdom5-wo-svc-town-5-grainhost`).
+# Без фильтра discovery находил «monitoring», а сумма ВСЕХ королевств (в том
+# числе прода) ложилась в граф как здоровье сервиса push-gateway: латентность
+# 52 с, 36 млн сбоев/мин. У pull-серий VM-operator ставит job = `<ns>/<scrape>`
+# — позитивный отбор по слэшу: если формат когда-нибудь сменится, Orleans
+# пропадёт целиком (orleans_namespaces=0 в stats), а не превратится в мусор.
 
 _ORLEANS = "microsoft_orleans_orleans_"
-_ORLEANS_FAULT_RE = "messaging_(rerouted|rejected|expired|sent_failed|sent_dropped)"
+_ORLEANS_PULL = 'job=~".+/.+"'
+# Сбои доставки. `messaging_rerouted` сюда НЕ входит: это пересылка сообщения
+# на другой силос (активация переехала, кэш директории устарел) — сообщение
+# доставлено, это стоимость, а не отказ. В preprod реранов 10–14 тыс./мин при
+# нуле настоящих сбоев; с ними в сумме 12 тыс. sent_failed в squad-14 были
+# неотличимы от фона.
+_ORLEANS_FAULT_RE = "messaging_(rejected|expired|sent_failed|sent_dropped)"
 _ORLEANS_CHURN_RE = "catalog_activation_(created|destroyed|shutdown)"
 
 
 def _q_orleans_namespaces() -> str:
-    return f'count by (namespace) ({_ORLEANS}app_requests_latency_count)'
+    return f'count by (namespace) ({_ORLEANS}app_requests_latency_count{{{_ORLEANS_PULL}}})'
 
 
 def _q_ns_orleans_latency_sum_by_pod(namespace: str) -> str:
-    return f'sum by (pod) (rate({_ORLEANS}app_requests_latency_sum{{namespace="{namespace}"}}[5m]))'
+    return (
+        f'sum by (pod) (rate({_ORLEANS}app_requests_latency_sum'
+        f'{{namespace="{namespace}",{_ORLEANS_PULL}}}[5m]))'
+    )
 
 
 def _q_ns_orleans_latency_count_by_pod(namespace: str) -> str:
-    return f'sum by (pod) (rate({_ORLEANS}app_requests_latency_count{{namespace="{namespace}"}}[5m]))'
+    return (
+        f'sum by (pod) (rate({_ORLEANS}app_requests_latency_count'
+        f'{{namespace="{namespace}",{_ORLEANS_PULL}}}[5m]))'
+    )
 
 
 def _q_ns_orleans_timedout_by_pod(namespace: str) -> str:
-    return f'sum by (pod) (rate({_ORLEANS}app_requests_timedout{{namespace="{namespace}"}}[5m])) * 60'
+    return (
+        f'sum by (pod) (rate({_ORLEANS}app_requests_timedout'
+        f'{{namespace="{namespace}",{_ORLEANS_PULL}}}[5m])) * 60'
+    )
 
 
 def _q_ns_orleans_faults_by_pod(namespace: str) -> str:
     return (
         f'sum by (pod) (rate({{__name__=~"{_ORLEANS}{_ORLEANS_FAULT_RE}",'
-        f'namespace="{namespace}"}}[5m])) * 60'
+        f'namespace="{namespace}",{_ORLEANS_PULL}}}[5m])) * 60'
     )
 
 
 def _q_ns_orleans_pings_missed_by_pod(namespace: str) -> str:
-    return f'sum by (pod) (rate({_ORLEANS}messaging_pings_reply_missed{{namespace="{namespace}"}}[5m])) * 60'
+    return (
+        f'sum by (pod) (rate({_ORLEANS}messaging_pings_reply_missed'
+        f'{{namespace="{namespace}",{_ORLEANS_PULL}}}[5m])) * 60'
+    )
 
 
 def _q_ns_orleans_churn_by_pod(namespace: str) -> str:
     return (
         f'sum by (pod) (rate({{__name__=~"{_ORLEANS}{_ORLEANS_CHURN_RE}",'
-        f'namespace="{namespace}"}}[5m])) * 60'
+        f'namespace="{namespace}",{_ORLEANS_PULL}}}[5m])) * 60'
     )
 
 
