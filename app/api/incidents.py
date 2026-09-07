@@ -32,9 +32,13 @@ def list_incidents(
     namespace: Optional[str] = None,
     service: Optional[str] = None,
     limit: int = Query(50, ge=1, le=500),
+    include_noise: bool = Query(False, description="Показывать инциденты из шумовых алертов"),
     db: Session = Depends(get_db),
 ) -> Dict[str, Any]:
     q = db.query(KGIncident)
+    if not include_noise:
+        # По умолчанию шум скрыт: он остаётся в БД и доступен по id и с флагом.
+        q = q.filter(KGIncident.noise.is_(False))
     if status:
         q = q.filter(KGIncident.status == status)
     if namespace:

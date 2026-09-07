@@ -13,7 +13,7 @@ from sqlalchemy.pool import StaticPool
 from app.api import incidents
 from app.auth import User, get_current_user
 from app.database import Base, get_db
-from app.knowledge_graph.incidents import attach_alert
+from app.knowledge_graph.incidents import attach_alert, mark_incident_noise
 from app.knowledge_graph.populator import upsert_service
 from app.knowledge_graph.schema import AlertEvent
 
@@ -104,3 +104,18 @@ def test_timeline_endpoint(db):
 def test_unknown_incident_is_404(db):
     assert _app(db).get("/kg/incidents/999").status_code == 404
     assert _app(db).get("/kg/incidents/999/timeline").status_code == 404
+
+
+def test_noise_incidents_hidden_by_default_and_shown_on_request(db):
+    inc = _seed(db)
+    mark_incident_noise(db, fingerprint="fp-1", kinds=["gen_mismatch"])
+    db.commit()
+    c = _app(db)
+    default = c.get("/kg/incidents").json()
+    assert [i["service"] for i in default["incidents"]] == ["auth"]      # town скрыт
+    shown = c.get("/kg/incidents", params={"include_noise": "true"}).json()
+    assert shown["count"] == 2
+    town = next(i for i in shown["incidents"] if i["service"] == "town-service")
+    assert town["noise"] is True and town["noise_kinds"] == ["gen_mismatch"]
+    # По id шумовой инцидент доступен всегда.
+    assert c.get(f"/kg/incidents/{inc.id}").json()["noise"] is True
