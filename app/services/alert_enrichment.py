@@ -504,6 +504,7 @@ def resolve_store_service(
     labels: Dict[str, str],
     *,
     legacy_default: Optional[str],
+    db: Optional[Session] = None,
 ) -> Optional[str]:
     """Резолв service-name для STORE-пути (kg_alerts) единообразно с enrichment.
 
@@ -534,6 +535,15 @@ def resolve_store_service(
         or labels.get("daemonset")
     ):
         _, target = _resolve_target_service_from_labels(labels)
+        if target:
+            return target
+    # Job/CronJob-алерты (KubeJobFailed): лейбл `service` — KSM, цель — в
+    # `job_name`. Владельца знает граф (kg_k8s_jobs.owner_service_name); без
+    # графа — имя CronJob из имени Job. Замер 07.09.2026: 66 алертов за 30
+    # дней все лежали на vm-kube-state-metrics.
+    if labels and labels.get("job_name"):
+        from app.knowledge_graph.job_attribution import resolve_job_target
+        target, _how = resolve_job_target(db, labels.get("namespace"), labels["job_name"])
         if target:
             return target
     return legacy_default
@@ -811,6 +821,13 @@ def enrich_alert(db: Session, incident: Incident) -> EnrichedContext:
     # alerts и игнорировал pod-hash-strip. Misattribute на vm-kube-state-metrics
     # =  330 alerts/week просачивались в #infra-error именно из-за этого.
     resolved_ns, resolved_svc = _resolve_target_service_from_labels(labels)
+    # Job-алерт: цель — владелец Job/CronJob из графа, а не имя конкретного
+    # запуска (`…-29779065`), которого в kg_services нет и не будет.
+    if resolved_svc and labels.get("job_name") == resolved_svc:
+        from app.knowledge_graph.job_attribution import resolve_job_target
+        owner, _how = resolve_job_target(db, resolved_ns or incident.namespace, resolved_svc)
+        if owner:
+            resolved_svc = owner
     # Если labels пустые/не дали target — fallback на incident.namespace.
     # Это уже не сервис-namespace, а namespace источника метрики (часто
     # `monitoring`), но без неё мы вообще ничего не найдём в KG.

@@ -51,6 +51,7 @@ def populate_from_incident(db: Session, incident: Incident) -> Dict[str, int]:
         legacy_default=(
             labels.get("service") or labels.get("app") or labels.get("deployment")
         ),
+        db=db,   # владелец Job/CronJob — из kg_k8s_jobs
     )
     namespace = incident.namespace
     if not (namespace and service_name):

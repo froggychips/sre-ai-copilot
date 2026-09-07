@@ -713,6 +713,7 @@ async def alertmanager_webhook_enrich_and_forward(
                         head_inc.labels.get("service")
                         or head_inc.labels.get("deployment")
                     ),
+                    db=db,
                 )
 
                 # A1: AM inhibit/silence gate. Если AM payload пришёл
@@ -837,6 +838,7 @@ async def alertmanager_webhook_enrich_and_forward(
                         legacy_default=(
                             inc.labels.get("service") or inc.labels.get("deployment")
                         ),
+                        db=db,
                     ),
                     duration_min=_resolved_duration_minutes(inc.starts_at, inc.ends_at),
                 )
