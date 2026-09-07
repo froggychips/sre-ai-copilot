@@ -49,6 +49,10 @@ The application consists of: an HTTP API (FastAPI), background tasks (Celery), a
 | `kg_nats_subjects_sync` | every 6h @ :43 | **Wave 7-Z**: parse C# monorepo → subject nodes + `uses_nats` edges с direction (off by default) |
 | `kg_jobs_sync` | every 15 min | **Wave 8-A (PR #82)**: k8s Job/CronJob → `kg_k8s_jobs` + `runs_as_job` linkage (через `owner_service_id` metadata column) |
 | `kg_storage_sync` | every 30 min | **Wave 8-B (PR #84)**: PVC/PV + `uses_volume` / `bound_to` edges в `kg_volume_edges` (heterogeneous Service↔PVC↔PV graph) |
+| `kg_deploy_watch` | every 5 min @ :03,:08… | **v1.0.4/1.0.5**: rollouts seen by the cluster — image or `spec.template` hash change (not `metadata.generation`, which HPA bumps) → exact `kg_deployments` rows (`namespace_scope=false`, `attribution=k8s_rollout`) |
+| `kg_health_retention` | daily | **v1.0.4**: batched purge of `kg_service_health`, anomaly / signal / ingress / log / cluster observations older than the retention window |
+| `kg_incidents_lifecycle` | every 5 min @ :04,:09… | **v1.0.6**: closes `kg_incidents` whose alerts are all resolved (`all_alerts_resolved`), ages out incidents silent for 7 days (`aged_out`) |
+| `remediation_verify` (not beat — `apply_async(countdown)`) | +5 min, +15 min after apply | **v1.0.7**: re-snapshots the target and assesses the outcome (`verified` / `failed` / `pending` / `unknown`) |
 
 ## 3. Data Flow (Webhook Incident Pipeline)
 
@@ -502,6 +506,37 @@ edge inventory — `docs/KG_SCHEMA_CONTRACT.md`.
   input.json + expected.json. **UX regression-guard**: любое изменение
   в discord/embed_builder валит diff. Update workflow:
   `UPDATE_SNAPSHOTS=1 pytest tests/test_discord_alert_gallery.py`.
+
+## 3f. Evidence & Incident Layer (v1.0.4 – v1.0.8)
+
+The deep review of 2026-09-05 (10 PRs, then a roadmap series) changed what the graph *means*, not only what it stores. Contracts live in [`SEMANTIC_CONTRACT.md`](SEMANTIC_CONTRACT.md) §5.1 and §11–§13.
+
+### SourceStatus — a sync that saw nothing is not a sync that ran
+Every data-source task returns `SourceStatus` ∈ `success / partial / empty / unavailable / failed / invalid` (`app/knowledge_graph/source_status.py`). Only `success` / `partial` write the beat heartbeat; the status itself is always written to Redis (`stats:beat:last_run:status:<task>`) and shown by the `sync_lag` self-health check as `last_status`. A source switched off by configuration reports `disabled` instead of `warn`. Guard: `tests/test_data_sources_are_watched.py::test_every_data_source_declares_its_status`.
+
+### Evidence contract — three outcomes, not two
+`Fact.verdict` ∈ `found / absent / unknown`. `unknown` is produced only by `Fact.unknown(kind, reason)` (confidence forced to 0, `epistemic=unknown`, `unknown_reason` mandatory). Every `Rule` declares `sources` — the ctx fields it depends on — and `Rule.run()` demotes `absent` to `unknown` when any of them is listed in `ctx["source_status"]`; `found` is never demoted. `alert_enrichment.enrich_alert` fills `source_status` on query exceptions, on a stale deploy stream (`deploy_stream_freshness().stale`, now also in the per-service path) and when the service is not in the graph. Consumers must distinguish: `absent` may refute a hypothesis, `unknown` must not (`fact_critic` skips unknown anchors; `to_prompt_context()` renders `?` with a warning). Deploy attribution became evidence: `recent_deploys_for*` return `attribution_scope` (`service` / `namespace` / `unknown`) — an exact record is `observed 0.95`, an ns-broadcast `inferred 0.6`.
+
+### Workload identity — `k8s_uid` and `incarnation`
+`kg_services.k8s_uid`, `incarnation`, `incarnation_changed_at`: a Deployment re-created under the same name is a different object; `incarnation` increments inside `ON CONFLICT` when the uid changes. `TargetRef.uid / incarnation` carry it into remediation.
+
+### `kg_deploy_watch` — rollouts seen by the cluster
+The second source of `kg_deployments`: a Redis snapshot of every workload (`uid`, `template_hash = sha256(spec.template)`, images); a rollout is a change of images or template hash — **not** `metadata.generation`, which HPA and annotation writers bump every tick (the 1.0.4 hotfix: 10 064 false rows on 776 services in 40 minutes). Rows land on the service node with `namespace_scope=false`, so `stale_class='active'` became reachable (0 → 77 services).
+
+### Incident — one open incident per service
+`kg_incidents` (`app/knowledge_graph/incidents.py`): `attach_alert` joins a firing alert to the open incident of its service, re-opens one resolved less than 30 minutes ago (`reopened_count`), or opens a new one; the invariant «≤ 1 open per (namespace, service)» is a **partial unique index**, not application code. `kg_alerts.incident_id` holds the `incident_key` (`ns/service@time`). `reconcile_incidents` (beat) resolves when every alert is resolved and ages out after 7 silent days. `noise=true` when enrichment classified all of the incident's alerts as noise (gen-mismatch / meta / rollout, per-alert kinds in `extras.noise_fingerprints`); a real alert clears the flag; `GET /kg/incidents` hides noise unless `include_noise=true`. Cross-service correlation is deliberately out of scope until a month of data exists — it will be edges between incidents, never a relaxation of the invariant.
+
+### Timeline — six tables on one axis, plus what the copilot did
+`incident_timeline.build_timeline`: incident, alerts, deployments (with attribution as evidence), pod events, anomalies (bucketed per metric·hour, always `inferred`), error-level logs in `[opened − 60 min, (resolved | now) + 30 min]`, sorted by time then causal kind order. **Operational memory** (v1.0.8) continues the same axis from `incidents.analysis` and `kg_remediation_decisions` joined by fingerprint: `evidence` (facts by verdict), `diagnosis` (`inferred`), `decision` (`declared`), `action.applied` (`observed`), `verification` (`observed` for verified/failed, `unknown` for pending); `memory.outcome` distinguishes `action_verified`, `action_applied_unverified`, `resolved_without_action`, `resolved_without_analysis`. `unknowns` names sources that could not be queried — an empty lane is never silently «nothing happened».
+
+### Blast radius — who breaks if X breaks
+`blast_radius.blast_radius_v2`: BFS *against* `calls` / `uses_db` / `uses_nats` / `serves_traffic` up to two hops; every edge is classified by `epistemic.classify_edge` (sources ∪ `discovered_by`, freshness, contradictions such as `serves_traffic` with `endpoints_ready == 0`); an impacted node inherits the weakest link of its path, `contradicted` anywhere marks the whole path. `unknowns`: no `calls` edges at all («unknown, not absent»), callers known only from manifests/env (all `calls` in the graph are declared/inferred — no runtime observation yet), `inactive` edges skipped, horizon, contradicted paths. Legacy `blast_radius_for` keys are preserved for the Discord embed, which now shows an epistemic legend (✓ ◇ ≈ ⌛ ⚠).
+
+### Remediation verification — same target, took effect, got better
+`remediation/verification.py`: before the write `snapshot_target` reads the live object (`uid`, `generation`, `observedGeneration`, `sha256(spec.template)`, replicas) through the read-only `kubectl get` path of `kubectl_breaker.run_kubectl`; if the graph's `target_ref.uid` differs, `apply_intent` refuses (`target_reincarnated`). A second snapshot follows the write; both live in `executor_applied`. `schedule_verification` enqueues `remediation_verify` at +5 and +15 minutes (`REMEDIATION_VERIFY_DELAYS_SEC`); `assess()` checks identity, effect (template/generation for restart, replicas for scale), convergence, health, alert resolution and new CrashLoop/OOM pod events; outcome → `executor_state` `verified` / `verification_failed`; every check is `True / False / None`, and `None` means «could not check», never «ok».
+
+### Self-health in metrics
+`SelfHealthCollector` exports `copilot_self_health_status`, `copilot_self_health_check_status{check}`, `copilot_self_health_last_run_timestamp` from the Redis snapshot; `VMPodScrape` + `VMRule sre-ai-copilot` (`k8s/monitoring.yaml`) alert on stale/absent/failing/warn-stuck checks. Counters `diagnostic_facts_verdict_total{kind, verdict}` and `remediation_verification_total{outcome}` measure Known Unknowns and verification outcomes directly.
 
 ## 4. Fact-Anchored Reasoning
 

@@ -49,6 +49,10 @@
 | `kg_nats_subjects_sync` | каждые 6h @ :43 | **Wave 7-Z**: парсит C# monorepo → subject-узлы + edges `uses_nats` с direction (off by default) |
 | `kg_jobs_sync` | каждые 15 мин | **Wave 8-A (PR #82)**: k8s Job/CronJob → `kg_k8s_jobs` + `runs_as_job` (через `owner_service_id` metadata column) |
 | `kg_storage_sync` | каждые 30 мин | **Wave 8-B (PR #84)**: PVC/PV + edges `uses_volume` / `bound_to` в `kg_volume_edges` (heterogeneous Service↔PVC↔PV граф) |
+| `kg_deploy_watch` | каждые 5 мин @ :03,:08… | **v1.0.4/1.0.5**: выкаты, увиденные кластером — смена образа или hash `spec.template` (не `metadata.generation`, его крутит HPA) → точные записи `kg_deployments` (`namespace_scope=false`, `attribution=k8s_rollout`) |
+| `kg_health_retention` | ежедневно | **v1.0.4**: батчевая чистка `kg_service_health`, anomaly / signal / ingress / log / cluster observations старше окна хранения |
+| `kg_incidents_lifecycle` | каждые 5 мин @ :04,:09… | **v1.0.6**: закрывает `kg_incidents`, у которых все алерты resolved (`all_alerts_resolved`), старит молчащие 7 дней (`aged_out`) |
+| `remediation_verify` (не beat — `apply_async(countdown)`) | +5 мин, +15 мин после apply | **v1.0.7**: повторный снимок цели и оценка исхода (`verified` / `failed` / `pending` / `unknown`) |
 
 ## 3. Поток данных (Webhook-инцидент)
 
@@ -438,6 +442,37 @@ baseline-снимков перед remediation-волной.
   + раннер `tests/test_discord_alert_gallery.py`. UX regression-guard:
   любое изменение в discord/embed_builder валит diff. Update workflow:
   `UPDATE_SNAPSHOTS=1 pytest tests/test_discord_alert_gallery.py`.
+
+## 3f. Слой свидетельств и инцидентов (v1.0.4 – v1.0.8)
+
+Глубокое ревью 05.09.2026 (10 PR, затем серия roadmap) изменило то, что граф *означает*, а не только то, что хранит. Контракты — в [`SEMANTIC_CONTRACT.md`](SEMANTIC_CONTRACT.md) §5.1 и §11–§13.
+
+### SourceStatus — синк, который ничего не увидел, не считается отработавшим
+Каждая задача-источник возвращает `SourceStatus` ∈ `success / partial / empty / unavailable / failed / invalid` (`app/knowledge_graph/source_status.py`). Heartbeat пишут только `success` / `partial`; сам статус пишется в Redis всегда (`stats:beat:last_run:status:<task>`) и показывается проверкой `sync_lag` как `last_status`. Источник, выключенный настройкой, отдаёт `disabled`, а не `warn`. Сторож: `tests/test_data_sources_are_watched.py::test_every_data_source_declares_its_status`.
+
+### Evidence-контракт — три исхода, не два
+`Fact.verdict` ∈ `found / absent / unknown`. `unknown` порождается только `Fact.unknown(kind, reason)` (confidence принудительно 0, `epistemic=unknown`, `unknown_reason` обязателен). Каждое `Rule` объявляет `sources` — поля ctx, от которых зависит ответ, — а `Rule.run()` понижает `absent` до `unknown`, если любой из них помечен в `ctx["source_status"]`; `found` не понижается никогда. `alert_enrichment.enrich_alert` заполняет `source_status` при исключении запроса, при мёртвом потоке деплоев (`deploy_stream_freshness().stale`, теперь и в сервисном пути) и когда сервиса нет в графе. Потребители обязаны различать: `absent` может опровергать гипотезу, `unknown` — нет (`fact_critic` пропускает unknown-якоря; `to_prompt_context()` рисует `?` с предупреждением). Привязка деплоя стала свидетельством: `recent_deploys_for*` отдают `attribution_scope` (`service` / `namespace` / `unknown`) — точная запись `observed 0.95`, ns-broadcast `inferred 0.6`.
+
+### Идентичность workload'а — `k8s_uid` и `incarnation`
+`kg_services.k8s_uid`, `incarnation`, `incarnation_changed_at`: Deployment, пересозданный под тем же именем, — другой объект; `incarnation` растёт внутри `ON CONFLICT` при смене uid. `TargetRef.uid / incarnation` несут это в remediation.
+
+### `kg_deploy_watch` — выкаты, увиденные кластером
+Второй источник `kg_deployments`: Redis-снимок каждого workload'а (`uid`, `template_hash = sha256(spec.template)`, образы); выкат — смена образов или hash шаблона, а **не** `metadata.generation`, который HPA и внешние аннотации крутят каждый тик (hotfix 1.0.5: 10 064 ложных записей на 776 сервисов за 40 минут). Записи ложатся на service-узел с `namespace_scope=false`, поэтому `stale_class='active'` стал достижим (0 → 77 сервисов).
+
+### Incident — один открытый инцидент на сервис
+`kg_incidents` (`app/knowledge_graph/incidents.py`): `attach_alert` присоединяет firing-алерт к открытому инциденту сервиса, переоткрывает закрытый меньше 30 минут назад (`reopened_count`) или заводит новый; инвариант «≤ 1 открытого на (namespace, service)» — **частичный уникальный индекс**, а не код приложения. `kg_alerts.incident_id` хранит `incident_key` (`ns/service@время`). `reconcile_incidents` (beat) закрывает, когда все алерты resolved, и старит после 7 дней тишины. `noise=true`, когда обогащение сочло все алерты инцидента шумом (gen-mismatch / meta / rollout, виды per-алерт в `extras.noise_fingerprints`); настоящий алерт снимает флаг; `GET /kg/incidents` скрывает шум без `include_noise=true`. Корреляция между сервисами намеренно вне scope до месяца данных — она придёт рёбрами между инцидентами, а не размытием инварианта.
+
+### Timeline — шесть таблиц на одной оси, плюс что копилот сделал
+`incident_timeline.build_timeline`: инцидент, алерты, деплои (привязка как свидетельство), события подов, аномалии (по метрике и часу, всегда `inferred`), логи error-уровня в окне `[opened − 60 мин, (resolved | now) + 30 мин]`, порядок — по времени, при равном — причина раньше следствия. **Операционная память** (v1.0.8) продолжает ту же ось из `incidents.analysis` и `kg_remediation_decisions` по fingerprint: `evidence` (факты по вердиктам), `diagnosis` (`inferred`), `decision` (`declared`), `action.applied` (`observed`), `verification` (`observed` для verified/failed, `unknown` для pending); `memory.outcome` различает `action_verified`, `action_applied_unverified`, `resolved_without_action`, `resolved_without_analysis`. `unknowns` называет источники, которые опросить было нечем — пустая полоса никогда молча не равна «ничего не было».
+
+### Blast radius — что сломается, если X сломается
+`blast_radius.blast_radius_v2`: BFS *против* `calls` / `uses_db` / `uses_nats` / `serves_traffic` до двух шагов; каждое ребро классифицирует `epistemic.classify_edge` (источники ∪ `discovered_by`, свежесть, противоречия вроде `serves_traffic` с `endpoints_ready == 0`); пострадавший наследует слабейшее звено пути, `contradicted` на любом ребре помечает весь путь. `unknowns`: нет рёбер `calls` («неизвестны, а не отсутствуют»), вызывающие известны лишь из манифестов/env (все `calls` в графе declared/inferred — runtime-наблюдений пока нет), пропущенные `inactive`, горизонт, противоречивые пути. Старые ключи `blast_radius_for` сохранены для Discord-embed, который теперь показывает эпистемическую легенду (✓ ◇ ≈ ⌛ ⚠).
+
+### Верификация remediation — та же цель, сработало, стало лучше
+`remediation/verification.py`: перед записью `snapshot_target` читает живой объект (`uid`, `generation`, `observedGeneration`, `sha256(spec.template)`, реплики) через read-only `kubectl get` в `kubectl_breaker.run_kubectl`; если `target_ref.uid` из графа отличается — `apply_intent` отказывает (`target_reincarnated`). Второй снимок — после записи; оба в `executor_applied`. `schedule_verification` ставит `remediation_verify` на +5 и +15 минут (`REMEDIATION_VERIFY_DELAYS_SEC`); `assess()` проверяет идентичность, эффект (шаблон/generation для рестарта, реплики для scale), сходимость, здоровье, резолв алерта и новые CrashLoop/OOM-события подов; исход → `executor_state` `verified` / `verification_failed`; каждая проверка — `True / False / None`, и `None` значит «не смогли проверить», а не «ок».
+
+### Self-health в метриках
+`SelfHealthCollector` экспортирует `copilot_self_health_status`, `copilot_self_health_check_status{check}`, `copilot_self_health_last_run_timestamp` из Redis-снимка; `VMPodScrape` + `VMRule sre-ai-copilot` (`k8s/monitoring.yaml`) алертят на протухшие/отсутствующие/упавшие/зависшие в warn проверки. Счётчики `diagnostic_facts_verdict_total{kind, verdict}` и `remediation_verification_total{outcome}` измеряют Known Unknowns и исходы верификации напрямую.
 
 ## 4. Fact-Anchored Reasoning (рассуждение на основе фактов)
 

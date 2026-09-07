@@ -1,6 +1,8 @@
 # Документация по модулям
 
 ## API-слой
+- `app/api/incidents.py`: `GET /kg/incidents` (`status`, `namespace`, `service`, `include_noise`; шум скрыт по умолчанию), `GET /kg/incidents/{id}` (с алертами), `GET /kg/incidents/{id}/timeline` (`incident_timeline.build_timeline`). Подключён с router-level `get_current_user`.
+- `app/api/kg_graph.py`: `GET /kg/blast-radius?namespace=&service=&hops=&limit=&include_inactive=` → `blast_radius.blast_radius_v2`; 404, если цели нет в графе.
 - `app/main.py`: инициализация FastAPI, middleware, роутеры, health/readiness, async job endpoints.
 - `app/api/webhooks.py`: endpoint для AlertManager webhook и статус фоновой задачи.
 - `app/api/replay.py`: повторный запуск анализа по историческому `incident_id`.
@@ -26,7 +28,8 @@
 
 ## Движок диагностики
 - `app/diagnostics/engine.py`: `DiagnosticsEngine` — оценивает все зарегистрированные правила против k8s-контекста, применяет conflict signals через `_apply_conflict_signals()`, возвращает заполненный `FactStore`.
-- `app/diagnostics/facts.py`: `FactKind` (канонические слаги), `Fact`, `FactStore`, `MUTUALLY_EXCLUSIVE_PAIRS`, `FactStore.conflicts()`, `FactStore.to_prompt_context()`.
+- `app/diagnostics/facts.py`: `FactKind`, `Fact`, `FactStore`, `Verdict`. **Evidence-контракт (v1.0.4)**: `Fact.verdict` ∈ `found` / `absent` / `unknown`; `Fact.unknown(kind, reason)` — единственный способ породить `unknown` (confidence принудительно 0, `epistemic=unknown`, `unknown_reason` обязателен); `epistemic` / `provenance` / `window_min` / `data_age_min`; `FactStore.unknown_kinds()`; `to_prompt_context()` рисует `✓ / ✗ / ?` и предупреждает критика, что `?` — не опровержение.
+- `app/diagnostics/rules/base.py`: `Rule.sources` (поля ctx, от которых зависит правило) и `Rule.run()` = `evaluate()` + понижение `absent` → `unknown`, если объявленный источник помечен в `ctx["source_status"]`; `Rule.source_problem()`. Сторож: `tests/test_evidence_contract.py`.
 - `app/diagnostics/rules/oom.py`: `OOMKilledRule` — сначала структурный шлюз (`_check_pod_state()`), text-regex fallback только при отсутствии exit code; возвращает `observed=False` если целевой exit ≠ 0 и ≠ 137.
 - `app/diagnostics/rules/crash.py`: `ProcessCrashRule` — детектирует SIGSEGV/SIGABRT/ненулевые exit codes.
 - `app/diagnostics/rules/crashloop.py`: `CrashLoopRule` — детектирует состояние CrashLoopBackOff.
@@ -108,6 +111,9 @@
 - `backfill_team_owner.py` — one-shot UPDATE `team_owner` для legacy строк.
 - `backfill_tc_deploys.py` — расширенный TC history backfill (default 30 дней).
 - `cleanup_drift.py` — thin wrapper над `drift_cleanup.py` для ручного dry-run / apply.
+- `cleanup_false_rollouts.py` — удаляет записи `k8s_rollout`, которые watcher 1.0.4 писал по росту `metadata.generation` (образы не менялись); dry-run по умолчанию.
+- `reattribute_deploys.py` — переатрибутирует ns-broadcast записи `kg_deployments` на точные цели по build properties TeamCity (`--apply --limit-builds N`).
+- `reattribute_job_alerts.py` — переносит `KubeJobFailed` / `KubeJobNotCompleted` с `vm-kube-state-metrics` на владельца Job/CronJob (`job_attribution`), ужимает или удаляет опустевшие KSM-инциденты и присоединяет алерты к инциденту владельца; dry-run по умолчанию, `--apply` для переноса.
 
 ### Metrics sync (`app/knowledge_graph/metrics_sync.py`)
 - `sync_service_health()` — каждые 5 мин, выполняет пять PromQL-запросов на сервис (`cpu_pct`, `mem_pct`, `restarts_rate`, `http_5xx_rate`, `p95_latency_ms`) против VictoriaMetrics и upsert'ит в `kg_service_health`.
@@ -207,6 +213,36 @@
 - **Dedup:** 6-часовое окно на check на уровне beat-задачи — один и тот же failing canary не репостится, пока не сменит статус или не пройдут 6 ч.
 - **Как добавить новую проверку:** написать функцию `_check_X(db) -> CheckResult` и добавить в список `ALL_CHECKS`. Каждая проверка read-only и самостоятельная.
 - **Конфигурация:** пороги — константы в модуле; Discord-webhook берётся из `settings.DISCORD_WEBHOOK_SELF_HEALTH_URL` (None отключает Discord-вывод, audit-log остаётся).
+
+
+## Свидетельства и инциденты (v1.0.4 – v1.0.8)
+
+### Source status (`app/knowledge_graph/source_status.py`)
+`SourceStatus` ∈ `success / partial / empty / unavailable / failed / invalid`; `mark()` / `status_of()` / `status_from_counts()`. `_record_beat_heartbeat` пишет heartbeat только для `success` / `partial`, статус — всегда (`stats:beat:last_run:status:<task>`); `self_health.check_sync_lag` показывает его как `last_status` и отдаёт `disabled` для источников, выключенных настройками.
+
+### Deploy watch (`app/knowledge_graph/k8s_deploy_watch.py`)
+`watch_k8s_rollouts`: Redis-снимок `kg:workload_revisions` (uid, `template_hash`, образы); выкат = смена образов или hash `spec.template` (никогда `metadata.generation`); ключ дедупа `uid:template_hash`; записи ложатся на service-узел с `attribution=k8s_rollout`, `namespace_scope=false`, `rollout_reason` ∈ `image` / `template`.
+
+### Инциденты (`app/knowledge_graph/incidents.py`)
+`attach_alert` (открытый → переоткрытие в `REOPEN_WINDOW_MIN=30` → новый; идемпотентно по fingerprint; проставляет `kg_alerts.incident_id`), `reconcile_incidents` (`all_alerts_resolved` / `aged_out` после `AGE_OUT_HOURS=168`), `mark_incident_noise` (виды per-алерт в `extras.noise_fingerprints`, `noise = все алерты шумовые`), `incident_to_dict`. Модель `KGIncident` (`kg_incidents`) с частичным уникальным индексом `uq_kg_incidents_one_open_per_service`.
+
+### Timeline инцидента (`app/knowledge_graph/incident_timeline.py`)
+`build_timeline(db, incident)` → `{incident, window, events[], counts, unknowns[], memory}`; событие = `{ts, kind, title, details, evidence: {epistemic, provenance}}`; виды: `incident.opened`, `deploy`, `pod_event`, `anomaly`, `log_errors`, `alert.fired`, `evidence`, `diagnosis`, `decision`, `action.applied`, `verification`, `alert.resolved`, `incident.resolved`. `LOOKBACK_MIN=60`, `LOOKAHEAD_MIN=30`.
+
+### Blast radius (`app/knowledge_graph/blast_radius.py`)
+`blast_radius_v2(db, ns, service, max_hops=2, limit=200, include_inactive=False)`: надмножество `queries.blast_radius_for` + `target`, `impact[]` (`service, via, hops, path, epistemic, badge, edge_epistemic, reasons, conflicts`), `summary`, `unknowns[]`. Использует `epistemic.classify_edge` / `find_edge_contradictions`.
+
+### Атрибуция job'ов (`app/knowledge_graph/job_attribution.py`)
+`resolve_job_target(db, ns, job_name)` → `(target, how)`, `how` ∈ `job_owner / cronjob_owner / cronjob_name / job_name`; `cronjob_base_name` срезает суффикс `-<unix-минуты>` (≥ 8 цифр). Используется в `resolve_store_service` (store-путь, ключ дедупа, resolved-notice) и `enrich_alert`.
+
+### Health retention (`app/knowledge_graph/health_retention.py`)
+`RETENTION_TARGETS` (шесть таблиц наблюдений) чистятся батчами задачей `kg_health_retention`.
+
+### Self-health в метриках (`app/knowledge_graph/self_health_metrics.py`)
+`publish_snapshot` / `read_snapshot` (Redis `stats:self_health:last`), `SelfHealthCollector` (prometheus_client Collector), регистрируется на старте API; `k8s/monitoring.yaml` содержит `VMPodScrape` + `VMRule sre-ai-copilot`.
+
+### Верификация remediation (`app/remediation/verification.py`)
+`TargetSnapshot`, `snapshot_target(intent)` (read-only `kubectl get -o json` через `kubectl_breaker.run_kubectl`), `expected_identity(db, incident_id)` (последний `kg_remediation_decisions.target_ref`), `identity_mismatch` / `identity_check`, `schedule_verification` (Celery `remediation_verify`, `REMEDIATION_VERIFY_DELAYS_SEC`), `assess()` (чистая), `verify_remediation()` → `analysis["executor_verification"]`, `executor_state` `verified` / `verification_failed`, audit `EXECUTOR_VERIFY_<OUTCOME>`, метрика `remediation_verification_total`.
 
 ## Данные и персистентность
 - `app/database.py`, `app/db/*`: engine/session helpers и интеграция БД.

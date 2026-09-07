@@ -124,3 +124,18 @@ owner-coverage с 99.5% до ~50% в день выката — регресси�
 `expected_stale`-инфраструктуры по всем контурам, включая dev/preprod, где
 топология заведомо неполна. Отсутствие ребра означает «связь неизвестна», а
 не «связи нет» (см. §7 в `KG_SCHEMA_CONTRACT.md`).
+
+## 7. Метрики self-health и диагностики копилота (v1.0.4+)
+
+Экспортируются на поде API (`:8001/metrics`), скрейпятся `VMPodScrape sre-ai-copilot` (`k8s/monitoring.yaml`); правила алертов — в `VMRule sre-ai-copilot`.
+
+| Метрика | Тип | Смысл |
+|---|---|---|
+| `copilot_self_health_status` | gauge | Общий вердикт последнего прогона self-health: 0 ok, 1 warn, 2 fail |
+| `copilot_self_health_check_status{check}` | gauge | Вердикт по проверке (`sync_lag`, `schema_version`, `anomaly_signal_health`, `materialization_zero_rate`, …); источники `disabled` в худший-из не входят |
+| `copilot_self_health_last_run_timestamp` | gauge | Unix-время последнего снимка в Redis (`stats:self_health:last`) |
+| `diagnostic_facts_verdict_total{kind, verdict}` | counter | Факты по вердикту свидетельства — доля `unknown` по kind напрямую меряет Known Unknowns (источники, которые копилот не смог опросить) |
+| `diagnostic_facts_observed_total{kind, observed}` | counter | Старый двузначный счётчик, оставлен ради дашбордов |
+| `remediation_verification_total{outcome}` | counter | Исходы `remediation_verify`: `verified` / `failed` / `pending` / `unknown` |
+
+Алерты (`VMRule sre-ai-copilot`): `CopilotSelfHealthStale` (снимок старше 2 интервалов), `CopilotSelfHealthAbsent`, `CopilotSelfHealthFailing` (статус 2), `CopilotSelfHealthWarnStuck` (статус 1 в течение 6 ч — первое боевое срабатывание 06.09.2026 было по `anomaly_signal_health` на стенде под длительной нагрузкой: легитимно), `CopilotApiDown` / `CopilotWorkerDown`, `CopilotPodCrashLooping`, `CopilotPostgresBackupFailed` / `Missing`, `CopilotCeleryBacklog`.

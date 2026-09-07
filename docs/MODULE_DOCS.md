@@ -1,6 +1,8 @@
 # Module Documentation
 
 ## API Layer
+- `app/api/incidents.py`: `GET /kg/incidents` (`status`, `namespace`, `service`, `include_noise`; noise hidden by default), `GET /kg/incidents/{id}` (with alerts), `GET /kg/incidents/{id}/timeline` (`incident_timeline.build_timeline`). Mounted with router-level `get_current_user`.
+- `app/api/kg_graph.py`: `GET /kg/blast-radius?namespace=&service=&hops=&limit=&include_inactive=` → `blast_radius.blast_radius_v2`; 404 when the target is not in the graph.
 - `app/main.py`: FastAPI init, middleware, routers, health/readiness, async job endpoints.
 - `app/api/webhooks.py`: AlertManager webhook endpoint and background task status.
 - `app/api/replay.py`: Re-run analysis for a historical `incident_id`.
@@ -26,7 +28,8 @@
 
 ## Diagnostic Engine
 - `app/diagnostics/engine.py`: `DiagnosticsEngine` — evaluates all registered rules against k8s context, applies conflict signals via `_apply_conflict_signals()`, returns a populated `FactStore`.
-- `app/diagnostics/facts.py`: `FactKind` (canonical slugs), `Fact`, `FactStore`, `MUTUALLY_EXCLUSIVE_PAIRS`, `FactStore.conflicts()`, `FactStore.to_prompt_context()`.
+- `app/diagnostics/facts.py`: `FactKind`, `Fact`, `FactStore`, `Verdict`. **Evidence contract (v1.0.4)**: `Fact.verdict` ∈ `found` / `absent` / `unknown`; `Fact.unknown(kind, reason)` is the only way to produce `unknown` (confidence forced to 0, `epistemic=unknown`, `unknown_reason` mandatory); `epistemic` / `provenance` / `window_min` / `data_age_min`; `FactStore.unknown_kinds()`; `to_prompt_context()` renders `✓ / ✗ / ?` and warns the critic that `?` is not a refutation.
+- `app/diagnostics/rules/base.py`: `Rule.sources` (ctx fields the rule depends on) and `Rule.run()` = `evaluate()` + demotion of `absent` → `unknown` when a declared source is listed in `ctx["source_status"]`; `Rule.source_problem()`. Guard: `tests/test_evidence_contract.py`.
 - `app/diagnostics/rules/oom.py`: `OOMKilledRule` — structured gate first (`_check_pod_state()`), text-regex fallback only when target pod has no exit code data; returns `observed=False` if target exit ≠ 0 and ≠ 137.
 - `app/diagnostics/rules/crash.py`: `ProcessCrashRule` — detects SIGSEGV/SIGABRT/non-zero exit codes.
 - `app/diagnostics/rules/crashloop.py`: `CrashLoopRule` — detects CrashLoopBackOff state.
@@ -112,6 +115,9 @@ Read-side API used by enrichment + MCP tools:
 - `backfill_team_owner.py` — one-shot UPDATE of `kg_services.team_owner` for legacy rows.
 - `backfill_tc_deploys.py` — extended TC history backfill (default 30 days, limit 1000).
 - `cleanup_drift.py` — thin wrapper over `drift_cleanup.py` for manual run / dry-run preview.
+- `cleanup_false_rollouts.py` — removes `k8s_rollout` rows written by the 1.0.4 watcher from `metadata.generation` growth (images unchanged); dry-run by default.
+- `reattribute_deploys.py` — re-attributes ns-broadcast `kg_deployments` rows to exact targets from TeamCity build properties (`--apply --limit-builds N`).
+- `reattribute_job_alerts.py` — moves `KubeJobFailed` / `KubeJobNotCompleted` alerts from `vm-kube-state-metrics` to the Job/CronJob owner (`job_attribution`), shrinks or deletes the emptied KSM incidents and attaches the alerts to the owner's incident; dry-run by default, `--apply` to move.
 
 ### Metrics sync (`app/knowledge_graph/metrics_sync.py`)
 - `sync_service_health()` — every 5 min, runs five PromQL queries per service (`cpu_pct`, `mem_pct`, `restarts_rate`, `http_5xx_rate`, `p95_latency_ms`) against VictoriaMetrics and upserts into `kg_service_health`.
@@ -414,6 +420,36 @@ Read-side API used by enrichment + MCP tools:
 - **Dedup:** 6-hour window per check at the beat-task level — the same failing canary won't repost until it has changed status or 6h have elapsed.
 - **Adding a new check:** add a `_check_X(db) -> CheckResult` function and append it to the `ALL_CHECKS` list. Each check is read-only and self-contained.
 - **Configuration:** thresholds are constants in the module; the Discord webhook is taken from `settings.DISCORD_WEBHOOK_SELF_HEALTH_URL` (None disables Discord output but keeps the audit log).
+
+
+## Evidence & Incidents (v1.0.4 – v1.0.8)
+
+### Source status (`app/knowledge_graph/source_status.py`)
+`SourceStatus` ∈ `success / partial / empty / unavailable / failed / invalid`; `mark()` / `status_of()` / `status_from_counts()`. `_record_beat_heartbeat` writes the heartbeat only for `success` / `partial`, the status always (`stats:beat:last_run:status:<task>`); `self_health.check_sync_lag` shows it as `last_status` and reports `disabled` for sources switched off by settings.
+
+### Deploy watch (`app/knowledge_graph/k8s_deploy_watch.py`)
+`watch_k8s_rollouts`: Redis snapshot `kg:workload_revisions` (uid, `template_hash`, images); a rollout = images or `spec.template` hash changed (never `metadata.generation`); dedup key `uid:template_hash`; rows land on the service node with `attribution=k8s_rollout`, `namespace_scope=false`, `rollout_reason` ∈ `image` / `template`.
+
+### Incidents (`app/knowledge_graph/incidents.py`)
+`attach_alert` (open → reopen within `REOPEN_WINDOW_MIN=30` → new; idempotent by fingerprint; sets `kg_alerts.incident_id`), `reconcile_incidents` (`all_alerts_resolved` / `aged_out` after `AGE_OUT_HOURS=168`), `mark_incident_noise` (per-alert kinds in `extras.noise_fingerprints`, `noise = all alerts noisy`), `incident_to_dict`. Model `KGIncident` (`kg_incidents`) with the partial unique index `uq_kg_incidents_one_open_per_service`.
+
+### Incident timeline (`app/knowledge_graph/incident_timeline.py`)
+`build_timeline(db, incident)` → `{incident, window, events[], counts, unknowns[], memory}`; event = `{ts, kind, title, details, evidence: {epistemic, provenance}}`; kinds: `incident.opened`, `deploy`, `pod_event`, `anomaly`, `log_errors`, `alert.fired`, `evidence`, `diagnosis`, `decision`, `action.applied`, `verification`, `alert.resolved`, `incident.resolved`. `LOOKBACK_MIN=60`, `LOOKAHEAD_MIN=30`.
+
+### Blast radius (`app/knowledge_graph/blast_radius.py`)
+`blast_radius_v2(db, ns, service, max_hops=2, limit=200, include_inactive=False)`: superset of `queries.blast_radius_for` + `target`, `impact[]` (`service, via, hops, path, epistemic, badge, edge_epistemic, reasons, conflicts`), `summary`, `unknowns[]`. Uses `epistemic.classify_edge` / `find_edge_contradictions`.
+
+### Job attribution (`app/knowledge_graph/job_attribution.py`)
+`resolve_job_target(db, ns, job_name)` → `(target, how)` with `how` ∈ `job_owner / cronjob_owner / cronjob_name / job_name`; `cronjob_base_name` strips the `-<unix-minutes>` suffix (≥ 8 digits). Used by `resolve_store_service` (store path, dedup key, resolved notice) and `enrich_alert`.
+
+### Health retention (`app/knowledge_graph/health_retention.py`)
+`RETENTION_TARGETS` (six observation tables) purged in batches by `kg_health_retention`.
+
+### Self-health metrics (`app/knowledge_graph/self_health_metrics.py`)
+`publish_snapshot` / `read_snapshot` (Redis `stats:self_health:last`), `SelfHealthCollector` (prometheus_client Collector) registered at API startup; `k8s/monitoring.yaml` holds `VMPodScrape` + `VMRule sre-ai-copilot`.
+
+### Remediation verification (`app/remediation/verification.py`)
+`TargetSnapshot`, `snapshot_target(intent)` (read-only `kubectl get -o json` via `kubectl_breaker.run_kubectl`), `expected_identity(db, incident_id)` (last `kg_remediation_decisions.target_ref`), `identity_mismatch` / `identity_check`, `schedule_verification` (Celery `remediation_verify`, `REMEDIATION_VERIFY_DELAYS_SEC`), `assess()` (pure), `verify_remediation()` → `analysis["executor_verification"]`, `executor_state` `verified` / `verification_failed`, audit `EXECUTOR_VERIFY_<OUTCOME>`, metric `remediation_verification_total`.
 
 ## Data & Persistence
 - `app/database.py`, `app/db/*`: Engine/session helpers and database integration.
