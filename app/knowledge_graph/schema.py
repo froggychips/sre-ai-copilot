@@ -318,7 +318,7 @@ class ServiceHealth(Base):
     # не было» (prometheus-net не отдаёт счётчик до первого инкремента).
     orleans_latency_avg_ms = Column(Float, nullable=True)
     orleans_timedout_rate = Column(Float, nullable=True)        # /мин
-    orleans_messaging_fault_rate = Column(Float, nullable=True)  # rerouted+rejected+expired+sent_failed+sent_dropped, /мин
+    orleans_messaging_fault_rate = Column(Float, nullable=True)  # rejected+expired+sent_failed+sent_dropped, /мин (rerouted — не сбой, см. metrics_sync)
     orleans_pings_missed_rate = Column(Float, nullable=True)     # pings_reply_missed, /мин — прокси death-vote
     orleans_activation_churn = Column(Float, nullable=True)      # created+destroyed+shutdown, /мин
     source = Column(String, nullable=True)

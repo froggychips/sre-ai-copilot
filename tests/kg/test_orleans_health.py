@@ -99,10 +99,34 @@ def test_fetch_namespace_adds_orleans_queries_only_when_asked():
 
 def test_promql_uses_regex_sums_and_per_minute_rates():
     q = ms._q_ns_orleans_faults_by_pod("preprod-kingdom2")
-    assert '__name__=~"microsoft_orleans_orleans_messaging_(rerouted|rejected|expired|sent_failed|sent_dropped)"' in q
+    assert '__name__=~"microsoft_orleans_orleans_messaging_(rejected|expired|sent_failed|sent_dropped)"' in q
+    assert "rerouted" not in q, "rerouted — пересылка, не сбой доставки"
     assert q.endswith("* 60")
     assert "catalog_activation_(created|destroyed|shutdown)" in ms._q_ns_orleans_churn_by_pod("x")
-    assert ms._q_orleans_namespaces() == "count by (namespace) (microsoft_orleans_orleans_app_requests_latency_count)"
+    assert ms._q_orleans_namespaces() == (
+        'count by (namespace) (microsoft_orleans_orleans_app_requests_latency_count{job=~".+/.+"})'
+    )
+
+
+def test_promql_selects_pull_series_only():
+    """Пуш-копии метера в push-gateway (ns monitoring, job без слэша) не должны
+    попадать ни в discovery, ни в шесть запросов: иначе сумма всех королевств
+    ложится в граф как здоровье сервиса push-gateway (52 с, 36 млн сбоев/мин)."""
+    queries = [ms._q_orleans_namespaces()] + [
+        fn("squad-14-kingdom2")
+        for fn in (
+            ms._q_ns_orleans_latency_sum_by_pod,
+            ms._q_ns_orleans_latency_count_by_pod,
+            ms._q_ns_orleans_timedout_by_pod,
+            ms._q_ns_orleans_faults_by_pod,
+            ms._q_ns_orleans_pings_missed_by_pod,
+            ms._q_ns_orleans_churn_by_pod,
+        )
+    ]
+    assert len(queries) == 1 + ms.ORLEANS_QUERY_COUNT
+    for q in queries:
+        assert 'job=~".+/.+"' in q, q
+        assert q.count("{") == q.count("}"), q
 
 
 # ── детектор аномалий знает новые метрики ────────────────────────────────
