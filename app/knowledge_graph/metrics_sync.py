@@ -34,6 +34,7 @@ from sqlalchemy.orm import Session
 
 from app.config import settings
 from app.context.vm_client import VMClient
+from app.knowledge_graph.namespace_lifecycle import missing_namespace_names
 from app.knowledge_graph.populator import insert_idempotent
 from app.knowledge_graph.schema import (NODE_KIND_SERVICE, Service,
                                         ServiceHealth)
@@ -387,11 +388,22 @@ async def _sync_service_health_async(db: Session) -> Dict[str, Any]:
         )
         .all()
     )
+    # Стенды, которых нет в кластере, не опрашиваем: VM по такому namespace
+    # отдаёт пустоту, а пустота, записанная как измерение, и держала squad-42
+    # «живым» назавтра после сноса (07–08.09.2026). Заодно минус 5 запросов
+    # на каждый снесённый namespace в каждом тике.
+    gone_ns = missing_namespace_names(db)
+    skipped_missing_ns = 0
+    if gone_ns:
+        kept = [s for s in services if cast(str, s.namespace) not in gone_ns]
+        skipped_missing_ns = len(services) - len(kept)
+        services = kept
     ts = datetime.utcnow()
 
     concurrency = max(1, int(settings.KG_METRICS_SYNC_CONCURRENCY))
     stats: Dict[str, Any] = {
         "real_services": len(services),
+        "skipped_missing_ns": skipped_missing_ns,
         "concurrency": concurrency,
         "namespaces": 0,
         "queries": 0,
