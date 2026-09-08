@@ -24,13 +24,14 @@ from __future__ import annotations
 
 import json
 from datetime import datetime, timedelta
-from typing import Any, Dict, Optional, cast
+from typing import Any, Dict, Iterable, List, Optional, Set, cast
 
 import structlog
 from sqlalchemy import func, or_
 from sqlalchemy.orm import Session
 
 from app.core.timeutil import parse_ts
+from app.knowledge_graph.contract import STALE_CLASS_GONE
 from app.knowledge_graph.kubectl_breaker import run_kubectl
 from app.knowledge_graph.schema import (NS_STATE_ACTIVE, NS_STATE_MISSING,
                                         Namespace, Service,
@@ -367,6 +368,7 @@ def sync_namespace_lifecycle(db: Session) -> Dict[str, Any]:
         "live": len(live), "known": len(known),
         "created": 0, "reincarnated": 0, "returned": 0, "marked_missing": 0,
     }
+    returned_names: List[str] = []
 
     for name, info in live.items():
         row = known.get(name)
@@ -399,6 +401,7 @@ def sync_namespace_lifecycle(db: Session) -> Dict[str, Any]:
 
         if row.state == NS_STATE_MISSING:
             stats["returned"] += 1
+            returned_names.append(name)
             log.info("kg_namespace.returned", namespace=name)
 
         row.k8s_uid = info["uid"] or row.k8s_uid  # type: ignore[assignment]
@@ -417,6 +420,82 @@ def sync_namespace_lifecycle(db: Session) -> Dict[str, Any]:
         stats["marked_missing"] += 1
         log.info("kg_namespace.marked_missing", namespace=name)
 
+    # Узлы исчезнувших namespace получают stale_class='gone'. Sweep по ВСЕМ
+    # не-active строкам, а не только по свежепомеченным: класс у узлов замирал
+    # на значении момента сноса (ns-sync по отсутствующему namespace больше не
+    # вызывается), и squad-42 утром 08.09.2026 держал 31 сервис в `active`
+    # при namespace, удалённых накануне. Идемпотентно — повторный тик ничего
+    # не перепишет.
+    gone_names = [name for name, row in known.items()
+                  if name not in live and row.state != NS_STATE_ACTIVE]
+    stats["services_gone"] = mark_services_gone(db, gone_names)
+    # Вернувшийся namespace: класс пересчитать сразу, не дожидаясь очередного
+    # ns-sync — иначе живой стенд до часа читался бы как снесённый.
+    stats["services_reclassified"] = _reclassify_returned(db, returned_names)
+
     db.commit()
     log.info("kg_namespace.lifecycle_synced", **stats)
     return stats
+
+
+def missing_namespace_names(db: Session) -> Set[str]:
+    """Namespace, которых сейчас нет в кластере (`state != active`).
+
+    Единая точка для обходов «по всем реальным сервисам» (metrics_sync,
+    health_score, детектор аномалий, агрегаты сигналов): без неё снесённый
+    стенд продолжал жить в графе — VM по несуществующему namespace отдаёт
+    пустоту, а пустота, записанная как измерение, давала свежие health-точки
+    и health_score узлам squad-42 назавтра после сноса.
+    """
+    rows = (
+        db.query(Namespace.namespace)
+        .filter(Namespace.state != NS_STATE_ACTIVE)
+        .all()
+    )
+    return {str(r[0]) for r in rows}
+
+
+def mark_services_gone(db: Session, namespaces: Iterable[str]) -> int:
+    """`stale_class='gone'` всем узлам перечисленных namespace. Идемпотентно.
+
+    Возвращает число строк, у которых класс действительно сменился.
+    """
+    names = [str(n) for n in namespaces]
+    if not names:
+        return 0
+    updated = (
+        db.query(Service)
+        .filter(
+            Service.namespace.in_(names),
+            or_(Service.stale_class.is_(None), Service.stale_class != STALE_CLASS_GONE),
+        )
+        .update({Service.stale_class: STALE_CLASS_GONE}, synchronize_session=False)
+    )
+    if updated:
+        log.info("kg_namespace.services_marked_gone",
+                 namespaces=len(names), services=updated)
+    return int(updated or 0)
+
+
+def _reclassify_returned(db: Session, namespaces: Iterable[str]) -> int:
+    """Пересчитать stale_class узлов вернувшихся namespace обычным
+    классификатором (`kg_sync._refresh_stale_class_for_namespace`).
+
+    Ленивый импорт: kg_sync тяжёлый и в lifecycle нужен только здесь. Сбой
+    пересчёта не роняет lifecycle — класс догонит очередной ns-sync.
+    """
+    names = [str(n) for n in namespaces]
+    if not names:
+        return 0
+    from app.knowledge_graph.kg_sync import _refresh_stale_class_for_namespace
+
+    # Пересчёт читает kg_services через ORM — отдать ему уже применённые
+    # изменения состояния namespace.
+    db.flush()
+    total = 0
+    for name in names:
+        try:
+            total += int(_refresh_stale_class_for_namespace(db, name) or 0)
+        except Exception as e:  # noqa: BLE001 — один namespace не должен ронять тик
+            log.warning("kg_namespace.reclassify_failed", namespace=name, error=str(e))
+    return total

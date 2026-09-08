@@ -45,6 +45,7 @@ from typing import Any, Dict, List, Optional, Tuple, cast
 
 from sqlalchemy.orm import Session
 
+from app.knowledge_graph.namespace_lifecycle import missing_namespace_names
 from app.knowledge_graph.populator import insert_idempotent
 from app.knowledge_graph.schema import (NODE_KIND_SERVICE, AnomalyObservation,
                                         LogObservation, Service, ServiceHealth)
@@ -552,8 +553,17 @@ def detect_anomalies(
         )
         .all()
     )
+    # Снесённый стенд аномалий не порождает: сравнивать «нет метрик» с
+    # baseline прошлой жизни — это ложные сигналы по namespace, которого нет.
+    gone_ns = missing_namespace_names(db)
+    skipped_missing_ns = 0
+    if gone_ns:
+        kept = [s for s in services if cast(str, s.namespace) not in gone_ns]
+        skipped_missing_ns = len(services) - len(kept)
+        services = kept
     stats: Dict[str, Any] = {
         "real_services": len(services),
+        "skipped_missing_ns": skipped_missing_ns,
         "now": now.isoformat(),
         "warn_thresh": warn_thresh,
         "crit_thresh": crit_thresh,

@@ -22,8 +22,9 @@ from app.database import Base
 from app.knowledge_graph import namespace_lifecycle as nl
 from app.knowledge_graph.namespace_lifecycle import (K8sNamespaceFetchError,
                                                      sync_namespace_lifecycle)
+from app.knowledge_graph.contract import STALE_CLASS_GONE, STALE_CLASS_VALUES
 from app.knowledge_graph.schema import (NS_STATE_ACTIVE, NS_STATE_MISSING,
-                                        Namespace)
+                                        Namespace, Service)
 
 
 @pytest.fixture
@@ -208,3 +209,86 @@ def test_nonzero_rc_is_a_failure(monkeypatch):
     monkeypatch.setattr(nl, "run_kubectl", lambda *a, **k: R())
     with pytest.raises(K8sNamespaceFetchError):
         nl._fetch_namespaces()
+
+
+# --- узлы исчезнувшего namespace -------------------------------------------
+#
+# Кейс squad-42 (08.09.2026): namespace удалены 07.09 12:23, kg_namespaces
+# честно показывал `missing`, а kg_services держал 31 узел в `active` —
+# класс считался только по давности деплоя и замер на значении момента сноса.
+
+
+def _svc(namespace: str, name: str = "town-service", stale_class: str = "active") -> Service:
+    return Service(name=name, namespace=namespace, synthetic=False, stale_class=stale_class)
+
+
+def test_disappeared_namespace_marks_its_services_gone(db, cluster):
+    db.add(Namespace(namespace="squad-42-shared", k8s_uid="uid-42", state=NS_STATE_ACTIVE))
+    db.add(_svc("squad-42-shared"))
+    db.add(_svc("prod-kingdom1", stale_class="active"))
+    db.commit()
+    cluster({"prod-kingdom1": ("uid-p", NOW)})
+
+    stats = sync_namespace_lifecycle(db)
+
+    gone = db.query(Service).filter_by(namespace="squad-42-shared").one()
+    alive = db.query(Service).filter_by(namespace="prod-kingdom1").one()
+    assert gone.stale_class == STALE_CLASS_GONE
+    assert alive.stale_class == "active", "живой namespace трогать нельзя"
+    assert stats["services_gone"] == 1
+
+
+def test_already_missing_namespace_is_swept_to_gone(db, cluster):
+    """Строка уже `missing` (сноc был до выкладки этого кода) — узлы всё равно
+    переводятся в gone: sweep идёт по всем не-active namespace, не только по
+    свежепомеченным."""
+    db.add(Namespace(namespace="squad-42-kingdom7", k8s_uid="uid-k7",
+                     state=NS_STATE_MISSING,
+                     missing_since=datetime.utcnow() - timedelta(hours=17)))
+    db.add(_svc("squad-42-kingdom7", stale_class="active"))
+    db.add(_svc("squad-42-kingdom7", name="map-service", stale_class="suspicious_stale"))
+    db.commit()
+    cluster({"prod-kingdom1": ("uid-p", NOW)})
+
+    stats = sync_namespace_lifecycle(db)
+
+    classes = {s.name: s.stale_class for s in db.query(Service).all()}
+    assert classes == {"town-service": STALE_CLASS_GONE, "map-service": STALE_CLASS_GONE}
+    assert stats["services_gone"] == 2
+
+
+def test_sweep_is_idempotent(db, cluster):
+    db.add(Namespace(namespace="squad-54-shared", k8s_uid="uid-54", state=NS_STATE_MISSING,
+                     missing_since=datetime.utcnow() - timedelta(days=30)))
+    db.add(_svc("squad-54-shared", stale_class=STALE_CLASS_GONE))
+    db.commit()
+    cluster({"prod-kingdom1": ("uid-p", NOW)})
+
+    stats = sync_namespace_lifecycle(db)
+    assert stats["services_gone"] == 0, "повторный тик ничего не переписывает"
+
+
+def test_returned_namespace_services_are_reclassified(db, cluster):
+    """Стенд вернулся — его узлы не остаются `gone` до очередного ns-sync."""
+    db.add(Namespace(namespace="squad-1-shared", k8s_uid="uid-a", state=NS_STATE_MISSING,
+                     missing_since=datetime.utcnow() - timedelta(hours=2), incarnation=1))
+    db.add(_svc("squad-1-shared", stale_class=STALE_CLASS_GONE))
+    db.commit()
+    cluster({"squad-1-shared": ("uid-a", NOW)})
+
+    stats = sync_namespace_lifecycle(db)
+
+    svc = db.query(Service).one()
+    assert svc.stale_class != STALE_CLASS_GONE
+    assert svc.stale_class in STALE_CLASS_VALUES
+    assert stats["services_reclassified"] == 1
+
+
+def test_missing_namespace_names_lists_every_non_active_state(db):
+    db.add_all([
+        Namespace(namespace="a-live", state=NS_STATE_ACTIVE),
+        Namespace(namespace="b-missing", state=NS_STATE_MISSING),
+        Namespace(namespace="c-retired", state="retired"),
+    ])
+    db.commit()
+    assert nl.missing_namespace_names(db) == {"b-missing", "c-retired"}

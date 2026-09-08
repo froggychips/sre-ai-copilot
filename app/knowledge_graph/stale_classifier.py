@@ -12,6 +12,16 @@
 * ``suspicious_stale`` — нет доказанных deploys сервиса за 30d, не
   expected_stale.
 
+Четвёртое значение ``gone`` классификатор НЕ выдаёт: его ставит
+``namespace_lifecycle`` узлам namespace, которого больше нет в кластере
+(`kg_namespaces.state != active`). Это ответ на другой вопрос — не «катился
+ли сервис», а «существует ли он», — и без него снесённый стенд жил в графе
+как активный: squad-42 (namespace удалены 07.09.2026 12:23) утром 08.09 имел
+31 сервис в ``active``, потому что признак считался только по давности
+деплоя, а ns-sync по исчезнувшему namespace больше не вызывался и класс
+просто замер. Когда namespace возвращается, ``kg_sync`` пересчитывает класс
+обычным путём.
+
 Используется в:
   * ``kg_sync.sync_namespace`` — переписывает ``kg_services.stale_class`` на
     каждом sync (idempotent).
@@ -88,6 +98,9 @@ from app.knowledge_graph.contract import (  # noqa: E402 — re-export посл�
     STALE_CLASS_EXPECTED_STALE as STALE_CLASS_EXPECTED,
     STALE_CLASS_SUSPICIOUS_STALE as STALE_CLASS_SUSPICIOUS,
 )
+# `gone` классификатор не выдаёт (см. докстринг модуля) — re-export для тех,
+# кто читает значения отсюда, а не из contract.
+from app.knowledge_graph.contract import STALE_CLASS_GONE  # noqa: E402, F401
 from app.knowledge_graph.contract import STALE_CLASS_VALUES as _CONTRACT_STALE_CLASS_VALUES  # noqa: E402
 
 # Для backward-compat сохраняем tuple-форму (старый API). В новых местах
@@ -192,11 +205,12 @@ def classify_stale_with_deploys(
       (``stats_digest._suspicious_stale_action_items`` и drill-down'ы)
       дополнительно требуют ``NOT EXISTS kg_deployments`` за 60d, а
       ns-broadcast-запись такому сервису эту проверку не пройдёт.
-    * Завести четвёртое значение (``unknown``) нельзя: enum зафиксирован в
-      ``contract.STALE_CLASS_VALUES`` + миграции колонки, а у соседей
-      ``expected_stale`` вырезает сервис из app-scope орфан-метрики
+    * Значение ``unknown`` заводить нельзя: у соседей ``expected_stale``
+      вырезает сервис из app-scope орфан-метрики
       (``contract.compute_orphan_stats``) — «неизвестно» туда мапить нельзя,
-      это испортило бы метрику качества.
+      это испортило бы метрику качества. Единственное значение вне этой
+      функции — ``gone`` (namespace снесён): его ставит
+      ``namespace_lifecycle``, и из app-scope оно вырезано осознанно.
     * Слитый (legacy) вход трактуется как раньше — свежий timestamp даёт
       ``active``. Это осознанный компромисс: разделить доказательства может
       только вызывающий (у него на руках ``Deployment.extras``, см.
