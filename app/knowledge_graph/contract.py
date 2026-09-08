@@ -37,6 +37,12 @@ log = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 #: KG schema contract version. Bump rules — см. docs/KG_SCHEMA_CONTRACT.md.
+#: 2.9 = владелец namespace: `kg_namespaces.deployed_by/deployed_branch/owner_*/
+#: last_activity_at` (миграция 20260908_0100), beat kg_namespace_owner_sync,
+#: NAMESPACE_OWNER_SOURCES. Один резолв для медика, дашборда и MCP-тула.
+#: 2.8 = `stale_class = gone`: узлы namespace, которого нет в кластере.
+#: Ставит namespace_lifecycle, не классификатор; вырезан из app-scope orphan.
+#: Кейс squad-42 (07–08.09.2026): 31 узел в active при удалённых namespace.
 #: 2.7 = db-узлы из secret_hint привязаны к realm (`<realm>-shared`) вместо
 #: схлопывания по имени. До этого `db:postgres:config` был ОДНИМ узлом в
 #: `preprod-kingdom1` с 1430 рёбрами из 106 namespace — при 41 физической базе.
@@ -60,7 +66,7 @@ log = logging.getLogger(__name__)
 #: без expected_stale-инфры) + единый источник `compute_orphan_stats`; все
 #: consumer'ы (STARTUP_CONTRACT_CHECK, quality_report, stats_digest) считают
 #: orphan через него. EDGE_KINDS не менялись.
-KG_SCHEMA_VERSION: str = "2.8"
+KG_SCHEMA_VERSION: str = "2.9"
 
 
 # ---------------------------------------------------------------------------
@@ -165,6 +171,22 @@ OWNER_SOURCES: Set[str] = {
     OWNER_SOURCE_DEPLOY_HISTORY,    # PR #85: most-frequent `triggered_by` за 30d в kg_deployments
     OWNER_SOURCE_PLATFORM_STATIC,   # synthetic-узлы platform/data/external — захардкожено
     OWNER_SOURCE_SUGGESTED,         # AI/heuristic suggestion (требует approve, planned)
+}
+
+#: Владелец NAMESPACE (человек, `kg_namespaces.owner_*`) — не путать с
+#: `team_owner` сервиса (команда). Значения `kg_namespaces.owner_source`:
+#: какой путь резолва дал ответ. Порядок = приоритет в
+#: `namespace_owner.resolve_owner`.
+NAMESPACE_OWNER_SOURCE_MANUAL: str = "manual"                  # PEOPLE_MANIFEST_PATH → namespace_owners
+NAMESPACE_OWNER_SOURCE_JIRA_ASSIGNEE: str = "jira_assignee"    # WO-ключ из deployed-branch → assignee задачи
+NAMESPACE_OWNER_SOURCE_DEPLOYED_BY: str = "deployed_by"        # лейбл deployed-by, не сервисный аккаунт
+NAMESPACE_OWNER_SOURCE_TC_TRIGGERED_BY: str = "tc_triggered_by"  # triggered_by последнего деплоя в kg_deployments
+
+NAMESPACE_OWNER_SOURCES: Set[str] = {
+    NAMESPACE_OWNER_SOURCE_MANUAL,
+    NAMESPACE_OWNER_SOURCE_JIRA_ASSIGNEE,
+    NAMESPACE_OWNER_SOURCE_DEPLOYED_BY,
+    NAMESPACE_OWNER_SOURCE_TC_TRIGGERED_BY,
 }
 
 #: Маппинг коротких алиасов из `OwnerSuggestion.sources` в канонические

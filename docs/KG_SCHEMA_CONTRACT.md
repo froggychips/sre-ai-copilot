@@ -1,7 +1,8 @@
 # KG Schema / Quality Contract
 
-> **Версия контракта:** `kg_schema: 2.8`
-> **Дата:** 2026-09-08 (2.8 — `stale_class=gone` у узлов снесённого namespace, §1.4;
+> **Версия контракта:** `kg_schema: 2.9`
+> **Дата:** 2026-09-08 (2.9 — владелец namespace `kg_namespaces.owner_*`, §1.5;
+> 2.8 — `stale_class=gone` у узлов снесённого namespace, §1.4;
 > 2.7 — db-узлы привязаны к realm, §1.3;
 > 2.6 — `owner_source`)
 > **Предыдущая правка:** 2026-06-10 (doc-update: `kg_ingress_observations` наполняется — §6.6;
@@ -25,7 +26,7 @@
 ## 1. Версия
 
 ```
-KG_SCHEMA_VERSION = "2.8"
+KG_SCHEMA_VERSION = "2.9"
 ```
 
 `major.minor`:
@@ -35,6 +36,30 @@ KG_SCHEMA_VERSION = "2.8"
   semantic существующего kind перевёрнут. Требует миграции consumer'ов.
 * **minor** — additive: новый edge kind, новый synthetic prefix, новые
   поля QUALITY_THRESHOLDS, перевод planned → active.
+
+### 1.5. Что изменилось в 2.9 — владелец namespace (`kg_namespaces.owner_*`)
+
+Колонки на `kg_namespaces`: сырые лейблы `deployed_by` / `deployed_branch`
+(пишет `namespace_lifecycle` каждым тиком) и результат резолва
+`owner_login`, `owner_source`, `owner_jira_key`, `owner_discord_id`,
+`owner_resolved_at` (beat `kg_namespace_owner_sync`, раз в час), плюс
+`last_activity_at` — последняя игровая сессия по ClickHouse сквада
+(опционально, `SQUAD_ACTIVITY_ENABLED`).
+
+`owner_source` ∈ `contract.NAMESPACE_OWNER_SOURCES` — какой путь дал ответ,
+в порядке приоритета: `manual` (манифест людей) → `jira_assignee` (WO-ключ из
+ветки → assignee задачи → логин через манифест или профили TeamCity) →
+`deployed_by` (лейбл, если не сервисный аккаунт) → `tc_triggered_by`
+(последний человек-триггер деплоя в `kg_deployments`). Это владелец
+**стенда** (человек); `kg_services.team_owner` — владелец сервиса (команда),
+другая сущность.
+
+Зачем: 08.09.2026 «чей это сквад» решали три несогласованных места (карта
+медика, `scripts/squad_dashboard.py`, скилл squad-occupancy); в карте медика
+не было 9 из 19 текущих деплойеров, и 4 из 6 больных сквадов пинговались
+«владелец не определён». Теперь резолв один, потребители (медик, дашборд,
+MCP-тул `kg_squad_owners`) читают колонки. Discord id — только из манифеста
+в ConfigMap кластера (`PEOPLE_MANIFEST_PATH`), в код не попадает.
 
 ### 1.4. Что изменилось в 2.8 — `stale_class = gone`
 
@@ -156,6 +181,7 @@ owner-coverage, «сервисов всего») считаются только
 | **2.2** | 2026-05-24 (PR #82/#84/#86) | + `runs_as_job` (через `K8sJob.owner_service_id`), `uses_volume`/`bound_to` (в `kg_volume_edges`), `kg_services.stale_class` column (active/expected_stale/suspicious_stale), `deploy_history` owner source |
 | **2.3** | 2026-06-06 | orphan-метрика → **app-scope**: знаменатель = real-сервисы с `stale_class != 'expected_stale'`, orphan = из них без ЛЮБОГО edge (any-kind). Единый источник `compute_orphan_stats(db)`; все consumer'ы (`STARTUP_CONTRACT_CHECK`/`quality_report`/`stats_digest`) считают через него. EDGE_KINDS без изменений |
 | **2.8** | 2026-09-08 | + `stale_class = gone` (namespace снесён; ставит `namespace_lifecycle`, не классификатор); app-scope orphan = `stale_class NOT IN ('expected_stale','gone')`; metrics_sync/health_score/аномалии/агрегаты пропускают узлы не-active namespace. §1.4 |
+| **2.9** | 2026-09-08 | + `kg_namespaces.deployed_by/deployed_branch/owner_login/owner_source/owner_jira_key/owner_discord_id/owner_resolved_at/last_activity_at` (миграция `20260908_0100`), beat `kg_namespace_owner_sync`, `NAMESPACE_OWNER_SOURCES`. §1.5 |
 
 ---
 

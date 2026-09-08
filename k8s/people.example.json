@@ -1,0 +1,20 @@
+{
+  "_comment": [
+    "Манифест людей для kg_namespace_owner_sync (PEOPLE_MANIFEST_PATH).",
+    "Кладётся в ConfigMap sre-ai-copilot-people ключом people.json; в git не коммитится —",
+    "связка логин ↔ человек остаётся внутри кластера.",
+    "  kubectl -n sre-ai create configmap sre-ai-copilot-people --from-file=people.json=./people.json",
+    "people[].login — TC-логин (как в лейбле deployed-by); discord_id — snowflake для @mention;",
+    "jira_account_id / jira_email / jira_display_name — чтобы сопоставить assignee задачи с логином",
+    "(если не заданы, сопоставление идёт по профилям TeamCity: e-mail, затем имя).",
+    "service_accounts — учётки автоматики, владельцем не бывают (дополняет встроенный список).",
+    "namespace_owners — ручной override: namespace → логин (источник manual)."
+  ],
+  "people": [
+    {"login": "example.login", "discord_id": "000000000000000000", "jira_email": "example@example.org"}
+  ],
+  "service_accounts": ["ai-agent", "aidev", "cicd"],
+  "namespace_owners": {
+    "squad-99-shared": "example.login"
+  }
+}

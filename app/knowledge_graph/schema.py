@@ -87,6 +87,28 @@ class Namespace(Base):
     #: Когда впервые не увидели. NULL у active — по нему считается TTL до
     #: retired, то есть время, а не доля, решает судьбу узлов.
     missing_since = Column(DateTime, nullable=True, index=True)
+    #: Сырые лейблы namespace (`deployed-by` / `deployed-branch`) — что
+    #: поставил TeamCity при раскатке. Пишет lifecycle каждым тиком. Это ещё
+    #: не владелец: кнопку мог нажать сервисный аккаунт (ai-agent, cicd), а
+    #: ветку — раскатать коллега для проверки чужой задачи.
+    deployed_by = Column(String, nullable=True)
+    deployed_branch = Column(String, nullable=True)
+    #: Владелец стенда — человек, к которому идти с вопросом «твой стенд
+    #: болеет». Резолв (`kg_namespace_owner_sync`): ручной override →
+    #: assignee Jira-задачи из ветки → deployed-by, если это не сервисный
+    #: аккаунт → кто триггерил последний деплой в TC. `owner_source` хранит,
+    #: какой из путей сработал (contract.NAMESPACE_OWNER_SOURCES).
+    owner_login = Column(String, nullable=True, index=True)
+    owner_source = Column(String, nullable=True)
+    owner_jira_key = Column(String, nullable=True)
+    #: Discord snowflake для @mention — из манифеста людей
+    #: (PEOPLE_MANIFEST_PATH), в код не попадает.
+    owner_discord_id = Column(String, nullable=True)
+    owner_resolved_at = Column(DateTime, nullable=True)
+    #: Последняя игровая сессия по ClickHouse сквада (опционально). Критерий
+    #: «стенд простаивает» для медика — вместо stale_class, который для
+    #: сквадов не работает (их деплои — ns-broadcast, active недостижим).
+    last_activity_at = Column(DateTime, nullable=True)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
 
