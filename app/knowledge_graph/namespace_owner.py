@@ -64,6 +64,10 @@ DEFAULT_SERVICE_ACCOUNTS: frozenset = frozenset({
 
 _HTTP_TIMEOUT = 8.0
 
+#: Через сколько namespace коммитить промежуточный результат (см.
+#: `sync_namespace_owners`): держать одну транзакцию на весь прогон нельзя.
+_COMMIT_EVERY = 10
+
 
 # ── манифест людей ───────────────────────────────────────────────────────────
 
@@ -173,17 +177,37 @@ class TcUser:
 
 
 def fetch_tc_users() -> Dict[str, TcUser]:
-    """Профили TeamCity `/app/rest/users` → {login: TcUser}. Нет TC_URL/TC_TOKEN
-    или ошибка → {} (путь через имена просто не сработает)."""
-    if not settings.TC_URL or not settings.TC_TOKEN:
+    """Профили TeamCity `/app/rest/users` → {login: TcUser}. Нет TC_URL/токена
+    или ошибка → {} (путь через имена просто не сработает).
+
+    Токен берётся из `TC_USERS_TOKEN`, и только если он пуст — из `TC_TOKEN`.
+    Причина: основной токен принадлежит сервисной учётке `ai-agent`, у которой
+    нет права смотреть профили (403 на проде 08.09.2026), и без отдельного
+    токена сопоставление «assignee Jira → TC-логин» не работает вообще.
+    """
+    token = settings.TC_USERS_TOKEN or settings.TC_TOKEN
+    if not settings.TC_URL or not token:
         return {}
     url = settings.TC_URL.rstrip("/") + "/app/rest/users"
-    headers = {"Authorization": f"Bearer {settings.TC_TOKEN}", "Accept": "application/json"}
+    headers = {"Authorization": f"Bearer {token}", "Accept": "application/json"}
     try:
         with httpx.Client(timeout=_HTTP_TIMEOUT) as client:
             r = client.get(url, headers=headers, params={"fields": "user(username,name,email)"})
             r.raise_for_status()
             users = r.json().get("user") or []
+    except httpx.HTTPStatusError as e:
+        # 403 — не сеть и не опечатка в URL, а нехватка права смотреть
+        # профили у владельца токена. Отдельная ветка, чтобы в логе была
+        # причина, а не безликий HTTPStatusError.
+        log.warning(
+            "namespace_owner.tc_users_forbidden" if e.response.status_code == 403
+            else "namespace_owner.tc_users_failed",
+            status=e.response.status_code,
+            used_dedicated_token=bool(settings.TC_USERS_TOKEN),
+            hint=("токену нужно право смотреть профили пользователей; задайте "
+                  "TC_USERS_TOKEN" if e.response.status_code == 403 else None),
+        )
+        return {}
     except Exception as e:  # noqa: BLE001
         log.warning("namespace_owner.tc_users_failed", error=type(e).__name__)
         return {}
@@ -457,6 +481,15 @@ def sync_namespace_owners(
             if last is not None:
                 row.last_activity_at = last  # type: ignore[assignment]
                 stats["activity_updated"] += 1
+
+        # Коммитим батчами, а не одной транзакцией на прогон. Прогон идёт
+        # ~95 с на 46 стендах (внутри — запросы в Jira), и всё это время
+        # открытая транзакция мешает соседям: в этот же день миграция
+        # `20260908_0100` не взяла лок за `lock_timeout=15s` из-за чужой
+        # транзакции возрастом 98 с. Заодно результат не теряется целиком,
+        # если прогон упадёт на середине.
+        if stats["scanned"] % _COMMIT_EVERY == 0:
+            db.commit()
 
     stats["jira_errors"] = jira_errors
     db.commit()

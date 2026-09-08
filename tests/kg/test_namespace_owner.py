@@ -230,3 +230,128 @@ def test_sync_records_activity_and_jira_errors(db):
     assert row.owner_login is None and row.owner_jira_key == "WO-15194"
     assert row.last_activity_at == last
     assert stats["jira_errors"] == 1 and stats["unresolved"] == 1 and stats["activity_updated"] == 1
+
+
+# --- токен для профилей TeamCity ---------------------------------------------
+#
+# 08.09.2026 на проде: TC_TOKEN принадлежит сервисной учётке `ai-agent`, у неё
+# нет права смотреть профили → 403, и путь `jira_assignee` молча деградировал
+# до `deployed_by` на всех 46 стендах. Отдельный TC_USERS_TOKEN это лечит.
+
+
+class _FakeResponse:
+    def __init__(self, status_code: int, payload=None):
+        self.status_code = status_code
+        self._payload = payload or {}
+
+    def json(self):
+        return self._payload
+
+    def raise_for_status(self):
+        if self.status_code >= 400:
+            raise no.httpx.HTTPStatusError("boom", request=None, response=self)
+
+
+class _FakeClient:
+    """Пишет использованный токен в `seen`, отдаёт заготовленный ответ."""
+
+    def __init__(self, response, seen: dict):
+        self._response = response
+        self._seen = seen
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def get(self, url, headers=None, params=None):
+        self._seen["url"] = url
+        self._seen["auth"] = (headers or {}).get("Authorization")
+        return self._response
+
+
+def _install_client(monkeypatch, response):
+    seen: dict = {}
+    monkeypatch.setattr(no.httpx, "Client", lambda **kw: _FakeClient(response, seen))
+    return seen
+
+
+def test_dedicated_users_token_wins_over_main_token(monkeypatch):
+    monkeypatch.setattr(no.settings, "TC_URL", "https://tc.example.org")
+    monkeypatch.setattr(no.settings, "TC_TOKEN", "service-account-token")
+    monkeypatch.setattr(no.settings, "TC_USERS_TOKEN", "profiles-token")
+    payload = {"user": [{"username": "Ddosta", "name": "Dmitry Dosta", "email": "dd@example.org"}]}
+    seen = _install_client(monkeypatch, _FakeResponse(200, payload))
+
+    users = no.fetch_tc_users()
+
+    assert seen["auth"] == "Bearer profiles-token"
+    assert users["ddosta"].email == "dd@example.org"
+
+
+def test_falls_back_to_main_token_when_dedicated_is_empty(monkeypatch):
+    monkeypatch.setattr(no.settings, "TC_URL", "https://tc.example.org")
+    monkeypatch.setattr(no.settings, "TC_TOKEN", "service-account-token")
+    monkeypatch.setattr(no.settings, "TC_USERS_TOKEN", "")
+    seen = _install_client(monkeypatch, _FakeResponse(200, {"user": []}))
+
+    assert no.fetch_tc_users() == {}
+    assert seen["auth"] == "Bearer service-account-token"
+
+
+def test_forbidden_is_not_fatal_and_names_the_cause(monkeypatch, caplog):
+    monkeypatch.setattr(no.settings, "TC_URL", "https://tc.example.org")
+    monkeypatch.setattr(no.settings, "TC_TOKEN", "service-account-token")
+    monkeypatch.setattr(no.settings, "TC_USERS_TOKEN", "")
+    _install_client(monkeypatch, _FakeResponse(403))
+
+    assert no.fetch_tc_users() == {}, "403 — пустой справочник, а не исключение"
+
+
+def test_no_token_at_all_skips_the_call(monkeypatch):
+    monkeypatch.setattr(no.settings, "TC_URL", "https://tc.example.org")
+    monkeypatch.setattr(no.settings, "TC_TOKEN", "")
+    monkeypatch.setattr(no.settings, "TC_USERS_TOKEN", "")
+
+    def _boom(**kw):
+        raise AssertionError("без токена запрос делать нельзя")
+
+    monkeypatch.setattr(no.httpx, "Client", _boom)
+    assert no.fetch_tc_users() == {}
+
+
+def test_sync_commits_in_batches_not_one_long_transaction(db, monkeypatch):
+    """Одна транзакция на весь прогон мешает соседям: 08.09.2026 миграция не
+    взяла лок за lock_timeout=15s из-за чужой транзакции возрастом 98 с, а этот
+    прогон длится ~95 с (внутри — запросы в Jira)."""
+    monkeypatch.setattr(no.settings, "NAMESPACE_OWNER_SCOPE_REGEX", r"^squad-\d+-shared$")
+    monkeypatch.setattr(no, "_COMMIT_EVERY", 3)
+    for i in range(1, 8):
+        db.add(Namespace(namespace=f"squad-{i}-shared", state=NS_STATE_ACTIVE,
+                         deployed_by=f"dev{i}", deployed_branch="preprod"))
+    db.commit()
+
+    commits: list[int] = []
+    real_commit = db.commit
+    scanned = {"n": 0}
+
+    def counting_commit():
+        commits.append(scanned["n"])
+        real_commit()
+
+    monkeypatch.setattr(db, "commit", counting_commit)
+    orig_resolve = no.resolve_owner
+
+    def counting_resolve(*a, **kw):
+        scanned["n"] += 1
+        return orig_resolve(*a, **kw)
+
+    monkeypatch.setattr(no, "resolve_owner", counting_resolve)
+
+    stats = no.sync_namespace_owners(db, people=PeopleManifest(), tc_users={},
+                                     jira_lookup=None, activity_lookup=None)
+
+    assert stats["resolved"] == 7
+    assert len(commits) >= 3, f"ожидались промежуточные коммиты, было: {commits}"
+    assert commits[0] <= 3, "первый коммит должен случиться до конца прогона"
