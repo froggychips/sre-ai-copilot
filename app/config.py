@@ -622,6 +622,16 @@ class Settings(BaseSettings):
         False,
         description="Явно разрешить вебхук без подписи (только локальная разработка)",
     )
+    # Вебхук внешних исполнителей (squad-medic): POST /webhooks/remediation.
+    # Та же схема, что у AlertManager, но timestamp ОБЯЗАТЕЛЕН: подпись
+    # считается над `ts.body`, окно свежести + anti-replay по подписи.
+    # Fail-closed: без секрета все запросы отклоняются.
+    REMEDIATION_WEBHOOK_SECRET: Optional[str] = Field(
+        None, description="HMAC-секрет вебхука внешних remediation-событий (squad-medic)",
+    )
+    REMEDIATION_WEBHOOK_MAX_AGE_SECONDS: int = Field(
+        300, description="Окно свежести X-Remediation-Timestamp (сек)",
+    )
     # Заголовок с реальным IP клиента за ingress/прокси для ключа rate-limit.
     # None = доверять только request.client.host. Включать ТОЛЬКО когда перед
     # сервисом стоит прокси, который этот заголовок перезаписывает.

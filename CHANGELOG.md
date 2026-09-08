@@ -6,6 +6,25 @@ All notable changes to this project are documented in this file.
 
 ### Добавлено
 
+- **События внешних исполнителей: `kg_remediation_events` + `POST /webhooks/remediation`.**
+  `kg_remediation_decisions` знал только про собственный executor копилота, а
+  squad-medic лечит сквады каждые 15 минут: 07.09 на ImagePullBackOff squad-39
+  он применил 13 бесполезных grant-фиксов и через 14 часов запинговал
+  владельца, копилот в тот же час выложил карточку по тому же стенду — ни в
+  timeline, ни в дайджесте действий медика не было. Теперь исполнитель
+  присылает событие прогона (applied / manual / gaps / outcome / root_cause /
+  next_action), оно привязывается к открытому на тот момент инциденту по
+  любому namespace стенда и попадает в timeline как `remediation.external`
+  (observed, provenance `kg_remediation_events`); Known Unknown «копилот не
+  действовал» уточняется, а не снимается. Auth — HMAC-SHA256 над
+  `timestamp.body`, timestamp обязателен, anti-replay по подписи, fail-closed
+  (`REMEDIATION_WEBHOOK_SECRET`). Повтор `(actor, run_id, namespace)`
+  идемпотентен. Миграция `20260908_0200` (новая таблица). Это шаг
+  «remediation verification» roadmap'а: у копилота появляется, что сверять с
+  состоянием после.
+
+### Добавлено
+
 - **Владелец namespace как факт графа (`kg_namespaces.owner_*`, контракт 2.9).**
   До этого «чей это сквад» решали три несогласованных места: карта TC-логин →
   Discord у squad-medic (15 записей; из 19 текущих деплойеров сквадов нет 9,
