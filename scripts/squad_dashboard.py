@@ -121,6 +121,32 @@ def fetch_kg():
     return rows
 
 
+OWNER_SQL = """
+SELECT substring(namespace from '^(squad-[0-9]+)') AS squad,
+       owner_login, owner_source, owner_jira_key, owner_resolved_at, last_activity_at
+FROM kg_namespaces
+WHERE namespace ~ '^squad-[0-9]+-shared$' AND state = 'active'
+"""
+
+
+def fetch_kg_owners():
+    """Владелец стенда из графа (kg_namespaces.owner_*, beat
+    kg_namespace_owner_sync) — тот же резолв, что у медика и MCP-тула
+    kg_squad_owners. До миграции колонок нет → {} и колонка берётся из лейбла."""
+    conn = psycopg2.connect(os.environ["DATABASE_URL"])
+    try:
+        cur = conn.cursor()
+        try:
+            cur.execute(OWNER_SQL)
+        except psycopg2.errors.UndefinedColumn:
+            log("  kg owners: колонок owner_* ещё нет (миграция copilot не раскатана) — владелец из лейбла")
+            return {}
+        cols = [d[0] for d in cur.description]
+        return {r[0]: dict(zip(cols, r)) for r in cur.fetchall()}
+    finally:
+        conn.close()
+
+
 # ---------- 2. ns labels (in-cluster k8s API; fallback local kubectl) ----------
 def _parse_k8s_ts(v):
     """creationTimestamp / annotation → naive UTC datetime (как остальные даты здесь)."""
@@ -320,6 +346,11 @@ def fmt_ts(s):
 def build_rows():
     kg = fetch_kg()
     labels = fetch_ns_labels()
+    try:
+        owners = fetch_kg_owners()
+    except Exception as e:  # noqa: BLE001 — владелец из графа опционален, доска живёт без него
+        log(f"  kg owners: {e}")
+        owners = {}
     one = fetch_oneservice()
     rows = []
     now = datetime.datetime.utcnow()
@@ -332,7 +363,12 @@ def build_rows():
         ov = one.get(s, {})
         lb = ov.get("last_build")
         inst = fetch_install(s)
-        owner = lbl.get("owner")
+        # Владелец: резолв графа (Jira-assignee по ветке → deployed-by → TC),
+        # лейбл deployed-by — только пока граф его не посчитал. Лейбл врёт,
+        # когда кнопку нажал сервисный аккаунт (ai-agent) или коллега.
+        own = owners.get(s) or {}
+        owner = own.get("owner_login") or lbl.get("owner")
+        owner_source = own.get("owner_source") if own.get("owner_login") else ("label" if lbl.get("owner") else None)
         act = fetch_ch_activity(s)
         # Все сквады в пределах SQUAD_NUMS — реальные провизионированные слоты,
         # поэтому показываем и пустые: classify() даёт им «свободен» (доступная ёмкость).
@@ -346,7 +382,8 @@ def build_rows():
             wh=(float(k["worst_health"]) if k.get("worst_health") is not None else None),
             ev24h=k.get("ev24h"), bo7=k.get("backoff7d"), ev7=k.get("evict7d"),
             un7=k.get("unhlth7d"), al=k.get("alerts"),
-            owner=owner, task=lbl.get("task"), branch=lbl.get("branch"),
+            owner=owner, owner_source=owner_source,
+            task=lbl.get("task"), branch=lbl.get("branch"),
             reserved=RESERVED.get(s),
             alive=bool(lbl), claim=lbl.get("claim"), claimed_at=lbl.get("claimed_at"),
             guard=lbl.get("guard"),
@@ -630,6 +667,11 @@ def render(rows, gen_date, jira_statuses=None, today=None):
         status = loz(status_txt, status_col)
         task = f'<a href="{jira}{esc(r["task"])}">{esc(r["task"])}</a>' if r["task"] else ""
         owner = esc(human(r["owner"])) if r["owner"] else loz("нет лейбла")
+        # Откуда взят владелец: jira_assignee / deployed_by / tc_triggered_by /
+        # manual — из графа; label — лейбл, граф ещё не считал.
+        src = r.get("owner_source")
+        if r["owner"] and src and src != "deployed_by":
+            owner += f' <span style="color:#6b778c;font-size:85%">· {esc(src)}</span>'
         reserved = reserved_cell(r.get("reserved"))
         # age=None означает «нет namespace squad-N-shared», то есть слот пуст,
         # а не «нет записи в KG» (так это читалось, пока возраст брался из kg_services)
