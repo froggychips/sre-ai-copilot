@@ -68,10 +68,13 @@ INSTALL = ["Wo_Backend_K8sNewCluster_InstallSquadEnv",
 
 KG_SQL = """
 WITH squad_svc AS (
-  SELECT id, namespace, health_score, created_at,
-         substring(namespace from '^(squad-[0-9]+)') AS squad
-  FROM kg_services
-  WHERE synthetic=false AND namespace ~ '^squad-[0-9]+'
+  -- Только namespace, которые сейчас есть в кластере: снесённый стенд
+  -- (squad-42, 07.09.2026) иначе висел на доске с «живыми» сервисами графа.
+  SELECT s.id, s.namespace, s.health_score, s.created_at,
+         substring(s.namespace from '^(squad-[0-9]+)') AS squad
+  FROM kg_services s
+  JOIN kg_namespaces n ON n.namespace = s.namespace AND n.state = 'active'
+  WHERE s.synthetic=false AND s.namespace ~ '^squad-[0-9]+'
 ),
 agg AS (
   SELECT squad, count(*) svcs, count(DISTINCT namespace) ns,

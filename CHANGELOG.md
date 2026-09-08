@@ -4,7 +4,22 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
-_Ничего в очереди — см. [1.0.11] ниже._
+### Исправлено
+
+- **Снесённый стенд больше не живёт в графе как активный (`stale_class = gone`,
+  контракт 2.8).** squad-42: namespace удалены 07.09 12:23, `kg_namespaces`
+  показывал `missing`, а `kg_services` утром 08.09 держал 31 узел в `active`
+  со свежими `health_computed_at`. Две причины: класс считался только по
+  давности деплоя и замирал на значении момента сноса (ns-sync по
+  отсутствующему namespace не вызывается), а metrics_sync / health_score /
+  детектор аномалий / агрегаты сигналов обходили `kg_services`, не глядя в
+  `kg_namespaces`, — пустой ответ VM записывался как измерение. Теперь
+  `namespace_lifecycle` на каждом тике идемпотентно переводит узлы всех
+  не-active namespace в `gone` (и пересчитывает класс сразу при возврате
+  namespace), четыре обхода пропускают такие узлы
+  (`missing_namespace_names`), `gone` вырезан из app-scope orphan-метрики
+  наравне с `expected_stale`, дашборд сквадов джойнит `kg_namespaces.state =
+  'active'`. Миграции нет: колонка `String`.
 
 ## [1.0.11] — 2026-09-07 — Пересылка отдельно
 

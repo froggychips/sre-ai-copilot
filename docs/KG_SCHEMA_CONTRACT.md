@@ -1,7 +1,8 @@
 # KG Schema / Quality Contract
 
-> **Версия контракта:** `kg_schema: 2.7`
-> **Дата:** 2026-08-15 (2.7 — db-узлы привязаны к realm, §1.3;
+> **Версия контракта:** `kg_schema: 2.8`
+> **Дата:** 2026-09-08 (2.8 — `stale_class=gone` у узлов снесённого namespace, §1.4;
+> 2.7 — db-узлы привязаны к realm, §1.3;
 > 2.6 — `owner_source`)
 > **Предыдущая правка:** 2026-06-10 (doc-update: `kg_ingress_observations` наполняется — §6.6;
 > уточнены consumer caveats §7.5: причина нулей `http_5xx`/`p95` в
@@ -24,7 +25,7 @@
 ## 1. Версия
 
 ```
-KG_SCHEMA_VERSION = "2.7"
+KG_SCHEMA_VERSION = "2.8"
 ```
 
 `major.minor`:
@@ -34,6 +35,29 @@ KG_SCHEMA_VERSION = "2.7"
   semantic существующего kind перевёрнут. Требует миграции consumer'ов.
 * **minor** — additive: новый edge kind, новый synthetic prefix, новые
   поля QUALITY_THRESHOLDS, перевод planned → active.
+
+### 1.4. Что изменилось в 2.8 — `stale_class = gone`
+
+Четвёртое значение `kg_services.stale_class`: **`gone`** — namespace узла
+отсутствует в кластере (`kg_namespaces.state != active`). Ставит его
+`namespace_lifecycle` (sweep по всем не-active namespace на каждом тике,
+идемпотентно), а не классификатор давности деплоя: это ответ на вопрос
+«существует ли сервис», а не «катился ли он». При возврате namespace класс
+пересчитывается обычным путём сразу в том же тике.
+
+Зачем: squad-42 — namespace удалены 07.09.2026 12:23, `kg_namespaces`
+честно показывал `missing`, а `kg_services` держал 31 узел в `active` с
+`health_computed_at` «сегодня»: класс замер на значении момента сноса
+(ns-sync по отсутствующему namespace больше не вызывается), а metrics_sync /
+health_score / детектор аномалий / агрегаты шли по `kg_services`, не глядя в
+`kg_namespaces`, и записывали пустой ответ VM как измерение. Теперь эти
+обходы исключают узлы не-active namespace
+(`namespace_lifecycle.missing_namespace_names`), а `gone` вырезан из
+app-scope orphan-метрики так же, как `expected_stale`.
+
+Потребителям: `WHERE stale_class = 'active'` больше не ловит снесённые
+стенды; кто хочет «всё живое» — `stale_class <> 'gone'` или join на
+`kg_namespaces.state = 'active'`.
 
 ### 1.3. Что изменилось в 2.7 — db-узлы привязаны к realm
 
@@ -131,6 +155,7 @@ owner-coverage, «сервисов всего») считаются только
 | 2.1 | Wave 7 (2026-05-22) | + `serves_traffic`, `routes_to`, `pod_event_of`; `subject:` synthetic |
 | **2.2** | 2026-05-24 (PR #82/#84/#86) | + `runs_as_job` (через `K8sJob.owner_service_id`), `uses_volume`/`bound_to` (в `kg_volume_edges`), `kg_services.stale_class` column (active/expected_stale/suspicious_stale), `deploy_history` owner source |
 | **2.3** | 2026-06-06 | orphan-метрика → **app-scope**: знаменатель = real-сервисы с `stale_class != 'expected_stale'`, orphan = из них без ЛЮБОГО edge (any-kind). Единый источник `compute_orphan_stats(db)`; все consumer'ы (`STARTUP_CONTRACT_CHECK`/`quality_report`/`stats_digest`) считают через него. EDGE_KINDS без изменений |
+| **2.8** | 2026-09-08 | + `stale_class = gone` (namespace снесён; ставит `namespace_lifecycle`, не классификатор); app-scope orphan = `stale_class NOT IN ('expected_stale','gone')`; metrics_sync/health_score/аномалии/агрегаты пропускают узлы не-active namespace. §1.4 |
 
 ---
 
@@ -339,6 +364,7 @@ PR #86 — first-class column на `kg_services` со значением кла�
 | `active` | `last_deploy_at` < 30 дней назад | `kg_sync.sync_namespace` → `kg_services.stale_class` |
 | `expected_stale` | backup/cron/system ns или infra-owner + deploy за 60d | `stats_digest.stale_deployments_section` (скрывает или compact-pill) |
 | `suspicious_stale` | нет deploy за 30d, не expected | dashboards / SQL `WHERE stale_class = 'suspicious_stale'` |
+| `gone` | namespace узла отсутствует в кластере (`kg_namespaces.state != active`), 2.8 | `namespace_lifecycle.sync_namespace_lifecycle` (sweep), вырезан из app-scope orphan-метрики; при возврате namespace пересчитывается |
 
 Реализация классификатора — `app/knowledge_graph/stale_classifier.py`
 (re-export из contract для backward-compat).

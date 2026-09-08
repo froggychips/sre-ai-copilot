@@ -60,7 +60,7 @@ log = logging.getLogger(__name__)
 #: без expected_stale-инфры) + единый источник `compute_orphan_stats`; все
 #: consumer'ы (STARTUP_CONTRACT_CHECK, quality_report, stats_digest) считают
 #: orphan через него. EDGE_KINDS не менялись.
-KG_SCHEMA_VERSION: str = "2.7"
+KG_SCHEMA_VERSION: str = "2.8"
 
 
 # ---------------------------------------------------------------------------
@@ -442,7 +442,8 @@ def compute_orphan_stats(db: "Session") -> OrphanStats:
     Считает в SQL то же, что per-service сумма `is_orphan(...)`:
 
       * `app_scope` = count real (NOT synthetic) **service**-узлов с
-        `coalesce(stale_class,'') <> 'expected_stale'`. workload-узлы в
+        `coalesce(stale_class,'') NOT IN ('expected_stale', 'gone')`
+        (`gone` = namespace снесён, v2.8). workload-узлы в
         знаменатель не входят: у них ребро serves_traffic есть всегда, и
         включение их в scope занизило бы orphan_pct вдвое без единого
         реально починенного сервиса.
@@ -471,20 +472,23 @@ def compute_orphan_stats(db: "Session") -> OrphanStats:
 
     # Значение expected_stale — bound param (:exp), не конкатенация в SQL
     # (Bandit B608 + чистая практика; значение и так доверенная константа).
-    params = {"exp": STALE_CLASS_EXPECTED_STALE}
+    params = {"exp": STALE_CLASS_EXPECTED_STALE, "gone": STALE_CLASS_GONE}
     params["svc_kind"] = NODE_KIND_SERVICE
     params["st"] = EDGE_SERVES_TRAFFIC
+    # `gone` (namespace снесён) из знаменателя вырезан так же, как expected:
+    # у узлов исчезнувшего стенда рёбер не будет уже никогда, и считать их
+    # орфанами — мерить не связность графа, а скорость уборки.
     app_scope = db.execute(text(
         "SELECT count(*) FROM kg_services s "
         "WHERE NOT s.synthetic "
         "  AND s.node_kind = :svc_kind "
-        "  AND coalesce(s.stale_class, '') <> :exp"
+        "  AND coalesce(s.stale_class, '') NOT IN (:exp, :gone)"
     ), params).scalar() or 0
     orphan = db.execute(text(
         "SELECT count(*) FROM kg_services s "
         "WHERE NOT s.synthetic "
         "  AND s.node_kind = :svc_kind "
-        "  AND coalesce(s.stale_class, '') <> :exp "
+        "  AND coalesce(s.stale_class, '') NOT IN (:exp, :gone) "
         "  AND s.id NOT IN ("
         "      SELECT src_id FROM kg_service_edges "
         "      WHERE src_id <> dst_id AND kind <> :st "
@@ -585,6 +589,7 @@ def compute_orphan_stats_by_env(db: "Session") -> Dict[str, OrphanStats]:
 
     params = {
         "exp": STALE_CLASS_EXPECTED_STALE,
+        "gone": STALE_CLASS_GONE,
         "svc_kind": NODE_KIND_SERVICE,
         "st": EDGE_SERVES_TRAFFIC,
     }
@@ -599,7 +604,7 @@ def compute_orphan_stats_by_env(db: "Session") -> Dict[str, OrphanStats]:
         "FROM kg_services s "
         "WHERE NOT s.synthetic "
         "  AND s.node_kind = :svc_kind "
-        "  AND coalesce(s.stale_class, '') <> :exp"
+        "  AND coalesce(s.stale_class, '') NOT IN (:exp, :gone)"
     ), params).fetchall()
 
     buckets: Dict[str, OrphanStats] = {}
@@ -644,11 +649,17 @@ ALL_NODE_KINDS: Set[str] = SERVICE_KINDS | STORAGE_NODE_KINDS | NODE_KINDS
 STALE_CLASS_ACTIVE: str = "active"
 STALE_CLASS_EXPECTED_STALE: str = "expected_stale"
 STALE_CLASS_SUSPICIOUS_STALE: str = "suspicious_stale"
+#: Namespace узла отсутствует в кластере (`kg_namespaces.state != active`).
+#: Ставится `namespace_lifecycle`, а не классификатором: это признак
+#: существования, не давности деплоя (v2.8). Из app-scope orphan-метрики
+#: такие узлы вырезаны так же, как `expected_stale`.
+STALE_CLASS_GONE: str = "gone"
 
 STALE_CLASS_VALUES: Set[str] = {
     STALE_CLASS_ACTIVE,
     STALE_CLASS_EXPECTED_STALE,
     STALE_CLASS_SUSPICIOUS_STALE,
+    STALE_CLASS_GONE,
 }
 
 
