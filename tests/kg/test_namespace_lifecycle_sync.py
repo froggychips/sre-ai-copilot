@@ -292,3 +292,27 @@ def test_missing_namespace_names_lists_every_non_active_state(db):
     ])
     db.commit()
     assert nl.missing_namespace_names(db) == {"b-missing", "c-retired"}
+
+
+# --- сырые лейблы владельца ------------------------------------------------------
+
+
+def test_lifecycle_stores_deployed_by_and_branch_labels(db, monkeypatch):
+    """deployed-by / deployed-branch — сырьё для kg_namespace_owner_sync; пишутся
+    и при создании строки, и при каждом тике (перераскатка без лейбла стирает)."""
+    db.add(Namespace(namespace="squad-64-shared", k8s_uid="uid-64", state=NS_STATE_ACTIVE,
+                     deployed_by="old", deployed_branch="old-branch"))
+    db.commit()
+    monkeypatch.setattr(nl, "_fetch_namespaces", lambda: {
+        "squad-64-shared": {"uid": "uid-64", "created_at": NOW,
+                            "deployed_by": "vdudnik", "deployed_branch": "wo-14648-becky"},
+        "squad-70-shared": {"uid": "uid-70", "created_at": NOW,
+                            "deployed_by": None, "deployed_branch": None},
+    })
+
+    sync_namespace_lifecycle(db)
+
+    old = db.query(Namespace).filter_by(namespace="squad-64-shared").one()
+    new = db.query(Namespace).filter_by(namespace="squad-70-shared").one()
+    assert (old.deployed_by, old.deployed_branch) == ("vdudnik", "wo-14648-becky")
+    assert (new.deployed_by, new.deployed_branch) == (None, None)

@@ -404,6 +404,34 @@ class Settings(BaseSettings):
     # Замер 21.08.2026: 1033 ребра в 22 пересозданных стендах жили с прежней
     # инкарнации и снова читались как факты о новом. Удаление данных — с
     # выключателем, grace-периодом в два часа и guard'ом на долю.
+    # Владелец namespace (kg_namespaces.owner_*). Один резолв для медика,
+    # дашборда сквадов и MCP-тула kg_squad_owners — до этого у каждого была
+    # своя карта, и 08.09.2026 у 9 из 19 деплойеров сквадов Discord-адресата
+    # не было ни у кого.
+    NAMESPACE_OWNER_SYNC_ENABLED: bool = Field(
+        True, description="Резолвить владельца namespace (beat kg_namespace_owner_sync)",
+    )
+    NAMESPACE_OWNER_SCOPE_REGEX: str = Field(
+        r"^squad-\d+-shared$",
+        description="Какие namespace получают владельца (regex по имени)",
+    )
+    # JSON-манифест людей: TC-логин → Discord id / Jira account, список
+    # сервисных аккаунтов, ручные override'ы владельца namespace. Лежит в
+    # ConfigMap кластера, в код не попадает (логин↔человек — не для публичного репо).
+    PEOPLE_MANIFEST_PATH: str = Field(
+        "", description="Путь к JSON-манифесту людей (ConfigMap sre-ai-copilot-people)",
+    )
+    # Последняя игровая активность сквада из его ClickHouse → kg_namespaces.last_activity_at.
+    # Default OFF: воркеру нужны CH-креды сквадов (те же, что у squad-dashboard).
+    SQUAD_ACTIVITY_ENABLED: bool = Field(False, description="Писать last_activity_at по CH сквада")
+    SQUAD_CH_USER: str = Field("", description="ClickHouse user сквадов")
+    SQUAD_CH_PASSWORD: str = Field("", description="ClickHouse password сквадов")
+    SQUAD_CH_PORT: int = Field(8123, description="ClickHouse HTTP port")
+    SQUAD_CH_DB: str = Field("WOAnalytics", description="ClickHouse database с фактами сессий")
+    SQUAD_CH_HOST_TEMPLATE: str = Field(
+        "clickhouse.{squad}-shared.svc.cluster.local",
+        description="Шаблон хоста ClickHouse сквада ({squad} = squad-N)",
+    )
     KG_REINCARNATION_PURGE_ENABLED: bool = Field(
         True,
         description="Убирать рёбра прежней инкарнации при пересоздании namespace",

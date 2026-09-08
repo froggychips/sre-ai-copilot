@@ -4,6 +4,24 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+### Добавлено
+
+- **Владелец namespace как факт графа (`kg_namespaces.owner_*`, контракт 2.9).**
+  До этого «чей это сквад» решали три несогласованных места: карта TC-логин →
+  Discord у squad-medic (15 записей; из 19 текущих деплойеров сквадов нет 9,
+  4 из 6 больных сквадов 08.09 пинговались «владелец не определён»),
+  `scripts/squad_dashboard.py` и скилл squad-occupancy в vibecode. Теперь
+  lifecycle пишет сырые лейблы `deployed_by`/`deployed_branch`, beat
+  `kg_namespace_owner_sync` (раз в час) резолвит владельца: manual →
+  assignee Jira-задачи из ветки (логин через манифест людей или профили
+  TeamCity) → deployed-by, если не сервисный аккаунт → последний
+  человек-триггер деплоя. Discord id — из манифеста `PEOPLE_MANIFEST_PATH`
+  (ConfigMap `sre-ai-copilot-people`, `k8s/people.example.json`), в код не
+  попадает. `last_activity_at` — последняя сессия по ClickHouse сквада
+  (`SQUAD_ACTIVITY_ENABLED`, default off). Дашборд сквадов берёт владельца из
+  графа с пометкой источника, лейбл — только пока граф не посчитал. Миграция
+  `20260908_0100` (ADD COLUMN nullable, таблица ~200 строк).
+
 ### Исправлено
 
 - **Снесённый стенд больше не живёт в графе как активный (`stale_class = gone`,

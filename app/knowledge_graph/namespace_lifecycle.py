@@ -73,9 +73,14 @@ def _fetch_namespaces() -> Dict[str, Dict[str, Any]]:
         name = meta.get("name")
         if not name:
             continue
+        labels = meta.get("labels") or {}
         result[name] = {
             "uid": meta.get("uid"),
             "created_at": parse_ts(meta.get("creationTimestamp")),
+            # Сырьё для владельца стенда (kg_namespaces.deployed_by/_branch):
+            # лейблы ставит TeamCity при раскатке сквада.
+            "deployed_by": labels.get("deployed-by") or None,
+            "deployed_branch": labels.get("deployed-branch") or None,
         }
     if not result:
         # Кластер без namespace невозможен: это сбой, а не «всё исчезло».
@@ -377,6 +382,8 @@ def sync_namespace_lifecycle(db: Session) -> Dict[str, Any]:
                 namespace=name, k8s_uid=info["uid"],
                 k8s_created_at=info["created_at"], incarnation=1,
                 state=NS_STATE_ACTIVE, first_seen_at=now, last_seen_at=now,
+                deployed_by=info.get("deployed_by"),
+                deployed_branch=info.get("deployed_branch"),
             ))
             stats["created"] += 1
             continue
@@ -409,6 +416,11 @@ def sync_namespace_lifecycle(db: Session) -> Dict[str, Any]:
         row.state = NS_STATE_ACTIVE  # type: ignore[assignment]
         row.last_seen_at = now  # type: ignore[assignment]
         row.missing_since = None  # type: ignore[assignment]
+        # Лейблы — как есть, включая None: перераскатка стенда без лейбла
+        # должна стирать прежнего деплойера, а не наследовать его.
+        if "deployed_by" in info:
+            row.deployed_by = info.get("deployed_by")  # type: ignore[assignment]
+            row.deployed_branch = info.get("deployed_branch")  # type: ignore[assignment]
 
     for name, row in known.items():
         if name in live or row.state != NS_STATE_ACTIVE:

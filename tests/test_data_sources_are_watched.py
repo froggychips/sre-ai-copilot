@@ -60,6 +60,9 @@ _MAINTENANCE = frozenset({
     "kg_health_recompute",
     "kg_health_retention",
     "kg_namespace_lifecycle",
+    # Владелец namespace — производное от лейблов, Jira и TC; молчание задачи
+    # оставляет owner_* устаревшими, но данных графа не искажает.
+    "kg_namespace_owner_sync",
     "kg_ownership_backfill",
     "kg_self_health_check",
     "kg_signal_aggregates_compute",

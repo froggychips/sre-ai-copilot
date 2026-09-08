@@ -76,6 +76,11 @@ spec:
           value: "true"
         - name: OWNERSHIP_MANIFEST_PATH
           value: /config/ownership.yaml
+        # Манифест людей (TC-логин → Discord id / Jira, сервисные аккаунты,
+        # ручные владельцы namespace) — для kg_namespace_owner_sync. Живёт
+        # только в кластере: связка логин↔человек в репозиторий не попадает.
+        - name: PEOPLE_MANIFEST_PATH
+          value: /config/people.json
         # Подставляется deploy.sh из IMAGE_TAG; в кластере значение застыло
         # на 1.0.0-rc.29, потому что ставилось руками.
         - name: BUILD_VERSION
@@ -206,6 +211,10 @@ spec:
           mountPath: /config/ownership.yaml
           subPath: ownership.yaml
           readOnly: true
+        - name: people
+          mountPath: /config/people.json
+          subPath: people.json
+          readOnly: true
         # readOnlyRootFilesystem: true выше означает, что писать некуда
         # вообще: без этого тома падает любая запись в /tmp, а её делают и
         # tempfile, и сборка .pyc. У beat такой том был, у воркера — нет.
@@ -215,6 +224,11 @@ spec:
       - name: ownership
         configMap:
           name: sre-ai-copilot-ownership
+      # optional: без ConfigMap под стартует, резолв идёт лейблами и TC без Discord id.
+      - name: people
+        configMap:
+          name: sre-ai-copilot-people
+          optional: true
       - name: tmp
         emptyDir: {}
 ---
@@ -296,6 +310,10 @@ spec:
           mountPath: /config/ownership.yaml
           subPath: ownership.yaml
           readOnly: true
+        - name: people
+          mountPath: /config/people.json
+          subPath: people.json
+          readOnly: true
         - name: tmp
           mountPath: /tmp
         envFrom:
@@ -320,6 +338,11 @@ spec:
           value: "true"
         - name: OWNERSHIP_MANIFEST_PATH
           value: /config/ownership.yaml
+        # Манифест людей (TC-логин → Discord id / Jira, сервисные аккаунты,
+        # ручные владельцы namespace) — для kg_namespace_owner_sync. Живёт
+        # только в кластере: связка логин↔человек в репозиторий не попадает.
+        - name: PEOPLE_MANIFEST_PATH
+          value: /config/people.json
         # Подставляется deploy.sh из IMAGE_TAG; в кластере значение застыло
         # на 1.0.0-rc.29, потому что ставилось руками.
         - name: BUILD_VERSION
@@ -427,6 +450,11 @@ spec:
       - name: ownership
         configMap:
           name: sre-ai-copilot-ownership
+      # optional: без ConfigMap под стартует, резолв идёт лейблами и TC без Discord id.
+      - name: people
+        configMap:
+          name: sre-ai-copilot-people
+          optional: true
       # Writable /tmp под celerybeat-schedule (см. --schedule выше).
       - name: tmp
         emptyDir:
