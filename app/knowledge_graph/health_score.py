@@ -59,6 +59,7 @@ from typing import Any, Dict, List, Optional, Tuple, cast
 from sqlalchemy import and_, or_
 from sqlalchemy.orm import Session
 
+from app.knowledge_graph.namespace_lifecycle import missing_namespace_names
 from app.knowledge_graph.schema import (
     NODE_KIND_SERVICE,
     AlertEvent,
@@ -472,6 +473,15 @@ def recompute_all_health(db: Session) -> Dict[str, int]:
         .order_by(Service.id)
         .all()
     )
+    # Узлы namespace, которого нет в кластере, не пересчитываем: свежий
+    # health_score у снесённого стенда читался как признак жизни (squad-42,
+    # 08.09.2026 — health_computed_at «сегодня» при namespace, удалённом вчера).
+    gone_ns = missing_namespace_names(db)
+    skipped_missing_ns = 0
+    if gone_ns:
+        kept = [s for s in services if cast(str, s.namespace) not in gone_ns]
+        skipped_missing_ns = len(services) - len(kept)
+        services = kept
     low_health = 0
     perfect_health = 0
     recomputed = 0
@@ -500,6 +510,7 @@ def recompute_all_health(db: Session) -> Dict[str, int]:
     )
     return {
         "real_services": len(services),
+        "skipped_missing_ns": skipped_missing_ns,
         "recomputed": recomputed,
         "low_health": low_health,
         "perfect_health": perfect_health,

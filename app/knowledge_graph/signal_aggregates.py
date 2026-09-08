@@ -27,6 +27,7 @@ from typing import Any, Dict, List, Optional, cast
 
 from sqlalchemy.orm import Session
 
+from app.knowledge_graph.namespace_lifecycle import missing_namespace_names
 from app.knowledge_graph.populator import insert_idempotent
 from app.knowledge_graph.schema import (AlertEvent, Deployment, PodEvent,
                                         Service, SignalAggregate)
@@ -169,8 +170,17 @@ def compute_signal_aggregates(
     services: List[Service] = (
         db.query(Service).filter(Service.synthetic.is_(False)).all()
     )
+    # Агрегаты по namespace, которого нет в кластере, не считаем — см.
+    # namespace_lifecycle.missing_namespace_names (кейс squad-42, 08.09.2026).
+    gone_ns = missing_namespace_names(db)
+    skipped_missing_ns = 0
+    if gone_ns:
+        kept = [s for s in services if str(s.namespace) not in gone_ns]
+        skipped_missing_ns = len(services) - len(kept)
+        services = kept
     stats: Dict[str, Any] = {
         "real_services": len(services),
+        "skipped_missing_ns": skipped_missing_ns,
         "window_hours": window_hours,
         "window_end": window_end.isoformat(),
         "inserted": 0,
