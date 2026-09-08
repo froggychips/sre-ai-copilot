@@ -95,6 +95,8 @@ def test_memory_chain_appears_in_causal_order(db):
         "records": 1, "diagnosis": "OOMKilled: memory limit too low after traffic growth",
         "resolution_quality": "resolved", "decisions": 1, "actions": 1,
         "verification": "verified", "identity_check": "same", "outcome": "action_verified",
+        # действия внешних исполнителей (kg_remediation_events) — в этом сценарии их нет
+        "external_actions": 0,
     }
     assert tl["unknowns"] == []
 

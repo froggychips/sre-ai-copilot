@@ -379,6 +379,24 @@ Drift-test `tests/test_contract_drift.py` исключает эти kinds из �
 
 ---
 
+## 6.6. События внешних исполнителей (`kg_remediation_events`, 2026-09-08)
+
+Одна строка = один прогон внешнего робота (сегодня — squad-medic) по одному
+стенду: `actor`, `run_id`, `namespace` (+ `namespaces` стенда), `squad`,
+`started_at`/`finished_at`, `outcome` ∈ fixed/partial/unresolved/failed/noop,
+`applied`/`manual`/`gaps` (JSON), `summary`/`root_cause`/`next_action`,
+`escalated`, `owner_login`, `incident_id` → `kg_incidents` (открытый на момент
+прогона инцидент по любому namespace стенда). Уникальность
+`(actor, run_id, namespace)` — повтор идемпотентен.
+
+Пишется только через `POST /webhooks/remediation` (HMAC над `ts.body`,
+fail-closed); читается `incident_timeline` (kind `remediation.external`,
+epistemic observed) и MCP-тулами. Отличие от `kg_remediation_decisions`: там
+решения собственного executor'а копилота с идентичностью цели и dry-run, здесь
+— доклад стороннего исполнителя о том, что он сделал.
+
+---
+
 ## 6.5. Stale class (`kg_services.stale_class`, добавлено в 2.2)
 
 PR #86 — first-class column на `kg_services` со значением классификации

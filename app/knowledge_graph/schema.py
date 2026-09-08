@@ -8,8 +8,8 @@ from __future__ import annotations
 from datetime import datetime
 
 from sqlalchemy import (JSON, BigInteger, Boolean, Column, DateTime, Float,
-                        ForeignKey, Index, Integer, String, UniqueConstraint,
-                        text)
+                        ForeignKey, Index, Integer, String, Text,
+                        UniqueConstraint, text)
 from sqlalchemy.orm import relationship
 
 from app.database import Base
@@ -912,4 +912,67 @@ class KGIncident(Base):
             postgresql_where=text("status = 'open'"),
             sqlite_where=text("status = 'open'"),
         ),
+    )
+
+
+class KGRemediationEvent(Base):
+    """Действие ВНЕШНЕГО исполнителя над стендом — то, что сделал не копилот.
+
+    `kg_remediation_decisions` хранит решения собственного executor'а копилота
+    и ничего не знает о других роботах. Между тем squad-medic лечит сквады
+    каждые 15 минут: 07.09.2026 на ImagePullBackOff squad-39 он применил 13
+    бесполезных grant-фиксов и через 14 часов запинговал владельца, а копилот
+    в тот же час выложил карточку KubeContainerWaiting по тому же стенду —
+    и ни в timeline инцидента, ни в дайджесте действий медика не было.
+
+    Одна строка = один прогон исполнителя по одному стенду: что применил,
+    что оставил человеку (`manual`), где сам был слеп (`gaps`), к какому
+    инциденту графа это относится (`incident_id`, если на момент прогона по
+    namespace стенда был открыт инцидент). Пишется через
+    `POST /webhooks/remediation` (HMAC, fail-closed), читается timeline'ом
+    инцидента и MCP-тулами. Это шаг «remediation verification» roadmap'а:
+    у копилота появляется, ЧТО сверять с состоянием после.
+    """
+
+    __tablename__ = "kg_remediation_events"
+
+    id = Column(Integer, primary_key=True)
+    #: Кто действовал: `squad-medic`, позже — другие роботы/скиллы.
+    #: Без index=True: uq_kg_remediation_events_run (actor, run_id, namespace)
+    #: покрывает колонку как префикс.
+    actor = Column(String, nullable=False)
+    #: Идентификатор прогона у исполнителя (имя пода CronJob, iso-время) —
+    #: для дедупа повторной отправки.
+    run_id = Column(String, nullable=True)
+    #: Основной namespace (для сквада — `squad-N-shared`), по нему идёт timeline.
+    namespace = Column(String, nullable=False, index=True)
+    #: Все namespace стенда, которые исполнитель трогал.
+    namespaces = Column(JSON, nullable=True)
+    squad = Column(String, nullable=True, index=True)
+    service_name = Column(String, nullable=True)
+    started_at = Column(DateTime, nullable=False, index=True)
+    finished_at = Column(DateTime, nullable=True)
+    duration_min = Column(Integer, nullable=True)
+    #: fixed | partial | unresolved | failed | noop
+    outcome = Column(String, nullable=False)
+    severity = Column(String, nullable=True)
+    fixed = Column(Boolean, nullable=False, default=False)
+    still_unhealthy = Column(Boolean, nullable=False, default=False)
+    applied = Column(JSON, nullable=True)
+    manual = Column(JSON, nullable=True)
+    gaps = Column(JSON, nullable=True)
+    summary = Column(Text, nullable=True)
+    root_cause = Column(Text, nullable=True)
+    next_action = Column(Text, nullable=True)
+    #: Владельца дёргали в Discord.
+    escalated = Column(Boolean, nullable=False, default=False)
+    owner_login = Column(String, nullable=True)
+    incident_id = Column(Integer, ForeignKey("kg_incidents.id"), nullable=True, index=True)
+    extras = Column(JSON, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    __table_args__ = (
+        # Повторная отправка одного прогона (retry исполнителя) — не второе
+        # событие. run_id NULL уникальностью не ограничен (SQL-семантика NULL).
+        UniqueConstraint("actor", "run_id", "namespace", name="uq_kg_remediation_events_run"),
     )
