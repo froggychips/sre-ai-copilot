@@ -14,7 +14,11 @@ from app.core.state_machine import IncidentState, StateMachine
 from app.security.replay import alertmanager_signature_cache, is_timestamp_fresh
 from app.database import IncidentRecord, get_db
 from app.ingestion.raw_collector import raw_collector
+from app.knowledge_graph.remediation_events import (SignatureError,
+                                                    check_remediation_signature,
+                                                    record_external_remediation)
 from app.metrics import ALERTS_SUPPRESSED
+from app.models.remediation_event import RemediationEventIn
 from app.models.incident import AlertManagerAlert, AlertManagerWebhook, Incident
 from app.services.teamcity_service import incident_teamcity_context
 from app.workers.tasks import (async_process_incident, celery_app,
@@ -870,3 +874,45 @@ async def get_task_status(task_id: str, user: User = Depends(get_current_user)):
     # probe статусов Celery-задач (enumeration + утечка прогресса пайплайна).
     res = celery_app.AsyncResult(task_id)
     return {"task_id": task_id, "status": res.status}
+
+
+# ── внешние исполнители: squad-medic ─────────────────────────────────────────
+
+
+async def verify_remediation_signature(request: Request) -> None:
+    """HMAC-SHA256 над `timestamp.body`, timestamp обязателен, anti-replay по
+    подписи. Fail-closed: без REMEDIATION_WEBHOOK_SECRET — 401 всегда.
+    Логика — `remediation_events.check_remediation_signature` (тестируется
+    без FastAPI); здесь только маппинг в HTTP."""
+    body = await request.body()
+    try:
+        signature = check_remediation_signature(
+            request.headers, body,
+            secret=settings.REMEDIATION_WEBHOOK_SECRET,
+            max_age_seconds=settings.REMEDIATION_WEBHOOK_MAX_AGE_SECONDS,
+        )
+    except SignatureError as e:
+        log.warning("remediation.webhook_rejected", reason=str(e))
+        raise HTTPException(status_code=401, detail=f"remediation webhook: {e}") from e
+    ttl = settings.REMEDIATION_WEBHOOK_MAX_AGE_SECONDS
+    if ttl > 0 and alertmanager_signature_cache.seen_recently(signature, ttl):
+        log.warning("remediation.webhook_replayed_signature")
+        raise HTTPException(status_code=401, detail="Replayed remediation request")
+
+
+@router.post(
+    "/remediation",
+    status_code=202,
+    dependencies=[Depends(verify_remediation_signature)],
+)
+async def remediation_event_webhook(
+    payload: RemediationEventIn, db: Session = Depends(get_db)
+):
+    """Событие внешнего исполнителя (squad-medic): что применил, что оставил
+    человеку, где был слеп — в `kg_remediation_events` и в timeline инцидента.
+
+    Никакого LLM и никаких действий в кластере: это запись факта. Повтор
+    того же `(actor, run_id, namespace)` идемпотентен (retry исполнителя).
+    """
+    result = record_external_remediation(db, payload)
+    return {"status": "recorded" if result["created"] else "duplicate", **result}

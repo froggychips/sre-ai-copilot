@@ -41,6 +41,7 @@ from app.core.timeutil import ensure_naive
 from app.knowledge_graph.epistemic import Epistemic
 from app.knowledge_graph.incidents import incident_to_dict
 from app.knowledge_graph.queries import deploy_attribution_scope
+from app.knowledge_graph.remediation_events import external_events_for_timeline
 from app.knowledge_graph.schema import (AlertEvent, AnomalyObservation,
                                         Deployment, KGIncident, LogObservation,
                                         PodEvent)
@@ -58,6 +59,8 @@ _KIND_ORDER = {
     "log_errors": 4, "alert.fired": 5,
     # операционная память: что копилот сделал — после того, что он увидел
     "evidence": 6, "diagnosis": 7, "decision": 8, "action.applied": 9, "verification": 10,
+    # действие внешнего исполнителя (squad-medic) — в одном ряду с action.applied
+    "remediation.external": 9,
     "alert.resolved": 11, "incident.resolved": 12,
 }
 
@@ -136,6 +139,41 @@ def build_timeline(
     events.extend(memory_events)
     if memory_unknown:
         unknowns.append(memory_unknown)
+
+    # ── действия внешних исполнителей (squad-medic) ────────────────────────
+    # Медик лечит сквады каждые 15 минут и до 08.09.2026 в ленте инцидента
+    # его не было: 07.09 на ImagePullBackOff squad-39 он применил 13 grant-фиксов
+    # и запинговал владельца, а копилот в тот же час выложил карточку по тому же
+    # стенду — два робота, одно событие, ни одной общей записи.
+    external = external_events_for_timeline(db, incident, start, end)
+    memory["external_actions"] = len(external)
+    if external and memory_unknown:
+        # «Копилот не действовал» остаётся правдой, но действовал другой
+        # робот — Known Unknown уточняется, а не снимается.
+        memory_unknown["reason"] += (
+            f"; при этом по стенду действовал внешний исполнитель "
+            f"({', '.join(sorted({str(e.actor) for e in external}))}) — "
+            "см. события remediation.external"
+        )
+    for ev in external:
+        title = f"{ev.actor}: {ev.outcome}"
+        if ev.summary:
+            title += f" · {str(ev.summary)[:160]}"
+        events.append(_ev(
+            _naive(cast(Optional[datetime], ev.started_at)) or opened_at, "remediation.external", title,
+            # Исполнитель докладывает о том, что сам сделал и увидел — наблюдение
+            # исполнителя, не вывод копилота.
+            epistemic=Epistemic.OBSERVED, provenance="kg_remediation_events",
+            details={
+                "actor": ev.actor, "run_id": ev.run_id, "squad": ev.squad,
+                "outcome": ev.outcome, "severity": ev.severity,
+                "fixed": bool(ev.fixed), "still_unhealthy": bool(ev.still_unhealthy),
+                "applied": ev.applied or [], "manual": ev.manual or [], "gaps": ev.gaps or [],
+                "root_cause": ev.root_cause, "next_action": ev.next_action,
+                "escalated": bool(ev.escalated), "owner_login": ev.owner_login,
+                "duration_min": ev.duration_min,
+            },
+        ))
 
     if resolved_at is not None:
         events.append(_ev(
