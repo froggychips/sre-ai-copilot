@@ -81,6 +81,17 @@ spec:
         # только в кластере: связка логин↔человек в репозиторий не попадает.
         - name: PEOPLE_MANIFEST_PATH
           value: /config/people.json
+        # Токен для чтения профилей TeamCity (/app/rest/users) — им резолвится
+        # «assignee Jira → TC-логин». Основной TC_TOKEN (учётка ai-agent) на
+        # этот эндпоинт получает 403. Берём тот же токен, что уже читает
+        # профили в CronJob squad-dashboard; optional — без него путь
+        # jira_assignee просто не сработает.
+        - name: TC_USERS_TOKEN
+          valueFrom:
+            secretKeyRef:
+              name: squad-dashboard-secrets
+              key: tc_token
+              optional: true
         # Подставляется deploy.sh из IMAGE_TAG; в кластере значение застыло
         # на 1.0.0-rc.29, потому что ставилось руками.
         - name: BUILD_VERSION
@@ -343,6 +354,17 @@ spec:
         # только в кластере: связка логин↔человек в репозиторий не попадает.
         - name: PEOPLE_MANIFEST_PATH
           value: /config/people.json
+        # Токен для чтения профилей TeamCity (/app/rest/users) — им резолвится
+        # «assignee Jira → TC-логин». Основной TC_TOKEN (учётка ai-agent) на
+        # этот эндпоинт получает 403. Берём тот же токен, что уже читает
+        # профили в CronJob squad-dashboard; optional — без него путь
+        # jira_assignee просто не сработает.
+        - name: TC_USERS_TOKEN
+          valueFrom:
+            secretKeyRef:
+              name: squad-dashboard-secrets
+              key: tc_token
+              optional: true
         # Подставляется deploy.sh из IMAGE_TAG; в кластере значение застыло
         # на 1.0.0-rc.29, потому что ставилось руками.
         - name: BUILD_VERSION
