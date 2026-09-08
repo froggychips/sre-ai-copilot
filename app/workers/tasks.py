@@ -217,6 +217,14 @@ celery_app.conf.beat_schedule = {
         "schedule": crontab(minute="3,13,23,33,43,53"),
         "options": {"expires": 540},
     },
+    "kg-namespace-owner-sync": {
+        "task": "kg_namespace_owner_sync",
+        # Раз в час на :09 — после kg_namespace_lifecycle (:03,:13,…), который
+        # кладёт сырые лейблы deployed-by/deployed-branch; резолв читает их.
+        # Чаще незачем: владелец стенда меняется при перераскатке, не в минутах.
+        "schedule": crontab(minute="9"),
+        "options": {"expires": 1800},
+    },
     "kg-db-edge-rehome": {
         "task": "kg_db_edge_rehome",
         # Раз в час и на :07 — заведомо ПОСЛЕ kg_namespace_lifecycle
@@ -845,6 +853,31 @@ def kg_alerts_resolve_sync_task():
     except Exception as e:
         logger.warning("kg_alerts_resolve_sync.failed: %s", e)
         return _src_polled({"error": str(e)})
+    finally:
+        db.close()
+
+
+@celery_app.task(name="kg_namespace_owner_sync")
+@single_instance(ttl_seconds=1800)
+def kg_namespace_owner_sync_task():
+    """Владелец namespace (kg_namespaces.owner_*): один резолв для медика,
+    дашборда сквадов и MCP-тула kg_squad_owners.
+
+    Читает лейблы, положенные lifecycle, ходит в Jira (assignee задачи из
+    ветки) и TeamCity (профили — для сопоставления имени с логином), берёт
+    Discord id из манифеста людей (PEOPLE_MANIFEST_PATH). Внешние источники
+    недоступны → понижение до следующего пути, не ошибка.
+    """
+    if not settings.NAMESPACE_OWNER_SYNC_ENABLED:
+        return {"skipped": "disabled"}
+    from app.knowledge_graph.namespace_owner import sync_namespace_owners
+
+    db = SessionLocal()
+    try:
+        return sync_namespace_owners(db)
+    except Exception as e:
+        logger.warning("kg_namespace_owner_sync.failed: %s", e)
+        return {"error": str(e)}
     finally:
         db.close()
 
