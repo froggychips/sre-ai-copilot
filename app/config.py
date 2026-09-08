@@ -421,6 +421,15 @@ class Settings(BaseSettings):
     PEOPLE_MANIFEST_PATH: str = Field(
         "", description="Путь к JSON-манифесту людей (ConfigMap sre-ai-copilot-people)",
     )
+    # Отдельный TC-токен ТОЛЬКО для `/app/rest/users` (сопоставление assignee
+    # Jira с TC-логином по e-mail/имени). Основной TC_TOKEN принадлежит
+    # сервисной учётке `ai-agent`, у которой нет права смотреть профили: замер
+    # 08.09.2026 — 403 AuthorizationFailedException, и путь `jira_assignee`
+    # молча деградировал до `deployed_by` на всех 46 стендах. Пусто —
+    # используется TC_TOKEN (обратная совместимость).
+    TC_USERS_TOKEN: str = Field(
+        "", description="TC-токен с правом читать профили пользователей (/app/rest/users)",
+    )
     # Последняя игровая активность сквада из его ClickHouse → kg_namespaces.last_activity_at.
     # Default OFF: воркеру нужны CH-креды сквадов (те же, что у squad-dashboard).
     SQUAD_ACTIVITY_ENABLED: bool = Field(False, description="Писать last_activity_at по CH сквада")
