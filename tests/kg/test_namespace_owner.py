@@ -22,7 +22,6 @@ from app.knowledge_graph.contract import (
     NAMESPACE_OWNER_SOURCE_TC_TRIGGERED_BY, NAMESPACE_OWNER_SOURCES)
 from app.knowledge_graph.namespace_owner import (JiraUnavailable, PeopleManifest,
                                                  Person, TcUser,
-                                                 gd_claims_from_builds,
                                                  jira_key_from_branch,
                                                  load_people_manifest,
                                                  resolve_owner,
@@ -135,21 +134,10 @@ def test_nothing_known_gives_unresolved_not_service_account():
 # --- кнопка «занять / освободить» (gd_claim) ---------------------------------
 
 
-def _gd_build(squad, login, *, status="SUCCESS", state="finished"):
-    """Ответ TeamCity по кнопке: номер стенда только в resulting-properties."""
-    return {
-        "status": status, "state": state,
-        "triggered": {"user": {"username": login}},
-        "resultingProperties": {"property": [
-            {"name": "TARGET_SQUAD", "value": ""},          # авто-выбор: пусто
-            {"name": "RESOLVED_SQUAD", "value": squad},
-        ]},
-    }
-
-
 def test_gd_claim_beats_stale_deployed_by_label():
-    """09.09.2026: стенд занят кнопкой, а лейбл остался от прежнего деплойера."""
-    res = resolve_owner("squad-8-shared", "grozoff", "default", people=PeopleManifest(),
+    """09.09.2026: стенд занят кнопкой (лейбл squad-owner), а deployed-by
+    остался от прежнего хозяина, который стенд освободил."""
+    res = resolve_owner("squad-8-shared", "sgrozov", "default", people=PeopleManifest(),
                         tc_users={}, jira_lookup=None, gd_claim_login="akomkov")
     assert (res.login, res.source) == ("akomkov", NAMESPACE_OWNER_SOURCE_GD_CLAIM)
 
@@ -157,7 +145,7 @@ def test_gd_claim_beats_stale_deployed_by_label():
 def test_jira_assignee_still_beats_gd_claim():
     """1.0.13: «владелец из задачи, а не из кнопки» — приоритет не меняем."""
     people = _people(ddosta={"jira_account_id": "acc-1"})
-    res = resolve_owner("squad-13-shared", "grozoff", "wo-14516-alliance-afk-leader",
+    res = resolve_owner("squad-13-shared", "sgrozov", "wo-14516-alliance-afk-leader",
                         people=people, tc_users={},
                         jira_lookup=lambda k: {"account_id": "acc-1", "email": None,
                                                "display_name": None},
@@ -166,36 +154,22 @@ def test_jira_assignee_still_beats_gd_claim():
 
 
 def test_gd_claim_by_service_account_is_ignored():
-    """Кнопку дёрнули REST-ом сервисным токеном — владельцем агент не становится."""
-    res = resolve_owner("squad-44-shared", "vdudnik", "preprod", people=PeopleManifest(),
+    """squad-18 09.09.2026: в squad-owner попал ai-agent — владельцем не считаем."""
+    res = resolve_owner("squad-18-shared", "aoganisyan", "preprod", people=PeopleManifest(),
                         tc_users={}, jira_lookup=None, gd_claim_login="ai-agent")
-    assert (res.login, res.source) == ("vdudnik", NAMESPACE_OWNER_SOURCE_DEPLOYED_BY)
+    assert (res.login, res.source) == ("aoganisyan", NAMESPACE_OWNER_SOURCE_DEPLOYED_BY)
 
 
-def test_gd_claims_parser_takes_latest_success_per_squad():
-    builds = [
-        _gd_build("squad-15", "akomkov"),                      # свежее — оно и победит
-        _gd_build("squad-15", "grozoff"),
-        _gd_build("squad-8", "akomkov"),
-        _gd_build("squad-20", "abugar", status="FAILURE"),      # неудачная попытка
-        _gd_build("squad-21", "someone", state="running"),      # ещё идёт
-        {"status": "SUCCESS", "state": "finished",              # освобождение без номера
-         "triggered": {"user": {"username": "x"}},
-         "resultingProperties": {"property": [{"name": "RESOLVED_SQUAD", "value": ""}]}},
-    ]
-    assert gd_claims_from_builds(builds) == {"squad-15": "akomkov", "squad-8": "akomkov"}
-
-
-def test_sync_prefers_gd_claim_over_label(db):
-    """Сквозь прогон: лейбл чужой, кнопку нажал другой человек → владелец из кнопки."""
+def test_sync_prefers_claim_owner_column_over_label(db):
+    """Сквозь прогон: deployed_by чужой, claim_owner (лейбл squad-owner) — истинный."""
     db.add(Namespace(namespace="squad-8-shared", state=NS_STATE_ACTIVE,
-                     deployed_by="grozoff", deployed_branch="default"))
+                     deployed_by="sgrozov", deployed_branch="default",
+                     claim_owner="akomkov"))
     db.commit()
-    stats = sync_namespace_owners(db, people=PeopleManifest(), tc_users={}, jira_lookup=None,
-                                  activity_lookup=None, gd_claims={"squad-8": "akomkov"})
+    sync_namespace_owners(db, people=PeopleManifest(), tc_users={}, jira_lookup=None,
+                          activity_lookup=None)
     row = db.query(Namespace).filter_by(namespace="squad-8-shared").one()
     assert (row.owner_login, row.owner_source) == ("akomkov", NAMESPACE_OWNER_SOURCE_GD_CLAIM)
-    assert stats["gd_claims"] == 1
 
 
 def test_every_source_value_is_in_contract():
