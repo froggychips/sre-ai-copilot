@@ -52,7 +52,7 @@ RESERVED = {
     "squad-54": "egecer · dev-35",      "squad-55": "egecer · dev-35",
     "squad-56": "schabanov · dev-36",   "squad-57": "schabanov · dev-36",
     "squad-58": "tkolosov · dev-37",    "squad-59": "tkolosov · dev-37",
-    "squad-60": "askuratov · dev-38",   "squad-61": "askuratov · dev-38",
+    "squad-60": "drakhmanov · dev-38",  "squad-61": "drakhmanov · dev-38",
     "squad-62": "aoganisyan · dev-39",  "squad-63": "aoganisyan · dev-39",
     "squad-64": "vdudnik · dev-40",     "squad-65": "vdudnik · dev-40",
     "squad-66": "vivanov · dev-41",     "squad-67": "vivanov · dev-41",
