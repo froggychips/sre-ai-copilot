@@ -15,10 +15,16 @@ TeamCity + Jira) и скилл squad-occupancy в vibecode (assignee Jira по �
    → TC-логин через манифест (`jira_account_id`) или через профили TeamCity
    (`/app/rest/users`: совпадение e-mail, затем имени). Покрывает кейс
    «тимлид раскатал чужую ветку для проверки»: стенд того, чья задача.
-3. **deployed_by** — лейбл `deployed-by`, если это не сервисный аккаунт
+3. **gd_claim** — кто нажал кнопку «Сквад-окружение: занять / освободить»
+   (`GdSquadEnv`); номер стенда кнопка публикует как `RESOLVED_SQUAD` в
+   resulting-properties. Явное действие «беру стенд» достовернее лейбла:
+   09.09.2026 squad-8 и squad-15 были заняты одним человеком 24–25.08, а
+   доска и медик показывали другого — прежнего деплойера из `deployed-by`,
+   который с тех пор не переписывался (жалоба «инфа не обновляется»).
+4. **deployed_by** — лейбл `deployed-by`, если это не сервисный аккаунт
    (ai-agent, aidev, cicd, …: 5 сквадов 08.09.2026 задеплоены агентом —
    человек за ними виден только через ветку и Jira).
-4. **tc_triggered_by** — `triggered_by` последнего деплоя в kg_deployments
+5. **tc_triggered_by** — `triggered_by` последнего деплоя в kg_deployments
    по сервисам namespace, снова минус сервисные аккаунты.
 
 Discord id — только из манифеста людей: он живёт в ConfigMap кластера,
@@ -46,8 +52,9 @@ from sqlalchemy.orm import Session
 from app.config import settings
 from app.core.timeutil import ensure_naive
 from app.knowledge_graph.contract import (
-    NAMESPACE_OWNER_SOURCE_DEPLOYED_BY, NAMESPACE_OWNER_SOURCE_JIRA_ASSIGNEE,
-    NAMESPACE_OWNER_SOURCE_MANUAL, NAMESPACE_OWNER_SOURCE_TC_TRIGGERED_BY)
+    NAMESPACE_OWNER_SOURCE_DEPLOYED_BY, NAMESPACE_OWNER_SOURCE_GD_CLAIM,
+    NAMESPACE_OWNER_SOURCE_JIRA_ASSIGNEE, NAMESPACE_OWNER_SOURCE_MANUAL,
+    NAMESPACE_OWNER_SOURCE_TC_TRIGGERED_BY)
 from app.knowledge_graph.schema import (NS_STATE_ACTIVE, Deployment, Namespace,
                                         Service)
 
@@ -221,6 +228,71 @@ def fetch_tc_users() -> Dict[str, TcUser]:
     return out
 
 
+#: Кнопка «Сквад-окружение: занять / освободить». Номер занятого стенда она
+#: отдаёт только как `RESOLVED_SQUAD` в resulting-properties (в queued-параметрах
+#: при авто-выборе он пуст), поэтому фильтровать по TARGET_SQUAD нельзя —
+#: сканируем окно билдов и разбираем свойства.
+GD_CLAIM_BUILDTYPE = "Wo_Backend_K8sNewCluster_GdSquadEnv"
+
+#: Сколько последних билдов кнопки смотреть. Занятий мало (десятки за месяц),
+#: окна с запасом хватает, а один запрос дешевле пер-сквадных.
+_GD_CLAIM_WINDOW = 200
+
+
+def gd_claims_from_builds(builds: Iterable[Dict[str, Any]]) -> Dict[str, str]:
+    """`{squad: логин}` из ответа TeamCity по кнопке занятия.
+
+    Чистая функция (тестируется без сети). Билды приходят от свежих к старым,
+    поэтому первый успешный на сквад и есть последнее занятие. Незавершённые и
+    неуспешные пропускаем: неудачная попытка занять стенд владельца не меняет.
+    """
+    out: Dict[str, str] = {}
+    for b in builds:
+        if b.get("status") != "SUCCESS" or b.get("state") != "finished":
+            continue
+        props = {p.get("name"): p.get("value")
+                 for p in ((b.get("resultingProperties") or {}).get("property") or [])}
+        squad = _opt_str(props.get("RESOLVED_SQUAD"))
+        if not squad:
+            continue
+        squad = squad.strip().lower()
+        if not re.fullmatch(r"squad-\d+", squad) or squad in out:
+            continue
+        login = _opt_str(((b.get("triggered") or {}).get("user") or {}).get("username"))
+        if login:
+            out[squad] = login.strip().lower()
+    return out
+
+
+def fetch_gd_claims() -> Dict[str, str]:
+    """Кто последним занял каждый стенд кнопкой ГД → `{squad: логин}`.
+
+    Нет TC_URL/токена или ошибка → `{}`: путь просто не сработает, резолв
+    понизится до `deployed_by`, как было до этого.
+    """
+    token = settings.TC_TOKEN or settings.TC_USERS_TOKEN
+    if not settings.TC_URL or not token:
+        return {}
+    url = settings.TC_URL.rstrip("/") + "/app/rest/builds"
+    params = {
+        "locator": f"buildType:{GD_CLAIM_BUILDTYPE},count:{_GD_CLAIM_WINDOW},branch:default:any",
+        "fields": ("build(id,status,state,startDate,triggered(user(username)),"
+                   "resultingProperties(property(name,value)))"),
+    }
+    headers = {"Authorization": f"Bearer {token}", "Accept": "application/json"}
+    try:
+        with httpx.Client(timeout=_HTTP_TIMEOUT) as client:
+            r = client.get(url, headers=headers, params=params)
+            r.raise_for_status()
+            builds = r.json().get("build") or []
+    except Exception as e:  # noqa: BLE001 — недоступность TC не ошибка резолва
+        log.warning("namespace_owner.gd_claims_failed", error=type(e).__name__)
+        return {}
+    claims = gd_claims_from_builds(builds)
+    log.info("namespace_owner.gd_claims", squads=len(claims))
+    return claims
+
+
 def fetch_jira_assignee(key: str) -> Optional[Dict[str, Optional[str]]]:
     """Assignee задачи: {account_id, email, display_name}. Нет кред / 404 /
     без исполнителя / ошибка → None."""
@@ -306,6 +378,7 @@ def resolve_owner(
     tc_users: Dict[str, TcUser],
     jira_lookup: Optional[JiraLookup],
     triggered_by_fallback: Optional[str] = None,
+    gd_claim_login: Optional[str] = None,
 ) -> OwnerResolution:
     """Чистая функция: все внешние данные приходят параметрами."""
     jira_key = jira_key_from_branch(deployed_branch)
@@ -327,6 +400,15 @@ def resolve_owner(
             if login and not people.is_service_account(login):
                 return OwnerResolution(login, NAMESPACE_OWNER_SOURCE_JIRA_ASSIGNEE, jira_key,
                                        people.discord_for(login), jira_unavailable)
+
+    # Нажатие «занять» — заявка человека на стенд, и она свежее лейбла:
+    # `deployed-by` остаётся от прошлого деплойера, пока новый владелец не
+    # катал полный деплой сам. Ниже Jira намеренно (см. 1.0.13: «владелец из
+    # задачи, а не из кнопки» — тимлид может занять стенд под чужую задачу).
+    gd = (gd_claim_login or "").strip().lower() or None
+    if gd and not people.is_service_account(gd):
+        return OwnerResolution(gd, NAMESPACE_OWNER_SOURCE_GD_CLAIM, jira_key,
+                               people.discord_for(gd), jira_unavailable)
 
     dep = (deployed_by or "").strip().lower() or None
     if dep and not people.is_service_account(dep):
@@ -411,6 +493,7 @@ def sync_namespace_owners(
     tc_users: Optional[Dict[str, TcUser]] = None,
     jira_lookup: Optional[JiraLookup] = fetch_jira_assignee,
     activity_lookup: Optional[Callable[[str], Optional[datetime]]] = fetch_squad_last_activity,
+    gd_claims: Optional[Dict[str, str]] = None,
 ) -> Dict[str, Any]:
     """Заполнить `kg_namespaces.owner_*` для active-namespace в scope.
 
@@ -421,6 +504,8 @@ def sync_namespace_owners(
     scope = re.compile(settings.NAMESPACE_OWNER_SCOPE_REGEX)
     people = people if people is not None else load_people_manifest(settings.PEOPLE_MANIFEST_PATH)
     tc_users = tc_users if tc_users is not None else fetch_tc_users()
+    # Один запрос на прогон: кнопка занятия отдаёт весь список стендов сразу.
+    gd_claims = gd_claims if gd_claims is not None else fetch_gd_claims()
 
     jira_cache: Dict[str, Optional[Dict[str, Optional[str]]]] = {}
     jira_errors = 0
@@ -446,6 +531,7 @@ def sync_namespace_owners(
         "scanned": 0, "resolved": 0, "unresolved": 0, "changed": 0,
         "by_source": {}, "jira_errors": 0, "activity_updated": 0,
         "people": len(people.people), "tc_users": len(tc_users),
+        "gd_claims": len(gd_claims),
     }
     for row in rows:
         name = cast(str, row.namespace)
@@ -453,10 +539,12 @@ def sync_namespace_owners(
             continue
         stats["scanned"] += 1
         fallback = last_triggered_by(db, name, people.service_accounts)
+        squad_key = name.rsplit("-shared", 1)[0] if name.endswith("-shared") else name
         res = resolve_owner(
             name, cast(Optional[str], row.deployed_by), cast(Optional[str], row.deployed_branch),
             people=people, tc_users=tc_users, jira_lookup=_jira,
             triggered_by_fallback=fallback,
+            gd_claim_login=gd_claims.get(squad_key),
         )
         before = (row.owner_login, row.owner_source, row.owner_jira_key, row.owner_discord_id)
         after = (res.login, res.source, res.jira_key, res.discord_id)

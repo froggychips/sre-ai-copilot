@@ -179,12 +179,14 @@ OWNER_SOURCES: Set[str] = {
 #: `namespace_owner.resolve_owner`.
 NAMESPACE_OWNER_SOURCE_MANUAL: str = "manual"                  # PEOPLE_MANIFEST_PATH → namespace_owners
 NAMESPACE_OWNER_SOURCE_JIRA_ASSIGNEE: str = "jira_assignee"    # WO-ключ из deployed-branch → assignee задачи
+NAMESPACE_OWNER_SOURCE_GD_CLAIM: str = "gd_claim"              # кто нажал «занять» (кнопка GdSquadEnv)
 NAMESPACE_OWNER_SOURCE_DEPLOYED_BY: str = "deployed_by"        # лейбл deployed-by, не сервисный аккаунт
 NAMESPACE_OWNER_SOURCE_TC_TRIGGERED_BY: str = "tc_triggered_by"  # triggered_by последнего деплоя в kg_deployments
 
 NAMESPACE_OWNER_SOURCES: Set[str] = {
     NAMESPACE_OWNER_SOURCE_MANUAL,
     NAMESPACE_OWNER_SOURCE_JIRA_ASSIGNEE,
+    NAMESPACE_OWNER_SOURCE_GD_CLAIM,
     NAMESPACE_OWNER_SOURCE_DEPLOYED_BY,
     NAMESPACE_OWNER_SOURCE_TC_TRIGGERED_BY,
 }

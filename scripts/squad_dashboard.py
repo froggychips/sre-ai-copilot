@@ -65,6 +65,11 @@ TC_TOKEN = os.environ["TC_TOKEN"].strip()  # --from-file может тащить
 ONE = "Wo_Backend_K8sNewCluster_OneServiceBuildAndUpdate"
 INSTALL = ["Wo_Backend_K8sNewCluster_InstallSquadEnv",
            "Wo_Backend_K8sNewCluster_RebuildSquadFromSource"]
+# Кнопка «Сквад-окружение: занять / освободить». В INSTALL её держать нельзя:
+# fetch_install() фильтрует по property TARGET_SQUAD, а кнопка публикует номер
+# только как RESOLVED_SQUAD в resulting-properties (при авто-выборе сквада в
+# queued-параметрах его вообще нет). Поэтому — отдельный оконный скан.
+GD_CLAIM = "Wo_Backend_K8sNewCluster_GdSquadEnv"
 
 KG_SQL = """
 WITH squad_svc AS (
@@ -312,6 +317,47 @@ def fetch_oneservice():
     return result
 
 
+def fetch_gd_claims():
+    """Оконный скан кнопки занятия → {squad: {number, status, started, by}}.
+
+    Даёт провенанс «стенд занят кнопкой», которого не видно ни в OneService, ни
+    в Install: squad-8 и squad-15 09.09.2026 показывали прошлый Install и
+    прошлого владельца, хотя заняты были кнопкой две недели назад.
+    TC недоступен → {}, колонка деградирует как раньше.
+    """
+    path = (f"/app/rest/builds?locator=buildType:{GD_CLAIM},count:{WINDOW},branch:default:any"
+            f"&fields=build(number,status,state,startDate,triggered(user(username)),"
+            f"resultingProperties(property(name,value)))")
+    try:
+        builds = tc_get(path).get("build", [])
+    except requests.RequestException as e:
+        log(f"  gd claims: TC недоступен ({e}) → провенанс занятия пропускаем")
+        return {}
+    out = {}
+    for b in builds:
+        if b.get("status") != "SUCCESS" or b.get("state") != "finished":
+            continue
+        props = {p["name"]: p.get("value") for p in
+                 (b.get("resultingProperties", {}) or {}).get("property", [])}
+        squad = (props.get("RESOLVED_SQUAD") or "").strip().lower()
+        if not re.fullmatch(r"squad-[0-9]+", squad) or squad in out:
+            continue
+        out[squad] = {"buildtype": "Claim", "number": b.get("number"),
+                      "status": b.get("status"), "started": b.get("startDate"),
+                      "by": (b.get("triggered", {}).get("user", {}) or {}).get("username", "?")}
+    log(f"  gd claims: занятий кнопкой по {len(out)} сквадам")
+    return out
+
+
+def _newer_provenance(a, b):
+    """Из двух записей провенанса (install/rebuild и claim) — та, что свежее."""
+    if not a:
+        return b
+    if not b:
+        return a
+    return a if (a.get("started") or "") >= (b.get("started") or "") else b
+
+
 def fetch_install(squad):
     """Последний install/rebuild по точному локатору TARGET_SQUAD."""
     found = []
@@ -352,6 +398,7 @@ def build_rows():
         log(f"  kg owners: {e}")
         owners = {}
     one = fetch_oneservice()
+    gd = fetch_gd_claims()
     rows = []
     now = datetime.datetime.utcnow()
     for n in SQUAD_NUMS:
@@ -362,8 +409,9 @@ def build_rows():
         k = kg.get(s, {}) if lbl else {}
         ov = one.get(s, {})
         lb = ov.get("last_build")
-        inst = fetch_install(s)
-        # Владелец: резолв графа (Jira-assignee по ветке → deployed-by → TC),
+        # Провенанс стенда: Install/Rebuild ИЛИ занятие кнопкой ГД — что свежее.
+        inst = _newer_provenance(fetch_install(s), gd.get(s))
+        # Владелец: резолв графа (Jira-assignee по ветке → кнопка ГД → deployed-by → TC),
         # лейбл deployed-by — только пока граф его не посчитал. Лейбл врёт,
         # когда кнопку нажал сервисный аккаунт (ai-agent) или коллега.
         own = owners.get(s) or {}
@@ -717,9 +765,12 @@ def render(rows, gen_date, jira_statuses=None, today=None):
         f'(<code>for-ai-agent: do-not-delete</code> / <code>used-by: rnd-squad</code>) — не снимать. '
         f'(Нет данных о деплое/активности — «не знаю», оставляем «занят».) '
         f'Ячейка <strong>Squad</strong> подсвечена тем же цветом.</li>'
-        f'<li><strong>Занявший</strong> — кто задеплоил: лейбл namespace <code>deployed-by</code> (TC-логин), '
-        f'показывается как <strong>имя и фамилия</strong> из профиля TeamCity. Логин остаётся, только если профиля '
-        f'в TC нет (служебная учётка, удалённый пользователь).</li>'
+        f'<li><strong>Занявший</strong> — владелец стенда из графа: assignee задачи по ветке → кто нажал '
+        f'«занять» (кнопка ГД) → лейбл <code>deployed-by</code> → триггер последнего деплоя; '
+        f'источник дописан серым (<code>· gd_claim</code> и т.п.), кроме случая с лейблом. Показывается как '
+        f'<strong>имя и фамилия</strong> из профиля TeamCity; логин остаётся, только если профиля в TC нет '
+        f'(служебная учётка, удалённый пользователь). Лейбл сам по себе врёт: он остаётся от прежнего '
+        f'деплойера, пока новый владелец не катал полный деплой.</li>'
         f'<li><strong>Reserved for</strong> — за кем закреплён сквад и на какой выделенной 128GB-ноде (WO-12485), '
         f'формат «имя и фамилия · нода»; по 2 сквада на разработчика, оба на одной ноде (co-location из-за local-path PVC). '
         f'Резерв (squad→разработчик→нода) — из карты в генераторе, зеркало <code>services/squad-mapping.yaml</code> (wo-k8s). '
@@ -733,8 +784,8 @@ def render(rows, gen_date, jira_statuses=None, today=None):
         f'разошёлся пароль). Самый честный сигнал реального использования стенда.</li>'
         f'<li><strong>Последняя сборка (OneService)</strong> — последний '
         f'OneServiceBuildAndUpdate в окне; idle = сборок в окне не было.</li>'
-        f'<li><strong>Установка / Rebuild</strong> — последний Install/Rebuild стенда '
-        f'(TC-билд #, кто, дата).</li>'
+        f'<li><strong>Установка / Rebuild</strong> — последнее развёртывание стенда: Install/Rebuild '
+        f'или <code>Claim</code> (занятие кнопкой ГД) — что свежее (TC-билд #, кто, дата).</li>'
         f'<li><strong>Возраст, дн</strong> — дней с <code>creationTimestamp</code> namespace '
         f'<code>squad-N-shared</code>, то есть сколько сквад реально занят. Пусто = стенда в кластере нет.</li>'
         f'<li><strong>NS</strong> — число namespace’ов сквада (shared + kingdom). Для слота без '
