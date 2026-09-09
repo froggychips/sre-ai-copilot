@@ -65,11 +65,6 @@ TC_TOKEN = os.environ["TC_TOKEN"].strip()  # --from-file может тащить
 ONE = "Wo_Backend_K8sNewCluster_OneServiceBuildAndUpdate"
 INSTALL = ["Wo_Backend_K8sNewCluster_InstallSquadEnv",
            "Wo_Backend_K8sNewCluster_RebuildSquadFromSource"]
-# Кнопка «Сквад-окружение: занять / освободить». В INSTALL её держать нельзя:
-# fetch_install() фильтрует по property TARGET_SQUAD, а кнопка публикует номер
-# только как RESOLVED_SQUAD в resulting-properties (при авто-выборе сквада в
-# queued-параметрах его вообще нет). Поэтому — отдельный оконный скан.
-GD_CLAIM = "Wo_Backend_K8sNewCluster_GdSquadEnv"
 
 KG_SQL = """
 WITH squad_svc AS (
@@ -201,6 +196,11 @@ def fetch_ns_labels():
             # возраст занятия = creationTimestamp самого ns, а НЕ min(created_at) сервисов в KG
             "created": _parse_k8s_ts(it["metadata"].get("creationTimestamp")),
             "claim": labels.get("squad-claim"),
+            # `squad-owner` ставит кнопка занятия — это заявка человека на
+            # стенд; deployed-by переписывается только полным деплоем и
+            # потому залипает на прежнем хозяине.
+            "claim_owner": labels.get("squad-owner"),
+            "claim_build": labels.get("squad-claim-build"),
             "claimed_at": _parse_k8s_ts(annotations.get("squad-claimed-at")),
             # for-ai-agent=do-not-delete / used-by=rnd-squad — стенд снимать нельзя
             "guard": (labels.get("for-ai-agent") or labels.get("used-by") or None),
@@ -317,36 +317,19 @@ def fetch_oneservice():
     return result
 
 
-def fetch_gd_claims():
-    """Оконный скан кнопки занятия → {squad: {number, status, started, by}}.
+def claim_provenance(lbl):
+    """Занятие кнопкой как запись провенанса — целиком из лейблов ns.
 
-    Даёт провенанс «стенд занят кнопкой», которого не видно ни в OneService, ни
-    в Install: squad-8 и squad-15 09.09.2026 показывали прошлый Install и
-    прошлого владельца, хотя заняты были кнопкой две недели назад.
-    TC недоступен → {}, колонка деградирует как раньше.
+    Скан истории TeamCity для этого не нужен: кнопка кладёт на namespace и
+    номер своего билда (`squad-claim-build`), и время (`squad-claimed-at`).
     """
-    path = (f"/app/rest/builds?locator=buildType:{GD_CLAIM},count:{WINDOW},branch:default:any"
-            f"&fields=build(number,status,state,startDate,triggered(user(username)),"
-            f"resultingProperties(property(name,value)))")
-    try:
-        builds = tc_get(path).get("build", [])
-    except requests.RequestException as e:
-        log(f"  gd claims: TC недоступен ({e}) → провенанс занятия пропускаем")
-        return {}
-    out = {}
-    for b in builds:
-        if b.get("status") != "SUCCESS" or b.get("state") != "finished":
-            continue
-        props = {p["name"]: p.get("value") for p in
-                 (b.get("resultingProperties", {}) or {}).get("property", [])}
-        squad = (props.get("RESOLVED_SQUAD") or "").strip().lower()
-        if not re.fullmatch(r"squad-[0-9]+", squad) or squad in out:
-            continue
-        out[squad] = {"buildtype": "Claim", "number": b.get("number"),
-                      "status": b.get("status"), "started": b.get("startDate"),
-                      "by": (b.get("triggered", {}).get("user", {}) or {}).get("username", "?")}
-    log(f"  gd claims: занятий кнопкой по {len(out)} сквадам")
-    return out
+    who = lbl.get("claim_owner")
+    when = lbl.get("claimed_at")
+    if not (who and when):
+        return None
+    return {"buildtype": "Claim", "number": lbl.get("claim_build") or "?",
+            "status": "SUCCESS", "started": when.strftime("%Y%m%dT%H%M%S+0000"),
+            "by": who}
 
 
 def _newer_provenance(a, b):
@@ -398,7 +381,6 @@ def build_rows():
         log(f"  kg owners: {e}")
         owners = {}
     one = fetch_oneservice()
-    gd = fetch_gd_claims()
     rows = []
     now = datetime.datetime.utcnow()
     for n in SQUAD_NUMS:
@@ -410,13 +392,21 @@ def build_rows():
         ov = one.get(s, {})
         lb = ov.get("last_build")
         # Провенанс стенда: Install/Rebuild ИЛИ занятие кнопкой ГД — что свежее.
-        inst = _newer_provenance(fetch_install(s), gd.get(s))
+        inst = _newer_provenance(fetch_install(s), claim_provenance(lbl))
         # Владелец: резолв графа (Jira-assignee по ветке → кнопка ГД → deployed-by → TC),
         # лейбл deployed-by — только пока граф его не посчитал. Лейбл врёт,
         # когда кнопку нажал сервисный аккаунт (ai-agent) или коллега.
         own = owners.get(s) or {}
         owner = own.get("owner_login") or lbl.get("owner")
         owner_source = own.get("owner_source") if own.get("owner_login") else ("label" if lbl.get("owner") else None)
+        # Пока резолв графа не раскатан (или он сам упёрся в залипший
+        # deployed-by), лейбл `squad-owner` точнее: это тот, кто занял стенд
+        # кнопкой. Сервисные учётки владельцем не считаем — кнопку могли
+        # дёрнуть REST-ом служебным токеном.
+        claim_owner = (lbl.get("claim_owner") or "").strip().lower() or None
+        if claim_owner and claim_owner not in SERVICE_ACCOUNTS and owner_source in (
+                None, "label", "deployed_by", "tc_triggered_by"):
+            owner, owner_source = claim_owner, "gd_claim"
         act = fetch_ch_activity(s)
         # Все сквады в пределах SQUAD_NUMS — реальные провизионированные слоты,
         # поэтому показываем и пустые: classify() даёт им «свободен» (доступная ёмкость).
@@ -530,6 +520,11 @@ def td_hl(content, colour):
     attr = f' data-highlight-colour="{colour}"' if colour else ""
     return f"<td{attr}><p>{content}</p></td>" if content else f"<td{attr}></td>"
 
+
+#: Учётки автоматики: за ними человека нет, владельцем стенда они быть не могут
+#: (тот же список, что в app/knowledge_graph/namespace_owner.py).
+SERVICE_ACCOUNTS = frozenset({"ai-agent", "aidev", "cicd", "teamcity",
+                              "teamcity-cicd", "qcerdh6w"})
 
 # базовые/idle-ветки: деплой с них = сквад никем не занят под конкретную работу
 BASE_BRANCHES = {"preprod", "default", "master", "main", "develop"}

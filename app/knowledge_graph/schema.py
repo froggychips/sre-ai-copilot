@@ -93,6 +93,9 @@ class Namespace(Base):
     #: ветку — раскатать коллега для проверки чужой задачи.
     deployed_by = Column(String, nullable=True)
     deployed_branch = Column(String, nullable=True)
+    # Лейбл `squad-owner`: кто занял стенд кнопкой ГД. Отличается от
+    # deployed_by, который остаётся от прежнего деплойера стенда.
+    claim_owner = Column(String, nullable=True)
     #: Владелец стенда — человек, к которому идти с вопросом «твой стенд
     #: болеет». Резолв (`kg_namespace_owner_sync`): ручной override →
     #: assignee Jira-задачи из ветки → deployed-by, если это не сервисный

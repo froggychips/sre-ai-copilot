@@ -81,6 +81,10 @@ def _fetch_namespaces() -> Dict[str, Dict[str, Any]]:
             # лейблы ставит TeamCity при раскатке сквада.
             "deployed_by": labels.get("deployed-by") or None,
             "deployed_branch": labels.get("deployed-branch") or None,
+            # `squad-owner` ставит кнопка «занять / освободить» — это заявка
+            # человека на стенд, тогда как deployed-by переписывается только
+            # полным деплоем и потому залипает на прежнем хозяине.
+            "claim_owner": labels.get("squad-owner") or None,
         }
     if not result:
         # Кластер без namespace невозможен: это сбой, а не «всё исчезло».
@@ -384,6 +388,7 @@ def sync_namespace_lifecycle(db: Session) -> Dict[str, Any]:
                 state=NS_STATE_ACTIVE, first_seen_at=now, last_seen_at=now,
                 deployed_by=info.get("deployed_by"),
                 deployed_branch=info.get("deployed_branch"),
+                claim_owner=info.get("claim_owner"),
             ))
             stats["created"] += 1
             continue
@@ -421,6 +426,7 @@ def sync_namespace_lifecycle(db: Session) -> Dict[str, Any]:
         if "deployed_by" in info:
             row.deployed_by = info.get("deployed_by")  # type: ignore[assignment]
             row.deployed_branch = info.get("deployed_branch")  # type: ignore[assignment]
+            row.claim_owner = info.get("claim_owner")  # type: ignore[assignment]
 
     for name, row in known.items():
         if name in live or row.state != NS_STATE_ACTIVE:
