@@ -52,7 +52,7 @@ RESERVED = {
     "squad-54": "india · dev-35",      "squad-55": "india · dev-35",
     "squad-56": "quebec · dev-36",   "squad-57": "quebec · dev-36",
     "squad-58": "sierra · dev-37",    "squad-59": "sierra · dev-37",
-    "squad-60": "zulu · dev-38",   "squad-61": "zulu · dev-38",
+    "squad-60": "hotel · dev-38",  "squad-61": "hotel · dev-38",
     "squad-62": "alpha · dev-39",  "squad-63": "alpha · dev-39",
     "squad-64": "tango · dev-40",     "squad-65": "tango · dev-40",
     "squad-66": "uniform · dev-41",     "squad-67": "uniform · dev-41",
