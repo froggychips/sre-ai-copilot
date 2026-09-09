@@ -316,3 +316,26 @@ def test_lifecycle_stores_deployed_by_and_branch_labels(db, monkeypatch):
     new = db.query(Namespace).filter_by(namespace="squad-70-shared").one()
     assert (old.deployed_by, old.deployed_branch) == ("vdudnik", "wo-14648-becky")
     assert (new.deployed_by, new.deployed_branch) == (None, None)
+
+
+def test_lifecycle_stores_claim_owner_label(db, monkeypatch):
+    """`squad-owner` — кто занял стенд кнопкой; пишется и при создании строки, и
+    на каждом тике, а освобождение стенда (лейбла нет) прежнего не наследует."""
+    db.add(Namespace(namespace="squad-8-shared", k8s_uid="uid-8", state=NS_STATE_ACTIVE,
+                     deployed_by="sgrozov", claim_owner="sgrozov"))
+    db.commit()
+    monkeypatch.setattr(nl, "_fetch_namespaces", lambda: {
+        # стенд перезанят другим человеком: deployed-by ещё прежний
+        "squad-8-shared": {"uid": "uid-8", "created_at": NOW, "deployed_by": "sgrozov",
+                           "deployed_branch": "default", "claim_owner": "akomkov"},
+        # новый стенд без лейбла занятия
+        "squad-33-shared": {"uid": "uid-33", "created_at": NOW, "deployed_by": None,
+                            "deployed_branch": None, "claim_owner": None},
+    })
+
+    sync_namespace_lifecycle(db)
+
+    taken = db.query(Namespace).filter_by(namespace="squad-8-shared").one()
+    fresh = db.query(Namespace).filter_by(namespace="squad-33-shared").one()
+    assert (taken.claim_owner, taken.deployed_by) == ("akomkov", "sgrozov")
+    assert fresh.claim_owner is None
