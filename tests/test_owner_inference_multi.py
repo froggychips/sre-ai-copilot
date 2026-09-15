@@ -525,8 +525,8 @@ def test_owner_aliases_empty_returns_question():
 
 def test_owner_aliases_case_insensitive():
     """username нормализуется в lower-case."""
-    assert owner_aliases.resolve_username("KEMYASHEV") == "@squad-1"
-    assert owner_aliases.resolve_username("Kemyashev") == "@squad-1"
+    assert owner_aliases.resolve_username("LIMA") == "@squad-1"
+    assert owner_aliases.resolve_username("Lima") == "@squad-1"
 
 
 def test_owner_aliases_bundled_yaml_resolves():
@@ -559,7 +559,7 @@ def test_owner_aliases_is_known_helper():
     assert owner_aliases.is_known_username("totally-random-bot") is False
     assert owner_aliases.is_known_username("") is False
     # Case-insensitive.
-    assert owner_aliases.is_known_username("KEMYASHEV") is True
+    assert owner_aliases.is_known_username("LIMA") is True
 
 
 def test_owner_aliases_bundled_size_at_least_15():

@@ -323,7 +323,7 @@ def test_dedicated_users_token_wins_over_main_token(monkeypatch):
     monkeypatch.setattr(no.settings, "TC_URL", "https://tc.example.org")
     monkeypatch.setattr(no.settings, "TC_TOKEN", "service-account-token")
     monkeypatch.setattr(no.settings, "TC_USERS_TOKEN", "profiles-token")
-    payload = {"user": [{"username": "Ddosta", "name": "Test User", "email": "dd@example.org"}]}
+    payload = {"user": [{"username": "Foxtrot", "name": "Test User", "email": "dd@example.org"}]}
     seen = _install_client(monkeypatch, _FakeResponse(200, payload))
 
     users = no.fetch_tc_users()

@@ -204,6 +204,25 @@ jobs:
       - name: Bandit (security static analysis)
         run: .venv/bin/bandit -r app -q --severity-level medium
 
+      # PII-страж — blocking. Репозиторий публичный, и 15.09.2026 в нём нашлись
+      # карта «squad-N -> логин · нода», ФИО сотрудников в фикстурах и коммит,
+      # сообщавший об увольнении конкретного человека.  # pii-allow: описание правила
+      # Проверка структурная:
+      # списка настоящих логинов в ней нет и быть не должно. Ложное срабатывание
+      # снимается комментарием `pii-allow` в той же строке.
+      - name: PII guard (no people in a public repo)
+        run: python3 scripts/check_no_pii.py
+
+      # Те же правила для сообщений коммитов PR: сам текст коммита — такая же
+      # публичная поверхность, как и код («резерв переходит от ушедшего X к Y»).
+      - name: PII guard (commit messages)
+        if: github.event_name == 'pull_request'
+        run: |
+          git log --format=%B \
+            "origin/${{ github.base_ref }}..${{ github.event.pull_request.head.sha }}" \
+            > /tmp/pr-commit-messages.txt
+          python3 scripts/check_no_pii.py /tmp/pr-commit-messages.txt
+
       # pip-audit — blocking. Долг расчищен (2026-05-13, после bump-а
       # protobuf 4.25→5.29.6 и dotenv 1.0→1.2.2). Любая новая известная
       # CVE в зависимостях фейлит CI — fix через dependabot-PR или ручной bump.
