@@ -46,22 +46,22 @@ def _scan(tmp_path: Path, text: str, name: str = "sample.py"):
 
 def test_login_node_pair_detected(tmp_path: Path):
     """Связка человека с нодой — то, что лежало в squad_dashboard.py."""
-    found = _scan(tmp_path, 'RESERVED = {"squad-58": "jsmith · dev-37"}')
+    found = _scan(tmp_path, 'RESERVED = {"squad-58": "jsmith · dev-37"}')  # pii-allow: фикстура
     assert [rule for _, rule, _ in found] == ["логин↔нода"]
 
 
 def test_corporate_email_detected(tmp_path: Path):
-    found = _scan(tmp_path, 'CONTACT = "ivan.petrov@lastoasisgame.com"')
+    found = _scan(tmp_path, 'CONTACT = "ivan.petrov@lastoasisgame.com"')  # pii-allow: фикстура
     assert [rule for _, rule, _ in found] == ["корпоративный e-mail"]
 
 
 def test_cyrillic_full_name_detected(tmp_path: Path):
-    found = _scan(tmp_path, 'OWNER = "Василий Кузнецов"')
+    found = _scan(tmp_path, 'OWNER = "Василий Кузнецов"')  # pii-allow: фикстура
     assert [rule for _, rule, _ in found] == ["кириллическое ФИО"]
 
 
 def test_hr_wording_detected(tmp_path: Path):
-    found = _scan(tmp_path, "# резерв переходит от ушедшего сотрудника к новому")
+    found = _scan(tmp_path, "# резерв переходит от ушедшего сотрудника к новому")  # pii-allow: фикстура
     assert [rule for _, rule, _ in found] == ["кадровая формулировка"]
 
 
@@ -79,7 +79,7 @@ def test_alert_fired_is_not_hr_wording(tmp_path: Path):
 
 
 def test_transient_gone_is_not_hr_wording(tmp_path: Path):
-    """«транзиент, ушедший на 3-й попытке» — не про увольнение."""
+    """«транзиент, ушедший на 3-й попытке» — техническая фраза."""  # pii-allow: фикстура
     assert _scan(tmp_path, "# транзиент, ушедший на 3-й попытке, даёт вердикт") == []
 
 
@@ -89,7 +89,7 @@ def test_domain_phrase_is_not_a_person(tmp_path: Path):
 
 
 def test_pii_allow_comment_suppresses(tmp_path: Path):
-    found = _scan(tmp_path, 'OWNER = "Василий Кузнецов"  # pii-allow: пример из документации')
+    found = _scan(tmp_path, 'OWNER = "Василий Кузнецов"  # pii-allow: пример')  # pii-allow: фикстура
     assert found == []
 
 

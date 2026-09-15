@@ -59,7 +59,7 @@ BINARY_SUFFIXES = {".png", ".jpg", ".jpeg", ".gif", ".ico", ".pdf", ".zip", ".gz
 
 # ── Правила ──────────────────────────────────────────────────────────────────
 
-#: «логин · dev-37» / «login · prod-k5» — связка человека с конкретной нодой.
+#: Связка человека с конкретной нодой: «<логин> · dev-37», «<логин> · prod-k5».
 RE_LOGIN_NODE = re.compile(
     r"\b(?P<login>[a-zA-Z][a-zA-Z0-9._-]{2,})\s*[·|]\s*(?:dev|prod|infra|node)-[a-zA-Z0-9-]+"
 )
@@ -83,9 +83,18 @@ RE_HR_WORDING = re.compile(
 
 
 def _iter_files(paths: list[str]) -> list[Path]:
+    """Файлы под проверку: аргументы либо всё дерево git.
+
+    `--others --exclude-standard` добавляет НЕотслеживаемые файлы: без них новый файл
+    с персональными данными проходил локальную проверку и падал уже в CI — ровно это
+    и случилось при первом прогоне стража.
+    """
     if paths:
         return [Path(p) for p in paths if Path(p).is_file()]
-    out = subprocess.run(["git", "ls-files"], capture_output=True, text=True, check=True)
+    out = subprocess.run(
+        ["git", "ls-files", "--cached", "--others", "--exclude-standard"],
+        capture_output=True, text=True, check=True,
+    )
     files = []
     for line in out.stdout.splitlines():
         p = Path(line)
