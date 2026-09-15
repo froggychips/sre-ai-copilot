@@ -429,7 +429,7 @@ async def test_embed_recent_deploys_render_clickable_via_tc_url_prefix():
             "minutes_before_incident": 14,
             "number": 2138,
             "buildtype_name": "Build and update",
-            "triggered_by": "wizaryx",
+            "triggered_by": "victor",
             "build_id": 125133,
             "url": None,  # нет URL в extras → берём через build_id
         }],
@@ -441,4 +441,4 @@ async def test_embed_recent_deploys_render_clickable_via_tc_url_prefix():
         f for f in payload["embeds"][0]["fields"] if "Recent deploys" in f["name"]
     )
     assert "viewLog.html?buildId=125133" in deploys_field["value"]
-    assert "wizaryx" in deploys_field["value"]
+    assert "victor" in deploys_field["value"]

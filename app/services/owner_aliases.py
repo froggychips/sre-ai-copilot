@@ -14,9 +14,9 @@
   4. Fallback `@?-{username}` — caller вернёт это для неизвестных юзеров.
 
 Формат YAML:
-    kemyashev: "@squad-1"
-    apleshkov: "@squad-2"
-    wizaryx: "@platform"
+    lima: "@squad-1"
+    bravo: "@squad-2"
+    victor: "@platform"
 
 Все ключи lower-case (TC usernames исторически lower-case).
 """
@@ -36,9 +36,9 @@ log = logging.getLogger(__name__)
 # bundled YAML. Оставлено как safety-net на случай отсутствия yaml-файла.
 # Каноничный source-of-truth — `owner_aliases.yaml` рядом с модулем.
 _DEFAULT_ALIASES: Dict[str, str] = {
-    "kemyashev": "@squad-1",
-    "apleshkov": "@squad-2",
-    "wizaryx": "@platform",
+    "lima": "@squad-1",
+    "bravo": "@squad-2",
+    "victor": "@platform",
 }
 
 

@@ -161,7 +161,7 @@ def test_build_deploy_correlation_field_suspect():
             "minutes_before_incident": 7,
             "sha": "deadbeef1234567890",
             "repo": "wo/backend",
-            "triggered_by": "apleshkov",
+            "triggered_by": "bravo",
         },
         "metrics_diff": {
             "p95_latency_ms": {"before": 100, "after": 200, "delta_pct": 100.0},
@@ -176,7 +176,7 @@ def test_build_deploy_correlation_field_suspect():
     assert "Wo_Backend_Build" in v
     assert "#1234" in v
     assert "7min before" in v
-    assert "apleshkov" in v
+    assert "bravo" in v
     assert "deadbeef" in v
     assert "wo-gitlab.lastoasisgame.com/wo/backend/-/commit/deadbeef" in v
     assert "p95 +100%" in v
@@ -367,7 +367,7 @@ async def test_send_incident_deploy_correlation_field(webhook_env):
             "minutes_before_incident": 3,
             "sha": "abcdef1234567890",
             "repo": "wo/repo",
-            "triggered_by": "kemyashev",
+            "triggered_by": "lima",
         },
         "metrics_diff": {
             "http_5xx_rate": {"before": 0.1, "after": 1.0, "delta_pct": 900.0},
@@ -386,7 +386,7 @@ async def test_send_incident_deploy_correlation_field(webhook_env):
     assert len(suspect_fields) == 1
     v = suspect_fields[0]["value"]
     assert "Wo_Build" in v
-    assert "kemyashev" in v
+    assert "lima" in v
     assert "5xx +900%" in v
     assert "abcdef" in v
 

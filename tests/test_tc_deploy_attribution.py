@@ -52,7 +52,7 @@ def _build(**over):
         "buildtype_name": "Build and update",
         "started_at": "2026-08-21T08:41:20",
         "finished_at": "2026-08-21T08:50:40",
-        "triggered_by": "sgrozov", "sha": "a3124ff5",
+        "triggered_by": "romeo", "sha": "a3124ff5",
         "all_revisions": [{"sha": "a3124ff5", "root": "wo-backend"}],
         "url": None, "target_realm": None, "target_service": None,
     }

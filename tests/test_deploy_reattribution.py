@@ -43,7 +43,7 @@ def _dep(db, svc, *, bt="Wo_Backend_K8sNewCluster_BuildAndDeploy", num="2917",
          scope=True):
     d = Deployment(
         service_id=svc.id, started_at=STARTED, buildtype_id=bt,
-        build_number=num, status="SUCCESS", triggered_by="sgrozov",
+        build_number=num, status="SUCCESS", triggered_by="romeo",
         extras={"branch": "preprod", "namespace_scope": True} if scope
         else {"branch": "preprod"},
     )

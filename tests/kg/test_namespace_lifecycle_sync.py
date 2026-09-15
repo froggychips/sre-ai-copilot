@@ -305,7 +305,7 @@ def test_lifecycle_stores_deployed_by_and_branch_labels(db, monkeypatch):
     db.commit()
     monkeypatch.setattr(nl, "_fetch_namespaces", lambda: {
         "squad-64-shared": {"uid": "uid-64", "created_at": NOW,
-                            "deployed_by": "vdudnik", "deployed_branch": "wo-14648-becky"},
+                            "deployed_by": "tango", "deployed_branch": "wo-14648-becky"},
         "squad-70-shared": {"uid": "uid-70", "created_at": NOW,
                             "deployed_by": None, "deployed_branch": None},
     })
@@ -314,7 +314,7 @@ def test_lifecycle_stores_deployed_by_and_branch_labels(db, monkeypatch):
 
     old = db.query(Namespace).filter_by(namespace="squad-64-shared").one()
     new = db.query(Namespace).filter_by(namespace="squad-70-shared").one()
-    assert (old.deployed_by, old.deployed_branch) == ("vdudnik", "wo-14648-becky")
+    assert (old.deployed_by, old.deployed_branch) == ("tango", "wo-14648-becky")
     assert (new.deployed_by, new.deployed_branch) == (None, None)
 
 
@@ -322,11 +322,11 @@ def test_lifecycle_stores_claim_owner_label(db, monkeypatch):
     """`squad-owner` — кто занял стенд кнопкой; пишется и при создании строки, и
     на каждом тике, а освобождение стенда (лейбла нет) прежнего не наследует."""
     db.add(Namespace(namespace="squad-8-shared", k8s_uid="uid-8", state=NS_STATE_ACTIVE,
-                     deployed_by="sgrozov", claim_owner="sgrozov"))
+                     deployed_by="romeo", claim_owner="romeo"))
     db.commit()
     monkeypatch.setattr(nl, "_fetch_namespaces", lambda: {
         # стенд перезанят другим человеком: deployed-by ещё прежний
-        "squad-8-shared": {"uid": "uid-8", "created_at": NOW, "deployed_by": "sgrozov",
+        "squad-8-shared": {"uid": "uid-8", "created_at": NOW, "deployed_by": "romeo",
                            "deployed_branch": "default", "claim_owner": "akomkov"},
         # новый стенд без лейбла занятия
         "squad-33-shared": {"uid": "uid-33", "created_at": NOW, "deployed_by": None,
@@ -337,5 +337,5 @@ def test_lifecycle_stores_claim_owner_label(db, monkeypatch):
 
     taken = db.query(Namespace).filter_by(namespace="squad-8-shared").one()
     fresh = db.query(Namespace).filter_by(namespace="squad-33-shared").one()
-    assert (taken.claim_owner, taken.deployed_by) == ("akomkov", "sgrozov")
+    assert (taken.claim_owner, taken.deployed_by) == ("akomkov", "romeo")
     assert fresh.claim_owner is None

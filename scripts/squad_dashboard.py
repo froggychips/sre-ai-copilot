@@ -9,7 +9,10 @@
 Запуск: k8s CronJob на образе sre-ai-copilot, SA sre-ai (умеет list namespaces).
 Env: DATABASE_URL, TC_URL, TC_TOKEN, CONFLUENCE_BASE, CONFLUENCE_EMAIL, CONFLUENCE_TOKEN,
      CONFLUENCE_PAGE_ID, CONFLUENCE_TITLE, [WINDOW=400], [SQUADS="1..24"], [DRY_RUN=1],
-     [NAME_OVERRIDES='{"логин":"Имя Фамилия"}' — для учёток вне TeamCity].
+     [NAME_OVERRIDES='{"логин":"Имя Фамилия"}' — для учёток вне TeamCity],
+     [RESERVED_MAP='{"squad-N":"логин · dev-N"}' — резерв нод, зеркало squad-mapping.yaml].
+Обе карты — только через env (ConfigMap squad-dashboard-env): репозиторий публичный,
+связка логин↔человек и логин↔нода в нём не хранится.
 DRY_RUN=1 — всё собрать и отрендерить, но НЕ писать в Confluence (печатает сводку).
 
 Источники логики: ref_kg_squad_dashboard_query (KG-SQL), ~/tc_squad_last_build.sh (TC REST).
@@ -39,25 +42,10 @@ CH_HOST_TEMPLATE = os.environ.get("CH_HOST_TEMPLATE",
 SQUAD_NUMS = [int(x) for x in SQUADS.split()] if SQUADS else list(range(1, 70))
 
 # Резервирование новых дедик-нод под разработчиков (WO-12485): squad -> «TC-логин · нода».
-# Зеркало services/squad-mapping.yaml (wo-k8s) — держать в синхроне вручную.
-# Показывается в колонке «Reserved for»; сами сквады создаются позже (InstallSquadEnv).
-RESERVED = {
-    "squad-40": "kemyashev · dev-28",   "squad-41": "kemyashev · dev-28",
-    "squad-42": "elebedev · dev-29",    "squad-43": "elebedev · dev-29",
-    "squad-44": "apleshkov · dev-30",   "squad-45": "apleshkov · dev-30",
-    "squad-46": "dgrin · dev-31",       "squad-47": "dgrin · dev-31",
-    "squad-48": "ddosta · dev-32",      "squad-49": "ddosta · dev-32",
-    "squad-50": "ncherkashin · dev-33", "squad-51": "ncherkashin · dev-33",
-    "squad-52": "kkuzmin · dev-34",     "squad-53": "kkuzmin · dev-34",
-    "squad-54": "egecer · dev-35",      "squad-55": "egecer · dev-35",
-    "squad-56": "schabanov · dev-36",   "squad-57": "schabanov · dev-36",
-    "squad-58": "sgrozov · dev-37",     "squad-59": "sgrozov · dev-37",
-    "squad-60": "drakhmanov · dev-38",  "squad-61": "drakhmanov · dev-38",
-    "squad-62": "aoganisyan · dev-39",  "squad-63": "aoganisyan · dev-39",
-    "squad-64": "vdudnik · dev-40",     "squad-65": "vdudnik · dev-40",
-    "squad-66": "vivanov · dev-41",     "squad-67": "vivanov · dev-41",
-    "squad-68": "igoncharov · dev-42",  "squad-69": "igoncharov · dev-42",
-}
+# Зеркало services/squad-mapping.yaml (wo-k8s). Карта задаётся ТОЛЬКО через env RESERVED_MAP —
+# см. reserved_map(); в репозитории её нет и быть не должно по той же причине, что и у
+# NAME_OVERRIDES: репозиторий публичный, а связка логин↔нода — личные данные.
+_RESERVED = None
 DRY_RUN = os.environ.get("DRY_RUN", "") not in ("", "0", "false", "False")
 
 TC_URL = os.environ["TC_URL"].rstrip("/")
@@ -266,6 +254,25 @@ def name_overrides():
     return _OVERRIDES
 
 
+def reserved_map():
+    """squad-N → «TC-логин · нода» для колонки «Reserved for» (WO-12485).
+
+    Зеркало services/squad-mapping.yaml (wo-k8s). Задаётся ТОЛЬКО через env RESERVED_MAP
+    (JSON, ConfigMap squad-dashboard-env) — по той же причине, что и NAME_OVERRIDES:
+    репозиторий публичный, а связка логин↔нода — личные данные. Карты нет — колонка
+    просто остаётся пустой, прогон не падает. Кривой JSON — тоже не роняем.
+    """
+    global _RESERVED
+    if _RESERVED is None:
+        raw = (os.environ.get("RESERVED_MAP") or "").strip()
+        try:
+            _RESERVED = json.loads(raw) if raw else {}
+        except ValueError as e:
+            log(f"  RESERVED_MAP: не разобрался как JSON ({e}) → игнорируем")
+            _RESERVED = {}
+    return _RESERVED
+
+
 def human(login):
     """«Имя Фамилия»: профиль TeamCity, затем env-оверрайд; иначе логин как есть."""
     if not login:
@@ -422,7 +429,7 @@ def build_rows():
             un7=k.get("unhlth7d"), al=k.get("alerts"),
             owner=owner, owner_source=owner_source,
             task=lbl.get("task"), branch=lbl.get("branch"),
-            reserved=RESERVED.get(s),
+            reserved=reserved_map().get(s),
             alive=bool(lbl), claim=lbl.get("claim"), claimed_at=lbl.get("claimed_at"),
             guard=lbl.get("guard"),
             lb=lb, inst=inst, act=act))
@@ -483,7 +490,7 @@ def inst_cell(inst):
 
 
 def reserved_cell(value):
-    """«Reserved for»: логин из карты RESERVED → ФИО, нода остаётся как есть."""
+    """«Reserved for»: логин из карты reserved_map() → ФИО, нода остаётся как есть."""
     if not value:
         return ""
     login, sep, node = value.partition(" · ")

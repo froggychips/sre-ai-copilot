@@ -103,9 +103,9 @@ def test_signal_a_no_prefix_no_db_returns_none():
 
 
 def test_signal_b_deploy_history_only():
-    """ns без prefix-match → deploy_history от kemyashev → @squad-1."""
+    """ns без prefix-match → deploy_history от lima → @squad-1."""
     db = _mock_db_with_responses(
-        deploys=[("kemyashev", 8), ("apleshkov", 2)],
+        deploys=[("lima", 8), ("bravo", 2)],
         labels=[],
     )
     sug = suggest_owner_multi_signal("weird-backend", db)
@@ -130,7 +130,7 @@ def test_signal_b_unknown_username_no_signal():
 def test_signal_b_known_user_amid_unknown():
     """Top-1 unknown, top-2 known → берём top-2, strength = top2 / total."""
     db = _mock_db_with_responses(
-        deploys=[("unknown-bot", 7), ("kemyashev", 3)],
+        deploys=[("unknown-bot", 7), ("lima", 3)],
         labels=[],
     )
     sug = suggest_owner_multi_signal("weird-ns", db)
@@ -286,7 +286,7 @@ def test_fusion_three_signals_agree():
 def test_fusion_all_three_signals_same_owner():
     """Все 3 указывают на squad-1 → confidence ≈ 1.0 (max)."""
     db = _mock_db_with_responses(
-        deploys=[("kemyashev", 10)],  # → squad-1, strength 1.0
+        deploys=[("lima", 10)],  # → squad-1, strength 1.0
         labels=[({"labels": {"team": "squad-1"}},)],
     )
     sug = suggest_owner_multi_signal("squad-1-shared", db)
@@ -296,8 +296,8 @@ def test_fusion_all_three_signals_same_owner():
 
 
 def test_fusion_signals_disagree_highest_wins():
-    """A=squad-7 (0.5), B=apleshkov→squad-2 (0.3*1.0=0.3) → A wins by score."""
-    db = _mock_db_with_responses(deploys=[("apleshkov", 10)], labels=[])
+    """A=squad-7 (0.5), B=bravo→squad-2 (0.3*1.0=0.3) → A wins by score."""
+    db = _mock_db_with_responses(deploys=[("bravo", 10)], labels=[])
     sug = suggest_owner_multi_signal("squad-7-shared", db)
     # Prefix (0.5) > deploy (0.3) → squad-7 побеждает однозначно.
     assert sug.owner == "squad-7"
@@ -308,7 +308,7 @@ def test_fusion_signals_disagree_highest_wins():
 def test_fusion_b_dominates_when_a_absent():
     """ns без prefix → B (deploy) + C (labels) согласны → их sum."""
     db = _mock_db_with_responses(
-        deploys=[("kemyashev", 10)],
+        deploys=[("lima", 10)],
         labels=[({"labels": {"squad": "squad-1"}},)],
     )
     sug = suggest_owner_multi_signal("legacy-ns", db)
@@ -334,7 +334,7 @@ def test_manual_override_wins_over_all_signals(monkeypatch, tmp_path):
     # Даже если prefix + deploy + labels указывают на squad-7 —
     # manual вписывает platform.
     db = _mock_db_with_responses(
-        deploys=[("kemyashev", 10)],
+        deploys=[("lima", 10)],
         labels=[({"labels": {"team": "squad-7"}},)],
     )
     sug = suggest_owner_multi_signal("squad-7-kingdom2", db)
@@ -380,7 +380,7 @@ def test_manual_manifest_unset_uses_heuristics():
 def test_confidence_high_when_signals_agree():
     """Согласие 2+ сигналов → confidence ≥ 0.5 (видимо в UI как «не ?»)."""
     db = _mock_db_with_responses(
-        deploys=[("kemyashev", 10)],
+        deploys=[("lima", 10)],
         labels=[({"labels": {"team": "squad-1"}},)],
     )
     sug = suggest_owner_multi_signal("squad-1-shared", db)
@@ -411,7 +411,7 @@ def test_confidence_zero_when_no_signal():
 def test_confidence_bounded_to_one():
     """Даже если бы все weights выдали max — confidence ≤ 1.0."""
     db = _mock_db_with_responses(
-        deploys=[("kemyashev", 10)],
+        deploys=[("lima", 10)],
         labels=[({"labels": {"team": "squad-1"}},)],
     )
     sug = suggest_owner_multi_signal("squad-1-shared", db)
@@ -438,7 +438,7 @@ def test_confidence_calibration_axes():
 
     # strong — два согласованных сигнала (prefix + deploy)
     db_strong = _mock_db_with_responses(
-        deploys=[("kemyashev", 10)],
+        deploys=[("lima", 10)],
         labels=[],
     )
     s_strong = suggest_owner_multi_signal("squad-1-shared", db_strong)
@@ -447,7 +447,7 @@ def test_confidence_calibration_axes():
 
     # max — все три
     db_max = _mock_db_with_responses(
-        deploys=[("kemyashev", 10)],
+        deploys=[("lima", 10)],
         labels=[({"labels": {"team": "squad-1"}},)],
     )
     s_max = suggest_owner_multi_signal("squad-1-shared", db_max)
@@ -510,9 +510,9 @@ def test_legacy_api_shared_unchanged_for_preupdate():
 
 def test_owner_aliases_defaults():
     """Дефолтные хардкод-юзеры должны резолвиться."""
-    assert owner_aliases.resolve_username("kemyashev") == "@squad-1"
-    assert owner_aliases.resolve_username("apleshkov") == "@squad-2"
-    assert owner_aliases.resolve_username("wizaryx") == "@platform"
+    assert owner_aliases.resolve_username("lima") == "@squad-1"
+    assert owner_aliases.resolve_username("bravo") == "@squad-2"
+    assert owner_aliases.resolve_username("victor") == "@platform"
 
 
 def test_owner_aliases_unknown_username():
@@ -525,8 +525,8 @@ def test_owner_aliases_empty_returns_question():
 
 def test_owner_aliases_case_insensitive():
     """username нормализуется в lower-case."""
-    assert owner_aliases.resolve_username("KEMYASHEV") == "@squad-1"
-    assert owner_aliases.resolve_username("Kemyashev") == "@squad-1"
+    assert owner_aliases.resolve_username("LIMA") == "@squad-1"
+    assert owner_aliases.resolve_username("Lima") == "@squad-1"
 
 
 def test_owner_aliases_bundled_yaml_resolves():
@@ -536,16 +536,16 @@ def test_owner_aliases_bundled_yaml_resolves():
     резолвятся из YAML по умолчанию.
     """
     # Расширения из bundled YAML (см. app/services/owner_aliases.yaml).
-    # `igoncharov` → @squad-gd (раньше был fallback @?-igoncharov).
-    assert owner_aliases.resolve_username("igoncharov") == "@squad-gd"
+    # `kilo` → @squad-gd (раньше был fallback @?-kilo).
+    assert owner_aliases.resolve_username("kilo") == "@squad-gd"
 
 
 def test_owner_aliases_bundled_yaml_platform_reviewers():
     """Несколько platform-reviewers резолвятся в @platform."""
     # Из bundled YAML.
-    assert owner_aliases.resolve_username("zbushuev") == "@platform"
-    assert owner_aliases.resolve_username("sgrozov") == "@platform"
-    assert owner_aliases.resolve_username("pryzhikov") == "@platform"
+    assert owner_aliases.resolve_username("yankee") == "@platform"
+    assert owner_aliases.resolve_username("romeo") == "@platform"
+    assert owner_aliases.resolve_username("papa") == "@platform"
 
 
 def test_owner_aliases_is_known_helper():
@@ -554,12 +554,12 @@ def test_owner_aliases_is_known_helper():
     Используется сигналом B (deploy_history) чтобы не выдавать
     `?-username` с положительным weight.
     """
-    assert owner_aliases.is_known_username("kemyashev") is True
-    assert owner_aliases.is_known_username("igoncharov") is True  # bundled
+    assert owner_aliases.is_known_username("lima") is True
+    assert owner_aliases.is_known_username("kilo") is True  # bundled
     assert owner_aliases.is_known_username("totally-random-bot") is False
     assert owner_aliases.is_known_username("") is False
     # Case-insensitive.
-    assert owner_aliases.is_known_username("KEMYASHEV") is True
+    assert owner_aliases.is_known_username("LIMA") is True
 
 
 def test_owner_aliases_bundled_size_at_least_15():
@@ -577,15 +577,15 @@ def test_owner_aliases_file_override(monkeypatch, tmp_path):
     """YAML-файл оверрайдит дефолты."""
     aliases = tmp_path / "aliases.yaml"
     aliases.write_text(
-        "kemyashev: \"@squad-99\"\n"
+        "lima: \"@squad-99\"\n"
         "newperson: \"@infra\"\n"
     )
     monkeypatch.setenv("OWNER_ALIASES_PATH", str(aliases))
     owner_aliases.reset_cache()
-    assert owner_aliases.resolve_username("kemyashev") == "@squad-99"  # override
+    assert owner_aliases.resolve_username("lima") == "@squad-99"  # override
     assert owner_aliases.resolve_username("newperson") == "@infra"     # new
     # Дефолтные не задетые остаются.
-    assert owner_aliases.resolve_username("apleshkov") == "@squad-2"
+    assert owner_aliases.resolve_username("bravo") == "@squad-2"
 
 
 # ── Backward compat: suggest_owner_for_ns ───────────────────────────────
@@ -672,12 +672,12 @@ def test_unowned_section_caps_top_n():
 
 
 def test_unowned_section_high_confidence_two_signals(monkeypatch, tmp_path):
-    """squad-1-shared + deploy от kemyashev → confidence 0.74 → не bold."""
+    """squad-1-shared + deploy от lima → confidence 0.74 → не bold."""
     unowned: defaultdict = defaultdict(int)
     unowned["squad-1-shared"] = 10
 
     db = _mock_db_with_responses(
-        deploys=[("kemyashev", 8), ("other", 2)],  # squad-1, strength 0.8
+        deploys=[("lima", 8), ("other", 2)],  # squad-1, strength 0.8
         labels=[],
     )
     text = stats_digest.unowned_namespaces_section(unowned, db=db)

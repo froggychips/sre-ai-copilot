@@ -1643,7 +1643,7 @@ class DiscordService:
                 by_part = f" by `{triggered}`" if triggered else ""
                 # Build label — кликабельный если есть TC URL.
                 if url:
-                    # «Build and update #2138 by wizaryx» — full человекочитаемый
+                    # «Build and update #2138 by victor» — full человекочитаемый
                     # лейбл. by_part интегрирован в линк, не как отдельный suffix.
                     if triggered:
                         build_label = f"[{bt_name} #{num} by {triggered}]({url})"

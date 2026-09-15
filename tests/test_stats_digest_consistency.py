@@ -356,7 +356,7 @@ def test_deploy_correlation_counts_rollouts_not_alerts():
 
 def test_deploy_correlation_names_the_real_window_everywhere():
     text = stats_digest.deploy_incident_correlation_section(
-        _corr_db((18, 7, 11, 9, 2), ("2138", "wizaryx", 3)), hours=24
+        _corr_db((18, 7, 11, 9, 2), ("2138", "victor", 3)), hours=24
     )
     assert "in 30m" not in text
     assert text.count("[-5m; finished+60m]") >= 2  # overall + Worst

@@ -62,7 +62,7 @@ from app.knowledge_graph.schema import (NS_STATE_ACTIVE, Deployment, Namespace,
 
 log = structlog.get_logger()
 
-#: Ключ задачи в ветке: `wo-15194-...`, `WO-15194`, `schabanov-wo-15194-...`.
+#: Ключ задачи в ветке: `wo-15194-...`, `WO-15194`, `quebec-wo-15194-...`.
 _JIRA_KEY_RE = re.compile(r"(?<![a-z0-9])(wo)-?(\d{3,6})(?![0-9])", re.IGNORECASE)
 
 #: Учётки автоматики: за ними человека нет, владельцем они быть не могут.

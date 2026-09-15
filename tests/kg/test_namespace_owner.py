@@ -54,7 +54,7 @@ def _people(**kw) -> PeopleManifest:
 
 @pytest.mark.parametrize("branch,key", [
     ("wo-14169-tutorial-fake-truck", "WO-14169"),
-    ("schabanov-wo-15194-greening-progress-double-count-preprod", "WO-15194"),
+    ("quebec-wo-15194-greening-progress-double-count-preprod", "WO-15194"),
     ("WO-15450", "WO-15450"),
     ("refs-heads-preprod", None),
     ("preprod", None),
@@ -88,38 +88,38 @@ def test_jira_assignee_via_people_manifest_beats_deployed_by():
 
 def test_jira_assignee_matched_through_teamcity_profiles():
     """Без записи в манифесте логин находится по профилю TC: e-mail, затем имя."""
-    tc = {"ddosta": TcUser("ddosta", name="Dmitry Dosta", email="dd@example.org"),
+    tc = {"foxtrot": TcUser("foxtrot", name="Test User", email="dd@example.org"),
           "other": TcUser("other", name="Someone Else", email=None)}
     by_email = resolve_owner("squad-13-shared", "ai-agent", "wo-14516-afk", people=PeopleManifest(),
                              tc_users=tc, jira_lookup=lambda k: {"account_id": "x", "email": "DD@example.org",
                                                                  "display_name": "Другое Имя"})
-    assert (by_email.login, by_email.source) == ("ddosta", NAMESPACE_OWNER_SOURCE_JIRA_ASSIGNEE)
+    assert (by_email.login, by_email.source) == ("foxtrot", NAMESPACE_OWNER_SOURCE_JIRA_ASSIGNEE)
     by_name = resolve_owner("squad-13-shared", "ai-agent", "wo-14516-afk", people=PeopleManifest(),
                             tc_users=tc, jira_lookup=lambda k: {"account_id": "x", "email": None,
-                                                                "display_name": " dmitry   DOSTA "})
-    assert by_name.login == "ddosta"
+                                                                "display_name": " test   USER "})
+    assert by_name.login == "foxtrot"
     assert by_name.discord_id is None, "Discord id только из манифеста"
 
 
 def test_service_account_deployer_falls_through_to_tc_trigger():
     """squad-44: deployed-by=ai-agent, ветка preprod — человек только в истории TC."""
     res = resolve_owner("squad-44-shared", "ai-agent", "preprod", people=PeopleManifest(), tc_users={},
-                        jira_lookup=None, triggered_by_fallback="wizaryx")
-    assert (res.login, res.source) == ("wizaryx", NAMESPACE_OWNER_SOURCE_TC_TRIGGERED_BY)
+                        jira_lookup=None, triggered_by_fallback="victor")
+    assert (res.login, res.source) == ("victor", NAMESPACE_OWNER_SOURCE_TC_TRIGGERED_BY)
 
 
 def test_deployed_by_human_when_branch_has_no_task():
-    people = _people(vdudnik={"discord_id": "7"})
-    res = resolve_owner("squad-65-shared", "vdudnik", "preprod", people=people, tc_users={}, jira_lookup=None)
-    assert (res.login, res.source, res.discord_id) == ("vdudnik", NAMESPACE_OWNER_SOURCE_DEPLOYED_BY, "7")
+    people = _people(tango={"discord_id": "7"})
+    res = resolve_owner("squad-65-shared", "tango", "preprod", people=people, tc_users={}, jira_lookup=None)
+    assert (res.login, res.source, res.discord_id) == ("tango", NAMESPACE_OWNER_SOURCE_DEPLOYED_BY, "7")
 
 
 def test_jira_unavailable_degrades_to_next_path_and_is_flagged():
     def boom(key):
         raise JiraUnavailable("timeout")
-    res = resolve_owner("squad-19-shared", "schabanov", "schabanov-wo-15194-x", people=PeopleManifest(),
+    res = resolve_owner("squad-19-shared", "quebec", "quebec-wo-15194-x", people=PeopleManifest(),
                         tc_users={}, jira_lookup=boom)
-    assert (res.login, res.source) == ("schabanov", NAMESPACE_OWNER_SOURCE_DEPLOYED_BY)
+    assert (res.login, res.source) == ("quebec", NAMESPACE_OWNER_SOURCE_DEPLOYED_BY)
     assert res.jira_unavailable is True
     assert res.jira_key == "WO-15194"
 
@@ -137,33 +137,33 @@ def test_nothing_known_gives_unresolved_not_service_account():
 def test_gd_claim_beats_stale_deployed_by_label():
     """09.09.2026: стенд занят кнопкой (лейбл squad-owner), а deployed-by
     остался от прежнего хозяина, который стенд освободил."""
-    res = resolve_owner("squad-8-shared", "sgrozov", "default", people=PeopleManifest(),
+    res = resolve_owner("squad-8-shared", "romeo", "default", people=PeopleManifest(),
                         tc_users={}, jira_lookup=None, gd_claim_login="akomkov")
     assert (res.login, res.source) == ("akomkov", NAMESPACE_OWNER_SOURCE_GD_CLAIM)
 
 
 def test_jira_assignee_still_beats_gd_claim():
     """1.0.13: «владелец из задачи, а не из кнопки» — приоритет не меняем."""
-    people = _people(ddosta={"jira_account_id": "acc-1"})
-    res = resolve_owner("squad-13-shared", "sgrozov", "wo-14516-alliance-afk-leader",
+    people = _people(foxtrot={"jira_account_id": "acc-1"})
+    res = resolve_owner("squad-13-shared", "romeo", "wo-14516-alliance-afk-leader",
                         people=people, tc_users={},
                         jira_lookup=lambda k: {"account_id": "acc-1", "email": None,
                                                "display_name": None},
                         gd_claim_login="akomkov")
-    assert (res.login, res.source) == ("ddosta", NAMESPACE_OWNER_SOURCE_JIRA_ASSIGNEE)
+    assert (res.login, res.source) == ("foxtrot", NAMESPACE_OWNER_SOURCE_JIRA_ASSIGNEE)
 
 
 def test_gd_claim_by_service_account_is_ignored():
     """squad-18 09.09.2026: в squad-owner попал ai-agent — владельцем не считаем."""
-    res = resolve_owner("squad-18-shared", "aoganisyan", "preprod", people=PeopleManifest(),
+    res = resolve_owner("squad-18-shared", "alpha", "preprod", people=PeopleManifest(),
                         tc_users={}, jira_lookup=None, gd_claim_login="ai-agent")
-    assert (res.login, res.source) == ("aoganisyan", NAMESPACE_OWNER_SOURCE_DEPLOYED_BY)
+    assert (res.login, res.source) == ("alpha", NAMESPACE_OWNER_SOURCE_DEPLOYED_BY)
 
 
 def test_sync_prefers_claim_owner_column_over_label(db):
     """Сквозь прогон: deployed_by чужой, claim_owner (лейбл squad-owner) — истинный."""
     db.add(Namespace(namespace="squad-8-shared", state=NS_STATE_ACTIVE,
-                     deployed_by="sgrozov", deployed_branch="default",
+                     deployed_by="romeo", deployed_branch="default",
                      claim_owner="akomkov"))
     db.commit()
     sync_namespace_owners(db, people=PeopleManifest(), tc_users={}, jira_lookup=None,
@@ -212,13 +212,13 @@ def test_sync_writes_owner_columns_for_scoped_active_namespaces(db, monkeypatch)
     now = datetime(2026, 9, 8, 9, 9)
     db.add_all([
         Namespace(namespace="squad-64-shared", state=NS_STATE_ACTIVE,
-                  deployed_by="vdudnik", deployed_branch="wo-14648-becky"),
-        Namespace(namespace="squad-64-kingdom2", state=NS_STATE_ACTIVE, deployed_by="vdudnik"),
+                  deployed_by="tango", deployed_branch="wo-14648-becky"),
+        Namespace(namespace="squad-64-kingdom2", state=NS_STATE_ACTIVE, deployed_by="tango"),
         Namespace(namespace="squad-42-shared", state=NS_STATE_MISSING, deployed_by="x"),
         Namespace(namespace="prod-shared", state=NS_STATE_ACTIVE, deployed_by="cicd"),
     ])
     db.commit()
-    people = _people(vdudnik={"discord_id": "1182"})
+    people = _people(tango={"discord_id": "1182"})
     calls = []
 
     def jira(key):
@@ -230,7 +230,7 @@ def test_sync_writes_owner_columns_for_scoped_active_namespaces(db, monkeypatch)
 
     row = db.query(Namespace).filter_by(namespace="squad-64-shared").one()
     assert (row.owner_login, row.owner_source, row.owner_jira_key, row.owner_discord_id) == (
-        "vdudnik", NAMESPACE_OWNER_SOURCE_DEPLOYED_BY, "WO-14648", "1182")
+        "tango", NAMESPACE_OWNER_SOURCE_DEPLOYED_BY, "WO-14648", "1182")
     assert row.owner_resolved_at == now
     for other in ("squad-64-kingdom2", "squad-42-shared", "prod-shared"):
         assert db.query(Namespace).filter_by(namespace=other).one().owner_login is None
@@ -246,19 +246,19 @@ def test_sync_uses_last_human_deploy_trigger_from_graph(db):
     db.flush()
     db.add_all([
         Deployment(service_id=svc.id, triggered_by="ai-agent", started_at=datetime(2026, 9, 7, 10, 6)),
-        Deployment(service_id=svc.id, triggered_by="wizaryx", started_at=datetime(2026, 9, 1, 8, 0)),
+        Deployment(service_id=svc.id, triggered_by="victor", started_at=datetime(2026, 9, 1, 8, 0)),
     ])
     db.commit()
 
     sync_namespace_owners(db, people=PeopleManifest(), tc_users={}, jira_lookup=None, activity_lookup=None)
 
     row = db.query(Namespace).filter_by(namespace="squad-44-shared").one()
-    assert (row.owner_login, row.owner_source) == ("wizaryx", NAMESPACE_OWNER_SOURCE_TC_TRIGGERED_BY)
+    assert (row.owner_login, row.owner_source) == ("victor", NAMESPACE_OWNER_SOURCE_TC_TRIGGERED_BY)
 
 
 def test_sync_records_activity_and_jira_errors(db):
     db.add(Namespace(namespace="squad-19-shared", state=NS_STATE_ACTIVE,
-                     deployed_by="ai-agent", deployed_branch="schabanov-wo-15194-x"))
+                     deployed_by="ai-agent", deployed_branch="quebec-wo-15194-x"))
     db.commit()
 
     def boom(key):
@@ -323,13 +323,13 @@ def test_dedicated_users_token_wins_over_main_token(monkeypatch):
     monkeypatch.setattr(no.settings, "TC_URL", "https://tc.example.org")
     monkeypatch.setattr(no.settings, "TC_TOKEN", "service-account-token")
     monkeypatch.setattr(no.settings, "TC_USERS_TOKEN", "profiles-token")
-    payload = {"user": [{"username": "Ddosta", "name": "Dmitry Dosta", "email": "dd@example.org"}]}
+    payload = {"user": [{"username": "Foxtrot", "name": "Test User", "email": "dd@example.org"}]}
     seen = _install_client(monkeypatch, _FakeResponse(200, payload))
 
     users = no.fetch_tc_users()
 
     assert seen["auth"] == "Bearer profiles-token"
-    assert users["ddosta"].email == "dd@example.org"
+    assert users["foxtrot"].email == "dd@example.org"
 
 
 def test_falls_back_to_main_token_when_dedicated_is_empty(monkeypatch):

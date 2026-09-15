@@ -479,7 +479,7 @@ def unowned_namespaces_section(
         • monitoring         — 44 series · suggest: **`@platform`** (manual)
         • squad-7-kingdom2   — 36 series · suggest: **`@squad-7`**
         • prod-cdn           — 12 series · suggest: `@cdn`
-        • weird-ns           — 8 series  · suggest: `@?-kemyashev` ?
+        • weird-ns           — 8 series  · suggest: `@?-lima` ?
 
     Правила рендера:
       - confidence ≥ 0.8 → **bold** suggestion (высокая уверенность).
@@ -2574,7 +2574,7 @@ _MCP_SERVICE_KEYS = frozenset({
     "squad-medic-robot",
     "discord-bot",
     "mcp-preplanner",
-    "claude-ybobryashov-rot",
+    "claude-whiskey-rot",
 })
 
 

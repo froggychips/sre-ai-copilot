@@ -44,7 +44,7 @@ def _svc(db, name, namespace):
 
 
 def _deploy(db, svc_id, *, minutes_before, buildtype="Bt_BuildAndUpdate",
-            number="728", who="ybobryashov"):
+            number="728", who="whiskey"):
     started = (_INCIDENT_AT - timedelta(minutes=minutes_before)).replace(tzinfo=None)
     d = Deployment(
         service_id=svc_id, sha="872a8dd", repo="new-wo/wo-k8s",

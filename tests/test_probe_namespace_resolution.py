@@ -89,7 +89,7 @@ def _deploy(ns: str, minutes_before: int) -> dict:
     return {
         "name": "town-service", "namespace": ns,
         "buildtype_id": "Bt1", "buildtype_name": "Build and full deploy",
-        "number": "834", "triggered_by": "ybobryashov",
+        "number": "834", "triggered_by": "whiskey",
         "minutes_before_incident": minutes_before, "sha": None, "repo": None,
         "status": "SUCCESS", "url": None, "ts": None,
     }

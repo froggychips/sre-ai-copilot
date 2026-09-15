@@ -222,7 +222,7 @@ def test_no_target_keeps_namespace_wide_blob(monkeypatch):
 
 def test_pod_logs_are_redacted_in_snapshot_text(monkeypatch):
     raw = (
-        "AuthError for user yar.shulgin@gmail.com from 10.42.13.7\n"
+        "AuthError for user xray.dot@gmail.com from 10.42.13.7\n"
         "Authorization: Bearer abcdefghij1234567890XYZ\n"
         "anthropic key sk-ant-api03-AAAAbbbbCCCCddddEEEE1234\n"
         "db password=hunter2\n"
@@ -233,7 +233,7 @@ def test_pod_logs_are_redacted_in_snapshot_text(monkeypatch):
     ))
     snap = K8sFacts._collect_sync("prod-shared", pod=_TARGET_POD)
 
-    for leak in ("yar.shulgin@gmail.com", "10.42.13.7",
+    for leak in ("xray.dot@gmail.com", "10.42.13.7",
                  "abcdefghij1234567890XYZ", "sk-ant-api03", "hunter2"):
         assert leak not in snap.text, f"leaked: {leak!r}"
     assert "<email>" in snap.text

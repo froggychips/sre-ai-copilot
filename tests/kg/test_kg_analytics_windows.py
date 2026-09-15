@@ -82,7 +82,7 @@ def _deploy(db, svc, *, minutes_before, number="728", buildtype="Bt_BuildAndUpda
         service_id=svc.id, sha="872a8dd", repo="new-wo/wo-k8s",
         buildtype_id=buildtype, build_number=number, started_at=started,
         finished_at=started + timedelta(minutes=2), status="SUCCESS",
-        triggered_by="ybobryashov",
+        triggered_by="whiskey",
         # Маркер ns-broadcast — так пишет tc_deploys_to_kg.
         extras={"buildtype_name": "Build and update", "namespace_scope": True},
     )

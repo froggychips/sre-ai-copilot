@@ -113,7 +113,7 @@ def _payload(**over) -> RemediationEventIn:
         "applied": ["grants: squad-39-shared/town-db"], "manual": ["image-pull — тег отсутствует в реестре"],
         "gaps": [], "summary": "ImagePullBackOff во всех сервисах",
         "root_cause": "тег снесён retention Nexus", "next_action": "перезапустить BuildAndUpdate",
-        "escalated": True, "owner_login": "wizaryx",
+        "escalated": True, "owner_login": "victor",
     }
     base.update(over)
     return RemediationEventIn(**base)

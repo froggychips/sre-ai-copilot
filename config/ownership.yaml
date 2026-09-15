@@ -43,7 +43,7 @@
 #   * vm-kube-state-metrics → @platform: kube state экспортёр в monitoring.
 #   * squad-gd-shared прикладные → @squad-gd: game-design squad имеет
 #     отдельный shared realm; prefix `squad-(\d+)-` не матчит «gd», поэтому
-#     manifest обязателен. Username igoncharov уже в owner_aliases.
+#     manifest обязателен. Username kilo уже в owner_aliases.
 #
 # Изменения требуют PR + rollout (manifest подгружается worker'ом из
 # configmap; см. docs/RUNBOOK.md § Ownership manifest).
@@ -123,7 +123,7 @@
 
 # ── ns-level catch-alls (последний шанс) ─────────────────────────────────
 # squad-gd-shared: всё что не подошло выше — squad-gd. Owner verified
-# через owner_aliases.yaml (igoncharov: @squad-gd).
+# через owner_aliases.yaml (kilo: @squad-gd).
 - ns_pattern: "squad-gd-shared"
   owner: "@squad-gd"
   reason: "squad-gd realm catch-all — game-design squad app services"

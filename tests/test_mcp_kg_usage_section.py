@@ -20,14 +20,14 @@ from app.services.digest import failures as digest_failures
 
 @pytest.mark.parametrize("key,expected", [
     # люди — key_name это «Имя Фамилия»
-    ("Виталий Шабалин", True),
-    ("Захар Бушуев", True),
+    ("Пётр Петров", True),
+    ("Сергей Сергеев", True),
     # известные служебные ключи
     ("knowledge-generator", False),
     ("squad-medic-robot", False),
     ("discord-bot", False),
     ("mcp-preplanner", False),
-    ("claude-ybobryashov-rot", False),
+    ("claude-whiskey-rot", False),
     # будущие боты по общему шаблону — страховка, а не догадка
     ("release-bot", False),
     ("some-robot", False),
@@ -54,8 +54,8 @@ async def test_bot_traffic_does_not_leak_into_human_count():
     """Регрессия: бот с сотней тысяч вызовов не должен попадать в цифру."""
     today = {
         ("kg_service", "knowledge-generator"): 111588.0,
-        ("kg_service", "Виталий Шабалин"): 12.0,
-        ("kg_timeline", "Захар Бушуев"): 8.0,
+        ("kg_service", "Пётр Петров"): 12.0,
+        ("kg_timeline", "Сергей Сергеев"): 8.0,
     }
     text = await mcp_kg_usage_section(_vm(today, {}))
 

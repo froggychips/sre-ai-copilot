@@ -251,7 +251,7 @@ _CLUSTER_ACT = {
         {
             "namespace": "preprod-shared", "buildtype_id": "Bt1",
             "buildtype_name": "Build and update", "number": "727",
-            "triggered_by": "ybobryashov", "minutes_before_incident": 7,
+            "triggered_by": "whiskey", "minutes_before_incident": 7,
         },
     ],
 }
@@ -305,7 +305,7 @@ def test_embed_collateral_verdict_replaces_negative():
     assert "cross-namespace rollout-collateral" in dep_field
     assert "530 деплоев" in dep_field
     assert "`squad-gd-shared` (60)" in dep_field
-    assert "#727" in dep_field and "ybobryashov" in dep_field
+    assert "#727" in dep_field and "whiskey" in dep_field
 
 
 def test_embed_keeps_negative_below_threshold():

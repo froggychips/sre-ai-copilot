@@ -848,9 +848,9 @@ OWNER_ALIASES_PATH=/etc/sre-ai/owner-aliases.yaml
 YAML формат:
 
 ```yaml
-kemyashev: "@squad-1"
-apleshkov: "@squad-2"
-wizaryx:   "@platform"
+lima: "@squad-1"
+bravo: "@squad-2"
+victor:   "@platform"
 new-engineer: "@squad-N"
 ```
 

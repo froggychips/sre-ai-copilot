@@ -187,7 +187,7 @@ def _deploy_history_top(
     Возвращает (team, strength) или None если данных нет.
       - team: `squad-N` / `platform` — без `@`. **Только resolved users**.
       - strength: доля most-frequent от общего числа deploys в окне, [0, 1].
-                  Например 5 деплоев у kemyashev из 6 общих → 0.83.
+                  Например 5 деплоев у lima из 6 общих → 0.83.
 
     Алгоритм:
       1. Считаем COUNT(*) per triggered_by за окно (top-10).

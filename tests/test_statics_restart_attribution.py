@@ -233,7 +233,7 @@ _CLUSTER_ACT = {
         {
             "namespace": "preprod-shared", "buildtype_id": "Bt1",
             "buildtype_name": "Build and update", "number": "727",
-            "triggered_by": "ybobryashov", "minutes_before_incident": 7,
+            "triggered_by": "whiskey", "minutes_before_incident": 7,
         },
     ],
 }

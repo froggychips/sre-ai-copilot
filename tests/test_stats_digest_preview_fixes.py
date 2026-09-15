@@ -37,7 +37,7 @@ def _reset_caches(monkeypatch):
 def _build(
     *,
     number: str = "2138",
-    triggered_by: str = "wizaryx",
+    triggered_by: str = "victor",
     buildtype: str = "town-service",
     branch: str = "refs/heads/preprod-kingdom2",
     status: str = "SUCCESS",
@@ -68,7 +68,7 @@ async def test_recent_deploys_aggregates_cascade_same_build_number():
     text = await stats_digest.recent_deploys_section(fetch_fn=fake_fetch)
     assert text.count("\n  •") == 1  # одна агрегированная строка
     assert "#2138" in text
-    assert "wizaryx" in text
+    assert "victor" in text
     assert "town-service/chat-tasks-service/map-service" in text
     assert "preprod-kingdom2" in text
 
@@ -260,11 +260,11 @@ def test_multi_signal_env_kingdom_not_multi_squad():
 
 
 def test_multi_signal_bare_shared_can_be_overridden_by_deploy_history():
-    """Если deploy_history говорит «kemyashev регулярно деплоит в prod-shared» —
+    """Если deploy_history говорит «lima регулярно деплоит в prod-shared» —
     его @squad-1 должен победить multi-squad placeholder."""
     from tests.test_owner_inference_multi import _mock_db_with_responses
     db = _mock_db_with_responses(
-        deploys=[("kemyashev", 20)],  # strength=1.0 → 0.4
+        deploys=[("lima", 20)],  # strength=1.0 → 0.4
         labels=[],
     )
     sug = ownership_suggester.suggest_owner_multi_signal("prod-shared", db)

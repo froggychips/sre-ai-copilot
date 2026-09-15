@@ -34,7 +34,7 @@
     },
     {
       "name": "🎯 Скорее всего",
-      "value": "Deploy #2231 by apleshkov (abc1234) 7 min ago — возможный регресс",
+      "value": "Deploy #2231 by bravo (abc1234) 7 min ago — возможный регресс",
       "inline": false
     },
     {
@@ -49,7 +49,7 @@
     },
     {
       "name": "Recent deploys (~7м)",
-      "value": "• [RebuildCartWorker #2231 by apleshkov](https://teamcity.example.com/build/2231) [`abc12345`](https://wo-gitlab.lastoasisgame.com/wo/backend/-/commit/abc1234567890def) — 7 min ago — SUCCESS",
+      "value": "• [RebuildCartWorker #2231 by bravo](https://teamcity.example.com/build/2231) [`abc12345`](https://wo-gitlab.lastoasisgame.com/wo/backend/-/commit/abc1234567890def) — 7 min ago — SUCCESS",
       "inline": false
     },
     {

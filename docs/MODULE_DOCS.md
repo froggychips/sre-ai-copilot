@@ -382,7 +382,7 @@ Read-side API used by enrichment + MCP tools:
 - TC username → team mapping для owner inference (сигнал B).
 - **Источники маппинга** в порядке приоритета:
   1. YAML-файл из ENV `OWNER_ALIASES_PATH` (deployment-specific override).
-  2. Pre-baked `_DEFAULT_ALIASES` в коде (`kemyashev → @squad-1` и т.п.,
+  2. Pre-baked `_DEFAULT_ALIASES` в коде (`lima → @squad-1` и т.п.,
      подтверждено по recent_deploys digest-у).
   3. Fallback `@?-{username}` — caller возвращает для неизвестных.
 - API: `resolve_username(username: str) → str` (lowercase'ит вход).

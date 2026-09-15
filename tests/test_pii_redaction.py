@@ -22,7 +22,7 @@ from app.services.pii_redaction import redact_pii
 # ---------------------------------------------------------------------------
 
 def test_redact_email_simple():
-    assert redact_pii("contact yar.shulgin@gmail.com for details") == \
+    assert redact_pii("contact xray.dot@gmail.com for details") == \
         "contact <email> for details"
 
 

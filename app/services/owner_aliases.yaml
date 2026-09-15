@@ -18,27 +18,27 @@
 # фолбэке — НЕ контрибутят к confidence сигнала B, см. ownership_suggester).
 
 # ── Platform / infra ──
-wizaryx: "@platform"
-yshulgin: "@platform"
-yar.shulgin: "@platform"
-zbushuev: "@platform"
-sgrozov: "@platform"
-pryzhikov: "@platform"
+victor: "@platform"
+xray: "@platform"
+xray.dot: "@platform"
+yankee: "@platform"
+romeo: "@platform"
+papa: "@platform"
 
 # ── Squad-1 (town / core gameplay) ──
-kemyashev: "@squad-1"
+lima: "@squad-1"
 
 # ── Squad-2 ──
-apleshkov: "@squad-2"
+bravo: "@squad-2"
 
 # ── Squad-gd (game design / live ops) ──
-igoncharov: "@squad-gd"
+kilo: "@squad-gd"
 
 # ── Backend / shared services ──
-egecer: "@backend"
-ddosta: "@backend"
-ashulgin: "@backend"
-mlopatin: "@backend"
+india: "@backend"
+foxtrot: "@backend"
+charlie: "@backend"
+november: "@backend"
 
 # ── QA / release ──
 qauser: "@qa"

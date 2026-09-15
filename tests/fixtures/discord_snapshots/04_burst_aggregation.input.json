@@ -34,7 +34,7 @@
           "number": "2231",
           "buildtype_name": "RebuildCartWorker",
           "status": "SUCCESS",
-          "triggered_by": "apleshkov",
+          "triggered_by": "bravo",
           "url": "https://teamcity.example.com/build/2231"
         }
       ],
@@ -63,7 +63,7 @@
                 "minutes_before_incident": 7,
                 "sha": "abc1234567890def",
                 "number": "2231",
-                "triggered_by": "apleshkov"
+                "triggered_by": "bravo"
               }
             ]
           }

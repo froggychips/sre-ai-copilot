@@ -66,7 +66,7 @@ def test_decay_critical_acked_no_decay():
     now = datetime(2026, 5, 25, 12, 0, 0, tzinfo=timezone.utc)
     fired_at = now - timedelta(hours=48)
     sev, prefix, marker = _age_decay_severity(
-        "critical", fired_at, acked_by="apleshkov", now=now,
+        "critical", fired_at, acked_by="bravo", now=now,
     )
     assert sev == "critical"
     assert prefix == ""
@@ -674,7 +674,7 @@ async def test_send_incident_decay_acked_stays_red(webhook_env):
             resolution_quality="unresolved",
             synthesis="...",
             fired_at=fired_at,
-            acked_by="apleshkov",
+            acked_by="bravo",
         )
 
     payload = mock_client.post.await_args.kwargs["json"]

@@ -305,12 +305,12 @@ def test_mttr_section_graceful_on_missing_table():
 
 
 def test_deploy_incident_correlation_renders():
-    """Базовый ренdere: 18 deploys, 7 attributed, worst=Build#2138 by wizaryx."""
+    """Базовый ренdere: 18 deploys, 7 attributed, worst=Build#2138 by victor."""
     db = MagicMock()
     # overall fetchone + worst fetchone
     db.execute.return_value.fetchone.side_effect = [
         (18, 7, 11),  # total, attributed, successes
-        ("2138", "wizaryx", 3),  # worst
+        ("2138", "victor", 3),  # worst
     ]
     text = stats_digest.deploy_incident_correlation_section(db, hours=24)
     assert "Deploy" in text
@@ -318,7 +318,7 @@ def test_deploy_incident_correlation_renders():
     assert "18" in text
     assert "7" in text
     assert "Build #2138" in text
-    assert "wizaryx" in text
+    assert "victor" in text
 
 
 def test_deploy_incident_correlation_hides_when_no_deploys():
@@ -472,7 +472,7 @@ async def test_recent_deploys_includes_clickable_url_for_single_build():
             "branch": "refs/heads/preprod",
             "buildtype_name": "Build and update",
             "finished_at": "2026-05-24T20:00:00+00:00",
-            "triggered_by": "wizaryx", "triggered_type": "user",
+            "triggered_by": "victor", "triggered_type": "user",
         }]
     with patch.object(stats_digest.settings, "TEAMCITY_WEB_URL",
                       "https://wo-teamcity.lastoasisgame.com", create=True):
@@ -491,18 +491,18 @@ async def test_recent_deploys_includes_url_for_cascade():
              "branch": "refs/heads/preprod-kingdom2",
              "buildtype_name": "town-service",
              "finished_at": "2026-05-24T20:00:00+00:00",
-             "triggered_by": "wizaryx", "triggered_type": "user"},
+             "triggered_by": "victor", "triggered_type": "user"},
             {"id": 101, "number": "2138", "status": "SUCCESS",
              "branch": "refs/heads/preprod-kingdom2",
              "buildtype_name": "chat-tasks",
              "finished_at": "2026-05-24T20:00:00+00:00",
-             "triggered_by": "wizaryx", "triggered_type": "user"},
+             "triggered_by": "victor", "triggered_type": "user"},
         ]
     with patch.object(stats_digest.settings, "TEAMCITY_WEB_URL",
                       "https://wo-teamcity.lastoasisgame.com", create=True):
         text = await stats_digest.recent_deploys_section(fetch_fn=fake_fetch)
-    # Wrapped link приоритетно вокруг "#2138 by wizaryx"
-    assert "[#2138 by `wizaryx`]" in text
+    # Wrapped link приоритетно вокруг "#2138 by victor"
+    assert "[#2138 by `victor`]" in text
     assert "buildId=100" in text  # первый build_id из cascade
 
 
