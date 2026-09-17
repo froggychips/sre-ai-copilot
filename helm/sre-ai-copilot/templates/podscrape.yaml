@@ -1,0 +1,32 @@
+{{- if .Values.monitoring.podScrape.enabled }}
+# Скрейп метрик подов чарта.
+#
+# Без этого объекта helm-установка не отдаёт в VictoriaMetrics НИ ОДНОЙ
+# серии воркера, даже когда порт 8001 объявлен и сервер поднят: единственный
+# scrape-объект репозитория живёт в k8s/monitoring.yaml, привязан к ns
+# sre-ai и селектит `app in (sre-ai-api, copilot-worker)` — лейблов `app`
+# у подов чарта нет вовсе, только `app.kubernetes.io/*`.
+#
+# Выключен по умолчанию: kind VMPodScrape требует CRD оператора
+# VictoriaMetrics, и на кластере без него установка упала бы целиком.
+apiVersion: operator.victoriametrics.com/v1beta1
+kind: VMPodScrape
+metadata:
+  name: {{ include "sre-ai-copilot.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "sre-ai-copilot.labels" . | nindent 4 }}
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: {{ include "sre-ai-copilot.name" . }}
+      app.kubernetes.io/instance: {{ .Release.Name }}
+  podMetricsEndpoints:
+  - port: metrics
+    path: /metrics
+    interval: {{ .Values.monitoring.podScrape.interval | default "30s" }}
+    honorLabels: true
+    # targetPort числом — страховка на случай подов, где порт объявлен без
+    # имени (та же оговорка, что в k8s/monitoring.yaml).
+    targetPort: 8001
+{{- end }}

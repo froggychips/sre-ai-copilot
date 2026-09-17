@@ -154,3 +154,31 @@ def test_helm_worker_matches_raw_manifest():
     assert raw_path.group(1) == chart_path.group(1), (
         f"пути расходятся: raw={raw_path.group(1)} chart={chart_path.group(1)}"
     )
+
+
+def test_helm_worker_ingress_is_restricted():
+    """Порт метрик в чарте не открыт всему кластеру.
+
+    До 17.09.2026 у worker-политики были одни Egress-правила, и это было
+    безопасно ровно потому, что воркер ничего не слушал. С появлением
+    /metrics на 0.0.0.0:8001 отсутствие Ingress-секции означало бы
+    неаутентифицированный listener, доступный любому поду кластера.
+    """
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[1]
+    chart = (root / "helm" / "sre-ai-copilot" / "templates"
+             / "networkpolicy.yaml").read_text(encoding="utf-8")
+
+    worker_block = chart[chart.index("-worker"):]
+    worker_block = worker_block[:worker_block.index("egress:")]
+
+    assert "- Ingress" in worker_block, (
+        "у worker-политики нет Ingress в policyTypes — listener открыт всем"
+    )
+    assert "port: 8001" in worker_block, (
+        "вход на 8001 должен быть разрешён явно и только он"
+    )
+    assert "namespaceSelector" in worker_block, (
+        "источник входа должен быть ограничен namespace'ом мониторинга"
+    )
