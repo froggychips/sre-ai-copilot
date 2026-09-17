@@ -58,8 +58,32 @@ def ledger(monkeypatch):
         finally:
             db.close()
 
+    def _reserve(day, micro, limit_micro):
+        """Условное списание одной транзакцией — как в Postgres-версии."""
+        if micro > limit_micro:
+            return None
+        db = Session()
+        try:
+            row = db.execute(
+                text("""
+                    INSERT INTO llm_spend_ledger (day, spent_micro_usd, updated_at)
+                    VALUES (:day, :delta, CURRENT_TIMESTAMP)
+                    ON CONFLICT (day) DO UPDATE
+                    SET spent_micro_usd = llm_spend_ledger.spent_micro_usd + :delta,
+                        updated_at = CURRENT_TIMESTAMP
+                    WHERE llm_spend_ledger.spent_micro_usd + :delta <= :limit
+                    RETURNING spent_micro_usd
+                """),
+                {"day": day, "delta": micro, "limit": limit_micro},
+            ).scalar()
+            db.commit()
+            return int(row) if row is not None else None
+        finally:
+            db.close()
+
     monkeypatch.setattr(cost_guard, "_apply_delta", _apply)
     monkeypatch.setattr(cost_guard, "_read_spent_micro", _read)
+    monkeypatch.setattr(cost_guard, "_reserve_atomic", _reserve)
     monkeypatch.setattr(settings, "LLM_PRICE_PER_MTOK", {"m": {"input": 3.0, "output": 15.0}}, raising=False)
     monkeypatch.setattr(settings, "MAX_TOKENS", 1000, raising=False)
     yield Session
@@ -448,3 +472,43 @@ def test_release_reports_zero_on_success(ledger, monkeypatch):
 
     assert cost_guard.release(verdict) == 0.0
     assert cost_guard.spent_today_usd() == pytest.approx(0.0, abs=1e-6)
+
+
+def test_rejected_reservation_leaves_no_trace(ledger, monkeypatch):
+    """Отказ по потолку не должен ничего списывать.
+
+    Раньше отказ делался в два шага — прибавить и вычесть обратно, — и
+    падение компенсирующей записи (или смерть воркера между коммитами)
+    оставляло в счётчике резерв под запрос, который никуда не отправляли.
+    Снять его некому: вердикт отказной, settle и release работают только с
+    разрешёнными. Бюджет блокировался до смены суток.
+    """
+    monkeypatch.setattr(settings, "LLM_DAILY_BUDGET_USD", 0.01, raising=False)
+    before = cost_guard.spent_today_usd()
+
+    verdict = cost_guard.reserve("m", "x" * 100_000)
+
+    assert not verdict.allowed
+    assert cost_guard.spent_today_usd() == pytest.approx(before)
+
+
+def test_rejection_does_not_block_smaller_calls(ledger, monkeypatch):
+    """После отказа крупного вызова мелкий, влезающий в остаток, проходит."""
+    monkeypatch.setattr(settings, "LLM_DAILY_BUDGET_USD", 1.0, raising=False)
+
+    big = cost_guard.reserve("m", "x" * 10_000_000)
+    assert not big.allowed
+
+    small = cost_guard.reserve("m", "привет")
+    assert small.allowed, "отказ крупного вызова не должен съедать бюджет"
+
+
+def test_reservation_is_atomic_under_concurrency(ledger, monkeypatch):
+    """Потолок держится, даже если проверка и списание идут вперемешку."""
+    monkeypatch.setattr(settings, "LLM_DAILY_BUDGET_USD", 1.0, raising=False)
+    prompt = "x" * 30_000
+
+    verdicts = [cost_guard.reserve("m", prompt) for _ in range(50)]
+
+    assert any(v.allowed for v in verdicts)
+    assert cost_guard.spent_today_usd() <= 1.0 + 1e-6

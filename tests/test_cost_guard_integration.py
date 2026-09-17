@@ -5,6 +5,7 @@
 Модуль без этого выглядел бы защитой, не будучи ею.
 """
 import asyncio
+import time
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -452,3 +453,75 @@ async def test_successful_release_reports_no_cost(priced):
             await service.generate_full("привет")
 
     assert costs == []
+
+
+@pytest.mark.asyncio
+async def test_cancellation_during_reservation_is_accounted(priced):
+    """Отмена во время записи резерва не должна терять этот резерв.
+
+    `to_thread` не останавливается от отмены: поток дописывает резерв в
+    ledger уже после того, как await поднял CancelledError. Без защиты
+    `verdict` остался бы None, обработчик отмены о резерве не узнал бы, и
+    тот висел бы в счётчике до смены суток.
+    """
+    from app.services import llm_service as svc
+
+    costs = []
+    started = asyncio.Event()
+
+    def _slow_reserve(*_a, **_k):
+        started.set()
+        time.sleep(0.2)          # поток продолжает работу после отмены
+        return _reserved(2.0)
+
+    client = MagicMock()
+    client.messages.create = AsyncMock(return_value=_anthropic_response())
+
+    service = svc.LLMService()
+    service.backend = "anthropic"
+    service.model = "m"
+    with patch.object(svc, "reserve", _slow_reserve), \
+         patch.object(svc, "track_llm_cost", lambda _m, c: costs.append(c)), \
+         patch.object(service, "_anthropic_client", return_value=client), \
+         patch.object(svc, "_get_resilience", return_value=None):
+        task = asyncio.ensure_future(service.generate_full("привет"))
+        await started.wait()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    assert costs == [2.0], "резерв, записанный потоком, должен попасть в метрику"
+
+
+@pytest.mark.asyncio
+async def test_cancellation_after_settlement_does_not_double_count(priced):
+    """Отмена ПОСЛЕ сведения не должна записывать резерв поверх факта.
+
+    К этому моменту в счётчике лежит фактическая стоимость, а не
+    worst-case: записать его ещё раз значит завысить расход на ровном
+    месте — зеркальная ошибка к той, что чинили раньше.
+    """
+    from app.services import llm_service as svc
+
+    costs = []
+
+    async def _report(_resilience, success):
+        # Отмена приходит уже после settle — например, пока идёт Redis.
+        raise asyncio.CancelledError()
+
+    client = MagicMock()
+    client.messages.create = AsyncMock(return_value=_anthropic_response())
+
+    service = svc.LLMService()
+    service.backend = "anthropic"
+    service.model = "m"
+    with patch.object(svc, "reserve", lambda *a, **k: _reserved(2.0)), \
+         patch.object(svc, "settle", lambda *a, **k: 0.5), \
+         patch.object(svc, "track_llm_cost", lambda _m, c: costs.append(c)), \
+         patch.object(svc, "_report_provider", _report), \
+         patch.object(service, "_anthropic_client", return_value=client), \
+         patch.object(svc, "_get_resilience", return_value=None):
+        with pytest.raises(asyncio.CancelledError):
+            await service.generate_full("привет")
+
+    assert costs == [0.5], "worst-case не должен записываться поверх факта"

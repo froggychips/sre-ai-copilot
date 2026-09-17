@@ -174,6 +174,9 @@ class LLMService:
         # значит «до резерва не дошли» — обработчикам ошибок нечего
         # возвращать.
         verdict = None
+        # Сведён ли резерв. Нужен обработчикам: пока False — в счётчике
+        # лежит worst-case, после True — фактическая стоимость.
+        accounted = False
         try:
             if self.backend == "claude_cli":
                 assert self.cli is not None
@@ -243,7 +246,25 @@ class LLMService:
             #
             # Здесь резерв берётся внутри retry-петли, поэтому каждая
             # оплачиваемая попытка проходит через него.
-            verdict = await asyncio.to_thread(reserve, self.model, prompt)
+            # shield: отмена (stage-cap) не останавливает поток, который уже
+            # пишет резерв в Postgres. Без защиты await поднял бы
+            # CancelledError, verdict остался бы None — а резерв при этом
+            # закоммичен и висел бы в счётчике до смены суток, потому что
+            # обработчик отмены о нём не знает. Дожидаемся результата и
+            # только потом пробрасываем отмену дальше.
+            _reserve_task = asyncio.ensure_future(
+                asyncio.to_thread(reserve, self.model, prompt)
+            )
+            try:
+                verdict = await asyncio.shield(_reserve_task)
+            except asyncio.CancelledError:
+                verdict = await _reserve_task
+                if verdict.reserved_usd > 0:
+                    track_llm_cost(self.model, verdict.reserved_usd)
+                # Учтено здесь — внешняя ветка отмены не должна записать то
+                # же самое второй раз.
+                accounted = True
+                raise
             if not verdict.allowed:
                 # LLMBudgetExceeded не входит в is_retryable_llm_error —
                 # ретраить отказ бюджета значит повторять попытку потратить
@@ -301,6 +322,11 @@ class LLMService:
             cost_usd = await asyncio.to_thread(
                 settle, verdict, self.model, input_tokens, output_tokens
             )
+            # С этого момента резерв сведён и записан в метрику. Отмена,
+            # пришедшая позже (например, пока _report_provider ждёт Redis),
+            # не должна записать его во второй раз: в счётчике уже лежит
+            # фактическая стоимость, а не worst-case.
+            accounted = True
             # Метрика пишется здесь, у КАЖДОЙ попытки, а не этажом выше по
             # итогу вызова: удержанные резервы неудачных попыток тоже
             # списаны с бюджета, и учитывать только последний успешный
@@ -335,7 +361,7 @@ class LLMService:
             # значит он уже списан, и метрика обязана это показать.
             # Отдельная ветка нужна потому, что hard-ceiling wait_for
             # заканчивается здесь, мимо общего except.
-            if verdict is not None and verdict.reserved_usd > 0:
+            if not accounted and verdict is not None and verdict.reserved_usd > 0:
                 track_llm_cost(self.model, verdict.reserved_usd)
             await _report_provider(resilience, success=False)
             logging.error("LLM call timed out")
@@ -370,7 +396,12 @@ class LLMService:
             # этом уже списан, и без записи метрика занижала бы расход
             # каждый раз, когда стадия упирается в потолок: у
             # последовательного критика это не редкость.
-            if verdict is not None and verdict.reserved_usd > 0:
+            #
+            # `accounted` защищает от обратного перекоса: отмена могла прийти
+            # уже ПОСЛЕ сведения, и тогда в счётчике лежит фактическая
+            # стоимость — записывать поверх неё worst-case значит завысить
+            # расход на ровном месте.
+            if not accounted and verdict is not None and verdict.reserved_usd > 0:
                 track_llm_cost(self.model, verdict.reserved_usd)
             # _report_provider намеренно не зовём: отмена по нашему таймауту
             # — не признак того, что провайдеру плохо.
@@ -381,7 +412,7 @@ class LLMService:
             # же самое. Иначе llm_cost_usd_total занижает расход именно
             # тогда, когда попыток много, а терминальный провал не даёт
             # вообще никакой цифры.
-            if verdict is not None and verdict.reserved_usd > 0:
+            if not accounted and verdict is not None and verdict.reserved_usd > 0:
                 track_llm_cost(self.model, verdict.reserved_usd)
             await _report_provider(resilience, success=False)
             logging.error(f"LLM call attempt failed: {e}")

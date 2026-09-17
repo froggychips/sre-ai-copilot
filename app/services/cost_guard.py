@@ -253,6 +253,48 @@ def _apply_delta(day: dt.date, delta_micro: int) -> int:
         db.close()
 
 
+def _reserve_atomic(day: dt.date, micro: int, limit_micro: int) -> Optional[int]:
+    """Списать резерв, ЕСЛИ он помещается в потолок. Одной транзакцией.
+
+    Возвращает новую сумму, если списали, и None, если не поместился.
+
+    Раньше это делалось в два шага: прибавить, посмотреть на результат и при
+    перерасходе вычесть обратно. Компенсирующая запись — слабое место: упади
+    она или умри воркер между коммитами, и в счётчике навсегда останется
+    резерв под запрос, который отвергли и никуда не отправили. Снять его
+    некому — вердикт отказной, а `settle` и `release` работают только с
+    разрешёнными, — так что бюджет заблокирован до смены суток UTC, включая
+    вызовы, которые в остаток прекрасно бы влезли.
+
+    Условие проверяется в самом UPDATE: не прошло — строка не меняется,
+    RETURNING пуст, компенсировать нечего.
+    """
+    from app.database import SessionLocal
+
+    sql = text("""
+        INSERT INTO llm_spend_ledger (day, spent_micro_usd, updated_at)
+        VALUES (:day, :delta, NOW())
+        ON CONFLICT (day) DO UPDATE
+        SET spent_micro_usd = llm_spend_ledger.spent_micro_usd + :delta,
+            updated_at = NOW()
+        WHERE llm_spend_ledger.spent_micro_usd + :delta <= :limit
+        RETURNING spent_micro_usd
+    """)
+    db = SessionLocal()
+    try:
+        # Вставка первой за сутки строки условия в WHERE не проходит (ON
+        # CONFLICT ещё не сработал), поэтому первый резерв дня сверяем сами.
+        if micro > limit_micro:
+            return None
+        row = db.execute(
+            sql, {"day": day, "delta": micro, "limit": limit_micro}
+        ).scalar()
+        db.commit()
+        return int(row) if row is not None else None
+    finally:
+        db.close()
+
+
 def _read_spent_micro(day: dt.date) -> Optional[int]:
     from app.database import SessionLocal
 
@@ -303,10 +345,11 @@ def reserve(
 
     cost = estimate_worst_case_usd(model, prompt)
     micro = max(1, int(math.ceil(cost * _USD_SCALE)))
+    limit_micro = int(limit * _USD_SCALE)
     day = _today(now)
 
     try:
-        new_total_micro = _apply_delta(day, micro)
+        new_total_micro = _reserve_atomic(day, micro, limit_micro)
     except Exception as e:  # noqa: BLE001
         # Резерв не записан — значит неизвестно, сколько потрачено, и
         # разрешать нечем. Это и есть fail-closed: у предохранителя между
@@ -314,21 +357,16 @@ def reserve(
         log.warning("cost_guard.reserve_failed", model=model, error=str(e))
         return BudgetVerdict(False, "budget_state_unknown", None, limit)
 
-    new_total = new_total_micro / _USD_SCALE
-    if new_total > limit:
-        # Резерв не помещается в потолок — откатываем его и отказываем.
-        # Откат обязателен: иначе отклонённые вызовы съедали бы бюджет и
-        # предохранитель захлопнулся бы навсегда после первого же отказа.
-        try:
-            _apply_delta(day, -micro)
-        except Exception as e:  # noqa: BLE001
-            log.warning("cost_guard.reserve_rollback_failed", error=str(e))
+    if new_total_micro is None:
+        # Не поместился. Ничего не списано — компенсировать нечего, и
+        # отклонённый вызов бюджета не съедает.
         return BudgetVerdict(
-            False, "daily_budget_exhausted", new_total - cost, limit
+            False, "daily_budget_exhausted", spent_today_usd(now), limit
         )
 
     return BudgetVerdict(
-        True, "within_budget", new_total, limit, reserved_usd=cost, day=day
+        True, "within_budget", new_total_micro / _USD_SCALE, limit,
+        reserved_usd=cost, day=day,
     )
 
 
