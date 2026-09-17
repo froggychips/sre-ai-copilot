@@ -753,3 +753,105 @@ def test_no_match_without_selector_change_keeps_edge(db):
     assert stats["skipped_no_match"] == 1
     assert stats["edges_dropped_stale_selector"] == 0
     assert db.query(ServiceEdge).filter_by(kind=EDGE_SERVES_TRAFFIC).count() == 1
+
+
+# ── CNPG: поды делает оператор, Deployment/StatefulSet за ними нет ──────────
+
+
+def _mk_cnpg_cluster(name: str, namespace: str, instances: int = 2):
+    """Cluster CR как его отдаёт kubectl: ни spec.template, ни spec.replicas."""
+    return {
+        "kind": "Cluster",
+        "metadata": {"name": name, "namespace": namespace},
+        "spec": {
+            "instances": instances,
+            "imageName": "ghcr.io/cloudnative-pg/postgresql:17.6",
+        },
+    }
+
+
+def test_cnpg_cluster_backs_rw_service(db):
+    """Service на CNPG получает workload-узел, а не пустоту.
+
+    17.09.2026 `config-worker-db-postgresql` в prod-shared переключили на
+    CNPG. Поды кластера не принадлежат ни Deployment, ни StatefulSet, ни
+    DaemonSet — их создаёт оператор из Cluster CR. Итог в графе: живой
+    primary не представлен ничем, а оставленный для отката StatefulSet
+    представлен полноценно.
+    """
+    clusters = [_mk_cnpg_cluster("cw-db-cnpg", "prod-shared")]
+    services = [_mk_service("cw-db-cnpg-rw", "prod-shared",
+                            selector={"cnpg.io/cluster": "cw-db-cnpg",
+                                      "cnpg.io/instanceRole": "primary"})]
+
+    with patch(
+        "app.knowledge_graph.k8s_topology_resources_sync._kubectl_get_all",
+        return_value=services,
+    ):
+        stats = sync_all_services(
+            db, deployments_index=_index_deployments_by_ns(clusters))
+
+    assert stats["skipped_no_match"] == 0
+    assert stats["edges_serves_traffic"] == 1
+
+    edge = db.query(ServiceEdge).filter_by(kind=EDGE_SERVES_TRAFFIC).one()
+    assert edge.dst.name == "cw-db-cnpg"
+    assert edge.dst.node_kind == NODE_KIND_WORKLOAD
+    meta = (edge.dst.metadata_json or {}).get("k8s_workload") or {}
+    assert meta["workload_kind"] == "Cluster"
+    # instances, а не replicas: у Cluster CR своя форма spec.
+    assert meta["replicas"] == 2
+    assert meta["images"] == ["ghcr.io/cloudnative-pg/postgresql:17.6"]
+
+
+def test_cnpg_replica_service_matches_same_cluster(db):
+    """`-ro` (replica) ведёт на тот же кластер, что и `-rw`.
+
+    Роль инстанса переезжает при failover — на проде промоушен занял 20
+    секунд. Если учитывать `instanceRole` в матче, ребро отваливалось бы при
+    каждом переключении примари, и blast-radius мигал бы вместе с ним.
+    """
+    clusters = [_mk_cnpg_cluster("cw-db-cnpg", "prod-shared")]
+    services = [
+        _mk_service("cw-db-cnpg-rw", "prod-shared",
+                    selector={"cnpg.io/cluster": "cw-db-cnpg",
+                              "cnpg.io/instanceRole": "primary"}),
+        _mk_service("cw-db-cnpg-ro", "prod-shared",
+                    selector={"cnpg.io/cluster": "cw-db-cnpg",
+                              "cnpg.io/instanceRole": "replica"}),
+    ]
+
+    with patch(
+        "app.knowledge_graph.k8s_topology_resources_sync._kubectl_get_all",
+        return_value=services,
+    ):
+        stats = sync_all_services(
+            db, deployments_index=_index_deployments_by_ns(clusters))
+
+    assert stats["edges_serves_traffic"] == 2
+    dst_names = {e.dst.name for e in
+                 db.query(ServiceEdge).filter_by(kind=EDGE_SERVES_TRAFFIC).all()}
+    assert dst_names == {"cw-db-cnpg"}
+
+
+def test_non_cnpg_selector_still_needs_every_label(db):
+    """Очистка селектора не ослабляет обычный матч.
+
+    Роль-лейблы вычищаются ТОЛЬКО для Cluster CR. Для Deployment селектор
+    по-прежнему требует совпадения всех ключей — иначе один Service начал бы
+    цеплять чужие workload'ы.
+    """
+    deps = [_mk_deployment("auth-app", "prod-shared",
+                           pod_labels={"app": "auth"})]
+    services = [_mk_service("auth-svc", "prod-shared",
+                            selector={"app": "auth", "tier": "api"})]
+
+    with patch(
+        "app.knowledge_graph.k8s_topology_resources_sync._kubectl_get_all",
+        return_value=services,
+    ):
+        stats = sync_all_services(
+            db, deployments_index=_index_deployments_by_ns(deps))
+
+    assert stats["skipped_no_match"] == 1
+    assert stats["edges_serves_traffic"] == 0

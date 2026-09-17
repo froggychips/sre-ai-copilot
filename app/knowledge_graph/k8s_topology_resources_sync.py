@@ -205,14 +205,33 @@ timeout=_KUBECTL_TIMEOUT_S,
 #: не матчился ни на что просто потому, что за ним стоял StatefulSet
 #: (все *-db / *-postgresql / clickhouse) или DaemonSet. Это уходило в
 #: skipped_no_match и читалось как «топология неизвестна».
-_WORKLOAD_RESOURCES = ("deployments", "statefulsets", "daemonsets")
+_WORKLOAD_RESOURCES = (
+    "deployments", "statefulsets", "daemonsets",
+    # CNPG создаёт поды из Cluster CR сам — за ними не стоит ни Deployment,
+    # ни StatefulSet. Без этого ресурса Service `*-cnpg-rw` не матчился ни на
+    # что: 17.09.2026 живой primary `config-worker-db-cnpg` не был
+    # представлен в графе вообще, тогда как оставленный для отката
+    # StatefulSet был представлен полноценно — ровно инверсия правды.
+    # CRD нет в кластере → _kubectl_get_all вернёт [], тик не падает.
+    "clusters.postgresql.cnpg.io",
+)
 
 #: kubectl-ресурс → значение workload_kind в metadata узла.
 _WORKLOAD_KIND_BY_RESOURCE = {
     "deployments": "Deployment",
     "statefulsets": "StatefulSet",
     "daemonsets": "DaemonSet",
+    "clusters.postgresql.cnpg.io": "Cluster",
 }
+
+#: Так выглядит workload_kind кластера CNPG.
+_CNPG_WORKLOAD_KIND = "Cluster"
+
+#: Лейблы, которыми CNPG различает РОЛЬ конкретного пода, а не идентичность
+#: workload'а. Роль переезжает при failover (на проде 17.09.2026 промоушен
+#: занял 20 секунд), поэтому в матче Service → Cluster она не участвует:
+#: иначе ребро отваливалось бы при каждом переключении примари.
+_CNPG_POD_ROLE_LABELS = ("cnpg.io/instanceRole", "cnpg.io/podRole")
 
 
 def _kubectl_get_deployments_all() -> List[Dict[str, Any]]:
@@ -293,6 +312,39 @@ def _find_matching_deployments(
     ]
 
 
+def _workload_pod_labels(obj: Dict[str, Any]) -> Dict[str, str]:
+    """Лейблы подов, которые порождает workload.
+
+    У Deployment/StatefulSet/DaemonSet это `spec.template.metadata.labels`.
+    У CNPG Cluster шаблона пода нет вовсе — оператор проставляет
+    `cnpg.io/cluster` сам, по имени кластера.
+    """
+    if obj.get("kind") == _CNPG_WORKLOAD_KIND:
+        name = (obj.get("metadata") or {}).get("name")
+        return {"cnpg.io/cluster": name} if name else {}
+    return (
+        ((obj.get("spec") or {}).get("template") or {}).get("metadata") or {}
+    ).get("labels") or {}
+
+
+def _selector_for_workload(
+    selector: Dict[str, str],
+    obj: Dict[str, Any],
+) -> Dict[str, str]:
+    """Селектор без ключей, описывающих роль пода, а не сам workload.
+
+    `config-worker-db-cnpg-rw` селектит `cnpg.io/cluster` + `instanceRole:
+    primary`. Идентичность workload'а задаёт только первый: второй говорит,
+    какой из подов кластера сейчас примари. Оставить его в матче — значит
+    привязать ребро графа к текущему раскладу ролей.
+    """
+    if obj.get("kind") != _CNPG_WORKLOAD_KIND:
+        return selector
+    return {
+        k: v for k, v in selector.items() if k not in _CNPG_POD_ROLE_LABELS
+    }
+
+
 def _find_matching_deployment_objects(
     selector: Dict[str, str],
     namespace: str,
@@ -308,10 +360,9 @@ def _find_matching_deployment_objects(
         return []
     matches: List[Dict[str, Any]] = []
     for dep in deployments_index.get(namespace, []):
-        pod_labels = (
-            ((dep.get("spec") or {}).get("template") or {}).get("metadata") or {}
-        ).get("labels") or {}
-        if not _selector_matches_labels(selector, pod_labels):
+        pod_labels = _workload_pod_labels(dep)
+        effective = _selector_for_workload(selector, dep)
+        if not effective or not _selector_matches_labels(effective, pod_labels):
             continue
         if not (dep.get("metadata") or {}).get("name"):
             continue
@@ -326,14 +377,22 @@ def _extract_workload_meta(dep: Dict[str, Any]) -> Dict[str, Any]:
     runtime, он живёт в метриках, а не в графе.
     """
     spec = dep.get("spec") or {}
+    if dep.get("kind") == _CNPG_WORKLOAD_KIND:
+        # У Cluster CR своя форма: инстансы вместо реплик, один образ на
+        # кластер вместо списка контейнеров.
+        image = spec.get("imageName")
+        return {
+            "workload_kind": _CNPG_WORKLOAD_KIND,
+            "replicas": spec.get("instances"),
+            "images": [image] if image else [],
+            "pod_labels": _workload_pod_labels(dep),
+        }
     containers = ((spec.get("template") or {}).get("spec") or {}).get("containers") or []
     return {
         "workload_kind": dep.get("kind") or "Deployment",
         "replicas": spec.get("replicas"),
         "images": [c.get("image") for c in containers if c.get("image")],
-        "pod_labels": (
-            ((spec.get("template") or {}).get("metadata") or {}).get("labels") or {}
-        ),
+        "pod_labels": _workload_pod_labels(dep),
     }
 
 
