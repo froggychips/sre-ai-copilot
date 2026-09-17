@@ -53,7 +53,8 @@ from app.knowledge_graph.schema import (NS_STATE_ACTIVE, AlertEvent,
                                         ClusterObservation, Deployment,
                                         LogObservation, Namespace,
                                         PodEvent, Service, ServiceEdge,
-                                        ServiceHealth, SignalAggregate)
+                                        ServiceHealth, SignalAggregate,
+                                        StorageVolume)
 
 log = structlog.get_logger()
 
@@ -1220,6 +1221,33 @@ def check_graph_integrity(db: Session) -> CheckResult:
         if has_own is not None:
             cross_realm_db_edges += 1
 
+    # Рёбра `serves_traffic`, чей selector разошёлся с selector'ом
+    # Service-узла. Значит Service переключили на другой backend, а ребро
+    # осталось от прежнего: граф правдоподобно врёт о том, что за сервисом
+    # стоит, и врёт увереннее всего — у ребра свежий last_seen_at.
+    #
+    # Замер 17.09.2026: ровно 1 на 8718 рёбер — `config-worker-db-postgresql`
+    # в prod-shared после переключения на CNPG. Узел уже показывал
+    # `cnpg.io/cluster`, ребро всё ещё вело на bitnami-StatefulSet, и так
+    # держалось бы до edge-decay, то есть сутками. Шума у проверки нет.
+    #
+    # Ребро без `extras.selector` (наследие до contract 2.4) не считается:
+    # судить не по чему. Узел без selector'а — тоже: headless и ExternalName
+    # его не имеют по определению.
+    stale_selector_edges = 0
+    for extras, meta in (
+        db.query(ServiceEdge.extras, src_s.metadata_json)
+        .join(src_s, ServiceEdge.src_id == src_s.id)
+        .filter(ServiceEdge.kind == "serves_traffic")
+        .all()
+    ):
+        edge_selector = (extras or {}).get("selector")
+        node_selector = ((meta or {}).get("k8s_service") or {}).get("selector")
+        if edge_selector is None or node_selector is None:
+            continue
+        if edge_selector != node_selector:
+            stale_selector_edges += 1
+
     self_loops_any = (
         db.query(func.count(ServiceEdge.id))
         .filter(ServiceEdge.src_id == ServiceEdge.dst_id)
@@ -1247,7 +1275,7 @@ def check_graph_integrity(db: Session) -> CheckResult:
             or stale_db_edges > _GRAPH_INTEGRITY_FAIL_STALE_DB_EDGES
             or dangling_edges > _GRAPH_INTEGRITY_FAIL_DANGLING):
         status = "fail"
-    elif dangling_edges > 0 or stale_db_edges > 0:
+    elif dangling_edges > 0 or stale_db_edges > 0 or stale_selector_edges > 0:
         status = "warn"
     else:
         status = "ok"
@@ -1263,6 +1291,323 @@ def check_graph_integrity(db: Session) -> CheckResult:
             "serves_traffic_self_loops": serves_traffic_self_loops,
             "dangling_edges": dangling_edges,
             "dangling_fail_threshold": _GRAPH_INTEGRITY_FAIL_DANGLING,
+            "stale_selector_edges": stale_selector_edges,
+        },
+    )
+
+
+
+# ── Этап 0: правдивость данных ────────────────────────────────────────────
+
+#: Доля устаревших узлов одного типа, после которой это уже не хвост, а сбой
+#: источника. Порог общий с `check_edges_freshness` намеренно: там он выбран
+#: по тем же соображениям, и два разных числа пришлось бы объяснять.
+_NODE_STALE_WARN_RATE = 0.30
+
+#: Через сколько молчание об узле становится подозрительным. Топология
+#: обходится раз в час, так что сутки — это двадцать четыре пропущенных тика.
+_NODE_STALE_AFTER_HOURS = 24
+
+
+def check_node_freshness(db: Session) -> CheckResult:
+    """Свежесть УЗЛОВ графа по типам — то, что `check_edges_freshness` не видит.
+
+    Та проверка считает рёбра, и этого мало: узел может стоять с прошлой
+    недели, пока его рёбра исправно освежает другой синк. Замер 17.09.2026
+    по живым окружениям:
+
+        service   7501 узлов,  71 устаревший  (0,9%)
+        workload  3922 узла,   25 устаревших  (0,6%)
+        ingress    334 узла,  194 устаревших  (58%)
+
+    Первые два ряда — норма, третий означает, что ingress-узлы в графе
+    больше чем наполовину описывают вчерашний кластер. Ни один существующий
+    сигнал этого не показывал: рёбра `routes_to` свежи, узлы — нет.
+
+    Как и у `check_edges_freshness`, считаются только узлы ЖИВЫХ
+    namespace: у снесённого окружения узлы обязаны устаревать, и мерить по
+    ним скорость retention вместо работы синка — ошибка, которую этот модуль
+    уже совершал трижды.
+    """
+    cutoff = _now() - timedelta(hours=_NODE_STALE_AFTER_HOURS)
+    ns = aliased(Namespace)
+    # Тип узлов, по которому идёт health-пересчёт, измерению НЕ ПОДЛЕЖИТ.
+    #
+    # `Service.updated_at` — не маркер свежести топологии: у колонки
+    # `onupdate=utcnow`, а `kg_health_recompute` каждые 20 минут пишет
+    # health_score всем non-synthetic сервисам и тем самым её обновляет.
+    # Значит для таких узлов «свежо» означает лишь «health посчитан», и
+    # остановка синка топологии останется невидимой.
+    #
+    # Отличить одно касание от другого ПО УЗЛУ нечем. Первая попытка
+    # сравнивала `updated_at <= health_computed_at` и была неверной:
+    # `recompute_all_health` фиксирует `now` ДО цикла, а onupdate у
+    # `updated_at` срабатывает позже, при flush. Замер 17.09.2026: из 10 725
+    # узлов с health_computed_at у ВСЕХ 10 725 `updated_at` строго больше,
+    # равных нет ни одного — предикат не срабатывал никогда, а тест на него
+    # проходил только потому, что выставлял метки равными вручную.
+    #
+    # Поэтому решение принимается по ТИПУ целиком: если health-пересчёт по
+    # нему шёл в пределах окна, тип уходит в not_measurable. Это честное
+    # «не знаю» вместо ложного «свежо», и оно не зависит от порядка,
+    # в котором две подсистемы пишут свои метки.
+    rows = (
+        db.query(
+            Service.node_kind,
+            func.count(Service.id),
+            func.sum(case((Service.updated_at < cutoff, 1), else_=0)),
+            func.max(Service.health_computed_at),
+        )
+        .join(ns, ns.namespace == Service.namespace)
+        .filter(ns.state == NS_STATE_ACTIVE)
+        .group_by(Service.node_kind)
+        .all()
+    )
+    by_kind: Dict[str, Dict[str, Any]] = {}
+    worst_rate = 0.0
+    worst_kind: Optional[str] = None
+    for node_kind, total, stale, last_health in rows:
+        total = int(total or 0)
+        stale = int(stale or 0)
+        if total == 0:
+            continue
+        # health-пересчёт «в пределах окна» = метки узлов этого типа перебиты
+        # им, и судить по ним о работе топологии нельзя.
+        if last_health is not None and last_health >= cutoff:
+            by_kind[str(node_kind or "unknown")] = {
+                "total": total,
+                "measurable": False,
+                "stale": None,
+                "stale_pct": None,
+                "reason": (
+                    "updated_at перебит health-пересчётом "
+                    f"(последний: {last_health.isoformat()})"
+                ),
+            }
+            continue
+        rate = stale / total
+        by_kind[str(node_kind or "unknown")] = {
+            "total": total,
+            "measurable": True,
+            "stale": stale,
+            "stale_pct": round(rate * 100, 1),
+        }
+        if rate > worst_rate:
+            worst_rate, worst_kind = rate, str(node_kind or "unknown")
+
+    status = "warn" if worst_rate > _NODE_STALE_WARN_RATE else "ok"
+    return CheckResult(
+        name="node_freshness",
+        status=status,
+        detail={
+            "by_node_kind": by_kind,
+            "worst_kind": worst_kind,
+            "worst_stale_pct": round(worst_rate * 100, 1),
+            "stale_after_hours": _NODE_STALE_AFTER_HOURS,
+            "scope": "active_namespaces_only",
+        },
+    )
+
+
+def check_source_coverage(db: Session) -> CheckResult:
+    """Какие источники графа отчитались за цикл, а какие промолчали.
+
+    Отчёты собирает `edge_decay_guard.record_source_run`, и до сих пор их
+    читал только сам decay — чтобы решить, можно ли гасить рёбра. Вопрос
+    «а все ли источники вообще отработали» никто не задавал, хотя это
+    основание доверять всему остальному: молчащий источник не создаёт
+    ошибок, он создаёт пустоту, неотличимую от «в кластере ничего нет».
+
+    ОГРАНИЧЕНИЕ. `_REPORTS` живёт в памяти процесса, а не в БД. Проверка
+    видит прогоны только того воркера, в котором выполняется сама; после
+    рестарта словарь пуст. Поэтому отсутствие отчёта — это `warn`, а не
+    `fail`: оно означает «не знаю», и ровно так и должно читаться. Довести
+    до `fail` можно будет, когда отчёты станут персистентными.
+    """
+    from app.knowledge_graph.edge_decay_guard import (
+        ALL_EDGE_SOURCES, REASON_EMPTY_FETCH, _fresh_hours, _grade_report,
+        get_source_report)
+
+    # Просроченный отчёт = «не знаю», а не «сломано». Без TTL один неудачный
+    # прогон в конкретном форке помнился бы вечно: последующие успешные
+    # прогоны уходят в другие процессы и локальную запись не перезаписывают,
+    # поэтому self-health, попав в тот самый форк, публиковал бы warn ещё
+    # долго после восстановления. Порог тот же, которым пользуется decay.
+    fresh_after = _now() - timedelta(hours=_fresh_hours())
+
+    reported: Dict[str, Any] = {}
+    silent: List[str] = []
+    expired: List[str] = []
+    unhealthy: Dict[str, str] = {}
+    for source in ALL_EDGE_SOURCES:
+        report = get_source_report(source)
+        if report is None:
+            silent.append(source)
+            continue
+        if report.ts is not None and report.ts < fresh_after:
+            expired.append(source)
+            continue
+        reason = _grade_report(report)
+        # `empty_fetch` здесь НЕ считается нездоровьем. В decay этот вердикт
+        # осмыслен: тот смотрит на источники, у которых в графе уже есть
+        # рёбра, и ноль объектов у них значит сбой fetch'а. Здесь инвентарь
+        # не проверяется вовсе, поэтому источник, у которого объектов
+        # законно нет (кластер без Ingress'ов или без PVC), выглядел бы
+        # сломанным вечно — и снова дал бы залипший warn.
+        # Явные отказы и ошибки остаются нездоровьем без оговорок.
+        if reason == REASON_EMPTY_FETCH:
+            reason = None
+        reported[source] = {
+            "fetched": report.fetched,
+            "errors": report.errors,
+            "failed": report.failed,
+            "ts": report.ts.isoformat() if report.ts else None,
+        }
+        if reason:
+            unhealthy[source] = reason
+
+    total = len(ALL_EDGE_SOURCES)
+    covered = len(reported)
+    # Молчание источника — «НЕ ЗНАЮ», а не «плохо», и статусом быть не может.
+    # `_REPORTS` живёт в памяти процесса, а celery крутит две реплики по два
+    # форка с рециклом воркера каждые 50 задач: одна проверка физически
+    # видит лишь подмножество из семи источников, поэтому warn по silent
+    # горел бы ВСЕГДА и через сутки превратился в залипший
+    # CopilotSelfHealthWarnStuck — то есть в шум, ради устранения которого
+    # весь Этап 0 и делается.
+    #
+    # Поэтому статус поднимает только ЯВНО нездоровый отчёт: его мы видели
+    # своими глазами, и он означает факт, а не пробел наблюдения.
+    status = "warn" if unhealthy else "ok"
+    return CheckResult(
+        name="source_coverage",
+        status=status,
+        detail={
+            "sources_total": total,
+            "sources_reported": covered,
+            "coverage_pct": round(covered / total * 100, 1) if total else 0.0,
+            "silent": sorted(silent),
+            "expired": sorted(expired),
+            "unhealthy": unhealthy,
+            "reported": reported,
+            "note": (
+                "отчёты живут в памяти ПРОЦЕССА, а celery крутит несколько "
+                "воркеров с рециклом: silent = «этот процесс прогона не "
+                "видел», а не «синк не работал». Статус по silent НЕ "
+                "поднимается — до персистентных отчётов покрытие здесь "
+                "неполно по устройству, и warn был бы вечным"
+            ),
+        },
+    )
+
+
+#: Колонки, которые ВЫГЛЯДЯТ измерением, но могут быть пусты целиком.
+#: Пара (модель, колонка, человеческое объяснение, почему пусто).
+#: Пятый элемент — ПРОБЕЛ ОЖИДАЕМ (архитектурный). Такие не поднимают
+#: статус: они не чинятся и не изменятся сами, а `CopilotSelfHealthWarnStuck`
+#: срабатывает, когда проверка держит warn сутки. Вечный warn на том, что
+#: нельзя починить, — это и есть шум, который Этап 0 убирает; ровно так же
+#: `KG_SELF_HEALTH_KNOWN_ZERO_METRICS` выводит 5xx/p95 из-под проверки нулей.
+#: Статус поднимает только НЕОЖИДАННЫЙ пробел: колонка, которую никто не
+#: объявлял пустой, а данных в ней нет.
+#:
+#: Четвёртый элемент — колонка времени для окна. У time-series таблиц
+#: считать по всей истории нельзя: одно непустое значение за всё время
+#: навсегда прячет РЕГРЕССИЮ сбора, а сам счёт дорожает вместе с таблицей.
+#: None = таблица-инвентарь, там уместен полный скан.
+_MEASUREMENT_COLUMNS: Sequence[tuple] = (
+    (ServiceHealth, "http_5xx_rate",
+     "app /metrics за JWT, vmagent не скрейпит (WO-12483)",
+     "ts", True),
+    (ServiceHealth, "p95_latency_ms",
+     "app /metrics за JWT, vmagent не скрейпит (WO-12483)",
+     "ts", True),
+    (StorageVolume, "disk_pct",
+     "kubelet не собирает volume stats для local-path: это не CSI",
+     None, True),
+)
+
+#: Окно, за которое ищется пробел в time-series. Сутки — тот же горизонт,
+#: на котором работают соседние проверки материализации.
+_SILENT_GAP_WINDOW_HOURS = 24
+
+
+def check_silent_gaps(db: Session) -> CheckResult:
+    """Колонки-измерения, у которых нет НИ ОДНОГО значения.
+
+    Самый дорогой класс ошибок в этом графе — не неверное число, а пустота,
+    поданная как факт. Пустая колонка выглядит в выдаче так же, как
+    измеренная: читатель видит поле с именем `disk_pct` и решает, что
+    заполненность диска известна.
+
+    Замер 17.09.2026: `kg_storage_volumes.disk_pct` пуст во всех 12 088
+    строках, `kg_service_health.http_5xx_rate` и `p95_latency_ms` — во всех
+    362 737 за сутки. Ни один из этих пробелов не был виден ни в одном
+    сигнале: проверки смотрели на долю нулей, а нулей там тоже нет.
+
+    Проверка не чинит пробел и не считает его поломкой — она делает его
+    ЯВНЫМ и называет причину. Поэтому `warn`, а не `fail`: часть пробелов
+    архитектурная (local-path не CSI, volume stats взять неоткуда), и
+    держать вечный `fail` на том, что нельзя починить, значит приучить
+    смотреть мимо.
+    """
+    gaps: List[Dict[str, Any]] = []
+    cutoff = _now() - timedelta(hours=_SILENT_GAP_WINDOW_HOURS)
+    # Колонки одной таблицы с одним окном считаются ОДНИМ запросом: раньше
+    # на каждую уходило по два полных count() по time-series таблице.
+    by_table: Dict[tuple, List[tuple]] = {}
+    for model, column, reason, ts_column, expected in _MEASUREMENT_COLUMNS:
+        by_table.setdefault((model, ts_column), []).append(
+            (column, reason, expected))
+
+    for (model, ts_column), columns in by_table.items():
+        cols = [(name, reason, expected, getattr(model, name, None))
+                for name, reason, expected in columns]
+        cols = [c for c in cols if c[3] is not None]
+        if not cols:
+            continue
+        q = db.query(
+            func.count(),
+            *[func.count(col) for _, _, _, col in cols],
+        ).select_from(model)
+        if ts_column:
+            ts_attr = getattr(model, ts_column, None)
+            if ts_attr is not None:
+                q = q.filter(ts_attr >= cutoff)
+        row = q.one()
+        total = int(row[0] or 0)
+        if total == 0:
+            # Пустая таблица (или пустое окно) — это отсутствие ОБЪЕКТОВ,
+            # а не пробел в измерении. Разные вещи, и путать их нельзя.
+            continue
+        for idx, (column, reason, expected, _) in enumerate(cols, start=1):
+            if int(row[idx] or 0) == 0:
+                gaps.append({
+                    "table": model.__tablename__,
+                    "column": column,
+                    "rows": total,
+                    "filled": 0,
+                    "window_hours": _SILENT_GAP_WINDOW_HOURS if ts_column else None,
+                    "expected": expected,
+                    "reason": reason,
+                })
+
+    unexpected = [g for g in gaps if not g["expected"]]
+    return CheckResult(
+        name="silent_gaps",
+        # Статус поднимает только НЕОЖИДАННЫЙ пробел. Ожидаемые остаются в
+        # detail: их задача — быть видимыми, а не звенеть каждые сутки.
+        status="warn" if unexpected else "ok",
+        detail={
+            "empty_measurement_columns": gaps,
+            "unexpected": unexpected,
+            "expected_count": len(gaps) - len(unexpected),
+            "checked": len(_MEASUREMENT_COLUMNS),
+            "note": (
+                "пустая колонка-измерение читается как измеренная: поле "
+                "есть, значения нет, отличить нечем. `expected: true` — "
+                "известный архитектурный пробел, статуса не поднимает"
+            ),
         },
     )
 
@@ -1334,6 +1679,9 @@ _ALL_CHECKS = (
     check_pod_events_link_rate,
     check_edges_freshness,
     check_edge_kind_freshness,
+    check_node_freshness,
+    check_source_coverage,
+    check_silent_gaps,
     check_deploy_stream_ingestion,
     check_graph_integrity,
     check_schema_version,

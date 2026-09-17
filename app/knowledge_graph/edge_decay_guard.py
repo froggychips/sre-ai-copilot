@@ -92,6 +92,22 @@ SOURCE_NATS_SUBJECTS_SYNC = "nats_subjects_sync"
 SOURCE_STORAGE_PODS = "k8s_storage_sync/pods"
 SOURCE_STORAGE_PVCS = "k8s_storage_sync/pvcs"
 
+#: Все источники, отчитывающиеся через `record_source_run`. Нужен для
+#: вопроса «а все ли вообще отработали»: до сих пор отчёты читал только сам
+#: decay, и молчание источника никого не тревожило — оно не создаёт ошибок,
+#: оно создаёт пустоту, неотличимую от «в кластере ничего нет».
+#: Заводишь новый источник — добавляешь строку СЮДА, иначе он не попадёт в
+#: покрытие и промолчит незаметно.
+ALL_EDGE_SOURCES: tuple = (
+    SOURCE_KG_SYNC,
+    SOURCE_TOPOLOGY_SERVICES,
+    SOURCE_TOPOLOGY_INGRESSES,
+    SOURCE_INGRESS_SYNC,
+    SOURCE_NATS_SUBJECTS_SYNC,
+    SOURCE_STORAGE_PODS,
+    SOURCE_STORAGE_PVCS,
+)
+
 
 # ── ЕДИНОЕ МЕСТО: kind ребра → синхронизатор, освежающий его last_seen_at ───
 #
