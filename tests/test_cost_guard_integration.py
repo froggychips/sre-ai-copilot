@@ -354,3 +354,101 @@ async def test_hard_ceiling_timeout_reports_cost(priced):
 
     assert costs, "таймаут по hard-ceiling тоже стоил денег"
     assert all(c == 2.0 for c in costs)
+
+
+@pytest.mark.asyncio
+async def test_stage_cancellation_reports_retained_cost(priced):
+    """Отмена по stage-cap приходит BaseException'ом — мимо обоих обработчиков.
+
+    `asyncio.CancelledError` не наследуется от Exception, поэтому ни ветка
+    TimeoutError, ни общий except его не видят. Резерв при этом списан, и
+    без отдельной ветки метрика занижала бы расход каждый раз, когда
+    стадия упирается в свой потолок.
+    """
+    from app.services import llm_service as svc
+
+    costs = []
+
+    async def _cancelled(*_a, **_k):
+        raise asyncio.CancelledError()
+
+    client = MagicMock()
+    client.messages.create = _cancelled
+
+    service = svc.LLMService()
+    service.backend = "anthropic"
+    service.model = "m"
+    with patch.object(svc, "reserve", lambda *a, **k: _reserved(2.0)), \
+         patch.object(svc, "track_llm_cost", lambda _m, c: costs.append(c)), \
+         patch.object(service, "_anthropic_client", return_value=client), \
+         patch.object(svc, "_get_resilience", return_value=None):
+        with pytest.raises(asyncio.CancelledError):
+            await service.generate_full("привет")
+
+    assert costs == [2.0], "отменённая попытка уже оплачена по мнению ledger"
+
+
+@pytest.mark.asyncio
+async def test_failed_release_is_reported_as_cost(priced):
+    """429 пришёл, но вернуть резерв не удалось — он остался списанным.
+
+    Симметрично `settle`: метрика обязана показывать то, что в счётчике, а
+    не то, что мы намеревались сделать.
+    """
+    import anthropic
+
+    from app.services import llm_service as svc
+
+    costs = []
+
+    async def _rate_limited(*_a, **_k):
+        raise anthropic.RateLimitError(
+            "rate limited", response=MagicMock(status_code=429), body=None
+        )
+
+    client = MagicMock()
+    client.messages.create = _rate_limited
+
+    service = svc.LLMService()
+    service.backend = "anthropic"
+    service.model = "m"
+    with patch.object(svc, "reserve", lambda *a, **k: _reserved(2.0)), \
+         patch.object(svc, "release", lambda *a, **k: 2.0), \
+         patch.object(svc, "track_llm_cost", lambda _m, c: costs.append(c)), \
+         patch.object(service, "_anthropic_client", return_value=client), \
+         patch.object(svc, "_get_resilience", return_value=None):
+        with pytest.raises(Exception):
+            await service.generate_full("привет")
+
+    assert costs, "неудавшийся возврат резерва должен попасть в метрику"
+
+
+@pytest.mark.asyncio
+async def test_successful_release_reports_no_cost(priced):
+    """Резерв вернулся — записывать в расход нечего."""
+    import anthropic
+
+    from app.services import llm_service as svc
+
+    costs = []
+
+    async def _rate_limited(*_a, **_k):
+        raise anthropic.RateLimitError(
+            "rate limited", response=MagicMock(status_code=429), body=None
+        )
+
+    client = MagicMock()
+    client.messages.create = _rate_limited
+
+    service = svc.LLMService()
+    service.backend = "anthropic"
+    service.model = "m"
+    with patch.object(svc, "reserve", lambda *a, **k: _reserved(2.0)), \
+         patch.object(svc, "release", lambda *a, **k: 0.0), \
+         patch.object(svc, "track_llm_cost", lambda _m, c: costs.append(c)), \
+         patch.object(service, "_anthropic_client", return_value=client), \
+         patch.object(svc, "_get_resilience", return_value=None):
+        with pytest.raises(Exception):
+            await service.generate_full("привет")
+
+    assert costs == []

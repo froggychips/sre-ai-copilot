@@ -353,9 +353,27 @@ class LLMService:
             # бесплатной значит открывать потолок именно тогда, когда
             # провайдеру плохо и попыток становится больше.
             if verdict is not None:
-                await asyncio.to_thread(release, verdict)
+                # release возвращает то, что ОСТАЛОСЬ списанным: 0 при
+                # успешном возврате, полный резерв — если запись упала.
+                # Во втором случае деньги с точки зрения ledger потрачены,
+                # и метрика обязана это показать.
+                retained = await asyncio.to_thread(release, verdict)
+                if retained:
+                    track_llm_cost(self.model, retained)
             await _report_provider(resilience, success=False)
             logging.error(f"LLM call attempt failed: {e}")
+            raise
+        except asyncio.CancelledError:
+            # Отмена приходит от внешнего stage-cap (pipeline._with_stage_cap,
+            # 240 с) и наследуется от BaseException — то есть мимо `except
+            # Exception` ниже и мимо ветки TimeoutError выше. Резерв при
+            # этом уже списан, и без записи метрика занижала бы расход
+            # каждый раз, когда стадия упирается в потолок: у
+            # последовательного критика это не редкость.
+            if verdict is not None and verdict.reserved_usd > 0:
+                track_llm_cost(self.model, verdict.reserved_usd)
+            # _report_provider намеренно не зовём: отмена по нашему таймауту
+            # — не признак того, что провайдеру плохо.
             raise
         except Exception as e:
             # Резерв этой попытки остаётся списанным (см. выше), значит он

@@ -427,3 +427,24 @@ def test_settle_reports_actual_cost_on_success(ledger, monkeypatch):
     accounted = cost_guard.settle(verdict, "m", 100, 10)
 
     assert accounted == pytest.approx(cost_guard.estimate_cost_usd("m", 100, 10))
+
+
+def test_release_reports_retained_amount_on_failure(ledger, monkeypatch):
+    """Вернуть резерв не удалось — сообщаем, сколько осталось списанным."""
+    monkeypatch.setattr(settings, "LLM_DAILY_BUDGET_USD", 100.0, raising=False)
+    verdict = cost_guard.reserve("m", "x" * 30_000)
+
+    def _boom(*_a, **_k):
+        raise ConnectionError("postgres down")
+
+    monkeypatch.setattr(cost_guard, "_apply_delta", _boom)
+
+    assert cost_guard.release(verdict) == pytest.approx(verdict.reserved_usd)
+
+
+def test_release_reports_zero_on_success(ledger, monkeypatch):
+    monkeypatch.setattr(settings, "LLM_DAILY_BUDGET_USD", 100.0, raising=False)
+    verdict = cost_guard.reserve("m", "x" * 30_000)
+
+    assert cost_guard.release(verdict) == 0.0
+    assert cost_guard.spent_today_usd() == pytest.approx(0.0, abs=1e-6)

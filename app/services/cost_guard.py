@@ -378,7 +378,7 @@ def settle(
     return actual
 
 
-def release(verdict: BudgetVerdict, now: Optional[dt.datetime] = None) -> None:
+def release(verdict: BudgetVerdict, now: Optional[dt.datetime] = None) -> float:
     """Вернуть резерв целиком — попытка ТОЧНО не была оплачена.
 
     Применимо к узкому случаю: провайдер отказал до обработки запроса
@@ -389,9 +389,12 @@ def release(verdict: BudgetVerdict, now: Optional[dt.datetime] = None) -> None:
 
     Без этого возврата шторм 429 — отказы, за которые никто не платит, —
     съедал бы суточный бюджет и блокировал день.
+
+    Возвращает сумму, которая ОСТАЛАСЬ списанной: 0.0 при успешном
+    возврате, полный резерв — если записать не удалось.
     """
     if verdict.reserved_usd <= 0:
-        return
+        return 0.0
     micro = int(round(verdict.reserved_usd * _USD_SCALE))
     # В сутки резерва, а не в текущие: 429 после полуночи иначе вычитался бы
     # из нового дня, оставив вчерашний с полным резервом.
@@ -399,7 +402,13 @@ def release(verdict: BudgetVerdict, now: Optional[dt.datetime] = None) -> None:
     try:
         _apply_delta(day, -micro)
     except Exception as e:  # noqa: BLE001
+        # Вернуть не удалось — резерв ОСТАЛСЯ в счётчике. Сообщаем об этом
+        # суммой: вызывающий обязан показать её в метрике, иначе расход
+        # разъедется с ledger ровно в момент отказа хранилища. Та же логика,
+        # что у `settle`.
         log.warning("cost_guard.release_failed", error=str(e))
+        return verdict.reserved_usd
+    return 0.0
 
 
 def peek(now: Optional[dt.datetime] = None) -> BudgetVerdict:
