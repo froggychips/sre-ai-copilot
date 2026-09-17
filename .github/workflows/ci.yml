@@ -17,30 +17,34 @@ permissions:
 jobs:
   test:
     name: Lint and Test
-    # Self-hosted runner (jabbook-air-m3-sre-copilot) because the froggychips
-    # account is currently blocked from GitHub-hosted runners on a billing
-    # issue. macOS arm64, actions/setup-python не используется — тот action
-    # рассчитан на GitHub-hosted пути (/Users/runner), которых здесь нет.
+    # Раннеры ARC в кластере (namespace sre-ai-ci, набор sre-copilot-k8s).
+    # GitHub-hosted недоступны: аккаунт заблокирован по биллингу.
     #
-    # Долг «тесты идут не на версии прода» закрыт 17.09.2026: интерпретатор
+    # Переехали с личного мака 17.09.2026, и причин было две. Безопасность:
+    # раннер работал под пользователем разработчика, рядом лежали
+    # ~/.kube/config с доступом к прод-кластеру, ~/.aws/credentials и
+    # ~/.ssh/id_rsa — любой код в CI видел их все. Доступность: ноутбук
+    # закрыт — CI стоит; так он простоял мёртвым 27 дней (04.07–31.07.2026),
+    # а в день переезда встал снова, потому что на маке не был запущен
+    # Rancher Desktop и `docker run` не поднял тестовый Postgres.
+    #
+    # Раннеры эфемерные: под живёт ровно один job и умирает. Поэтому
+    # `clean: false` ниже больше не экономит время (каталог всегда новый),
+    # но и не вредит — оставлен, чтобы не трогать чекаут заодно с переездом.
+    #
+    # Долг «тесты идут не на версии прода» закрыт тогда же: интерпретатор
     # берётся ровно тот, что в Dockerfile (3.11), и держится тестом
     # tests/test_ops_manifests.py::test_python_version_is_consistent_across_toolchain.
-    #
-    # Питон ставит uv, а НЕ homebrew, и это вынужденно. `brew install
-    # python@3.11` на этой машине ставится, но сборка нерабочая: под macOS
-    # 26.1 `platform.mac_ver()` у неё возвращает пустую строку, из-за чего
-    # падает и `ensurepip` (ValueError: invalid literal for int()), и любой
-    # инструмент, читающий версию ОС. У homebrew-3.12 та же функция отвечает
-    # корректно — то есть дело в конкретной бутылке 3.11, а не в машине.
-    # `uv venv --python 3.11` берёт standalone-сборку CPython и работает;
-    # проверено полным прогоном набора (3433 passed) на 3.11.14.
-    runs-on: [self-hosted, macOS, ARM64]
+    # Ставит его uv: в образе раннера питона нужной версии нет, а на маке
+    # homebrew-сборка 3.11 была нерабочей под macOS 26.1
+    # (`platform.mac_ver()` пуст → падал ensurepip).
+    runs-on: sre-copilot-k8s
     # Изоляция self-hosted раннера от чужого кода (security finding 19.08.2026).
     #
-    # Раннер здесь persistent и работает под пользователем разработчика: рядом
-    # с ним лежат ~/.kube/config с доступом к прод-кластеру, ~/.ssh/id_rsa,
-    # ~/.aws/credentials и токены. Выполнить на нём PR из чужого форка —
-    # значит отдать всё это автору PR.
+    # Условие оставлено и после переезда в кластер, хотя ключей разработчика
+    # рядом больше нет: под эфемерный, в отдельном namespace, без доступа к
+    # kube-apiserver (NetworkPolicy) и без токена ServiceAccount. Но чужой
+    # код в CI — всё ещё чужой код, а dind-сайдкар privileged.
     #
     # Approval-политика (all_external_contributors) — процедурная защита: она
     # держится на внимательности человека, нажимающего кнопку. Это условие —
@@ -145,8 +149,11 @@ jobs:
         run: |
           set -e
           # $HOME берём в shell, а не через env-контекст GHA: системного HOME
-          # там нет, подстановка дала бы unix:///.rd/docker.sock.
-          export DOCKER_HOST="unix://$HOME/.rd/docker.sock"
+          # DOCKER_HOST не задаётся: в поде раннера ARC (containerMode:
+          # dind) сокет лежит на штатном /var/run/docker.sock, и переменная
+          # уже выставлена самим контейнером. Раньше здесь был сокет Rancher
+          # Desktop с личной машины — он существовал, только пока RD
+          # запущен, и 17.09.2026 CI встал ровно поэтому.
           docker rm -f copilot-ci-pg >/dev/null 2>&1 || true
           # Порт назначает docker (-p 0:5432), а не мы: раннер self-hosted, на
           # той же машине бывают чужие контейнеры и локальная отладка —
@@ -200,7 +207,6 @@ jobs:
       - name: Stop Postgres
         if: always()
         run: |
-          export DOCKER_HOST="unix://$HOME/.rd/docker.sock"
           docker rm -f copilot-ci-pg >/dev/null 2>&1 || true
 
       # Golden-eval — blocking. Единственная метрика, которая описывает сам
@@ -266,7 +272,7 @@ jobs:
     # ubuntu-latest (GitHub-hosted) на froggychips даёт startup_failure —
     # джоба умирает за секунды без раннера (та же болезнь, что и macos-latest).
     # Self-hosted Mac: docker от Rancher Desktop, amd64 через эмуляцию VM.
-    runs-on: [self-hosted, macOS, ARM64]
+    runs-on: sre-copilot-k8s
     if: github.event_name == 'push'
     permissions:
       contents: read
@@ -289,17 +295,18 @@ jobs:
         run: |
           DOCKER_CONFIG="$RUNNER_TEMP/docker-config"
           mkdir -p "$DOCKER_CONFIG"
-          # Job-local конфиг теряет три вещи из пользовательского
-          # ~/.docker — восстанавливаем явно:
-          # 1) credsStore none: с пустым конфигом docker CLI автодетектит
-          #    osxkeychain из PATH (~/.rd/bin) → -25308 из LaunchAgent.
-          # 2) cliPluginsExtraDirs: buildx/compose живут в
-          #    ~/.docker/cli-plugins, без них «buildx is required».
-          # 3) DOCKER_HOST: без currentContext docker идёт в
-          #    /var/run/docker.sock, которого нет — сокет RD в ~/.rd.
-          printf '{"credsStore":"none","cliPluginsExtraDirs":["%s/.docker/cli-plugins"]}' "$HOME" > "$DOCKER_CONFIG/config.json"
+          # Job-local конфиг нужен, чтобы docker/login-action писал
+          # учётные данные в каталог job'а, а не в общий ~/.docker.
+          #
+          # Три прежние подпорки сняты вместе с переездом на кластерный
+          # раннер: credsStore none (docker CLI на маке автодетектил
+          # osxkeychain из ~/.rd/bin и падал с -25308), cliPluginsExtraDirs
+          # (buildx жил в ~/.docker/cli-plugins) и DOCKER_HOST на сокет
+          # Rancher Desktop. В образе раннера buildx v0.36+ уже на месте,
+          # сокет штатный /var/run/docker.sock, keychain отсутствует как
+          # класс.
+          printf '{}' > "$DOCKER_CONFIG/config.json"
           echo "DOCKER_CONFIG=$DOCKER_CONFIG" >> "$GITHUB_ENV"
-          echo "DOCKER_HOST=unix://$HOME/.rd/docker.sock" >> "$GITHUB_ENV"
 
       - name: Log in to GitHub Container Registry
         uses: docker/login-action@v4

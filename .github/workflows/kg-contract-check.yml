@@ -36,7 +36,7 @@ permissions:
 jobs:
   contract-check:
     name: KG contract drift gate
-    runs-on: [self-hosted, macOS, ARM64]
+    runs-on: sre-copilot-k8s
     # Изоляция self-hosted раннера от чужого кода (security finding 19.08.2026).
     #
     # Раннер здесь persistent и работает под пользователем разработчика: рядом
