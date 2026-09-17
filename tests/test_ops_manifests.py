@@ -289,3 +289,43 @@ def test_helm_notes_warn_about_values_secrets_path() -> None:
     notes = (_CHART_DIR / "templates" / "NOTES.txt").read_text(encoding="utf-8")
     assert "existingSecret" in notes, "NOTES.txt не упоминает безопасный путь"
     assert "WARNING" in notes, "NOTES.txt не предупреждает про values-путь"
+
+
+def test_worker_exposes_metrics_port() -> None:
+    """У воркера объявлен порт метрик, иначе скрейпить нечего.
+
+    VMPodScrape перечисляет `copilot-worker` в селекторе с 05.09.2026, но
+    сервер метрик поднимался только в API-процессе: 17.09.2026 в
+    VictoriaMetrics не было ни одной серии `llm_*`, хотя весь LLM-слой
+    считается именно в воркере.
+    """
+    import yaml
+
+    docs = [
+        d for d in yaml.safe_load_all(
+            (_REPO_ROOT / "k8s" / "worker.yaml").read_text(encoding="utf-8")
+        ) if d
+    ]
+    workers = [
+        d for d in docs
+        if d.get("kind") == "Deployment"
+        and d["metadata"]["name"] == "copilot-worker"
+    ]
+    assert workers, "не найден Deployment copilot-worker"
+    container = workers[0]["spec"]["template"]["spec"]["containers"][0]
+
+    ports = {p.get("name"): p.get("containerPort") for p in container.get("ports", [])}
+    assert ports.get("metrics") == 8001, (
+        f"порт metrics:8001 не объявлен у воркера (есть: {ports})"
+    )
+
+    env = {e["name"]: e.get("value") for e in container.get("env", [])}
+    assert env.get("PROMETHEUS_MULTIPROC_DIR"), (
+        "без PROMETHEUS_MULTIPROC_DIR сервер отдаёт реестр родителя, "
+        "где задачи не исполняются — то есть ровные нули"
+    )
+    mounts = {m["mountPath"] for m in container.get("volumeMounts", [])}
+    assert any(env["PROMETHEUS_MULTIPROC_DIR"].startswith(m) for m in mounts), (
+        f"каталог {env['PROMETHEUS_MULTIPROC_DIR']} вне смонтированных томов "
+        f"({mounts}), а readOnlyRootFilesystem запрещает запись"
+    )
