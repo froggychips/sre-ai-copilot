@@ -55,6 +55,8 @@ log = structlog.get_logger()
 #: ошибку двоичного округления на тысячах операций, а целое точно.
 _USD_SCALE = 1_000_000
 
+#: Имя таблицы для читателя и тестов; в сами запросы оно вписано
+#: литералом (см. _apply_delta).
 _TABLE = "llm_spend_ledger"
 
 
@@ -176,11 +178,15 @@ def _apply_delta(day: dt.date, delta_micro: int) -> int:
     """
     from app.database import SessionLocal
 
-    sql = text(f"""
-        INSERT INTO {_TABLE} (day, spent_micro_usd, updated_at)
+    # Имя таблицы — литералом, а не через f-строку: подставлять в SQL хоть
+    # что-то форматированием здесь незачем (таблица одна и известна), а
+    # статический анализ иначе справедливо считает это конструированием
+    # запроса из строк (bandit B608).
+    sql = text("""
+        INSERT INTO llm_spend_ledger (day, spent_micro_usd, updated_at)
         VALUES (:day, GREATEST(:delta, 0), NOW())
         ON CONFLICT (day) DO UPDATE
-        SET spent_micro_usd = GREATEST({_TABLE}.spent_micro_usd + :delta, 0),
+        SET spent_micro_usd = GREATEST(llm_spend_ledger.spent_micro_usd + :delta, 0),
             updated_at = NOW()
         RETURNING spent_micro_usd
     """)
@@ -196,7 +202,7 @@ def _apply_delta(day: dt.date, delta_micro: int) -> int:
 def _read_spent_micro(day: dt.date) -> Optional[int]:
     from app.database import SessionLocal
 
-    sql = text(f"SELECT spent_micro_usd FROM {_TABLE} WHERE day = :day")
+    sql = text("SELECT spent_micro_usd FROM llm_spend_ledger WHERE day = :day")
     db = SessionLocal()
     try:
         row = db.execute(sql, {"day": day}).scalar()
