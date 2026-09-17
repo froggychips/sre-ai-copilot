@@ -97,6 +97,10 @@ def broken_ledger(monkeypatch):
 
     monkeypatch.setattr(cost_guard, "_apply_delta", _boom)
     monkeypatch.setattr(cost_guard, "_read_spent_micro", _boom)
+    # Резерв ходит своим путём (_reserve_atomic) — без подмены тест ушёл бы
+    # в настоящий Postgres, который в CI поднят, и «недоступное хранилище»
+    # оказалось бы доступным.
+    monkeypatch.setattr(cost_guard, "_reserve_atomic", _boom)
 
 
 # --- цена вызова ----------------------------------------------------------
