@@ -219,3 +219,68 @@ def test_same_realm_kingdom_to_shared_is_normal(db):
     r = check_graph_integrity(db)
     assert r.detail["cross_realm_db_edges"] == 0
     assert r.status == "ok"
+
+
+# ── selector ребра разошёлся с selector'ом Service ──────────────────────────
+
+
+def _svc_with_selector(db, name, selector, ns="prod-shared"):
+    s = Service(name=name, namespace=ns,
+                metadata_json={"k8s_service": {"selector": selector}})
+    db.add(s)
+    db.flush()
+    return s
+
+
+def test_stale_selector_edge_raises_warn(db):
+    """Service переключили на другой backend — ребро осталось от прежнего.
+
+    17.09.2026 `config-worker-db-postgresql` в prod-shared переехал на CNPG.
+    Узел уже показывал `cnpg.io/cluster`, а ребро `serves_traffic` всё ещё
+    вело на bitnami-StatefulSet и несло в extras прежний селектор. Граф
+    правдоподобно врал о том, что стоит за прод-базой, причём увереннее
+    всего: у ребра свежий last_seen_at.
+    """
+    svc = _svc_with_selector(db, "cw-db-postgresql",
+                             {"cnpg.io/cluster": "cw-db-cnpg"})
+    wl = _svc(db, "cw-db-postgresql-sts")
+    e = _edge(db, svc.id, wl.id)
+    e.extras = {"selector": {"app.kubernetes.io/instance": "cw-db"}}
+    db.commit()
+
+    r = check_graph_integrity(db)
+    assert r.detail["stale_selector_edges"] == 1
+    assert r.status == "warn"
+
+
+def test_matching_selector_is_not_stale(db):
+    """Совпадающий селектор не считается расхождением."""
+    sel = {"app": "auth"}
+    svc = _svc_with_selector(db, "auth-svc", sel)
+    wl = _svc(db, "auth-app")
+    e = _edge(db, svc.id, wl.id)
+    e.extras = {"selector": dict(sel)}
+    db.commit()
+
+    r = check_graph_integrity(db)
+    assert r.detail["stale_selector_edges"] == 0
+    assert r.status == "ok"
+
+
+def test_edge_without_selector_is_not_counted(db):
+    """Ребро без extras.selector — наследие, судить не по чему.
+
+    Так же и узел без селектора: headless и ExternalName его не имеют по
+    определению, и считать это расхождением значило бы держать вечный warn.
+    """
+    svc = _svc_with_selector(db, "hl-svc", {"app": "pg"})
+    wl = _svc(db, "hl-workload")
+    _edge(db, svc.id, wl.id)          # extras = None
+    plain = _svc(db, "no-selector-svc")
+    wl2 = _svc(db, "no-selector-workload")
+    e2 = _edge(db, plain.id, wl2.id)
+    e2.extras = {"selector": {"app": "x"}}
+    db.commit()
+
+    r = check_graph_integrity(db)
+    assert r.detail["stale_selector_edges"] == 0

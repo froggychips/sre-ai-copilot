@@ -1220,6 +1220,33 @@ def check_graph_integrity(db: Session) -> CheckResult:
         if has_own is not None:
             cross_realm_db_edges += 1
 
+    # Рёбра `serves_traffic`, чей selector разошёлся с selector'ом
+    # Service-узла. Значит Service переключили на другой backend, а ребро
+    # осталось от прежнего: граф правдоподобно врёт о том, что за сервисом
+    # стоит, и врёт увереннее всего — у ребра свежий last_seen_at.
+    #
+    # Замер 17.09.2026: ровно 1 на 8718 рёбер — `config-worker-db-postgresql`
+    # в prod-shared после переключения на CNPG. Узел уже показывал
+    # `cnpg.io/cluster`, ребро всё ещё вело на bitnami-StatefulSet, и так
+    # держалось бы до edge-decay, то есть сутками. Шума у проверки нет.
+    #
+    # Ребро без `extras.selector` (наследие до contract 2.4) не считается:
+    # судить не по чему. Узел без selector'а — тоже: headless и ExternalName
+    # его не имеют по определению.
+    stale_selector_edges = 0
+    for extras, meta in (
+        db.query(ServiceEdge.extras, src_s.metadata_json)
+        .join(src_s, ServiceEdge.src_id == src_s.id)
+        .filter(ServiceEdge.kind == "serves_traffic")
+        .all()
+    ):
+        edge_selector = (extras or {}).get("selector")
+        node_selector = ((meta or {}).get("k8s_service") or {}).get("selector")
+        if edge_selector is None or node_selector is None:
+            continue
+        if edge_selector != node_selector:
+            stale_selector_edges += 1
+
     self_loops_any = (
         db.query(func.count(ServiceEdge.id))
         .filter(ServiceEdge.src_id == ServiceEdge.dst_id)
@@ -1247,7 +1274,7 @@ def check_graph_integrity(db: Session) -> CheckResult:
             or stale_db_edges > _GRAPH_INTEGRITY_FAIL_STALE_DB_EDGES
             or dangling_edges > _GRAPH_INTEGRITY_FAIL_DANGLING):
         status = "fail"
-    elif dangling_edges > 0 or stale_db_edges > 0:
+    elif dangling_edges > 0 or stale_db_edges > 0 or stale_selector_edges > 0:
         status = "warn"
     else:
         status = "ok"
@@ -1263,6 +1290,7 @@ def check_graph_integrity(db: Session) -> CheckResult:
             "serves_traffic_self_loops": serves_traffic_self_loops,
             "dangling_edges": dangling_edges,
             "dangling_fail_threshold": _GRAPH_INTEGRITY_FAIL_DANGLING,
+            "stale_selector_edges": stale_selector_edges,
         },
     )
 
