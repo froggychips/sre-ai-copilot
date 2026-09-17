@@ -139,9 +139,17 @@ def enable_llm_pipeline_for_tests(monkeypatch):
     Тесты которым нужно проверить именно gate-поведение (Disabled)
     делают свой patch.object(settings, "LLM_PIPELINE_ENABLED", False) —
     он перебивает эту fixture внутри своего scope.
+
+    По той же причине снимается и scope-фильтр (severity/namespace,
+    см. app/workers/pipeline_scope.py): продовый дефолт — critical в
+    prod-* — отсекал бы фикстуры pipeline-тестов, у которых severity и
+    namespace выбраны под сценарий, а не под область действия прода.
+    Тесты самого фильтра ставят своё значение и перебивают эту fixture.
     """
     from app.config import settings
     monkeypatch.setattr(settings, "LLM_PIPELINE_ENABLED", True)
+    monkeypatch.setattr(settings, "PIPELINE_SEVERITY_ALLOWLIST", [], raising=False)
+    monkeypatch.setattr(settings, "PIPELINE_NAMESPACE_PREFIXES", [], raising=False)
     yield
 
 

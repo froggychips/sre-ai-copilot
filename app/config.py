@@ -85,6 +85,26 @@ class Settings(BaseSettings):
     #   - severity-фильтр сужен до critical + prod-*
     LLM_PIPELINE_ENABLED: bool = False
 
+    # Область действия пайплайна: третье условие его включения (первые два —
+    # E2E-тесты и потолок расхода). Дефолты уже сужены до того, что записано
+    # в этом условии: critical + namespace'ы с префиксом prod-.
+    #
+    # Фильтр стоит НЕ в вебхуке, а на входе в задачу: так он покрывает оба
+    # пути попадания в пайплайн (Celery и PIPELINE_DIRECT_INVOKE) — ровно
+    # как хард-гейт выше. Фильтр в одном вебхуке обходился бы вторым путём.
+    #
+    # Пустой список отключает фильтр ПО СВОЕМУ измерению. Это законное, но
+    # осознанное действие: severity-фильтр — единственное, что отделяет
+    # «разбираем важное» от «жжём бюджет на каждом warning из dev».
+    PIPELINE_SEVERITY_ALLOWLIST: List[str] = Field(
+        default_factory=lambda: ["critical"],
+        description="Severity, которые доходят до LLM-пайплайна. [] = не фильтровать",
+    )
+    PIPELINE_NAMESPACE_PREFIXES: List[str] = Field(
+        default_factory=lambda: ["prod-"],
+        description="Префиксы namespace, которые доходят до пайплайна. [] = не фильтровать",
+    )
+
     # Потолок на стадию пайплайна. Это НАМЕРЕННО терминальный cap: истёкший
     # таймаут стадии не должен ретраиться (перезапуск всего инцидента ×3 жжёт
     # LLM-бюджет). См. RETRIABLE_EXC в app/workers/tasks.py.

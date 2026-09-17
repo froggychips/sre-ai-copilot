@@ -19,6 +19,7 @@ from app.services.audit_logger import audit_service
 from app.services.telemetry_utils import incident_span
 from app.telemetry import setup_telemetry
 from app.workers.pipeline import IncidentPipeline, transition_to
+from app.workers.pipeline_scope import check_scope
 from app.workers.task_lock import single_instance
 
 setup_telemetry(service_name="copilot-worker")
@@ -560,6 +561,21 @@ async def async_process_incident(
             "reason": "LLM_PIPELINE_ENABLED=false",
         })
         return {"status": "skipped", "reason": "LLM_PIPELINE_ENABLED=false"}
+
+    # ── ОБЛАСТЬ ДЕЙСТВИЯ: третье условие включения пайплайна ───────────
+    # Дефолт — critical + prod-*. Проверка здесь, а не в вебхуке: в пайплайн
+    # ведут два пути, и фильтр в одном из них второй обходит.
+    scope = check_scope(incident_data)
+    if not scope.in_scope:
+        logger.info(
+            "pipeline.skipped_out_of_scope incident_id=%s ns=%s sev=%s reason=%s",
+            incident_id, scope.namespace, scope.severity, scope.reason,
+        )
+        audit_service.log_event("PIPELINE_SCOPE_SKIP", {
+            "incident_id": incident_id,
+            **scope.as_dict(),
+        })
+        return {"status": "skipped", "reason": scope.reason}
 
     with incident_span(incident_id, service=_service, namespace=_namespace) as _root_span:
         db = SessionLocal()
