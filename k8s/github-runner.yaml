@@ -57,6 +57,14 @@
 # снимается macOS-специфика (DOCKER_HOST на Rancher-сокет). ДО того как
 # раннеры поднимутся, workflow править НЕЛЬЗЯ: старый раннер перестанет
 # подходить под новый лейбл, и CI встанет целиком.
+#
+# ОТДЕЛЬНЫЙ ШАГ ПЕРЕД ВЫВОДОМ МАКА ИЗ СТРОЯ: перенастроить ci-deadman.
+# `k8s/ci-deadman.yaml` задаёт `RUNNER_NAME=jabbook-air-m3-sre-copilot`, а
+# `scripts/ci_deadman.py` сверяет имя точно. Имена эфемерных раннеров ARC
+# меняются на каждый job, поэтому после отключения мака сторож будет
+# рапортовать «раннер офлайн» при полностью здоровом CI — то есть ровно тот
+# ложный сигнал, ради отсутствия которого он и заводился. Имя нужно либо
+# очистить, либо заменить на проверку набора (`sre-copilot-k8s`).
 ---
 apiVersion: v1
 kind: Namespace
@@ -91,7 +99,14 @@ metadata:
 spec:
   podSelector:
     matchLabels:
-      app.kubernetes.io/name: gha-runner-scale-set
+      # Лейбл, который ARC ставит НА САМ под эфемерного раннера. Проверен на
+      # живом поде 17.09.2026, а не взят из чарта: `app.kubernetes.io/name`
+      # там равен ИМЕНИ НАБОРА (`sre-copilot-k8s`), поэтому селектор по
+      # `gha-runner-scale-set` не выбирал ни одного пода — политика была
+      # no-op, а CI работал без ограничений. Ровно так же в этом репозитории
+      # уже пустовала `copilot-network-policy` (селектор `app:
+      # sre-ai-copilot`, которого нет ни на одном поде).
+      actions-ephemeral-runner: "True"
   policyTypes:
   - Egress
   - Ingress
@@ -134,9 +149,13 @@ spec:
   # с ноутбука, то есть строка подключения к боевой БД лежит на личной
   # машине.
   - to:
+    # kubernetes.io/metadata.name — лейбл, который ставит САМ kubernetes.
+    # Кастомного `name: sre-ai` на этом namespace нет и никем не ставится:
+    # проверено на живом объекте. По нему исключение не матчило бы ничего,
+    # и kg-contract-check не достучался бы до базы.
     - namespaceSelector:
         matchLabels:
-          name: sre-ai
+          kubernetes.io/metadata.name: sre-ai
       podSelector:
         matchLabels:
           app: postgres
