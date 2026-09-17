@@ -84,9 +84,21 @@ def test_prefix_match_is_not_substring_match(default_scope):
 
 
 @pytest.mark.asyncio
-async def test_scope_gate_blocks_pipeline_entry(monkeypatch):
+async def test_scope_gate_blocks_pipeline_entry(monkeypatch, tmp_path):
     """Фильтр стоит на входе в задачу — мимо него не пройти ни одним путём."""
+    from sqlalchemy import create_engine
+    from sqlalchemy.orm import sessionmaker
+
+    from app.database import Base
     from app.workers import tasks
+
+    # Своя БД: на пути скипа задача убирает осиротевшую запись, и без
+    # подмены тест лез бы в настоящий Postgres. Транзиентную ошибку такого
+    # обращения уборка намеренно пробрасывает — see
+    # test_transient_cleanup_failure_is_retried.
+    engine = create_engine(f"sqlite:///{tmp_path}/gate.db")
+    Base.metadata.create_all(engine)
+    monkeypatch.setattr(tasks, "SessionLocal", sessionmaker(bind=engine))
 
     monkeypatch.setattr(settings, "LLM_PIPELINE_ENABLED", True, raising=False)
     monkeypatch.setattr(settings, "PIPELINE_SEVERITY_ALLOWLIST", ["critical"], raising=False)
