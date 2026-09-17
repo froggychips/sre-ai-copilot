@@ -4,6 +4,7 @@
 что резерв кто-то берёт, а сводит его тот же код, который получает ответ.
 Модуль без этого выглядел бы защитой, не будучи ею.
 """
+import asyncio
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -321,3 +322,35 @@ async def test_budget_exception_is_not_retriable_by_celery():
     from app.workers.tasks import RETRIABLE_EXC
 
     assert not issubclass(LLMBudgetExceeded, RETRIABLE_EXC)
+
+
+@pytest.mark.asyncio
+async def test_hard_ceiling_timeout_reports_cost(priced):
+    """wait_for-таймаут заканчивается в своей ветке, мимо общего except.
+
+    Резерв там удержан так же, как и в остальных отказах, значит метрика
+    обязана его показать — иначе повторные hard-ceiling таймауты занижают
+    llm_cost_usd_total, а именно они и случаются, когда провайдер висит.
+    """
+    from app.services import llm_service as svc
+
+    costs = []
+
+    async def _hang(*_a, **_k):
+        raise asyncio.TimeoutError()
+
+    client = MagicMock()
+    client.messages.create = _hang
+
+    service = svc.LLMService()
+    service.backend = "anthropic"
+    service.model = "m"
+    with patch.object(svc, "reserve", lambda *a, **k: _reserved(2.0)), \
+         patch.object(svc, "track_llm_cost", lambda _m, c: costs.append(c)), \
+         patch.object(service, "_anthropic_client", return_value=client), \
+         patch.object(svc, "_get_resilience", return_value=None):
+        with pytest.raises(Exception):
+            await service.generate_full("привет")
+
+    assert costs, "таймаут по hard-ceiling тоже стоил денег"
+    assert all(c == 2.0 for c in costs)

@@ -331,6 +331,12 @@ class LLMService:
             # LLMCircuitOpen выше.
             raise
         except asyncio.TimeoutError as e:
+            # Резерв этой попытки удержан (см. общий обработчик ниже) —
+            # значит он уже списан, и метрика обязана это показать.
+            # Отдельная ветка нужна потому, что hard-ceiling wait_for
+            # заканчивается здесь, мимо общего except.
+            if verdict is not None and verdict.reserved_usd > 0:
+                track_llm_cost(self.model, verdict.reserved_usd)
             await _report_provider(resilience, success=False)
             logging.error("LLM call timed out")
             # `from e` сохраняет __cause__=TimeoutError → is_retryable_llm_error

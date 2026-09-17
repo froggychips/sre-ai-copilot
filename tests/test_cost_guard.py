@@ -360,3 +360,70 @@ def test_pipeline_enabled_with_budget_is_valid(monkeypatch):
     monkeypatch.setenv("LLM_BACKEND", "claude_cli")
     cfg = Settings(LLM_PIPELINE_ENABLED=True, LLM_DAILY_BUDGET_USD=25.0)
     assert cfg.LLM_DAILY_BUDGET_USD == 25.0
+
+
+# --- резерв и сведение через полночь UTC -----------------------------------
+
+def test_settlement_goes_to_the_day_that_was_charged(ledger, monkeypatch):
+    """Вызов начался в 23:59, закончился в 00:01 — сводим вчерашний день.
+
+    Иначе излишек возвращается новому дню, где отрицательная дельта
+    упирается в ноль, а на старом дне навсегда остаётся полный worst-case:
+    сутки закрываются с фиктивным расходом, которого не было.
+    """
+    monkeypatch.setattr(settings, "LLM_DAILY_BUDGET_USD", 100.0, raising=False)
+    before_midnight = dt.datetime(2026, 9, 17, 23, 59, tzinfo=dt.timezone.utc)
+    after_midnight = dt.datetime(2026, 9, 18, 0, 1, tzinfo=dt.timezone.utc)
+
+    verdict = cost_guard.reserve("m", "x" * 30_000, now=before_midnight)
+    reserved = cost_guard.spent_today_usd(before_midnight)
+    assert reserved > 0
+
+    cost_guard.settle(verdict, "m", 100, 10, now=after_midnight)
+
+    old_day = cost_guard.spent_today_usd(before_midnight)
+    new_day = cost_guard.spent_today_usd(after_midnight)
+
+    assert old_day < reserved, "излишек должен вернуться в день резерва"
+    assert new_day == 0.0, "новый день не должен получить чужую проводку"
+
+
+def test_release_goes_to_the_day_that_was_charged(ledger, monkeypatch):
+    """429 после полуночи возвращает резерв туда, откуда его списали."""
+    monkeypatch.setattr(settings, "LLM_DAILY_BUDGET_USD", 100.0, raising=False)
+    before_midnight = dt.datetime(2026, 9, 17, 23, 59, tzinfo=dt.timezone.utc)
+    after_midnight = dt.datetime(2026, 9, 18, 0, 1, tzinfo=dt.timezone.utc)
+
+    verdict = cost_guard.reserve("m", "x" * 30_000, now=before_midnight)
+    cost_guard.release(verdict, now=after_midnight)
+
+    assert cost_guard.spent_today_usd(before_midnight) == pytest.approx(0.0, abs=1e-6)
+    assert cost_guard.spent_today_usd(after_midnight) == 0.0
+
+
+def test_settle_reports_what_was_actually_charged(ledger, monkeypatch):
+    """Свести не удалось — возвращается удержанный резерв, а не факт.
+
+    В счётчике остался полный worst-case; отдать вызывающему меньшее число
+    значило бы развести метрику расхода с ledger ровно в момент отказа
+    хранилища.
+    """
+    monkeypatch.setattr(settings, "LLM_DAILY_BUDGET_USD", 100.0, raising=False)
+    verdict = cost_guard.reserve("m", "x" * 30_000)
+
+    def _boom(*_a, **_k):
+        raise ConnectionError("postgres down")
+
+    monkeypatch.setattr(cost_guard, "_apply_delta", _boom)
+    accounted = cost_guard.settle(verdict, "m", 100, 10)
+
+    assert accounted == pytest.approx(verdict.reserved_usd)
+
+
+def test_settle_reports_actual_cost_on_success(ledger, monkeypatch):
+    monkeypatch.setattr(settings, "LLM_DAILY_BUDGET_USD", 100.0, raising=False)
+    verdict = cost_guard.reserve("m", "x" * 30_000)
+
+    accounted = cost_guard.settle(verdict, "m", 100, 10)
+
+    assert accounted == pytest.approx(cost_guard.estimate_cost_usd("m", 100, 10))

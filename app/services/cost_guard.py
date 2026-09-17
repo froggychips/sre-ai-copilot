@@ -79,6 +79,11 @@ class BudgetVerdict:
     limit_usd: float
     #: Сколько зарезервировано под этот вызов. Сводится в `settle`.
     reserved_usd: float = 0.0
+    #: Сутки, со счётчика которых списан резерв. Сведение обязано идти в ЭТУ
+    #: строку, а не в «сегодня»: вызов, начатый в 23:59 и закончившийся в
+    #: 00:01, иначе возвращал бы излишек новому дню (где его клампит ноль),
+    #: а на старом дне навсегда оставался бы полный worst-case.
+    day: Optional[dt.date] = None
 
     def as_dict(self) -> Dict[str, object]:
         return {
@@ -87,6 +92,7 @@ class BudgetVerdict:
             "spent_usd": self.spent_usd,
             "limit_usd": self.limit_usd,
             "reserved_usd": self.reserved_usd,
+            "day": self.day.isoformat() if self.day else None,
         }
 
 
@@ -321,7 +327,9 @@ def reserve(
             False, "daily_budget_exhausted", new_total - cost, limit
         )
 
-    return BudgetVerdict(True, "within_budget", new_total, limit, reserved_usd=cost)
+    return BudgetVerdict(
+        True, "within_budget", new_total, limit, reserved_usd=cost, day=day
+    )
 
 
 def settle(
@@ -331,11 +339,21 @@ def settle(
     output_tokens: int,
     now: Optional[dt.datetime] = None,
 ) -> float:
-    """Свести резерв с фактическим расходом. Возвращает фактическую стоимость.
+    """Свести резерв с фактом. Возвращает сумму, УЧТЁННУЮ в счётчике.
 
     Вызывается ПОСЛЕ ответа модели, включая ответы неудачные: пустой и
     обрезанный тоже оплачены. Разница между резервом и фактом возвращается
     в бюджет — именно поэтому резерв может быть щедрым.
+
+    Возвращается не «фактическая стоимость», а то, что на самом деле легло
+    в счётчик. Разница видна, когда свести не удалось: в счётчике остаётся
+    полный резерв, и отдать вызывающему меньшее число значило бы развести
+    метрику расхода с ledger ровно в момент отказа хранилища.
+
+    Сведение идёт в сутки, с которых списан резерв (`verdict.day`), а не в
+    текущие: вызов, начатый в 23:59 и закончившийся в 00:01, иначе вернул
+    бы излишек новому дню — где отрицательная дельта упирается в ноль, —
+    а на старом дне навсегда остался бы полный worst-case.
     """
     if verdict.reserved_usd <= 0:
         # Резерва не было (потолок не задан) — сводить нечего.
@@ -345,16 +363,18 @@ def settle(
     delta_micro = int(round((actual - verdict.reserved_usd) * _USD_SCALE))
     if delta_micro == 0:
         return actual
+    day = verdict.day or _today(now)
     try:
-        _apply_delta(_today(now), delta_micro)
+        _apply_delta(day, delta_micro)
     except Exception as e:  # noqa: BLE001
-        # Резерв остаётся списанным. Для потолка это безопасная сторона:
-        # бюджет считается потраченным чуть больше, чем на самом деле.
+        # Свести не удалось: в счётчике остался полный резерв. Возвращаем
+        # его, а не факт — иначе метрика показала бы меньше, чем списано.
         log.warning(
             "cost_guard.settle_failed",
             model=model, delta_usd=round(actual - verdict.reserved_usd, 6),
             error=str(e),
         )
+        return verdict.reserved_usd
     return actual
 
 
@@ -373,8 +393,11 @@ def release(verdict: BudgetVerdict, now: Optional[dt.datetime] = None) -> None:
     if verdict.reserved_usd <= 0:
         return
     micro = int(round(verdict.reserved_usd * _USD_SCALE))
+    # В сутки резерва, а не в текущие: 429 после полуночи иначе вычитался бы
+    # из нового дня, оставив вчерашний с полным резервом.
+    day = verdict.day or _today(now)
     try:
-        _apply_delta(_today(now), -micro)
+        _apply_delta(day, -micro)
     except Exception as e:  # noqa: BLE001
         log.warning("cost_guard.release_failed", error=str(e))
 
