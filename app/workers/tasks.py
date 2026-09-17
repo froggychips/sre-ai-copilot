@@ -21,6 +21,8 @@ from app.services.cost_guard import peek as peek_budget
 from app.services.telemetry_utils import incident_span
 from app.telemetry import setup_telemetry
 from app.workers.pipeline import IncidentPipeline, transition_to
+from app.workers.pipeline_scope import (SCOPE_APPROVED_KEY, ScopeVerdict,
+                                        check_scope)
 from app.workers.task_lock import single_instance
 
 setup_telemetry(service_name="copilot-worker")
@@ -563,14 +565,40 @@ async def async_process_incident(
         })
         return {"status": "skipped", "reason": "LLM_PIPELINE_ENABLED=false"}
 
+    # ── ОБЛАСТЬ ДЕЙСТВИЯ: третье условие включения пайплайна ───────────
+    # Дефолт — critical + prod-*. Основная проверка стоит в вебхуке, ДО
+    # создания записи инцидента; сюда задача приезжает с меткой о том, что
+    # решение уже принято. Своё мы в этом случае не принимаем: api и worker
+    # — разные деплойменты, в окне выкатки их настройки расходятся, и
+    # второй ответ на тот же вопрос означал бы, что запись создана по
+    # одному решению, а обработана по другому.
+    #
+    # Проверка остаётся для вызовов БЕЗ метки: прямой запуск задачи, replay,
+    # ручной прогон — там вебхука в пути не было и решать некому.
+    if not incident_data.get(SCOPE_APPROVED_KEY):
+        scope = check_scope(incident_data)
+    else:
+        scope = ScopeVerdict(True, "approved_by_webhook", "", "")
+    if not scope.in_scope:
+        logger.info(
+            "pipeline.skipped_out_of_scope incident_id=%s ns=%s sev=%s reason=%s",
+            incident_id, scope.namespace, scope.severity, scope.reason,
+        )
+        audit_service.log_event("PIPELINE_SCOPE_SKIP", {
+            "incident_id": incident_id,
+            **scope.as_dict(),
+        })
+        return {"status": "skipped", "reason": scope.reason}
+
     # ── БЮДЖЕТ: второй предохранитель, независимый от флага ────────────
     # Флаг выше — выключатель, у него два положения. Потолок нужен для
     # третьего: «работай, но не дороже N в сутки».
     #
     # Здесь именно ПРОСМОТР, а не резерв: стоимость целого прогона заранее
-    # неизвестна. Гарантию потолка даёт резерв в BaseAgent.ask перед каждым
-    # вызовом; этот взгляд экономит прогон из семи агентов, когда деньги
-    # уже кончились — чтобы выяснить это, не нужно платить за первый из них.
+    # неизвестна. Гарантию потолка даёт резерв в LLMService.generate_full
+    # перед каждой попыткой; этот взгляд экономит прогон из семи агентов,
+    # когда деньги уже кончились — чтобы выяснить это, не нужно платить за
+    # первый из них.
     verdict = peek_budget()
     if not verdict.allowed:
         logger.warning(

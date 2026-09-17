@@ -20,6 +20,8 @@ from app.knowledge_graph.remediation_events import (SignatureError,
 from app.metrics import ALERTS_SUPPRESSED
 from app.models.remediation_event import RemediationEventIn
 from app.models.incident import AlertManagerAlert, AlertManagerWebhook, Incident
+from app.workers.pipeline_scope import SCOPE_APPROVED_KEY as _SCOPE_APPROVED_KEY
+from app.workers.pipeline_scope import check_scope
 from app.services.teamcity_service import incident_teamcity_context
 from app.workers.tasks import (async_process_incident, celery_app,
                                process_incident_task)
@@ -415,6 +417,34 @@ async def alertmanager_webhook(
             })
             continue
 
+        # ── ОБЛАСТЬ ДЕЙСТВИЯ: фильтр ДО создания записи ──────────────────
+        # Отсекаем то, что пайплайн разбирать не будет (severity/namespace,
+        # см. app/workers/pipeline_scope.py), прежде чем в БД появится
+        # IncidentRecord. Именно до, а не после: строка, созданная для
+        # отфильтрованного алерта, дальше мешает трижды — OPEN входит в
+        # _SKIP_STATES и глушит дедупом последующие fire; терминальный
+        # статус делает резолв no-op'ом, и алерт остаётся «требующим
+        # внимания» после того, как погас; а re-fire при repeat_interval
+        # засчитывается флаппингом, накручивая счётчик и повторную работу.
+        # Без записи ни одной из этих проблем не возникает, а расширение
+        # фильтра подхватит алерт на следующем же firing-уведомлении.
+        #
+        # Проверка стоит ПОСЛЕ ветки resolved: резолв уже существующей
+        # записи (созданной, когда фильтр был шире) обязан отработать.
+        scope = check_scope(incident.model_dump())
+        if not scope.in_scope:
+            log.info(
+                "webhook.out_of_scope",
+                incident_id=incident.incident_id,
+                **scope.as_dict(),
+            )
+            accepted.append({
+                "incident_id": incident.incident_id,
+                "task_id": "out_of_scope",
+                "reason": scope.reason,
+            })
+            continue
+
         # ── FIRING: detect flapping (re-fire after RESOLVED/TRIAGE_REQUIRED) ─
         # TRIAGE_REQUIRED — терминал для неразрешённых инцидентов; его re-fire
         # тоже flapping и переобрабатывается как re-fire после RESOLVED.
@@ -509,11 +539,17 @@ async def alertmanager_webhook(
                 })
                 continue
 
+        # Область действия уже проверена выше, до создания записи. Помечаем
+        # это в полезной нагрузке, чтобы воркер не принимал решение заново:
+        # api и worker — разные деплойменты, и в окне выкатки их настройки
+        # расходятся. Два независимых ответа на один вопрос означали бы, что
+        # запись создана по одному решению, а обработана по другому.
+        dispatched = {**incident.model_dump(), _SCOPE_APPROVED_KEY: True}
         if settings.PIPELINE_DIRECT_INVOKE:
-            await async_process_incident(incident.model_dump())
+            await async_process_incident(dispatched)
             accepted.append({"incident_id": incident.incident_id, "task_id": "direct"})
         else:
-            task = process_incident_task.delay(incident.model_dump())
+            task = process_incident_task.delay(dispatched)
             accepted.append({"incident_id": incident.incident_id, "task_id": task.id})
 
     return {"status": "accepted", "alerts": accepted}
