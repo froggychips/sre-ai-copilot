@@ -51,7 +51,7 @@ from app.knowledge_graph.edge_decay_guard import (
     SOURCE_TOPOLOGY_INGRESSES, SOURCE_TOPOLOGY_SERVICES, record_source_run)
 from app.knowledge_graph.populator import upsert_edge, upsert_service
 from app.knowledge_graph.schema import (NODE_KIND_SERVICE, NODE_KIND_WORKLOAD,
-                                        Service)
+                                        Service, ServiceEdge)
 
 logger = logging.getLogger(__name__)
 
@@ -409,6 +409,9 @@ def sync_all_services(
         "skipped_no_selector": 0,
         "skipped_no_match": 0,
         "skipped_self_loop": 0,
+        # Рёбра, снятые как построенные по УСТАРЕВШЕМУ selector'у: Service
+        # переключили на другой backend, и прежнее ребро стало ложью.
+        "edges_dropped_stale_selector": 0,
         # Services, откатившиеся per-item savepoint-ом: раньше один DataError
         # ронял весь tick, теперь считаем и продолжаем.
         "errors": 0,
@@ -440,18 +443,62 @@ def sync_all_services(
     logger.info(
         "k8s_topology_resources.services_done fetched=%d nodes=%d workloads=%d "
         "edges=%d skipped_no_selector=%d skipped_no_match=%d skipped_self_loop=%d "
-        "errors=%d",
+        "dropped_stale_selector=%d errors=%d",
         stats["services_fetched"], stats["nodes_upserted"],
         stats["workload_nodes_upserted"],
         stats["edges_serves_traffic"],
         stats["skipped_no_selector"], stats["skipped_no_match"],
-        stats["skipped_self_loop"], stats["errors"],
+        stats["skipped_self_loop"], stats["edges_dropped_stale_selector"],
+        stats["errors"],
     )
     # Отчёт для edge-decay guard: `serves_traffic` децаится только если этот
     # срез реально отработал. Ровно здесь ломался прод — `kubectl get
     # services -A` таймаутил, services_fetched=0, а decay об этом не знал.
     record_source_run(SOURCE_TOPOLOGY_SERVICES, stats)
     return stats
+
+
+def _drop_stale_selector_edges(
+    db: Session,
+    svc_node: Service,
+    selector: Dict[str, str],
+    stats: Dict[str, int],
+) -> None:
+    """Снять serves_traffic-рёбра, построенные по УСТАРЕВШЕМУ selector'у.
+
+    Service переключают на другой backend, не переименовывая. Миграция
+    `config-worker-db` с bitnami-StatefulSet на CNPG (17.09.2026) сменила
+    selector на `cnpg.io/cluster`, а поды CNPG не принадлежат ни Deployment,
+    ни StatefulSet, ни DaemonSet — оператор создаёт их из Cluster CR сам.
+    Матчей нет → `_sync_one_service` выходил по `skipped_no_match`, НЕ трогая
+    прежнее ребро. Узел Service при этом обновлялся: в графе оказывались
+    новый selector на узле и старый на ребре, а `kg_service_edges` и
+    `kg_workload` продолжали отвечать мёртвым StatefulSet'ом — до
+    edge-decay, то есть сутками.
+
+    Критерий снятия — НЕ «матчей нет»: пустой срез бывает и от сбоя
+    kubectl, по нему сносить рёбра нельзя. Критерий — `extras.selector`
+    ребра, разошедшийся с текущим selector'ом Service. Селектор не менялся →
+    ребро не трогаем, даже если срез пуст. Ребро без `extras.selector`
+    (до contract 2.4 наследие) тоже не трогаем: судить не по чему.
+    """
+    edges = (
+        db.query(ServiceEdge)
+        .filter(ServiceEdge.src_id == svc_node.id,
+                ServiceEdge.kind == EDGE_SERVES_TRAFFIC)
+        .all()
+    )
+    for edge in edges:
+        edge_selector = (edge.extras or {}).get("selector")
+        if edge_selector is None or edge_selector == selector:
+            continue
+        logger.info(
+            "k8s_topology_resources.stale_selector_edge_dropped "
+            "ns=%s svc=%s edge_selector=%s current_selector=%s",
+            svc_node.namespace, svc_node.name, edge_selector, selector,
+        )
+        db.delete(edge)
+        stats["edges_dropped_stale_selector"] += 1
 
 
 def _sync_one_service(
@@ -484,6 +531,10 @@ def _sync_one_service(
     stats["nodes_upserted"] += 1
 
     selector = meta_json["selector"] or {}
+    # Прежде чем искать новые матчи — снять те рёбра, что построены по
+    # прежнему selector'у. Иначе переключённый Service продолжает указывать
+    # на старый workload, и делает это молча.
+    _drop_stale_selector_edges(db, svc_node, selector, stats)
     if not selector:
         stats["skipped_no_selector"] += 1
         return
