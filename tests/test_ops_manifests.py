@@ -222,6 +222,46 @@ def test_python_version_is_consistent_across_toolchain() -> None:
     )
 
 
+def test_ci_python_matches_runtime() -> None:
+    """CI гоняет тесты на той же версии, что стоит в Dockerfile.
+
+    Тест выше держит вместе Dockerfile, ruff и mypy — но не CI, и потому
+    расхождение жило молча: линтеры были настроены на 3.11, а прогон шёл на
+    3.12, то есть тесты проверяли не тот интерпретатор, в котором код едет.
+    Закрыто 17.09.2026; без этой проверки вернётся при первой же правке
+    workflow.
+
+    Версию задаёт `uv venv --python X.Y`. Homebrew-путь в workflow —
+    отдельный запрет: сборка python@3.11 из homebrew под macOS 26.1
+    нерабочая (`platform.mac_ver()` пуст), и возврат к ней снова уведёт CI
+    на другую версию.
+    """
+    dockerfile = (_REPO_ROOT / "Dockerfile").read_text(encoding="utf-8")
+    runtime = re.search(r"^FROM\s+python:(\d+)\.(\d+)", dockerfile, re.MULTILINE)
+    assert runtime, "не разобрал `FROM python:X.Y...` в Dockerfile"
+    expected = f"{runtime.group(1)}.{runtime.group(2)}"
+
+    workflows = sorted((_REPO_ROOT / ".github" / "workflows").glob("*.yml"))
+    assert workflows, "не найдено ни одного workflow"
+
+    checked = 0
+    for wf in workflows:
+        text = wf.read_text(encoding="utf-8")
+        for found in re.findall(r"uv venv --python (\d+\.\d+)", text):
+            checked += 1
+            assert found == expected, (
+                f"{wf.name}: CI ставит python {found}, а рантайм "
+                f"{expected} (Dockerfile)"
+            )
+        for path in re.findall(r"/opt/homebrew/bin/python3\.\d+", text):
+            raise AssertionError(
+                f"{wf.name}: {path} — homebrew-питон в CI. Версию ставит uv; "
+                "сборка python@3.11 из homebrew под macOS 26 нерабочая."
+            )
+
+    assert checked, "ни один workflow не задаёт версию python через uv"
+
+
 def test_helm_secret_values_path_is_optional() -> None:
     """existingSecret — путь по умолчанию для prod, values-путь под условием."""
     values = (_CHART_DIR / "values.yaml").read_text(encoding="utf-8")
