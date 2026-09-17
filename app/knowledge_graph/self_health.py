@@ -1331,11 +1331,34 @@ def check_node_freshness(db: Session) -> CheckResult:
     """
     cutoff = _now() - timedelta(hours=_NODE_STALE_AFTER_HOURS)
     ns = aliased(Namespace)
+    # Узлы, которых коснулся health-пересчёт, из измерения ИСКЛЮЧАЮТСЯ.
+    #
+    # `Service.updated_at` — не маркер свежести топологии: у колонки
+    # `onupdate=utcnow`, а `kg_health_recompute` каждые 20 минут пишет
+    # health_score всем non-synthetic сервисам и тем самым обновляет её.
+    # Замер 17.09.2026: у node_kind='service' health_computed_at стоял на
+    # текущей минуте, у workload — месячной давности, у ingress его нет
+    # вовсе. То есть для service эта проверка показывала бы вечные 0,9%
+    # даже при полностью вставшем синке топологии.
+    #
+    # Отличить одно от другого нечем, пока у узла нет собственного
+    # topology-timestamp, поэтому такие узлы уходят в not_measurable —
+    # честное «не знаю» вместо ложного «свежо». Признак: последнее касание
+    # совпало с health-пересчётом.
+    touched_by_health = case(
+        (Service.health_computed_at.is_(None), 0),
+        (Service.updated_at <= Service.health_computed_at, 1),
+        else_=0,
+    )
     rows = (
         db.query(
             Service.node_kind,
             func.count(Service.id),
-            func.sum(case((Service.updated_at < cutoff, 1), else_=0)),
+            func.sum(case(
+                ((Service.updated_at < cutoff) & (touched_by_health == 0), 1),
+                else_=0,
+            )),
+            func.sum(touched_by_health),
         )
         .join(ns, ns.namespace == Service.namespace)
         .filter(ns.state == NS_STATE_ACTIVE)
@@ -1345,14 +1368,26 @@ def check_node_freshness(db: Session) -> CheckResult:
     by_kind: Dict[str, Dict[str, Any]] = {}
     worst_rate = 0.0
     worst_kind: Optional[str] = None
-    for node_kind, total, stale in rows:
+    for node_kind, total, stale, not_measurable in rows:
         total = int(total or 0)
         stale = int(stale or 0)
-        if total == 0:
+        not_measurable = int(not_measurable or 0)
+        measurable = total - not_measurable
+        if measurable <= 0:
+            by_kind[str(node_kind or "unknown")] = {
+                "total": total,
+                "measurable": 0,
+                "not_measurable": not_measurable,
+                "stale": None,
+                "stale_pct": None,
+                "reason": "updated_at у всех узлов перебит health-пересчётом",
+            }
             continue
-        rate = stale / total
+        rate = stale / measurable
         by_kind[str(node_kind or "unknown")] = {
             "total": total,
+            "measurable": measurable,
+            "not_measurable": not_measurable,
             "stale": stale,
             "stale_pct": round(rate * 100, 1),
         }
@@ -1411,12 +1446,17 @@ def check_source_coverage(db: Session) -> CheckResult:
 
     total = len(ALL_EDGE_SOURCES)
     covered = len(reported)
-    if unhealthy:
-        status = "warn"
-    elif silent:
-        status = "warn"
-    else:
-        status = "ok"
+    # Молчание источника — «НЕ ЗНАЮ», а не «плохо», и статусом быть не может.
+    # `_REPORTS` живёт в памяти процесса, а celery крутит две реплики по два
+    # форка с рециклом воркера каждые 50 задач: одна проверка физически
+    # видит лишь подмножество из семи источников, поэтому warn по silent
+    # горел бы ВСЕГДА и через сутки превратился в залипший
+    # CopilotSelfHealthWarnStuck — то есть в шум, ради устранения которого
+    # весь Этап 0 и делается.
+    #
+    # Поэтому статус поднимает только ЯВНО нездоровый отчёт: его мы видели
+    # своими глазами, и он означает факт, а не пробел наблюдения.
+    status = "warn" if unhealthy else "ok"
     return CheckResult(
         name="source_coverage",
         status=status,
@@ -1428,8 +1468,11 @@ def check_source_coverage(db: Session) -> CheckResult:
             "unhealthy": unhealthy,
             "reported": reported,
             "note": (
-                "отчёты живут в памяти процесса: silent = «этот воркер не "
-                "видел прогона», а не «синк не работал»"
+                "отчёты живут в памяти ПРОЦЕССА, а celery крутит несколько "
+                "воркеров с рециклом: silent = «этот процесс прогона не "
+                "видел», а не «синк не работал». Статус по silent НЕ "
+                "поднимается — до персистентных отчётов покрытие здесь "
+                "неполно по устройству, и warn был бы вечным"
             ),
         },
     )
@@ -1437,14 +1480,25 @@ def check_source_coverage(db: Session) -> CheckResult:
 
 #: Колонки, которые ВЫГЛЯДЯТ измерением, но могут быть пусты целиком.
 #: Пара (модель, колонка, человеческое объяснение, почему пусто).
+#: Четвёртый элемент — колонка времени для окна. У time-series таблиц
+#: считать по всей истории нельзя: одно непустое значение за всё время
+#: навсегда прячет РЕГРЕССИЮ сбора, а сам счёт дорожает вместе с таблицей.
+#: None = таблица-инвентарь, там уместен полный скан.
 _MEASUREMENT_COLUMNS: Sequence[tuple] = (
     (ServiceHealth, "http_5xx_rate",
-     "app /metrics за JWT, vmagent не скрейпит (WO-12483)"),
+     "app /metrics за JWT, vmagent не скрейпит (WO-12483)",
+     "ts"),
     (ServiceHealth, "p95_latency_ms",
-     "app /metrics за JWT, vmagent не скрейпит (WO-12483)"),
+     "app /metrics за JWT, vmagent не скрейпит (WO-12483)",
+     "ts"),
     (StorageVolume, "disk_pct",
-     "kubelet не собирает volume stats для local-path: это не CSI"),
+     "kubelet не собирает volume stats для local-path: это не CSI",
+     None),
 )
+
+#: Окно, за которое ищется пробел в time-series. Сутки — тот же горизонт,
+#: на котором работают соседние проверки материализации.
+_SILENT_GAP_WINDOW_HOURS = 24
 
 
 def check_silent_gaps(db: Session) -> CheckResult:
@@ -1467,22 +1521,43 @@ def check_silent_gaps(db: Session) -> CheckResult:
     смотреть мимо.
     """
     gaps: List[Dict[str, Any]] = []
-    for model, column, reason in _MEASUREMENT_COLUMNS:
-        col = getattr(model, column, None)
-        if col is None:
+    cutoff = _now() - timedelta(hours=_SILENT_GAP_WINDOW_HOURS)
+    # Колонки одной таблицы с одним окном считаются ОДНИМ запросом: раньше
+    # на каждую уходило по два полных count() по time-series таблице.
+    by_table: Dict[tuple, List[tuple]] = {}
+    for model, column, reason, ts_column in _MEASUREMENT_COLUMNS:
+        by_table.setdefault((model, ts_column), []).append((column, reason))
+
+    for (model, ts_column), columns in by_table.items():
+        cols = [(name, reason, getattr(model, name, None))
+                for name, reason in columns]
+        cols = [c for c in cols if c[2] is not None]
+        if not cols:
             continue
-        total = db.query(func.count()).select_from(model).scalar() or 0
+        q = db.query(
+            func.count(),
+            *[func.count(col) for _, _, col in cols],
+        ).select_from(model)
+        if ts_column:
+            ts_attr = getattr(model, ts_column, None)
+            if ts_attr is not None:
+                q = q.filter(ts_attr >= cutoff)
+        row = q.one()
+        total = int(row[0] or 0)
         if total == 0:
+            # Пустая таблица (или пустое окно) — это отсутствие ОБЪЕКТОВ,
+            # а не пробел в измерении. Разные вещи, и путать их нельзя.
             continue
-        filled = db.query(func.count(col)).scalar() or 0
-        if filled == 0:
-            gaps.append({
-                "table": model.__tablename__,
-                "column": column,
-                "rows": total,
-                "filled": 0,
-                "reason": reason,
-            })
+        for idx, (column, reason, _) in enumerate(cols, start=1):
+            if int(row[idx] or 0) == 0:
+                gaps.append({
+                    "table": model.__tablename__,
+                    "column": column,
+                    "rows": total,
+                    "filled": 0,
+                    "window_hours": _SILENT_GAP_WINDOW_HOURS if ts_column else None,
+                    "reason": reason,
+                })
 
     return CheckResult(
         name="silent_gaps",

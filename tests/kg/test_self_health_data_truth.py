@@ -109,14 +109,21 @@ def test_dead_namespace_nodes_are_not_counted(db):
 # ── покрытие источников ────────────────────────────────────────────────────
 
 
-def test_silent_source_is_reported(db):
-    """Молчащий источник не создаёт ошибок — он создаёт пустоту."""
+def test_silent_source_is_listed_but_does_not_raise_status(db):
+    """Молчание источника видно в detail, но статуса НЕ поднимает.
+
+    `_REPORTS` живёт в памяти процесса, а celery крутит несколько воркеров
+    с рециклом — одна проверка физически видит лишь часть источников.
+    Поднимай silent статус, warn горел бы всегда и через сутки стал
+    залипшим CopilotSelfHealthWarnStuck: ровно тот шум, ради устранения
+    которого Этап 0 и делается. Молчание — «не знаю», а не «плохо».
+    """
     record_source_run(SOURCE_KG_SYNC, {"services_fetched": 10, "errors": 0})
 
     r = check_source_coverage(db)
     assert r.detail["sources_reported"] == 1
     assert len(r.detail["silent"]) == len(ALL_EDGE_SOURCES) - 1
-    assert r.status == "warn"
+    assert r.status == "ok"
 
 
 def test_all_sources_reported_is_ok(db):
@@ -182,3 +189,62 @@ def test_empty_table_is_not_a_gap(db):
     r = check_silent_gaps(db)
     assert r.detail["empty_measurement_columns"] == []
     assert r.status == "ok"
+
+
+
+def test_node_freshness_excludes_health_touched_nodes(db):
+    """Узел, которого коснулся health-пересчёт, не считается свежим.
+
+    `Service.updated_at` имеет onupdate=utcnow, а kg_health_recompute
+    каждые 20 минут пишет health_score всем non-synthetic сервисам. Замер
+    17.09.2026: у service health_computed_at стоял на текущей минуте, у
+    workload — месячной давности, у ingress его нет вовсе. Без исключения
+    таких узлов проверка показывала бы вечные 0,9% даже при полностью
+    вставшем синке топологии — то есть врала бы зелёным.
+    """
+    _ns(db)
+    stale_ts = datetime.utcnow() - timedelta(hours=48)
+    # Узел, у которого последнее касание — от health-пересчёта.
+    db.add(Service(name="health-touched", namespace="prod-shared",
+                   node_kind="service", updated_at=stale_ts,
+                   health_computed_at=stale_ts))
+    # Узел, которого health не касался вовсе.
+    db.add(Service(name="topology-only", namespace="prod-shared",
+                   node_kind="service", updated_at=stale_ts,
+                   health_computed_at=None))
+    db.commit()
+
+    r = check_node_freshness(db)
+    svc = r.detail["by_node_kind"]["service"]
+    assert svc["total"] == 2
+    assert svc["not_measurable"] == 1
+    assert svc["measurable"] == 1
+    assert svc["stale"] == 1
+
+
+def test_silent_gaps_uses_recent_window_for_timeseries(db):
+    """Регрессия сбора видна, даже если значение когда-то было.
+
+    Раньше счёт шёл по всей истории: одно непустое значение за всё время
+    навсегда прятало бы то, что сбор сломался вчера. Плюс полный скан
+    time-series таблицы дорожает вместе с ней.
+    """
+    svc = Service(name="svc", namespace="prod-shared")
+    db.add(svc)
+    db.flush()
+    # Древняя точка с измерением — за пределами окна.
+    db.add(ServiceHealth(service_id=svc.id,
+                         ts=datetime.utcnow() - timedelta(days=30),
+                         http_5xx_rate=0.5, p95_latency_ms=10.0))
+    # Свежие точки без измерения — сбор сломался.
+    for h in (1, 2, 3):
+        db.add(ServiceHealth(service_id=svc.id,
+                             ts=datetime.utcnow() - timedelta(hours=h),
+                             http_5xx_rate=None, p95_latency_ms=None))
+    db.commit()
+
+    r = check_silent_gaps(db)
+    cols = {g["column"] for g in r.detail["empty_measurement_columns"]}
+    assert "http_5xx_rate" in cols
+    assert "p95_latency_ms" in cols
+    assert r.status == "warn"
