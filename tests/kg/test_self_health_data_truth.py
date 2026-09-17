@@ -164,7 +164,11 @@ def test_empty_measurement_column_is_surfaced(db):
     r = check_silent_gaps(db)
     cols = {g["column"] for g in r.detail["empty_measurement_columns"]}
     assert "disk_pct" in cols
-    assert r.status == "warn"
+    # Пробел архитектурный (local-path не CSI) — он ВИДЕН, но статуса не
+    # поднимает: чинить нечего, а вечный warn через сутки станет залипшим
+    # CopilotSelfHealthWarnStuck.
+    assert r.detail["expected_count"] == 1
+    assert r.status == "ok"
 
 
 def test_filled_column_is_not_a_gap(db):
@@ -204,22 +208,26 @@ def test_node_freshness_excludes_health_touched_nodes(db):
     """
     _ns(db)
     stale_ts = datetime.utcnow() - timedelta(hours=48)
-    # Узел, у которого последнее касание — от health-пересчёта.
-    db.add(Service(name="health-touched", namespace="prod-shared",
-                   node_kind="service", updated_at=stale_ts,
-                   health_computed_at=stale_ts))
-    # Узел, которого health не касался вовсе.
-    db.add(Service(name="topology-only", namespace="prod-shared",
-                   node_kind="service", updated_at=stale_ts,
-                   health_computed_at=None))
+    # По service health-пересчёт шёл только что → тип неизмерим целиком.
+    db.add(Service(name="svc-a", namespace="prod-shared", node_kind="service",
+                   updated_at=stale_ts,
+                   health_computed_at=datetime.utcnow()))
+    db.add(Service(name="svc-b", namespace="prod-shared", node_kind="service",
+                   updated_at=stale_ts, health_computed_at=None))
+    # По ingress health-пересчёта нет вовсе → тип измерим.
+    db.add(Service(name="ing-a", namespace="prod-shared", node_kind="ingress",
+                   updated_at=stale_ts, health_computed_at=None))
     db.commit()
 
     r = check_node_freshness(db)
     svc = r.detail["by_node_kind"]["service"]
-    assert svc["total"] == 2
-    assert svc["not_measurable"] == 1
-    assert svc["measurable"] == 1
-    assert svc["stale"] == 1
+    assert svc["measurable"] is False
+    assert svc["stale"] is None
+    assert "health" in svc["reason"]
+
+    ing = r.detail["by_node_kind"]["ingress"]
+    assert ing["measurable"] is True
+    assert ing["stale"] == 1
 
 
 def test_silent_gaps_uses_recent_window_for_timeseries(db):
@@ -244,7 +252,33 @@ def test_silent_gaps_uses_recent_window_for_timeseries(db):
     db.commit()
 
     r = check_silent_gaps(db)
-    cols = {g["column"] for g in r.detail["empty_measurement_columns"]}
-    assert "http_5xx_rate" in cols
-    assert "p95_latency_ms" in cols
+    by_col = {g["column"]: g for g in r.detail["empty_measurement_columns"]}
+    assert "http_5xx_rate" in by_col
+    assert "p95_latency_ms" in by_col
+    # Считалось по окну, а не по всей истории: древняя точка с измерением
+    # в счёт не пошла, иначе пробел был бы не виден.
+    assert by_col["http_5xx_rate"]["rows"] == 3
+    assert by_col["http_5xx_rate"]["window_hours"] == 24
+
+
+
+def test_unexpected_gap_does_raise_warn(db, monkeypatch):
+    """Пробел, которого никто не объявлял, статус поднимает.
+
+    Разделение существенное: ожидаемые пробелы (5xx за JWT, volume stats без
+    CSI) не чинятся и звенеть не должны, а вот колонка, которая обязана
+    заполняться и вдруг пуста, — это регрессия сбора.
+    """
+    from app.knowledge_graph import self_health as sh
+
+    monkeypatch.setattr(
+        sh, "_MEASUREMENT_COLUMNS",
+        ((StorageVolume, "disk_pct", "обязана заполняться", None, False),),
+    )
+    db.add(StorageVolume(kind="pvc", namespace="prod-shared",
+                         name="pvc-x", disk_pct=None))
+    db.commit()
+
+    r = sh.check_silent_gaps(db)
+    assert len(r.detail["unexpected"]) == 1
     assert r.status == "warn"

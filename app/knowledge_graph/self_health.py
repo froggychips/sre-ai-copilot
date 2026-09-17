@@ -1331,34 +1331,32 @@ def check_node_freshness(db: Session) -> CheckResult:
     """
     cutoff = _now() - timedelta(hours=_NODE_STALE_AFTER_HOURS)
     ns = aliased(Namespace)
-    # Узлы, которых коснулся health-пересчёт, из измерения ИСКЛЮЧАЮТСЯ.
+    # Тип узлов, по которому идёт health-пересчёт, измерению НЕ ПОДЛЕЖИТ.
     #
     # `Service.updated_at` — не маркер свежести топологии: у колонки
     # `onupdate=utcnow`, а `kg_health_recompute` каждые 20 минут пишет
-    # health_score всем non-synthetic сервисам и тем самым обновляет её.
-    # Замер 17.09.2026: у node_kind='service' health_computed_at стоял на
-    # текущей минуте, у workload — месячной давности, у ingress его нет
-    # вовсе. То есть для service эта проверка показывала бы вечные 0,9%
-    # даже при полностью вставшем синке топологии.
+    # health_score всем non-synthetic сервисам и тем самым её обновляет.
+    # Значит для таких узлов «свежо» означает лишь «health посчитан», и
+    # остановка синка топологии останется невидимой.
     #
-    # Отличить одно от другого нечем, пока у узла нет собственного
-    # topology-timestamp, поэтому такие узлы уходят в not_measurable —
-    # честное «не знаю» вместо ложного «свежо». Признак: последнее касание
-    # совпало с health-пересчётом.
-    touched_by_health = case(
-        (Service.health_computed_at.is_(None), 0),
-        (Service.updated_at <= Service.health_computed_at, 1),
-        else_=0,
-    )
+    # Отличить одно касание от другого ПО УЗЛУ нечем. Первая попытка
+    # сравнивала `updated_at <= health_computed_at` и была неверной:
+    # `recompute_all_health` фиксирует `now` ДО цикла, а onupdate у
+    # `updated_at` срабатывает позже, при flush. Замер 17.09.2026: из 10 725
+    # узлов с health_computed_at у ВСЕХ 10 725 `updated_at` строго больше,
+    # равных нет ни одного — предикат не срабатывал никогда, а тест на него
+    # проходил только потому, что выставлял метки равными вручную.
+    #
+    # Поэтому решение принимается по ТИПУ целиком: если health-пересчёт по
+    # нему шёл в пределах окна, тип уходит в not_measurable. Это честное
+    # «не знаю» вместо ложного «свежо», и оно не зависит от порядка,
+    # в котором две подсистемы пишут свои метки.
     rows = (
         db.query(
             Service.node_kind,
             func.count(Service.id),
-            func.sum(case(
-                ((Service.updated_at < cutoff) & (touched_by_health == 0), 1),
-                else_=0,
-            )),
-            func.sum(touched_by_health),
+            func.sum(case((Service.updated_at < cutoff, 1), else_=0)),
+            func.max(Service.health_computed_at),
         )
         .join(ns, ns.namespace == Service.namespace)
         .filter(ns.state == NS_STATE_ACTIVE)
@@ -1368,26 +1366,29 @@ def check_node_freshness(db: Session) -> CheckResult:
     by_kind: Dict[str, Dict[str, Any]] = {}
     worst_rate = 0.0
     worst_kind: Optional[str] = None
-    for node_kind, total, stale, not_measurable in rows:
+    for node_kind, total, stale, last_health in rows:
         total = int(total or 0)
         stale = int(stale or 0)
-        not_measurable = int(not_measurable or 0)
-        measurable = total - not_measurable
-        if measurable <= 0:
+        if total == 0:
+            continue
+        # health-пересчёт «в пределах окна» = метки узлов этого типа перебиты
+        # им, и судить по ним о работе топологии нельзя.
+        if last_health is not None and last_health >= cutoff:
             by_kind[str(node_kind or "unknown")] = {
                 "total": total,
-                "measurable": 0,
-                "not_measurable": not_measurable,
+                "measurable": False,
                 "stale": None,
                 "stale_pct": None,
-                "reason": "updated_at у всех узлов перебит health-пересчётом",
+                "reason": (
+                    "updated_at перебит health-пересчётом "
+                    f"(последний: {last_health.isoformat()})"
+                ),
             }
             continue
-        rate = stale / measurable
+        rate = stale / total
         by_kind[str(node_kind or "unknown")] = {
             "total": total,
-            "measurable": measurable,
-            "not_measurable": not_measurable,
+            "measurable": True,
             "stale": stale,
             "stale_pct": round(rate * 100, 1),
         }
@@ -1424,15 +1425,26 @@ def check_source_coverage(db: Session) -> CheckResult:
     до `fail` можно будет, когда отчёты станут персистентными.
     """
     from app.knowledge_graph.edge_decay_guard import (
-        ALL_EDGE_SOURCES, _grade_report, get_source_report)
+        ALL_EDGE_SOURCES, _fresh_hours, _grade_report, get_source_report)
+
+    # Просроченный отчёт = «не знаю», а не «сломано». Без TTL один неудачный
+    # прогон в конкретном форке помнился бы вечно: последующие успешные
+    # прогоны уходят в другие процессы и локальную запись не перезаписывают,
+    # поэтому self-health, попав в тот самый форк, публиковал бы warn ещё
+    # долго после восстановления. Порог тот же, которым пользуется decay.
+    fresh_after = _now() - timedelta(hours=_fresh_hours())
 
     reported: Dict[str, Any] = {}
     silent: List[str] = []
+    expired: List[str] = []
     unhealthy: Dict[str, str] = {}
     for source in ALL_EDGE_SOURCES:
         report = get_source_report(source)
         if report is None:
             silent.append(source)
+            continue
+        if report.ts is not None and report.ts < fresh_after:
+            expired.append(source)
             continue
         reason = _grade_report(report)
         reported[source] = {
@@ -1465,6 +1477,7 @@ def check_source_coverage(db: Session) -> CheckResult:
             "sources_reported": covered,
             "coverage_pct": round(covered / total * 100, 1) if total else 0.0,
             "silent": sorted(silent),
+            "expired": sorted(expired),
             "unhealthy": unhealthy,
             "reported": reported,
             "note": (
@@ -1480,6 +1493,14 @@ def check_source_coverage(db: Session) -> CheckResult:
 
 #: Колонки, которые ВЫГЛЯДЯТ измерением, но могут быть пусты целиком.
 #: Пара (модель, колонка, человеческое объяснение, почему пусто).
+#: Пятый элемент — ПРОБЕЛ ОЖИДАЕМ (архитектурный). Такие не поднимают
+#: статус: они не чинятся и не изменятся сами, а `CopilotSelfHealthWarnStuck`
+#: срабатывает, когда проверка держит warn сутки. Вечный warn на том, что
+#: нельзя починить, — это и есть шум, который Этап 0 убирает; ровно так же
+#: `KG_SELF_HEALTH_KNOWN_ZERO_METRICS` выводит 5xx/p95 из-под проверки нулей.
+#: Статус поднимает только НЕОЖИДАННЫЙ пробел: колонка, которую никто не
+#: объявлял пустой, а данных в ней нет.
+#:
 #: Четвёртый элемент — колонка времени для окна. У time-series таблиц
 #: считать по всей истории нельзя: одно непустое значение за всё время
 #: навсегда прячет РЕГРЕССИЮ сбора, а сам счёт дорожает вместе с таблицей.
@@ -1487,13 +1508,13 @@ def check_source_coverage(db: Session) -> CheckResult:
 _MEASUREMENT_COLUMNS: Sequence[tuple] = (
     (ServiceHealth, "http_5xx_rate",
      "app /metrics за JWT, vmagent не скрейпит (WO-12483)",
-     "ts"),
+     "ts", True),
     (ServiceHealth, "p95_latency_ms",
      "app /metrics за JWT, vmagent не скрейпит (WO-12483)",
-     "ts"),
+     "ts", True),
     (StorageVolume, "disk_pct",
      "kubelet не собирает volume stats для local-path: это не CSI",
-     None),
+     None, True),
 )
 
 #: Окно, за которое ищется пробел в time-series. Сутки — тот же горизонт,
@@ -1525,18 +1546,19 @@ def check_silent_gaps(db: Session) -> CheckResult:
     # Колонки одной таблицы с одним окном считаются ОДНИМ запросом: раньше
     # на каждую уходило по два полных count() по time-series таблице.
     by_table: Dict[tuple, List[tuple]] = {}
-    for model, column, reason, ts_column in _MEASUREMENT_COLUMNS:
-        by_table.setdefault((model, ts_column), []).append((column, reason))
+    for model, column, reason, ts_column, expected in _MEASUREMENT_COLUMNS:
+        by_table.setdefault((model, ts_column), []).append(
+            (column, reason, expected))
 
     for (model, ts_column), columns in by_table.items():
-        cols = [(name, reason, getattr(model, name, None))
-                for name, reason in columns]
-        cols = [c for c in cols if c[2] is not None]
+        cols = [(name, reason, expected, getattr(model, name, None))
+                for name, reason, expected in columns]
+        cols = [c for c in cols if c[3] is not None]
         if not cols:
             continue
         q = db.query(
             func.count(),
-            *[func.count(col) for _, _, col in cols],
+            *[func.count(col) for _, _, _, col in cols],
         ).select_from(model)
         if ts_column:
             ts_attr = getattr(model, ts_column, None)
@@ -1548,7 +1570,7 @@ def check_silent_gaps(db: Session) -> CheckResult:
             # Пустая таблица (или пустое окно) — это отсутствие ОБЪЕКТОВ,
             # а не пробел в измерении. Разные вещи, и путать их нельзя.
             continue
-        for idx, (column, reason, _) in enumerate(cols, start=1):
+        for idx, (column, reason, expected, _) in enumerate(cols, start=1):
             if int(row[idx] or 0) == 0:
                 gaps.append({
                     "table": model.__tablename__,
@@ -1556,18 +1578,25 @@ def check_silent_gaps(db: Session) -> CheckResult:
                     "rows": total,
                     "filled": 0,
                     "window_hours": _SILENT_GAP_WINDOW_HOURS if ts_column else None,
+                    "expected": expected,
                     "reason": reason,
                 })
 
+    unexpected = [g for g in gaps if not g["expected"]]
     return CheckResult(
         name="silent_gaps",
-        status="warn" if gaps else "ok",
+        # Статус поднимает только НЕОЖИДАННЫЙ пробел. Ожидаемые остаются в
+        # detail: их задача — быть видимыми, а не звенеть каждые сутки.
+        status="warn" if unexpected else "ok",
         detail={
             "empty_measurement_columns": gaps,
+            "unexpected": unexpected,
+            "expected_count": len(gaps) - len(unexpected),
             "checked": len(_MEASUREMENT_COLUMNS),
             "note": (
-                "пустая колонка-измерение читается как измеренная: "
-                "поле есть, значения нет, отличить нечем"
+                "пустая колонка-измерение читается как измеренная: поле "
+                "есть, значения нет, отличить нечем. `expected: true` — "
+                "известный архитектурный пробел, статуса не поднимает"
             ),
         },
     )
