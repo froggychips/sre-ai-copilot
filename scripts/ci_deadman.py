@@ -150,15 +150,31 @@ def check_runners():
     if not runners:
         return ["**раннеров нет вообще** — CI не на чем гонять"]
 
-    watched = [r for r in runners if not RUNNER_NAME or r.get("name") == RUNNER_NAME]
-    if RUNNER_NAME and not watched:
-        return [f"раннер `{RUNNER_NAME}` не зарегистрирован в репозитории"]
+    if RUNNER_NAME:
+        watched = [r for r in runners if r.get("name") == RUNNER_NAME]
+        if not watched:
+            return [f"раннер `{RUNNER_NAME}` не зарегистрирован в репозитории"]
+        for r in watched:
+            status = r.get("status")
+            if status != "online":
+                problems.append(f"раннер `{r.get('name')}` в статусе `{status}`")
+        return problems
 
-    for r in watched:
-        status = r.get("status")
-        if status != "online":
-            problems.append(f"раннер `{r.get('name')}` в статусе `{status}`")
-    return problems
+    # Имя не задано — значит следим за парком целиком, и находка здесь одна:
+    # живых раннеров не осталось ВООБЩЕ. Жаловаться на каждый офлайновый
+    # нельзя, и это не педантизм: с переездом на ARC (17.09.2026) в
+    # репозитории одновременно живут эфемерные раннеры, которые офлайнят при
+    # каждом пересоздании пода, и старый мак, который офлайнит всякий раз,
+    # когда закрывают ноутбук. Пожаловавшись на любого из них, канарейка
+    # ежечасно кричала бы при полностью здоровом CI — то есть приучала бы
+    # игнорировать канал, чего этот модуль как раз избегает.
+    online = [r for r in runners if r.get("status") == "online"]
+    if not online:
+        listed = ", ".join(
+            f"`{r.get('name')}` — {r.get('status')}" for r in runners
+        ) or "—"
+        return [f"**ни один раннер не online** — CI не на чем гонять ({listed})"]
+    return []
 
 
 def check_queue():
