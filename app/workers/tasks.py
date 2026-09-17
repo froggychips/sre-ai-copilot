@@ -539,6 +539,41 @@ def process_incident_task(self, incident_data: dict):
     )
 
 
+def _mark_out_of_scope(incident_id: str) -> None:
+    """Увести запись из OPEN, раз пайплайн её не разбирает.
+
+    Вебхук уже закоммитил строку как OPEN, а OPEN входит в его
+    `_SKIP_STATES`: оставь её там — и каждый следующий fire того же
+    fingerprint будет дедуплицироваться. Расширив фильтр, мы не подхватили
+    бы уже активный инцидент, пока он не погаснет и не загорится снова.
+
+    TRIAGE_REQUIRED сказано по делу: копайлот его не разбирал, разбирается
+    человек. Его re-fire вебхук трактует как flapping и переобрабатывает.
+
+    Ошибку записи глушим: в скипе она означает лишь, что инцидент останется
+    в OPEN — неприятно, но это ровно прежнее поведение, а не новое.
+    """
+    from app.core.state_machine import IncidentState
+
+    db = SessionLocal()
+    try:
+        record = (
+            db.query(IncidentRecord)
+            .filter(IncidentRecord.incident_id == incident_id)
+            .first()
+        )
+        if record is None:
+            return
+        transition_to(record, IncidentState.TRIAGE_REQUIRED, db)
+    except Exception as e:  # noqa: BLE001
+        logger.warning(
+            "pipeline.scope_skip_state_not_persisted incident_id=%s error=%s",
+            incident_id, e,
+        )
+    finally:
+        db.close()
+
+
 async def async_process_incident(
     incident_data: dict, retries: int = 0, max_retries: int = 0
 ):
@@ -575,6 +610,7 @@ async def async_process_incident(
             "incident_id": incident_id,
             **scope.as_dict(),
         })
+        _mark_out_of_scope(incident_id)
         return {"status": "skipped", "reason": scope.reason}
 
     with incident_span(incident_id, service=_service, namespace=_namespace) as _root_span:

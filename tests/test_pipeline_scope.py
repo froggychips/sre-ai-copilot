@@ -96,3 +96,47 @@ async def test_scope_gate_blocks_pipeline_entry(monkeypatch):
 
     assert result["status"] == "skipped"
     assert result["reason"] == "severity_out_of_scope"
+
+
+@pytest.mark.asyncio
+async def test_scope_skip_leaves_incident_redispatchable(monkeypatch, tmp_path):
+    """Скип по области действия не должен запирать инцидент в OPEN.
+
+    OPEN входит в `_SKIP_STATES` вебхука: оставшись там, инцидент
+    дедуплицировался бы на каждом следующем fire, и расширение фильтра не
+    подхватило бы уже активный алерт, пока тот не погаснет и не загорится
+    снова.
+    """
+    from sqlalchemy import create_engine
+    from sqlalchemy.orm import sessionmaker
+
+    from app.core.state_machine import IncidentState
+    from app.database import Base, IncidentRecord
+    from app.workers import tasks
+
+    engine = create_engine(f"sqlite:///{tmp_path}/scope.db")
+    Base.metadata.create_all(engine)
+    Session = sessionmaker(bind=engine)
+    monkeypatch.setattr(tasks, "SessionLocal", Session)
+
+    db = Session()
+    db.add(IncidentRecord(
+        incident_id="fp-1", status=IncidentState.OPEN.value, data={},
+    ))
+    db.commit()
+    db.close()
+
+    monkeypatch.setattr(settings, "LLM_PIPELINE_ENABLED", True, raising=False)
+    monkeypatch.setattr(settings, "PIPELINE_SEVERITY_ALLOWLIST", ["critical"], raising=False)
+    monkeypatch.setattr(settings, "PIPELINE_NAMESPACE_PREFIXES", [], raising=False)
+
+    await tasks.async_process_incident(
+        {"incident_id": "fp-1", "severity": "warning", "namespace": "dev-17"}
+    )
+
+    db = Session()
+    status = db.query(IncidentRecord).filter_by(incident_id="fp-1").first().status
+    db.close()
+
+    assert status == IncidentState.TRIAGE_REQUIRED.value
+    assert status != IncidentState.OPEN.value, "инцидент остался бы недостижим для re-fire"
