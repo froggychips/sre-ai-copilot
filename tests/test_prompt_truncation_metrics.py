@@ -62,23 +62,35 @@ def test_input_size_is_observed_even_without_truncation(monkeypatch):
 
 
 def test_metrics_failure_does_not_break_sanitize(monkeypatch):
-    """Телеметрия не важнее вызова модели: её сбой не ломает запрос."""
-    import app.services.prompt_guard as pg
+    """Телеметрия не важнее вызова модели: её сбой не ломает запрос.
 
-    def _boom(*_a, **_k):
-        raise RuntimeError("метрики недоступны")
-
-    monkeypatch.setattr(pg, "_count_truncation", _boom)
-    monkeypatch.setattr(pg, "_observe_input_size", _boom)
+    Падать заставляем САМУ метрику и держим подмену активной во время
+    sanitize. Если подменить хелперы на no-op перед вызовом, тест пройдёт
+    и без try/except внутри них — то есть не докажет ничего.
+    """
+    import app.observability.ai_metrics as ai_metrics
     from app.config import settings
 
+    class _BrokenMetric:
+        def observe(self, *_a, **_k):
+            raise RuntimeError("метрики недоступны")
+
+        def inc(self, *_a, **_k):
+            raise RuntimeError("метрики недоступны")
+
+    broken = _BrokenMetric()
+    monkeypatch.setattr(ai_metrics, "PROMPT_INPUT_CHARS", broken)
+    monkeypatch.setattr(ai_metrics, "PROMPT_INPUT_TRUNCATED", broken)
     monkeypatch.setattr(settings, "PROMPT_INPUT_MAX_CHARS", 50, raising=False)
 
+    # Контроль подмены: метрика действительно падает прямо сейчас.
     with pytest.raises(RuntimeError):
-        # Прямой вызов подменённого хелпера падает — это контроль подмены.
-        pg._count_truncation()
+        ai_metrics.PROMPT_INPUT_CHARS.observe(1)
+    with pytest.raises(RuntimeError):
+        ai_metrics.PROMPT_INPUT_TRUNCATED.inc()
 
-    # А сам sanitize обязан отработать: он ловит исключения внутри хелперов.
-    monkeypatch.setattr(pg, "_count_truncation", lambda: None)
-    monkeypatch.setattr(pg, "_observe_input_size", lambda _s: None)
-    assert prompt_guard.sanitize("z" * 200)
+    # Обе метрики на пути обрезки — и observe, и inc; sanitize обязан
+    # отработать при живой подмене.
+    result = prompt_guard.sanitize("z" * 200)
+
+    assert "truncated" in result, "обрезка должна произойти несмотря на сбой метрик"
