@@ -65,6 +65,11 @@ Task: {instruction}
                 output_tokens = result.get("output_tokens", 0) if isinstance(result, dict) else 0
                 model_name = (result.get("model") if isinstance(result, dict) else settings.MODEL_NAME) or settings.MODEL_NAME
 
+                # Стоимость считает, списывает И записывает в метрику
+                # generate_full — он единственный знает про попытки. Здесь
+                # инкремент означал бы двойной счёт: успешная попытка
+                # попала бы в llm_cost_usd_total дважды.
+
                 if not response_text:
                     record_llm_call(
                         backend=model_name,
@@ -138,6 +143,9 @@ Task: {instruction}
                     "output_tokens": output_tokens,
                 })
             except Exception as exc:
+                # Бюджетом заведует generate_full: он резервирует перед
+                # каждой попыткой и решает, возвращать ли резерв. Здесь
+                # только учёт и телеметрия.
                 if recorded:
                     raise  # empty-response branch уже всё записал
                 duration_s = time.monotonic() - start

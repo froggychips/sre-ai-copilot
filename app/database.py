@@ -32,7 +32,8 @@ tests/test_idle_transaction_guard.py.
 """
 from datetime import datetime
 
-from sqlalchemy import JSON, Column, DateTime, Integer, String, create_engine
+from sqlalchemy import (JSON, BigInteger, Column, Date, DateTime, Integer,
+                        String, create_engine, func)
 from sqlalchemy.orm import declarative_base, sessionmaker
 
 from app.config import settings
@@ -212,6 +213,29 @@ class IncidentRecord(Base):
     executor_state = Column(String, nullable=True, index=True)    # in_flight|applied|…
     executor_claimed_at = Column(DateTime, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
+
+
+class LLMSpendLedger(Base):
+    """Суточный расход на LLM — источник истины для предохранителя бюджета.
+
+    Строка в сутки. Живёт в Postgres, а не в Redis, потому что Redis здесь
+    поднят с `allkeys-lru` и вытесняет любой ключ под давлением памяти:
+    пропавший счётчик читается как «потрачено 0» и выдаёт полный бюджет
+    заново — предохранитель открылся бы сам, тихо и под нагрузкой.
+
+    Сумма в МИКРОДОЛЛАРАХ целым: расход набирается тысячами сложений, и
+    дробное сложение копило бы ошибку округления. Писать и читать её
+    напрямую не нужно — этим занимается `app.services.cost_guard`, где
+    сложение делается атомарным UPSERT'ом на стороне БД.
+    """
+
+    __tablename__ = "llm_spend_ledger"
+    day = Column(Date, primary_key=True)
+    spent_micro_usd = Column(BigInteger, nullable=False, server_default="0")
+    # naive-UTC, как вся остальная схема: смешивать timestamptz и timestamp
+    # в одной базе значит считать окна по разным зонам (см.
+    # test_datetime_columns_are_without_timezone).
+    updated_at = Column(DateTime, nullable=False, server_default=func.now())
 
 
 def get_db():

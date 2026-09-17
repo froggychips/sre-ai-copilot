@@ -12,10 +12,12 @@ from sqlalchemy.orm.attributes import flag_modified
 from app.config import settings
 from app.core.state_machine import IncidentState
 from app.database import IncidentRecord, ReadOnlyAutocommitSession, SessionLocal
+from app.observability.ai_metrics import track_budget_denied
 from app.observability.worker_metrics import (
     register_celery_signals as register_worker_metrics_signals,
 )
 from app.services.audit_logger import audit_service
+from app.services.cost_guard import peek as peek_budget
 from app.services.telemetry_utils import incident_span
 from app.telemetry import setup_telemetry
 from app.workers.pipeline import IncidentPipeline, transition_to
@@ -560,6 +562,29 @@ async def async_process_incident(
             "reason": "LLM_PIPELINE_ENABLED=false",
         })
         return {"status": "skipped", "reason": "LLM_PIPELINE_ENABLED=false"}
+
+    # ── БЮДЖЕТ: второй предохранитель, независимый от флага ────────────
+    # Флаг выше — выключатель, у него два положения. Потолок нужен для
+    # третьего: «работай, но не дороже N в сутки».
+    #
+    # Здесь именно ПРОСМОТР, а не резерв: стоимость целого прогона заранее
+    # неизвестна. Гарантию потолка даёт резерв в BaseAgent.ask перед каждым
+    # вызовом; этот взгляд экономит прогон из семи агентов, когда деньги
+    # уже кончились — чтобы выяснить это, не нужно платить за первый из них.
+    verdict = peek_budget()
+    if not verdict.allowed:
+        logger.warning(
+            "pipeline.skipped_budget incident_id=%s ns=%s reason=%s spent=%s limit=%s",
+            incident_id, _namespace, verdict.reason,
+            verdict.spent_usd, verdict.limit_usd,
+        )
+        track_budget_denied(verdict.reason)
+        audit_service.log_event("PIPELINE_BUDGET_SKIP", {
+            "incident_id": incident_id,
+            "namespace": _namespace,
+            **verdict.as_dict(),
+        })
+        return {"status": "skipped", "reason": verdict.reason}
 
     with incident_span(incident_id, service=_service, namespace=_namespace) as _root_span:
         db = SessionLocal()
