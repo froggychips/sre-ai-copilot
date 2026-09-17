@@ -429,7 +429,8 @@ def test_sync_all_services_empty_when_kubectl_fails(db):
         "workload_nodes_upserted": 0,
         "edges_serves_traffic": 0,
         "skipped_no_selector": 0, "skipped_no_match": 0,
-        "skipped_self_loop": 0, "errors": 0,
+        "skipped_self_loop": 0, "edges_dropped_stale_selector": 0,
+        "errors": 0,
     }
 
 
@@ -678,3 +679,240 @@ def test_per_namespace_fallback_skips_broken_namespace():
         items = mod._kubectl_get_all("services")
 
     assert [i["metadata"]["name"] for i in items] == ["dep-good"]
+
+
+# ── смена selector'а: ребро на прежний workload обязано сниматься ───────────
+
+
+def test_selector_change_drops_stale_serves_traffic_edge(db):
+    """Service переключили на другой backend → прежнее ребро снимается.
+
+    Живой случай 17.09.2026: `config-worker-db-postgresql` в prod-shared
+    переехал с bitnami-StatefulSet на CNPG. Селектор Service стал
+    `cnpg.io/cluster`, а поды CNPG не принадлежат ни Deployment, ни
+    StatefulSet, ни DaemonSet — их делает оператор из Cluster CR. Матчей нет
+    → синк выходил по skipped_no_match, НЕ трогая старое ребро. Узел при
+    этом обновлялся: в графе оказывались новый селектор на узле и старый на
+    ребре, и kg_service_edges / kg_workload сутками отвечали мёртвым
+    StatefulSet'ом.
+    """
+    deps = [_mk_deployment("cw-db-postgresql", "prod-shared",
+                           pod_labels={"app.kubernetes.io/instance": "cw-db"})]
+    deps_idx = _index_deployments_by_ns(deps)
+
+    before = [_mk_service("cw-db-postgresql", "prod-shared",
+                          selector={"app.kubernetes.io/instance": "cw-db"})]
+    with patch(
+        "app.knowledge_graph.k8s_topology_resources_sync._kubectl_get_all",
+        return_value=before,
+    ):
+        sync_all_services(db, deployments_index=deps_idx)
+    assert db.query(ServiceEdge).filter_by(kind=EDGE_SERVES_TRAFFIC).count() == 1
+
+    # Тот же Service, новый селектор; старый StatefulSet никуда не делся —
+    # он оставлен как путь отката, но трафика уже не получает.
+    after = [_mk_service("cw-db-postgresql", "prod-shared",
+                         selector={"cnpg.io/cluster": "cw-db-cnpg",
+                                   "cnpg.io/instanceRole": "primary"})]
+    with patch(
+        "app.knowledge_graph.k8s_topology_resources_sync._kubectl_get_all",
+        return_value=after,
+    ):
+        stats = sync_all_services(db, deployments_index=deps_idx)
+
+    assert stats["skipped_no_match"] == 1
+    assert stats["edges_dropped_stale_selector"] == 1
+    assert db.query(ServiceEdge).filter_by(kind=EDGE_SERVES_TRAFFIC).count() == 0
+
+
+def test_no_match_without_selector_change_keeps_edge(db):
+    """Пустой срез workload'ов НЕ повод сносить рёбра.
+
+    `kubectl get deployments -A` на этом кластере таймаутит регулярно (42 МБ
+    JSON). Если сносить рёбра по «матчей нет», один сбойный тик стирал бы
+    топологию целиком. Критерий — разошедшийся селектор, а не отсутствие
+    матча: селектор прежний → ребро живёт.
+    """
+    deps = [_mk_deployment("auth-app", "prod-shared", pod_labels={"app": "auth"})]
+    services = [_mk_service("auth-svc", "prod-shared", selector={"app": "auth"})]
+
+    with patch(
+        "app.knowledge_graph.k8s_topology_resources_sync._kubectl_get_all",
+        return_value=services,
+    ):
+        sync_all_services(db, deployments_index=_index_deployments_by_ns(deps))
+    assert db.query(ServiceEdge).filter_by(kind=EDGE_SERVES_TRAFFIC).count() == 1
+
+    # Тот же селектор, но срез workload'ов пуст — имитация сбоя kubectl.
+    with patch(
+        "app.knowledge_graph.k8s_topology_resources_sync._kubectl_get_all",
+        return_value=services,
+    ):
+        stats = sync_all_services(db, deployments_index={})
+
+    assert stats["skipped_no_match"] == 1
+    assert stats["edges_dropped_stale_selector"] == 0
+    assert db.query(ServiceEdge).filter_by(kind=EDGE_SERVES_TRAFFIC).count() == 1
+
+
+# ── CNPG: поды делает оператор, Deployment/StatefulSet за ними нет ──────────
+
+
+def _mk_cnpg_cluster(name: str, namespace: str, instances: int = 2):
+    """Cluster CR как его отдаёт kubectl: ни spec.template, ни spec.replicas."""
+    return {
+        "kind": "Cluster",
+        "metadata": {"name": name, "namespace": namespace},
+        "spec": {
+            "instances": instances,
+            "imageName": "ghcr.io/cloudnative-pg/postgresql:17.6",
+        },
+    }
+
+
+def test_cnpg_cluster_backs_rw_service(db):
+    """Service на CNPG получает workload-узел, а не пустоту.
+
+    17.09.2026 `config-worker-db-postgresql` в prod-shared переключили на
+    CNPG. Поды кластера не принадлежат ни Deployment, ни StatefulSet, ни
+    DaemonSet — их создаёт оператор из Cluster CR. Итог в графе: живой
+    primary не представлен ничем, а оставленный для отката StatefulSet
+    представлен полноценно.
+    """
+    clusters = [_mk_cnpg_cluster("cw-db-cnpg", "prod-shared")]
+    services = [_mk_service("cw-db-cnpg-rw", "prod-shared",
+                            selector={"cnpg.io/cluster": "cw-db-cnpg",
+                                      "cnpg.io/instanceRole": "primary"})]
+
+    with patch(
+        "app.knowledge_graph.k8s_topology_resources_sync._kubectl_get_all",
+        return_value=services,
+    ):
+        stats = sync_all_services(
+            db, deployments_index=_index_deployments_by_ns(clusters))
+
+    assert stats["skipped_no_match"] == 0
+    assert stats["edges_serves_traffic"] == 1
+
+    edge = db.query(ServiceEdge).filter_by(kind=EDGE_SERVES_TRAFFIC).one()
+    assert edge.dst.name == "cw-db-cnpg"
+    assert edge.dst.node_kind == NODE_KIND_WORKLOAD
+    meta = (edge.dst.metadata_json or {}).get("k8s_workload") or {}
+    assert meta["workload_kind"] == "Cluster"
+    # instances, а не replicas: у Cluster CR своя форма spec.
+    assert meta["replicas"] == 2
+    assert meta["images"] == ["ghcr.io/cloudnative-pg/postgresql:17.6"]
+
+
+def test_cnpg_replica_service_matches_same_cluster(db):
+    """`-ro` (replica) ведёт на тот же кластер, что и `-rw`.
+
+    Роль инстанса переезжает при failover — на проде промоушен занял 20
+    секунд. Если учитывать `instanceRole` в матче, ребро отваливалось бы при
+    каждом переключении примари, и blast-radius мигал бы вместе с ним.
+    """
+    clusters = [_mk_cnpg_cluster("cw-db-cnpg", "prod-shared")]
+    services = [
+        _mk_service("cw-db-cnpg-rw", "prod-shared",
+                    selector={"cnpg.io/cluster": "cw-db-cnpg",
+                              "cnpg.io/instanceRole": "primary"}),
+        _mk_service("cw-db-cnpg-ro", "prod-shared",
+                    selector={"cnpg.io/cluster": "cw-db-cnpg",
+                              "cnpg.io/instanceRole": "replica"}),
+    ]
+
+    with patch(
+        "app.knowledge_graph.k8s_topology_resources_sync._kubectl_get_all",
+        return_value=services,
+    ):
+        stats = sync_all_services(
+            db, deployments_index=_index_deployments_by_ns(clusters))
+
+    assert stats["edges_serves_traffic"] == 2
+    dst_names = {e.dst.name for e in
+                 db.query(ServiceEdge).filter_by(kind=EDGE_SERVES_TRAFFIC).all()}
+    assert dst_names == {"cw-db-cnpg"}
+
+
+def test_non_cnpg_selector_still_needs_every_label(db):
+    """Очистка селектора не ослабляет обычный матч.
+
+    Роль-лейблы вычищаются ТОЛЬКО для Cluster CR. Для Deployment селектор
+    по-прежнему требует совпадения всех ключей — иначе один Service начал бы
+    цеплять чужие workload'ы.
+    """
+    deps = [_mk_deployment("auth-app", "prod-shared",
+                           pod_labels={"app": "auth"})]
+    services = [_mk_service("auth-svc", "prod-shared",
+                            selector={"app": "auth", "tier": "api"})]
+
+    with patch(
+        "app.knowledge_graph.k8s_topology_resources_sync._kubectl_get_all",
+        return_value=services,
+    ):
+        stats = sync_all_services(
+            db, deployments_index=_index_deployments_by_ns(deps))
+
+    assert stats["skipped_no_match"] == 1
+    assert stats["edges_serves_traffic"] == 0
+
+
+def test_endpoint_only_edge_without_selector_is_dropped(db):
+    """Ребро, воскрешённое корроборатором endpoints, снимается.
+
+    `k8s_endpoints_sync` подтверждает живые рёбра своим upsert_edge с
+    extras={"endpoints_ready": ...} — без селектора. Таски идут в разных
+    воркерах: если корроборатор прочитал ребро до того, как мы его удалили,
+    его upsert воссоздаст строку уже без селектора. Ветка «нет селектора —
+    не трогаем» хранила бы её вечно, и снятое ребро возвращалось бы на
+    каждом тике.
+    """
+    from app.knowledge_graph.k8s_endpoints_sync import DISCOVERED_BY_ENDPOINTS
+
+    deps = [_mk_deployment("cw-db-postgresql", "prod-shared",
+                           pod_labels={"app.kubernetes.io/instance": "cw-db"})]
+    services = [_mk_service("cw-db-postgresql", "prod-shared",
+                            selector={"cnpg.io/cluster": "cw-db-cnpg"})]
+
+    svc = upsert_service(db, "prod-shared", "cw-db-postgresql")
+    wl = upsert_service(db, "prod-shared", "cw-db-postgresql-sts",
+                        node_kind=NODE_KIND_WORKLOAD)
+    db.flush()
+    edge = ServiceEdge(src_id=svc.id, dst_id=wl.id, kind=EDGE_SERVES_TRAFFIC,
+                       extras={"endpoints_ready": 1,
+                               "discovery_sources": [DISCOVERED_BY_ENDPOINTS]})
+    db.add(edge)
+    db.commit()
+
+    with patch(
+        "app.knowledge_graph.k8s_topology_resources_sync._kubectl_get_all",
+        return_value=services,
+    ):
+        stats = sync_all_services(
+            db, deployments_index=_index_deployments_by_ns(deps))
+
+    assert stats["edges_dropped_stale_selector"] == 1
+    assert db.query(ServiceEdge).filter_by(kind=EDGE_SERVES_TRAFFIC).count() == 0
+
+
+def test_legacy_edge_without_provenance_is_kept(db):
+    """Ребро без селектора И без источников — наследие, судить не по чему."""
+    deps = [_mk_deployment("auth-app", "prod-shared", pod_labels={"app": "auth"})]
+    services = [_mk_service("auth-svc", "prod-shared", selector={"app": "auth"})]
+
+    svc = upsert_service(db, "prod-shared", "auth-svc")
+    wl = upsert_service(db, "prod-shared", "auth-legacy",
+                        node_kind=NODE_KIND_WORKLOAD)
+    db.flush()
+    db.add(ServiceEdge(src_id=svc.id, dst_id=wl.id, kind=EDGE_SERVES_TRAFFIC,
+                       extras={"confidence": "declared_k8s"}))
+    db.commit()
+
+    with patch(
+        "app.knowledge_graph.k8s_topology_resources_sync._kubectl_get_all",
+        return_value=services,
+    ):
+        stats = sync_all_services(
+            db, deployments_index=_index_deployments_by_ns(deps))
+
+    assert stats["edges_dropped_stale_selector"] == 0

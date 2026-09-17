@@ -49,9 +49,10 @@ from sqlalchemy.orm import Session
 from app.knowledge_graph.kubectl_breaker import run_kubectl
 from app.knowledge_graph.edge_decay_guard import (
     SOURCE_TOPOLOGY_INGRESSES, SOURCE_TOPOLOGY_SERVICES, record_source_run)
+from app.knowledge_graph.k8s_endpoints_sync import DISCOVERED_BY_ENDPOINTS
 from app.knowledge_graph.populator import upsert_edge, upsert_service
 from app.knowledge_graph.schema import (NODE_KIND_SERVICE, NODE_KIND_WORKLOAD,
-                                        Service)
+                                        Service, ServiceEdge)
 
 logger = logging.getLogger(__name__)
 
@@ -205,14 +206,33 @@ timeout=_KUBECTL_TIMEOUT_S,
 #: не матчился ни на что просто потому, что за ним стоял StatefulSet
 #: (все *-db / *-postgresql / clickhouse) или DaemonSet. Это уходило в
 #: skipped_no_match и читалось как «топология неизвестна».
-_WORKLOAD_RESOURCES = ("deployments", "statefulsets", "daemonsets")
+_WORKLOAD_RESOURCES = (
+    "deployments", "statefulsets", "daemonsets",
+    # CNPG создаёт поды из Cluster CR сам — за ними не стоит ни Deployment,
+    # ни StatefulSet. Без этого ресурса Service `*-cnpg-rw` не матчился ни на
+    # что: 17.09.2026 живой primary `config-worker-db-cnpg` не был
+    # представлен в графе вообще, тогда как оставленный для отката
+    # StatefulSet был представлен полноценно — ровно инверсия правды.
+    # CRD нет в кластере → _kubectl_get_all вернёт [], тик не падает.
+    "clusters.postgresql.cnpg.io",
+)
 
 #: kubectl-ресурс → значение workload_kind в metadata узла.
 _WORKLOAD_KIND_BY_RESOURCE = {
     "deployments": "Deployment",
     "statefulsets": "StatefulSet",
     "daemonsets": "DaemonSet",
+    "clusters.postgresql.cnpg.io": "Cluster",
 }
+
+#: Так выглядит workload_kind кластера CNPG.
+_CNPG_WORKLOAD_KIND = "Cluster"
+
+#: Лейблы, которыми CNPG различает РОЛЬ конкретного пода, а не идентичность
+#: workload'а. Роль переезжает при failover (на проде 17.09.2026 промоушен
+#: занял 20 секунд), поэтому в матче Service → Cluster она не участвует:
+#: иначе ребро отваливалось бы при каждом переключении примари.
+_CNPG_POD_ROLE_LABELS = ("cnpg.io/instanceRole", "cnpg.io/podRole")
 
 
 def _kubectl_get_deployments_all() -> List[Dict[str, Any]]:
@@ -293,6 +313,39 @@ def _find_matching_deployments(
     ]
 
 
+def _workload_pod_labels(obj: Dict[str, Any]) -> Dict[str, str]:
+    """Лейблы подов, которые порождает workload.
+
+    У Deployment/StatefulSet/DaemonSet это `spec.template.metadata.labels`.
+    У CNPG Cluster шаблона пода нет вовсе — оператор проставляет
+    `cnpg.io/cluster` сам, по имени кластера.
+    """
+    if obj.get("kind") == _CNPG_WORKLOAD_KIND:
+        name = (obj.get("metadata") or {}).get("name")
+        return {"cnpg.io/cluster": name} if name else {}
+    return (
+        ((obj.get("spec") or {}).get("template") or {}).get("metadata") or {}
+    ).get("labels") or {}
+
+
+def _selector_for_workload(
+    selector: Dict[str, str],
+    obj: Dict[str, Any],
+) -> Dict[str, str]:
+    """Селектор без ключей, описывающих роль пода, а не сам workload.
+
+    `config-worker-db-cnpg-rw` селектит `cnpg.io/cluster` + `instanceRole:
+    primary`. Идентичность workload'а задаёт только первый: второй говорит,
+    какой из подов кластера сейчас примари. Оставить его в матче — значит
+    привязать ребро графа к текущему раскладу ролей.
+    """
+    if obj.get("kind") != _CNPG_WORKLOAD_KIND:
+        return selector
+    return {
+        k: v for k, v in selector.items() if k not in _CNPG_POD_ROLE_LABELS
+    }
+
+
 def _find_matching_deployment_objects(
     selector: Dict[str, str],
     namespace: str,
@@ -308,10 +361,9 @@ def _find_matching_deployment_objects(
         return []
     matches: List[Dict[str, Any]] = []
     for dep in deployments_index.get(namespace, []):
-        pod_labels = (
-            ((dep.get("spec") or {}).get("template") or {}).get("metadata") or {}
-        ).get("labels") or {}
-        if not _selector_matches_labels(selector, pod_labels):
+        pod_labels = _workload_pod_labels(dep)
+        effective = _selector_for_workload(selector, dep)
+        if not effective or not _selector_matches_labels(effective, pod_labels):
             continue
         if not (dep.get("metadata") or {}).get("name"):
             continue
@@ -326,14 +378,22 @@ def _extract_workload_meta(dep: Dict[str, Any]) -> Dict[str, Any]:
     runtime, он живёт в метриках, а не в графе.
     """
     spec = dep.get("spec") or {}
+    if dep.get("kind") == _CNPG_WORKLOAD_KIND:
+        # У Cluster CR своя форма: инстансы вместо реплик, один образ на
+        # кластер вместо списка контейнеров.
+        image = spec.get("imageName")
+        return {
+            "workload_kind": _CNPG_WORKLOAD_KIND,
+            "replicas": spec.get("instances"),
+            "images": [image] if image else [],
+            "pod_labels": _workload_pod_labels(dep),
+        }
     containers = ((spec.get("template") or {}).get("spec") or {}).get("containers") or []
     return {
         "workload_kind": dep.get("kind") or "Deployment",
         "replicas": spec.get("replicas"),
         "images": [c.get("image") for c in containers if c.get("image")],
-        "pod_labels": (
-            ((spec.get("template") or {}).get("metadata") or {}).get("labels") or {}
-        ),
+        "pod_labels": _workload_pod_labels(dep),
     }
 
 
@@ -409,6 +469,9 @@ def sync_all_services(
         "skipped_no_selector": 0,
         "skipped_no_match": 0,
         "skipped_self_loop": 0,
+        # Рёбра, снятые как построенные по УСТАРЕВШЕМУ selector'у: Service
+        # переключили на другой backend, и прежнее ребро стало ложью.
+        "edges_dropped_stale_selector": 0,
         # Services, откатившиеся per-item savepoint-ом: раньше один DataError
         # ронял весь tick, теперь считаем и продолжаем.
         "errors": 0,
@@ -440,18 +503,84 @@ def sync_all_services(
     logger.info(
         "k8s_topology_resources.services_done fetched=%d nodes=%d workloads=%d "
         "edges=%d skipped_no_selector=%d skipped_no_match=%d skipped_self_loop=%d "
-        "errors=%d",
+        "dropped_stale_selector=%d errors=%d",
         stats["services_fetched"], stats["nodes_upserted"],
         stats["workload_nodes_upserted"],
         stats["edges_serves_traffic"],
         stats["skipped_no_selector"], stats["skipped_no_match"],
-        stats["skipped_self_loop"], stats["errors"],
+        stats["skipped_self_loop"], stats["edges_dropped_stale_selector"],
+        stats["errors"],
     )
     # Отчёт для edge-decay guard: `serves_traffic` децаится только если этот
     # срез реально отработал. Ровно здесь ломался прод — `kubectl get
     # services -A` таймаутил, services_fetched=0, а decay об этом не знал.
     record_source_run(SOURCE_TOPOLOGY_SERVICES, stats)
     return stats
+
+
+def _drop_stale_selector_edges(
+    db: Session,
+    svc_node: Service,
+    selector: Dict[str, str],
+    stats: Dict[str, int],
+) -> None:
+    """Снять serves_traffic-рёбра, построенные по УСТАРЕВШЕМУ selector'у.
+
+    Service переключают на другой backend, не переименовывая. Миграция
+    `config-worker-db` с bitnami-StatefulSet на CNPG (17.09.2026) сменила
+    selector на `cnpg.io/cluster`, а поды CNPG не принадлежат ни Deployment,
+    ни StatefulSet, ни DaemonSet — оператор создаёт их из Cluster CR сам.
+    Матчей нет → `_sync_one_service` выходил по `skipped_no_match`, НЕ трогая
+    прежнее ребро. Узел Service при этом обновлялся: в графе оказывались
+    новый selector на узле и старый на ребре, а `kg_service_edges` и
+    `kg_workload` продолжали отвечать мёртвым StatefulSet'ом — до
+    edge-decay, то есть сутками.
+
+    Критерий снятия — НЕ «матчей нет»: пустой срез бывает и от сбоя
+    kubectl, по нему сносить рёбра нельзя. Критерий — `extras.selector`
+    ребра, разошедшийся с текущим selector'ом Service. Селектор не менялся →
+    ребро не трогаем, даже если срез пуст. Ребро без `extras.selector`
+    (до contract 2.4 наследие) тоже не трогаем: судить не по чему.
+    """
+    edges = (
+        db.query(ServiceEdge)
+        .filter(ServiceEdge.src_id == svc_node.id,
+                ServiceEdge.kind == EDGE_SERVES_TRAFFIC)
+        .all()
+    )
+    for edge in edges:
+        # Тот же паттерн, что в blast_radius._edge_sources: `edge.extras or
+        # {}` mypy выводит как пустой dict, и .get по нему не типизируется.
+        extras: Dict[str, Any] = edge.extras if isinstance(edge.extras, dict) else {}
+        edge_selector = extras.get("selector")
+        if edge_selector is None:
+            # Ребро без селектора топология не строила. Обычно это наследие
+            # до contract 2.4, и трогать его нельзя — судить не по чему.
+            #
+            # Но есть второй путь: `k8s_endpoints_sync` подтверждает живые
+            # рёбра своим upsert_edge с extras={"endpoints_ready": ...}, без
+            # селектора. Таски идут в разных воркерах, и если корроборатор
+            # успел прочитать ребро до того, как мы его удалили, его upsert
+            # воссоздаст строку — уже БЕЗ селектора. Дальше эта же ветка
+            # хранила бы её вечно, и снятое ребро возвращалось бы каждый раз.
+            #
+            # Поэтому: если единственный источник ребра — корроборатор,
+            # топологического подтверждения у него нет, и снять его можно.
+            sources = {
+                src for src in (extras.get("discovery_sources") or [])
+                if isinstance(src, str)
+            }
+            if not sources or sources - {DISCOVERED_BY_ENDPOINTS}:
+                continue
+        elif edge_selector == selector:
+            continue
+        logger.info(
+            "k8s_topology_resources.stale_selector_edge_dropped "
+            "ns=%s svc=%s edge_selector=%s current_selector=%s",
+            svc_node.namespace, svc_node.name, edge_selector, selector,
+        )
+        db.delete(edge)
+        stats["edges_dropped_stale_selector"] += 1
 
 
 def _sync_one_service(
@@ -484,6 +613,10 @@ def _sync_one_service(
     stats["nodes_upserted"] += 1
 
     selector = meta_json["selector"] or {}
+    # Прежде чем искать новые матчи — снять те рёбра, что построены по
+    # прежнему selector'у. Иначе переключённый Service продолжает указывать
+    # на старый workload, и делает это молча.
+    _drop_stale_selector_edges(db, svc_node, selector, stats)
     if not selector:
         stats["skipped_no_selector"] += 1
         return

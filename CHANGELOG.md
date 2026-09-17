@@ -6,6 +6,39 @@ All notable changes to this project are documented in this file.
 
 ### Исправлено
 
+- **Граф врал о том, что стоит за прод-базой: ребро переживало смену
+  selector'а.** `config-worker-db-postgresql` в prod-shared 17.09.2026
+  переключили с bitnami-StatefulSet на CNPG. Узел Service синк обновил —
+  селектор в графе стал `cnpg.io/cluster`; ребро `serves_traffic` осталось
+  прежним, со старым селектором в `extras` и свежим `last_seen_at`. Матчей по
+  новому селектору нет (поды CNPG не принадлежат ни Deployment, ни
+  StatefulSet), `_sync_one_service` выходил по `skipped_no_match`, не трогая
+  ребро, и `kg_service_edges` / `kg_workload` сутками отвечали мёртвым
+  StatefulSet'ом — правдоподобно и неверно. Теперь ребро снимается, когда
+  `extras.selector` разошёлся с текущим селектором Service. Критерий именно
+  такой, а не «матчей нет»: пустой срез бывает и от таймаута `kubectl get
+  deployments -A` на 42 МБ JSON, по нему сносить топологию нельзя.
+- **CNPG-кластер не был представлен в графе вообще.** Синк собирал
+  Deployment / StatefulSet / DaemonSet, а поды CNPG создаёт оператор из
+  Cluster CR. Итог на проде — инверсия правды: живой primary не представлен
+  ничем, оставленный для отката StatefulSet представлен полноценно. Добавлен
+  ресурс `clusters.postgresql.cnpg.io`. Роль инстанса
+  (`cnpg.io/instanceRole`, `cnpg.io/podRole`) в матче не участвует: она про
+  то, какой под сейчас примари, а не про то, какой workload стоит за
+  сервисом — промоушен занимает секунды, и ребро отваливалось бы при каждом
+  failover. Вычистка ключей работает только для Cluster CR.
+- **Главный прод-релиз не попадал в `kg_deployments` ни одной записью.**
+  Фильтр деплоев искал английские токены (`deploy`/`update`/`backup`) в
+  отображаемом имени конфигурации, а
+  `Wo_Backend_K8sNewCluster_Prod_ReleaseToProd` называется «Релиз на PROD».
+  За 30 дней по `prod-*` в графе лежали ровно четыре buildtype:
+  DeployStatics, BackupAllDb, DeployPreprodTerrain и k8s_rollout — вопрос
+  «что приехало релизом» было нечем закрыть. Туда же уходило «Развернуть
+  Squad-окружение» (`InstallSquadEnv`). Теперь конфигурация опознаётся и по
+  id: имя человек пишет на любом языке, id TeamCity формирует латиницей и
+  при переименовании не трогает. Исключения зеркальны именным, плюс
+  `ReleasePoolToggle` — переключение пула агентов кода не катит.
+
 - **Владелец стенда: читаем лейбл `squad-owner`, а не только `deployed-by`.**
   В резолв `kg_namespaces.owner_*` добавлен путь `gd_claim` — заявка человека,
   которую кнопка «Сквад-окружение: занять / освободить» пишет прямо на
