@@ -39,7 +39,7 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.orm import Session
 
 from app.config import settings
-from app.context.seq_client import SeqClient
+from app.providers.factory import make_log_provider
 from app.knowledge_graph.schema import NODE_KIND_SERVICE, LogObservation, Service
 from app.services.pii_redaction import redact_pii
 
@@ -49,6 +49,21 @@ log = logging.getLogger(__name__)
 # Уровни Seq, которые льём в KG. Warning тоже учитываем (см. WO signal-m33302),
 # но при необходимости можно отрезать через env позже.
 _LEVELS = ("Error", "Fatal", "Warning")
+
+
+class LogSourceUnavailable(RuntimeError):
+    """Инстанс не ответил НИ ПО ОДНОМУ уровню — окно не наблюдалось.
+
+    Поднимается, чтобы прогон посчитал инстанс недостижимым, а не тихо
+    успешным. Без этого `_sync_instance` возвращался нормально даже когда
+    источник недоступен целиком: инстанс попадал в `reached`, защита
+    «reached == 0» не срабатывала, heartbeat писался — и полная слепота
+    выглядела как тишина в логах. Ровно тот случай, ради которого эта
+    защита и заводилась после 20.08.2026.
+
+    Частичный отказ (ответил хотя бы один уровень) исключением НЕ является:
+    там данные есть, и терять их из-за одного молчащего уровня незачем.
+    """
 
 
 def _load_instances() -> List[Dict[str, Optional[str]]]:
@@ -259,30 +274,37 @@ async def _sync_instance(
     token = instance.get("token") or None
     ns_hint = instance.get("namespace") or None
 
-    client = SeqClient(base_url=url, api_key=token, timeout=10.0)
-    stats = {"groups_total": 0, "matched": 0, "unmatched": 0, "rows": 0}
+    # Провайдер, а не SeqClient напрямую: синк не должен знать, откуда
+    # берутся логи. Реализация выбирается конфигом (LOG_PROVIDER_BACKEND),
+    # и смена источника не требует правок здесь.
+    provider = make_log_provider(name=name, url=url, token=token, timeout=10.0)
+    stats = {"groups_total": 0, "matched": 0, "unmatched": 0, "rows": 0,
+             "unmeasured": 0, "measured": 0}
 
     for level in _LEVELS:
-        try:
-            events = await client.top_messages(
-                level=level, since=since, until=until, limit=500,
-            )
-        except Exception as e:
+        window = await provider.service_stats(
+            level=level, since=since, until=until, limit=500,
+        )
+        if not window.measured:
+            # Окно НЕ наблюдалось. Пропускаем, не записывая нулей: строка
+            # с count=0 здесь означала бы «ошибок не было», а мы этого не
+            # знаем. Считаем такие окна отдельно — по ним видно слепоту.
+            stats["unmeasured"] += 1
             log.warning(
-                "seq_logs_sync.fetch_failed source=%s level=%s err=%s",
-                name, level, e,
+                "seq_logs_sync.unmeasured source=%s level=%s reason=%s",
+                name, level, window.reason,
             )
-            continue
-        if not events:
             continue
 
-        by_app = SeqClient.aggregate_by_service(events)
-        for app_name, (total, counter) in by_app.items():
+        stats["measured"] += 1
+        by_app = window.value or {}
+        if not by_app:
+            continue
+
+        for app_name, svc_stats in by_app.items():
             stats["groups_total"] += 1
-            top_msg = ""
-            if counter:
-                # most_common(1) — самый частый MessageTemplate в окне.
-                top_msg, _ = counter.most_common(1)[0]
+            total = svc_stats.count
+            top_msg = svc_stats.top_message
             top_hash = _msg_hash(top_msg) if top_msg else None
 
             svc_id: Optional[int] = None
@@ -326,6 +348,14 @@ async def _sync_instance(
                     name, app_name, level, e,
                 )
 
+    if stats["measured"] == 0:
+        # Ни одно окно не наблюдалось — про этот инстанс мы не знаем
+        # ничего. Вернуться нормально значило бы попасть в `reached` и
+        # объявить прогон успешным при полной слепоте.
+        raise LogSourceUnavailable(
+            f"{name}: ни один уровень из {len(_LEVELS)} не измерен"
+        )
+
     return stats
 
 
@@ -349,6 +379,10 @@ async def _sync_seq_logs_async(
         # Сколько инстансов реально ответили. Без этого счётчика «rows=0»
         # означает одновременно «в логах тихо» и «спросить не удалось».
         "reached": 0, "failed": 0,
+        # Окна, которые не удалось наблюдать у достигнутых инстансов.
+        # Инстанс ответил хотя бы по одному уровню, но не по всем — данные
+        # частичные, и это не то же самое, что «в логах тихо».
+        "unmeasured_windows": 0,
     }
     for inst in instances:
         try:
@@ -361,6 +395,7 @@ async def _sync_seq_logs_async(
             )
             continue
         totals["reached"] += 1
+        totals["unmeasured_windows"] += stats.get("unmeasured", 0)
         totals["rows"] += stats["rows"]
         totals["matched"] += stats["matched"]
         totals["unmatched"] += stats["unmatched"]

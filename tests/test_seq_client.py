@@ -104,8 +104,17 @@ async def test_count_events_empty_returns_zero():
 
 
 @pytest.mark.asyncio
-async def test_count_events_http_error_returns_zero():
-    """Любая ошибка HTTP → graceful 0 (не падаем)."""
+async def test_count_events_http_error_raises_not_zero():
+    """Ошибка HTTP → SeqQueryError, а НЕ ноль.
+
+    Раньше здесь возвращался «graceful 0», и это был тот же дефект, что
+    чинили в top_messages после 20.08.2026 (NetworkPolicy перекрыла Seq,
+    синк 12,8 часа отчитывался rows=0): ноль, означающий «источник
+    недоступен», неотличим от «ошибок не было». Пустота — факт, отказ —
+    отсутствие факта.
+    """
+    from app.context.seq_client import SeqQueryError
+
     mock_client = AsyncMock()
     mock_client.__aenter__ = AsyncMock(return_value=mock_client)
     mock_client.__aexit__ = AsyncMock(return_value=False)
@@ -114,9 +123,8 @@ async def test_count_events_http_error_returns_zero():
 
     with patch("httpx.AsyncClient", mock_cls):
         client = SeqClient(base_url="https://host/seq")
-        total = await client.count_events("Error", _SINCE, _UNTIL)
-
-    assert total == 0
+        with pytest.raises(SeqQueryError):
+            await client.count_events("Error", _SINCE, _UNTIL)
 
 
 # ---------- count_events: поведение на cap --------------------------------
