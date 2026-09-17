@@ -59,18 +59,6 @@ class StateMachine:
             # _safe_transition увидит терминал и поднимет
             # IncidentResolvedExternally — пайплайн остановится чисто.
             IncidentState.RESOLVED,
-            # Алерт вне области действия пайплайна (severity/namespace, см.
-            # app/workers/pipeline_scope.py). Разбирать его копайлот не
-            # будет — этим занимается человек, и TRIAGE_REQUIRED означает
-            # ровно это.
-            #
-            # Без такого перехода строка оставалась бы в OPEN, а OPEN входит
-            # в _SKIP_STATES вебхука: каждый следующий fire того же
-            # fingerprint дедуплицировался бы, и расширение фильтра не
-            # подхватило бы уже активный инцидент — до тех пор, пока тот не
-            # погаснет и не загорится снова. Тот же класс залипания, что
-            # выше чинил переход OPEN → RESOLVED.
-            IncidentState.TRIAGE_REQUIRED,
             IncidentState.FAILED,
         },
         IncidentState.INVESTIGATING: {

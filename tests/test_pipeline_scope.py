@@ -4,6 +4,8 @@
 до critical + prod-*». Проверяется и сам фильтр, и то, что он стоит на
 пути, мимо которого не пройти.
 """
+from unittest.mock import MagicMock, patch
+
 import pytest
 
 from app.config import settings
@@ -98,45 +100,148 @@ async def test_scope_gate_blocks_pipeline_entry(monkeypatch):
     assert result["reason"] == "severity_out_of_scope"
 
 
-@pytest.mark.asyncio
-async def test_scope_skip_leaves_incident_redispatchable(monkeypatch, tmp_path):
-    """Скип по области действия не должен запирать инцидент в OPEN.
+# --- фильтр в вебхуке: запись не создаётся вовсе ---------------------------
 
-    OPEN входит в `_SKIP_STATES` вебхука: оставшись там, инцидент
-    дедуплицировался бы на каждом следующем fire, и расширение фильтра не
-    подхватило бы уже активный алерт, пока тот не погаснет и не загорится
-    снова.
-    """
+def _webhook_payload(severity: str, namespace: str, status: str = "firing") -> dict:
+    return {
+        "version": "4",
+        "groupKey": "g1",
+        "status": status,
+        "alerts": [{
+            "status": status,
+            "labels": {"severity": severity, "namespace": namespace,
+                       "alertname": "TestAlert"},
+            "annotations": {"summary": "тест"},
+            "startsAt": "2026-09-17T10:00:00Z",
+            "fingerprint": "fp-scope-1",
+        }],
+    }
+
+
+@pytest.fixture
+def scoped_db(monkeypatch, tmp_path):
+    """Живая sqlite-БД + продовый scope-фильтр."""
     from sqlalchemy import create_engine
     from sqlalchemy.orm import sessionmaker
 
-    from app.core.state_machine import IncidentState
-    from app.database import Base, IncidentRecord
-    from app.workers import tasks
+    from app.database import Base
 
     engine = create_engine(f"sqlite:///{tmp_path}/scope.db")
     Base.metadata.create_all(engine)
     Session = sessionmaker(bind=engine)
-    monkeypatch.setattr(tasks, "SessionLocal", Session)
 
-    db = Session()
+    monkeypatch.setattr(settings, "PIPELINE_SEVERITY_ALLOWLIST", ["critical"], raising=False)
+    monkeypatch.setattr(settings, "PIPELINE_NAMESPACE_PREFIXES", ["prod-"], raising=False)
+    return Session
+
+
+@pytest.mark.asyncio
+async def test_out_of_scope_alert_creates_no_record(scoped_db):
+    """Отфильтрованный алерт не оставляет строки в БД.
+
+    Запись, созданная для алерта, который пайплайн разбирать не будет,
+    дальше мешает трижды: OPEN входит в `_SKIP_STATES` и глушит дедупом
+    последующие fire; терминальный статус делает резолв no-op'ом; re-fire
+    при `repeat_interval` засчитывается флаппингом. Отсутствие записи
+    снимает все три разом.
+    """
+    from app.api.webhooks import alertmanager_webhook
+    from app.database import IncidentRecord
+    from app.models.incident import AlertManagerWebhook
+
+    db = scoped_db()
+    payload = AlertManagerWebhook(**_webhook_payload("warning", "dev-17"))
+
+    result = await alertmanager_webhook(payload, db=db)
+
+    assert result["alerts"][0]["task_id"] == "out_of_scope"
+    assert db.query(IncidentRecord).count() == 0, "строки быть не должно"
+    db.close()
+
+
+@pytest.mark.asyncio
+async def test_repeat_firing_does_not_accumulate_flaps(scoped_db):
+    """Повтор firing по repeat_interval не накручивает flap_count.
+
+    AlertManager шлёт уведомление снова, пока алерт горит. Записи нет —
+    считать нечего, и ложной истории флаппинга не появляется.
+    """
+    from app.api.webhooks import alertmanager_webhook
+    from app.database import IncidentRecord
+    from app.models.incident import AlertManagerWebhook
+
+    db = scoped_db()
+    payload = AlertManagerWebhook(**_webhook_payload("warning", "dev-17"))
+
+    for _ in range(3):
+        await alertmanager_webhook(payload, db=db)
+
+    assert db.query(IncidentRecord).count() == 0
+    db.close()
+
+
+@pytest.mark.asyncio
+async def test_widened_scope_picks_up_the_next_firing(scoped_db, monkeypatch):
+    """Расширили фильтр — следующий firing обрабатывается, ждать резолва не нужно."""
+    from app.api.webhooks import alertmanager_webhook
+    from app.database import IncidentRecord
+    from app.models.incident import AlertManagerWebhook
+
+    db = scoped_db()
+    payload = AlertManagerWebhook(**_webhook_payload("warning", "dev-17"))
+    await alertmanager_webhook(payload, db=db)
+    assert db.query(IncidentRecord).count() == 0
+
+    monkeypatch.setattr(settings, "PIPELINE_SEVERITY_ALLOWLIST", [], raising=False)
+    monkeypatch.setattr(settings, "PIPELINE_NAMESPACE_PREFIXES", [], raising=False)
+    with patch("app.api.webhooks.process_incident_task") as task:
+        task.delay.return_value = MagicMock(id="t1")
+        await alertmanager_webhook(payload, db=db)
+
+    assert db.query(IncidentRecord).count() == 1
+    db.close()
+
+
+@pytest.mark.asyncio
+async def test_resolve_of_existing_record_still_applies(scoped_db):
+    """Резолв записи, созданной когда фильтр был шире, обязан отработать.
+
+    Поэтому scope-проверка стоит ПОСЛЕ ветки resolved: иначе инцидент,
+    принятый до сужения фильтра, навсегда остался бы незакрытым.
+    """
+    from app.api.webhooks import alertmanager_webhook
+    from app.core.state_machine import IncidentState
+    from app.database import IncidentRecord
+    from app.models.incident import AlertManagerWebhook
+
+    db = scoped_db()
     db.add(IncidentRecord(
-        incident_id="fp-1", status=IncidentState.OPEN.value, data={},
+        incident_id="fp-scope-1", status=IncidentState.OPEN.value, data={},
     ))
     db.commit()
+
+    payload = AlertManagerWebhook(**_webhook_payload("warning", "dev-17", status="resolved"))
+    await alertmanager_webhook(payload, db=db)
+
+    row = db.query(IncidentRecord).filter_by(incident_id="fp-scope-1").first()
+    assert row.status == IncidentState.RESOLVED.value
     db.close()
 
-    monkeypatch.setattr(settings, "LLM_PIPELINE_ENABLED", True, raising=False)
-    monkeypatch.setattr(settings, "PIPELINE_SEVERITY_ALLOWLIST", ["critical"], raising=False)
-    monkeypatch.setattr(settings, "PIPELINE_NAMESPACE_PREFIXES", [], raising=False)
 
-    await tasks.async_process_incident(
-        {"incident_id": "fp-1", "severity": "warning", "namespace": "dev-17"}
-    )
+@pytest.mark.asyncio
+async def test_in_scope_alert_is_accepted(scoped_db):
+    """Продовый critical проходит фильтр и попадает в обработку."""
+    from app.api.webhooks import alertmanager_webhook
+    from app.database import IncidentRecord
+    from app.models.incident import AlertManagerWebhook
 
-    db = Session()
-    status = db.query(IncidentRecord).filter_by(incident_id="fp-1").first().status
+    db = scoped_db()
+    payload = AlertManagerWebhook(**_webhook_payload("critical", "prod-k5"))
+
+    with patch("app.api.webhooks.process_incident_task") as task:
+        task.delay.return_value = MagicMock(id="t1")
+        result = await alertmanager_webhook(payload, db=db)
+
+    assert result["alerts"][0]["task_id"] != "out_of_scope"
+    assert db.query(IncidentRecord).count() == 1
     db.close()
-
-    assert status == IncidentState.TRIAGE_REQUIRED.value
-    assert status != IncidentState.OPEN.value, "инцидент остался бы недостижим для re-fire"

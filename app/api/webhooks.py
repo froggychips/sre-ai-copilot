@@ -20,6 +20,7 @@ from app.knowledge_graph.remediation_events import (SignatureError,
 from app.metrics import ALERTS_SUPPRESSED
 from app.models.remediation_event import RemediationEventIn
 from app.models.incident import AlertManagerAlert, AlertManagerWebhook, Incident
+from app.workers.pipeline_scope import check_scope
 from app.services.teamcity_service import incident_teamcity_context
 from app.workers.tasks import (async_process_incident, celery_app,
                                process_incident_task)
@@ -412,6 +413,34 @@ async def alertmanager_webhook(
             accepted.append({
                 "incident_id": incident.incident_id,
                 "task_id": resolve_result,
+            })
+            continue
+
+        # ── ОБЛАСТЬ ДЕЙСТВИЯ: фильтр ДО создания записи ──────────────────
+        # Отсекаем то, что пайплайн разбирать не будет (severity/namespace,
+        # см. app/workers/pipeline_scope.py), прежде чем в БД появится
+        # IncidentRecord. Именно до, а не после: строка, созданная для
+        # отфильтрованного алерта, дальше мешает трижды — OPEN входит в
+        # _SKIP_STATES и глушит дедупом последующие fire; терминальный
+        # статус делает резолв no-op'ом, и алерт остаётся «требующим
+        # внимания» после того, как погас; а re-fire при repeat_interval
+        # засчитывается флаппингом, накручивая счётчик и повторную работу.
+        # Без записи ни одной из этих проблем не возникает, а расширение
+        # фильтра подхватит алерт на следующем же firing-уведомлении.
+        #
+        # Проверка стоит ПОСЛЕ ветки resolved: резолв уже существующей
+        # записи (созданной, когда фильтр был шире) обязан отработать.
+        scope = check_scope(incident.model_dump())
+        if not scope.in_scope:
+            log.info(
+                "webhook.out_of_scope",
+                incident_id=incident.incident_id,
+                **scope.as_dict(),
+            )
+            accepted.append({
+                "incident_id": incident.incident_id,
+                "task_id": "out_of_scope",
+                "reason": scope.reason,
             })
             continue
 
