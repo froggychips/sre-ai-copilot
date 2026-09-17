@@ -110,21 +110,23 @@ def test_dead_namespace_nodes_are_not_counted(db):
 # ── покрытие источников ────────────────────────────────────────────────────
 
 
-def test_silent_source_is_listed_but_does_not_raise_status(db):
-    """Молчание источника видно в detail, но статуса НЕ поднимает.
+def test_silent_source_raises_status(db):
+    """Молчание источника — находка, а не «не знаю».
 
-    `_REPORTS` живёт в памяти процесса, а celery крутит несколько воркеров
-    с рециклом — одна проверка физически видит лишь часть источников.
-    Поднимай silent статус, warn горел бы всегда и через сутки стал
-    залипшим CopilotSelfHealthWarnStuck: ровно тот шум, ради устранения
-    которого Этап 0 и делается. Молчание — «не знаю», а не «плохо».
+    Так было не всегда: пока отчёты жили только в памяти процесса, silent
+    означал «этот форк не видел прогона», warn горел бы всегда и через
+    сутки стал бы залипшим CopilotSelfHealthWarnStuck. Поэтому статус по
+    silent не поднимался, и метрика была, а сигнала не было.
+
+    С переносом отчётов в redis (17.09.2026) молчание снова означает ровно
+    то, чем кажется, и проверка снова может о нём сказать.
     """
     record_source_run(SOURCE_KG_SYNC, {"services_fetched": 10, "errors": 0})
 
     r = check_source_coverage(db)
     assert r.detail["sources_reported"] == 1
     assert len(r.detail["silent"]) == len(ALL_EDGE_SOURCES) - 1
-    assert r.status == "ok"
+    assert r.status == "warn"
 
 
 def test_all_sources_reported_is_ok(db):
@@ -300,3 +302,26 @@ def test_empty_fetch_is_not_unhealthy(db):
     r = check_source_coverage(db)
     assert SOURCE_INGRESS_SYNC not in r.detail["unhealthy"]
     assert r.status == "ok"
+
+
+def test_expired_report_raises_status(db, monkeypatch):
+    """Просроченный отчёт — тоже находка, а не тишина.
+
+    Запись живёт в redis 48 часов, окном свежести считаются 24: между ними
+    лежит просроченный, но ещё не удалённый отчёт. Не учитывай мы его,
+    проверка молчала бы ровно сутки — причём именно тогда, когда
+    сохранённая метка времени ДОКАЗЫВАЕТ, что источник пропустил срок.
+    """
+    from app.knowledge_graph import edge_decay_guard as guard
+
+    for source in ALL_EDGE_SOURCES:
+        record_source_run(source, {"errors": 0})
+    # Отчёт есть, но старше окна свежести.
+    stale = datetime.utcnow() - timedelta(hours=guard._fresh_hours() + 1)
+    guard._REPORTS[SOURCE_KG_SYNC] = guard.SourceReport(
+        source=SOURCE_KG_SYNC, ts=stale, fetched=1, errors=0, failed=False,
+    )
+
+    r = check_source_coverage(db)
+    assert SOURCE_KG_SYNC in r.detail["expired"]
+    assert r.status == "warn"

@@ -63,7 +63,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Mapping, Optional, Tuple
 
 from sqlalchemy import func
@@ -214,11 +214,17 @@ class SourceReport:
     raw: Dict[str, Any] = field(default_factory=dict)
 
 
-# In-process реестр отчётов. ОГРАНИЧЕНИЕ: celery-worker раскидывает beat-таски
-# по forked-процессам, поэтому отчёт чужого синка kg_sync увидит только если
-# они попали в один процесс. Это не дыра, а слой: когда отчёта нет, решение
-# принимает фоллбэк по данным (`max(last_seen_at)`), который межпроцессный по
-# определению. Апгрейд до durable-хранилища потребует таблицы (миграции).
+# In-process кэш отчётов. С 17.09.2026 он больше не единственный слой:
+# `record_source_run` дублирует отчёт в redis, и `get_source_report` читает
+# оттуда, если в этом процессе отчёта нет. Раньше отчёт чужого синка
+# соседний форк не видел вовсе — celery раскидывает beat-таски по
+# процессам, — и `check_source_coverage` не мог отличить «источник молчит»
+# от «этот форк не видел прогона», а decay терял точную причину и
+# откатывался на общий `no_recent_refresh`.
+#
+# Память остаётся первой ступенью: она быстрее и переживает недоступный
+# redis. Отдельной таблицы для этого не нужно — истории здесь не хранится,
+# только последний отчёт на источник.
 _REPORTS: Dict[str, SourceReport] = {}
 
 
@@ -258,7 +264,60 @@ def record_source_run(
         raw=payload,
     )
     _REPORTS[source] = report
+    _persist_report(report)
     return report
+
+
+def _persist_report(report: SourceReport) -> None:
+    """Продублировать отчёт в redis — чтобы его увидел соседний процесс.
+
+    Fail-open и намеренно молча: синк свою работу уже сделал, и падать на
+    недоступном redis из-за телеметрии он не должен. Ошибку залогирует сам
+    слой записи.
+    """
+    try:
+        from app.services.digest.state import record_source_report
+
+        record_source_report(report.source, {
+            "ts": report.ts.isoformat(),
+            "fetched": report.fetched,
+            "errors": report.errors,
+            "failed": report.failed,
+        })
+    except Exception:  # noqa: BLE001 — телеметрия не роняет синк
+        pass
+
+
+def _report_from_redis(source: str) -> Optional[SourceReport]:
+    """Отчёт соседнего процесса. None — ключа нет, redis лёг или мусор.
+
+    `raw` намеренно не переносится: он нужен только для отладки внутри
+    одного прогона, а в redis раздувал бы значение полным stats-словарём
+    синка. Решения принимаются по fetched/errors/failed.
+    """
+    try:
+        from app.services.digest.state import get_source_report
+
+        data = get_source_report(source)
+        if not data:
+            return None
+        ts_raw = data.get("ts")
+        ts = datetime.fromisoformat(ts_raw) if ts_raw else None
+        if ts is None:
+            return None
+        if ts.tzinfo is not None:
+            ts = ts.astimezone(timezone.utc).replace(tzinfo=None)
+        fetched = data.get("fetched")
+        return SourceReport(
+            source=source,
+            ts=ts,
+            fetched=int(fetched) if fetched is not None else None,
+            errors=int(data.get("errors") or 0),
+            failed=bool(data.get("failed")),
+            raw={},
+        )
+    except Exception:  # noqa: BLE001 — читаем best-effort
+        return None
 
 
 def reset_source_reports() -> None:
@@ -267,8 +326,28 @@ def reset_source_reports() -> None:
 
 
 def get_source_report(source: str) -> Optional[SourceReport]:
-    """Последний отчёт источника (или None)."""
-    return _REPORTS.get(source)
+    """Самый СВЕЖИЙ отчёт источника: из своего процесса или из redis.
+
+    Берётся тот, у кого позже `ts`, а не локальный по умолчанию. Разница
+    существенная: следующий прогон того же синка мог уйти в другой форк и
+    записать в redis свежий отчёт — упавший или с пустым fetch'ем. Отдай
+    мы локальный просто потому, что он свой, старый здоровый отчёт
+    маскировал бы новый сбойный на всё окно свежести, и decay считал бы
+    источник живым.
+
+    Redis-ступень нужна и сама по себе: синк отработал в ОДНОМ форке, а
+    решение принимается в другом — до 17.09.2026 такой отчёт для читателя
+    просто не существовал.
+
+    Fail-open: redis недоступен → остаётся локальный, как раньше.
+    """
+    local = _REPORTS.get(source)
+    remote = _report_from_redis(source)
+    if local is None:
+        return remote
+    if remote is None:
+        return local
+    return remote if remote.ts > local.ts else local
 
 
 def _resolve_sources(
@@ -443,7 +522,11 @@ def _unhealthy(
             continue
         # Сигнал 1: свежий per-cycle отчёт синка — самый точный и
         # actionable, поэтому его причина имеет приоритет в логах.
-        report = _REPORTS.get(source)
+        # Читаем через get_source_report: с 17.09.2026 он берёт отчёт и из
+        # redis, поэтому прогон из соседнего форка больше не невидим —
+        # раньше в таком случае терялась точная причина (empty_fetch,
+        # fetch_errors) и всё сводилось к общему no_recent_refresh.
+        report = get_source_report(source)
         if report is not None and report.ts >= cutoff:
             reason = _grade_report(report)
             if reason:
