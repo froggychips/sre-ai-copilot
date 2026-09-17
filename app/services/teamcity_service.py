@@ -488,14 +488,20 @@ def _is_deploy_buildtype(
     не трогает. Судить только по имени — значит терять всё, что назвали
     по-русски, а это включало главный прод-релиз.
     """
+    # Исключения по id проверяются ПЕРВЫМИ, до имени. Порядок существенный:
+    # имя редактируемо, id — нет, и если конфигурацию из списка исключений
+    # переименуют во что-то с deploy/update/backup внутри («Release Pool
+    # Toggle» → «Update release pool agents»), проверка по имени объявила бы
+    # её деплоем, ни разу не заглянув в _DEPLOY_ID_EXCLUDE. Это ровно
+    # противоречит посылке, ради которой id вообще добавлен.
+    lower_id = buildtype_id.lower() if buildtype_id else ""
+    if lower_id and any(ex in lower_id for ex in _DEPLOY_ID_EXCLUDE):
+        return False
     if _is_deploy_buildtype_name(name):
         return True
-    if not buildtype_id:
+    if not lower_id:
         return False
-    lower = buildtype_id.lower()
-    if any(ex in lower for ex in _DEPLOY_ID_EXCLUDE):
-        return False
-    return any(tok in lower for tok in _DEPLOY_ID_TOKENS)
+    return any(tok in lower_id for tok in _DEPLOY_ID_TOKENS)
 
 
 def _fetch_recent_deploys_direct(

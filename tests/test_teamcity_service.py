@@ -378,3 +378,17 @@ def test_is_deploy_buildtype_falls_back_to_name_without_id():
     """Без id поведение прежнее — источник мог не отдать buildTypeId."""
     assert _is_deploy_buildtype("Build and full deploy", None)
     assert not _is_deploy_buildtype("Maintenance", None)
+
+
+def test_id_exclusion_wins_over_renamed_display_name():
+    """Переименование не превращает исключённую конфигурацию в деплой.
+
+    Имя редактируемо, id — нет. Если «Release Pool Toggle» переименуют в
+    «Update release pool agents», проверка по имени сказала бы «деплой» и
+    засорила бы kg_deployments сборкой, которая кода не катит. Исключения
+    по id поэтому проверяются первыми.
+    """
+    assert not _is_deploy_buildtype(
+        "Update release pool agents", "Wo_Admin_Preupdate_ReleasePoolToggle")
+    assert not _is_deploy_buildtype(
+        "Backup terrain settings", "Wo_Backend_K8sNewCluster_UpdateTerrain")

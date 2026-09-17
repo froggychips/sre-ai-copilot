@@ -100,7 +100,23 @@ metadata:
     {{- include "sre-ai-copilot.labels" . | nindent 4 }}
 rules:
 - apiGroups: ["apps"]
-  resources: ["deployments"]
+  # statefulsets/daemonsets — те же, что в k8s/base/rbac.yaml. Здесь их не
+  # было: чарт остался на одних deployments, то есть в helm-развёртывании
+  # Service, за которым стоит БД, не матчился ни на что — ровно тот дефект,
+  # который в base закрыли 08.08.2026 (2231 промах за тик).
+  resources: ["deployments", "statefulsets", "daemonsets"]
+  verbs: ["get", "list", "watch"]
+# CNPG: поды кластера создаёт оператор из Cluster CR, и без чтения этого
+# ресурса Service `*-cnpg-rw` не матчится ни на один workload. Замер
+# 17.09.2026: живой primary config-worker-db-cnpg не был представлен в графе
+# вообще, а оставленный для отката StatefulSet — был.
+#
+# Права здесь ОБЯЗАТЕЛЬНЫ именно потому, что их отсутствие не видно:
+# `_kubectl_get_all` превращает Forbidden в пустой список, то есть синк не
+# упадёт и не залогирует ошибку — он просто никогда не найдёт ни одного
+# кластера, и фикс топологии молча не заработает.
+- apiGroups: ["postgresql.cnpg.io"]
+  resources: ["clusters"]
   verbs: ["get", "list", "watch"]
 # `namespaces` cluster-wide list — auto-discovery non-system ns в
 # kg_sync.discover_namespaces() и drift_cleanup.fetch_live_namespaces().
