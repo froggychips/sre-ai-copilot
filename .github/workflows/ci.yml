@@ -19,20 +19,21 @@ jobs:
     name: Lint and Test
     # Self-hosted runner (jabbook-air-m3-sre-copilot) because the froggychips
     # account is currently blocked from GitHub-hosted runners on a billing
-    # issue. macOS arm64; we use the homebrew-installed Python 3.12 directly
-    # instead of actions/setup-python — that action assumes GitHub-hosted
-    # paths (/Users/runner) that don't exist on a self-hosted setup.
+    # issue. macOS arm64, actions/setup-python не используется — тот action
+    # рассчитан на GitHub-hosted пути (/Users/runner), которых здесь нет.
     #
-    # ВНИМАНИЕ: 3.12 здесь ≠ 3.11 в Dockerfile (рантайм прода). Тесты идут НЕ
-    # на версии прода — осознанный долг, а не проектное решение.
-    # Прежнее обоснование («psycopg2-binary имеет arm64-колёса только с cp312»)
-    # УСТАРЕЛО: проверено 2026-08-10 для запиненной 2.9.12 —
-    # psycopg2_binary-2.9.12-cp311-cp311-macosx_11_0_arm64.whl существует.
-    # Реальная причина сейчас одна: на раннере из homebrew стоят только
-    # 3.12/3.13/3.14, python@3.11 не установлен.
-    # Чтобы выровнять с продом: brew install python@3.11 на раннере, затем
-    # заменить пути ниже на /opt/homebrew/bin/python3.11 (ruff.toml и mypy.ini
-    # уже описывают 3.11 — см. комментарий в ruff.toml).
+    # Долг «тесты идут не на версии прода» закрыт 17.09.2026: интерпретатор
+    # берётся ровно тот, что в Dockerfile (3.11), и держится тестом
+    # tests/test_ops_manifests.py::test_python_version_is_consistent_across_toolchain.
+    #
+    # Питон ставит uv, а НЕ homebrew, и это вынужденно. `brew install
+    # python@3.11` на этой машине ставится, но сборка нерабочая: под macOS
+    # 26.1 `platform.mac_ver()` у неё возвращает пустую строку, из-за чего
+    # падает и `ensurepip` (ValueError: invalid literal for int()), и любой
+    # инструмент, читающий версию ОС. У homebrew-3.12 та же функция отвечает
+    # корректно — то есть дело в конкретной бутылке 3.11, а не в машине.
+    # `uv venv --python 3.11` берёт standalone-сборку CPython и работает;
+    # проверено полным прогоном набора (3433 passed) на 3.11.14.
     runs-on: [self-hosted, macOS, ARM64]
     # Изоляция self-hosted раннера от чужого кода (security finding 19.08.2026).
     #
@@ -65,7 +66,10 @@ jobs:
           fetch-depth: 0
 
       - name: Show Python version
-        run: /opt/homebrew/bin/python3.12 --version
+        run: |
+          export PATH="$HOME/.local/bin:$PATH"
+          uv python find 3.11 >/dev/null || uv python install 3.11
+          uv run --python 3.11 python --version
 
       # Версии инструментов запинены. Без пинов они ставились «последние», а
       # стабильность держалась случайно: .venv переиспользуется между прогонами
@@ -78,9 +82,13 @@ jobs:
       # при переезде на requirements-dev.txt он начнёт слать PR-ы на них.
       - name: Create venv and install dependencies
         run: |
-          /opt/homebrew/bin/python3.12 -m venv .venv
-          .venv/bin/pip install --upgrade pip
-          .venv/bin/pip install \
+          export PATH="$HOME/.local/bin:$PATH"
+          # venv пересоздаётся под 3.11: при clean:false здесь мог остаться
+          # каталог, собранный прежним интерпретатором 3.12, и тогда прогон
+          # молча продолжился бы на нём.
+          rm -rf .venv
+          uv venv --python 3.11 .venv
+          uv pip install --python .venv/bin/python \
             ruff==0.15.20 \
             mypy==2.1.0 \
             pytest==9.1.1 \
@@ -89,7 +97,10 @@ jobs:
             pytest-mock==3.15.1 \
             bandit==1.9.4 \
             pip-audit==2.10.1
-          if [ -f requirements.txt ]; then .venv/bin/pip install -r requirements.txt; fi
+          if [ -f requirements.txt ]; then
+            uv pip install --python .venv/bin/python -r requirements.txt
+          fi
+          .venv/bin/python --version
 
       # Ruff — blocking. Долг расчищен (2026-05-13).
       # Любая новая ruff-ошибка должна быть исправлена в PR, не накапливаться.
