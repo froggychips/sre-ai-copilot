@@ -578,8 +578,19 @@ def _drop_orphan_open_record(incident_id: str) -> None:
                 "api и worker разошлись в области действия (окно выкатки?)",
                 incident_id,
             )
-    except Exception as e:  # noqa: BLE001
+    except Exception as e:
         db.rollback()
+        if isinstance(e, RETRIABLE_EXC):
+            # Транзиентный сбой БД: проглотить его значит вернуть успех,
+            # дать Celery подтвердить задачу и оставить строку в OPEN — то
+            # есть ровно то состояние, ради устранения которого эта уборка
+            # и делается. Пробрасываем, чтобы задача была переиграна:
+            # OperationalError уже входит в RETRIABLE_EXC.
+            logger.warning(
+                "pipeline.scope_skip_orphan_retry incident_id=%s error=%s",
+                incident_id, e,
+            )
+            raise
         logger.warning(
             "pipeline.scope_skip_orphan_not_dropped incident_id=%s error=%s",
             incident_id, e,

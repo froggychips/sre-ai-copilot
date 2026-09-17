@@ -355,3 +355,63 @@ async def test_missing_record_is_not_an_error(monkeypatch, tmp_path):
     )
 
     assert result["status"] == "skipped"
+
+
+@pytest.mark.asyncio
+async def test_transient_cleanup_failure_is_retried(monkeypatch):
+    """Сбой БД при уборке не должен превращаться в успешную задачу.
+
+    Проглотив его, мы вернули бы успех, Celery подтвердил бы задачу, а
+    строка осталась бы в OPEN — то самое состояние, ради устранения
+    которого уборка и делается. OperationalError уже входит в
+    RETRIABLE_EXC, поэтому задача будет переиграна.
+    """
+    from sqlalchemy.exc import OperationalError
+
+    from app.workers import tasks
+
+    def _broken_session():
+        raise OperationalError("SELECT 1", {}, Exception("server closed"))
+
+    monkeypatch.setattr(tasks, "SessionLocal", _broken_session)
+    monkeypatch.setattr(settings, "LLM_PIPELINE_ENABLED", True, raising=False)
+    monkeypatch.setattr(settings, "PIPELINE_SEVERITY_ALLOWLIST", ["critical"], raising=False)
+    monkeypatch.setattr(settings, "PIPELINE_NAMESPACE_PREFIXES", [], raising=False)
+
+    with pytest.raises(OperationalError):
+        await tasks.async_process_incident(
+            {"incident_id": "fp-db-down", "severity": "warning", "namespace": "dev-17"}
+        )
+
+
+@pytest.mark.asyncio
+async def test_permanent_cleanup_failure_does_not_block_the_skip(monkeypatch, tmp_path):
+    """Неретраибельная ошибка уборки не должна валить скип бесконечно.
+
+    Ретрай тут не поможет — а скип сам по себе корректен: алерт вне
+    области действия, LLM не тронут.
+    """
+    from sqlalchemy import create_engine
+    from sqlalchemy.orm import sessionmaker
+
+    from app.database import Base
+    from app.workers import tasks
+
+    engine = create_engine(f"sqlite:///{tmp_path}/perm.db")
+    Base.metadata.create_all(engine)
+    Session = sessionmaker(bind=engine)
+
+    class _Broken(Session.class_):
+        def query(self, *_a, **_k):
+            raise ValueError("схема разъехалась")
+
+    monkeypatch.setattr(tasks, "SessionLocal", lambda: _Broken(bind=engine))
+    monkeypatch.setattr(settings, "LLM_PIPELINE_ENABLED", True, raising=False)
+    monkeypatch.setattr(settings, "PIPELINE_SEVERITY_ALLOWLIST", ["critical"], raising=False)
+    monkeypatch.setattr(settings, "PIPELINE_NAMESPACE_PREFIXES", [], raising=False)
+
+    result = await tasks.async_process_incident(
+        {"incident_id": "fp-perm", "severity": "warning", "namespace": "dev-17"}
+    )
+
+    assert result["status"] == "skipped"
