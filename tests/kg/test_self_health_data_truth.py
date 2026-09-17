@@ -14,6 +14,7 @@ from sqlalchemy.orm import sessionmaker
 from app.database import Base
 from app.knowledge_graph import edge_decay_guard
 from app.knowledge_graph.edge_decay_guard import (ALL_EDGE_SOURCES,
+                                                  SOURCE_INGRESS_SYNC,
                                                   SOURCE_KG_SYNC,
                                                   record_source_run)
 from app.knowledge_graph.schema import (Namespace, Service, ServiceHealth,
@@ -282,3 +283,20 @@ def test_unexpected_gap_does_raise_warn(db, monkeypatch):
     r = sh.check_silent_gaps(db)
     assert len(r.detail["unexpected"]) == 1
     assert r.status == "warn"
+
+
+def test_empty_fetch_is_not_unhealthy(db):
+    """Источник без объектов — не сломанный источник.
+
+    `_grade_report` считает нулевой fetch за empty_fetch, и в decay это
+    осмысленно: тот смотрит на источники, у которых в графе уже есть рёбра.
+    Здесь инвентарь не проверяется, поэтому кластер без Ingress'ов или без
+    PVC давал бы вечный warn на здоровом источнике.
+    """
+    for source in ALL_EDGE_SOURCES:
+        record_source_run(source, {"errors": 0})
+    record_source_run(SOURCE_INGRESS_SYNC, {"ingresses_fetched": 0, "errors": 0})
+
+    r = check_source_coverage(db)
+    assert SOURCE_INGRESS_SYNC not in r.detail["unhealthy"]
+    assert r.status == "ok"

@@ -1425,7 +1425,8 @@ def check_source_coverage(db: Session) -> CheckResult:
     до `fail` можно будет, когда отчёты станут персистентными.
     """
     from app.knowledge_graph.edge_decay_guard import (
-        ALL_EDGE_SOURCES, _fresh_hours, _grade_report, get_source_report)
+        ALL_EDGE_SOURCES, REASON_EMPTY_FETCH, _fresh_hours, _grade_report,
+        get_source_report)
 
     # Просроченный отчёт = «не знаю», а не «сломано». Без TTL один неудачный
     # прогон в конкретном форке помнился бы вечно: последующие успешные
@@ -1447,6 +1448,15 @@ def check_source_coverage(db: Session) -> CheckResult:
             expired.append(source)
             continue
         reason = _grade_report(report)
+        # `empty_fetch` здесь НЕ считается нездоровьем. В decay этот вердикт
+        # осмыслен: тот смотрит на источники, у которых в графе уже есть
+        # рёбра, и ноль объектов у них значит сбой fetch'а. Здесь инвентарь
+        # не проверяется вовсе, поэтому источник, у которого объектов
+        # законно нет (кластер без Ingress'ов или без PVC), выглядел бы
+        # сломанным вечно — и снова дал бы залипший warn.
+        # Явные отказы и ошибки остаются нездоровьем без оговорок.
+        if reason == REASON_EMPTY_FETCH:
+            reason = None
         reported[source] = {
             "fetched": report.fetched,
             "errors": report.errors,
