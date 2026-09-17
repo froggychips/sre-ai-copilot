@@ -1,9 +1,14 @@
-"""PR из чужого форка не должен выполняться на self-hosted раннере.
+"""PR из чужого форка не должен выполняться на нашем раннере.
 
-Security finding 19.08.2026. Раннер здесь persistent и работает под
-пользователем разработчика: рядом с ним лежат `~/.kube/config` с доступом к
-прод-кластеру, `~/.ssh/id_rsa`, `~/.aws/credentials`, `~/.docker/config.json`
-и токены. Выполнить на нём код из чужого PR — значит отдать всё это автору PR.
+Security finding 19.08.2026. Тогда раннер был persistent и работал под
+пользователем разработчика: рядом лежали `~/.kube/config` с доступом к
+прод-кластеру, `~/.ssh/id_rsa`, `~/.aws/credentials` и токены. Выполнить на
+нём код из чужого PR — значит отдать всё это автору PR.
+
+С переездом на ARC (17.09.2026) ключей разработчика рядом больше нет: под
+эфемерный, в отдельном namespace, без доступа к kube-apiserver и без токена
+ServiceAccount. Требование осталось: чужой код — всё ещё чужой код, а
+dind-сайдкар privileged.
 
 Репозиторий публичный, форки разрешены, GitHub-hosted раннеры недоступны
 (аккаунт отрезан от них по биллингу) — то есть «просто перенести PR-проверки
@@ -40,11 +45,34 @@ def _triggers_on_pull_request(path: pathlib.Path) -> bool:
     return "pull_request" in (on if isinstance(on, dict) else {on: None})
 
 
+#: Префиксы образов GitHub-hosted. Всё остальное исполняется на НАШЕЙ
+#: инфраструктуре, даже когда слова "self-hosted" в runs-on нет.
+_GITHUB_HOSTED_PREFIXES = ("ubuntu-", "windows-", "macos-")
+
+
 def _uses_self_hosted(job: dict) -> bool:
+    """Job исполняется на нашей инфраструктуре, а не на GitHub-hosted.
+
+    Проверка по слову "self-hosted" перестала работать после переезда на
+    ARC 17.09.2026: у runner scale set в `runs-on` пишется ИМЯ НАБОРА
+    (`sre-copilot-k8s`), лейбла self-hosted там нет вовсе. Тест ниже честно
+    поймал это падением — он и задуман так, чтобы молчаливое «ничего не
+    нашлось» считалось поломкой парсинга, а не поводом радоваться.
+
+    Поэтому признак инвертирован: self-hosted = НЕ GitHub-hosted образ.
+    Так новый набор раннеров попадает под проверку изоляции сам, без
+    правки списка при каждом переименовании.
+    """
     runs_on = job.get("runs-on", "")
-    if isinstance(runs_on, list):
-        return "self-hosted" in runs_on
-    return "self-hosted" in str(runs_on)
+    labels = runs_on if isinstance(runs_on, list) else [runs_on]
+    labels = [str(label) for label in labels if label]
+    if not labels:
+        return False
+    if any("self-hosted" in label for label in labels):
+        return True
+    return not any(
+        label.startswith(_GITHUB_HOSTED_PREFIXES) for label in labels
+    )
 
 
 def _pr_workflow_jobs():
