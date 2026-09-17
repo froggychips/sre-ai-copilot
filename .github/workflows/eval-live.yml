@@ -30,7 +30,7 @@ permissions:
 jobs:
   eval:
     name: Golden Eval
-    runs-on: [self-hosted, macOS, ARM64]
+    runs-on: sre-copilot-k8s
     # Без ключа прогон бессмысленен: секрет отсутствует → джоба не стартует
     # вместо того, чтобы падать на середине набора.
     if: ${{ github.event_name == 'workflow_dispatch' || github.repository == 'froggychips/sre-ai-copilot' }}

@@ -527,3 +527,44 @@ def test_hard_threshold_matches_a_real_ci_run_length(dm):
     assert dm.STUCK_HOURS <= 1.0, (
         "порог больше часа: столько CI уже не должен молчать при одном раннере"
     )
+
+
+def test_one_online_runner_is_enough_when_name_not_set(token, monkeypatch):
+    """Офлайновый сосед не находка, пока есть хоть один живой раннер.
+
+    С переездом на ARC (17.09.2026) в репозитории одновременно живут
+    эфемерные раннеры — они офлайнят при каждом пересоздании пода — и
+    оставленный на время мак, который офлайнит всякий раз, когда закрывают
+    ноутбук. Жалоба на каждого сделала бы ежечасный крик при здоровом CI,
+    то есть приучила бы игнорировать канал.
+    """
+    monkeypatch.setattr(token, "RUNNER_NAME", "")
+    monkeypatch.setattr(token, "gh", lambda *a, **k: {"runners": [
+        {"name": "jabbook-air-m3-sre-copilot", "status": "offline"},
+        {"name": "sre-copilot-k8s-abc-runner-xyz", "status": "online"},
+    ]})
+    assert token.check_runners() == []
+
+
+def test_all_runners_offline_is_a_finding(token, monkeypatch):
+    """А вот когда живых не осталось вовсе — это находка."""
+    monkeypatch.setattr(token, "RUNNER_NAME", "")
+    monkeypatch.setattr(token, "gh", lambda *a, **k: {"runners": [
+        {"name": "jabbook-air-m3-sre-copilot", "status": "offline"},
+        {"name": "sre-copilot-k8s-abc-runner-xyz", "status": "offline"},
+    ]})
+    problems = token.check_runners()
+    assert len(problems) == 1
+    assert "ни один раннер не online" in problems[0]
+
+
+def test_named_runner_offline_is_still_a_finding(token, monkeypatch):
+    """Если имя задано явно — следим именно за ним, как и раньше."""
+    monkeypatch.setattr(token, "RUNNER_NAME", "jabbook-air-m3-sre-copilot")
+    monkeypatch.setattr(token, "gh", lambda *a, **k: {"runners": [
+        {"name": "jabbook-air-m3-sre-copilot", "status": "offline"},
+        {"name": "sre-copilot-k8s-abc-runner-xyz", "status": "online"},
+    ]})
+    problems = token.check_runners()
+    assert len(problems) == 1
+    assert "offline" in problems[0]

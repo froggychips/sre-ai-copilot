@@ -20,7 +20,12 @@
 #   # 2. ConfigMap с env (несекретное):
 #   kubectl -n sre-ai create configmap ci-deadman-env \
 #     --from-literal=GITHUB_REPO=froggychips/sre-ai-copilot \
-#     --from-literal=RUNNER_NAME=jabbook-air-m3-sre-copilot \
+#     # RUNNER_NAME НЕ ЗАДАЁТСЯ: пустое значение = следим за ВСЕМИ раннерами
+#     # репозитория. С переездом CI на ARC (k8s/github-runner.yaml) имена
+#     # раннеров эфемерны — под живёт один job и умирает, — поэтому сверка с
+#     # конкретным именем после cutover давала бы «раннер офлайн» при
+#     # полностью здоровом CI. То есть ровно тот ложный сигнал, ради
+#     # отсутствия которого эта канарейка и заводилась.
 #     --from-literal=QUEUE_MINUTES=30 \
 #     --from-literal=STALE_PR_DAYS=3 \
 #     --dry-run=client -o yaml | kubectl apply -f -
