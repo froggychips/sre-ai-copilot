@@ -548,7 +548,10 @@ def _drop_stale_selector_edges(
         .all()
     )
     for edge in edges:
-        edge_selector = (edge.extras or {}).get("selector")
+        # Тот же паттерн, что в blast_radius._edge_sources: `edge.extras or
+        # {}` mypy выводит как пустой dict, и .get по нему не типизируется.
+        extras: Dict[str, Any] = edge.extras if isinstance(edge.extras, dict) else {}
+        edge_selector = extras.get("selector")
         if edge_selector is None or edge_selector == selector:
             continue
         logger.info(
