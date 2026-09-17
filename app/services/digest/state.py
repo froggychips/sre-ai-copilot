@@ -37,6 +37,11 @@ __all__ = [
     "FIRING_SERIES_WINDOW_LABEL",
     "BEAT_HEARTBEAT_REDIS_PREFIX",
     "BEAT_HEARTBEAT_REDIS_TTL",
+    "SOURCE_REPORT_REDIS_PREFIX",
+    "SOURCE_REPORT_REDIS_TTL",
+    "record_source_report",
+    "get_source_report",
+    "source_report_key",
     "read_last_firing_series",
     "write_last_firing_series",
     "read_day_snapshot",
@@ -73,6 +78,19 @@ FIRING_SERIES_WINDOW_LABEL = f"снимок firing-серий за {FIRING_SERIE
 # завис». TTL 7 дней — на случай долгого простоя.
 BEAT_HEARTBEAT_REDIS_PREFIX = "stats:beat:last_run"
 BEAT_HEARTBEAT_REDIS_TTL = 7 * 24 * 3600
+
+# Отчёт синка о своём прогоне (см. edge_decay_guard.SourceReport). Живёт
+# здесь, а не в памяти процесса, по простой причине: celery раскидывает
+# beat-таски по forked-процессам, и отчёт чужого синка соседний процесс не
+# видел. Из-за этого `check_source_coverage` не мог отличить «источник
+# молчит» от «этот форк не видел прогона» и не поднимал статус вовсе, а
+# decay терял точную причину и откатывался на общий `no_recent_refresh`.
+#
+# TTL 48 часов — вдвое больше окна свежести (KG_EDGE_SOURCE_FRESH_HOURS=24):
+# просроченный отчёт всё равно не считается здоровьем, но и удалять его
+# раньше, чем истечёт окно, незачем.
+SOURCE_REPORT_REDIS_PREFIX = "stats:kg:source_report"
+SOURCE_REPORT_REDIS_TTL = 48 * 3600
 
 
 # --- Async-слой: снапшоты предыдущего дня ---------------------------------
@@ -247,6 +265,47 @@ def record_task_status(task_name: str, status: str) -> None:
         log.warning(
             "stats_digest.beat_status_write_failed", task=task_name, error=str(e),
         )
+
+
+def source_report_key(source: str) -> str:
+    return f"{SOURCE_REPORT_REDIS_PREFIX}:{source}"
+
+
+def record_source_report(source: str, payload: Dict[str, Any]) -> None:
+    """Отчёт синка о прогоне — межпроцессно.
+
+    Пишется на КАЖДЫЙ завершённый прогон, вместе с in-process реестром:
+    redis переживает границу процесса, память — нет. Fail-open, как и
+    heartbeat: недоступный redis не должен ронять синк, у которого своя
+    работа уже сделана.
+    """
+    try:
+        client = _get_beat_redis()
+        client.set(
+            source_report_key(source),
+            json.dumps(payload, ensure_ascii=False, default=str),
+            ex=SOURCE_REPORT_REDIS_TTL,
+        )
+    except Exception as e:
+        log.warning(
+            "stats_digest.source_report_write_failed", source=source, error=str(e),
+        )
+
+
+def get_source_report(source: str) -> Optional[Dict[str, Any]]:
+    """Отчёт синка из redis. None — ключа нет, redis недоступен или мусор."""
+    try:
+        client = _get_beat_redis()
+        raw = client.get(source_report_key(source))
+        if raw is None:
+            return None
+        data = json.loads(raw)
+    except Exception as e:
+        log.warning(
+            "stats_digest.source_report_read_failed", source=source, error=str(e),
+        )
+        return None
+    return data if isinstance(data, dict) else None
 
 
 def get_beat_last_status(task_name: str) -> Optional[str]:

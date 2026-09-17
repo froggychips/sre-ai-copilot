@@ -24,6 +24,7 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
 from app.database import Base
+from app.knowledge_graph import edge_decay_guard
 from app.knowledge_graph.edge_decay_guard import (
     EDGE_KIND_FRESHNESS_SOURCES, REASON_EMPTY_FETCH, REASON_FETCH_ERRORS,
     REASON_NO_RECENT_REFRESH, REASON_SYNC_FAILED, REASON_UNMAPPED_KIND,
@@ -432,3 +433,110 @@ def test_volume_source_health_is_per_slice(db):
     assert volume_edge_block_reason(
         "bound_to", "k8s_storage/pvc_spec", bad,
     ) is None
+
+
+# ── отчёт переживает границу процесса ───────────────────────────────────────
+
+
+def test_report_is_mirrored_to_redis(monkeypatch):
+    """record_source_run дублирует отчёт в redis.
+
+    celery раскидывает beat-таски по forked-процессам: до 17.09.2026 отчёт
+    чужого синка соседний форк не видел вовсе, и решения принимались без
+    самого точного сигнала.
+    """
+    written = {}
+
+    def _fake_record(source, payload):
+        written[source] = payload
+
+    monkeypatch.setattr(
+        "app.services.digest.state.record_source_report", _fake_record
+    )
+    edge_decay_guard.reset_source_reports()
+    edge_decay_guard.record_source_run(
+        edge_decay_guard.SOURCE_KG_SYNC, {"namespaces": 7, "errors": 2}
+    )
+
+    payload = written[edge_decay_guard.SOURCE_KG_SYNC]
+    assert payload["errors"] == 2
+    assert payload["failed"] is False
+    assert payload["ts"], "без метки времени отчёт бесполезен: свежесть не проверить"
+
+
+def test_report_is_read_from_redis_when_process_has_none(monkeypatch):
+    """Отчёт соседнего процесса виден, даже когда в этом его нет."""
+    monkeypatch.setattr(
+        "app.services.digest.state.get_source_report",
+        lambda source: {
+            "ts": "2026-09-17T12:00:00",
+            "fetched": 0,
+            "errors": 0,
+            "failed": False,
+        },
+    )
+    edge_decay_guard.reset_source_reports()
+
+    report = edge_decay_guard.get_source_report(edge_decay_guard.SOURCE_KG_SYNC)
+    assert report is not None, "отчёт из redis обязан быть виден"
+    assert report.fetched == 0
+
+
+def test_newer_redis_report_wins_over_local(monkeypatch):
+    """Свежий отчёт из другого форка ПЕРЕБИВАЕТ локальный, а не наоборот.
+
+    Следующий прогон того же синка мог уйти в соседний процесс и записать
+    в redis упавший отчёт. Отдавай мы локальный просто потому, что он свой,
+    старый здоровый отчёт маскировал бы новый сбойный на всё окно свежести,
+    и decay считал бы источник живым.
+    """
+    monkeypatch.setattr(
+        "app.services.digest.state.record_source_report", lambda *a, **k: None
+    )
+    edge_decay_guard.reset_source_reports()
+    edge_decay_guard.record_source_run(
+        edge_decay_guard.SOURCE_KG_SYNC, {"namespaces": 3, "errors": 0}
+    )
+
+    newer = (datetime.utcnow() + timedelta(minutes=5)).isoformat()
+    monkeypatch.setattr(
+        "app.services.digest.state.get_source_report",
+        lambda source: {"ts": newer, "fetched": 0, "errors": 0, "failed": True},
+    )
+
+    report = edge_decay_guard.get_source_report(edge_decay_guard.SOURCE_KG_SYNC)
+    assert report is not None
+    assert report.failed is True, "новый сбойный отчёт обязан перебить старый здоровый"
+
+
+def test_local_report_wins_when_it_is_newer(monkeypatch):
+    """Устаревший отчёт из redis локальный не перебивает."""
+    older = (datetime.utcnow() - timedelta(hours=3)).isoformat()
+    monkeypatch.setattr(
+        "app.services.digest.state.get_source_report",
+        lambda source: {"ts": older, "fetched": 0, "errors": 0, "failed": True},
+    )
+    monkeypatch.setattr(
+        "app.services.digest.state.record_source_report", lambda *a, **k: None
+    )
+    edge_decay_guard.reset_source_reports()
+    edge_decay_guard.record_source_run(
+        edge_decay_guard.SOURCE_KG_SYNC, {"namespaces": 3, "errors": 0}
+    )
+
+    report = edge_decay_guard.get_source_report(edge_decay_guard.SOURCE_KG_SYNC)
+    assert report is not None and report.fetched == 3 and report.failed is False
+
+
+def test_redis_failure_does_not_break_sync(monkeypatch):
+    """Недоступный redis не роняет синк: его работа уже сделана."""
+    def _boom(*_a, **_k):
+        raise RuntimeError("redis лёг")
+
+    monkeypatch.setattr("app.services.digest.state.record_source_report", _boom)
+    edge_decay_guard.reset_source_reports()
+
+    report = edge_decay_guard.record_source_run(
+        edge_decay_guard.SOURCE_KG_SYNC, {"namespaces": 5, "errors": 0}
+    )
+    assert report.fetched == 5, "отчёт обязан вернуться даже при мёртвом redis"
