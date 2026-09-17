@@ -4,6 +4,7 @@
 до critical + prod-*». Проверяется и сам фильтр, и то, что он стоит на
 пути, мимо которого не пройти.
 """
+from datetime import datetime, timedelta
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -283,9 +284,14 @@ async def test_worker_rejection_removes_the_orphan_record(monkeypatch, tmp_path)
     Session = sessionmaker(bind=engine)
     monkeypatch.setattr(tasks, "SessionLocal", Session)
 
+    # Старше потолка стадии: живой разбор столько в OPEN не держится.
+    old_enough = datetime.utcnow() - timedelta(
+        seconds=float(settings.PIPELINE_STAGE_TIMEOUT_SECONDS) + 60
+    )
     db = Session()
     db.add(IncidentRecord(
         incident_id="fp-orphan", status=IncidentState.OPEN.value, data={},
+        created_at=old_enough,
     ))
     db.commit()
     db.close()
@@ -305,12 +311,50 @@ async def test_worker_rejection_removes_the_orphan_record(monkeypatch, tmp_path)
 
 
 @pytest.mark.asyncio
-async def test_record_in_flight_is_left_alone(monkeypatch, tmp_path):
-    """Запись, по которой пайплайн уже работает, трогать нельзя.
+async def test_fresh_open_record_is_left_alone(monkeypatch, tmp_path):
+    """Свежая строка в OPEN может быть живым разбором — не трогаем.
 
-    Другой воркер — чья версия область признала — мог начать разбор.
-    Условие `status = OPEN` стоит в самом DELETE именно поэтому.
+    `stage_analyze` уходит в анализатор ДО перехода в INVESTIGATING, то
+    есть работающий воркер держит строку в OPEN всю стадию. Снести её
+    значит уронить его переход и потерять сделанный анализ.
     """
+    from sqlalchemy import create_engine
+    from sqlalchemy.orm import sessionmaker
+
+    from app.core.state_machine import IncidentState
+    from app.database import Base, IncidentRecord
+    from app.workers import tasks
+
+    engine = create_engine(f"sqlite:///{tmp_path}/fresh.db")
+    Base.metadata.create_all(engine)
+    Session = sessionmaker(bind=engine)
+    monkeypatch.setattr(tasks, "SessionLocal", Session)
+
+    db = Session()
+    db.add(IncidentRecord(
+        incident_id="fp-fresh", status=IncidentState.OPEN.value, data={},
+    ))
+    db.commit()
+    db.close()
+
+    monkeypatch.setattr(settings, "LLM_PIPELINE_ENABLED", True, raising=False)
+    monkeypatch.setattr(settings, "PIPELINE_SEVERITY_ALLOWLIST", ["critical"], raising=False)
+    monkeypatch.setattr(settings, "PIPELINE_NAMESPACE_PREFIXES", [], raising=False)
+
+    await tasks.async_process_incident(
+        {"incident_id": "fp-fresh", "severity": "warning", "namespace": "dev-17"}
+    )
+
+    db = Session()
+    assert db.query(IncidentRecord).filter_by(incident_id="fp-fresh").count() == 1, (
+        "свежую строку могли создать секунду назад под живой разбор"
+    )
+    db.close()
+
+
+@pytest.mark.asyncio
+async def test_record_in_flight_is_left_alone(monkeypatch, tmp_path):
+    """Запись, по которой пайплайн уже перешёл дальше OPEN, трогать нельзя."""
     from sqlalchemy import create_engine
     from sqlalchemy.orm import sessionmaker
 

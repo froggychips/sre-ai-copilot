@@ -556,10 +556,24 @@ def _drop_orphan_open_record(incident_id: str) -> None:
 
     Поэтому строка удаляется — система возвращается в состояние, как если
     бы настройки совпали, и следующий firing решит судьбу алерта заново.
-    Условие `status = OPEN` в самом DELETE: если пайплайн уже начал работу
-    (другой воркер, чья версия область признала), трогать её нельзя.
+
+    Удаляется НЕ любая строка в OPEN. `stage_analyze` уходит в анализатор
+    ДО перехода в INVESTIGATING (pipeline.py), то есть живой разбор держит
+    строку в OPEN всю стадию — до PIPELINE_STAGE_TIMEOUT_SECONDS. Снести её
+    значит уронить чужой переход и потерять уже сделанный анализ, а такое
+    столкновение возможно и при дубле доставки Celery, и в окне выкатки.
+
+    Поэтому к условию `status = OPEN` добавлен возраст: трогаем только то,
+    что провисело дольше потолка стадии, — работать над ним заведомо уже
+    никто не может. Свежую строку оставляем; если она и правда осиротела,
+    её уберёт следующий firing, когда возраст наберётся.
     """
+    from datetime import datetime, timedelta
+
     from app.core.state_machine import IncidentState
+
+    stage_cap = float(getattr(settings, "PIPELINE_STAGE_TIMEOUT_SECONDS", 240.0))
+    cutoff = datetime.utcnow() - timedelta(seconds=stage_cap)
 
     db = SessionLocal()
     try:
@@ -568,6 +582,9 @@ def _drop_orphan_open_record(incident_id: str) -> None:
             .filter(
                 IncidentRecord.incident_id == incident_id,
                 IncidentRecord.status == IncidentState.OPEN.value,
+                # Возраст — защита от сноса живой работы: до перехода в
+                # INVESTIGATING строка остаётся OPEN всю стадию анализа.
+                IncidentRecord.created_at < cutoff,
             )
             .delete(synchronize_session=False)
         )
