@@ -855,3 +855,64 @@ def test_non_cnpg_selector_still_needs_every_label(db):
 
     assert stats["skipped_no_match"] == 1
     assert stats["edges_serves_traffic"] == 0
+
+
+def test_endpoint_only_edge_without_selector_is_dropped(db):
+    """Ребро, воскрешённое корроборатором endpoints, снимается.
+
+    `k8s_endpoints_sync` подтверждает живые рёбра своим upsert_edge с
+    extras={"endpoints_ready": ...} — без селектора. Таски идут в разных
+    воркерах: если корроборатор прочитал ребро до того, как мы его удалили,
+    его upsert воссоздаст строку уже без селектора. Ветка «нет селектора —
+    не трогаем» хранила бы её вечно, и снятое ребро возвращалось бы на
+    каждом тике.
+    """
+    from app.knowledge_graph.k8s_endpoints_sync import DISCOVERED_BY_ENDPOINTS
+
+    deps = [_mk_deployment("cw-db-postgresql", "prod-shared",
+                           pod_labels={"app.kubernetes.io/instance": "cw-db"})]
+    services = [_mk_service("cw-db-postgresql", "prod-shared",
+                            selector={"cnpg.io/cluster": "cw-db-cnpg"})]
+
+    svc = upsert_service(db, "prod-shared", "cw-db-postgresql")
+    wl = upsert_service(db, "prod-shared", "cw-db-postgresql-sts",
+                        node_kind=NODE_KIND_WORKLOAD)
+    db.flush()
+    edge = ServiceEdge(src_id=svc.id, dst_id=wl.id, kind=EDGE_SERVES_TRAFFIC,
+                       extras={"endpoints_ready": 1,
+                               "discovery_sources": [DISCOVERED_BY_ENDPOINTS]})
+    db.add(edge)
+    db.commit()
+
+    with patch(
+        "app.knowledge_graph.k8s_topology_resources_sync._kubectl_get_all",
+        return_value=services,
+    ):
+        stats = sync_all_services(
+            db, deployments_index=_index_deployments_by_ns(deps))
+
+    assert stats["edges_dropped_stale_selector"] == 1
+    assert db.query(ServiceEdge).filter_by(kind=EDGE_SERVES_TRAFFIC).count() == 0
+
+
+def test_legacy_edge_without_provenance_is_kept(db):
+    """Ребро без селектора И без источников — наследие, судить не по чему."""
+    deps = [_mk_deployment("auth-app", "prod-shared", pod_labels={"app": "auth"})]
+    services = [_mk_service("auth-svc", "prod-shared", selector={"app": "auth"})]
+
+    svc = upsert_service(db, "prod-shared", "auth-svc")
+    wl = upsert_service(db, "prod-shared", "auth-legacy",
+                        node_kind=NODE_KIND_WORKLOAD)
+    db.flush()
+    db.add(ServiceEdge(src_id=svc.id, dst_id=wl.id, kind=EDGE_SERVES_TRAFFIC,
+                       extras={"confidence": "declared_k8s"}))
+    db.commit()
+
+    with patch(
+        "app.knowledge_graph.k8s_topology_resources_sync._kubectl_get_all",
+        return_value=services,
+    ):
+        stats = sync_all_services(
+            db, deployments_index=_index_deployments_by_ns(deps))
+
+    assert stats["edges_dropped_stale_selector"] == 0

@@ -49,6 +49,7 @@ from sqlalchemy.orm import Session
 from app.knowledge_graph.kubectl_breaker import run_kubectl
 from app.knowledge_graph.edge_decay_guard import (
     SOURCE_TOPOLOGY_INGRESSES, SOURCE_TOPOLOGY_SERVICES, record_source_run)
+from app.knowledge_graph.k8s_endpoints_sync import DISCOVERED_BY_ENDPOINTS
 from app.knowledge_graph.populator import upsert_edge, upsert_service
 from app.knowledge_graph.schema import (NODE_KIND_SERVICE, NODE_KIND_WORKLOAD,
                                         Service, ServiceEdge)
@@ -552,7 +553,26 @@ def _drop_stale_selector_edges(
         # {}` mypy выводит как пустой dict, и .get по нему не типизируется.
         extras: Dict[str, Any] = edge.extras if isinstance(edge.extras, dict) else {}
         edge_selector = extras.get("selector")
-        if edge_selector is None or edge_selector == selector:
+        if edge_selector is None:
+            # Ребро без селектора топология не строила. Обычно это наследие
+            # до contract 2.4, и трогать его нельзя — судить не по чему.
+            #
+            # Но есть второй путь: `k8s_endpoints_sync` подтверждает живые
+            # рёбра своим upsert_edge с extras={"endpoints_ready": ...}, без
+            # селектора. Таски идут в разных воркерах, и если корроборатор
+            # успел прочитать ребро до того, как мы его удалили, его upsert
+            # воссоздаст строку — уже БЕЗ селектора. Дальше эта же ветка
+            # хранила бы её вечно, и снятое ребро возвращалось бы каждый раз.
+            #
+            # Поэтому: если единственный источник ребра — корроборатор,
+            # топологического подтверждения у него нет, и снять его можно.
+            sources = {
+                src for src in (extras.get("discovery_sources") or [])
+                if isinstance(src, str)
+            }
+            if not sources or sources - {DISCOVERED_BY_ENDPOINTS}:
+                continue
+        elif edge_selector == selector:
             continue
         logger.info(
             "k8s_topology_resources.stale_selector_edge_dropped "
