@@ -539,6 +539,55 @@ def process_incident_task(self, incident_data: dict):
     )
 
 
+def _drop_orphan_open_record(incident_id: str) -> None:
+    """Убрать запись, созданную вебхуком, если воркер область не признал.
+
+    В норме сюда не попадают: вебхук отсекает такие алерты ДО создания
+    IncidentRecord. Но api и worker — разные деплойменты, и deploy.sh
+    обновляет их по очереди, так что в окне выкатки их настройки области
+    расходятся: api ещё принимает алерт и создаёт строку в OPEN, а worker
+    уже отвергает.
+
+    Оставить такую строку нельзя. OPEN входит в `_SKIP_STATES` вебхука, и
+    каждое следующее firing-уведомление дедуплицировалось бы — ровно та
+    осиротевшая запись, ради устранения которой фильтр и переехал в вебхук.
+    Любой другой статус возвращает одну из соседних проблем: терминальный
+    ломает резолв, «переобрабатываемый» даёт ложный флаппинг.
+
+    Поэтому строка удаляется — система возвращается в состояние, как если
+    бы настройки совпали, и следующий firing решит судьбу алерта заново.
+    Условие `status = OPEN` в самом DELETE: если пайплайн уже начал работу
+    (другой воркер, чья версия область признала), трогать её нельзя.
+    """
+    from app.core.state_machine import IncidentState
+
+    db = SessionLocal()
+    try:
+        deleted = (
+            db.query(IncidentRecord)
+            .filter(
+                IncidentRecord.incident_id == incident_id,
+                IncidentRecord.status == IncidentState.OPEN.value,
+            )
+            .delete(synchronize_session=False)
+        )
+        db.commit()
+        if deleted:
+            logger.warning(
+                "pipeline.scope_skip_dropped_orphan incident_id=%s — "
+                "api и worker разошлись в области действия (окно выкатки?)",
+                incident_id,
+            )
+    except Exception as e:  # noqa: BLE001
+        db.rollback()
+        logger.warning(
+            "pipeline.scope_skip_orphan_not_dropped incident_id=%s error=%s",
+            incident_id, e,
+        )
+    finally:
+        db.close()
+
+
 async def async_process_incident(
     incident_data: dict, retries: int = 0, max_retries: int = 0
 ):
@@ -576,6 +625,7 @@ async def async_process_incident(
             "incident_id": incident_id,
             **scope.as_dict(),
         })
+        _drop_orphan_open_record(incident_id)
         return {"status": "skipped", "reason": scope.reason}
 
     with incident_span(incident_id, service=_service, namespace=_namespace) as _root_span:

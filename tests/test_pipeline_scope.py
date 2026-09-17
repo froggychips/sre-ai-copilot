@@ -245,3 +245,113 @@ async def test_in_scope_alert_is_accepted(scoped_db):
     assert result["alerts"][0]["task_id"] != "out_of_scope"
     assert db.query(IncidentRecord).count() == 1
     db.close()
+
+
+# --- рассинхрон api и worker в окне выкатки --------------------------------
+
+@pytest.mark.asyncio
+async def test_worker_rejection_removes_the_orphan_record(monkeypatch, tmp_path):
+    """api принял и создал OPEN, worker область не признал — строки не остаётся.
+
+    api и worker — разные деплойменты, и deploy.sh обновляет их по очереди:
+    в окне выкатки их настройки области расходятся. Оставшаяся строка в
+    OPEN попадает в `_SKIP_STATES` вебхука и глушит дедупом каждое
+    следующее firing — ровно та осиротевшая запись, ради устранения
+    которой фильтр и переехал в вебхук.
+    """
+    from sqlalchemy import create_engine
+    from sqlalchemy.orm import sessionmaker
+
+    from app.core.state_machine import IncidentState
+    from app.database import Base, IncidentRecord
+    from app.workers import tasks
+
+    engine = create_engine(f"sqlite:///{tmp_path}/orphan.db")
+    Base.metadata.create_all(engine)
+    Session = sessionmaker(bind=engine)
+    monkeypatch.setattr(tasks, "SessionLocal", Session)
+
+    db = Session()
+    db.add(IncidentRecord(
+        incident_id="fp-orphan", status=IncidentState.OPEN.value, data={},
+    ))
+    db.commit()
+    db.close()
+
+    monkeypatch.setattr(settings, "LLM_PIPELINE_ENABLED", True, raising=False)
+    monkeypatch.setattr(settings, "PIPELINE_SEVERITY_ALLOWLIST", ["critical"], raising=False)
+    monkeypatch.setattr(settings, "PIPELINE_NAMESPACE_PREFIXES", [], raising=False)
+
+    result = await tasks.async_process_incident(
+        {"incident_id": "fp-orphan", "severity": "warning", "namespace": "dev-17"}
+    )
+
+    assert result["status"] == "skipped"
+    db = Session()
+    assert db.query(IncidentRecord).filter_by(incident_id="fp-orphan").count() == 0
+    db.close()
+
+
+@pytest.mark.asyncio
+async def test_record_in_flight_is_left_alone(monkeypatch, tmp_path):
+    """Запись, по которой пайплайн уже работает, трогать нельзя.
+
+    Другой воркер — чья версия область признала — мог начать разбор.
+    Условие `status = OPEN` стоит в самом DELETE именно поэтому.
+    """
+    from sqlalchemy import create_engine
+    from sqlalchemy.orm import sessionmaker
+
+    from app.core.state_machine import IncidentState
+    from app.database import Base, IncidentRecord
+    from app.workers import tasks
+
+    engine = create_engine(f"sqlite:///{tmp_path}/inflight.db")
+    Base.metadata.create_all(engine)
+    Session = sessionmaker(bind=engine)
+    monkeypatch.setattr(tasks, "SessionLocal", Session)
+
+    db = Session()
+    db.add(IncidentRecord(
+        incident_id="fp-busy", status=IncidentState.INVESTIGATING.value, data={},
+    ))
+    db.commit()
+    db.close()
+
+    monkeypatch.setattr(settings, "LLM_PIPELINE_ENABLED", True, raising=False)
+    monkeypatch.setattr(settings, "PIPELINE_SEVERITY_ALLOWLIST", ["critical"], raising=False)
+    monkeypatch.setattr(settings, "PIPELINE_NAMESPACE_PREFIXES", [], raising=False)
+
+    await tasks.async_process_incident(
+        {"incident_id": "fp-busy", "severity": "warning", "namespace": "dev-17"}
+    )
+
+    db = Session()
+    row = db.query(IncidentRecord).filter_by(incident_id="fp-busy").first()
+    assert row is not None, "чужую работу удалять нельзя"
+    assert row.status == IncidentState.INVESTIGATING.value
+    db.close()
+
+
+@pytest.mark.asyncio
+async def test_missing_record_is_not_an_error(monkeypatch, tmp_path):
+    """Штатный путь: записи нет, потому что вебхук её и не создавал."""
+    from sqlalchemy import create_engine
+    from sqlalchemy.orm import sessionmaker
+
+    from app.database import Base
+    from app.workers import tasks
+
+    engine = create_engine(f"sqlite:///{tmp_path}/none.db")
+    Base.metadata.create_all(engine)
+    monkeypatch.setattr(tasks, "SessionLocal", sessionmaker(bind=engine))
+
+    monkeypatch.setattr(settings, "LLM_PIPELINE_ENABLED", True, raising=False)
+    monkeypatch.setattr(settings, "PIPELINE_SEVERITY_ALLOWLIST", ["critical"], raising=False)
+    monkeypatch.setattr(settings, "PIPELINE_NAMESPACE_PREFIXES", [], raising=False)
+
+    result = await tasks.async_process_incident(
+        {"incident_id": "fp-absent", "severity": "warning", "namespace": "dev-17"}
+    )
+
+    assert result["status"] == "skipped"
