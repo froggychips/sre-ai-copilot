@@ -5,8 +5,10 @@ import structlog
 from app.config import settings
 from app.core.tracing import record_llm_call
 from app.llm.router import ModelRouter
-from app.observability.ai_metrics import track_llm_usage_per_agent
+from app.observability.ai_metrics import (track_budget_denied, track_llm_cost,
+                                        track_llm_usage_per_agent)
 from app.services.audit_logger import audit_service
+from app.services.cost_guard import LLMBudgetExceeded, check_budget, record_spend
 from app.services.llm_service import LLMTruncatedResponse
 from app.services.prompt_guard import prompt_guard
 from app.services.telemetry_utils import record_llm_metrics, tracer
@@ -45,6 +47,22 @@ class BaseAgent:
 
             safe_context = prompt_guard.sanitize(user_context)
 
+            # Бюджет проверяется у КАЖДОГО агента, а не только на входе в
+            # пайплайн: прогон — это семь вызовов, и потолок можно пробить
+            # внутри одного инцидента. Отказ здесь останавливает прогон на
+            # том агенте, где кончились деньги, а не после всех.
+            verdict = check_budget()
+            if not verdict.allowed:
+                track_budget_denied(verdict.reason)
+                audit_service.log_event("LLM_CALL_BUDGET_DENIED", {
+                    "agent": self.name, **verdict.as_dict(),
+                })
+                raise LLMBudgetExceeded(
+                    f"LLM budget guard: {verdict.reason} "
+                    f"(agent={self.name}, spent={verdict.spent_usd}, "
+                    f"limit={verdict.limit_usd})"
+                )
+
             full_prompt = f"""
 Role: {self.role}
 Task: {instruction}
@@ -64,6 +82,14 @@ Task: {instruction}
                 input_tokens = result.get("input_tokens", 0) if isinstance(result, dict) else 0
                 output_tokens = result.get("output_tokens", 0) if isinstance(result, dict) else 0
                 model_name = (result.get("model") if isinstance(result, dict) else settings.MODEL_NAME) or settings.MODEL_NAME
+
+                # Списываем ДО разбора исхода: пустой и обрезанный ответы
+                # тоже оплачены, и не учесть их значит сделать потолок
+                # декоративным ровно в тех случаях, когда модель ведёт себя
+                # плохо и прогонов становится больше.
+                spent = record_spend(model_name, input_tokens, output_tokens)
+                if spent:
+                    track_llm_cost(model_name, spent)
 
                 if not response_text:
                     record_llm_call(

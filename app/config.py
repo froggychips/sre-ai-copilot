@@ -85,6 +85,34 @@ class Settings(BaseSettings):
     #   - severity-фильтр сужен до critical + prod-*
     LLM_PIPELINE_ENABLED: bool = False
 
+    # Суточный потолок расхода на LLM, в долларах. 0 — потолок НЕ задан, и
+    # это состояние трактуется как запрет: `cost_guard` не пропустит вызов.
+    # Включённый пайплайн без потолка — ровно та дыра, из-за которой
+    # LLM_PIPELINE_ENABLED до сих пор False (см. арифметику выше).
+    #
+    # Почему предохранитель в коде, а не только cap в консоли Anthropic:
+    # консольный cap рубит ключ целиком и постфактум, унося вместе с
+    # пайплайном всё остальное, что ходит тем же ключом.
+    LLM_DAILY_BUDGET_USD: float = Field(
+        0.0, description="Потолок трат на LLM в сутки (UTC), USD. 0 = запрещено"
+    )
+    # Цены за миллион токенов по моделям: {"model-id": {"input": 3.0,
+    # "output": 15.0}}. Таблица в настройках, а не в коде: прайс меняется
+    # без нас, и захардкоженное число устарело бы незаметно.
+    LLM_PRICE_PER_MTOK: dict = Field(
+        default_factory=dict,
+        description="Цены за 1M токенов по моделям, USD",
+    )
+    # Ставка для модели, которой нет в таблице. Намеренно НЕ дешёвая:
+    # недооценка пропускает трату мимо потолка, переоценка лишь раньше
+    # остановит — цена этих двух ошибок несимметрична.
+    LLM_PRICE_FALLBACK_INPUT: float = Field(
+        15.0, description="Ставка input за 1M токенов для неизвестной модели, USD"
+    )
+    LLM_PRICE_FALLBACK_OUTPUT: float = Field(
+        75.0, description="Ставка output за 1M токенов для неизвестной модели, USD"
+    )
+
     # Потолок на стадию пайплайна. Это НАМЕРЕННО терминальный cap: истёкший
     # таймаут стадии не должен ретраиться (перезапуск всего инцидента ×3 жжёт
     # LLM-бюджет). См. RETRIABLE_EXC в app/workers/tasks.py.
@@ -1010,6 +1038,17 @@ class Settings(BaseSettings):
             raise ValueError(
                 "ANTHROPIC_API_KEY is required when LLM_BACKEND=anthropic. "
                 "For local dev without an API key, set LLM_BACKEND=claude_cli."
+            )
+        # Условие включения пайплайна, записанное исполняемым правилом.
+        # Раньше оно жило комментарием у LLM_PIPELINE_ENABLED («включать
+        # ПОСЛЕ того как budget cap установлен») — то есть держалось на
+        # памяти того, кто включает. Здесь его нельзя ни забыть, ни обойти:
+        # без потолка процесс с включённым пайплайном просто не поднимется.
+        if self.LLM_PIPELINE_ENABLED and self.LLM_DAILY_BUDGET_USD <= 0:
+            raise ValueError(
+                "LLM_PIPELINE_ENABLED=true requires LLM_DAILY_BUDGET_USD > 0. "
+                "Пайплайн из семи агентов на потоке алертов без суточного "
+                "потолка — это $750/час до того, как кто-то заметит."
             )
         if self.is_production:
             if not self.SAFE_MODE:
