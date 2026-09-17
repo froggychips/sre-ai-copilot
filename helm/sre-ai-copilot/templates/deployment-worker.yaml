@@ -33,6 +33,11 @@ spec:
         # Pin по digest в CI: image: ghcr.io/froggychips/sre-ai-copilot@sha256:<digest>
         image: "{{ .Values.image.repository }}:{{ required "image.tag обязателен (CI публикует только :<git-sha>, тега :latest нет)" .Values.image.tag }}"
         imagePullPolicy: {{ .Values.image.pullPolicy }}
+        ports:
+        # Метрики воркера: весь LLM-слой (токены, латентность, ошибки по
+        # агентам) считается здесь, а не в API. VMPodScrape целится в 8001.
+        - containerPort: 8001
+          name: metrics
         command:
         - celery
         - -A
@@ -56,6 +61,14 @@ spec:
         - secretRef:
             name: {{ include "sre-ai-copilot.secretName" . }}
         env:
+        # Каталог общей памяти prometheus_client. Воркер работает prefork'ом,
+        # задачи исполняются в детях, и реестр у каждого свой — сервер в
+        # родителе отдавал бы нули. Переменная задаётся здесь, а не в коде:
+        # prometheus_client читает её при СОЗДАНИИ метрик, то есть при
+        # импорте модулей. Каталог обязан существовать к этому моменту —
+        # его создаёт kubelet, монтируя том ниже.
+        - name: PROMETHEUS_MULTIPROC_DIR
+          value: /tmp/prometheus-multiproc
         - name: LLM_BACKEND
           value: {{ .Values.env.llmBackend | quote }}
         - name: LOG_LEVEL
@@ -117,15 +130,22 @@ spec:
           failureThreshold: 5
         resources:
           {{- toYaml .Values.resources.worker | nindent 10 }}
-        {{- if .Values.ownershipManifest.enabled }}
         volumeMounts:
+        # Отдельный том, а не подкаталог: каталог обязан существовать ДО
+        # импорта модулей, иначе первый же Counter падает FileNotFoundError
+        # и воркер умирает на старте.
+        - name: prometheus-multiproc
+          mountPath: /tmp/prometheus-multiproc
+        {{- if .Values.ownershipManifest.enabled }}
         - name: ownership-manifest
           mountPath: {{ .Values.env.ownershipManifestPath | default "/config/ownership.yaml" | quote }}
           subPath: ownership.yaml
           readOnly: true
         {{- end }}
-      {{- if .Values.ownershipManifest.enabled }}
       volumes:
+      - name: prometheus-multiproc
+        emptyDir: {}
+      {{- if .Values.ownershipManifest.enabled }}
       - name: ownership-manifest
         configMap:
           name: {{ include "sre-ai-copilot.fullname" . }}-ownership

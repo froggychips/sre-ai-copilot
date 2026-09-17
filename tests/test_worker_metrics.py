@@ -9,6 +9,8 @@ localhost:8001/metrics` внутри пода возвращал пустоту.
 Снаружи это выглядело исправным: код есть, scrape-объект есть. Не было
 только того, что скрейпить.
 """
+import os
+
 import pytest
 
 from app.observability import worker_metrics
@@ -39,22 +41,38 @@ def test_empty_env_value_counts_as_unset(monkeypatch):
     assert worker_metrics.start_worker_metrics_server() is False
 
 
-def test_stale_files_are_removed(tmp_path, monkeypatch):
+def test_dead_process_files_are_removed(tmp_path):
     """Файлы прошлого запуска не должны попадать в сумму.
 
     `MultiProcessCollector` честно суммирует всё, что лежит в каталоге, —
-    счётчики «помнили» бы прогоны, которых в этом поде не было. Том
+    счётчики «помнили» бы прогоны, которых в этом контейнере не было. Том
     emptyDir переживает рестарт контейнера в том же поде.
     """
-    stale = tmp_path / "counter_12345.db"
+    # PID, которого заведомо нет: max_pid на linux ≤ 4194304.
+    stale = tmp_path / "counter_4194305.db"
     stale.write_bytes(b"leftover")
     keep = tmp_path / "notes.txt"
     keep.write_text("не метрика")
 
     worker_metrics._prepare_dir(tmp_path)
 
-    assert not stale.exists(), "старый .db обязан быть удалён"
+    assert not stale.exists(), "файл мёртвого процесса обязан быть удалён"
     assert keep.exists(), "посторонние файлы не трогаем"
+
+
+def test_live_process_file_survives(tmp_path):
+    """Файл ЖИВОГО процесса не трогаем — иначе теряем свои же метрики.
+
+    Метрики создаются при импорте модулей, то есть до celeryd_init: к
+    моменту очистки файл текущего процесса уже существует. Снести его —
+    значит потерять всё записанное и продолжить писать в удалённый inode.
+    """
+    mine = tmp_path / f"counter_{os.getpid()}.db"
+    mine.write_bytes(b"my metrics")
+
+    worker_metrics._prepare_dir(tmp_path)
+
+    assert mine.exists(), "файл живого процесса удалять нельзя"
 
 
 def test_prepare_dir_creates_missing_path(tmp_path):
@@ -95,4 +113,44 @@ def test_port_matches_scrape_target():
     assert worker_metrics.WORKER_METRICS_PORT in targets, (
         f"порт {worker_metrics.WORKER_METRICS_PORT} не совпадает с targetPort "
         f"в VMPodScrape ({targets})"
+    )
+
+
+def test_helm_worker_matches_raw_manifest():
+    """Helm-чарт настроен так же, как k8s/worker.yaml.
+
+    Эта пара уже разъезжалась: RBAC для CNPG добавили в base, а в чарте
+    остались одни deployments, и helm-развёртывание молча теряло половину
+    топологии. Здесь цена расхождения такая же — метрики воркера просто не
+    экспортировались бы, и это не видно ниоткуда, кроме пустого графика.
+    """
+    import re
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[1]
+    chart = (root / "helm" / "sre-ai-copilot" / "templates"
+             / "deployment-worker.yaml").read_text(encoding="utf-8")
+
+    assert "PROMETHEUS_MULTIPROC_DIR" in chart, (
+        "в чарте нет PROMETHEUS_MULTIPROC_DIR — start_worker_metrics_server "
+        "вернёт False на каждой helm-установке"
+    )
+    assert re.search(r"containerPort:\s*8001", chart), (
+        "в чарте не объявлен порт метрик"
+    )
+    assert "prometheus-multiproc" in chart, (
+        "каталог должен монтироваться томом: без него первый Counter падает "
+        "FileNotFoundError ещё на импорте"
+    )
+
+    raw = (root / "k8s" / "worker.yaml").read_text(encoding="utf-8")
+    raw_path = re.search(
+        r"name: PROMETHEUS_MULTIPROC_DIR\s*\n\s*value:\s*(\S+)", raw
+    )
+    chart_path = re.search(
+        r"name: PROMETHEUS_MULTIPROC_DIR\s*\n\s*value:\s*(\S+)", chart
+    )
+    assert raw_path and chart_path, "не разобрал значение переменной"
+    assert raw_path.group(1) == chart_path.group(1), (
+        f"пути расходятся: raw={raw_path.group(1)} chart={chart_path.group(1)}"
     )

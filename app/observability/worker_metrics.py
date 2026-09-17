@@ -57,16 +57,45 @@ def multiproc_dir() -> Optional[Path]:
     return Path(raw) if raw else None
 
 
-def _prepare_dir(path: Path) -> None:
-    """Каталог должен существовать и быть пустым к старту воркера.
+def _pid_from_name(name: str) -> Optional[int]:
+    """`counter_123.db` / `gauge_livesum_123.db` → 123."""
+    stem = name.rsplit(".", 1)[0]
+    tail = stem.rsplit("_", 1)[-1]
+    return int(tail) if tail.isdigit() else None
 
-    Файлы остаются от процессов прошлого запуска, и `MultiProcessCollector`
-    честно их суммирует — то есть счётчики «помнили» бы прогоны, которых в
-    этом поде не было. Под эфемерный и /tmp обычно свежий, но у воркера
-    том `emptyDir` переживает рестарт контейнера в том же поде.
+
+def _process_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        # Процесс есть, но чужой — трогать его файл нельзя тем более.
+        return True
+    return True
+
+
+def _prepare_dir(path: Path) -> None:
+    """Убрать файлы МЁРТВЫХ процессов, не тронув живые.
+
+    `emptyDir` переживает рестарт контейнера в том же поде, и оставшиеся
+    файлы `MultiProcessCollector` честно суммирует — счётчики «помнили» бы
+    прогоны, которых в этом контейнере не было.
+
+    Чистить всё подряд НЕЛЬЗЯ. Метрики создаются при импорте модулей, то
+    есть ДО celeryd_init: к моменту этого вызова файл текущего процесса уже
+    существует, и снести его — значит потерять всё, что он успел записать,
+    а дальше писать в удалённый inode.
+
+    Каталог здесь только досоздаётся для локальных запусков и тестов; в
+    кластере его создаёт kubelet, монтируя том. Полагаться на mkdir тут
+    нельзя по той же причине: первый Counter конструируется раньше.
     """
     path.mkdir(parents=True, exist_ok=True)
     for leftover in path.glob("*.db"):
+        pid = _pid_from_name(leftover.name)
+        if pid is None or _process_alive(pid):
+            continue
         try:
             leftover.unlink()
         except OSError as exc:

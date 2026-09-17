@@ -249,7 +249,24 @@ spec:
         # tempfile, и сборка .pyc. У beat такой том был, у воркера — нет.
         - name: tmp
           mountPath: /tmp
+        # Каталог общей памяти prometheus_client — ОТДЕЛЬНЫМ томом, а не
+        # подкаталогом в /tmp, и это принципиально.
+        #
+        # PROMETHEUS_MULTIPROC_DIR читается в момент СОЗДАНИЯ метрики, то
+        # есть при импорте модулей — задолго до celeryd_init. Если каталога
+        # нет, первый же `Counter(...)` падает FileNotFoundError на
+        # counter_<pid>.db, и воркер умирает на старте. Проверено
+        # воспроизведением, а не рассуждением.
+        #
+        # Смонтированный том решает это декларативно: kubelet создаёт
+        # каталог до запуска процесса. В коде это сделать поздно по
+        # определению, а в entrypoint — значит завести скрипт там, где
+        # хватает одной строки манифеста.
+        - name: prometheus-multiproc
+          mountPath: /tmp/prometheus-multiproc
       volumes:
+      - name: prometheus-multiproc
+        emptyDir: {}
       - name: ownership
         configMap:
           name: sre-ai-copilot-ownership
