@@ -51,9 +51,11 @@ template:
       image: ghcr.io/actions/actions-runner:latest
       command: ["/home/runner/run.sh"]
       env:
-      # uv ставит python нужной версии сам (3.11 = версия Dockerfile).
-      # На маке это обход сломанной homebrew-сборки, здесь — просто
-      # единственный инструмент, которым workflow уже пользуется.
+      # ВАЖНО: в стоковом образе actions-runner НЕТ uv, а все три workflow
+      # зовут его сразу (`uv venv --python 3.11`). Одна эта переменная его
+      # не приносит — она лишь говорит, куда uv положит интерпретаторы,
+      # когда появится. Поэтому в workflow добавлен шаг `setup-uv`; без
+      # него job'ы после переключения упали бы на `uv: command not found`.
       - name: UV_PYTHON_INSTALL_DIR
         value: /home/runner/.local/share/uv/python
       resources:

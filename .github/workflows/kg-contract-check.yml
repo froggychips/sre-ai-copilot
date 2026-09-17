@@ -75,6 +75,15 @@ jobs:
         with:
           clean: false
 
+      # uv — единственный способ получить python версии прода: своей
+      # рабочей сборки 3.11 нет ни на маке (homebrew-бутылка нерабочая под
+      # macOS 26.1), ни в образе раннера ARC (там uv не предустановлен).
+      # Action идемпотентен: где uv уже есть, он его и использует.
+      - name: Setup uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          version: "0.9.5"
+
       - name: Setup venv
         run: |
           export PATH="$HOME/.local/bin:$PATH"
