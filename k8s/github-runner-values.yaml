@@ -1,0 +1,76 @@
+# values для helm-чарта gha-runner-scale-set (ARC).
+# Устанавливается в namespace sre-ai-ci — см. шапку k8s/github-runner.yaml.
+
+githubConfigUrl: https://github.com/froggychips/sre-ai-copilot
+
+# Секрет с учётными данными GitHub App. Создаётся ЧЕЛОВЕКОМ до установки,
+# в манифесте его нет намеренно: приватный ключ App'а в git не кладём.
+githubConfigSecret: github-runner-app
+
+# Имя набора = значение `runs-on` в workflow.
+runnerScaleSetName: sre-copilot-k8s
+
+# ── Сколько раннеров держать ────────────────────────────────────────────────
+#
+# minRunners: 1 — один тёплый раннер всегда онлайн. Ноль тоже работает
+# (под поднимается по приходу job'а), но тогда ci-deadman, который следит
+# за «раннер online», начнёт видеть отсутствие раннеров как поломку, а
+# каждый прогон получит +30–60 секунд на старт пода.
+#
+# maxRunners: 3 — CI репозитория состоит из четырёх workflow, и параллельно
+# реально идут максимум два-три job'а. Верхняя граница нужна, чтобы серия
+# push'ов не заняла ноду целиком: на dev-нодах живут squad-окружения.
+minRunners: 1
+maxRunners: 3
+
+# ── Docker внутри job'а ─────────────────────────────────────────────────────
+#
+# dind, потому что ci.yml поднимает Postgres командой `docker run` (образ
+# postgres:16-alpine, порт назначается динамически) и останавливает его
+# в конце. Альтернатива — containerMode: kubernetes, где `services:` в
+# workflow превращаются в отдельные поды; она чище по правам (не нужен
+# privileged), но требует переписать шаги подъёма базы и завести hook'и
+# ARC. Сейчас размен сделан в пользу «workflow почти не меняется».
+#
+# ЧЕСТНО ПРО ЦЕНУ: dind-контейнер privileged. Это ослабление изоляции ПОДА,
+# но не возврат к исходной проблеме: под эфемерный, в отдельном namespace,
+# без доступа к kube-apiserver (NetworkPolicy) и без ~/.kube, ~/.aws,
+# ~/.ssh разработчика. Если privileged окажется неприемлем — переезд на
+# containerMode: kubernetes делается без смены остального.
+containerMode:
+  type: dind
+
+template:
+  spec:
+    # ServiceAccount без каких-либо RoleBinding: раннеру не нужны права в
+    # кластере вообще. Токен API монтировать тоже незачем — в CI он
+    # используется только для эскалации, если под скомпрометируют.
+    automountServiceAccountToken: false
+    containers:
+    - name: runner
+      image: ghcr.io/actions/actions-runner:latest
+      command: ["/home/runner/run.sh"]
+      env:
+      # uv ставит python нужной версии сам (3.11 = версия Dockerfile).
+      # На маке это обход сломанной homebrew-сборки, здесь — просто
+      # единственный инструмент, которым workflow уже пользуется.
+      - name: UV_PYTHON_INSTALL_DIR
+        value: /home/runner/.local/share/uv/python
+      resources:
+        requests:
+          cpu: "1"
+          memory: 2Gi
+        limits:
+          # Полный прогон набора — 3400+ тестов и поднятый рядом Postgres.
+          # На маке это укладывается в ~2 минуты; лимит взят с запасом,
+          # чтобы CI не начал падать по OOM на ровном месте.
+          cpu: "4"
+          memory: 6Gi
+
+# ── Где размещать ───────────────────────────────────────────────────────────
+#
+# dev-ноды заняты squad-окружениями, и CI не должен с ними конкурировать за
+# память в пик. Явного nodeSelector нет намеренно: на момент написания
+# выделенной ноды под CI не существует, а прибивать раннеры к конкретной
+# ноде без неё — значит получить Pending при первой же эвакуации.
+# Появится выделенная нода — добавить сюда nodeSelector и toleration.

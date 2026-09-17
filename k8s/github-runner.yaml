@@ -1,0 +1,145 @@
+# GitHub Actions runner В КЛАСТЕРЕ вместо личного ноутбука.
+#
+# ЗАЧЕМ. Сейчас весь CI репозитория гоняется на единственном self-hosted
+# раннере — личном Mac разработчика (GitHub-hosted недоступны: аккаунт
+# заблокирован по биллингу, см. шапку ci-deadman.yaml). У этого два
+# независимых дефекта, и оба уже стоили дорого:
+#
+#   1. БЕЗОПАСНОСТЬ. Раннер persistent и работает под пользователем
+#      разработчика. Рядом с ним лежат ~/.kube/config с доступом к прод-
+#      кластеру, ~/.aws/credentials и ~/.ssh/id_rsa. Любой код, доехавший
+#      до CI, видит их все. Изоляция от форков структурная (job с форка не
+#      стартует), но собственные ветки исполняются с полным доступом —
+#      то есть CI является дорогой в прод.
+#
+#   2. ДОСТУПНОСТЬ. Ноутбук закрыт — CI стоит. Именно так он простоял
+#      мёртвым 27 дней (04.07–31.07.2026), и узнали об этом случайно;
+#      ci-deadman.yaml появился как реакция ровно на этот случай.
+#
+# Раннер в кластере закрывает оба: ~/.kube ноутбука перестаёт быть частью
+# CI-пути, а доступность больше не зависит от крышки ноутбука.
+#
+# ПОЧЕМУ ARC, А НЕ ПРОСТО DEPLOYMENT С ОБРАЗОМ РАННЕРА. Actions Runner
+# Controller выдаёт ЭФЕМЕРНЫЕ раннеры: под живёт ровно один job и умирает.
+# Persistent-раннер (хоть на маке, хоть в кластере) накапливает состояние
+# между прогонами — именно на этом в ci.yml появился `clean: false` и
+# переиспользуемый .venv, который однажды пересобрался и уронил CI
+# (ruff 0.16.1, 0 → 2659 ошибок). Эфемерность убирает класс целиком.
+#
+# ЧТО ТРЕБУЕТСЯ ОТ ЧЕЛОВЕКА ПЕРЕД УСТАНОВКОЙ (я это сделать не могу):
+#   * создать GitHub App на организацию/аккаунт froggychips с правами
+#     Actions: read/write, Administration: read/write, Metadata: read;
+#   * установить его на репозиторий sre-ai-copilot;
+#   * положить в кластер секрет с его учётными данными:
+#
+#       kubectl -n sre-ai-ci create secret generic github-runner-app \
+#         --from-literal=github_app_id=<APP_ID> \
+#         --from-literal=github_app_installation_id=<INSTALLATION_ID> \
+#         --from-file=github_app_private_key=<путь к .private-key.pem>
+#
+# PAT вместо App тоже работает, но App предпочтительнее: токен
+# короткоживущий и права ограничены одним репозиторием.
+#
+# УСТАНОВКА (два helm-релиза, контроллер и набор раннеров):
+#
+#   kubectl apply -f k8s/github-runner.yaml       # namespace + NetworkPolicy
+#
+#   helm install arc \
+#     --namespace sre-ai-ci \
+#     oci://ghcr.io/actions/actions-runner-controller-charts/gha-runner-scale-set-controller
+#
+#   helm install sre-copilot-runners \
+#     --namespace sre-ai-ci \
+#     -f k8s/github-runner-values.yaml \
+#     oci://ghcr.io/actions/actions-runner-controller-charts/gha-runner-scale-set
+#
+# ПОСЛЕ установки в workflow меняется `runs-on` на `sre-copilot-k8s` и
+# снимается macOS-специфика (DOCKER_HOST на Rancher-сокет). ДО того как
+# раннеры поднимутся, workflow править НЕЛЬЗЯ: старый раннер перестанет
+# подходить под новый лейбл, и CI встанет целиком.
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: sre-ai-ci
+  labels:
+    name: sre-ai-ci
+    # Отдельный namespace, а не sre-ai: в нём исполняется код из
+    # репозитория, и он не должен делить пространство с боевым копайлотом,
+    # его секретами и базой.
+    purpose: ci-runners
+---
+# NetworkPolicy: что раннеру можно, а что нет.
+#
+# Раннер исполняет код из репозитория — значит это наименее доверенный под
+# в кластере, и относиться к нему надо соответственно. Политика строится
+# от запрета: egress разрешён только туда, без чего CI не соберётся.
+#
+# ОСОБЕННО ВАЖЕН запрет к kube-apiserver. Без него под с ServiceAccount'ом
+# (даже безправным) становится точкой, из которой пробуют эскалацию, а
+# смысл всей затеи — убрать доступ к кластеру из CI-пути, а не перенести
+# его с ноутбука внутрь.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: github-runner-egress
+  # namespace ЯВНО: без него apply кладёт политику в namespace текущего
+  # контекста. 05.09.2026 так и вышло с copilot-network-policy — уехала в
+  # `default`, где её селектор не выбирает ничего, и apply отрапортовал
+  # успех.
+  namespace: sre-ai-ci
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: gha-runner-scale-set
+  policyTypes:
+  - Egress
+  - Ingress
+  # Входящий трафик раннеру не нужен вообще: он сам ходит за job'ами
+  # (long-poll к GitHub), никто не стучится к нему.
+  ingress: []
+  egress:
+  # DNS.
+  - to:
+    - namespaceSelector: {}
+      podSelector:
+        matchLabels:
+          k8s-app: kube-dns
+    ports:
+    - protocol: UDP
+      port: 53
+    - protocol: TCP
+      port: 53
+  # Интернет: GitHub (job'ы, checkout), PyPI и ghcr (зависимости, образы).
+  # Вырезаны приватные диапазоны — именно этот блок отделяет «раннер ходит
+  # в интернет» от «раннер ходит по кластеру».
+  - to:
+    - ipBlock:
+        cidr: 0.0.0.0/0
+        except:
+        - 10.0.0.0/8
+        - 172.16.0.0/12
+        - 192.168.0.0/16
+        - 169.254.0.0/16
+    ports:
+    - protocol: TCP
+      port: 443
+    - protocol: TCP
+      port: 80
+  # База графа — только для job'а kg-contract-check (KG_READER_DATABASE_URL,
+  # роль kg_reader с SELECT-only). Это единственная причина, по которой CI
+  # вообще нужен доступ внутрь кластера; всё остальное живёт в интернете.
+  #
+  # Раннер в кластере здесь ещё и выигрывает: сейчас этот job ходит в базу
+  # с ноутбука, то есть строка подключения к боевой БД лежит на личной
+  # машине.
+  - to:
+    - namespaceSelector:
+        matchLabels:
+          name: sre-ai
+      podSelector:
+        matchLabels:
+          app: postgres
+    ports:
+    - protocol: TCP
+      port: 5432
