@@ -950,6 +950,13 @@ class Settings(BaseSettings):
     #         "token":"...","namespace":"prod-shared"}, ...]`
     #   2. Одиночные SEQ_URL_<ENV>/SEQ_TOKEN_<ENV> для prod/preprod/preupdate
     #      (без namespace-hint — сервис матчится по name только).
+    # Какая реализация LogProvider собирается фабрикой (app/providers/
+    # factory.py). Сейчас единственная — "seq"; вторая, поверх ClickHouse,
+    # появится после решения, куда логи писать. Смысл настройки в том,
+    # чтобы этот выбор не требовал трогать вызывающий код.
+    LOG_PROVIDER_BACKEND: str = Field(
+        "seq", description="Реализация LogProvider: seq"
+    )
     SEQ_INSTANCES: str = Field("", description="Seq instances (JSON list). Пусто = fallback на SEQ_URL_<ENV>")
     SEQ_URL_PROD: str = Field("", description="Seq prod base URL (https://wo-api1-prod.lastoasisgame.com/seq)")
     SEQ_TOKEN_PROD: str = Field("", description="Seq prod API key (X-Seq-ApiKey header)")

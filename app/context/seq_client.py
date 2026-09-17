@@ -99,14 +99,35 @@ class SeqClient:
                 return str(v)
         return None
 
-    @with_external_retry(max_attempts=2, initial_delay=0.5, name="seq.count")
     async def count_events(
         self,
         level: str,
         since: datetime,
         until: datetime,
     ) -> int:
-        """Count событий заданного level за окно [since, until].
+        """Количество событий за окно. Поднимает SeqQueryError при отказе.
+
+        Тонкая обёртка над `count_events_detailed` для вызывающих, которым
+        безразлично, упёрлись ли мы в потолок пагинации.
+        """
+        total, _capped = await self.count_events_detailed(level, since, until)
+        return total
+
+    @with_external_retry(max_attempts=2, initial_delay=0.5, name="seq.count")
+    async def count_events_detailed(
+        self,
+        level: str,
+        since: datetime,
+        until: datetime,
+    ) -> Tuple[int, bool]:
+        """Count событий за окно + признак упора в потолок пагинации.
+
+        Второй элемент кортежа — `capped`: True означает, что реальный
+        объём БОЛЬШЕ возвращённого числа. Для потребителя это разные
+        утверждения — «ровно 20000» и «не меньше 20000», — и склеивать их
+        в одно число значит терять именно ту разницу, по которой принимают
+        решение.
+
 
         Seq REST `/api/events` возвращает СТРАНИЦУ raw-событий (list), без
         конверта `{Total}`. Поэтому реальный total получаем пагинацией:
@@ -116,7 +137,11 @@ class SeqClient:
         в `_COUNT_MAX_PAGES`. Если cap достигнут — WARNING и возврат floor-оценки
         (что насчитали), а НЕ тихая обрезка до 1.
 
-        Возвращает 0 при любой ошибке (graceful degrade).
+        Поднимает `SeqQueryError`, если Seq не ответил. Раньше здесь
+        возвращался 0 «graceful degrade» — тот же дефект, что чинили в
+        `top_messages` после 20.08.2026 (NetworkPolicy перекрыла Seq, синк
+        12,8 часа отчитывался `rows=0`), только недочищенный: ноль,
+        означающий «источник недоступен», уходил дальше как «ошибок нет».
         """
         seq_level = _SEQ_LEVELS.get(level, level)
         # Seq фильтр: `@Level = 'Error'`. fromDateUtc / toDateUtc — naive UTC.
@@ -127,6 +152,7 @@ class SeqClient:
             "count": self._COUNT_PAGE_SIZE,
         }
         total = 0
+        capped = False
         after_id: Optional[str] = None
         try:
             async with httpx.AsyncClient(timeout=self._timeout) as client:
@@ -161,21 +187,23 @@ class SeqClient:
                             "page=%d total=%d — событие без Id, пагинация оборвана",
                             self._url, level, page, total,
                         )
+                        # Пагинация оборвана не по концу данных: посчитанное
+                        # — нижняя оценка, как и при упоре в cap.
+                        capped = True
                         break
                 else:
                     # for завершился без break ⇒ упёрлись в cap.
+                    capped = True
                     logger.warning(
                         "seq_client.count_cap_hit url=%s level=%s max_pages=%d "
                         "floor_total=%d — реальный объём БОЛЬШЕ, возвращаю оценку",
                         self._url, level, self._COUNT_MAX_PAGES, total,
                     )
         except Exception as e:
-            logger.debug(
-                "seq_client.count_failed url=%s level=%s err=%s",
-                self._url, level, e,
-            )
-            return 0
-        return total
+            raise SeqQueryError(
+                f"seq {self._url} level={level}: {type(e).__name__}: {e}"
+            ) from e
+        return total, capped
 
     @with_external_retry(max_attempts=2, initial_delay=0.5, name="seq.events")
     async def top_messages(
