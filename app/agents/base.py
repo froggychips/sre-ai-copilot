@@ -1,3 +1,4 @@
+import asyncio
 import time
 
 import structlog
@@ -8,7 +9,7 @@ from app.llm.router import ModelRouter
 from app.observability.ai_metrics import (track_budget_denied, track_llm_cost,
                                         track_llm_usage_per_agent)
 from app.services.audit_logger import audit_service
-from app.services.cost_guard import LLMBudgetExceeded, check_budget, record_spend
+from app.services.cost_guard import LLMBudgetExceeded, reserve, settle
 from app.services.llm_service import LLMTruncatedResponse
 from app.services.prompt_guard import prompt_guard
 from app.services.telemetry_utils import record_llm_metrics, tracer
@@ -47,11 +48,30 @@ class BaseAgent:
 
             safe_context = prompt_guard.sanitize(user_context)
 
-            # Бюджет проверяется у КАЖДОГО агента, а не только на входе в
-            # пайплайн: прогон — это семь вызовов, и потолок можно пробить
-            # внутри одного инцидента. Отказ здесь останавливает прогон на
-            # том агенте, где кончились деньги, а не после всех.
-            verdict = check_budget()
+            full_prompt = f"""
+Role: {self.role}
+Task: {instruction}
+<user_context>
+{safe_context}
+</user_context>
+"""
+
+            # Бюджет РЕЗЕРВИРУЕТСЯ у каждого агента, а не проверяется один
+            # раз на входе в пайплайн. Прогон — это семь вызовов, часть их
+            # уходит через asyncio.gather, и воркеров несколько: простая
+            # проверка «сумма меньше потолка» прошла бы у всех сразу, до
+            # того как первый успеет списать. Резерв атомарен, поэтому
+            # потолок остаётся потолком; излишек возвращается в settle.
+            #
+            # Резерв считается по ГОТОВОМУ промпту: его длина и есть то
+            # единственное, что известно о стоимости вызова заранее.
+            #
+            # to_thread: запись идёт в Postgres синхронным драйвером, а мы
+            # в event loop. Единицы миллисекунд против секунд LLM-вызова,
+            # но блокировать loop ради них незачем.
+            verdict = await asyncio.to_thread(
+                reserve, settings.MODEL_NAME, full_prompt
+            )
             if not verdict.allowed:
                 track_budget_denied(verdict.reason)
                 audit_service.log_event("LLM_CALL_BUDGET_DENIED", {
@@ -62,14 +82,6 @@ class BaseAgent:
                     f"(agent={self.name}, spent={verdict.spent_usd}, "
                     f"limit={verdict.limit_usd})"
                 )
-
-            full_prompt = f"""
-Role: {self.role}
-Task: {instruction}
-<user_context>
-{safe_context}
-</user_context>
-"""
             start = time.monotonic()
             recorded = False  # flag: empty/truncated-response уже записал свой error, exception-branch пропускает
             try:
@@ -83,11 +95,13 @@ Task: {instruction}
                 output_tokens = result.get("output_tokens", 0) if isinstance(result, dict) else 0
                 model_name = (result.get("model") if isinstance(result, dict) else settings.MODEL_NAME) or settings.MODEL_NAME
 
-                # Списываем ДО разбора исхода: пустой и обрезанный ответы
-                # тоже оплачены, и не учесть их значит сделать потолок
-                # декоративным ровно в тех случаях, когда модель ведёт себя
-                # плохо и прогонов становится больше.
-                spent = record_spend(model_name, input_tokens, output_tokens)
+                # Резерв сводится с фактом ДО разбора исхода: пустой и
+                # обрезанный ответы тоже оплачены, и не учесть их значит
+                # сделать потолок декоративным ровно в тех случаях, когда
+                # модель ведёт себя плохо и прогонов становится больше.
+                spent = await asyncio.to_thread(
+                    settle, verdict, model_name, input_tokens, output_tokens
+                )
                 if spent:
                     track_llm_cost(model_name, spent)
 
@@ -164,6 +178,12 @@ Task: {instruction}
                     "output_tokens": output_tokens,
                 })
             except Exception as exc:
+                # Резерв НЕ возвращается. Вызов к провайдеру уже состоялся,
+                # и часть его исходов оплачена: `generate_full` поднимает
+                # ValueError на пустом ответе раньше, чем usage доедет сюда,
+                # то есть токены списаны, а чисел о них у нас нет. Вернуть
+                # резерв значило бы открыть потолок ровно на неудачных
+                # прогонах — а их при проблемах с моделью больше всего.
                 if recorded:
                     raise  # empty-response branch уже всё записал
                 duration_s = time.monotonic() - start

@@ -1,3 +1,4 @@
+import math
 from typing import List, Optional
 
 from pydantic import Field, model_validator
@@ -1044,11 +1045,19 @@ class Settings(BaseSettings):
         # ПОСЛЕ того как budget cap установлен») — то есть держалось на
         # памяти того, кто включает. Здесь его нельзя ни забыть, ни обойти:
         # без потолка процесс с включённым пайплайном просто не поднимется.
-        if self.LLM_PIPELINE_ENABLED and self.LLM_DAILY_BUDGET_USD <= 0:
+        # `math.isfinite` здесь не формальность: pydantic принимает
+        # LLM_DAILY_BUDGET_USD=NaN, а `NaN <= 0` ложно — такой «потолок»
+        # прошёл бы проверку и пропускал бы дальше всё подряд, потому что
+        # ложно и `spent >= NaN`. inf даёт тот же результат честнее.
+        if self.LLM_PIPELINE_ENABLED and not (
+            math.isfinite(self.LLM_DAILY_BUDGET_USD)
+            and self.LLM_DAILY_BUDGET_USD > 0
+        ):
             raise ValueError(
-                "LLM_PIPELINE_ENABLED=true requires LLM_DAILY_BUDGET_USD > 0. "
-                "Пайплайн из семи агентов на потоке алертов без суточного "
-                "потолка — это $750/час до того, как кто-то заметит."
+                "LLM_PIPELINE_ENABLED=true requires a finite LLM_DAILY_BUDGET_USD > 0 "
+                f"(got {self.LLM_DAILY_BUDGET_USD!r}). Пайплайн из семи агентов на "
+                "потоке алертов без суточного потолка — это $750/час до того, "
+                "как кто-то заметит."
             )
         if self.is_production:
             if not self.SAFE_MODE:

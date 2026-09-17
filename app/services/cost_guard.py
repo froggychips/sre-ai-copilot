@@ -12,41 +12,50 @@ Cap в консоли Anthropic эту задачу не решает. Он ру
 пайплайном умрёт всё остальное, что ходит тем же ключом. Предохранитель
 нужен здесь — до вызова и с отказом ровно одного потребителя.
 
-Счётчик живёт в Redis, а не в процессе. Воркер работает prefork'ом и
-рециклит форки каждые 50 задач: процесс-локальная сумма обнулялась бы
-несколько раз в час, и потолок не значил бы ничего. Ключ суточный, по UTC,
-с TTL — отдельная уборка не нужна.
+РЕЗЕРВИРОВАНИЕ, А НЕ ПРОВЕРКА
+-----------------------------
+Наивное «посмотреть сумму и пропустить, если меньше потолка» потолком не
+является. Вызов, начатый при $9.99 из $10, закончится выше предела; хуже
+того, `MultiHypothesisAgent.generate` делает вызовы через `asyncio.gather`,
+а воркеров несколько — все они увидят один и тот же баланс раньше, чем
+первый из них успеет списать. Поэтому стоимость **резервируется до
+вызова** одной атомарной операцией, а после вызова резерв сводится с
+фактическим расходом. Отказ и списание — это одно и то же действие, а не
+два разных.
 
-**Fail-closed.** Недоступный Redis означает не «трать дальше», а «я не знаю,
-сколько уже потрачено». Для предохранителя, который стоит между сервисом и
-деньгами, незнание — причина отказать: цена ошибки несимметрична, лишний
-час без RCA обратим, а потраченные деньги нет. Это отличает его от
-телеметрии рядом (`ai_metrics`), которая намеренно fail-open: метрика не
-важнее вызова модели, а бюджет важнее.
+ПОЧЕМУ POSTGRES, А НЕ REDIS
+---------------------------
+Redis в этом кластере поднят с `maxmemory 256mb` и `allkeys-lru`
+(`k8s/redis.yaml`): под давлением памяти он вытеснит любой ключ, включая
+счётчик расхода. Исчезнувший счётчик читается как «потрачено 0» и выдаёт
+полный суточный бюджет заново — то есть предохранитель открывается сам,
+тихо и именно тогда, когда система под нагрузкой. Деньгам нужна durable
+запись, а не кэш.
+
+Побочно это чинит и второй способ открыться: Redis, который читается, но
+не принимает запись (read-only реплика, кончился диск под AOF), оставлял
+бы `check` довольным устаревшей суммой, пока каждая следующая трата уходит
+в никуда. Здесь резерв — это запись, и провал записи означает отказ.
 """
 from __future__ import annotations
 
 import datetime as dt
+import math
 from dataclasses import dataclass
 from typing import Dict, Optional
 
 import structlog
+from sqlalchemy import text
 
 from app.config import settings
 
 log = structlog.get_logger()
 
-#: Префикс суточного ключа. Дата — в UTC: воркеры могут стоять в разных
-#: зонах, а потолок должен быть один на всех.
-_KEY_PREFIX = "llm:spend:"
-
-#: TTL с запасом на сутки — ключ переживает свой день и уходит сам.
-_KEY_TTL_SECONDS = 48 * 3600
-
-#: Расход хранится в МИКРОДОЛЛАРАХ целым числом. `INCRBYFLOAT` копит
-#: ошибку двоичного округления на каждом из тысяч сложений; целое
-#: `INCRBY` точен по определению.
+#: Расход хранится в МИКРОДОЛЛАРАХ целым числом. Дробное сложение копит
+#: ошибку двоичного округления на тысячах операций, а целое точно.
 _USD_SCALE = 1_000_000
+
+_TABLE = "llm_spend_ledger"
 
 
 class LLMBudgetExceeded(Exception):
@@ -66,6 +75,8 @@ class BudgetVerdict:
     reason: str
     spent_usd: Optional[float]
     limit_usd: float
+    #: Сколько зарезервировано под этот вызов. Сводится в `settle`.
+    reserved_usd: float = 0.0
 
     def as_dict(self) -> Dict[str, object]:
         return {
@@ -73,24 +84,31 @@ class BudgetVerdict:
             "reason": self.reason,
             "spent_usd": self.spent_usd,
             "limit_usd": self.limit_usd,
+            "reserved_usd": self.reserved_usd,
         }
 
 
-def _redis():
-    """Тот же клиент, что у heartbeat-ключей. Бросает, если Redis недоступен.
-
-    Исключение НЕ глушим: вызывающий обязан отличить «потрачено 0» от
-    «неизвестно сколько потрачено», а возврат None на этом уровне эти два
-    случая склеивает.
-    """
-    from app.services.digest.state import _get_beat_redis
-
-    return _get_beat_redis()
-
-
-def _today_key(now: Optional[dt.datetime] = None) -> str:
+def _today(now: Optional[dt.datetime] = None) -> dt.date:
+    """Сутки по UTC: воркеры могут стоять в разных зонах, потолок один."""
     moment = now or dt.datetime.now(dt.timezone.utc)
-    return f"{_KEY_PREFIX}{moment.strftime('%Y-%m-%d')}"
+    return moment.astimezone(dt.timezone.utc).date()
+
+
+def _limit_usd() -> float:
+    """Потолок из настроек. 0 — не задан.
+
+    NaN и inf отсеиваются здесь, а не только инвариантом конфига: настройку
+    можно подменить в рантайме (тесты, `monkeypatch`), а сравнение с NaN
+    всегда ложно — то есть такой «потолок» пропускал бы вообще всё.
+    """
+    raw = getattr(settings, "LLM_DAILY_BUDGET_USD", 0.0) or 0.0
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return 0.0
+    if not math.isfinite(value) or value <= 0:
+        return 0.0
+    return value
 
 
 def _price_table() -> Dict[str, Dict[str, float]]:
@@ -98,15 +116,14 @@ def _price_table() -> Dict[str, Dict[str, float]]:
 
     Таблица живёт в конфиге, а не в коде: прайс меняется без нас, и
     захардкоженное число незаметно устарело бы ровно тогда, когда на него
-    полагаются. Пустая таблица — законное состояние: тогда расход считается
-    по `LLM_PRICE_FALLBACK_*`.
+    полагаются.
     """
     table = getattr(settings, "LLM_PRICE_PER_MTOK", None)
     return table if isinstance(table, dict) else {}
 
 
 def estimate_cost_usd(model: str, input_tokens: int, output_tokens: int) -> float:
-    """Стоимость одного вызова в долларах.
+    """Стоимость вызова в долларах.
 
     Неизвестная модель считается по fallback-ставке, и ставка эта заведомо
     НЕ дешёвая. Ошибиться в пользу «дешевле, чем на самом деле» значит
@@ -128,6 +145,66 @@ def estimate_cost_usd(model: str, input_tokens: int, output_tokens: int) -> floa
     return (tokens_in * in_price + tokens_out * out_price) / 1_000_000
 
 
+def estimate_worst_case_usd(model: str, prompt: str) -> float:
+    """Верхняя оценка стоимости вызова, известная ДО вызова.
+
+    Резервировать можно только то, что уже посчитано, а точное число
+    приходит вместе с ответом. Оценка сознательно завышена с обеих сторон:
+    длина промпта делится на 3 (у кириллицы токенов на символ больше, чем
+    привычные 4 у английского), а выход берётся равным `MAX_TOKENS` — тому
+    максимуму, который модели разрешено выдать.
+
+    Заниженный резерв не защищает: он пропускает вызов, который пробьёт
+    потолок. Завышенный лишь остановит раньше, а разница возвращается сразу
+    после ответа.
+    """
+    prompt_chars = len(prompt or "")
+    input_tokens = (prompt_chars + 2) // 3
+    output_tokens = int(getattr(settings, "MAX_TOKENS", 4096) or 4096)
+    return estimate_cost_usd(model, input_tokens, output_tokens)
+
+
+def _apply_delta(day: dt.date, delta_micro: int) -> int:
+    """Прибавить к суточному счётчику и вернуть новое значение.
+
+    Одна атомарная операция: UPSERT со сложением на стороне БД. Прочитать,
+    сложить в питоне и записать значило бы вернуть ровно ту гонку, ради
+    которой всё это и делается.
+
+    Счётчик не опускается ниже нуля: возврат неиспользованного резерва не
+    должен «печатать» бюджет, если списания разъехались.
+    """
+    from app.database import SessionLocal
+
+    sql = text(f"""
+        INSERT INTO {_TABLE} (day, spent_micro_usd, updated_at)
+        VALUES (:day, GREATEST(:delta, 0), NOW())
+        ON CONFLICT (day) DO UPDATE
+        SET spent_micro_usd = GREATEST({_TABLE}.spent_micro_usd + :delta, 0),
+            updated_at = NOW()
+        RETURNING spent_micro_usd
+    """)
+    db = SessionLocal()
+    try:
+        value = db.execute(sql, {"day": day, "delta": delta_micro}).scalar_one()
+        db.commit()
+        return int(value)
+    finally:
+        db.close()
+
+
+def _read_spent_micro(day: dt.date) -> Optional[int]:
+    from app.database import SessionLocal
+
+    sql = text(f"SELECT spent_micro_usd FROM {_TABLE} WHERE day = :day")
+    db = SessionLocal()
+    try:
+        row = db.execute(sql, {"day": day}).scalar()
+        return int(row) if row is not None else 0
+    finally:
+        db.close()
+
+
 def spent_today_usd(now: Optional[dt.datetime] = None) -> Optional[float]:
     """Сколько потрачено за текущие сутки UTC. None — счётчик недоступен.
 
@@ -135,99 +212,113 @@ def spent_today_usd(now: Optional[dt.datetime] = None) -> Optional[float]:
     значит «неизвестно», второе — «точно ничего».
     """
     try:
-        raw = _redis().get(_today_key(now))
+        micro = _read_spent_micro(_today(now))
     except Exception as e:  # noqa: BLE001 — недоступность считаем незнанием
-        log.warning("cost_guard.redis_unavailable", op="get", error=str(e))
+        log.warning("cost_guard.ledger_unavailable", op="read", error=str(e))
         return None
-    if raw is None:
-        return 0.0
-    try:
-        return int(raw) / _USD_SCALE
-    except (TypeError, ValueError):
-        # Ключ перебит чем-то посторонним — это тоже незнание, не ноль.
-        log.warning("cost_guard.counter_malformed", value=str(raw)[:64])
-        return None
+    return None if micro is None else micro / _USD_SCALE
 
 
-def check_budget(now: Optional[dt.datetime] = None) -> BudgetVerdict:
-    """Можно ли тратить прямо сейчас.
+def reserve(
+    model: str,
+    prompt: str,
+    now: Optional[dt.datetime] = None,
+) -> BudgetVerdict:
+    """Зарезервировать стоимость вызова. `allowed=False` — вызывать нельзя.
 
-    Проверка идёт ДО вызова модели. После — поздно: потолок был бы превышен
-    ровно на стоимость последнего прогона, а у пайплайна из семи агентов
-    это не округление.
+    Резерв списывается ДО обращения к модели и сводится с фактическим
+    расходом в `settle`. Проверка без резерва потолком не является: между
+    ней и списанием помещается сколько угодно параллельных вызовов.
     """
-    limit = float(getattr(settings, "LLM_DAILY_BUDGET_USD", 0.0) or 0.0)
+    limit = _limit_usd()
     if limit <= 0:
         # Потолок не задан — предохранитель молчит и пропускает.
         #
         # Отказывать здесь было бы неправильно: через `BaseAgent` ходит не
-        # только пайплайн, но и живые `/copilot`-команды в Discord, и
-        # fail-closed по умолчанию выключил бы работающее. Запрет «включённый
-        # пайплайн без потолка» — не дело этой функции: он проверяется один
-        # раз на старте инвариантом в `config.py`, где его нельзя ни забыть,
-        # ни обойти. Один предохранитель — одна ответственность.
+        # только пайплайн, но и живые `/copilot`-команды, и fail-closed по
+        # умолчанию выключил бы работающее. Запрет «включённый пайплайн без
+        # потолка» — не дело этой функции: он проверяется один раз на старте
+        # инвариантом в `config.py`, где его нельзя ни забыть, ни обойти.
+        return BudgetVerdict(True, "budget_not_configured", None, 0.0)
+
+    cost = estimate_worst_case_usd(model, prompt)
+    micro = max(1, int(math.ceil(cost * _USD_SCALE)))
+    day = _today(now)
+
+    try:
+        new_total_micro = _apply_delta(day, micro)
+    except Exception as e:  # noqa: BLE001
+        # Резерв не записан — значит неизвестно, сколько потрачено, и
+        # разрешать нечем. Это и есть fail-closed: у предохранителя между
+        # сервисом и деньгами незнание равно запрету.
+        log.warning("cost_guard.reserve_failed", model=model, error=str(e))
+        return BudgetVerdict(False, "budget_state_unknown", None, limit)
+
+    new_total = new_total_micro / _USD_SCALE
+    if new_total > limit:
+        # Резерв не помещается в потолок — откатываем его и отказываем.
+        # Откат обязателен: иначе отклонённые вызовы съедали бы бюджет и
+        # предохранитель захлопнулся бы навсегда после первого же отказа.
+        try:
+            _apply_delta(day, -micro)
+        except Exception as e:  # noqa: BLE001
+            log.warning("cost_guard.reserve_rollback_failed", error=str(e))
         return BudgetVerdict(
-            allowed=True,
-            reason="budget_not_configured",
-            spent_usd=None,
-            limit_usd=limit,
+            False, "daily_budget_exhausted", new_total - cost, limit
         )
 
-    spent = spent_today_usd(now)
-    if spent is None:
-        return BudgetVerdict(
-            allowed=False,
-            reason="budget_state_unknown",
-            spent_usd=None,
-            limit_usd=limit,
-        )
-    if spent >= limit:
-        return BudgetVerdict(
-            allowed=False,
-            reason="daily_budget_exhausted",
-            spent_usd=spent,
-            limit_usd=limit,
-        )
-    return BudgetVerdict(
-        allowed=True,
-        reason="within_budget",
-        spent_usd=spent,
-        limit_usd=limit,
-    )
+    return BudgetVerdict(True, "within_budget", new_total, limit, reserved_usd=cost)
 
 
-def record_spend(
+def settle(
+    verdict: BudgetVerdict,
     model: str,
     input_tokens: int,
     output_tokens: int,
     now: Optional[dt.datetime] = None,
-) -> Optional[float]:
-    """Списать стоимость вызова. Возвращает списанную сумму, None — не списали.
+) -> float:
+    """Свести резерв с фактическим расходом. Возвращает фактическую стоимость.
 
-    Провал записи означает, что потраченное не учтено, и следующий
-    `check_budget` этого не увидит. Поэтому он тут же и логируется: молча
-    потерянная трата хуже отказа, потому что делает потолок декоративным.
+    Вызывается ПОСЛЕ ответа модели, включая ответы неудачные: пустой и
+    обрезанный тоже оплачены. Разница между резервом и фактом возвращается
+    в бюджет — именно поэтому резерв может быть щедрым.
     """
-    cost = estimate_cost_usd(model, input_tokens, output_tokens)
-    if cost <= 0:
-        return 0.0
-    micro = int(round(cost * _USD_SCALE))
-    if micro <= 0:
-        # Вызов дешевле микродоллара: копить нечего, но и терять нечего.
-        return 0.0
-    key = _today_key(now)
+    if verdict.reserved_usd <= 0:
+        # Резерва не было (потолок не задан) — сводить нечего.
+        return estimate_cost_usd(model, input_tokens, output_tokens)
+
+    actual = estimate_cost_usd(model, input_tokens, output_tokens)
+    delta_micro = int(round((actual - verdict.reserved_usd) * _USD_SCALE))
+    if delta_micro == 0:
+        return actual
     try:
-        client = _redis()
-        pipe = client.pipeline()
-        pipe.incrby(key, micro)
-        pipe.expire(key, _KEY_TTL_SECONDS)
-        pipe.execute()
+        _apply_delta(_today(now), delta_micro)
     except Exception as e:  # noqa: BLE001
+        # Резерв остаётся списанным. Для потолка это безопасная сторона:
+        # бюджет считается потраченным чуть больше, чем на самом деле.
         log.warning(
-            "cost_guard.spend_not_recorded",
-            model=model,
-            cost_usd=round(cost, 6),
+            "cost_guard.settle_failed",
+            model=model, delta_usd=round(actual - verdict.reserved_usd, 6),
             error=str(e),
         )
-        return None
-    return cost
+    return actual
+
+
+def peek(now: Optional[dt.datetime] = None) -> BudgetVerdict:
+    """Состояние бюджета БЕЗ резервирования — «стоит ли вообще начинать».
+
+    Гарантией потолка не является и не пытается быть: между этим ответом и
+    вызовом модели помещается что угодно. Гарантию даёт `reserve`, а это —
+    способ не начинать прогон из семи агентов, когда деньги уже кончились,
+    и не платить за первый из них, чтобы это выяснить.
+    """
+    limit = _limit_usd()
+    if limit <= 0:
+        return BudgetVerdict(True, "budget_not_configured", None, 0.0)
+
+    spent = spent_today_usd(now)
+    if spent is None:
+        return BudgetVerdict(False, "budget_state_unknown", None, limit)
+    if spent >= limit:
+        return BudgetVerdict(False, "daily_budget_exhausted", spent, limit)
+    return BudgetVerdict(True, "within_budget", spent, limit)

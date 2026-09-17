@@ -17,7 +17,7 @@ from app.observability.worker_metrics import (
     register_celery_signals as register_worker_metrics_signals,
 )
 from app.services.audit_logger import audit_service
-from app.services.cost_guard import check_budget
+from app.services.cost_guard import peek as peek_budget
 from app.services.telemetry_utils import incident_span
 from app.telemetry import setup_telemetry
 from app.workers.pipeline import IncidentPipeline, transition_to
@@ -565,10 +565,13 @@ async def async_process_incident(
 
     # ── БЮДЖЕТ: второй предохранитель, независимый от флага ────────────
     # Флаг выше — выключатель, у него два положения. Потолок нужен для
-    # третьего: «работай, но не дороже N в сутки». Проверка здесь, на входе,
-    # экономит не один вызов, а весь прогон из семи агентов; BaseAgent.ask
-    # проверяет ещё раз — потолок можно пробить и внутри одного инцидента.
-    verdict = check_budget()
+    # третьего: «работай, но не дороже N в сутки».
+    #
+    # Здесь именно ПРОСМОТР, а не резерв: стоимость целого прогона заранее
+    # неизвестна. Гарантию потолка даёт резерв в BaseAgent.ask перед каждым
+    # вызовом; этот взгляд экономит прогон из семи агентов, когда деньги
+    # уже кончились — чтобы выяснить это, не нужно платить за первый из них.
+    verdict = peek_budget()
     if not verdict.allowed:
         logger.warning(
             "pipeline.skipped_budget incident_id=%s ns=%s reason=%s spent=%s limit=%s",
