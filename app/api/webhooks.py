@@ -20,6 +20,7 @@ from app.knowledge_graph.remediation_events import (SignatureError,
 from app.metrics import ALERTS_SUPPRESSED
 from app.models.remediation_event import RemediationEventIn
 from app.models.incident import AlertManagerAlert, AlertManagerWebhook, Incident
+from app.workers.pipeline_scope import SCOPE_APPROVED_KEY as _SCOPE_APPROVED_KEY
 from app.workers.pipeline_scope import check_scope
 from app.services.teamcity_service import incident_teamcity_context
 from app.workers.tasks import (async_process_incident, celery_app,
@@ -538,11 +539,17 @@ async def alertmanager_webhook(
                 })
                 continue
 
+        # Область действия уже проверена выше, до создания записи. Помечаем
+        # это в полезной нагрузке, чтобы воркер не принимал решение заново:
+        # api и worker — разные деплойменты, и в окне выкатки их настройки
+        # расходятся. Два независимых ответа на один вопрос означали бы, что
+        # запись создана по одному решению, а обработана по другому.
+        dispatched = {**incident.model_dump(), _SCOPE_APPROVED_KEY: True}
         if settings.PIPELINE_DIRECT_INVOKE:
-            await async_process_incident(incident.model_dump())
+            await async_process_incident(dispatched)
             accepted.append({"incident_id": incident.incident_id, "task_id": "direct"})
         else:
-            task = process_incident_task.delay(incident.model_dump())
+            task = process_incident_task.delay(dispatched)
             accepted.append({"incident_id": incident.incident_id, "task_id": task.id})
 
     return {"status": "accepted", "alerts": accepted}

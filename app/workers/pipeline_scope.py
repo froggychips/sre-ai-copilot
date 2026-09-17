@@ -25,6 +25,11 @@ from typing import Any, Dict, List, Optional
 from app.config import settings
 
 
+#: Метка в полезной нагрузке задачи: область действия уже проверена тем,
+#: кто задачу поставил. Значение приходит из нашей же очереди, не извне.
+SCOPE_APPROVED_KEY = "_scope_approved"
+
+
 @dataclass(frozen=True)
 class ScopeVerdict:
     """`in_scope=False` — инцидент до пайплайна не доходит."""

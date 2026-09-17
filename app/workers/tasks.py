@@ -19,7 +19,8 @@ from app.services.audit_logger import audit_service
 from app.services.telemetry_utils import incident_span
 from app.telemetry import setup_telemetry
 from app.workers.pipeline import IncidentPipeline, transition_to
-from app.workers.pipeline_scope import check_scope
+from app.workers.pipeline_scope import (SCOPE_APPROVED_KEY, ScopeVerdict,
+                                        check_scope)
 from app.workers.task_lock import single_instance
 
 setup_telemetry(service_name="copilot-worker")
@@ -539,83 +540,6 @@ def process_incident_task(self, incident_data: dict):
     )
 
 
-def _drop_orphan_open_record(incident_id: str) -> None:
-    """Убрать запись, созданную вебхуком, если воркер область не признал.
-
-    В норме сюда не попадают: вебхук отсекает такие алерты ДО создания
-    IncidentRecord. Но api и worker — разные деплойменты, и deploy.sh
-    обновляет их по очереди, так что в окне выкатки их настройки области
-    расходятся: api ещё принимает алерт и создаёт строку в OPEN, а worker
-    уже отвергает.
-
-    Оставить такую строку нельзя. OPEN входит в `_SKIP_STATES` вебхука, и
-    каждое следующее firing-уведомление дедуплицировалось бы — ровно та
-    осиротевшая запись, ради устранения которой фильтр и переехал в вебхук.
-    Любой другой статус возвращает одну из соседних проблем: терминальный
-    ломает резолв, «переобрабатываемый» даёт ложный флаппинг.
-
-    Поэтому строка удаляется — система возвращается в состояние, как если
-    бы настройки совпали, и следующий firing решит судьбу алерта заново.
-
-    Удаляется НЕ любая строка в OPEN. `stage_analyze` уходит в анализатор
-    ДО перехода в INVESTIGATING (pipeline.py), то есть живой разбор держит
-    строку в OPEN всю стадию — до PIPELINE_STAGE_TIMEOUT_SECONDS. Снести её
-    значит уронить чужой переход и потерять уже сделанный анализ, а такое
-    столкновение возможно и при дубле доставки Celery, и в окне выкатки.
-
-    Поэтому к условию `status = OPEN` добавлен возраст: трогаем только то,
-    что провисело дольше потолка стадии, — работать над ним заведомо уже
-    никто не может. Свежую строку оставляем; если она и правда осиротела,
-    её уберёт следующий firing, когда возраст наберётся.
-    """
-    from datetime import datetime, timedelta
-
-    from app.core.state_machine import IncidentState
-
-    stage_cap = float(getattr(settings, "PIPELINE_STAGE_TIMEOUT_SECONDS", 240.0))
-    cutoff = datetime.utcnow() - timedelta(seconds=stage_cap)
-
-    db = SessionLocal()
-    try:
-        deleted = (
-            db.query(IncidentRecord)
-            .filter(
-                IncidentRecord.incident_id == incident_id,
-                IncidentRecord.status == IncidentState.OPEN.value,
-                # Возраст — защита от сноса живой работы: до перехода в
-                # INVESTIGATING строка остаётся OPEN всю стадию анализа.
-                IncidentRecord.created_at < cutoff,
-            )
-            .delete(synchronize_session=False)
-        )
-        db.commit()
-        if deleted:
-            logger.warning(
-                "pipeline.scope_skip_dropped_orphan incident_id=%s — "
-                "api и worker разошлись в области действия (окно выкатки?)",
-                incident_id,
-            )
-    except Exception as e:
-        db.rollback()
-        if isinstance(e, RETRIABLE_EXC):
-            # Транзиентный сбой БД: проглотить его значит вернуть успех,
-            # дать Celery подтвердить задачу и оставить строку в OPEN — то
-            # есть ровно то состояние, ради устранения которого эта уборка
-            # и делается. Пробрасываем, чтобы задача была переиграна:
-            # OperationalError уже входит в RETRIABLE_EXC.
-            logger.warning(
-                "pipeline.scope_skip_orphan_retry incident_id=%s error=%s",
-                incident_id, e,
-            )
-            raise
-        logger.warning(
-            "pipeline.scope_skip_orphan_not_dropped incident_id=%s error=%s",
-            incident_id, e,
-        )
-    finally:
-        db.close()
-
-
 async def async_process_incident(
     incident_data: dict, retries: int = 0, max_retries: int = 0
 ):
@@ -640,10 +564,19 @@ async def async_process_incident(
         return {"status": "skipped", "reason": "LLM_PIPELINE_ENABLED=false"}
 
     # ── ОБЛАСТЬ ДЕЙСТВИЯ: третье условие включения пайплайна ───────────
-    # Дефолт — critical + prod-*. Это ВТОРАЯ линия: основной фильтр стоит в
-    # вебхуке, до создания записи инцидента. Здесь он ловит второй путь в
-    # пайплайн — прямой вызов задачи, минуя вебхук.
-    scope = check_scope(incident_data)
+    # Дефолт — critical + prod-*. Основная проверка стоит в вебхуке, ДО
+    # создания записи инцидента; сюда задача приезжает с меткой о том, что
+    # решение уже принято. Своё мы в этом случае не принимаем: api и worker
+    # — разные деплойменты, в окне выкатки их настройки расходятся, и
+    # второй ответ на тот же вопрос означал бы, что запись создана по
+    # одному решению, а обработана по другому.
+    #
+    # Проверка остаётся для вызовов БЕЗ метки: прямой запуск задачи, replay,
+    # ручной прогон — там вебхука в пути не было и решать некому.
+    if not incident_data.get(SCOPE_APPROVED_KEY):
+        scope = check_scope(incident_data)
+    else:
+        scope = ScopeVerdict(True, "approved_by_webhook", "", "")
     if not scope.in_scope:
         logger.info(
             "pipeline.skipped_out_of_scope incident_id=%s ns=%s sev=%s reason=%s",
@@ -653,7 +586,6 @@ async def async_process_incident(
             "incident_id": incident_id,
             **scope.as_dict(),
         })
-        _drop_orphan_open_record(incident_id)
         return {"status": "skipped", "reason": scope.reason}
 
     with incident_span(incident_id, service=_service, namespace=_namespace) as _root_span:

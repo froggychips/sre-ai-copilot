@@ -4,7 +4,6 @@
 до critical + prod-*». Проверяется и сам фильтр, и то, что он стоит на
 пути, мимо которого не пройти.
 """
-from datetime import datetime, timedelta
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -262,212 +261,70 @@ async def test_in_scope_alert_is_accepted(scoped_db):
 
 # --- рассинхрон api и worker в окне выкатки --------------------------------
 
+
+# --- решение об области принимается один раз -------------------------------
+
 @pytest.mark.asyncio
-async def test_worker_rejection_removes_the_orphan_record(monkeypatch, tmp_path):
-    """api принял и создал OPEN, worker область не признал — строки не остаётся.
+async def test_webhook_decision_travels_with_the_task(scoped_db):
+    """Вебхук помечает задачу проверенной — воркер не решает заново.
 
     api и worker — разные деплойменты, и deploy.sh обновляет их по очереди:
-    в окне выкатки их настройки области расходятся. Оставшаяся строка в
-    OPEN попадает в `_SKIP_STATES` вебхука и глушит дедупом каждое
-    следующее firing — ровно та осиротевшая запись, ради устранения
-    которой фильтр и переехал в вебхук.
+    в окне выкатки их настройки области расходятся. Два независимых ответа
+    на один вопрос означали бы, что запись создана по одному решению, а
+    обработана по другому, — и тогда строка остаётся в БД без обработчика.
     """
-    from sqlalchemy import create_engine
-    from sqlalchemy.orm import sessionmaker
+    from app.api.webhooks import alertmanager_webhook
+    from app.models.incident import AlertManagerWebhook
+    from app.workers.pipeline_scope import SCOPE_APPROVED_KEY
 
-    from app.core.state_machine import IncidentState
-    from app.database import Base, IncidentRecord
-    from app.workers import tasks
+    db = scoped_db()
+    payload = AlertManagerWebhook(**_webhook_payload("critical", "prod-k5"))
 
-    engine = create_engine(f"sqlite:///{tmp_path}/orphan.db")
-    Base.metadata.create_all(engine)
-    Session = sessionmaker(bind=engine)
-    monkeypatch.setattr(tasks, "SessionLocal", Session)
+    with patch("app.api.webhooks.process_incident_task") as task:
+        task.delay.return_value = MagicMock(id="t1")
+        await alertmanager_webhook(payload, db=db)
 
-    # Старше потолка стадии: живой разбор столько в OPEN не держится.
-    old_enough = datetime.utcnow() - timedelta(
-        seconds=float(settings.PIPELINE_STAGE_TIMEOUT_SECONDS) + 60
-    )
-    db = Session()
-    db.add(IncidentRecord(
-        incident_id="fp-orphan", status=IncidentState.OPEN.value, data={},
-        created_at=old_enough,
-    ))
-    db.commit()
+    dispatched = task.delay.call_args.args[0]
+    assert dispatched[SCOPE_APPROVED_KEY] is True
     db.close()
+
+
+@pytest.mark.asyncio
+async def test_approved_task_is_not_rechecked(monkeypatch):
+    """Задача с меткой проходит, даже если настройки воркера уже. """
+    from app.workers import tasks
+    from app.workers.pipeline_scope import SCOPE_APPROVED_KEY
+
+    monkeypatch.setattr(settings, "LLM_PIPELINE_ENABLED", True, raising=False)
+    # У воркера область уже некуда: без метки алерт был бы отвергнут.
+    monkeypatch.setattr(settings, "PIPELINE_SEVERITY_ALLOWLIST", ["critical"], raising=False)
+    monkeypatch.setattr(settings, "PIPELINE_NAMESPACE_PREFIXES", ["prod-"], raising=False)
+
+    checked = []
+    monkeypatch.setattr(tasks, "check_scope", lambda d: checked.append(d) or None)
+
+    with patch.object(tasks, "SessionLocal", side_effect=RuntimeError("дальше не идём")):
+        with pytest.raises(RuntimeError):
+            await tasks.async_process_incident({
+                "incident_id": "fp-approved", "severity": "warning",
+                "namespace": "dev-17", SCOPE_APPROVED_KEY: True,
+            })
+
+    assert checked == [], "решение вебхука не должно перепроверяться"
+
+
+@pytest.mark.asyncio
+async def test_unmarked_task_is_still_checked(monkeypatch):
+    """Прямой вызов без метки проверяется: вебхука в пути не было."""
+    from app.workers import tasks
 
     monkeypatch.setattr(settings, "LLM_PIPELINE_ENABLED", True, raising=False)
     monkeypatch.setattr(settings, "PIPELINE_SEVERITY_ALLOWLIST", ["critical"], raising=False)
     monkeypatch.setattr(settings, "PIPELINE_NAMESPACE_PREFIXES", [], raising=False)
 
     result = await tasks.async_process_incident(
-        {"incident_id": "fp-orphan", "severity": "warning", "namespace": "dev-17"}
+        {"incident_id": "fp-direct", "severity": "warning", "namespace": "dev-17"}
     )
 
     assert result["status"] == "skipped"
-    db = Session()
-    assert db.query(IncidentRecord).filter_by(incident_id="fp-orphan").count() == 0
-    db.close()
-
-
-@pytest.mark.asyncio
-async def test_fresh_open_record_is_left_alone(monkeypatch, tmp_path):
-    """Свежая строка в OPEN может быть живым разбором — не трогаем.
-
-    `stage_analyze` уходит в анализатор ДО перехода в INVESTIGATING, то
-    есть работающий воркер держит строку в OPEN всю стадию. Снести её
-    значит уронить его переход и потерять сделанный анализ.
-    """
-    from sqlalchemy import create_engine
-    from sqlalchemy.orm import sessionmaker
-
-    from app.core.state_machine import IncidentState
-    from app.database import Base, IncidentRecord
-    from app.workers import tasks
-
-    engine = create_engine(f"sqlite:///{tmp_path}/fresh.db")
-    Base.metadata.create_all(engine)
-    Session = sessionmaker(bind=engine)
-    monkeypatch.setattr(tasks, "SessionLocal", Session)
-
-    db = Session()
-    db.add(IncidentRecord(
-        incident_id="fp-fresh", status=IncidentState.OPEN.value, data={},
-    ))
-    db.commit()
-    db.close()
-
-    monkeypatch.setattr(settings, "LLM_PIPELINE_ENABLED", True, raising=False)
-    monkeypatch.setattr(settings, "PIPELINE_SEVERITY_ALLOWLIST", ["critical"], raising=False)
-    monkeypatch.setattr(settings, "PIPELINE_NAMESPACE_PREFIXES", [], raising=False)
-
-    await tasks.async_process_incident(
-        {"incident_id": "fp-fresh", "severity": "warning", "namespace": "dev-17"}
-    )
-
-    db = Session()
-    assert db.query(IncidentRecord).filter_by(incident_id="fp-fresh").count() == 1, (
-        "свежую строку могли создать секунду назад под живой разбор"
-    )
-    db.close()
-
-
-@pytest.mark.asyncio
-async def test_record_in_flight_is_left_alone(monkeypatch, tmp_path):
-    """Запись, по которой пайплайн уже перешёл дальше OPEN, трогать нельзя."""
-    from sqlalchemy import create_engine
-    from sqlalchemy.orm import sessionmaker
-
-    from app.core.state_machine import IncidentState
-    from app.database import Base, IncidentRecord
-    from app.workers import tasks
-
-    engine = create_engine(f"sqlite:///{tmp_path}/inflight.db")
-    Base.metadata.create_all(engine)
-    Session = sessionmaker(bind=engine)
-    monkeypatch.setattr(tasks, "SessionLocal", Session)
-
-    db = Session()
-    db.add(IncidentRecord(
-        incident_id="fp-busy", status=IncidentState.INVESTIGATING.value, data={},
-    ))
-    db.commit()
-    db.close()
-
-    monkeypatch.setattr(settings, "LLM_PIPELINE_ENABLED", True, raising=False)
-    monkeypatch.setattr(settings, "PIPELINE_SEVERITY_ALLOWLIST", ["critical"], raising=False)
-    monkeypatch.setattr(settings, "PIPELINE_NAMESPACE_PREFIXES", [], raising=False)
-
-    await tasks.async_process_incident(
-        {"incident_id": "fp-busy", "severity": "warning", "namespace": "dev-17"}
-    )
-
-    db = Session()
-    row = db.query(IncidentRecord).filter_by(incident_id="fp-busy").first()
-    assert row is not None, "чужую работу удалять нельзя"
-    assert row.status == IncidentState.INVESTIGATING.value
-    db.close()
-
-
-@pytest.mark.asyncio
-async def test_missing_record_is_not_an_error(monkeypatch, tmp_path):
-    """Штатный путь: записи нет, потому что вебхук её и не создавал."""
-    from sqlalchemy import create_engine
-    from sqlalchemy.orm import sessionmaker
-
-    from app.database import Base
-    from app.workers import tasks
-
-    engine = create_engine(f"sqlite:///{tmp_path}/none.db")
-    Base.metadata.create_all(engine)
-    monkeypatch.setattr(tasks, "SessionLocal", sessionmaker(bind=engine))
-
-    monkeypatch.setattr(settings, "LLM_PIPELINE_ENABLED", True, raising=False)
-    monkeypatch.setattr(settings, "PIPELINE_SEVERITY_ALLOWLIST", ["critical"], raising=False)
-    monkeypatch.setattr(settings, "PIPELINE_NAMESPACE_PREFIXES", [], raising=False)
-
-    result = await tasks.async_process_incident(
-        {"incident_id": "fp-absent", "severity": "warning", "namespace": "dev-17"}
-    )
-
-    assert result["status"] == "skipped"
-
-
-@pytest.mark.asyncio
-async def test_transient_cleanup_failure_is_retried(monkeypatch):
-    """Сбой БД при уборке не должен превращаться в успешную задачу.
-
-    Проглотив его, мы вернули бы успех, Celery подтвердил бы задачу, а
-    строка осталась бы в OPEN — то самое состояние, ради устранения
-    которого уборка и делается. OperationalError уже входит в
-    RETRIABLE_EXC, поэтому задача будет переиграна.
-    """
-    from sqlalchemy.exc import OperationalError
-
-    from app.workers import tasks
-
-    def _broken_session():
-        raise OperationalError("SELECT 1", {}, Exception("server closed"))
-
-    monkeypatch.setattr(tasks, "SessionLocal", _broken_session)
-    monkeypatch.setattr(settings, "LLM_PIPELINE_ENABLED", True, raising=False)
-    monkeypatch.setattr(settings, "PIPELINE_SEVERITY_ALLOWLIST", ["critical"], raising=False)
-    monkeypatch.setattr(settings, "PIPELINE_NAMESPACE_PREFIXES", [], raising=False)
-
-    with pytest.raises(OperationalError):
-        await tasks.async_process_incident(
-            {"incident_id": "fp-db-down", "severity": "warning", "namespace": "dev-17"}
-        )
-
-
-@pytest.mark.asyncio
-async def test_permanent_cleanup_failure_does_not_block_the_skip(monkeypatch, tmp_path):
-    """Неретраибельная ошибка уборки не должна валить скип бесконечно.
-
-    Ретрай тут не поможет — а скип сам по себе корректен: алерт вне
-    области действия, LLM не тронут.
-    """
-    from sqlalchemy import create_engine
-    from sqlalchemy.orm import sessionmaker
-
-    from app.database import Base
-    from app.workers import tasks
-
-    engine = create_engine(f"sqlite:///{tmp_path}/perm.db")
-    Base.metadata.create_all(engine)
-    Session = sessionmaker(bind=engine)
-
-    class _Broken(Session.class_):
-        def query(self, *_a, **_k):
-            raise ValueError("схема разъехалась")
-
-    monkeypatch.setattr(tasks, "SessionLocal", lambda: _Broken(bind=engine))
-    monkeypatch.setattr(settings, "LLM_PIPELINE_ENABLED", True, raising=False)
-    monkeypatch.setattr(settings, "PIPELINE_SEVERITY_ALLOWLIST", ["critical"], raising=False)
-    monkeypatch.setattr(settings, "PIPELINE_NAMESPACE_PREFIXES", [], raising=False)
-
-    result = await tasks.async_process_incident(
-        {"incident_id": "fp-perm", "severity": "warning", "namespace": "dev-17"}
-    )
-
-    assert result["status"] == "skipped"
+    assert result["reason"] == "severity_out_of_scope"
