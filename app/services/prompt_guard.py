@@ -44,6 +44,26 @@ import structlog
 logger = structlog.get_logger()
 
 
+def _observe_input_size(size: int) -> None:
+    """Размер входа ДО обрезки. Fail-open: телеметрия не ломает запрос."""
+    try:
+        from app.observability.ai_metrics import PROMPT_INPUT_CHARS
+
+        PROMPT_INPUT_CHARS.observe(size)
+    except Exception:  # noqa: BLE001 — метрика не важнее вызова модели
+        pass
+
+
+def _count_truncation() -> None:
+    """Факт обрезки. Без счётчика потеря evidence видна только в логах."""
+    try:
+        from app.observability.ai_metrics import PROMPT_INPUT_TRUNCATED
+
+        PROMPT_INPUT_TRUNCATED.inc()
+    except Exception:  # noqa: BLE001
+        pass
+
+
 class PromptGuard:
     # Паттерны атак: "ignore previous instructions", "jailbreak", "override".
     # Это ЕДИНСТВЕННЫЙ блокирующий сигнал — настоящие попытки перехвата
@@ -89,6 +109,7 @@ class PromptGuard:
         from app.config import settings as _settings
 
         max_chars = getattr(_settings, "PROMPT_INPUT_MAX_CHARS", 20000)
+        _observe_input_size(len(sanitized))
         if len(sanitized) > max_chars:
             dropped = len(sanitized) - max_chars
             logger.info(
@@ -97,6 +118,7 @@ class PromptGuard:
                 max_chars=max_chars,
                 dropped_chars=dropped,
             )
+            _count_truncation()
             sanitized = sanitized[:max_chars] + f"…[truncated {dropped} chars]"
 
         return sanitized
