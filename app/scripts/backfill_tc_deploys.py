@@ -18,7 +18,9 @@ from datetime import datetime
 from app.database import SessionLocal
 from app.knowledge_graph.populator import record_deployment
 from app.knowledge_graph.schema import Service
-from app.services.teamcity_service import branch_for_namespace, recent_deploys
+from app.services.teamcity_service import (branch_for_namespace,
+                                          is_prod_buildtype,
+                                          recent_deploys)
 
 
 async def _backfill(days: int, limit: int) -> dict:
@@ -43,6 +45,15 @@ async def _backfill(days: int, limit: int) -> dict:
 
         for b in builds:
             branch_full = (b.get("branch") or "").replace("refs/heads/", "")
+            # Та же нормализация, что в штатном сборе (workers/tasks.py).
+            # Прод-конфиги TC запускаются на ветке preprod — оттуда берётся
+            # только инструментарий, а деплой уходит в prod дочерним билдом.
+            # Без этой строки исторические прод-релизы осели бы на preprod-*
+            # (и squad-gd-*, у которых правило ветки тоже preprod), то есть
+            # backfill создал бы ложную историю, оставив prod-* пустым —
+            # ровно ту проблему, ради которой прод-релизы сюда и допущены.
+            if is_prod_buildtype(b.get("buildtype_id") or ""):
+                branch_full = "prod"
             target_namespaces = ns_by_branch.get(branch_full, [])
             if not target_namespaces:
                 skipped_no_branch += 1
