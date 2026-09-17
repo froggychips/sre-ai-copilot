@@ -238,7 +238,18 @@ jobs:
       # protobuf 4.25→5.29.6 и dotenv 1.0→1.2.2). Любая новая известная
       # CVE в зависимостях фейлит CI — fix через dependabot-PR или ручной bump.
       - name: pip-audit (dependency CVEs)
-        run: .venv/bin/pip-audit --requirement requirements.txt --strict
+        # Аудит УСТАНОВЛЕННОГО окружения, а не файла requirements.
+        #
+        # С `--requirement` pip-audit создаёт под резолв собственный
+        # временный venv, а тот зовёт ensurepip — который в standalone-сборке
+        # CPython от uv падает с SIGABRT. Своей сборки питона у нас больше
+        # нет (homebrew-3.11 нерабочая, см. шапку), поэтому уходим от режима,
+        # которому нужен ensurepip.
+        #
+        # Покрытие от этого не сужается, а уточняется: .venv собран ровно из
+        # requirements.txt, и проверяются фактически установленные версии со
+        # всеми транзитивными зависимостями, а не то, что записано в файле.
+        run: .venv/bin/pip-audit --strict
 
   build-and-push:
     name: Build and Push Docker Image
