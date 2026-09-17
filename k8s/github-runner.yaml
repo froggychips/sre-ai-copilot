@@ -77,6 +77,37 @@ metadata:
     # его секретами и базой.
     purpose: ci-runners
 ---
+# LimitRange: ресурсы для контейнеров, которых нет в values.
+#
+# dind в чарте 0.14.2 — sidecar-initContainer, который чарт генерирует сам,
+# и запись с тем же именем в values он игнорирует (проверено на живом
+# объекте: в AutoscalingRunnerSet остаётся один `runner`, у dind лимитов
+# нет). А именно dind исполняет `docker run`, то есть тестовый Postgres и
+# сборки образов живут в нём.
+#
+# Без requests планировщик считает такой контейнер бесплатным: три
+# параллельных job'а помещаются на ноду, где памяти на них нет, и выбивают
+# соседей — а рядом на dev-нодах живут squad-окружения.
+#
+# LimitRange решает это, не вмешиваясь в чарт: значения получает КАЖДЫЙ
+# контейнер, который не задал свои, включая будущие. У контейнера `runner`
+# ресурсы заданы явно в values, и на него это не влияет.
+apiVersion: v1
+kind: LimitRange
+metadata:
+  name: runner-defaults
+  namespace: sre-ai-ci
+spec:
+  limits:
+  - type: Container
+    default:
+      cpu: "2"
+      memory: 4Gi
+    defaultRequest:
+      cpu: "500m"
+      memory: 1Gi
+
+---
 # NetworkPolicy: что раннеру можно, а что нет.
 #
 # Раннер исполняет код из репозитория — значит это наименее доверенный под
