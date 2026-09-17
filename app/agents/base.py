@@ -5,8 +5,7 @@ import structlog
 from app.config import settings
 from app.core.tracing import record_llm_call
 from app.llm.router import ModelRouter
-from app.observability.ai_metrics import (track_llm_cost,
-                                        track_llm_usage_per_agent)
+from app.observability.ai_metrics import track_llm_usage_per_agent
 from app.services.audit_logger import audit_service
 from app.services.llm_service import LLMTruncatedResponse
 from app.services.prompt_guard import prompt_guard
@@ -66,14 +65,10 @@ Task: {instruction}
                 output_tokens = result.get("output_tokens", 0) if isinstance(result, dict) else 0
                 model_name = (result.get("model") if isinstance(result, dict) else settings.MODEL_NAME) or settings.MODEL_NAME
 
-                # Стоимость посчитана и сведена этажом ниже, в
-                # LLMService.generate_full: резервировать здесь было
-                # неверно — там retry, и один вызов агента превращается в
-                # несколько оплачиваемых обращений к провайдеру. Сюда
-                # цифра приезжает готовой, нам остаётся метрика.
-                spent = result.get("cost_usd", 0.0) if isinstance(result, dict) else 0.0
-                if spent:
-                    track_llm_cost(model_name, spent)
+                # Стоимость считает, списывает И записывает в метрику
+                # generate_full — он единственный знает про попытки. Здесь
+                # инкремент означал бы двойной счёт: успешная попытка
+                # попала бы в llm_cost_usd_total дважды.
 
                 if not response_text:
                     record_llm_call(

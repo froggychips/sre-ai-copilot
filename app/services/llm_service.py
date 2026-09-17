@@ -6,7 +6,7 @@ from typing import Any, Dict, Optional
 from anthropic import AsyncAnthropic, RateLimitError
 
 from app.config import settings
-from app.observability.ai_metrics import track_budget_denied
+from app.observability.ai_metrics import track_budget_denied, track_llm_cost
 from app.services.claude_cli_service import ClaudeCliService
 from app.services.cost_guard import (LLMBudgetExceeded, release, reserve,
                                      settle)
@@ -301,6 +301,12 @@ class LLMService:
             cost_usd = await asyncio.to_thread(
                 settle, verdict, self.model, input_tokens, output_tokens
             )
+            # Метрика пишется здесь, у КАЖДОЙ попытки, а не этажом выше по
+            # итогу вызова: удержанные резервы неудачных попыток тоже
+            # списаны с бюджета, и учитывать только последний успешный
+            # ответ значило бы расходиться с ledger ровно во время
+            # retry-штормов, когда попыток больше всего.
+            track_llm_cost(self.model, cost_usd)
             await _report_provider(resilience, success=True)
             return {
                 "text": text,
@@ -315,6 +321,14 @@ class LLMService:
         except LLMCircuitOpen:
             # Брейкер сработал — это НЕ новый сбой провайдера, не считаем его
             # и не ретраим (см. llm_retry_strategy).
+            raise
+        except LLMBudgetExceeded:
+            # Отказ бюджета — наше локальное решение, провайдера мы не
+            # трогали. Уходя в общий обработчик ниже, он репортился бы как
+            # сбой anthropic: пять отказов подряд открывают circuit, и
+            # вызовы остаются заблокированными даже после того, как ledger
+            # поднялся или сутки сменились. Тот же довод, что у
+            # LLMCircuitOpen выше.
             raise
         except asyncio.TimeoutError as e:
             await _report_provider(resilience, success=False)
@@ -338,6 +352,13 @@ class LLMService:
             logging.error(f"LLM call attempt failed: {e}")
             raise
         except Exception as e:
+            # Резерв этой попытки остаётся списанным (см. выше), значит он
+            # уже потрачен по мнению ledger — и метрика обязана показать то
+            # же самое. Иначе llm_cost_usd_total занижает расход именно
+            # тогда, когда попыток много, а терминальный провал не даёт
+            # вообще никакой цифры.
+            if verdict is not None and verdict.reserved_usd > 0:
+                track_llm_cost(self.model, verdict.reserved_usd)
             await _report_provider(resilience, success=False)
             logging.error(f"LLM call attempt failed: {e}")
             raise

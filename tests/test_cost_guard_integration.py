@@ -204,17 +204,115 @@ async def test_budget_denial_is_not_retried(priced):
 
 
 @pytest.mark.asyncio
-async def test_cost_reaches_the_agent_for_metrics(priced):
-    """Стоимость приезжает в ask готовой — метрике незачем её пересчитывать."""
+async def test_budget_denial_does_not_open_provider_circuit(priced):
+    """Отказ бюджета — наше решение, провайдер ни при чём.
+
+    Уходя в общий обработчик, он репортился бы как сбой anthropic: пять
+    отказов подряд открывают circuit, и вызовы остаются заблокированными
+    даже после того, как ledger поднялся или сменились сутки.
+    """
+    from app.services import llm_service as svc
+
+    reports = []
+
+    async def _report(_resilience, success):
+        reports.append(success)
+
+    client = MagicMock()
+    client.messages.create = AsyncMock(return_value=_anthropic_response())
+
+    service = svc.LLMService()
+    service.backend = "anthropic"
+    service.model = "m"
+    with patch.object(svc, "reserve", lambda *a, **k: _denied()), \
+         patch.object(svc, "_report_provider", _report), \
+         patch.object(service, "_anthropic_client", return_value=client), \
+         patch.object(svc, "_get_resilience", return_value=MagicMock()):
+        with pytest.raises(LLMBudgetExceeded):
+            await service.generate_full("привет")
+
+    assert reports == [], "отказ бюджета не должен считаться сбоем провайдера"
+
+
+@pytest.mark.asyncio
+async def test_metric_counts_retained_reservations(priced):
+    """Метрика обязана показывать то же, что списал ledger.
+
+    Резерв неудачной попытки остаётся списанным, и учитывать только
+    стоимость последнего успешного ответа значит занижать расход ровно во
+    время retry-штормов, когда попыток больше всего.
+    """
+    import anthropic
+
+    from app.services import llm_service as svc
+
+    costs = []
+
+    async def _create(*_a, **_k):
+        if len(costs) < 2:
+            raise anthropic.APITimeoutError(request=MagicMock())
+        return _anthropic_response()
+
+    client = MagicMock()
+    client.messages.create = _create
+
+    service = svc.LLMService()
+    service.backend = "anthropic"
+    service.model = "m"
+    with patch.object(svc, "reserve", lambda *a, **k: _reserved(2.0)), \
+         patch.object(svc, "settle", lambda *a, **k: 0.5), \
+         patch.object(svc, "track_llm_cost", lambda _m, c: costs.append(c)), \
+         patch.object(service, "_anthropic_client", return_value=client), \
+         patch.object(svc, "_get_resilience", return_value=None):
+        await service.generate_full("привет")
+
+    # Две удержанные оценки по 2.0 + фактическая стоимость успешной 0.5.
+    assert costs == [2.0, 2.0, 0.5]
+
+
+@pytest.mark.asyncio
+async def test_terminal_failure_still_reports_cost(priced):
+    """Провал всех попыток тоже стоил денег — метрика не должна молчать."""
+    import anthropic
+
+    from app.services import llm_service as svc
+
+    costs = []
+
+    async def _create(*_a, **_k):
+        raise anthropic.APITimeoutError(request=MagicMock())
+
+    client = MagicMock()
+    client.messages.create = _create
+
+    service = svc.LLMService()
+    service.backend = "anthropic"
+    service.model = "m"
+    with patch.object(svc, "reserve", lambda *a, **k: _reserved(2.0)), \
+         patch.object(svc, "track_llm_cost", lambda _m, c: costs.append(c)), \
+         patch.object(service, "_anthropic_client", return_value=client), \
+         patch.object(svc, "_get_resilience", return_value=None):
+        with pytest.raises(Exception):
+            await service.generate_full("привет")
+
+    assert costs, "терминальный провал не должен давать нулевой расход"
+
+
+@pytest.mark.asyncio
+async def test_agent_does_not_double_count_cost(priced):
+    """Учёт живёт в одном месте: агент не инкрементит поверх."""
     result = {
         "text": "ответ", "input_tokens": 10, "output_tokens": 5,
         "model": "m", "cost_usd": 0.42,
     }
-    with patch("app.agents.base.track_llm_cost") as metric, \
-         patch("app.agents.base.ModelRouter.route_and_call_full", return_value=result):
-        await BaseAgent(name="A", role="r").ask("контекст")
+    with patch("app.agents.base.ModelRouter.route_and_call_full", return_value=result):
+        import app.agents.base as base
 
-    metric.assert_called_once_with("m", 0.42)
+        assert not hasattr(base, "track_llm_cost"), (
+            "агент не должен писать стоимость — иначе успешная попытка "
+            "попадёт в счётчик дважды"
+        )
+        await BaseAgent(name="A", role="r").ask("контекст")
 
 
 @pytest.mark.asyncio
