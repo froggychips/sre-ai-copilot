@@ -12,6 +12,9 @@ from sqlalchemy.orm.attributes import flag_modified
 from app.config import settings
 from app.core.state_machine import IncidentState
 from app.database import IncidentRecord, ReadOnlyAutocommitSession, SessionLocal
+from app.observability.worker_metrics import (
+    register_celery_signals as register_worker_metrics_signals,
+)
 from app.services.audit_logger import audit_service
 from app.services.telemetry_utils import incident_span
 from app.telemetry import setup_telemetry
@@ -23,6 +26,14 @@ setup_telemetry(service_name="copilot-worker")
 logger = logging.getLogger(__name__)
 
 celery_app = Celery("sre_tasks", broker=settings.REDIS_URL, backend=settings.REDIS_URL)
+
+# Метрики воркера: сервер /metrics поднимается по celeryd_init. До
+# 17.09.2026 его не было вовсе — весь LLM-слой (токены, латентность,
+# ошибки по агентам) считался здесь и никуда не уезжал, хотя VMPodScrape
+# уже перечислял copilot-worker в селекторе. Подписка на сигналы делается
+# при импорте модуля задач: сам celery импортирует его первым делом
+# (`-A app.workers.tasks.celery_app`).
+register_worker_metrics_signals()
 
 # task_track_started: выставляем безусловно (в т.ч. eager) — раньше это жило
 # на legacy-app Celery("worker") в celery_worker.py, который теперь сведён сюда.

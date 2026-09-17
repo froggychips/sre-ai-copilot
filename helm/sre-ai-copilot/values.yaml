@@ -182,3 +182,19 @@ secrets:
   jiraBaseUrl: ""
   jiraEmail: ""
   jiraApiToken: ""
+
+# Мониторинг: откуда пускать скрейп и создавать ли scrape-объект.
+monitoring:
+  # namespace, из которого разрешён вход на порт метрик (8001).
+  # NetworkPolicy воркера и API пускают только его.
+  namespace: monitoring
+  podScrape:
+    # VMPodScrape для подов чарта. По умолчанию ВЫКЛЮЧЕН: объект требует
+    # CRD оператора VictoriaMetrics, и на кластере без него `helm install`
+    # упал бы на неизвестном kind — это хуже, чем отсутствие метрик.
+    #
+    # Включать там, где оператор есть. Без него метрики воркера считаются,
+    # но никем не собираются: сам по себе объявленный порт 8001 series в
+    # VictoriaMetrics не создаёт.
+    enabled: false
+    interval: 30s

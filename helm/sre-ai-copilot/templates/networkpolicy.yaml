@@ -100,7 +100,27 @@ spec:
       operator: In
       values: ["worker", "beat", "migrate"]
   policyTypes:
+  - Ingress
   - Egress
+  # Входящий трафик: только скрейп метрик, и только из ns monitoring.
+  #
+  # Раньше здесь были одни Egress-правила, и это было безопасно ровно
+  # потому, что воркер ничего не слушал. С появлением /metrics на
+  # 0.0.0.0:8001 (17.09.2026) отсутствие Ingress-секции означало бы
+  # неаутентифицированный listener, открытый всему кластеру. В raw-
+  # манифесте порт 8001 ограничен ns monitoring с самого начала — здесь
+  # то же самое.
+  #
+  # Пустой список правил для ВСЕХ остальных портов: под изолирован, а
+  # beat и migrate не слушают ничего вовсе.
+  ingress:
+  - from:
+    - namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: {{ .Values.monitoring.namespace | default "monitoring" }}
+    ports:
+    - protocol: TCP
+      port: 8001
   egress:
   # Postgres
   - to:

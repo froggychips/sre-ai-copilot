@@ -49,6 +49,13 @@ spec:
         - --loglevel=info
         # concurrency=2, НЕ 4 — см. арифметику в resources ниже.
         - --concurrency=2
+        ports:
+        # Метрики воркера. Порт объявлен ЯВНО: VMPodScrape целится в
+        # `targetPort: 8001` и уже перечисляет copilot-worker в селекторе —
+        # до 17.09.2026 скрейпить было нечего, потому что сервер метрик
+        # поднимался только в API-процессе, а весь LLM-слой считается здесь.
+        - containerPort: 8001
+          name: metrics
         securityContext:
           readOnlyRootFilesystem: true
           allowPrivilegeEscalation: false
@@ -58,6 +65,17 @@ spec:
         - secretRef:
             name: sre-ai-secrets
         env:
+        # Каталог общей памяти prometheus_client. Воркер работает prefork'ом
+        # (--concurrency=2), и задачи исполняются в ДЕТЯХ: реестр у каждого
+        # свой, поэтому сервер в родителе отдавал бы нули. В multiprocess-
+        # режиме дети пишут сюда, родитель отдаёт сумму.
+        #
+        # Путь внутри уже смонтированного emptyDir /tmp — своего тома не
+        # нужно, а readOnlyRootFilesystem запрещает писать куда-либо ещё.
+        # Переменная задаётся ЗДЕСЬ, а не в коде: prometheus_client смотрит
+        # на неё в момент создания метрик, то есть при импорте модулей.
+        - name: PROMETHEUS_MULTIPROC_DIR
+          value: /tmp/prometheus-multiproc
         # ENV=production включает fail-closed-валидаторы в app/config.py
         # (обязательные секреты + запрет SAFE_MODE=false). Заполни secrets.yaml.
         - name: ENV
@@ -231,7 +249,24 @@ spec:
         # tempfile, и сборка .pyc. У beat такой том был, у воркера — нет.
         - name: tmp
           mountPath: /tmp
+        # Каталог общей памяти prometheus_client — ОТДЕЛЬНЫМ томом, а не
+        # подкаталогом в /tmp, и это принципиально.
+        #
+        # PROMETHEUS_MULTIPROC_DIR читается в момент СОЗДАНИЯ метрики, то
+        # есть при импорте модулей — задолго до celeryd_init. Если каталога
+        # нет, первый же `Counter(...)` падает FileNotFoundError на
+        # counter_<pid>.db, и воркер умирает на старте. Проверено
+        # воспроизведением, а не рассуждением.
+        #
+        # Смонтированный том решает это декларативно: kubelet создаёт
+        # каталог до запуска процесса. В коде это сделать поздно по
+        # определению, а в entrypoint — значит завести скрипт там, где
+        # хватает одной строки манифеста.
+        - name: prometheus-multiproc
+          mountPath: /tmp/prometheus-multiproc
       volumes:
+      - name: prometheus-multiproc
+        emptyDir: {}
       - name: ownership
         configMap:
           name: sre-ai-copilot-ownership
