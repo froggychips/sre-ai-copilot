@@ -1,3 +1,4 @@
+import math
 from typing import List, Optional
 
 from pydantic import Field, model_validator
@@ -85,13 +86,43 @@ class Settings(BaseSettings):
     #   - severity-фильтр сужен до critical + prod-*
     LLM_PIPELINE_ENABLED: bool = False
 
+    # Суточный потолок расхода на LLM, в долларах. 0 — потолок НЕ задан, и
+    # это состояние трактуется как запрет: `cost_guard` не пропустит вызов.
+    # Включённый пайплайн без потолка — ровно та дыра, из-за которой
+    # LLM_PIPELINE_ENABLED до сих пор False (см. арифметику выше).
+    #
+    # Почему предохранитель в коде, а не только cap в консоли Anthropic:
+    # консольный cap рубит ключ целиком и постфактум, унося вместе с
+    # пайплайном всё остальное, что ходит тем же ключом.
+    LLM_DAILY_BUDGET_USD: float = Field(
+        0.0, description="Потолок трат на LLM в сутки (UTC), USD. 0 = запрещено"
+    )
+    # Цены за миллион токенов по моделям: {"model-id": {"input": 3.0,
+    # "output": 15.0}}. Таблица в настройках, а не в коде: прайс меняется
+    # без нас, и захардкоженное число устарело бы незаметно.
+    LLM_PRICE_PER_MTOK: dict = Field(
+        default_factory=dict,
+        description="Цены за 1M токенов по моделям, USD",
+    )
+    # Ставка для модели, которой нет в таблице. Намеренно НЕ дешёвая:
+    # недооценка пропускает трату мимо потолка, переоценка лишь раньше
+    # остановит — цена этих двух ошибок несимметрична.
+    LLM_PRICE_FALLBACK_INPUT: float = Field(
+        15.0, description="Ставка input за 1M токенов для неизвестной модели, USD"
+    )
+    LLM_PRICE_FALLBACK_OUTPUT: float = Field(
+        75.0, description="Ставка output за 1M токенов для неизвестной модели, USD"
+    )
+
     # Область действия пайплайна: третье условие его включения (первые два —
     # E2E-тесты и потолок расхода). Дефолты уже сужены до того, что записано
     # в этом условии: critical + namespace'ы с префиксом prod-.
     #
-    # Фильтр стоит НЕ в вебхуке, а на входе в задачу: так он покрывает оба
-    # пути попадания в пайплайн (Celery и PIPELINE_DIRECT_INVOKE) — ровно
-    # как хард-гейт выше. Фильтр в одном вебхуке обходился бы вторым путём.
+    # Проверяется в вебхуке, ДО создания записи инцидента, и решение едет
+    # с задачей: api и worker — разные деплойменты, и два независимых ответа
+    # на один вопрос означали бы, что запись создана по одному решению, а
+    # обработана по другому. В задаче проверка остаётся второй линией — для
+    # вызовов без метки (прямой запуск, replay).
     #
     # Пустой список отключает фильтр ПО СВОЕМУ измерению. Это законное, но
     # осознанное действие: severity-фильтр — единственное, что отделяет
@@ -970,6 +1001,13 @@ class Settings(BaseSettings):
     #         "token":"...","namespace":"prod-shared"}, ...]`
     #   2. Одиночные SEQ_URL_<ENV>/SEQ_TOKEN_<ENV> для prod/preprod/preupdate
     #      (без namespace-hint — сервис матчится по name только).
+    # Какая реализация LogProvider собирается фабрикой (app/providers/
+    # factory.py). Сейчас единственная — "seq"; вторая, поверх ClickHouse,
+    # появится после решения, куда логи писать. Смысл настройки в том,
+    # чтобы этот выбор не требовал трогать вызывающий код.
+    LOG_PROVIDER_BACKEND: str = Field(
+        "seq", description="Реализация LogProvider: seq"
+    )
     SEQ_INSTANCES: str = Field("", description="Seq instances (JSON list). Пусто = fallback на SEQ_URL_<ENV>")
     SEQ_URL_PROD: str = Field("", description="Seq prod base URL (https://wo-api1-prod.lastoasisgame.com/seq)")
     SEQ_TOKEN_PROD: str = Field("", description="Seq prod API key (X-Seq-ApiKey header)")
@@ -1031,6 +1069,51 @@ class Settings(BaseSettings):
                 "ANTHROPIC_API_KEY is required when LLM_BACKEND=anthropic. "
                 "For local dev without an API key, set LLM_BACKEND=claude_cli."
             )
+        # Условие включения пайплайна, записанное исполняемым правилом.
+        # Раньше оно жило комментарием у LLM_PIPELINE_ENABLED («включать
+        # ПОСЛЕ того как budget cap установлен») — то есть держалось на
+        # памяти того, кто включает. Здесь его нельзя ни забыть, ни обойти:
+        # без потолка процесс с включённым пайплайном просто не поднимется.
+        # `math.isfinite` здесь не формальность: pydantic принимает
+        # LLM_DAILY_BUDGET_USD=NaN, а `NaN <= 0` ложно — такой «потолок»
+        # прошёл бы проверку и пропускал бы дальше всё подряд, потому что
+        # ложно и `spent >= NaN`. inf даёт тот же результат честнее.
+        if self.LLM_PIPELINE_ENABLED and not (
+            math.isfinite(self.LLM_DAILY_BUDGET_USD)
+            and self.LLM_DAILY_BUDGET_USD > 0
+        ):
+            raise ValueError(
+                "LLM_PIPELINE_ENABLED=true requires a finite LLM_DAILY_BUDGET_USD > 0 "
+                f"(got {self.LLM_DAILY_BUDGET_USD!r}). Пайплайн из семи агентов на "
+                "потоке алертов без суточного потолка — это $750/час до того, "
+                "как кто-то заметит."
+            )
+
+        # Таблица цен: запись либо полная и осмысленная, либо её нет. Две
+        # половины одной ставки хуже отсутствия обеих — `{"input": 3}` даёт
+        # бесплатный выход, то есть потолок на месте, цифры правдоподобны, а
+        # половина расхода не считается. На старте это видно, в рантайме уже
+        # нет, поэтому проверяем здесь и отказываемся подниматься.
+        if isinstance(self.LLM_PRICE_PER_MTOK, dict):
+            for model_id, entry in self.LLM_PRICE_PER_MTOK.items():
+                if not isinstance(entry, dict):
+                    raise ValueError(
+                        f"LLM_PRICE_PER_MTOK[{model_id!r}] должен быть объектом "
+                        f"с ключами input и output, получено: {entry!r}"
+                    )
+                for side in ("input", "output"):
+                    raw = entry.get(side)
+                    try:
+                        rate = float(raw)  # type: ignore[arg-type]
+                    except (TypeError, ValueError):
+                        raise ValueError(
+                            f"LLM_PRICE_PER_MTOK[{model_id!r}][{side!r}] не число: {raw!r}"
+                        ) from None
+                    if not math.isfinite(rate) or rate <= 0:
+                        raise ValueError(
+                            f"LLM_PRICE_PER_MTOK[{model_id!r}][{side!r}] должна быть "
+                            f"конечной и положительной, получено: {raw!r}"
+                        )
         if self.is_production:
             if not self.SAFE_MODE:
                 raise ValueError(

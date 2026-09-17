@@ -310,3 +310,51 @@ def track_hypotheses_count(n: int) -> None:
 
 def track_survivors_count(n: int) -> None:
     SURVIVORS_COUNT_PER_RUN.observe(n)
+
+# Обрезка входа промпта. До 17.09.2026 факт обрезки жил только в
+# structlog-записи `prompt_guard.input_truncated`: чтобы узнать, теряем ли
+# мы evidence, приходилось идти в логи и верить, что нужный под ещё жив.
+#
+# Вопрос не праздный: роадмап предлагает строить EvidenceBundle с
+# приоритетами и token budget, и это оправдано ровно настолько, насколько
+# обрезка реально срабатывает. Счётчик отвечает на это фактом, а
+# гистограмма показывает, НАСКОЛЬКО не влезаем — по ней и выбирать, резать
+# умнее или поднимать лимит.
+PROMPT_INPUT_TRUNCATED = Counter(
+    "prompt_input_truncated_total",
+    "Prompt inputs truncated before the model call",
+)
+
+PROMPT_INPUT_CHARS = Histogram(
+    "prompt_input_chars",
+    "Prompt input size in characters, before truncation",
+    # Верхние корзины намеренно выше лимита в 20000: без них не видно, на
+    # сколько именно вход превышает предел — а это и есть цифра, по которой
+    # принимается решение.
+    buckets=(1_000, 5_000, 10_000, 20_000, 50_000, 100_000, float("inf")),
+)
+
+
+# --- Стоимость и бюджет ---------------------------------------------------
+# Счётчик токенов выше отвечает «сколько», но не «почём»: сравнить модели или
+# поставить потолок по нему нельзя, пока цена живёт отдельно от расхода.
+# Здесь расход в деньгах и работа предохранителя (app/services/cost_guard.py).
+LLM_COST_USD = Counter(
+    "llm_cost_usd_total", "Оценка расхода на LLM в долларах", ["model"]
+)
+# `reason` различает три разных отказа, которые иначе слились бы в один:
+# потолок не задан, потолок исчерпан, состояние счётчика неизвестно. Первое —
+# конфигурация, второе — норма дня, третье — недоступный Redis.
+LLM_BUDGET_DENIED = Counter(
+    "llm_budget_denied_total", "Отказы предохранителя бюджета", ["reason"]
+)
+
+
+def track_llm_cost(model: str, cost_usd: float) -> None:
+    """Записать стоимость вызова. Отрицательное игнорируем: Counter не убывает."""
+    if cost_usd > 0:
+        LLM_COST_USD.labels(model=model or "unknown").inc(cost_usd)
+
+
+def track_budget_denied(reason: str) -> None:
+    LLM_BUDGET_DENIED.labels(reason=reason or "unknown").inc()

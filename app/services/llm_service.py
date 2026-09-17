@@ -3,10 +3,13 @@ import logging
 import weakref
 from typing import Any, Dict, Optional
 
-from anthropic import AsyncAnthropic
+from anthropic import AsyncAnthropic, RateLimitError
 
 from app.config import settings
+from app.observability.ai_metrics import track_budget_denied, track_llm_cost
 from app.services.claude_cli_service import ClaudeCliService
+from app.services.cost_guard import (LLMBudgetExceeded, release, reserve,
+                                     settle)
 from app.services.resilience import LLMCircuitOpen, llm_retry_strategy
 
 _LLM_PROVIDER = "anthropic"
@@ -167,6 +170,13 @@ class LLMService:
         # локальный subprocess, у него своя модель отказа (resilience=None →
         # _report_provider/проверка circuit no-op).
         resilience = None if self.backend == "claude_cli" else _get_resilience()
+        # Резерв бюджета берётся ниже, перед самим HTTP-вызовом. None здесь
+        # значит «до резерва не дошли» — обработчикам ошибок нечего
+        # возвращать.
+        verdict = None
+        # Сведён ли резерв. Нужен обработчикам: пока False — в счётчике
+        # лежит worst-case, после True — фактическая стоимость.
+        accounted = False
         try:
             if self.backend == "claude_cli":
                 assert self.cli is not None
@@ -225,6 +235,46 @@ class LLMService:
             #     случай, если корутина зависнет ВНЕ httpx (DNS/телo/локи).
             #     Он НЕ отменяет сетевой сокет сам по себе — поэтому слой (1)
             #     обязателен, а wait_for оставлен лишь как hard-ceiling.
+            # ── БЮДЖЕТ: резерв на КАЖДУЮ попытку, а не на вызов агента ──
+            # Резервировать этажом выше (в BaseAgent.ask) было ошибкой:
+            # generate_full обёрнут llm_retry_strategy, то есть один
+            # логический вызов агента — до трёх обращений к провайдеру. Из
+            # ретраибельных ошибок как минимум таймаут означает, что запрос
+            # дошёл и был обработан: попытка оплачена, а резерв был один на
+            # все три. Потолок переставал быть потолком ровно в тот момент,
+            # когда провайдеру плохо и попыток становится больше.
+            #
+            # Здесь резерв берётся внутри retry-петли, поэтому каждая
+            # оплачиваемая попытка проходит через него.
+            # shield: отмена (stage-cap) не останавливает поток, который уже
+            # пишет резерв в Postgres. Без защиты await поднял бы
+            # CancelledError, verdict остался бы None — а резерв при этом
+            # закоммичен и висел бы в счётчике до смены суток, потому что
+            # обработчик отмены о нём не знает. Дожидаемся результата и
+            # только потом пробрасываем отмену дальше.
+            _reserve_task = asyncio.ensure_future(
+                asyncio.to_thread(reserve, self.model, prompt)
+            )
+            try:
+                verdict = await asyncio.shield(_reserve_task)
+            except asyncio.CancelledError:
+                verdict = await _reserve_task
+                if verdict.reserved_usd > 0:
+                    track_llm_cost(self.model, verdict.reserved_usd)
+                # Учтено здесь — внешняя ветка отмены не должна записать то
+                # же самое второй раз.
+                accounted = True
+                raise
+            if not verdict.allowed:
+                # LLMBudgetExceeded не входит в is_retryable_llm_error —
+                # ретраить отказ бюджета значит повторять попытку потратить
+                # то, чего тратить нельзя.
+                track_budget_denied(verdict.reason)
+                raise LLMBudgetExceeded(
+                    f"LLM budget guard: {verdict.reason} "
+                    f"(model={self.model}, spent={verdict.spent_usd}, "
+                    f"limit={verdict.limit_usd})"
+                )
             response = await asyncio.wait_for(
                 client.messages.create(
                     model=self.model,
@@ -264,28 +314,106 @@ class LLMService:
                 )
             # Anthropic SDK: response.usage.input_tokens / .output_tokens
             usage = getattr(response, "usage", None)
+            input_tokens = int(getattr(usage, "input_tokens", 0) or 0)
+            output_tokens = int(getattr(usage, "output_tokens", 0) or 0)
+            # Сводим резерв с фактом. Разница (резерв был верхней оценкой)
+            # возвращается в бюджет — именно поэтому резерв может быть
+            # щедрым, не съедая потолок.
+            cost_usd = await asyncio.to_thread(
+                settle, verdict, self.model, input_tokens, output_tokens
+            )
+            # С этого момента резерв сведён и записан в метрику. Отмена,
+            # пришедшая позже (например, пока _report_provider ждёт Redis),
+            # не должна записать его во второй раз: в счётчике уже лежит
+            # фактическая стоимость, а не worst-case.
+            accounted = True
+            # Метрика пишется здесь, у КАЖДОЙ попытки, а не этажом выше по
+            # итогу вызова: удержанные резервы неудачных попыток тоже
+            # списаны с бюджета, и учитывать только последний успешный
+            # ответ значило бы расходиться с ledger ровно во время
+            # retry-штормов, когда попыток больше всего.
+            track_llm_cost(self.model, cost_usd)
             await _report_provider(resilience, success=True)
             return {
                 "text": text,
-                "input_tokens": int(getattr(usage, "input_tokens", 0) or 0),
-                "output_tokens": int(getattr(usage, "output_tokens", 0) or 0),
+                "input_tokens": input_tokens,
+                "output_tokens": output_tokens,
                 "model": self.model,
                 "backend": "anthropic",
                 "stop_reason": stop_reason,
                 "truncated": truncated,
+                "cost_usd": cost_usd,
             }
         except LLMCircuitOpen:
             # Брейкер сработал — это НЕ новый сбой провайдера, не считаем его
             # и не ретраим (см. llm_retry_strategy).
             raise
+        except LLMBudgetExceeded:
+            # Отказ бюджета — наше локальное решение, провайдера мы не
+            # трогали. Уходя в общий обработчик ниже, он репортился бы как
+            # сбой anthropic: пять отказов подряд открывают circuit, и
+            # вызовы остаются заблокированными даже после того, как ledger
+            # поднялся или сутки сменились. Тот же довод, что у
+            # LLMCircuitOpen выше.
+            raise
         except asyncio.TimeoutError as e:
+            # Резерв этой попытки удержан (см. общий обработчик ниже) —
+            # значит он уже списан, и метрика обязана это показать.
+            # Отдельная ветка нужна потому, что hard-ceiling wait_for
+            # заканчивается здесь, мимо общего except.
+            if not accounted and verdict is not None and verdict.reserved_usd > 0:
+                track_llm_cost(self.model, verdict.reserved_usd)
             await _report_provider(resilience, success=False)
             logging.error("LLM call timed out")
             # `from e` сохраняет __cause__=TimeoutError → is_retryable_llm_error
             # распознаёт ретраибельность сквозь обёртку ValueError (таймаут =
             # транзиент, повтор оправдан).
             raise ValueError("LLM timeout") from e
+        except RateLimitError as e:
+            # 429 — провайдер отказал ДО обработки запроса, платить не за
+            # что. Резерв возвращаем: иначе шторм rate-limit'ов съедал бы
+            # суточный бюджет отказами, за которые никто не выставил счёт.
+            #
+            # Для остальных ошибок резерв НЕ возвращается: таймаут означает,
+            # что запрос дошёл и мог быть обработан, и считать такую попытку
+            # бесплатной значит открывать потолок именно тогда, когда
+            # провайдеру плохо и попыток становится больше.
+            if verdict is not None:
+                # release возвращает то, что ОСТАЛОСЬ списанным: 0 при
+                # успешном возврате, полный резерв — если запись упала.
+                # Во втором случае деньги с точки зрения ledger потрачены,
+                # и метрика обязана это показать.
+                retained = await asyncio.to_thread(release, verdict)
+                if retained:
+                    track_llm_cost(self.model, retained)
+            await _report_provider(resilience, success=False)
+            logging.error(f"LLM call attempt failed: {e}")
+            raise
+        except asyncio.CancelledError:
+            # Отмена приходит от внешнего stage-cap (pipeline._with_stage_cap,
+            # 240 с) и наследуется от BaseException — то есть мимо `except
+            # Exception` ниже и мимо ветки TimeoutError выше. Резерв при
+            # этом уже списан, и без записи метрика занижала бы расход
+            # каждый раз, когда стадия упирается в потолок: у
+            # последовательного критика это не редкость.
+            #
+            # `accounted` защищает от обратного перекоса: отмена могла прийти
+            # уже ПОСЛЕ сведения, и тогда в счётчике лежит фактическая
+            # стоимость — записывать поверх неё worst-case значит завысить
+            # расход на ровном месте.
+            if not accounted and verdict is not None and verdict.reserved_usd > 0:
+                track_llm_cost(self.model, verdict.reserved_usd)
+            # _report_provider намеренно не зовём: отмена по нашему таймауту
+            # — не признак того, что провайдеру плохо.
+            raise
         except Exception as e:
+            # Резерв этой попытки остаётся списанным (см. выше), значит он
+            # уже потрачен по мнению ledger — и метрика обязана показать то
+            # же самое. Иначе llm_cost_usd_total занижает расход именно
+            # тогда, когда попыток много, а терминальный провал не даёт
+            # вообще никакой цифры.
+            if not accounted and verdict is not None and verdict.reserved_usd > 0:
+                track_llm_cost(self.model, verdict.reserved_usd)
             await _report_provider(resilience, success=False)
             logging.error(f"LLM call attempt failed: {e}")
             raise
