@@ -1059,6 +1059,32 @@ class Settings(BaseSettings):
                 "потоке алертов без суточного потолка — это $750/час до того, "
                 "как кто-то заметит."
             )
+
+        # Таблица цен: запись либо полная и осмысленная, либо её нет. Две
+        # половины одной ставки хуже отсутствия обеих — `{"input": 3}` даёт
+        # бесплатный выход, то есть потолок на месте, цифры правдоподобны, а
+        # половина расхода не считается. На старте это видно, в рантайме уже
+        # нет, поэтому проверяем здесь и отказываемся подниматься.
+        if isinstance(self.LLM_PRICE_PER_MTOK, dict):
+            for model_id, entry in self.LLM_PRICE_PER_MTOK.items():
+                if not isinstance(entry, dict):
+                    raise ValueError(
+                        f"LLM_PRICE_PER_MTOK[{model_id!r}] должен быть объектом "
+                        f"с ключами input и output, получено: {entry!r}"
+                    )
+                for side in ("input", "output"):
+                    raw = entry.get(side)
+                    try:
+                        rate = float(raw)  # type: ignore[arg-type]
+                    except (TypeError, ValueError):
+                        raise ValueError(
+                            f"LLM_PRICE_PER_MTOK[{model_id!r}][{side!r}] не число: {raw!r}"
+                        ) from None
+                    if not math.isfinite(rate) or rate <= 0:
+                        raise ValueError(
+                            f"LLM_PRICE_PER_MTOK[{model_id!r}][{side!r}] должна быть "
+                            f"конечной и положительной, получено: {raw!r}"
+                        )
         if self.is_production:
             if not self.SAFE_MODE:
                 raise ValueError(

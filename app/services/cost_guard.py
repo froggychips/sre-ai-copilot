@@ -42,7 +42,7 @@ from __future__ import annotations
 import datetime as dt
 import math
 from dataclasses import dataclass
-from typing import Dict, Optional
+from typing import Any, Dict, Optional
 
 import structlog
 from sqlalchemy import text
@@ -124,6 +124,55 @@ def _price_table() -> Dict[str, Dict[str, float]]:
     return table if isinstance(table, dict) else {}
 
 
+def _valid_rate(value: Any) -> Optional[float]:
+    """Ставка, если она вообще является ставкой. Иначе None.
+
+    Отвергается всё, по чему нельзя честно посчитать деньги: не-число,
+    NaN, бесконечность, ноль и отрицательное. Ноль отвергается наравне с
+    мусором намеренно — «бесплатная модель» и «эту графу забыли заполнить»
+    выглядят в конфиге одинаково, а стоят по-разному.
+    """
+    try:
+        rate = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(rate) or rate <= 0:
+        return None
+    return rate
+
+
+def _rates_for(model: str) -> tuple:
+    """Ставки (input, output) за миллион токенов для модели.
+
+    Запись, у которой не хватает половины или ставка не годится, считается
+    НЕ настроенной — берётся дорогой fallback. Иначе `{"input": 3}`
+    означало бы бесплатный выход, и это был бы худший вид ошибки: потолок
+    на месте, цифры правдоподобны, а половина расхода не считается.
+
+    Такие записи ещё и не дают процессу подняться с включённым пайплайном
+    (инвариант в `config.py`) — но настройку можно подменить в рантайме, и
+    здесь стоит вторая линия.
+    """
+    fallback_in = _valid_rate(getattr(settings, "LLM_PRICE_FALLBACK_INPUT", None)) or 15.0
+    fallback_out = _valid_rate(getattr(settings, "LLM_PRICE_FALLBACK_OUTPUT", None)) or 75.0
+
+    prices = _price_table().get(model or "")
+    if not isinstance(prices, dict):
+        return fallback_in, fallback_out
+
+    in_price = _valid_rate(prices.get("input"))
+    out_price = _valid_rate(prices.get("output"))
+    if in_price is None or out_price is None:
+        log.warning(
+            "cost_guard.price_entry_invalid",
+            model=model,
+            entry=str(prices)[:120],
+            note="считаем по дорогой ставке: половина цены хуже отсутствия цены",
+        )
+        return fallback_in, fallback_out
+    return in_price, out_price
+
+
 def estimate_cost_usd(model: str, input_tokens: int, output_tokens: int) -> float:
     """Стоимость вызова в долларах.
 
@@ -132,13 +181,7 @@ def estimate_cost_usd(model: str, input_tokens: int, output_tokens: int) -> floa
     пропустить трату мимо потолка — то есть ровно то, от чего предохранитель
     поставлен.
     """
-    prices = _price_table().get(model or "")
-    if prices is None:
-        in_price = float(getattr(settings, "LLM_PRICE_FALLBACK_INPUT", 15.0))
-        out_price = float(getattr(settings, "LLM_PRICE_FALLBACK_OUTPUT", 75.0))
-    else:
-        in_price = float(prices.get("input", 0.0))
-        out_price = float(prices.get("output", 0.0))
+    in_price, out_price = _rates_for(model)
 
     # Отрицательные значения приходят только из битого usage; в минус
     # бюджет уводить нельзя — иначе один такой ответ «вернёт» деньги.
@@ -150,20 +193,25 @@ def estimate_cost_usd(model: str, input_tokens: int, output_tokens: int) -> floa
 def estimate_worst_case_usd(model: str, prompt: str) -> float:
     """Верхняя оценка стоимости вызова, известная ДО вызова.
 
-    Резервировать можно только то, что уже посчитано, а точное число
-    приходит вместе с ответом. Оценка сознательно завышена с обеих сторон:
-    длина промпта делится на 3 (у кириллицы токенов на символ больше, чем
-    привычные 4 у английского), а выход берётся равным `MAX_TOKENS` — тому
-    максимуму, который модели разрешено выдать.
+    Вход считается в БАЙТАХ UTF-8, и это не приблизительность, а граница,
+    которую можно доказать: любой токен субсловного токенизатора занимает
+    минимум один байт исходного текста, поэтому токенов никогда не больше,
+    чем байт. Прежняя оценка «символов / 3» границей не была — она
+    подобрана под латиницу и кириллицу, а на CJK, эмодзи, base64 и прочем
+    плотном тексте занижает счёт. Заниженный резерв не защищает: он
+    пропускает вызов, который пробьёт потолок, и `settle` потом честно
+    допишет перерасход — уже после того, как деньги потрачены.
 
-    Заниженный резерв не защищает: он пропускает вызов, который пробьёт
-    потолок. Завышенный лишь остановит раньше, а разница возвращается сразу
-    после ответа.
+    Выход берётся равным `MAX_TOKENS`: больше модели выдать не разрешено.
+
+    Оценка щедрая (для английского текста — вчетверо), и это нормально:
+    завышенный резерв лишь остановит раньше, а разница возвращается сразу
+    после ответа. Настоящую цифру знает только токенизатор провайдера, и
+    когда счёт станет узким местом, за ней надо идти к нему.
     """
-    prompt_chars = len(prompt or "")
-    input_tokens = (prompt_chars + 2) // 3
+    prompt_bytes = len((prompt or "").encode("utf-8"))
     output_tokens = int(getattr(settings, "MAX_TOKENS", 4096) or 4096)
-    return estimate_cost_usd(model, input_tokens, output_tokens)
+    return estimate_cost_usd(model, prompt_bytes, output_tokens)
 
 
 def _apply_delta(day: dt.date, delta_micro: int) -> int:
@@ -308,6 +356,27 @@ def settle(
             error=str(e),
         )
     return actual
+
+
+def release(verdict: BudgetVerdict, now: Optional[dt.datetime] = None) -> None:
+    """Вернуть резерв целиком — попытка ТОЧНО не была оплачена.
+
+    Применимо к узкому случаю: провайдер отказал до обработки запроса
+    (429 rate limit). Там, где ответ мог быть сгенерирован и не доехать
+    (таймаут), резерв остаётся списанным: считать такую попытку бесплатной
+    значит открывать потолок ровно на неудачных прогонах, которых при
+    проблемах с провайдером больше всего.
+
+    Без этого возврата шторм 429 — отказы, за которые никто не платит, —
+    съедал бы суточный бюджет и блокировал день.
+    """
+    if verdict.reserved_usd <= 0:
+        return
+    micro = int(round(verdict.reserved_usd * _USD_SCALE))
+    try:
+        _apply_delta(_today(now), -micro)
+    except Exception as e:  # noqa: BLE001
+        log.warning("cost_guard.release_failed", error=str(e))
 
 
 def peek(now: Optional[dt.datetime] = None) -> BudgetVerdict:

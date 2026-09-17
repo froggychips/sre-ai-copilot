@@ -107,18 +107,88 @@ def test_negative_usage_never_refunds(monkeypatch):
     assert cost_guard.estimate_cost_usd("m", -1_000_000, -1_000_000) == 0.0
 
 
-def test_worst_case_is_not_cheaper_than_reality(monkeypatch):
-    """Оценка до вызова обязана быть верхней границей, иначе не защищает."""
+@pytest.mark.parametrize("prompt,label", [
+    ("hello world " * 50, "латиница"),
+    ("привет мир " * 50, "кириллица"),
+    ("日本語のテキスト" * 50, "CJK"),
+    ("🎉🔥✨" * 50, "эмодзи"),
+    ("aGVsbG8gd29ybGQ=" * 50, "base64"),
+])
+def test_worst_case_bounds_any_possible_tokenization(monkeypatch, prompt, label):
+    """Оценка должна мажорировать ЛЮБОЙ разбор текста на токены.
+
+    Проверяется против доказуемой границы, а не против той же формулы,
+    по которой оценка и считается: токен субсловного токенизатора занимает
+    минимум один байт исходного текста, поэтому токенов не бывает больше,
+    чем байт UTF-8. Прежняя оценка «символов / 3» этому не удовлетворяла —
+    на CJK и эмодзи байт втрое больше символов, и резерв занижался ровно
+    там, где текст плотнее.
+    """
     monkeypatch.setattr(settings, "LLM_PRICE_PER_MTOK", {"m": {"input": 3.0, "output": 15.0}}, raising=False)
     monkeypatch.setattr(settings, "MAX_TOKENS", 1000, raising=False)
 
-    prompt = "я" * 3000
     estimate = cost_guard.estimate_worst_case_usd("m", prompt)
-    # Худший реальный исход: токенов не больше, чем символов, а выход
-    # ограничен MAX_TOKENS.
-    real_upper = cost_guard.estimate_cost_usd("m", len(prompt) // 3, 1000)
+    provable_upper = cost_guard.estimate_cost_usd(
+        "m", len(prompt.encode("utf-8")), 1000
+    )
 
-    assert estimate >= real_upper
+    assert estimate >= provable_upper, f"{label}: резерв ниже доказуемой границы"
+
+
+def test_worst_case_covers_max_output(monkeypatch):
+    """Выход резервируется по MAX_TOKENS — больше модель выдать не может."""
+    monkeypatch.setattr(settings, "LLM_PRICE_PER_MTOK", {"m": {"input": 0.000001, "output": 15.0}}, raising=False)
+    monkeypatch.setattr(settings, "MAX_TOKENS", 1000, raising=False)
+
+    estimate = cost_guard.estimate_worst_case_usd("m", "")
+    assert estimate >= cost_guard.estimate_cost_usd("m", 0, 1000)
+
+
+# --- битые записи в таблице цен ------------------------------------------
+
+@pytest.mark.parametrize("entry,label", [
+    ({"input": 3.0}, "нет output"),
+    ({"output": 15.0}, "нет input"),
+    ({"input": 3.0, "output": 0}, "output нулевой"),
+    ({"input": -3.0, "output": 15.0}, "input отрицательный"),
+    ({"input": 3.0, "output": float("nan")}, "output NaN"),
+    ({"input": float("inf"), "output": 15.0}, "input inf"),
+    ({"input": "три", "output": 15.0}, "input не число"),
+])
+def test_broken_price_entry_falls_back_to_expensive(monkeypatch, entry, label):
+    """Полуфабрикат в таблице цен не должен означать «бесплатно».
+
+    `{"input": 3}` иначе даёт бесплатный выход: потолок на месте, цифры
+    правдоподобны, а половина расхода не считается — худший вид ошибки в
+    предохранителе. Дорогой fallback используется не только для незнакомой
+    модели, но и для знакомой с негодной записью.
+    """
+    monkeypatch.setattr(settings, "LLM_PRICE_PER_MTOK", {"m": entry}, raising=False)
+    monkeypatch.setattr(settings, "LLM_PRICE_FALLBACK_INPUT", 15.0, raising=False)
+    monkeypatch.setattr(settings, "LLM_PRICE_FALLBACK_OUTPUT", 75.0, raising=False)
+
+    cost = cost_guard.estimate_cost_usd("m", 1_000_000, 1_000_000)
+
+    assert cost == pytest.approx(90.0), f"{label}: посчитано не по fallback"
+
+
+def test_valid_price_entry_is_used(monkeypatch):
+    monkeypatch.setattr(settings, "LLM_PRICE_PER_MTOK", {"m": {"input": 3.0, "output": 15.0}}, raising=False)
+    assert cost_guard.estimate_cost_usd("m", 1_000_000, 1_000_000) == pytest.approx(18.0)
+
+
+@pytest.mark.parametrize("entry", [
+    {"input": 3.0},
+    {"input": 3.0, "output": 0},
+    {"input": 3.0, "output": float("nan")},
+    {"input": 3.0, "output": "дорого"},
+    "не объект",
+])
+def test_broken_price_entry_blocks_startup(monkeypatch, entry):
+    """На старте битую запись видно — там и отказываемся подниматься."""
+    monkeypatch.setenv("LLM_BACKEND", "claude_cli")
+    with pytest.raises(ValueError, match="LLM_PRICE_PER_MTOK"):
+        Settings(LLM_PRICE_PER_MTOK={"m": entry})
 
 
 # --- резервирование -------------------------------------------------------

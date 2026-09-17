@@ -4,7 +4,7 @@
 что резерв кто-то берёт, а сводит его тот же код, который получает ответ.
 Модуль без этого выглядел бы защитой, не будучи ею.
 """
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -26,98 +26,200 @@ def _reserved(amount=1.0):
     return BudgetVerdict(True, "within_budget", 1.0, 10.0, reserved_usd=amount)
 
 
+def _anthropic_response():
+    """Минимальный ответ Anthropic SDK: текстовый блок + usage."""
+    block = MagicMock()
+    block.type = "text"
+    block.text = "ответ"
+    response = MagicMock()
+    response.content = [block]
+    response.stop_reason = "end_turn"
+    response.usage = MagicMock(input_tokens=10, output_tokens=5)
+    return response
+
+
 def _denied():
     return BudgetVerdict(False, "daily_budget_exhausted", 10.0, 10.0)
 
 
-@pytest.mark.asyncio
-async def test_exhausted_budget_blocks_before_the_call(priced):
-    """Отказ происходит ДО обращения к модели, а не после."""
-    router = AsyncMock()
-    with patch("app.agents.base.reserve", return_value=_denied()), \
-         patch("app.agents.base.ModelRouter.route_and_call_full", new=router):
-        with pytest.raises(LLMBudgetExceeded):
-            await BaseAgent(name="A", role="r").ask("контекст")
-
-    router.assert_not_awaited(), "модель не должна вызываться при исчерпанном бюджете"
-
+# --- бюджет на уровне ПОПЫТКИ, а не вызова агента -------------------------
 
 @pytest.mark.asyncio
-async def test_reservation_is_taken_on_the_full_prompt(priced):
-    """Резервируется стоимость ГОТОВОГО промпта, а не голого контекста.
+async def test_every_retry_attempt_is_reserved(priced):
+    """Главное: резерв берётся на каждое обращение к провайдеру.
 
-    Роль и инструкция уезжают в модель вместе с контекстом и стоят денег;
-    оценка по одному `user_context` систематически занижала бы резерв.
+    generate_full обёрнут llm_retry_strategy (3 попытки), и таймаут среди
+    ретраибельных ошибок означает, что запрос дошёл и мог быть обработан —
+    то есть оплачен. Один резерв на три оплачиваемые попытки делал бы
+    потолок ненастоящим ровно тогда, когда провайдеру плохо.
     """
-    result = {"text": "ответ", "input_tokens": 10, "output_tokens": 5, "model": "m"}
-    with patch("app.agents.base.reserve", return_value=_reserved()) as reserve, \
-         patch("app.agents.base.settle", return_value=0.1), \
-         patch("app.agents.base.ModelRouter.route_and_call_full", return_value=result):
-        await BaseAgent(name="A", role="РОЛЬ-МАРКЕР").ask("контекст", instruction="ЗАДАЧА-МАРКЕР")
+    import anthropic
 
-    prompt = reserve.call_args.args[1]
-    assert "РОЛЬ-МАРКЕР" in prompt and "ЗАДАЧА-МАРКЕР" in prompt
-    assert "контекст" in prompt
+    from app.services import llm_service as svc
+
+    calls = {"reserve": 0, "create": 0}
+
+    def _reserve(*_a, **_k):
+        calls["reserve"] += 1
+        return _reserved()
+
+    async def _create(*_a, **_k):
+        calls["create"] += 1
+        if calls["create"] < 3:
+            raise anthropic.APITimeoutError(request=MagicMock())
+        return _anthropic_response()
+
+    client = MagicMock()
+    client.messages.create = _create
+
+    service = svc.LLMService()
+    service.backend = "anthropic"
+    service.model = "m"
+    with patch.object(svc, "reserve", _reserve), \
+         patch.object(svc, "settle", lambda *a, **k: 0.5), \
+         patch.object(service, "_anthropic_client", return_value=client), \
+         patch.object(svc, "_get_resilience", return_value=None):
+        result = await service.generate_full("привет")
+
+    assert calls["create"] == 3, "ожидались три обращения к провайдеру"
+    assert calls["reserve"] == 3, "каждая попытка обязана резервировать"
+    assert result["text"] == "ответ"
 
 
 @pytest.mark.asyncio
-async def test_successful_call_settles_the_reserve(priced):
-    result = {"text": "ответ", "input_tokens": 1_000_000, "output_tokens": 0, "model": "m"}
-    with patch("app.agents.base.reserve", return_value=_reserved()), \
-         patch("app.agents.base.settle", return_value=3.0) as settle, \
+async def test_timeout_keeps_the_reservation_charged(priced):
+    """Таймаут — попытка могла быть оплачена, резерв не возвращаем."""
+    import anthropic
+
+    from app.services import llm_service as svc
+
+    released = []
+
+    async def _create(*_a, **_k):
+        raise anthropic.APITimeoutError(request=MagicMock())
+
+    client = MagicMock()
+    client.messages.create = _create
+
+    service = svc.LLMService()
+    service.backend = "anthropic"
+    service.model = "m"
+    with patch.object(svc, "reserve", lambda *a, **k: _reserved()), \
+         patch.object(svc, "release", lambda *a, **k: released.append(a)), \
+         patch.object(service, "_anthropic_client", return_value=client), \
+         patch.object(svc, "_get_resilience", return_value=None):
+        with pytest.raises(Exception):
+            await service.generate_full("привет")
+
+    assert not released, "резерв таймаута не возвращается: ответ мог быть сгенерирован"
+
+
+@pytest.mark.asyncio
+async def test_rate_limit_returns_the_reservation(priced):
+    """429 — провайдер отказал до обработки, платить не за что.
+
+    Без возврата шторм rate-limit'ов съедал бы суточный бюджет отказами,
+    за которые никто не выставил счёт.
+    """
+    import anthropic
+
+    from app.services import llm_service as svc
+
+    released = []
+
+    async def _create(*_a, **_k):
+        raise anthropic.RateLimitError(
+            "rate limited", response=MagicMock(status_code=429), body=None
+        )
+
+    client = MagicMock()
+    client.messages.create = _create
+
+    service = svc.LLMService()
+    service.backend = "anthropic"
+    service.model = "m"
+    with patch.object(svc, "reserve", lambda *a, **k: _reserved()), \
+         patch.object(svc, "release", lambda *a, **k: released.append(a)), \
+         patch.object(service, "_anthropic_client", return_value=client), \
+         patch.object(svc, "_get_resilience", return_value=None):
+        with pytest.raises(Exception):
+            await service.generate_full("привет")
+
+    assert released, "резерв 429 должен вернуться в бюджет"
+
+
+@pytest.mark.asyncio
+async def test_exhausted_budget_blocks_the_provider_call(priced):
+    """Отказ бюджета происходит ДО обращения к провайдеру."""
+    from app.services import llm_service as svc
+
+    calls = {"create": 0}
+
+    async def _create(*_a, **_k):
+        calls["create"] += 1
+        return _anthropic_response()
+
+    client = MagicMock()
+    client.messages.create = _create
+
+    service = svc.LLMService()
+    service.backend = "anthropic"
+    service.model = "m"
+    with patch.object(svc, "reserve", lambda *a, **k: _denied()), \
+         patch.object(service, "_anthropic_client", return_value=client), \
+         patch.object(svc, "_get_resilience", return_value=None):
+        with pytest.raises(LLMBudgetExceeded):
+            await service.generate_full("привет")
+
+    assert calls["create"] == 0, "модель не должна вызываться при исчерпанном бюджете"
+
+
+@pytest.mark.asyncio
+async def test_budget_denial_is_not_retried(priced):
+    """Ретрай отказа бюджета — повтор попытки потратить запрещённое."""
+    from app.services import llm_service as svc
+    from app.services.resilience import is_retryable_llm_error
+
+    assert not is_retryable_llm_error(LLMBudgetExceeded("нет денег"))
+
+    calls = {"reserve": 0}
+
+    def _reserve(*_a, **_k):
+        calls["reserve"] += 1
+        return _denied()
+
+    client = MagicMock()
+    client.messages.create = AsyncMock(return_value=_anthropic_response())
+
+    service = svc.LLMService()
+    service.backend = "anthropic"
+    service.model = "m"
+    with patch.object(svc, "reserve", _reserve), \
+         patch.object(service, "_anthropic_client", return_value=client), \
+         patch.object(svc, "_get_resilience", return_value=None):
+        with pytest.raises(LLMBudgetExceeded):
+            await service.generate_full("привет")
+
+    assert calls["reserve"] == 1, "отказ бюджета не должен уходить в retry-петлю"
+
+
+@pytest.mark.asyncio
+async def test_cost_reaches_the_agent_for_metrics(priced):
+    """Стоимость приезжает в ask готовой — метрике незачем её пересчитывать."""
+    result = {
+        "text": "ответ", "input_tokens": 10, "output_tokens": 5,
+        "model": "m", "cost_usd": 0.42,
+    }
+    with patch("app.agents.base.track_llm_cost") as metric, \
          patch("app.agents.base.ModelRouter.route_and_call_full", return_value=result):
         await BaseAgent(name="A", role="r").ask("контекст")
 
-    settle.assert_called_once()
-    assert settle.call_args.args[2] == 1_000_000
+    metric.assert_called_once_with("m", 0.42)
 
 
 @pytest.mark.asyncio
-async def test_provider_error_keeps_the_reserve_charged(priced):
-    """Провайдер упал — резерв остаётся списанным, и это правильно.
-
-    `LLMService.generate_full` поднимает ValueError на пустом ответе раньше,
-    чем usage доедет до учёта: токены оплачены, а чисел о них нет. Вернуть
-    резерв значило бы открыть потолок ровно на неудачных прогонах, которых
-    при проблемах с моделью больше всего.
-    """
-    released = []
-    with patch("app.agents.base.reserve", return_value=_reserved(2.5)), \
-         patch("app.agents.base.settle", side_effect=lambda *a, **k: released.append(a)), \
-         patch(
-             "app.agents.base.ModelRouter.route_and_call_full",
-             side_effect=ValueError("Empty response from LLM"),
-         ):
-        with pytest.raises(ValueError):
-            await BaseAgent(name="A", role="r").ask("контекст")
-
-    assert not released, "сводить нечего: ответа не было, резерв остаётся списанным"
-
-
-@pytest.mark.asyncio
-async def test_truncated_json_response_is_still_settled(priced):
-    """Обрезанный ответ оплачен: вызов состоялся, usage известен."""
-    result = {
-        "text": '{"refutations": [',
-        "input_tokens": 400_000,
-        "output_tokens": 100_000,
-        "model": "m",
-        "truncated": True,
-    }
-    from app.services.llm_service import LLMTruncatedResponse
-
-    with patch("app.agents.base.reserve", return_value=_reserved()), \
-         patch("app.agents.base.settle", return_value=2.7) as settle, \
-         patch("app.agents.base.ModelRouter.route_and_call_full", return_value=result):
-        with pytest.raises(LLMTruncatedResponse):
-            await BaseAgent(name="A", role="r", json_response=True).ask("контекст")
-
-    settle.assert_called_once()
-
-
-@pytest.mark.asyncio
-async def test_budget_exception_is_not_retriable():
-    """Ретрай при исчерпанном потолке — это попытка потратить ×3."""
+async def test_budget_exception_is_not_retriable_by_celery():
+    """Celery тоже не должен ретраить исчерпанный потолок."""
     from app.workers.tasks import RETRIABLE_EXC
 
     assert not issubclass(LLMBudgetExceeded, RETRIABLE_EXC)

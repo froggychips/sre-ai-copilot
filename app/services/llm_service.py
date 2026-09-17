@@ -3,10 +3,13 @@ import logging
 import weakref
 from typing import Any, Dict, Optional
 
-from anthropic import AsyncAnthropic
+from anthropic import AsyncAnthropic, RateLimitError
 
 from app.config import settings
+from app.observability.ai_metrics import track_budget_denied
 from app.services.claude_cli_service import ClaudeCliService
+from app.services.cost_guard import (LLMBudgetExceeded, release, reserve,
+                                     settle)
 from app.services.resilience import LLMCircuitOpen, llm_retry_strategy
 
 _LLM_PROVIDER = "anthropic"
@@ -167,6 +170,10 @@ class LLMService:
         # локальный subprocess, у него своя модель отказа (resilience=None →
         # _report_provider/проверка circuit no-op).
         resilience = None if self.backend == "claude_cli" else _get_resilience()
+        # Резерв бюджета берётся ниже, перед самим HTTP-вызовом. None здесь
+        # значит «до резерва не дошли» — обработчикам ошибок нечего
+        # возвращать.
+        verdict = None
         try:
             if self.backend == "claude_cli":
                 assert self.cli is not None
@@ -225,6 +232,28 @@ class LLMService:
             #     случай, если корутина зависнет ВНЕ httpx (DNS/телo/локи).
             #     Он НЕ отменяет сетевой сокет сам по себе — поэтому слой (1)
             #     обязателен, а wait_for оставлен лишь как hard-ceiling.
+            # ── БЮДЖЕТ: резерв на КАЖДУЮ попытку, а не на вызов агента ──
+            # Резервировать этажом выше (в BaseAgent.ask) было ошибкой:
+            # generate_full обёрнут llm_retry_strategy, то есть один
+            # логический вызов агента — до трёх обращений к провайдеру. Из
+            # ретраибельных ошибок как минимум таймаут означает, что запрос
+            # дошёл и был обработан: попытка оплачена, а резерв был один на
+            # все три. Потолок переставал быть потолком ровно в тот момент,
+            # когда провайдеру плохо и попыток становится больше.
+            #
+            # Здесь резерв берётся внутри retry-петли, поэтому каждая
+            # оплачиваемая попытка проходит через него.
+            verdict = await asyncio.to_thread(reserve, self.model, prompt)
+            if not verdict.allowed:
+                # LLMBudgetExceeded не входит в is_retryable_llm_error —
+                # ретраить отказ бюджета значит повторять попытку потратить
+                # то, чего тратить нельзя.
+                track_budget_denied(verdict.reason)
+                raise LLMBudgetExceeded(
+                    f"LLM budget guard: {verdict.reason} "
+                    f"(model={self.model}, spent={verdict.spent_usd}, "
+                    f"limit={verdict.limit_usd})"
+                )
             response = await asyncio.wait_for(
                 client.messages.create(
                     model=self.model,
@@ -264,15 +293,24 @@ class LLMService:
                 )
             # Anthropic SDK: response.usage.input_tokens / .output_tokens
             usage = getattr(response, "usage", None)
+            input_tokens = int(getattr(usage, "input_tokens", 0) or 0)
+            output_tokens = int(getattr(usage, "output_tokens", 0) or 0)
+            # Сводим резерв с фактом. Разница (резерв был верхней оценкой)
+            # возвращается в бюджет — именно поэтому резерв может быть
+            # щедрым, не съедая потолок.
+            cost_usd = await asyncio.to_thread(
+                settle, verdict, self.model, input_tokens, output_tokens
+            )
             await _report_provider(resilience, success=True)
             return {
                 "text": text,
-                "input_tokens": int(getattr(usage, "input_tokens", 0) or 0),
-                "output_tokens": int(getattr(usage, "output_tokens", 0) or 0),
+                "input_tokens": input_tokens,
+                "output_tokens": output_tokens,
                 "model": self.model,
                 "backend": "anthropic",
                 "stop_reason": stop_reason,
                 "truncated": truncated,
+                "cost_usd": cost_usd,
             }
         except LLMCircuitOpen:
             # Брейкер сработал — это НЕ новый сбой провайдера, не считаем его
@@ -285,6 +323,20 @@ class LLMService:
             # распознаёт ретраибельность сквозь обёртку ValueError (таймаут =
             # транзиент, повтор оправдан).
             raise ValueError("LLM timeout") from e
+        except RateLimitError as e:
+            # 429 — провайдер отказал ДО обработки запроса, платить не за
+            # что. Резерв возвращаем: иначе шторм rate-limit'ов съедал бы
+            # суточный бюджет отказами, за которые никто не выставил счёт.
+            #
+            # Для остальных ошибок резерв НЕ возвращается: таймаут означает,
+            # что запрос дошёл и мог быть обработан, и считать такую попытку
+            # бесплатной значит открывать потолок именно тогда, когда
+            # провайдеру плохо и попыток становится больше.
+            if verdict is not None:
+                await asyncio.to_thread(release, verdict)
+            await _report_provider(resilience, success=False)
+            logging.error(f"LLM call attempt failed: {e}")
+            raise
         except Exception as e:
             await _report_provider(resilience, success=False)
             logging.error(f"LLM call attempt failed: {e}")
