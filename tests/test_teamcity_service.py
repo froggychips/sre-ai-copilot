@@ -16,6 +16,7 @@ from app.services.teamcity_service import (
     _TC_PAGE_SIZE,
     _build_summary_direct,
     _fetch_recent_deploys_direct,
+    _is_deploy_buildtype,
     _is_deploy_buildtype_name,
     _parse_tc_date,
     _tc_to_iso,
@@ -329,3 +330,51 @@ def test_recent_deploys_limit_applied_to_newest_after_filtering():
     assert finished == sorted(finished, reverse=True)
     assert out[0]["sha"] == f"{0:040d}"
     assert out[0]["triggered_by"] == "yar"
+
+
+# ── фильтр деплоев: имя может быть на любом языке, id — всегда латиницей ────
+
+
+def test_is_deploy_buildtype_catches_russian_named_prod_release():
+    """«Релиз на PROD» — деплой, хотя в имени нет английских токенов.
+
+    Wo_Backend_K8sNewCluster_Prod_ReleaseToProd называется по-русски, и
+    фильтр по имени его отбрасывал. Следствие: за 30 дней по prod-*
+    в kg_deployments лежали только бэкапы, статика и terrain — главный
+    прод-релиз не попадал в граф вообще, и вопрос «что приехало релизом»
+    оставался без источника.
+    """
+    assert not _is_deploy_buildtype_name("Релиз на PROD")
+    assert _is_deploy_buildtype(
+        "Релиз на PROD", "Wo_Backend_K8sNewCluster_Prod_ReleaseToProd")
+
+
+def test_is_deploy_buildtype_catches_russian_named_squad_install():
+    assert _is_deploy_buildtype(
+        "Развернуть Squad-окружение",
+        "Wo_Backend_K8sNewCluster_InstallSquadEnv")
+
+
+def test_is_deploy_buildtype_rejects_release_pool_toggle():
+    """`release` в id ещё не деплой: пул агентов кода не катит."""
+    assert not _is_deploy_buildtype(
+        "Release Pool — переключить агентов",
+        "Wo_Admin_Preupdate_ReleasePoolToggle")
+
+
+def test_is_deploy_buildtype_keeps_name_exclusions_via_id():
+    """Исключения не обходятся через id."""
+    assert not _is_deploy_buildtype(
+        "Update terrain", "Wo_Backend_K8sNewCluster_UpdateTerrain")
+    assert not _is_deploy_buildtype(
+        "Update secret", "Wo_Backend_K8sNewCluster_UpdateSecret")
+    assert not _is_deploy_buildtype(
+        "Set ab test", "Wo_Backend_K8sNewCluster_SetAbTest")
+    assert not _is_deploy_buildtype(
+        "Delete namespace", "Wo_Backend_K8sNewCluster_DeleteNamespace")
+
+
+def test_is_deploy_buildtype_falls_back_to_name_without_id():
+    """Без id поведение прежнее — источник мог не отдать buildTypeId."""
+    assert _is_deploy_buildtype("Build and full deploy", None)
+    assert not _is_deploy_buildtype("Maintenance", None)

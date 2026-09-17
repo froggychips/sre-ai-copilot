@@ -432,6 +432,24 @@ _DEPLOY_NAME_TOKENS = ("deploy", "update", "backup")
 _DEPLOY_NAME_EXCLUDE = ("set client min", "set ab test", "update terrain",
                         "update secret", "delete namespace")
 
+#: Токены в ID конфигурации. TeamCity формирует id латиницей и не меняет его
+#: при переименовании — поэтому конфигурация с РУССКИМ отображаемым именем
+#: ловится только так.
+#:
+#: Замер 17.09.2026: `Wo_Backend_K8sNewCluster_Prod_ReleaseToProd` называется
+#: «Релиз на PROD» — ни одного английского токена в имени. Главная
+#: прод-конфигурация не попадала в kg_deployments ВООБЩЕ: за 30 дней по
+#: prod-* в графе лежали только бэкапы, статика и terrain, а «релиз прошёл»
+#: было нечем подтвердить. Туда же уходило «Развернуть Squad-окружение»
+#: (`InstallSquadEnv`).
+_DEPLOY_ID_TOKENS = ("deploy", "update", "backup", "release", "installsquadenv")
+
+#: Исключения по id — зеркало _DEPLOY_NAME_EXCLUDE для тех же конфигураций
+#: плюс `ReleasePoolToggle` («Release Pool — переключить агентов»):
+#: переключение пула агентов кода не катит.
+_DEPLOY_ID_EXCLUDE = ("releasepool", "updateterrain", "updatesecret",
+                      "setclientminversion", "setabtest", "deletenamespace")
+
 # Пагинация TC REST. Раньше был один запрос `count:200`: TC отдавал 200 САМЫХ
 # СВЕЖИХ билдов проекта (включая не-deploy), и только потом Python-фильтр по
 # имени buildType выкидывал лишнее — т.е. кап съедали чужие билды.
@@ -457,6 +475,27 @@ def _is_deploy_buildtype_name(name: Optional[str]) -> bool:
     if any(ex in lower for ex in _DEPLOY_NAME_EXCLUDE):
         return False
     return any(tok in lower for tok in _DEPLOY_NAME_TOKENS)
+
+
+def _is_deploy_buildtype(
+    name: Optional[str],
+    buildtype_id: Optional[str] = None,
+) -> bool:
+    """Деплой ли это — по отображаемому имени ИЛИ по id конфигурации.
+
+    Имя человек пишет как хочет и на каком угодно языке; id TeamCity
+    формирует латиницей из исходного английского имени и при переименовании
+    не трогает. Судить только по имени — значит терять всё, что назвали
+    по-русски, а это включало главный прод-релиз.
+    """
+    if _is_deploy_buildtype_name(name):
+        return True
+    if not buildtype_id:
+        return False
+    lower = buildtype_id.lower()
+    if any(ex in lower for ex in _DEPLOY_ID_EXCLUDE):
+        return False
+    return any(tok in lower for tok in _DEPLOY_ID_TOKENS)
 
 
 def _fetch_recent_deploys_direct(
@@ -526,7 +565,7 @@ def _fetch_recent_deploys_direct(
                     for pr in ((b.get("properties") or {}).get("property") or [])
                     if pr.get("name")
                 }
-                if not _is_deploy_buildtype_name(btype_name):
+                if not _is_deploy_buildtype(btype_name, b.get("buildTypeId")):
                     continue
                 triggered = b.get("triggered") or {}
                 trig_user = triggered.get("user") or {}
