@@ -1136,7 +1136,7 @@ def test_accumulated_garbage_does_not_block_cleanup(db):
     for i in range(40):
         db.add(StorageVolume(
             kind="pvc", namespace="squad-99-shared", name=f"dead-{i}",
-            phase="Bound", updated_at=old, created_at=old,
+            phase="Bound", updated_at=old, created_at=old, last_seen_at=old,
         ))
     db.commit()
 
@@ -1188,7 +1188,7 @@ def test_cleanup_is_capped_per_run(db):
     for i in range(20):
         db.add(StorageVolume(
             kind="pvc", namespace="squad-98-shared", name=f"dead-{i}",
-            phase="Bound", updated_at=old, created_at=old,
+            phase="Bound", updated_at=old, created_at=old, last_seen_at=old,
         ))
     db.commit()
 
@@ -1226,3 +1226,104 @@ def test_pv_slice_reports_itself_as_a_source(db):
     report = get_source_report(SOURCE_STORAGE_PVS)
     assert report is not None
     assert report.fetched == 1
+
+
+# ── Находки ревью: «видели» и «менялось» — разные вопросы ────────────────
+
+def test_stable_volumes_are_marked_seen_even_without_changes(db):
+    """Синк отмечает том как виденный, даже если менять в нём нечего.
+
+    ORM не эмитит UPDATE, когда все присвоенные поля совпали с прежними, а
+    у PV они не меняются годами. Прод 18.09.2026: из 10 059 PV моложе
+    суток была 61 строка, при том что каждый прогон видел 1214 живых. Если
+    «недавно виденное» считать по `updated_at`, знаменатель порога усадки
+    схлопывается почти в ноль — и порог перестаёт держать что-либо.
+    """
+    from datetime import datetime, timedelta
+
+    from app.knowledge_graph.schema import StorageVolume
+
+    snapshot = [_mk_pvc(f"data-{i}", "prod-shared") for i in range(4)]
+    with patch(
+        "app.knowledge_graph.k8s_storage_sync._get_all", return_value=snapshot,
+    ):
+        sync_pvcs(db)
+
+    # Сутки простоя без единого изменения полей.
+    long_ago = datetime.utcnow() - timedelta(days=40)
+    db.query(StorageVolume).update(
+        {"updated_at": long_ago, "last_seen_at": long_ago},
+        synchronize_session=False,
+    )
+    db.commit()
+
+    with patch(
+        "app.knowledge_graph.k8s_storage_sync._get_all", return_value=snapshot,
+    ):
+        stats = sync_pvcs(db)
+
+    rows = db.query(StorageVolume).filter_by(kind="pvc").all()
+    assert stats["last_seen_touched"] == 4
+    assert all(v.last_seen_at > long_ago for v in rows), (
+        "прогон видел все четыре — отметка обязана обновиться"
+    )
+    assert all(v.updated_at == long_ago for v in rows), (
+        "а вот updated_at двигаться не должен: поля те же. Ровно поэтому "
+        "он и не годится в качестве «видели»"
+    )
+
+
+def test_partial_snapshot_blocks_cleanup_for_unchanged_volumes(db):
+    """Обрезанный снимок блокирует чистку и тогда, когда тома не менялись.
+
+    Регресс на находку ревью: пока «недавно виденным» считался
+    `updated_at`, стабильные тома в знаменатель не попадали, порог
+    получался нулевым и разрешал сносить живые узлы по неполному снимку —
+    ровно то, ради чего порог и заведён.
+    """
+    from datetime import datetime, timedelta
+
+    from app.knowledge_graph.schema import StorageVolume
+
+    full = [_mk_pvc(f"data-{i}", "prod-shared") for i in range(4)]
+    with patch(
+        "app.knowledge_graph.k8s_storage_sync._get_all", return_value=full,
+    ):
+        sync_pvcs(db)
+
+    long_ago = datetime.utcnow() - timedelta(days=40)
+    db.query(StorageVolume).update(
+        {"updated_at": long_ago}, synchronize_session=False,
+    )
+    db.commit()
+
+    with patch(
+        "app.knowledge_graph.k8s_storage_sync._get_all",
+        return_value=[_mk_pvc("data-0", "prod-shared")],
+    ):
+        stats = sync_pvcs(db)
+
+    assert stats["cleanup"]["skipped"] == "delete_pct"
+    assert len(_pvc_names(db)) == 4
+
+
+def test_pv_source_report_waits_for_commit(db):
+    """Отчёт источника пишется только после успешного коммита.
+
+    Отчитаться раньше значит объявить срез свежим за прогон, который
+    откатился: `check_source_coverage` на весь freshness-window сочтёт PV
+    обновлёнными и скроет отказ — а именно этот срез решает, чистить ли
+    узлы.
+    """
+    from app.knowledge_graph import k8s_storage_sync as sync_mod
+
+    with patch(
+        "app.knowledge_graph.k8s_storage_sync._get_all",
+        return_value=[_mk_pv("pv-0")],
+    ), patch.object(sync_mod, "record_source_run") as report, patch.object(
+        db, "commit", side_effect=RuntimeError("deadlock detected"),
+    ):
+        with pytest.raises(RuntimeError):
+            sync_mod.sync_pvs(db)
+
+    report.assert_not_called()

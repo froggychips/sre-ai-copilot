@@ -50,7 +50,7 @@ import subprocess
 from datetime import datetime, timedelta
 from typing import Any, Dict, Iterable, Iterator, List, Optional, Sequence, Set, Tuple, cast
 
-from sqlalchemy import and_, or_
+from sqlalchemy import and_, func as sa_func, or_
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -881,6 +881,61 @@ def _cleanup_absent_volumes(
     return stats
 
 
+def _touch_last_seen(
+    db: Session,
+    ids: Sequence[int],
+    now: Optional[datetime] = None,
+) -> int:
+    """Отметить «этот прогон их видел» — явным UPDATE, а не надеждой на ORM.
+
+    Надеяться нельзя: SQLAlchemy не эмитит UPDATE, если все присвоенные
+    поля совпали с прежними, а у PV они не меняются годами. Замер
+    18.09.2026: из 10 059 PV моложе суток была 61 строка, при том что
+    каждый прогон синка видит 1214 живых. То есть `updated_at` отвечает на
+    вопрос «когда строка менялась», а порогу усадки нужен другой — «когда
+    её видели», и подменять один другим значит получить знаменатель 61
+    вместо 1214 и порог, который не держит ничего.
+
+    Одним UPDATE на чанк, а не присваиванием в `_upsert_volume`: последнее
+    превратило бы каждый из 12 тысяч апсертов в отдельный UPDATE.
+    """
+    if not ids:
+        return 0
+    stamp = now or datetime.utcnow()
+    touched = 0
+    for part in _chunked(list(ids)):
+        touched += int(
+            db.query(StorageVolume)
+            .filter(StorageVolume.id.in_(part))
+            .update(
+                {
+                    StorageVolume.last_seen_at: stamp,
+                    # `updated_at` присваивается САМ СЕБЕ намеренно: иначе
+                    # SQLAlchemy подставит его `onupdate` и «видели» снова
+                    # станет неотличимо от «менялось» — то есть ровно то,
+                    # что эта колонка и заводилась разделить.
+                    StorageVolume.updated_at: StorageVolume.updated_at,
+                },
+                synchronize_session=False,
+            )
+            or 0
+        )
+    return touched
+
+
+def _seen_recently_clause(cutoff: datetime) -> Any:
+    """«Синк видел том после cutoff».
+
+    `coalesce` — для строк, вставленных до миграции 20260918_0100 или между
+    ней и первым прогоном нового кода: у них `last_seen_at` пуст, и считать
+    их невиданными было бы неправдой. Тот же приём, что в
+    `_stale_edge_clause` для legacy-рёбер.
+    """
+    return sa_func.coalesce(
+        StorageVolume.last_seen_at, StorageVolume.updated_at,
+    ) >= cutoff
+
+
 def _live_set_shrink_pct(db: Session, *, kind: str, current: int) -> float:
     """На сколько ужался снимок против того, что синк видел НЕДАВНО.
 
@@ -895,7 +950,13 @@ def _live_set_shrink_pct(db: Session, *, kind: str, current: int) -> float:
     Ту же ловушку разбирали в drift_cleanup, и решение там такое же по
     сути: сравнивать с живым набором, а не с размером графа. Там роль
     «недавно виденного» играет `state='active'`, который ведёт lifecycle;
-    у томов своего состояния нет, поэтому им служит `updated_at`.
+    у томов своего состояния нет, поэтому им служит `last_seen_at`.
+
+    Именно `last_seen_at`, а не `updated_at`: второй двигается, только
+    когда МЕНЯЮТСЯ поля, а у PV они не меняются годами. На `updated_at`
+    знаменатель был 61 при живом наборе 1214 — то есть порог пропускал
+    любой обрезанный снимок, ради которого и заведён. Отметку ставит
+    `_touch_last_seen` в конце среза, до чистки.
 
     Ноль, когда сравнивать не с чем: пустая таблица или первый прогон —
     не повод считать снимок подозрительным.
@@ -903,7 +964,7 @@ def _live_set_shrink_pct(db: Session, *, kind: str, current: int) -> float:
     cutoff = datetime.utcnow() - timedelta(hours=_RECENTLY_SEEN_HOURS)
     recently_seen = (
         db.query(StorageVolume)
-        .filter(StorageVolume.kind == kind, StorageVolume.updated_at >= cutoff)
+        .filter(StorageVolume.kind == kind, _seen_recently_clause(cutoff))
         .count()
     )
     if recently_seen <= 0:
@@ -1032,23 +1093,30 @@ def sync_pvs(db: Session) -> Dict[str, Any]:
     pvs, fetch_ok = _fetch_items("persistentvolumes", stats)
     stats["pvs_fetched"] = len(pvs)
     seen: Set[Tuple[str, str]] = set()
+    seen_ids: List[int] = []
     for pv in pvs:
         fields = _extract_pv_fields(pv)
         if not fields["name"]:
             stats["pvs_skipped"] += 1
             continue
-        _upsert_volume(db, fields)
+        node = _upsert_volume(db, fields)
+        seen_ids.append(cast(int, node.id))
         seen.add((fields["namespace"], fields["name"]))
         stats["pvs_upserted"] += 1
+    # Строго до чистки: порог усадки спрашивает у графа, сколько томов
+    # видели недавно, и этот прогон обязан быть уже посчитан.
+    stats["last_seen_touched"] = _touch_last_seen(db, seen_ids)
     cleanup = _cleanup_absent_volumes(
         db, kind=NODE_PV, seen=seen, fetch_ok=fetch_ok,
     )
     stats["cleanup"] = cleanup
-    # Отчёт о срезе PV: до 18.09.2026 эта часть синка не отчитывалась, и её
-    # молчание было невидимо для check_source_coverage — при том что именно
-    # её снимок решает, чистить ли узлы.
-    record_source_run(SOURCE_STORAGE_PVS, stats)
     db.commit()
+    # Отчёт о срезе PV — ПОСЛЕ коммита: до 18.09.2026 эта часть синка не
+    # отчитывалась вовсе, и её молчание было невидимо для
+    # check_source_coverage, при том что именно её снимок решает, чистить
+    # ли узлы. Отчитаться раньше коммита значит записать «срез свежий» для
+    # прогона, который откатился, — и на весь freshness-window скрыть отказ.
+    record_source_run(SOURCE_STORAGE_PVS, stats)
     logger.info(
         "k8s_storage.pvs_done fetched=%d upserted=%d skipped=%d errors=%d "
         "cleaned=%d",
@@ -1089,6 +1157,7 @@ def sync_pvcs(
     pvcs, fetch_ok = _fetch_items("persistentvolumeclaims", stats)
     stats["pvcs_fetched"] = len(pvcs)
     seen: Set[Tuple[str, str]] = set()
+    seen_ids: List[int] = []
     for pvc in pvcs:
         fields = _extract_pvc_fields(pvc)
         if not fields["name"]:
@@ -1098,6 +1167,7 @@ def sync_pvcs(
         if disk_pct is not None:
             stats["disk_pct_attached"] += 1
         pvc_node = _upsert_volume(db, fields, disk_pct=disk_pct)
+        seen_ids.append(cast(int, pvc_node.id))
         seen.add((fields["namespace"], fields["name"]))
         stats["pvcs_upserted"] += 1
 
@@ -1121,6 +1191,7 @@ def sync_pvcs(
                 extras={"phase": fields.get("phase")},
             )
             stats["edges_bound_to"] += 1
+    stats["last_seen_touched"] = _touch_last_seen(db, seen_ids)
     cleanup = _cleanup_absent_volumes(
         db, kind=NODE_PVC, seen=seen, fetch_ok=fetch_ok,
     )
