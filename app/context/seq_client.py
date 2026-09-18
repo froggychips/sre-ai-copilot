@@ -58,6 +58,31 @@ class SeqQueryError(RuntimeError):
     """
 
 
+def _escape_literal_braces(text: str) -> str:
+    """Экранировать скобки текстового токена — там они ВСЕГДА литеральные.
+
+    Плейсхолдеры приезжают из Seq отдельными токенами, поэтому всё, что
+    пришло текстом, — это текст, и в шаблоне Serilog оно записывается
+    удвоенной скобкой. Отсюда правило без исключений: в текстовом токене
+    `{` → `{{`, `}` → `}}`.
+
+    Точное исходное написание шаблона из токенов не восстановить: Seq
+    отдаёт текст уже развёрнутым, и `{{Name}}` не отличить от литерала,
+    записанного как есть. Восстановить можно другое, и этого достаточно —
+    КАНОН, в котором каждый шаблон записан ровно одним способом. Канон
+    получается биекцией: плейсхолдеры остаются одиночными скобками, текст
+    удваивается, и разные шаблоны Seq не могут дать одну строку.
+
+    Половинчатое экранирование (только того, что похоже на плейсхолдер)
+    биекцию ломает: `{{{Name}}}` приходит тремя токенами — текст `{`,
+    свойство `Name`, текст `}` — и одиночные скобки под такое правило не
+    попадали, поэтому шаблон складывался в `{{Name}}`, то есть в тот же
+    хэш, что и литеральный текст `{Name}`. Именно этот случай и стоил
+    отдельного захода.
+    """
+    return text.replace("{", "{{").replace("}", "}}")
+
+
 class SeqClient:
     """Тонкая обёртка над Seq `/api/events` для count + top-messages.
 
@@ -291,10 +316,68 @@ class SeqClient:
 
     @staticmethod
     def extract_message_template(event: Dict[str, Any]) -> str:
-        """MessageTemplate стабильнее RenderedMessage (без интерполяции).
+        """Шаблон сообщения — стабильный ключ события, без интерполяции.
 
-        Fallback chain: MessageTemplate → RenderedMessage → Message → "".
+        Seq REST отдаёт шаблон РАЗОБРАННЫМ на токены, в
+        `MessageTemplateTokens`: чередование `{"Text": "..."}` и
+        `{"PropertyName": "..."}`. Ключей `MessageTemplate`,
+        `RenderedMessage` и `Message`, которые искала прежняя версия, в
+        ответе НЕТ вовсе — рекон живого события 18.09.2026 дал ровно такой
+        набор полей:
+
+            EventType, Exception, Id, Level, Links,
+            MessageTemplateTokens, Properties, SpanKind, Timestamp
+
+        Из-за этого `sample_message` и `top_message_hash` не заполнялись НИ
+        У ОДНОГО наблюдения: на 18.09.2026 — 1726 записей за сутки, включая
+        88 Error и один Fatal, у всех текст пуст. Счётчики при этом верные,
+        поэтому дефект выглядел безобидно: видно, что у GR.WO.Bot в
+        prod-kingdom2 за сутки 50 089 Warning, и не видно, каких именно.
+        Тот же класс, что был с полем `App` (искали `Application`, а
+        сервис-тег лежит в `Properties` как `App`).
+
+        Плейсхолдеры НЕ подставляются значениями: шаблон должен быть
+        ОДИНАКОВЫМ для всех событий одного вида, иначе хэш перестаёт
+        группировать, а `top_message_hash` становится уникальным на каждое
+        событие.
+
+        Сам плейсхолдер берётся из `RawText`, когда Seq его отдаёт, и лишь
+        иначе собирается как `{ИмяСвойства}`. Разница не косметическая:
+        `RawText` несёт деструктурирование и формат, которых в
+        `PropertyName` нет, — `{@Error}` собралось бы как `{Error}`, то
+        есть в чужой шаблон. Рекон 4000 событий всех восьми Seq
+        18.09.2026: 413 property-токенов из 10 207 имеют `RawText`
+        (`{@Error}`, `{@Ops}`, `{@Op}`, `{@StatesBefore}`), текстовые
+        токены — всегда `Text`.
+
+        Крайние пробелы шаблона сохраняются: обрезка склеила бы два разных
+        шаблона Seq в один хэш. `.strip()` остаётся только в проверке «не
+        из одних ли пробелов собралось» — на такой шаблон честнее
+        провалиться в fallback.
+
+        Старые ключи оставлены в fallback: их отдают другие версии Seq API,
+        и терять совместимость ради одного формата незачем.
         """
+        tokens = event.get("MessageTemplateTokens")
+        if isinstance(tokens, list) and tokens:
+            parts = []
+            for token in tokens:
+                if not isinstance(token, dict):
+                    continue
+                text = token.get("Text")
+                if text:
+                    parts.append(_escape_literal_braces(str(text)))
+                    continue
+                raw = token.get("RawText")
+                if raw:
+                    parts.append(str(raw))
+                    continue
+                prop = token.get("PropertyName")
+                if prop:
+                    parts.append("{" + str(prop) + "}")
+            template = "".join(parts)
+            if template.strip():
+                return template
         for k in ("MessageTemplate", "RenderedMessage", "Message"):
             v = event.get(k)
             if v:
