@@ -50,7 +50,7 @@ import subprocess
 from datetime import datetime, timedelta
 from typing import Any, Dict, Iterable, Iterator, List, Optional, Sequence, Set, Tuple, cast
 
-from sqlalchemy import and_, func as sa_func, or_
+from sqlalchemy import and_, or_
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -127,6 +127,11 @@ _RECENTLY_SEEN_HOURS = 24
 REASON_FETCH_FAILED = "fetch_failed"
 REASON_EMPTY_FETCH = "empty_fetch"
 REASON_DELETE_PCT = "delete_pct"
+# Опоры нет: синк ни разу не отмечал тома этого вида за последние сутки,
+# значит сравнивать снимок не с чем. Бутстрап после миграции
+# 20260918_0100 и возвращение синка после суток простоя — те самые два
+# случая, когда обрезанный лист выглядел бы как живой набор.
+REASON_NO_BASELINE = "no_baseline"
 
 
 class KubectlFetchError(RuntimeError):
@@ -781,15 +786,22 @@ def _cleanup_absent_volumes(
     kind: str,
     seen: Set[Tuple[str, str]],
     fetch_ok: bool,
+    baseline: int,
 ) -> Dict[str, Any]:
     """Удалить узлы `kg_storage_volumes` данного kind, которых нет в снимке.
 
     `seen` — множество (namespace, name) из ТЕКУЩЕГО cluster-wide листа.
+    `baseline` — сколько томов этого вида синк видел за последние сутки ДО
+    текущего прогона (см. `_recently_seen_count`); считать его обязан
+    вызывающий, до того как отметит увиденное сейчас, иначе опора включит
+    в себя сам проверяемый снимок и любая усадка станет нулевой.
+
     Пропускаем чистку, если:
       * `fetch_ok=False` — kubectl сбойнул, снимок неполный;
       * `seen` пусто — пустой fetch неотличим от пустого кластера
         (дисциплина `k8s_jobs_sync.cleanup_stale_jobs`);
-      * удаление затронуло бы > `_VOLUME_MAX_DELETE_PCT`% узлов kind'а.
+      * `baseline` пуст — сравнивать не с чем, fail-closed;
+      * живой набор ужался больше чем на `_VOLUME_MAX_DELETE_PCT`%.
     """
     stats: Dict[str, Any] = {
         "volumes_deleted": 0, "edges_deleted": 0, "skipped": "",
@@ -838,7 +850,22 @@ def _cleanup_absent_volumes(
     # здесь он тот же, только сравнивать надо с предыдущим прогоном, а не
     # с размером графа: у томов нет состояния active/missing, по которому
     # namespace отличает живое от мёртвого.
-    shrink_pct = _live_set_shrink_pct(db, kind=kind, current=len(seen))
+    # Опоры нет — значит снимок не с чем сравнить, и «похож ли он на
+    # правду» неизвестно. Молчаливое «ноль процентов усадки» тут читалось
+    # бы как «всё в порядке»: именно так на бутстрапе обрезанный лист в 300
+    # томов прошёл бы за живой набор в 1214 и увёл бы за собой 500 живых
+    # узлов. Ждём прогона, который опору поставит.
+    if baseline <= 0:
+        stats["skipped"] = REASON_NO_BASELINE
+        logger.warning(
+            "k8s_storage.volume_cleanup_skipped kind=%s reason=%s — синк не "
+            "отмечал тома этого вида за последние %dч, сравнивать снимок "
+            "(%d) не с чем",
+            kind, REASON_NO_BASELINE, _RECENTLY_SEEN_HOURS, len(seen),
+        )
+        return stats
+
+    shrink_pct = _live_set_shrink_pct(baseline=baseline, current=len(seen))
     if shrink_pct > _VOLUME_MAX_DELETE_PCT:
         stats["skipped"] = REASON_DELETE_PCT
         stats["shrink_pct"] = round(shrink_pct, 1)
@@ -923,29 +950,42 @@ def _touch_last_seen(
     return touched
 
 
-def _seen_recently_clause(cutoff: datetime) -> Any:
-    """«Синк видел том после cutoff».
+def _recently_seen_count(db: Session, *, kind: str) -> int:
+    """Сколько томов этого вида синк отмечал за `_RECENTLY_SEEN_HOURS`.
 
-    `coalesce` — для строк, вставленных до миграции 20260918_0100 или между
-    ней и первым прогоном нового кода: у них `last_seen_at` пуст, и считать
-    их невиданными было бы неправдой. Тот же приём, что в
-    `_stale_edge_clause` для legacy-рёбер.
+    Опора для порога усадки, и считать её надо ДО того, как текущий прогон
+    отметит увиденное: иначе в опору попадёт сам проверяемый снимок, любая
+    усадка окажется нулевой, и порог снова перестанет что-либо значить.
+
+    Только `last_seen_at`, без подмешивания `updated_at`. Подмешивание
+    выглядело безобидно, но давало ложную опору ровно там, где опоры нет:
+    на первом прогоне после миграции у всех строк отметки ещё не было, а
+    `updated_at` есть у каждой — и обрезанный лист в 300 томов прошёл бы за
+    живой набор. Пустая опора честнее: она видна как `no_baseline` и
+    чистку останавливает.
     """
-    return sa_func.coalesce(
-        StorageVolume.last_seen_at, StorageVolume.updated_at,
-    ) >= cutoff
+    cutoff = datetime.utcnow() - timedelta(hours=_RECENTLY_SEEN_HOURS)
+    return int(
+        db.query(StorageVolume)
+        .filter(
+            StorageVolume.kind == kind,
+            StorageVolume.last_seen_at.isnot(None),
+            StorageVolume.last_seen_at >= cutoff,
+        )
+        .count()
+        or 0
+    )
 
 
-def _live_set_shrink_pct(db: Session, *, kind: str, current: int) -> float:
+def _live_set_shrink_pct(*, baseline: int, current: int) -> float:
     """На сколько ужался снимок против того, что синк видел НЕДАВНО.
 
-    Знаменатель — записи, обновлённые за `_RECENTLY_SEEN_HOURS`, а не все
-    строки таблицы. В этом вся разница с прежней формулой: старые записи
-    снесённых стендов в знаменатель не входят, поэтому накопленный мусор
-    не делает порог строже сам к себе. А вопрос, ради которого порог
-    заведён, — «не соврал ли kubectl» — остаётся: вчера видели 1214, а
-    сегодня лист отдал 300, значит снимок подозрительный, и чистить по
-    нему нельзя.
+    Знаменатель — тома, отмеченные за последние сутки, а не все строки
+    таблицы. В этом вся разница с прежней формулой: старые записи снесённых
+    стендов в знаменатель не входят, поэтому накопленный мусор не делает
+    порог строже сам к себе. А вопрос, ради которого порог заведён, — «не
+    соврал ли kubectl» — остаётся: вчера видели 1214, сегодня лист отдал
+    300, значит снимок подозрительный, и чистить по нему нельзя.
 
     Ту же ловушку разбирали в drift_cleanup, и решение там такое же по
     сути: сравнивать с живым набором, а не с размером графа. Там роль
@@ -955,21 +995,14 @@ def _live_set_shrink_pct(db: Session, *, kind: str, current: int) -> float:
     Именно `last_seen_at`, а не `updated_at`: второй двигается, только
     когда МЕНЯЮТСЯ поля, а у PV они не меняются годами. На `updated_at`
     знаменатель был 61 при живом наборе 1214 — то есть порог пропускал
-    любой обрезанный снимок, ради которого и заведён. Отметку ставит
-    `_touch_last_seen` в конце среза, до чистки.
+    любой обрезанный снимок, ради которого и заведён.
 
-    Ноль, когда сравнивать не с чем: пустая таблица или первый прогон —
-    не повод считать снимок подозрительным.
+    Рост набора усадкой не считается: новых томов больше, чем видели вчера,
+    — это не повод подозревать kubectl.
     """
-    cutoff = datetime.utcnow() - timedelta(hours=_RECENTLY_SEEN_HOURS)
-    recently_seen = (
-        db.query(StorageVolume)
-        .filter(StorageVolume.kind == kind, _seen_recently_clause(cutoff))
-        .count()
-    )
-    if recently_seen <= 0:
+    if baseline <= 0:
         return 0.0
-    return max(100.0 * (recently_seen - current) / recently_seen, 0.0)
+    return max(100.0 * (baseline - current) / baseline, 0.0)
 
 
 def _stale_edge_clause(cutoff: datetime) -> Any:
@@ -1090,6 +1123,10 @@ def sync_pvs(db: Session) -> Dict[str, Any]:
         "errors": 0,
         "fetch_failed": False,
     }
+    # Опора — ДО апсертов и отметки: сколько PV синк видел за прошлые сутки
+    # без учёта текущего снимка. Посчитать её после `_touch_last_seen`
+    # значило бы сравнивать снимок с ним же самим.
+    baseline = _recently_seen_count(db, kind=NODE_PV)
     pvs, fetch_ok = _fetch_items("persistentvolumes", stats)
     stats["pvs_fetched"] = len(pvs)
     seen: Set[Tuple[str, str]] = set()
@@ -1107,7 +1144,7 @@ def sync_pvs(db: Session) -> Dict[str, Any]:
     # видели недавно, и этот прогон обязан быть уже посчитан.
     stats["last_seen_touched"] = _touch_last_seen(db, seen_ids)
     cleanup = _cleanup_absent_volumes(
-        db, kind=NODE_PV, seen=seen, fetch_ok=fetch_ok,
+        db, kind=NODE_PV, seen=seen, fetch_ok=fetch_ok, baseline=baseline,
     )
     stats["cleanup"] = cleanup
     db.commit()
@@ -1154,6 +1191,7 @@ def sync_pvcs(
         "errors": 0,
         "fetch_failed": False,
     }
+    baseline = _recently_seen_count(db, kind=NODE_PVC)
     pvcs, fetch_ok = _fetch_items("persistentvolumeclaims", stats)
     stats["pvcs_fetched"] = len(pvcs)
     seen: Set[Tuple[str, str]] = set()
@@ -1193,7 +1231,7 @@ def sync_pvcs(
             stats["edges_bound_to"] += 1
     stats["last_seen_touched"] = _touch_last_seen(db, seen_ids)
     cleanup = _cleanup_absent_volumes(
-        db, kind=NODE_PVC, seen=seen, fetch_ok=fetch_ok,
+        db, kind=NODE_PVC, seen=seen, fetch_ok=fetch_ok, baseline=baseline,
     )
     stats["cleanup"] = cleanup
     db.commit()

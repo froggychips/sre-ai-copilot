@@ -1327,3 +1327,97 @@ def test_pv_source_report_waits_for_commit(db):
             sync_mod.sync_pvs(db)
 
     report.assert_not_called()
+
+
+def test_bootstrap_without_baseline_refuses_to_clean(db):
+    """Пока синк не отметил ни одного тома, чистка не идёт.
+
+    Вторая находка ревью и самая неприятная: первый прогон после миграции
+    отмечает только тот снимок, который сейчас в руках. Если он обрезан —
+    300 томов вместо 1214, — то и опора получится 300, усадка выйдет
+    нулевой, и чистка снесёт живые узлы. Поэтому опора считается ДО
+    отметки, а пустая опора означает «сравнивать не с чем» и останавливает
+    чистку, а не разрешает её.
+    """
+    from app.knowledge_graph.schema import StorageVolume
+
+    _seed_volume_edges(db, count=4)
+    # Состояние сразу после миграции: колонка есть, отметок ещё нет.
+    db.query(StorageVolume).update(
+        {"last_seen_at": None}, synchronize_session=False,
+    )
+    db.commit()
+
+    with patch(
+        "app.knowledge_graph.k8s_storage_sync._get_all",
+        return_value=[_mk_pvc("data-0", "prod-shared")],
+    ):
+        stats = sync_pvcs(db)
+
+    assert stats["cleanup"]["skipped"] == "no_baseline"
+    assert len(_pvc_names(db)) == 4, "по снимку без опоры не сносим ничего"
+
+
+def test_cleanup_resumes_once_baseline_exists(db):
+    """Опора появляется на первом же прогоне, и чистка идёт со следующего.
+
+    Цена fail-closed — один цикл синка, и она того стоит: дальше порог
+    работает на честном знаменателе.
+    """
+    from app.knowledge_graph.schema import StorageVolume
+
+    _seed_volume_edges(db, count=4)
+    db.query(StorageVolume).update(
+        {"last_seen_at": None}, synchronize_session=False,
+    )
+    db.commit()
+
+    full = [_mk_pvc(f"data-{i}", "prod-shared") for i in range(4)]
+    with patch(
+        "app.knowledge_graph.k8s_storage_sync._get_all", return_value=full,
+    ):
+        first = sync_pvcs(db)
+    # Удалять на полном снимке нечего, до порога дело и не доходит — важно
+    # здесь другое: прогон поставил отметки, то есть опору для следующего.
+    assert first["cleanup"]["volumes_deleted"] == 0
+    assert first["last_seen_touched"] == 4
+
+    # Кластер отдал три из четырёх — том действительно удалён.
+    with patch(
+        "app.knowledge_graph.k8s_storage_sync._get_all", return_value=full[:3],
+    ):
+        second = sync_pvcs(db)
+
+    assert second["cleanup"]["skipped"] == ""
+    assert second["cleanup"]["volumes_deleted"] == 1
+    assert len(_pvc_names(db)) == 3
+
+
+def test_baseline_is_taken_before_the_run_marks_anything(db):
+    """Опора не должна включать в себя проверяемый снимок.
+
+    Если посчитать её после отметки, знаменатель станет равен текущему
+    снимку, усадка — нулю, и порог замолчит навсегда. Здесь это видно
+    прямо: вчера видели четыре тома, сегодня лист отдал один, и опора
+    обязана остаться четвёркой.
+    """
+    from app.knowledge_graph import k8s_storage_sync as sync_mod
+
+    _seed_volume_edges(db, count=4)
+
+    seen_baselines = []
+    original = sync_mod._recently_seen_count
+
+    def spy(db_, *, kind):
+        value = original(db_, kind=kind)
+        seen_baselines.append((kind, value))
+        return value
+
+    with patch.object(sync_mod, "_recently_seen_count", spy), patch(
+        "app.knowledge_graph.k8s_storage_sync._get_all",
+        return_value=[_mk_pvc("data-0", "prod-shared")],
+    ):
+        stats = sync_pvcs(db)
+
+    assert seen_baselines == [("pvc", 4)]
+    assert stats["cleanup"]["skipped"] == "delete_pct"
