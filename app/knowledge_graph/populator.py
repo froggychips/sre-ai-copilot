@@ -388,10 +388,18 @@ def _upsert_service_fallback(
             current = OWNER_SOURCE_TRUST.get(svc.owner_source or "", 0.0)
             # Пустой владелец перебивает провенанс — см. PG-путь.
             repairable = not svc.team_owner
-            if (repairable or current <= incoming) and svc.team_owner != team_owner:
-                svc.team_owner = team_owner
-                svc.owner_source = owner_source
-                changed = True
+            if repairable or current <= incoming:
+                # Условие НЕ включает «владелец изменился»: у строки может
+                # совпадать владелец при отсутствующем или более слабом
+                # провенансе, и тогда чинить надо именно источник. PG-путь
+                # переписывает оба поля вместе, и расхождение путей здесь
+                # оставляло бы legacy-строки без провенанса навсегда — но
+                # только на sqlite, то есть ровно там, где это видно тестам
+                # и незаметно в проде.
+                if svc.team_owner != team_owner or svc.owner_source != owner_source:
+                    svc.team_owner = team_owner
+                    svc.owner_source = owner_source
+                    changed = True
         elif team_owner and svc.team_owner != team_owner:
             svc.team_owner = team_owner
             svc.owner_source = owner_source

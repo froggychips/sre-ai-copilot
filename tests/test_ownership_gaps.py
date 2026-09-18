@@ -527,3 +527,76 @@ def test_orphaned_provenance_does_not_block_repair(db):
     )
     assert fixed.team_owner == "squad-13", "битую строку обязан починить любой владелец"
     assert fixed.owner_source == OWNER_SOURCE_K8S_LABELS
+
+
+def test_provenance_is_repaired_when_owner_matches(db):
+    """Владелец тот же, провенанс отсутствует — чинить надо источник.
+
+    Условие «владелец изменился» блокировало обновление источника, и
+    legacy-строка оставалась без провенанса навсегда. PG-путь переписывает
+    оба поля вместе, так что расхождение было видно только на sqlite — то
+    есть там, где его и ловят тесты.
+    """
+    from app.knowledge_graph.schema import NODE_KIND_WORKLOAD
+
+    upsert_service(
+        db, namespace="squad-14-kingdom2", name="town-service",
+        node_kind=NODE_KIND_WORKLOAD,
+    )
+    legacy = (
+        db.query(Service)
+        .filter(
+            Service.namespace == "squad-14-kingdom2",
+            Service.node_kind == NODE_KIND_WORKLOAD,
+        )
+        .one()
+    )
+    legacy.team_owner = "squad-14"
+    legacy.owner_source = None       # провенанс потерян
+    db.flush()
+
+    upsert_service(
+        db, namespace="squad-14-kingdom2", name="town-service",
+        node_kind=NODE_KIND_WORKLOAD,
+        team_owner="squad-14", owner_source=OWNER_SOURCE_K8S_LABELS,
+        owner_respect_trust=True,
+    )
+
+    fixed = (
+        db.query(Service)
+        .filter(
+            Service.namespace == "squad-14-kingdom2",
+            Service.node_kind == NODE_KIND_WORKLOAD,
+        )
+        .one()
+    )
+    assert fixed.team_owner == "squad-14"
+    assert fixed.owner_source == OWNER_SOURCE_K8S_LABELS, "провенанс обязан починиться"
+
+
+def test_weaker_source_does_not_downgrade_provenance(db):
+    """Обратное: слабый источник не должен портить сильный провенанс."""
+    from app.knowledge_graph.schema import NODE_KIND_WORKLOAD
+
+    upsert_service(
+        db, namespace="squad-15-kingdom2", name="town-service",
+        node_kind=NODE_KIND_WORKLOAD,
+        team_owner="squad-15", owner_source=OWNER_SOURCE_MANUAL,
+    )
+
+    upsert_service(
+        db, namespace="squad-15-kingdom2", name="town-service",
+        node_kind=NODE_KIND_WORKLOAD,
+        team_owner="squad-15", owner_source=OWNER_SOURCE_NAMESPACE_PREFIX,
+        owner_respect_trust=True,
+    )
+
+    row = (
+        db.query(Service)
+        .filter(
+            Service.namespace == "squad-15-kingdom2",
+            Service.node_kind == NODE_KIND_WORKLOAD,
+        )
+        .one()
+    )
+    assert row.owner_source == OWNER_SOURCE_MANUAL
