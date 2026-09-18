@@ -1439,6 +1439,11 @@ def check_source_coverage(db: Session) -> CheckResult:
     silent: List[str] = []
     expired: List[str] = []
     unhealthy: Dict[str, str] = {}
+    # Источники, у которых чистка узлов отменилась: снимок есть, ошибок нет,
+    # а верить ему нечем. Сам по себе такой прогон выглядит здоровым —
+    # fetched больше нуля, errors ноль, — и без отдельного списка молчал бы
+    # ровно в том случае, ради которого заведён.
+    cleanup_blocked: Dict[str, Any] = {}
     for source in ALL_EDGE_SOURCES:
         report = get_source_report(source)
         if report is None:
@@ -1463,6 +1468,10 @@ def check_source_coverage(db: Session) -> CheckResult:
             "failed": report.failed,
             "ts": report.ts.isoformat() if report.ts else None,
         }
+        if report.cleanup:
+            reported[source]["cleanup"] = report.cleanup
+            if report.cleanup.get("skipped"):
+                cleanup_blocked[source] = report.cleanup
         if reason:
             unhealthy[source] = reason
 
@@ -1485,7 +1494,11 @@ def check_source_coverage(db: Session) -> CheckResult:
     # удалённая запись. Не учитывай мы её, проверка молчала бы ровно сутки —
     # причём именно тогда, когда сохранённая метка времени ДОКАЗЫВАЕТ, что
     # источник пропустил свой срок.
-    status = "warn" if (unhealthy or silent or expired) else "ok"
+    status = (
+        "warn"
+        if (unhealthy or silent or expired or cleanup_blocked)
+        else "ok"
+    )
     return CheckResult(
         name="source_coverage",
         status=status,
@@ -1496,12 +1509,17 @@ def check_source_coverage(db: Session) -> CheckResult:
             "silent": sorted(silent),
             "expired": sorted(expired),
             "unhealthy": unhealthy,
+            "cleanup_blocked": cleanup_blocked,
             "reported": reported,
             "note": (
                 "отчёты переживают границу процесса (redis, TTL 48ч), "
                 "поэтому silent = «источник не отчитался», а не «этот форк "
                 "не видел». expired = отчёт старше окна свежести: тоже "
-                "«не знаю», но с известной давностью"
+                "«не знаю», но с известной давностью. cleanup_blocked = "
+                "источник отработал, но чистку узлов отменил: снимок есть, "
+                "ошибок нет, а сравнить его не с чем (`no_baseline`) или он "
+                "подозрительно мал (`delete_pct`) — единственный случай, "
+                "когда здоровый с виду прогон требует человека"
             ),
         },
     )

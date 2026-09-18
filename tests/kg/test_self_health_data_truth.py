@@ -17,6 +17,7 @@ from app.knowledge_graph.edge_decay_guard import (ALL_EDGE_SOURCES,
                                                   SOURCE_INGRESS_SYNC,
                                                   SOURCE_KG_SYNC,
                                                   record_source_run)
+from app.knowledge_graph.edge_decay_guard import SOURCE_STORAGE_PVS
 from app.knowledge_graph.schema import (Namespace, Service, ServiceHealth,
                                         StorageVolume)
 from app.knowledge_graph.self_health import (check_node_freshness,
@@ -325,3 +326,58 @@ def test_expired_report_raises_status(db, monkeypatch):
     r = check_source_coverage(db)
     assert SOURCE_KG_SYNC in r.detail["expired"]
     assert r.status == "warn"
+
+
+# ── Отменённая чистка узлов не должна выглядеть здоровым прогоном ────────
+
+def test_blocked_cleanup_reaches_self_health(db):
+    """Срез отработал, но чистку отменил — и это видно снаружи прогона.
+
+    Находка ревью: обещание «человек увидит цифры в дайджесте» не
+    выполнялось. `record_source_run` переносил в redis только ts, fetched,
+    errors и failed, поэтому прогон, отменивший чистку из-за недоверенного
+    снимка, выглядел здоровым: объекты получены, ошибок нет. Именно в этом
+    состоянии следующий прогон принял бы обрезанный снимок за опору.
+    """
+    for source in ALL_EDGE_SOURCES:
+        record_source_run(source, {"errors": 0})
+    record_source_run(SOURCE_STORAGE_PVS, {
+        "pvs_fetched": 300,
+        "errors": 0,
+        "cleanup": {
+            "skipped": "no_baseline",
+            "bootstrap_baseline": 300,
+            "rows_total": 10059,
+        },
+    })
+
+    r = check_source_coverage(db)
+
+    blocked = r.detail["cleanup_blocked"]
+    assert SOURCE_STORAGE_PVS in blocked
+    assert blocked[SOURCE_STORAGE_PVS]["skipped"] == "no_baseline"
+    # Цифры рядом — по ним и видно, верить ли снимку: 300 против 10 059
+    # строк графа читается иначе, чем 1214 против тех же 10 059.
+    assert blocked[SOURCE_STORAGE_PVS]["bootstrap_baseline"] == 300
+    assert blocked[SOURCE_STORAGE_PVS]["rows_total"] == 10059
+    assert r.status == "warn"
+    assert SOURCE_STORAGE_PVS not in r.detail["unhealthy"], (
+        "это не поломка источника: он отработал штатно и сам себя "
+        "притормозил — путать одно с другим значит обесценить оба сигнала"
+    )
+
+
+def test_successful_cleanup_stays_quiet(db):
+    """Прошедшая чистка статус не поднимает — иначе warn горел бы всегда."""
+    for source in ALL_EDGE_SOURCES:
+        record_source_run(source, {"errors": 0})
+    record_source_run(SOURCE_STORAGE_PVS, {
+        "pvs_fetched": 1214,
+        "errors": 0,
+        "cleanup": {"skipped": "", "volumes_deleted": 500},
+    })
+
+    r = check_source_coverage(db)
+
+    assert r.detail["cleanup_blocked"] == {}
+    assert r.status == "ok"
