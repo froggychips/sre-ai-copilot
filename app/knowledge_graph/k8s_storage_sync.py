@@ -857,11 +857,19 @@ def _cleanup_absent_volumes(
     # узлов. Ждём прогона, который опору поставит.
     if baseline <= 0:
         stats["skipped"] = REASON_NO_BASELINE
+        # Опорой станет ИМЕННО этот снимок, и проверить его нечем — значит
+        # он должен быть виден человеку. Размер графа рядом со снимком
+        # даёт ту самую проверку: 1214 против 10 059 строк — накопленный
+        # мусор, ожидаемая картина; 300 против 1214 — снимок, которому
+        # верить нельзя, и это повод смотреть на кластер, а не на граф.
+        stats["bootstrap_baseline"] = len(seen)
+        stats["rows_total"] = len(rows)
         logger.warning(
             "k8s_storage.volume_cleanup_skipped kind=%s reason=%s — синк не "
             "отмечал тома этого вида за последние %dч, сравнивать снимок "
-            "(%d) не с чем",
-            kind, REASON_NO_BASELINE, _RECENTLY_SEEN_HOURS, len(seen),
+            "(%d при %d строках в графе) не с чем; опорой станет он сам",
+            kind, REASON_NO_BASELINE, _RECENTLY_SEEN_HOURS,
+            len(seen), len(rows),
         )
         return stats
 

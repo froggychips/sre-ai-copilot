@@ -1356,6 +1356,11 @@ def test_bootstrap_without_baseline_refuses_to_clean(db):
 
     assert stats["cleanup"]["skipped"] == "no_baseline"
     assert len(_pvc_names(db)) == 4, "по снимку без опоры не сносим ничего"
+    # Опорой станет именно этот снимок, проверить его нечем — значит он
+    # обязан быть виден: снимок рядом с размером графа и есть та проверка,
+    # которую вместо автоматики делает человек.
+    assert stats["cleanup"]["bootstrap_baseline"] == 1
+    assert stats["cleanup"]["rows_total"] == 4
 
 
 def test_cleanup_resumes_once_baseline_exists(db):
