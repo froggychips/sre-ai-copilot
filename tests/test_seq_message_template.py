@@ -223,27 +223,49 @@ def test_escaped_braces_do_not_merge_with_a_real_placeholder():
     assert literal != parametrized
 
 
-def test_interpolated_json_is_left_alone():
-    """Скобки интерполированного JSON не удваиваются.
+def test_interpolated_json_is_escaped_as_literal_text():
+    """Интерполированный JSON — тоже литеральный текст, тоже удваивается.
 
     Рекон 18.09.2026: из 13 449 текстовых токенов скобки есть у 67, и все
     они — JSON, вставленный в строку интерполяцией (`$"...{json}"`).
-    Плейсхолдером Serilog его не считает — сразу за скобкой кавычка, — и в
-    шаблоне он записан ровно так, как пришёл. Удвоить в нём скобки значило
-    бы исказить текст, который Seq отдал точным.
+    Читаемость от удвоения страдает, но альтернатива хуже: половинчатое
+    правило оставляло бы одиночные скобки, а с ними канон перестаёт быть
+    однозначным.
     """
     event = {"MessageTemplateTokens": [
         {"Text": "Received LeaderboardUpdated message: "},
-        {"Text": '{"LeaderboardId":4002,"Score":20,"GroupId":null}'},
+        {"Text": '{"LeaderboardId":4002,"Score":20}'},
     ]}
     assert SeqClient.extract_message_template(event) == (
         'Received LeaderboardUpdated message: '
-        '{"LeaderboardId":4002,"Score":20,"GroupId":null}'
+        '{{"LeaderboardId":4002,"Score":20}}'
     )
 
 
+def test_brace_wrapped_placeholder_keeps_its_own_shape():
+    """`{{{Name}}}` и `{{Name}}` не складываются в один хэш.
+
+    Первый — литеральная скобка, свойство, литеральная скобка; Seq отдаёт
+    его тремя токенами. Второй — литеральный текст `{Name}` одним токеном.
+    Пока экранировались только «похожие на плейсхолдер» куски, одиночные
+    скобки первого оставались как есть, и оба шаблона сходились в
+    `{{Name}}` — то есть разные события считались одним.
+    """
+    wrapped = SeqClient.extract_message_template({
+        "MessageTemplateTokens": [
+            {"Text": "{"}, {"PropertyName": "Name"}, {"Text": "}"},
+        ]
+    })
+    literal = SeqClient.extract_message_template({
+        "MessageTemplateTokens": [{"Text": "{Name}"}]
+    })
+    assert wrapped == "{{{Name}}}"
+    assert literal == "{{Name}}"
+    assert wrapped != literal
+
+
 def test_formatted_placeholder_in_literal_text_is_escaped():
-    """Экранируется и плейсхолдер с форматом — Serilog принял бы и его."""
+    """Экранируется и плейсхолдер с форматом, пришедший текстом."""
     event = {"MessageTemplateTokens": [{"Text": "took {Elapsed:0.000} ms"}]}
     assert SeqClient.extract_message_template(event) == (
         "took {{Elapsed:0.000}} ms"
