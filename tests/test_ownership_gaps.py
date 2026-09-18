@@ -312,55 +312,103 @@ def test_classified_records_are_not_flagged(db):
 
 # --- наследование по силе источника ---------------------------------------
 
-def test_strong_owner_propagates_to_workload_by_assignment(db):
-    """Лейбл распространяется на workload присваиванием.
+def test_inheritance_passes_owner_with_trust_gate(db):
+    """Владелец наследуется с оговоркой «только если не слабее».
 
-    Он описывает конкретный объект, поэтому им можно переписать старую
-    догадку: иначе workload навсегда остался бы с префиксным владельцем,
-    даже когда у Service появился лейбл.
-    """
-    from app.knowledge_graph.k8s_topology_resources_sync import _inherited_owner
-
-    svc = type("N", (), {"team_owner": "squad-7", "owner_source": OWNER_SOURCE_K8S_LABELS})()
-
-    assert _inherited_owner(svc) == {
-        "team_owner": "squad-7", "owner_source": OWNER_SOURCE_K8S_LABELS,
-    }
-
-
-def test_weak_owner_propagates_to_workload_as_fallback(db):
-    """Догадка по префиксу — только дозаполнением.
-
-    Она описывает namespace целиком и ничего не знает про отдельный
-    объект, поэтому не должна переписывать то, что поставили осознанно.
+    Сравнение с провенансом самого workload делает upsert, внутри одного
+    UPDATE: здесь сравнивать с константой было недостаточно — лейбл
+    Service (0.9) затирал бы ручную правку workload (1.0) на каждом
+    проходе синка.
     """
     from app.knowledge_graph.k8s_topology_resources_sync import _inherited_owner
 
     svc = type("N", (), {
-        "team_owner": "squad-28", "owner_source": OWNER_SOURCE_NAMESPACE_PREFIX,
+        "team_owner": "squad-7", "owner_source": OWNER_SOURCE_K8S_LABELS,
     })()
 
     assert _inherited_owner(svc) == {
-        "owner_fallback": "squad-28",
-        "owner_fallback_source": OWNER_SOURCE_NAMESPACE_PREFIX,
+        "team_owner": "squad-7",
+        "owner_source": OWNER_SOURCE_K8S_LABELS,
+        "owner_respect_trust": True,
     }
 
 
-def test_manual_owner_propagates_by_assignment(db):
+def test_manual_owner_is_inherited_too(db):
     from app.knowledge_graph.k8s_topology_resources_sync import _inherited_owner
 
     svc = type("N", (), {"team_owner": "platform", "owner_source": OWNER_SOURCE_MANUAL})()
-    assert "team_owner" in _inherited_owner(svc)
+    assert _inherited_owner(svc)["team_owner"] == "platform"
 
 
-def test_owner_without_provenance_propagates_as_fallback(db):
-    """Владелец без источника доверия не заслуживает — только дозаполнение."""
+def test_manual_workload_owner_survives_service_label(db):
+    """Ручная правка workload сильнее лейбла Service — и остаётся.
+
+    Без сравнения с провенансом назначения синк затирал бы её каждые 15
+    минут, унося с собой и маршрут эскалации.
+    """
     from app.knowledge_graph.k8s_topology_resources_sync import _inherited_owner
+    from app.knowledge_graph.schema import NODE_KIND_WORKLOAD
 
-    svc = type("N", (), {"team_owner": "squad-3", "owner_source": None})()
-    assert _inherited_owner(svc) == {
-        "owner_fallback": "squad-3", "owner_fallback_source": None,
-    }
+    upsert_service(
+        db, namespace="squad-11-kingdom2", name="town-service",
+        team_owner="вручную-назначенный", owner_source=OWNER_SOURCE_MANUAL,
+        node_kind=NODE_KIND_WORKLOAD,
+    )
+    labelled_service = type("N", (), {
+        "team_owner": "squad-11", "owner_source": OWNER_SOURCE_K8S_LABELS,
+    })()
+
+    upsert_service(
+        db, namespace="squad-11-kingdom2", name="town-service",
+        node_kind=NODE_KIND_WORKLOAD, **_inherited_owner(labelled_service),
+    )
+
+    workload = (
+        db.query(Service)
+        .filter(
+            Service.namespace == "squad-11-kingdom2",
+            Service.name == "town-service",
+            Service.node_kind == NODE_KIND_WORKLOAD,
+        )
+        .one()
+    )
+    assert workload.team_owner == "вручную-назначенный"
+    assert workload.owner_source == OWNER_SOURCE_MANUAL
+
+
+def test_label_overwrites_weaker_prefix_guess_on_workload(db):
+    """А вот догадку по префиксу лейбл переписать обязан.
+
+    Иначе workload навсегда остался бы с владельцем, выведенным из имени
+    namespace, даже после того как на объект повесили лейбл.
+    """
+    from app.knowledge_graph.k8s_topology_resources_sync import _inherited_owner
+    from app.knowledge_graph.schema import NODE_KIND_WORKLOAD
+
+    upsert_service(
+        db, namespace="squad-12-kingdom2", name="town-service",
+        team_owner="squad-12", owner_source=OWNER_SOURCE_NAMESPACE_PREFIX,
+        node_kind=NODE_KIND_WORKLOAD,
+    )
+    labelled_service = type("N", (), {
+        "team_owner": "настоящая-команда", "owner_source": OWNER_SOURCE_K8S_LABELS,
+    })()
+
+    upsert_service(
+        db, namespace="squad-12-kingdom2", name="town-service",
+        node_kind=NODE_KIND_WORKLOAD, **_inherited_owner(labelled_service),
+    )
+
+    workload = (
+        db.query(Service)
+        .filter(
+            Service.namespace == "squad-12-kingdom2",
+            Service.name == "town-service",
+            Service.node_kind == NODE_KIND_WORKLOAD,
+        )
+        .one()
+    )
+    assert workload.team_owner == "настоящая-команда"
 
 
 def test_owner_without_provenance_reaches_the_workload(db):

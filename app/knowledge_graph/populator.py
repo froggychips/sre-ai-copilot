@@ -21,6 +21,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.knowledge_graph.contract import (UQ_KG_SERVICE_NS_NAME_KIND,
+                                          OWNER_SOURCE_TRUST,
                                           owner_source_valid)
 from app.knowledge_graph.schema import (NODE_KIND_SERVICE, AlertEvent,
                                         Deployment, PodEvent, Service,
@@ -71,6 +72,7 @@ def upsert_service(
     k8s_uid: Optional[str] = None,
     owner_fallback: Optional[str] = None,
     owner_fallback_source: Optional[str] = None,
+    owner_respect_trust: bool = False,
 ) -> Service:
     """Idempotent upsert узла графа — ЕДИНСТВЕННЫЙ путь записи kg_services.
 
@@ -85,6 +87,14 @@ def upsert_service(
     без источника — это уже 12 577 существующих строк, у которых провенанс
     неизвестен. Неизвестное значение отбрасывается с warning, чтобы опечатка
     не завела в графе седьмой «источник».
+
+    `owner_respect_trust` — перезаписывать владельца только если источник
+    нового НЕ СЛАБЕЕ источника существующего (по `OWNER_SOURCE_TRUST`).
+    Нужен наследованию: workload получает владельца Service, но у самого
+    workload может стоять ручная правка (1.0), которую лейбл Service (0.9)
+    затирать не должен — а без сравнения с назначением это происходило бы
+    каждый проход синка. Отсутствующий провенанс весит 0, поэтому пустое
+    поле заполняется всегда.
 
     `owner_fallback` — владелец, которым заполняют ПУСТОЕ поле, не перетирая
     существующее. Нужен источникам, которые знают слабую догадку и не должны
@@ -145,12 +155,28 @@ def upsert_service(
         return _upsert_service_pg(
             db, namespace, name, team_owner, metadata, synthetic, node_kind,
             stale_class, owner_source, k8s_uid,
-            owner_fallback, owner_fallback_source,
+            owner_fallback, owner_fallback_source, owner_respect_trust,
         )
     return _upsert_service_fallback(
         db, namespace, name, team_owner, metadata, synthetic, node_kind,
         stale_class, owner_source, k8s_uid,
-        owner_fallback, owner_fallback_source,
+        owner_fallback, owner_fallback_source, owner_respect_trust,
+    )
+
+
+def _trust_expr(col: Any) -> Any:
+    """SQL-выражение: вес доверия источника из колонки.
+
+    Та же таблица, что в контракте (`OWNER_SOURCE_TRUST`), перенесённая в
+    SQL, чтобы сравнение шло внутри одного UPDATE — без чтения строки
+    заранее и без гонки между чтением и записью.
+    """
+    return sa.case(
+        *[
+            (col == source, sa.literal(trust))
+            for source, trust in OWNER_SOURCE_TRUST.items()
+        ],
+        else_=sa.literal(0.0),
     )
 
 
@@ -167,6 +193,7 @@ def _upsert_service_pg(
     k8s_uid: Optional[str] = None,
     owner_fallback: Optional[str] = None,
     owner_fallback_source: Optional[str] = None,
+    owner_respect_trust: bool = False,
 ) -> Service:
     from sqlalchemy.dialects.postgresql import insert as pg_insert
 
@@ -189,7 +216,20 @@ def _upsert_service_pg(
     }
     set_clause: Dict[str, Any] = {"updated_at": now}
     tbl_ref = Service.__table__
-    if team_owner:
+    if team_owner and owner_respect_trust:
+        # Перезапись только если новый источник не слабее существующего.
+        # Сравнение идёт с ПРОВЕНАНСОМ СТРОКИ, а не с константой: иначе
+        # лейбл Service (0.9) затирал бы ручную правку workload (1.0) на
+        # каждом проходе. NULL весит 0 — пустое поле заполняется всегда.
+        incoming = OWNER_SOURCE_TRUST.get(owner_source or "", 0.0)
+        stronger = _trust_expr(tbl_ref.c.owner_source) <= incoming
+        set_clause["team_owner"] = sa.case(
+            (stronger, sa.literal(team_owner)), else_=tbl_ref.c.team_owner,
+        )
+        set_clause["owner_source"] = sa.case(
+            (stronger, sa.literal(owner_source)), else_=tbl_ref.c.owner_source,
+        )
+    elif team_owner:
         set_clause["team_owner"] = team_owner
         # Источник переписываем только вместе с владельцем: иначе у строки
         # остался бы провенанс от предыдущего, уже перезаписанного значения.
@@ -299,6 +339,7 @@ def _upsert_service_fallback(
     k8s_uid: Optional[str] = None,
     owner_fallback: Optional[str] = None,
     owner_fallback_source: Optional[str] = None,
+    owner_respect_trust: bool = False,
 ) -> Service:
     svc = (
         db.query(Service)
@@ -330,7 +371,16 @@ def _upsert_service_fallback(
         logger.info("kg.service_created", namespace=namespace, name=name)
     else:
         changed = False
-        if team_owner and svc.team_owner != team_owner:
+        if team_owner and owner_respect_trust:
+            # Зеркалит PG-путь: перезапись только если новый источник не
+            # слабее того, что стоит в строке.
+            incoming = OWNER_SOURCE_TRUST.get(owner_source or "", 0.0)
+            current = OWNER_SOURCE_TRUST.get(svc.owner_source or "", 0.0)
+            if current <= incoming and svc.team_owner != team_owner:
+                svc.team_owner = team_owner
+                svc.owner_source = owner_source
+                changed = True
+        elif team_owner and svc.team_owner != team_owner:
             svc.team_owner = team_owner
             svc.owner_source = owner_source
             changed = True

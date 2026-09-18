@@ -50,9 +50,7 @@ from app.knowledge_graph.kubectl_breaker import run_kubectl
 from app.knowledge_graph.edge_decay_guard import (
     SOURCE_TOPOLOGY_INGRESSES, SOURCE_TOPOLOGY_SERVICES, record_source_run)
 from app.knowledge_graph.k8s_endpoints_sync import DISCOVERED_BY_ENDPOINTS
-from app.knowledge_graph.contract import (OWNER_SOURCE_K8S_LABELS,
-                                          OWNER_SOURCE_NAMESPACE_PREFIX,
-                                          OWNER_SOURCE_TRUST)
+from app.knowledge_graph.contract import OWNER_SOURCE_NAMESPACE_PREFIX
 from app.knowledge_graph.populator import upsert_edge, upsert_service
 from app.knowledge_graph.schema import (NODE_KIND_SERVICE, NODE_KIND_WORKLOAD,
                                         Service, ServiceEdge)
@@ -260,32 +258,38 @@ def _kubectl_get_deployments_all() -> List[Dict[str, Any]]:
 # ── pure helpers ────────────────────────────────────────────────────────────
 
 
-def _inherited_owner(svc_node: Any) -> Dict[str, Optional[str]]:
+def _inherited_owner(svc_node: Any) -> Dict[str, Any]:
     """Как передать владельца Service его workload-узлу.
 
-    Возвращает готовые kwargs для `upsert_service`: либо присваивание
-    (`team_owner`/`owner_source`), либо дозаполнение (`owner_fallback*`).
+    Возвращает kwargs для `upsert_service` с `owner_respect_trust=True`:
+    владелец передаётся, но перезапишет существующего только если его
+    источник не слабее (по `OWNER_SOURCE_TRUST`).
 
-    Разница по силе источника. Лейбл и ручная правка описывают этот
-    конкретный объект, поэтому их можно распространять на workload
-    присваиванием. Догадка по префиксу описывает namespace целиком и
-    ничего не знает про отдельный объект: ею можно только заполнить
-    пустоту, но не переписать то, что кто-то поставил осознанно.
+    Так решаются обе крайности сразу. Безусловное присваивание позволяло
+    догадке по префиксу затирать лейбл workload — эскалация уезжала на
+    команду, выведенную из имени namespace. Чистое дозаполнение оставляло
+    workload со старой догадкой навсегда, даже когда у Service появился
+    лейбл. Сравнение по силе пропускает второе и запрещает первое.
 
-    Граница — по `OWNER_SOURCE_TRUST`: всё, что слабее лейбла, передаётся
-    дозаполнением.
+    Отсутствие владельца не передаёт ничего: наследовать нечего.
     """
     owner = str(svc_node.team_owner) if svc_node.team_owner else None
     if not owner:
         return {}
     source = str(svc_node.owner_source) if svc_node.owner_source else None
-    trust = OWNER_SOURCE_TRUST.get(source or "", 0.0)
-    if trust >= OWNER_SOURCE_TRUST[OWNER_SOURCE_K8S_LABELS]:
-        return {"team_owner": owner, "owner_source": source}
-    return {"owner_fallback": owner, "owner_fallback_source": source}
+    # Сравнение с провенансом САМОГО workload делает upsert, внутри одного
+    # UPDATE: сравнивать здесь с константой было недостаточно — лейбл
+    # Service (0.9) затирал бы ручную правку workload (1.0) на каждом
+    # проходе, а чтобы узнать провенанс назначения, пришлось бы читать
+    # строку заранее и жить с гонкой между чтением и записью.
+    return {
+        "team_owner": owner,
+        "owner_source": source,
+        "owner_respect_trust": True,
+    }
 
 
-def _owner_kw(svc_node: Any, key: str) -> Optional[str]:
+def _owner_kw(svc_node: Any, key: str) -> Any:
     """Одно поле из решения `_inherited_owner`. None — это поле не нужно."""
     return _inherited_owner(svc_node).get(key)
 
@@ -734,8 +738,7 @@ def _sync_one_service(
             # которой провенанс и заводили (OWNER_SOURCE_TRUST).
             team_owner=_owner_kw(svc_node, "team_owner"),
             owner_source=_owner_kw(svc_node, "owner_source"),
-            owner_fallback=_owner_kw(svc_node, "owner_fallback"),
-            owner_fallback_source=_owner_kw(svc_node, "owner_fallback_source"),
+            owner_respect_trust=bool(_owner_kw(svc_node, "owner_respect_trust")),
             node_kind=NODE_KIND_WORKLOAD,
             metadata={"k8s_workload": _extract_workload_meta(dep)},
             k8s_uid=(dep.get("metadata") or {}).get("uid"),
