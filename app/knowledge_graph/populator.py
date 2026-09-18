@@ -117,7 +117,13 @@ def upsert_service(
             namespace=namespace, name=name, owner_source=owner_source,
         )
         owner_source = None
-    if owner_fallback is not None and owner_fallback_source is not None:
+    if owner_fallback is not None:
+        # Источник None здесь законен: контракт прямо допускает владельца с
+        # неизвестным провенансом (`owner_source_valid(None)` истинно), и
+        # таких строк в графе больше шести тысяч. Требовать источник значило
+        # бы терять владельца при наследовании: workload создавался бы
+        # вообще без владельца там, где у Service он есть, но приехал из
+        # эпохи до учёта источников.
         if not owner_source_valid(owner_fallback_source):
             logger.warning(
                 "kg.owner_source_unknown",
@@ -126,16 +132,14 @@ def upsert_service(
             )
             owner_fallback = None
             owner_fallback_source = None
-    elif owner_fallback is not None or owner_fallback_source is not None:
-        # Источник без владельца и владелец без источника одинаково
-        # бессмысленны: провенанс должен приезжать вместе со значением.
+    elif owner_fallback_source is not None:
+        # А вот источник БЕЗ владельца бессмыслен в любом случае: он
+        # описывает значение, которого нет.
         logger.warning(
-            "kg.owner_fallback_incomplete",
+            "kg.owner_fallback_source_without_owner",
             namespace=namespace, name=name,
-            owner_fallback=owner_fallback,
             owner_fallback_source=owner_fallback_source,
         )
-        owner_fallback = None
         owner_fallback_source = None
     if _is_postgresql(db):
         return _upsert_service_pg(

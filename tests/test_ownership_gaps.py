@@ -148,22 +148,31 @@ def test_source_without_owner_is_cleaned(db):
     assert _get(db, "squad-5-shared", "orphan-node").owner_source is None
 
 
-def test_incomplete_fallback_is_rejected(db):
-    """Владелец без источника (и наоборот) не принимается.
+def test_fallback_without_provenance_still_fills_owner(db):
+    """Владелец без источника законен — контракт это допускает.
 
-    Провенанс должен приезжать вместе со значением — иначе мы снова
-    получаем владельца, о котором неизвестно, откуда он.
+    `owner_source_valid(None)` истинно, и таких строк в графе больше шести
+    тысяч: они приехали из эпохи до учёта источников. Требовать источник
+    значило бы терять владельца при наследовании — workload создавался бы
+    вообще без владельца там, где у Service он есть.
     """
     upsert_service(
         db, namespace="squad-6-shared", name="nats", owner_fallback="squad-6",
     )
-    assert _get(db, "squad-6-shared", "nats").team_owner is None
+    svc = _get(db, "squad-6-shared", "nats")
+    assert svc.team_owner == "squad-6"
+    assert svc.owner_source is None, "провенанс неизвестен — и это честно"
 
+
+def test_fallback_source_without_owner_is_ignored(db):
+    """Источник без владельца бессмыслен: он описывает то, чего нет."""
     upsert_service(
-        db, namespace="squad-6-shared", name="nats",
+        db, namespace="squad-6-shared", name="nats-client",
         owner_fallback_source=OWNER_SOURCE_NAMESPACE_PREFIX,
     )
-    assert _get(db, "squad-6-shared", "nats").owner_source is None
+    svc = _get(db, "squad-6-shared", "nats-client")
+    assert svc.team_owner is None
+    assert svc.owner_source is None
 
 
 def test_unknown_fallback_source_is_rejected(db):
@@ -352,6 +361,41 @@ def test_owner_without_provenance_propagates_as_fallback(db):
     assert _inherited_owner(svc) == {
         "owner_fallback": "squad-3", "owner_fallback_source": None,
     }
+
+
+def test_owner_without_provenance_reaches_the_workload(db):
+    """Сквозная проверка: legacy-владелец доезжает до workload.
+
+    Проверять только возврат `_inherited_owner` было недостаточно: пара
+    «владелец без источника» отбрасывалась в upsert как неполная, и
+    workload создавался вообще без владельца — то есть наследование
+    теряло его именно у тех строк, которых в графе больше всего.
+    """
+    from app.knowledge_graph.k8s_topology_resources_sync import _inherited_owner
+    from app.knowledge_graph.schema import NODE_KIND_WORKLOAD
+
+    upsert_service(db, namespace="squad-3-kingdom2", name="town-service")
+    svc = _get(db, "squad-3-kingdom2", "town-service")
+    svc.team_owner = "squad-3"      # legacy: владелец есть
+    svc.owner_source = None         # ...а провенанс неизвестен
+    db.flush()
+
+    upsert_service(
+        db, namespace="squad-3-kingdom2", name="town-service",
+        node_kind=NODE_KIND_WORKLOAD, **_inherited_owner(svc),
+    )
+
+    workload = (
+        db.query(Service)
+        .filter(
+            Service.namespace == "squad-3-kingdom2",
+            Service.name == "town-service",
+            Service.node_kind == NODE_KIND_WORKLOAD,
+        )
+        .one()
+    )
+    assert workload.team_owner == "squad-3", "владельца терять нельзя"
+    assert workload.owner_source is None
 
 
 def test_no_owner_propagates_nothing(db):
