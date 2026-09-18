@@ -28,12 +28,13 @@ import logging
 import time
 from collections import defaultdict
 from datetime import datetime
-from typing import Any, Dict, List, Optional, Tuple, cast
+from typing import Any, Dict, List, Optional, Set, Tuple, cast
 
 from sqlalchemy.orm import Session
 
 from app.config import settings
-from app.context.vm_client import VMClient
+from app.providers.metrics import MetricsProvider
+from app.providers.vm_metrics import make_metrics_provider
 from app.knowledge_graph.namespace_lifecycle import missing_namespace_names
 from app.knowledge_graph.populator import insert_idempotent
 from app.knowledge_graph.schema import (NODE_KIND_SERVICE, Service,
@@ -234,9 +235,26 @@ def _insert_idempotent(
     return insert_idempotent(db, row)
 
 
+#: Служебный ключ в raw: имена метрик, окна которых НЕ измерены. Нужен
+#: Orleans-агрегации, где отсутствие серии при живом latency_count значит
+#: «сбоев не было» — а для упавшего запроса это утверждение неверно.
+_UNMEASURED_KEY = "__unmeasured__"
+
+
+class MetricsUnavailable(RuntimeError):
+    """Источник метрик не ответил ни по одному окну namespace.
+
+    Отдельный тип, потому что смысл у него ровно противоположный пустому
+    результату: пустота — факт («серий нет»), а это — отсутствие факта.
+    Синк считает такой namespace неуспешным, и цифра `errors` перестаёт
+    быть нулевой при полной слепоте.
+    """
+
+
+
 async def _fetch_namespace(
     sem: asyncio.Semaphore,
-    vm: VMClient,
+    vm: MetricsProvider,
     namespace: str,
     orleans: bool = False,
 ) -> Tuple[str, Optional[Dict[str, Dict[str, float]]], Optional[BaseException]]:
@@ -248,39 +266,84 @@ async def _fetch_namespace(
     """
     async with sem:
         try:
-            by_pod = await asyncio.gather(
-                vm.query_instant_by(_q_ns_cpu_by_pod(namespace), "pod"),
-                vm.query_instant_by(_q_ns_mem_by_pod(namespace), "pod"),
-                vm.query_instant_by(_q_ns_restarts_by_pod(namespace), "pod"),
-                vm.query_instant_by(_q_ns_5xx_by_service(namespace), "service"),
-                vm.query_instant_by(_q_ns_p95_by_service(namespace), "service"),
+            base = await asyncio.gather(
+                vm.by_label(_q_ns_cpu_by_pod(namespace), "pod"),
+                vm.by_label(_q_ns_mem_by_pod(namespace), "pod"),
+                vm.by_label(_q_ns_restarts_by_pod(namespace), "pod"),
+                vm.by_label(_q_ns_5xx_by_service(namespace), "service"),
+                vm.by_label(_q_ns_p95_by_service(namespace), "service"),
             )
-            raw: Dict[str, Dict[str, float]] = {
-                "cpu_pct": by_pod[0],
-                "mem_pct": by_pod[1],
-                "restarts_rate": by_pod[2],
-                "http_5xx_rate": by_pod[3],
-                "p95_latency_ms": by_pod[4],
-            }
+            # Частичный отказ данные не отменяет: измеренные окна пишем,
+            # неизмеренные дают пустоту — и для сервиса это обернётся None,
+            # то есть честным «не знаем», а не нулём.
+            # Неизмеренные окна помним по именам. Для pod-метрик отсутствие
+            # ключа и так даёт сервису None, но у Orleans иначе: там
+            # отсутствие серии при живом latency_count ТРАКТУЕТСЯ как ноль
+            # (prometheus-net не экспортирует счётчик до первого
+            # инкремента). Без этого списка упавший запрос про таймауты
+            # записался бы как «таймаутов не было».
+            unmeasured: Set[str] = set()
+            raw: Dict[str, Dict[str, float]] = {}
+            # Все измерения окна — нужны, чтобы собрать причину отказа
+            # после того, как выполнены и базовые запросы, и Orleans.
+            measurements = list(base)
+            for key, m in (
+                ("cpu_pct", base[0]),
+                ("mem_pct", base[1]),
+                ("restarts_rate", base[2]),
+                ("http_5xx_rate", base[3]),
+                ("p95_latency_ms", base[4]),
+            ):
+                raw[key] = m.or_else({})
+                if not m.measured:
+                    unmeasured.add(key)
             if orleans:
                 orl = await asyncio.gather(
-                    vm.query_instant_by(_q_ns_orleans_latency_sum_by_pod(namespace), "pod"),
-                    vm.query_instant_by(_q_ns_orleans_latency_count_by_pod(namespace), "pod"),
-                    vm.query_instant_by(_q_ns_orleans_timedout_by_pod(namespace), "pod"),
-                    vm.query_instant_by(_q_ns_orleans_faults_by_pod(namespace), "pod"),
-                    vm.query_instant_by(_q_ns_orleans_pings_missed_by_pod(namespace), "pod"),
-                    vm.query_instant_by(_q_ns_orleans_churn_by_pod(namespace), "pod"),
-                    vm.query_instant_by(_q_ns_orleans_rerouted_by_pod(namespace), "pod"),
+                    vm.by_label(_q_ns_orleans_latency_sum_by_pod(namespace), "pod"),
+                    vm.by_label(_q_ns_orleans_latency_count_by_pod(namespace), "pod"),
+                    vm.by_label(_q_ns_orleans_timedout_by_pod(namespace), "pod"),
+                    vm.by_label(_q_ns_orleans_faults_by_pod(namespace), "pod"),
+                    vm.by_label(_q_ns_orleans_pings_missed_by_pod(namespace), "pod"),
+                    vm.by_label(_q_ns_orleans_churn_by_pod(namespace), "pod"),
+                    vm.by_label(_q_ns_orleans_rerouted_by_pod(namespace), "pod"),
                 )
-                raw.update({
-                    "orleans_latency_sum": orl[0],
-                    "orleans_latency_count": orl[1],
-                    "orleans_timedout_rate": orl[2],
-                    "orleans_messaging_fault_rate": orl[3],
-                    "orleans_pings_missed_rate": orl[4],
-                    "orleans_activation_churn": orl[5],
-                    "orleans_rerouted_rate": orl[6],
-                })
+                measurements.extend(orl)
+                for key, m in (
+                    ("orleans_latency_sum", orl[0]),
+                    ("orleans_latency_count", orl[1]),
+                    ("orleans_timedout_rate", orl[2]),
+                    ("orleans_messaging_fault_rate", orl[3]),
+                    ("orleans_pings_missed_rate", orl[4]),
+                    ("orleans_activation_churn", orl[5]),
+                    ("orleans_rerouted_rate", orl[6]),
+                ):
+                    raw[key] = m.or_else({})
+                    if not m.measured:
+                        unmeasured.add(key)
+            # Ни одно окно не измерено — про namespace неизвестно НИЧЕГО.
+            # Вернуться нормально значило бы записать «сигнала нет» для всех
+            # его сервисов: недоступная VictoriaMetrics выглядела бы как
+            # namespace, где никто не экспортирует метрик, а прогон — как
+            # успешный (errors=0, skipped_empty=N). Ровно та слепота,
+            # неотличимая от тишины, против которой стоит весь Этап 0.
+            #
+            # Решение принимается ПОСЛЕ всех запросов, включая Orleans:
+            # ранний выход отбрасывал их, не выполнив, — а они могли
+            # ответить, когда базовые пять споткнулись на своих таймаутах.
+            # Тогда живые данные о силосах терялись, и namespace шёл в
+            # ошибки, хотя источник отвечал.
+            measured_keys = set(raw) - unmeasured
+            if not measured_keys:
+                reasons = sorted({m.reason for m in measurements if m.reason})
+                return (namespace, None, MetricsUnavailable(
+                    f"{namespace}: ни одно окно не измерено "
+                    f"({'; '.join(reasons) or 'источник молчит'})"
+                ))
+            if unmeasured:
+                # Кладём в сам raw под служебным ключом: сигнатура
+                # _aggregate_service_metrics остаётся прежней, а знание о
+                # неизмеренном доезжает до того места, где решают про нули.
+                raw[_UNMEASURED_KEY] = {k: 1.0 for k in unmeasured}
             return (namespace, raw, None)
         except BaseException as e:  # noqa: BLE001 — фиксируем всё, классифицируем выше
             return (namespace, None, e)
@@ -312,6 +375,7 @@ def _aggregate_service_metrics(
             if svc is not None:
                 acc[svc].append(val)
 
+    unmeasured = set(raw.get(_UNMEASURED_KEY, {}))
     svc_5xx = raw.get("http_5xx_rate", {})
     svc_p95 = raw.get("p95_latency_ms", {})
 
@@ -343,13 +407,34 @@ def _aggregate_service_metrics(
             "http_5xx_rate": svc_5xx.get(name),
             "p95_latency_ms": svc_p95.get(name),
         }
-        metrics.update(_orleans_metrics(orl_acc.get(name)))
+        metrics.update(_orleans_metrics(orl_acc.get(name), unmeasured))
         out.append((sid, name, metrics))
     return out
 
 
-def _orleans_metrics(acc: Optional[Dict[str, float]]) -> Dict[str, Optional[float]]:
-    """Шесть колонок orleans_* из сумм по подам; всё None, если силоса нет."""
+def _orleans_metrics(
+    acc: Optional[Dict[str, float]],
+    unmeasured: Optional[Set[str]] = None,
+) -> Dict[str, Optional[float]]:
+    """Шесть колонок orleans_* из сумм по подам; всё None, если силоса нет.
+
+    `unmeasured` — метрики, запрос которых НЕ дал ответа. Для них ставится
+    None вместо нуля: правило «нет серии при живом latency_count значит
+    сбоев не было» верно только тогда, когда источник ответил. Упавший
+    запрос про таймауты иначе записался бы как «таймаутов ноль».
+    """
+    blind = unmeasured or set()
+    if "orleans_latency_count" in blind:
+        # Не знаем даже, живёт ли силос: без счётчика вызовов ни одно из
+        # правил ниже применить нельзя.
+        return {
+            "orleans_latency_avg_ms": None,
+            "orleans_timedout_rate": None,
+            "orleans_messaging_fault_rate": None,
+            "orleans_pings_missed_rate": None,
+            "orleans_activation_churn": None,
+            "orleans_rerouted_rate": None,
+        }
     if not acc or acc.get("orleans_latency_count", 0.0) <= 0.0:
         return {
             "orleans_latency_avg_ms": None,
@@ -360,13 +445,28 @@ def _orleans_metrics(acc: Optional[Dict[str, float]]) -> Dict[str, Optional[floa
             "orleans_rerouted_rate": None,
         }
     count = acc["orleans_latency_count"]
+
+    def _rate(key: str) -> Optional[float]:
+        """Значение счётчика, но None — если его окно не наблюдалось."""
+        if key in blind:
+            return None
+        return acc.get(key, 0.0)
+
+    latency_sum = _rate("orleans_latency_sum")
+    timedout = _rate("orleans_timedout_rate")
+    faults = _rate("orleans_messaging_fault_rate")
+    missed = _rate("orleans_pings_missed_rate")
+    churn = _rate("orleans_activation_churn")
+    rerouted = _rate("orleans_rerouted_rate")
     return {
-        "orleans_latency_avg_ms": round(1000.0 * acc.get("orleans_latency_sum", 0.0) / count, 3),
-        "orleans_timedout_rate": round(acc.get("orleans_timedout_rate", 0.0), 4),
-        "orleans_messaging_fault_rate": round(acc.get("orleans_messaging_fault_rate", 0.0), 4),
-        "orleans_pings_missed_rate": round(acc.get("orleans_pings_missed_rate", 0.0), 4),
-        "orleans_activation_churn": round(acc.get("orleans_activation_churn", 0.0), 3),
-        "orleans_rerouted_rate": round(acc.get("orleans_rerouted_rate", 0.0), 3),
+        "orleans_latency_avg_ms": (
+            round(1000.0 * latency_sum / count, 3) if latency_sum is not None else None
+        ),
+        "orleans_timedout_rate": round(timedout, 4) if timedout is not None else None,
+        "orleans_messaging_fault_rate": round(faults, 4) if faults is not None else None,
+        "orleans_pings_missed_rate": round(missed, 4) if missed is not None else None,
+        "orleans_activation_churn": round(churn, 3) if churn is not None else None,
+        "orleans_rerouted_rate": round(rerouted, 3) if rerouted is not None else None,
     }
 
 
@@ -375,7 +475,10 @@ async def _sync_service_health_async(db: Session) -> Dict[str, Any]:
         log.info("metrics_sync.skipped reason=no_vm_url")
         return {"skipped": "no_vm_url"}
 
-    vm = VMClient(settings.VICTORIA_METRICS_URL, timeout=15.0)
+    # Провайдер, а не VMClient напрямую: синк не должен знать, откуда
+    # берутся метрики, а отказ источника обязан доезжать сюда отличимым
+    # от пустого ответа.
+    vm = make_metrics_provider(url=settings.VICTORIA_METRICS_URL, timeout=15.0)
     # node_kind='service': с contract 2.4 у пары «k8s Service foo + Deployment
     # foo» ДВА non-synthetic узла. Метрики агрегируются по имени, поэтому без
     # фильтра каждая пара писала бы две идентичные строки kg_service_health
@@ -433,11 +536,15 @@ async def _sync_service_health_async(db: Session) -> Dict[str, Any]:
     # Orleans discovery: где вообще есть метер силоса (07.09.2026 — 24 ns из
     # 231). Сбой discovery не роняет тик — просто без Orleans в этот раз.
     orleans_ns: set = set()
-    try:
-        found = await vm.query_instant_by(_q_orleans_namespaces(), "namespace")
-        orleans_ns = {ns for ns in found if ns in by_ns}
-    except Exception as e:  # noqa: BLE001
-        log.warning("metrics_sync.orleans_discovery_failed err=%s", e)
+    discovery = await vm.by_label(_q_orleans_namespaces(), "namespace")
+    if discovery.measured:
+        orleans_ns = {ns for ns in (discovery.value or {}) if ns in by_ns}
+    else:
+        # Discovery не удалось — просто без Orleans в этот раз, тик не роняем.
+        # Это не то же, что «силосов нет»: в лог уходит причина, а не тишина.
+        log.warning(
+            "metrics_sync.orleans_discovery_unmeasured reason=%s", discovery.reason
+        )
     stats["orleans_namespaces"] = len(orleans_ns)
     stats["orleans_queries"] = len(orleans_ns) * ORLEANS_QUERY_COUNT
 
@@ -494,6 +601,27 @@ async def _sync_service_health_async(db: Session) -> Dict[str, Any]:
     except Exception:
         db.rollback()
         raise
+    # Ни один namespace не измерен — источник недоступен целиком, и сказать
+    # это надо тем же словом, каким это говорят остальные синки: ключ
+    # `skipped` со строкой-причиной, который `status_from_counts` читает как
+    # UNAVAILABLE.
+    #
+    # Без него полный отказ VictoriaMetrics выглядел как EMPTY: `fetched=0`
+    # проверяется РАНЬШЕ `errors`, поэтому нулевые данные классифицируются
+    # до того, как кто-то посмотрит на ошибки. А EMPTY в self-health
+    # (`check_source_coverage`) намеренно не считается нездоровьем — пустое
+    # окно бывает штатным. То есть полная слепота не поднимала тревогу.
+    if stats["namespaces"] and stats["errors"] >= stats["namespaces"]:
+        stats["skipped"] = (
+            f"victoria metrics недоступна: не измерен ни один из "
+            f"{stats['namespaces']} namespace"
+        )
+        log.error(
+            "metrics_sync.source_unavailable namespaces=%d errors=%d — "
+            "состояние метрик неизвестно",
+            stats["namespaces"], stats["errors"],
+        )
+
     stats["duration_ms"] = int((time.monotonic() - t0) * 1000)
 
     log.info(

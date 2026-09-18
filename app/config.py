@@ -1008,6 +1008,10 @@ class Settings(BaseSettings):
     LOG_PROVIDER_BACKEND: str = Field(
         "seq", description="Реализация LogProvider: seq"
     )
+    # Реализация MetricsProvider. Сейчас единственная — VictoriaMetrics.
+    METRICS_PROVIDER_BACKEND: str = Field(
+        "vm", description="Реализация MetricsProvider: vm"
+    )
     SEQ_INSTANCES: str = Field("", description="Seq instances (JSON list). Пусто = fallback на SEQ_URL_<ENV>")
     SEQ_URL_PROD: str = Field("", description="Seq prod base URL (https://wo-api1-prod.lastoasisgame.com/seq)")
     SEQ_TOKEN_PROD: str = Field("", description="Seq prod API key (X-Seq-ApiKey header)")

@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import asyncio
 from datetime import datetime, timedelta
-from typing import Dict, List
+from typing import List
 
 import pytest
 from sqlalchemy import create_engine
@@ -74,13 +74,17 @@ class _VM:
     def __init__(self):
         self.queries: List[str] = []
 
-    async def query_instant_by(self, query: str, by_label: str) -> Dict[str, float]:
+    name = "fake-vm"
+
+    async def by_label(self, query: str, label: str):
+        from app.providers.measurement import Measurement
+
         self.queries.append(query)
-        if by_label == "namespace":
-            return {"preprod-kingdom2": 3.0, "squad-6-kingdom2": 1.0}
+        if label == "namespace":
+            return Measurement.of({"preprod-kingdom2": 3.0, "squad-6-kingdom2": 1.0})
         if "microsoft_orleans" in query:
-            return {"town-grainhost-a": 1.0}
-        return {}
+            return Measurement.of({"town-grainhost-a": 1.0})
+        return Measurement.of({})
 
 
 def test_fetch_namespace_adds_orleans_queries_only_when_asked():
