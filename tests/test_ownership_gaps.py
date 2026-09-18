@@ -237,3 +237,65 @@ def test_topology_uses_same_prefix_table_as_kg_sync(namespace, expected):
 
     assert topology_derive(namespace) == expected
     assert topology_derive(namespace) == sync_derive(namespace)
+
+
+# --- слепая зона: namespace, о котором граф не знает ----------------------
+
+def test_orphan_namespace_check_finds_invisible_records(db):
+    """Сервисы без записи в kg_namespaces и без класса должны быть названы.
+
+    Такие записи проваливаются между механизмами: классификатор их не
+    трогает (он ходит обходом kg_sync), а drift_cleanup чистит только
+    namespace со state='missing' — которого у них нет, потому что самой
+    записи в kg_namespaces нет.
+    """
+    from app.knowledge_graph.self_health import check_orphan_namespaces
+
+    # Живой namespace с классом — не должен попасть в находки.
+    upsert_service(
+        db, namespace="squad-7-kingdom2", name="town-service",
+        team_owner="squad-7", owner_source=OWNER_SOURCE_NAMESPACE_PREFIX,
+        stale_class="active",
+    )
+    # Записи о namespace, которого в графе нет вовсе.
+    for i in range(3):
+        upsert_service(db, namespace="squad-52-kingdom5", name=f"svc-{i}")
+    db.flush()
+
+    result = check_orphan_namespaces(db)
+
+    assert result.status == "warn"
+    assert result.detail["services"] == 3
+    assert result.detail["namespaces"] == 1
+    assert "squad-52-kingdom5" in result.detail["top"]
+
+
+def test_orphan_namespace_check_is_ok_when_graph_is_consistent(db):
+    """Нет таких записей — проверка молчит."""
+    from app.knowledge_graph.schema import Namespace
+    from app.knowledge_graph.self_health import check_orphan_namespaces
+
+    db.add(Namespace(namespace="squad-7-kingdom2", state="active"))
+    upsert_service(
+        db, namespace="squad-7-kingdom2", name="town-service",
+        stale_class="active",
+    )
+    db.flush()
+
+    assert check_orphan_namespaces(db).status == "ok"
+
+
+def test_classified_records_are_not_flagged(db):
+    """Запись с классом видна отчётам — она не слепая зона.
+
+    Даже если namespace в kg_namespaces отсутствует: класс означает, что
+    классификатор её видел и отнёс к категории.
+    """
+    from app.knowledge_graph.self_health import check_orphan_namespaces
+
+    upsert_service(
+        db, namespace="squad-99-shared", name="svc", stale_class="gone",
+    )
+    db.flush()
+
+    assert check_orphan_namespaces(db).status == "ok"
