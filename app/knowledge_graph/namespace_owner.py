@@ -11,18 +11,23 @@ TeamCity + Jira) и скилл squad-occupancy в vibecode (assignee Jira по �
 Порядок (первый сработавший путь — ответ, `owner_source` говорит какой):
 
 1. **manual** — `namespace_owners` в манифесте людей (PEOPLE_MANIFEST_PATH).
-2. **jira_assignee** — WO-ключ из `deployed-branch` → assignee задачи в Jira
-   → TC-логин через манифест (`jira_account_id`) или через профили TeamCity
-   (`/app/rest/users`: совпадение e-mail, затем имени). Покрывает кейс
-   «тимлид раскатал чужую ветку для проверки»: стенд того, чья задача.
-3. **gd_claim** — лейбл `squad-owner`, его ставит кнопка «Сквад-окружение:
+2. **gd_claim** — лейбл `squad-owner`, его ставит кнопка «Сквад-окружение:
    занять / освободить» (рядом кладёт `squad-claim-build` и аннотацию
-   `squad-claimed-at`). Явная заявка человека на стенд достовернее
-   `deployed-by`: тот переписывается только полным деплоем и потому залипает
-   на прежнем хозяине. 09.09.2026 лейбл стоял на 40 из 46 стендов и в шести
-   случаях расходился с `deployed-by` — включая два сквада, которые две
-   недели числились за человеком, освободившим их (жалоба звучала как
-   «дашборд не обновляется», хотя доска обновлялась исправно).
+   `squad-claimed-at`). Прямое действие человека «беру стенд», и потому
+   сильнее всех производных сигналов. 09.09.2026 лейбл стоял на 40 из 46
+   стендов и в шести случаях расходился с `deployed-by` — включая два
+   сквада, которые две недели числились за человеком, освободившим их.
+3. **jira_assignee** — WO-ключ из `deployed-branch` → assignee задачи в Jira
+   → TC-логин через манифест (`jira_account_id`) или через профили TeamCity
+   (`/app/rest/users`: совпадение e-mail, затем имени). Отвечает, когда
+   кнопку не нажимали вовсе: «тимлид раскатал чужую ветку для проверки» —
+   стенд того, чья задача.
+
+   До 18.09.2026 (WO-16030) Jira стояла ВЫШЕ кнопки, и это давало неверного
+   владельца у трёх стендов из 46: assignee — свойство ЗАДАЧИ, его
+   переставляют по ходу работы, и стенд «уезжал» к новому исполнителю, хотя
+   занимал его прежний человек. Кнопка относится к стенду и меняется только
+   при новом занятии.
 4. **deployed_by** — лейбл `deployed-by`, если это не сервисный аккаунт
    (ai-agent, aidev, cicd, …: 5 сквадов 08.09.2026 задеплоены агентом —
    человек за ними виден только через ветку и Jira).
@@ -326,6 +331,24 @@ def resolve_owner(
                                people.discord_for(manual))
 
     jira_unavailable = False
+
+    # Нажатие «занять» — прямое действие человека «беру стенд», и оно
+    # сильнее assignee. До 18.09.2026 порядок был обратным, и это давало
+    # неверного владельца у трёх стендов из 46: кнопку нажимал один
+    # человек, а показывался исполнитель задачи из ветки. Assignee —
+    # свойство ЗАДАЧИ: его переставляют по ходу работы (передали
+    # фиче-овнеру, взяли на ревью), и стенд «уезжал» вместе с ним, хотя
+    # занимал его тот же человек. Кнопка же относится к стенду и меняется
+    # только тогда, когда стенд занимают заново.
+    #
+    # Прежний довод за Jira («тимлид раскатал чужую ветку для проверки»)
+    # никуда не делся, но он про другой случай — когда кнопку не нажимали
+    # вовсе. Там claim пуст, и ответ по-прежнему даёт Jira.
+    gd = (gd_claim_login or "").strip().lower() or None
+    if gd and not people.is_service_account(gd):
+        return OwnerResolution(gd, NAMESPACE_OWNER_SOURCE_GD_CLAIM, jira_key,
+                               people.discord_for(gd), jira_unavailable)
+
     if jira_key and jira_lookup is not None:
         try:
             assignee = jira_lookup(jira_key)
@@ -337,15 +360,6 @@ def resolve_owner(
             if login and not people.is_service_account(login):
                 return OwnerResolution(login, NAMESPACE_OWNER_SOURCE_JIRA_ASSIGNEE, jira_key,
                                        people.discord_for(login), jira_unavailable)
-
-    # Нажатие «занять» — заявка человека на стенд, и она свежее лейбла:
-    # `deployed-by` остаётся от прошлого деплойера, пока новый владелец не
-    # катал полный деплой сам. Ниже Jira намеренно (см. 1.0.13: «владелец из
-    # задачи, а не из кнопки» — тимлид может занять стенд под чужую задачу).
-    gd = (gd_claim_login or "").strip().lower() or None
-    if gd and not people.is_service_account(gd):
-        return OwnerResolution(gd, NAMESPACE_OWNER_SOURCE_GD_CLAIM, jira_key,
-                               people.discord_for(gd), jira_unavailable)
 
     dep = (deployed_by or "").strip().lower() or None
     if dep and not people.is_service_account(dep):
@@ -360,16 +374,71 @@ def resolve_owner(
     return OwnerResolution(None, None, jira_key, None, jira_unavailable)
 
 
-def last_triggered_by(db: Session, namespace: str,
-                      service_accounts: Iterable[str]) -> Optional[str]:
-    """`triggered_by` самого свежего деплоя по сервисам namespace, минус
-    сервисные аккаунты. NULL/пусто пропускаем."""
-    excluded = {s.lower() for s in service_accounts}
+def _clear_owner_of_dead_namespaces(db: Session, scope: Any) -> int:
+    """Снять владельца с namespace, которых в кластере больше нет.
+
+    Резолв идёт только по активным, поэтому у снесённого стенда owner_login
+    оставался тем, каким был в день сноса, а `owner_resolved_at` замирал на
+    той же дате. На витрине это скрыто (там «свободен»), но MCP-тул
+    `kg_squad_owners` отдавал владельца по несуществующему стенду, и его
+    читают squad-medic и скиллы: 18.09.2026 так висели восемь записей,
+    снесённых 9–16 сентября (WO-16030).
+
+    Стенд снесён — значит ничей: это факт, а не отсутствие данных. Поэтому
+    поля обнуляются, а `owner_resolved_at` ставится текущим — чтобы дата
+    отвечала на «когда мы это знали», а не застревала в дне сноса.
+    """
     rows = (
+        db.query(Namespace)
+        .filter(Namespace.state != NS_STATE_ACTIVE,
+                Namespace.owner_login.isnot(None))
+        .all()
+    )
+    cleared = 0
+    for row in rows:
+        name = cast(str, row.namespace)
+        if not scope.search(name):
+            continue
+        log.info("namespace_owner.cleared_on_missing", namespace=name,
+                 was_owner=row.owner_login, was_source=row.owner_source,
+                 state=row.state)
+        row.owner_login = None  # type: ignore[assignment]
+        row.owner_source = None  # type: ignore[assignment]
+        row.owner_jira_key = None  # type: ignore[assignment]
+        row.owner_discord_id = None  # type: ignore[assignment]
+        row.owner_resolved_at = datetime.utcnow()  # type: ignore[assignment]
+        cleared += 1
+    return cleared
+
+
+def last_triggered_by(db: Session, namespace: str,
+                      service_accounts: Iterable[str],
+                      *, since: Optional[datetime] = None) -> Optional[str]:
+    """`triggered_by` самого свежего деплоя по сервисам namespace, минус
+    сервисные аккаунты. NULL/пусто пропускаем.
+
+    `since` — момент создания ТЕКУЩЕЙ инкарнации namespace
+    (`kg_namespaces.k8s_created_at`). Номер стенда переиспользуется: squad-8
+    на 18.09.2026 живёт седьмой раз, а деплои от прежних его жизней лежат в
+    той же таблице, потому что `kg_deployments` привязан к сервисам, а не к
+    инкарнации. Без отсечки ответом на «чей стенд» становился человек,
+    катавший ДРУГОЙ стенд под тем же номером: у squad-8 — деплой от 27
+    августа при namespace, созданном 17 сентября, у squad-3 — от 29 апреля
+    (WO-16030, пять стендов из 46).
+
+    Без `since` поведение прежнее: вызывающий, у которого нет даты
+    создания, не должен получить пустой ответ вместо приблизительного.
+    """
+    excluded = {s.lower() for s in service_accounts}
+    q = (
         db.query(Deployment.triggered_by)
         .join(Service, Service.id == Deployment.service_id)
         .filter(Service.namespace == namespace, Deployment.triggered_by.isnot(None))
-        .order_by(Deployment.started_at.desc())
+    )
+    if since is not None:
+        q = q.filter(Deployment.started_at >= since)
+    rows = (
+        q.order_by(Deployment.started_at.desc())
         .limit(50)
         .all()
     )
@@ -471,7 +540,10 @@ def sync_namespace_owners(
         if not scope.search(name):
             continue
         stats["scanned"] += 1
-        fallback = last_triggered_by(db, name, people.service_accounts)
+        fallback = last_triggered_by(
+            db, name, people.service_accounts,
+            since=cast(Optional[datetime], row.k8s_created_at),
+        )
         res = resolve_owner(
             name, cast(Optional[str], row.deployed_by), cast(Optional[str], row.deployed_branch),
             people=people, tc_users=tc_users, jira_lookup=_jira,
@@ -512,6 +584,7 @@ def sync_namespace_owners(
             db.commit()
 
     stats["jira_errors"] = jira_errors
+    stats["cleared_on_missing"] = _clear_owner_of_dead_namespaces(db, scope)
     db.commit()
     log.info("namespace_owner.synced", **{k: v for k, v in stats.items() if k != "by_source"},
              by_source=stats["by_source"])
