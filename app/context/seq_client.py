@@ -291,10 +291,50 @@ class SeqClient:
 
     @staticmethod
     def extract_message_template(event: Dict[str, Any]) -> str:
-        """MessageTemplate стабильнее RenderedMessage (без интерполяции).
+        """Шаблон сообщения — стабильный ключ события, без интерполяции.
 
-        Fallback chain: MessageTemplate → RenderedMessage → Message → "".
+        Seq REST отдаёт шаблон РАЗОБРАННЫМ на токены, в
+        `MessageTemplateTokens`: чередование `{"Text": "..."}` и
+        `{"PropertyName": "..."}`. Ключей `MessageTemplate`,
+        `RenderedMessage` и `Message`, которые искала прежняя версия, в
+        ответе НЕТ вовсе — рекон живого события 18.09.2026 дал ровно такой
+        набор полей:
+
+            EventType, Exception, Id, Level, Links,
+            MessageTemplateTokens, Properties, SpanKind, Timestamp
+
+        Из-за этого `sample_message` и `top_message_hash` не заполнялись НИ
+        У ОДНОГО наблюдения: на 18.09.2026 — 1726 записей за сутки, включая
+        88 Error и один Fatal, у всех текст пуст. Счётчики при этом верные,
+        поэтому дефект выглядел безобидно: видно, что у GR.WO.Bot в
+        prod-kingdom2 за сутки 50 089 Warning, и не видно, каких именно.
+        Тот же класс, что был с полем `App` (искали `Application`, а
+        сервис-тег лежит в `Properties` как `App`).
+
+        Плейсхолдеры собираются как `{ИмяСвойства}`, а не подставляются
+        значениями: шаблон должен быть ОДИНАКОВЫМ для всех событий одного
+        вида, иначе хэш перестаёт группировать, а `top_message_hash`
+        становится уникальным на каждое событие.
+
+        Старые ключи оставлены в fallback: их отдают другие версии Seq API,
+        и терять совместимость ради одного формата незачем.
         """
+        tokens = event.get("MessageTemplateTokens")
+        if isinstance(tokens, list) and tokens:
+            parts = []
+            for token in tokens:
+                if not isinstance(token, dict):
+                    continue
+                text = token.get("Text")
+                if text:
+                    parts.append(str(text))
+                    continue
+                prop = token.get("PropertyName")
+                if prop:
+                    parts.append("{" + str(prop) + "}")
+            template = "".join(parts).strip()
+            if template:
+                return template
         for k in ("MessageTemplate", "RenderedMessage", "Message"):
             v = event.get(k)
             if v:
