@@ -877,6 +877,11 @@ def _cleanup_absent_volumes(
     if shrink_pct > _VOLUME_MAX_DELETE_PCT:
         stats["skipped"] = REASON_DELETE_PCT
         stats["shrink_pct"] = round(shrink_pct, 1)
+        # Процент без обоих чисел не читается: «ужалось на 75%» — это 1214
+        # против 300 или 4 против 1? Решение принимает человек, и принимать
+        # его он будет по тому, что попало в отчёт источника.
+        stats["baseline"] = baseline
+        stats["rows_total"] = len(rows)
         logger.warning(
             "k8s_storage.volume_cleanup_skipped kind=%s reason=%s "
             "live_set_shrank=%.1f%% > %.1f%% (сейчас %d, было больше) — "

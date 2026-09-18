@@ -1409,6 +1409,12 @@ def check_node_freshness(db: Session) -> CheckResult:
     )
 
 
+#: Причины пропуска чистки, которые требуют человека. `fetch_failed` сюда
+#: не нужен — он и так виден по errors источника; `empty_fetch` не нужен
+#: тем более: пустой инвентарь законен.
+_ACTIONABLE_CLEANUP_SKIPS = frozenset({"no_baseline", "delete_pct"})
+
+
 def check_source_coverage(db: Session) -> CheckResult:
     """Какие источники графа отчитались за цикл, а какие промолчали.
 
@@ -1470,7 +1476,12 @@ def check_source_coverage(db: Session) -> CheckResult:
         }
         if report.cleanup:
             reported[source]["cleanup"] = report.cleanup
-            if report.cleanup.get("skipped"):
+            # Только те причины, с которыми человеку есть что делать.
+            # `empty_fetch` сюда не входит: кластер без PV — законное
+            # состояние, и вечный warn на нём стал бы залипшим
+            # `CopilotSelfHealthWarnStuck`, то есть ровно тем шумом, от
+            # которого проверка и уходит выше по коду.
+            if report.cleanup.get("skipped") in _ACTIONABLE_CLEANUP_SKIPS:
                 cleanup_blocked[source] = report.cleanup
         if reason:
             unhealthy[source] = reason
@@ -1494,11 +1505,18 @@ def check_source_coverage(db: Session) -> CheckResult:
     # удалённая запись. Не учитывай мы её, проверка молчала бы ровно сутки —
     # причём именно тогда, когда сохранённая метка времени ДОКАЗЫВАЕТ, что
     # источник пропустил свой срок.
-    status = (
-        "warn"
-        if (unhealthy or silent or expired or cleanup_blocked)
-        else "ok"
-    )
+    # `fail`, а не `warn`: остановленная чистка узлов — единственное здесь
+    # состояние, где ждать нельзя. Warn остаётся в метрике и в логе
+    # (`_kg_self_health_logic` шлёт в Discord только на fail), а решение
+    # «верить ли снимку» живёт до следующего прогона синка — пять минут по
+    # текущему расписанию. Цифры уходят в алерт вместе со статусом, см.
+    # `_summarize_self_health_detail`.
+    if cleanup_blocked:
+        status = "fail"
+    elif unhealthy or silent or expired:
+        status = "warn"
+    else:
+        status = "ok"
     return CheckResult(
         name="source_coverage",
         status=status,
