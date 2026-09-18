@@ -527,10 +527,44 @@ def td_hl(content, colour):
     return f"<td{attr}><p>{content}</p></td>" if content else f"<td{attr}></td>"
 
 
-#: Учётки автоматики: за ними человека нет, владельцем стенда они быть не могут
-#: (тот же список, что в app/knowledge_graph/namespace_owner.py).
-SERVICE_ACCOUNTS = frozenset({"ai-agent", "aidev", "cicd", "teamcity",
-                              "teamcity-cicd", "qcerdh6w"})
+#: Учётки автоматики: за ними человека нет, владельцем стенда они быть не
+#: могут. Дефолт совпадает с `DEFAULT_SERVICE_ACCOUNTS` графа, а фактический
+#: список берётся из того же манифеста людей — см. `service_accounts()`.
+DEFAULT_SERVICE_ACCOUNTS = frozenset({"ai-agent", "aidev", "cicd", "teamcity",
+                                      "teamcity-cicd", "qcerdh6w"})
+
+_SERVICE_ACCOUNTS = None
+
+
+def service_accounts():
+    """Сервисные учётки из манифеста людей, как их видит граф.
+
+    Статическая копия списка была бы третьим местом, где решается «человек
+    ли это», и разошлась бы с графом ровно там, где список меняют: бот,
+    добавленный в манифест, для графа перестаёт быть человеком, а для
+    витрины остаётся им — и его claim перекрыл бы настоящего владельца.
+    Поэтому источник один, а код здесь только читает.
+
+    Манифест не смонтирован или битый — берём дефолт: он совпадает с
+    `DEFAULT_SERVICE_ACCOUNTS` в графе, то есть расходимся лишь на
+    дописанных вручную ботах, а не на всех.
+    """
+    global _SERVICE_ACCOUNTS
+    if _SERVICE_ACCOUNTS is not None:
+        return _SERVICE_ACCOUNTS
+    accounts = set(DEFAULT_SERVICE_ACCOUNTS)
+    path = os.environ.get("PEOPLE_MANIFEST_PATH")
+    if path and os.path.exists(path):
+        try:
+            with open(path, encoding="utf-8") as f:
+                raw = json.load(f)
+            for sa in raw.get("service_accounts") or []:
+                if str(sa).strip():
+                    accounts.add(str(sa).strip().lower())
+        except Exception as e:  # манифест не обязателен — витрину не роняем
+            log(f"people manifest {path}: {e}")
+    _SERVICE_ACCOUNTS = frozenset(accounts)
+    return _SERVICE_ACCOUNTS
 
 def pick_owner(own: dict, lbl: dict):
     """Кто владелец стенда для витрины: (логин, источник).
@@ -556,7 +590,7 @@ def pick_owner(own: dict, lbl: dict):
     claim = (lbl.get("claim_owner") or "").strip().lower() or None
     if not claim:
         return owner, source
-    if claim not in SERVICE_ACCOUNTS:
+    if claim not in service_accounts():
         # Ручное назначение в манифесте людей перекрывать нельзя: это
         # единственный источник, который человек выставил сам.
         return (owner, source) if source == "manual" else (claim, "gd_claim")

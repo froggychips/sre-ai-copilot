@@ -86,3 +86,48 @@ def test_label_answers_while_graph_is_silent(dash):
 def test_nobody_claimed_nobody_deployed(dash):
     """Ни графа, ни лейблов — пусто, а не выдуманный владелец."""
     assert dash.pick_owner({}, {}) == (None, None)
+
+
+# --- список сервисных учёток берётся оттуда же, что у графа -----------------
+
+
+def test_service_accounts_come_from_the_shared_manifest(dash, tmp_path, monkeypatch):
+    """Бот, дописанный в манифест, перестаёт быть человеком и для витрины.
+
+    Замечание ревью: своя копия списка — это третье место, где решается
+    «человек ли это», и расходится она ровно там, где список правят. Граф
+    читает `service_accounts` из манифеста людей, витрина держала статику —
+    значит claim такого бота перекрыл бы настоящего владельца.
+    """
+    manifest = tmp_path / "people.json"
+    manifest.write_text('{"service_accounts": ["squad-bot"]}', encoding="utf-8")
+    monkeypatch.setenv("PEOPLE_MANIFEST_PATH", str(manifest))
+    monkeypatch.setattr(dash, "_SERVICE_ACCOUNTS", None)
+
+    assert "squad-bot" in dash.service_accounts()
+    assert "ai-agent" in dash.service_accounts(), "дефолт остаётся на месте"
+
+    owner, source = dash.pick_owner(
+        {"owner_login": "aoganisyan", "owner_source": "jira_assignee"},
+        {"claim_owner": "squad-bot"},
+    )
+    assert (owner, source) == ("aoganisyan", "jira_assignee")
+
+
+def test_missing_manifest_falls_back_to_defaults(dash, tmp_path, monkeypatch):
+    """Манифест не смонтирован — витрина не падает и знает базовых ботов."""
+    monkeypatch.setenv("PEOPLE_MANIFEST_PATH", str(tmp_path / "нет-такого.json"))
+    monkeypatch.setattr(dash, "_SERVICE_ACCOUNTS", None)
+
+    accounts = dash.service_accounts()
+    assert accounts == dash.DEFAULT_SERVICE_ACCOUNTS
+
+
+def test_broken_manifest_does_not_break_the_board(dash, tmp_path, monkeypatch):
+    """Битый JSON — тоже не повод ронять витрину."""
+    manifest = tmp_path / "people.json"
+    manifest.write_text("{не json", encoding="utf-8")
+    monkeypatch.setenv("PEOPLE_MANIFEST_PATH", str(manifest))
+    monkeypatch.setattr(dash, "_SERVICE_ACCOUNTS", None)
+
+    assert dash.service_accounts() == dash.DEFAULT_SERVICE_ACCOUNTS
