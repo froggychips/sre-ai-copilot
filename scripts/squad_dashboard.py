@@ -51,8 +51,14 @@ DRY_RUN = os.environ.get("DRY_RUN", "") not in ("", "0", "false", "False")
 TC_URL = os.environ["TC_URL"].rstrip("/")
 TC_TOKEN = os.environ["TC_TOKEN"].strip()  # --from-file может тащить хвостовой \n
 ONE = "Wo_Backend_K8sNewCluster_OneServiceBuildAndUpdate"
+#: Конфигурации TeamCity, которыми разворачивают стенд. Список сверен с
+#: живым TeamCity 18.09.2026 (WO-16030): `RebuildSquadFromSource` там не
+#: существует и давал 69 ошибок 404 за прогон — по одной на сквад, — а
+#: нынешняя основная кнопка `InstallSquadEnvParallel` в списке
+#: отсутствовала, из-за чего реальные развёртывания в колонку
+#: «Установка / Rebuild» не попадали вовсе.
 INSTALL = ["Wo_Backend_K8sNewCluster_InstallSquadEnv",
-           "Wo_Backend_K8sNewCluster_RebuildSquadFromSource"]
+           "Wo_Backend_K8sNewCluster_InstallSquadEnvParallel"]
 
 KG_SQL = """
 WITH squad_svc AS (
@@ -403,17 +409,7 @@ def build_rows():
         # Владелец: резолв графа (Jira-assignee по ветке → кнопка ГД → deployed-by → TC),
         # лейбл deployed-by — только пока граф его не посчитал. Лейбл врёт,
         # когда кнопку нажал сервисный аккаунт (ai-agent) или коллега.
-        own = owners.get(s) or {}
-        owner = own.get("owner_login") or lbl.get("owner")
-        owner_source = own.get("owner_source") if own.get("owner_login") else ("label" if lbl.get("owner") else None)
-        # Пока резолв графа не раскатан (или он сам упёрся в залипший
-        # deployed-by), лейбл `squad-owner` точнее: это тот, кто занял стенд
-        # кнопкой. Сервисные учётки владельцем не считаем — кнопку могли
-        # дёрнуть REST-ом служебным токеном.
-        claim_owner = (lbl.get("claim_owner") or "").strip().lower() or None
-        if claim_owner and claim_owner not in SERVICE_ACCOUNTS and owner_source in (
-                None, "label", "deployed_by", "tc_triggered_by"):
-            owner, owner_source = claim_owner, "gd_claim"
+        owner, owner_source = pick_owner(owners.get(s) or {}, lbl)
         act = fetch_ch_activity(s)
         # Все сквады в пределах SQUAD_NUMS — реальные провизионированные слоты,
         # поэтому показываем и пустые: classify() даёт им «свободен» (доступная ёмкость).
@@ -483,8 +479,11 @@ def build_cell(lb):
 def inst_cell(inst):
     if not inst:
         return ""
-    # компактнее: RebuildSquadFromSource -> Rebuild, InstallSquadEnv -> Install; дата без времени
-    bt = inst["buildtype"].replace("SquadFromSource", "").replace("SquadEnv", "")
+    # компактнее: InstallSquadEnvParallel -> Install (parallel),
+    # InstallSquadEnv -> Install; дата без времени.
+    bt = (inst["buildtype"]
+          .replace("SquadEnvParallel", " (parallel)")
+          .replace("SquadEnv", ""))
     date = fmt_ts(inst["started"]).split(" ")[0]
     return esc(f'{bt} #{inst["number"]} · {human(inst["by"])} · {date}')
 
@@ -528,10 +527,80 @@ def td_hl(content, colour):
     return f"<td{attr}><p>{content}</p></td>" if content else f"<td{attr}></td>"
 
 
-#: Учётки автоматики: за ними человека нет, владельцем стенда они быть не могут
-#: (тот же список, что в app/knowledge_graph/namespace_owner.py).
-SERVICE_ACCOUNTS = frozenset({"ai-agent", "aidev", "cicd", "teamcity",
-                              "teamcity-cicd", "qcerdh6w"})
+#: Учётки автоматики: за ними человека нет, владельцем стенда они быть не
+#: могут. Дефолт совпадает с `DEFAULT_SERVICE_ACCOUNTS` графа, а фактический
+#: список берётся из того же манифеста людей — см. `service_accounts()`.
+DEFAULT_SERVICE_ACCOUNTS = frozenset({"ai-agent", "aidev", "cicd", "teamcity",
+                                      "teamcity-cicd", "qcerdh6w"})
+
+_SERVICE_ACCOUNTS = None
+
+
+def service_accounts():
+    """Сервисные учётки из манифеста людей, как их видит граф.
+
+    Статическая копия списка была бы третьим местом, где решается «человек
+    ли это», и разошлась бы с графом ровно там, где список меняют: бот,
+    добавленный в манифест, для графа перестаёт быть человеком, а для
+    витрины остаётся им — и его claim перекрыл бы настоящего владельца.
+    Поэтому источник один, а код здесь только читает.
+
+    Манифест не смонтирован или битый — берём дефолт: он совпадает с
+    `DEFAULT_SERVICE_ACCOUNTS` в графе, то есть расходимся лишь на
+    дописанных вручную ботах, а не на всех.
+    """
+    global _SERVICE_ACCOUNTS
+    if _SERVICE_ACCOUNTS is not None:
+        return _SERVICE_ACCOUNTS
+    accounts = set(DEFAULT_SERVICE_ACCOUNTS)
+    path = os.environ.get("PEOPLE_MANIFEST_PATH")
+    if path and os.path.exists(path):
+        try:
+            with open(path, encoding="utf-8") as f:
+                raw = json.load(f)
+            for sa in raw.get("service_accounts") or []:
+                if str(sa).strip():
+                    accounts.add(str(sa).strip().lower())
+        except Exception as e:  # манифест не обязателен — витрину не роняем
+            log(f"people manifest {path}: {e}")
+    _SERVICE_ACCOUNTS = frozenset(accounts)
+    return _SERVICE_ACCOUNTS
+
+def pick_owner(own: dict, lbl: dict):
+    """Кто владелец стенда для витрины: (логин, источник).
+
+    Правило приоритета живёт в графе (`app/knowledge_graph/namespace_owner.py`),
+    здесь только СВЕЖЕСТЬ: доска собирается раз в 5 минут, резолв графа идёт
+    раз в час, и между ними лейбл `squad-owner` уже новый, а `owner_login`
+    ещё старый.
+
+    До 18.09.2026 здесь стоял свой список источников, поверх которых
+    разрешалось перекрывать (`None, label, deployed_by, tc_triggered_by`), и
+    `jira_assignee` в него не входил — поэтому при ветке с WO-ключом метка
+    игнорировалась всегда. Это давало неверного владельца у трёх стендов из
+    46 (WO-16030): кнопку нажимал один человек, а показывался исполнитель
+    задачи. Второе место, решающее «чей стенд», и разошлось с первым —
+    поэтому здесь остался ровно один вопрос, «что свежее», а не своя
+    иерархия источников.
+    """
+    graph_login = own.get("owner_login")
+    owner = graph_login or lbl.get("owner")
+    source = own.get("owner_source") if graph_login else ("label" if lbl.get("owner") else None)
+
+    claim = (lbl.get("claim_owner") or "").strip().lower() or None
+    if not claim:
+        return owner, source
+    if claim not in service_accounts():
+        # Ручное назначение в манифесте людей перекрывать нельзя: это
+        # единственный источник, который человек выставил сам.
+        return (owner, source) if source == "manual" else (claim, "gd_claim")
+    if not owner:
+        # Стенд занят кнопкой, но нажала её автоматика. Показываем её как
+        # есть: пустая клетка читается как «ничей», хотя стенд занят, и по
+        # такой строке принимают решение «можно брать».
+        return claim, "gd_claim_bot"
+    return owner, source
+
 
 # базовые/idle-ветки: деплой с них = сквад никем не занят под конкретную работу
 BASE_BRANCHES = {"preprod", "default", "master", "main", "develop"}

@@ -88,6 +88,8 @@ spec:
             - configMapRef:
                 name: squad-dashboard-env       # TC_URL / CONFLUENCE_* / WINDOW
             env:                                # remap lowercase secret-ключей в env-имена скрипта
+            - name: PEOPLE_MANIFEST_PATH        # тот же манифест людей, что у воркера
+              value: /config/people.json
             - name: TC_TOKEN
               valueFrom:
                 secretKeyRef:
@@ -114,7 +116,21 @@ spec:
             - name: script
               mountPath: /scripts
               readOnly: true
+            # Тот же манифест людей, что у воркера: из него витрина берёт
+            # список сервисных учёток. Своя копия списка расходилась бы с
+            # графом ровно там, где список правят, — и claim бота перекрыл
+            # бы настоящего владельца стенда (WO-16030).
+            - name: people
+              mountPath: /config/people.json
+              subPath: people.json
+              readOnly: true
           volumes:
           - name: script
             configMap:
               name: squad-dashboard-script
+          # optional: без ConfigMap CronJob стартует, список берётся
+          # дефолтный — он совпадает с DEFAULT_SERVICE_ACCOUNTS графа.
+          - name: people
+            configMap:
+              name: sre-ai-copilot-people
+              optional: true

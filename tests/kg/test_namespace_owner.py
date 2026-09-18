@@ -142,14 +142,37 @@ def test_gd_claim_beats_stale_deployed_by_label():
     assert (res.login, res.source) == ("akomkov", NAMESPACE_OWNER_SOURCE_GD_CLAIM)
 
 
-def test_jira_assignee_still_beats_gd_claim():
-    """1.0.13: «владелец из задачи, а не из кнопки» — приоритет не меняем."""
+def test_gd_claim_beats_jira_assignee():
+    """WO-16030: кнопка «занять» сильнее assignee задачи.
+
+    Приоритет обратный тому, что был с 1.0.13, и это осознанная смена.
+    Замер 18.09.2026: неверный владелец у трёх стендов из 46 — кнопку
+    нажимал один человек, а показывался исполнитель задачи из ветки.
+    Assignee — свойство ЗАДАЧИ: его переставляют по ходу работы, и стенд
+    «уезжает» к новому исполнителю, хотя занимает его прежний. Кнопка
+    относится к стенду и меняется только при новом занятии.
+    """
     people = _people(foxtrot={"jira_account_id": "acc-1"})
     res = resolve_owner("squad-13-shared", "romeo", "wo-14516-alliance-afk-leader",
                         people=people, tc_users={},
                         jira_lookup=lambda k: {"account_id": "acc-1", "email": None,
                                                "display_name": None},
                         gd_claim_login="akomkov")
+    assert (res.login, res.source) == ("akomkov", NAMESPACE_OWNER_SOURCE_GD_CLAIM)
+
+
+def test_jira_answers_when_nobody_pressed_the_button():
+    """Без claim ответ по-прежнему даёт Jira — тот самый случай 1.0.13.
+
+    «Тимлид раскатал чужую ветку для проверки»: кнопку не нажимали, и
+    стенд принадлежит тому, чья задача, а не тому, кто катал.
+    """
+    people = _people(foxtrot={"jira_account_id": "acc-1"})
+    res = resolve_owner("squad-13-shared", "romeo", "wo-14516-alliance-afk-leader",
+                        people=people, tc_users={},
+                        jira_lookup=lambda k: {"account_id": "acc-1", "email": None,
+                                               "display_name": None},
+                        gd_claim_login=None)
     assert (res.login, res.source) == ("foxtrot", NAMESPACE_OWNER_SOURCE_JIRA_ASSIGNEE)
 
 
@@ -397,3 +420,115 @@ def test_sync_commits_in_batches_not_one_long_transaction(db, monkeypatch):
     assert stats["resolved"] == 7
     assert len(commits) >= 3, f"ожидались промежуточные коммиты, было: {commits}"
     assert commits[0] <= 3, "первый коммит должен случиться до конца прогона"
+
+
+# --- инкарнация стенда: деплои прошлой жизни не считаются (WO-16030) --------
+
+
+def _svc_with_deploy(db, namespace, who, started_at):
+    svc = Service(namespace=namespace, name=f"api-{namespace}")
+    db.add(svc)
+    db.flush()
+    db.add(Deployment(service_id=svc.id, triggered_by=who, started_at=started_at))
+    db.commit()
+    return svc
+
+
+def test_deploy_from_previous_incarnation_is_not_an_owner(db):
+    """squad-8: namespace создан 17.09, деплой с человеком — от 27 августа.
+
+    Номер стенда переиспользуется (седьмая жизнь), а `kg_deployments`
+    привязан к сервисам, не к инкарнации. Без отсечки владельцем стенда
+    становился человек, катавший ДРУГОЙ стенд под тем же номером.
+    """
+    db.add(Namespace(namespace="squad-8-shared", state=NS_STATE_ACTIVE,
+                     deployed_by="ai-agent", deployed_branch="master",
+                     claim_owner="ai-agent",
+                     k8s_created_at=datetime(2026, 9, 17, 16, 1)))
+    _svc_with_deploy(db, "squad-8-shared", "sgrozov", datetime(2026, 8, 27, 10, 0))
+    db.commit()
+
+    sync_namespace_owners(db, people=PeopleManifest(), tc_users={}, jira_lookup=None,
+                          activity_lookup=None)
+
+    row = db.query(Namespace).filter_by(namespace="squad-8-shared").one()
+    assert (row.owner_login, row.owner_source) == (None, None), (
+        "живой человек с прошлой жизни стенда хуже пустоты: по нему коллеги "
+        "решают, что стенд занят"
+    )
+
+
+def test_deploy_after_namespace_creation_still_counts(db):
+    """Отсечка не должна съесть нормальный fallback текущей жизни стенда."""
+    db.add(Namespace(namespace="squad-9-shared", state=NS_STATE_ACTIVE,
+                     deployed_by="ai-agent", deployed_branch="master",
+                     k8s_created_at=datetime(2026, 9, 17, 16, 1)))
+    _svc_with_deploy(db, "squad-9-shared", "victor", datetime(2026, 9, 18, 9, 0))
+    db.commit()
+
+    sync_namespace_owners(db, people=PeopleManifest(), tc_users={}, jira_lookup=None,
+                          activity_lookup=None)
+
+    row = db.query(Namespace).filter_by(namespace="squad-9-shared").one()
+    assert (row.owner_login, row.owner_source) == (
+        "victor", NAMESPACE_OWNER_SOURCE_TC_TRIGGERED_BY)
+
+
+def test_namespace_without_creation_date_keeps_old_behaviour(db):
+    """Нет даты создания — отсекать нечем, ответ прежний, а не пустой."""
+    db.add(Namespace(namespace="squad-11-shared", state=NS_STATE_ACTIVE,
+                     deployed_by="ai-agent", deployed_branch="master"))
+    _svc_with_deploy(db, "squad-11-shared", "victor", datetime(2026, 4, 29, 9, 0))
+    db.commit()
+
+    sync_namespace_owners(db, people=PeopleManifest(), tc_users={}, jira_lookup=None,
+                          activity_lookup=None)
+
+    row = db.query(Namespace).filter_by(namespace="squad-11-shared").one()
+    assert row.owner_login == "victor"
+
+
+# --- снесённый стенд ничей (WO-16030) ---------------------------------------
+
+
+def test_owner_is_cleared_when_namespace_is_gone(db):
+    """Стенд снесён — значит ничей, и это факт, а не отсутствие данных.
+
+    Резолв идёт только по активным, поэтому у снесённого стенда владелец
+    оставался тем, каким был в день сноса. На витрине это скрыто (там
+    «свободен»), но `kg_squad_owners` отдавал владельца по несуществующему
+    стенду, а его читают squad-medic и скиллы: 18.09.2026 так висели восемь
+    записей, снесённых 9–16 сентября.
+    """
+    db.add(Namespace(namespace="squad-13-shared", state=NS_STATE_MISSING,
+                     owner_login="ddosta", owner_source=NAMESPACE_OWNER_SOURCE_GD_CLAIM,
+                     owner_jira_key="WO-15000", owner_discord_id="42",
+                     owner_resolved_at=datetime(2026, 9, 9, 12, 0)))
+    db.commit()
+
+    stats = sync_namespace_owners(db, people=PeopleManifest(), tc_users={},
+                                  jira_lookup=None, activity_lookup=None)
+
+    row = db.query(Namespace).filter_by(namespace="squad-13-shared").one()
+    assert stats["cleared_on_missing"] == 1
+    assert (row.owner_login, row.owner_source, row.owner_jira_key,
+            row.owner_discord_id) == (None, None, None, None)
+    assert row.owner_resolved_at > datetime(2026, 9, 9, 12, 0), (
+        "дата отвечает на «когда мы это знали», а не застревает в дне сноса"
+    )
+
+
+def test_live_namespace_keeps_its_owner(db):
+    """Чистка не трогает живые стенды — иначе она съела бы резолв."""
+    db.add(Namespace(namespace="squad-14-shared", state=NS_STATE_ACTIVE,
+                     deployed_by="victor", deployed_branch="preprod",
+                     owner_login="victor",
+                     owner_source=NAMESPACE_OWNER_SOURCE_DEPLOYED_BY))
+    db.commit()
+
+    stats = sync_namespace_owners(db, people=PeopleManifest(), tc_users={},
+                                  jira_lookup=None, activity_lookup=None)
+
+    row = db.query(Namespace).filter_by(namespace="squad-14-shared").one()
+    assert stats["cleared_on_missing"] == 0
+    assert row.owner_login == "victor"
