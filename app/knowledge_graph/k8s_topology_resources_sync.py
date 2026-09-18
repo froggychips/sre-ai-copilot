@@ -50,6 +50,7 @@ from app.knowledge_graph.kubectl_breaker import run_kubectl
 from app.knowledge_graph.edge_decay_guard import (
     SOURCE_TOPOLOGY_INGRESSES, SOURCE_TOPOLOGY_SERVICES, record_source_run)
 from app.knowledge_graph.k8s_endpoints_sync import DISCOVERED_BY_ENDPOINTS
+from app.knowledge_graph.contract import OWNER_SOURCE_NAMESPACE_PREFIX
 from app.knowledge_graph.populator import upsert_edge, upsert_service
 from app.knowledge_graph.schema import (NODE_KIND_SERVICE, NODE_KIND_WORKLOAD,
                                         Service, ServiceEdge)
@@ -255,6 +256,55 @@ def _kubectl_get_deployments_all() -> List[Dict[str, Any]]:
 
 
 # ── pure helpers ────────────────────────────────────────────────────────────
+
+
+def _inherited_owner(svc_node: Any) -> Dict[str, Any]:
+    """Как передать владельца Service его workload-узлу.
+
+    Возвращает kwargs для `upsert_service` с `owner_respect_trust=True`:
+    владелец передаётся, но перезапишет существующего только если его
+    источник не слабее (по `OWNER_SOURCE_TRUST`).
+
+    Так решаются обе крайности сразу. Безусловное присваивание позволяло
+    догадке по префиксу затирать лейбл workload — эскалация уезжала на
+    команду, выведенную из имени namespace. Чистое дозаполнение оставляло
+    workload со старой догадкой навсегда, даже когда у Service появился
+    лейбл. Сравнение по силе пропускает второе и запрещает первое.
+
+    Отсутствие владельца не передаёт ничего: наследовать нечего.
+    """
+    owner = str(svc_node.team_owner) if svc_node.team_owner else None
+    if not owner:
+        return {}
+    source = str(svc_node.owner_source) if svc_node.owner_source else None
+    # Сравнение с провенансом САМОГО workload делает upsert, внутри одного
+    # UPDATE: сравнивать здесь с константой было недостаточно — лейбл
+    # Service (0.9) затирал бы ручную правку workload (1.0) на каждом
+    # проходе, а чтобы узнать провенанс назначения, пришлось бы читать
+    # строку заранее и жить с гонкой между чтением и записью.
+    return {
+        "team_owner": owner,
+        "owner_source": source,
+        "owner_respect_trust": True,
+    }
+
+
+def _owner_kw(svc_node: Any, key: str) -> Any:
+    """Одно поле из решения `_inherited_owner`. None — это поле не нужно."""
+    return _inherited_owner(svc_node).get(key)
+
+
+def _derive_team_owner(namespace: str) -> Optional[str]:
+    """Владелец по префиксу namespace — та же таблица, что у kg_sync.
+
+    Делегируем в `ownership_suggester._try_prefix_match`, а не в
+    `kg_sync._derive_team_owner`: импорт kg_sync отсюда замкнул бы цикл
+    (он сам тянет этот синк). Источник правды один — префиксная таблица.
+    """
+    from app.services.ownership_suggester import _try_prefix_match
+
+    return _try_prefix_match(namespace)
+
 
 
 def _extract_service_meta(svc: Dict[str, Any]) -> Dict[str, Any]:
@@ -597,15 +647,35 @@ def _sync_one_service(
         return
 
     meta_json = _extract_service_meta(svc)
-    # upsert Service node. team_owner мы НЕ заполняем здесь — это
-    # делает kg_sync на основе ns-pattern (squad-N → squad). Если
-    # upsert_service видит существующий узел — он сохранит уже
-    # выставленный team_owner и просто обновит metadata_json.
+    ns_owner = _derive_team_owner(ns)
+    # Владельца передаём как ДОЗАПОЛНЕНИЕ, а не как значение. Прежний
+    # комментарий гласил «team_owner мы НЕ заполняем здесь — это делает
+    # kg_sync на основе ns-pattern», и это оказалось неверно: kg_sync ходит
+    # по `kubectl get deployments`, а сюда приезжают Service и StatefulSet.
+    # Базы (`*-db-postgresql`) и `nats`/`nats-client` внутри squad-стенда
+    # деплойментами не являются, поэтому владельца им не проставлял НИКТО:
+    # 18.09.2026 таких живых узлов было 17 из 19 всех активных без
+    # владельца — в squad-28-kingdom5 26 сервисов получили `squad-28` по
+    # префиксу, а семь баз и NATS остались пустыми.
+    #
+    # Именно fallback, а не team_owner: префикс — самая слабая догадка
+    # (OWNER_SOURCE_TRUST = 0.4), и перезаписывать ею лейбл или ручную
+    # правку нельзя. Присваивание здесь однажды уже обвалило owner-coverage
+    # с 99.97% до ~50% (см. комментарий ниже в этом же файле).
     svc_node = upsert_service(
         db,
         namespace=ns,
         name=name,
         metadata={"k8s_service": meta_json},
+        owner_fallback=ns_owner,
+        # Источник — только если владелец вывелся. Для namespace без
+        # префиксного правила (`sre-ai`, `default`, operator-namespace)
+        # владельца нет, и источник без него upsert считает неполным
+        # fallback'ом: синк ходит по всему кластеру каждые 15 минут, так что
+        # это был бы warning на каждый сервис каждый проход.
+        owner_fallback_source=(
+            OWNER_SOURCE_NAMESPACE_PREFIX if ns_owner else None
+        ),
         # uid объекта был в руках всё это время — синк держит полный JSON.
         # Без него пересозданный Service неотличим от прежнего по имени.
         k8s_uid=meta.get("uid"),
@@ -644,7 +714,31 @@ def _sync_one_service(
             # команде. Без этого 2000+ новых узлов приехали бы без
             # team_owner и обвалили owner-coverage графа (99.97% → ~50%),
             # причём как «регрессия качества данных», которой нет.
-            team_owner=str(svc_node.team_owner) if svc_node.team_owner else None,
+            #
+            # Вместе с владельцем наследуется и ПРОВЕНАНС. Раньше здесь
+            # передавался только team_owner, а upsert переписывает источник
+            # всегда вместе со значением — то есть каждый проход затирал
+            # owner_source в NULL. Отсюда живые узлы с владельцем и без
+            # источника (135 на 18.09.2026): по ним нельзя сказать, можно
+            # ли ссылаться на этого владельца в эскалации, хотя веса
+            # доверия в контракте для этого и заведены.
+            # Наследование идёт ПО СИЛЕ ИСТОЧНИКА, а не безусловно.
+            #
+            # Безусловное присваивание ломало гарантию fallback'а через
+            # второй шаг: Service без владельца получает выше слабую догадку
+            # по префиксу, и она приезжала сюда обычным team_owner — затирая
+            # владельца workload, который мог быть проставлен лейблом или
+            # руками. Эскалация уехала бы на команду, выведенную из имени
+            # namespace.
+            #
+            # Чистое дозаполнение тоже неверно: тогда workload навсегда
+            # остался бы со старой догадкой, даже когда у Service появился
+            # лейбл. Поэтому сильный источник наследуется присваиванием,
+            # слабый — дозаполнением, а решает та же таблица весов, ради
+            # которой провенанс и заводили (OWNER_SOURCE_TRUST).
+            team_owner=_owner_kw(svc_node, "team_owner"),
+            owner_source=_owner_kw(svc_node, "owner_source"),
+            owner_respect_trust=bool(_owner_kw(svc_node, "owner_respect_trust")),
             node_kind=NODE_KIND_WORKLOAD,
             metadata={"k8s_workload": _extract_workload_meta(dep)},
             k8s_uid=(dep.get("metadata") or {}).get("uid"),

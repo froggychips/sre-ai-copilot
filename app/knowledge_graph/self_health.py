@@ -1676,6 +1676,56 @@ def check_digest_delivery(db: Session) -> CheckResult:
     )
 
 
+def check_orphan_namespaces(db: Session) -> CheckResult:
+    """Сервисы в namespace, о котором граф не знает ничего.
+
+    Такие записи проваливаются между всеми механизмами сразу.
+    `_refresh_stale_class_for_namespace` вызывается только из обхода
+    `kg_sync`, поэтому у них пустой `stale_class` — то есть они не попадают
+    ни в одну категорию отчётов: ни в active, ни в gone, ни в
+    suspicious_stale. А `drift_cleanup` чистит namespace, помеченные в
+    `kg_namespaces` как `missing`; namespace, которого в этой таблице нет
+    вовсе, он не увидит никогда.
+
+    Замер 18.09.2026: 80 записей в `squad-52-kingdom5` и
+    `squad-52-kingdom7`. Ни одного из них нет в кластере (`kubectl get ns`
+    отвечает NotFound), в `kg_namespaces` они тоже отсутствуют, а
+    `updated_at` — сегодняшний: что-то продолжает их трогать. Все 52
+    сервиса без владельца и без класса.
+
+    Проверка не чинит, а называет: пока такие записи не видны, спорить о
+    покрытии владельцами бессмысленно — они не попадают в знаменатель.
+    """
+    rows = (
+        db.query(Service.namespace, func.count(Service.id))
+        .outerjoin(Namespace, Namespace.namespace == Service.namespace)
+        .filter(
+            Service.synthetic.is_(False),
+            Service.stale_class.is_(None),
+            Namespace.namespace.is_(None),
+        )
+        .group_by(Service.namespace)
+        .all()
+    )
+    by_ns = {str(ns): int(cnt) for ns, cnt in rows if ns}
+    total = sum(by_ns.values())
+    detail: Dict[str, Any] = {
+        "services": total,
+        "namespaces": len(by_ns),
+        "top": dict(sorted(by_ns.items(), key=lambda kv: -kv[1])[:5]),
+    }
+    if total == 0:
+        return CheckResult(name="orphan_namespaces", status="ok", detail=detail)
+    detail["reason"] = (
+        f"{total} сервисов в {len(by_ns)} namespace без записи в kg_namespaces "
+        f"и без stale_class — они не видны ни отчётам, ни drift_cleanup"
+    )
+    # warn, не fail: это дыра в наблюдаемости, а не поломка. Поднимать
+    # тревогу до того, как решено, чьи это записи, значило бы приучать
+    # смотреть мимо красного.
+    return CheckResult(name="orphan_namespaces", status="warn", detail=detail)
+
+
 _ALL_CHECKS = (
     check_materialization_zero_rate,
     check_sync_lag,
@@ -1690,6 +1740,7 @@ _ALL_CHECKS = (
     check_silent_gaps,
     check_deploy_stream_ingestion,
     check_graph_integrity,
+    check_orphan_namespaces,
     check_schema_version,
 )
 

@@ -21,6 +21,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.knowledge_graph.contract import (UQ_KG_SERVICE_NS_NAME_KIND,
+                                          OWNER_SOURCE_TRUST,
                                           owner_source_valid)
 from app.knowledge_graph.schema import (NODE_KIND_SERVICE, AlertEvent,
                                         Deployment, PodEvent, Service,
@@ -69,6 +70,9 @@ def upsert_service(
     stale_class: Optional[str] = None,
     owner_source: Optional[str] = None,
     k8s_uid: Optional[str] = None,
+    owner_fallback: Optional[str] = None,
+    owner_fallback_source: Optional[str] = None,
+    owner_respect_trust: bool = False,
 ) -> Service:
     """Idempotent upsert узла графа — ЕДИНСТВЕННЫЙ путь записи kg_services.
 
@@ -83,6 +87,22 @@ def upsert_service(
     без источника — это уже 12 577 существующих строк, у которых провенанс
     неизвестен. Неизвестное значение отбрасывается с warning, чтобы опечатка
     не завела в графе седьмой «источник».
+
+    `owner_respect_trust` — перезаписывать владельца только если источник
+    нового НЕ СЛАБЕЕ источника существующего (по `OWNER_SOURCE_TRUST`).
+    Нужен наследованию: workload получает владельца Service, но у самого
+    workload может стоять ручная правка (1.0), которую лейбл Service (0.9)
+    затирать не должен — а без сравнения с назначением это происходило бы
+    каждый проход синка. Отсутствующий провенанс весит 0, поэтому пустое
+    поле заполняется всегда.
+
+    `owner_fallback` — владелец, которым заполняют ПУСТОЕ поле, не перетирая
+    существующее. Нужен источникам, которые знают слабую догадку и не должны
+    затирать ею сильную: топология видит namespace (значит, может вывести
+    squad-N по префиксу), но лейбл `team-owner` или ручная правка всегда
+    точнее. Обычный `team_owner` перезаписывает при каждом проходе — именно
+    так однажды обвалили owner-coverage с 99.97% до ~50%, — а этот путь
+    только дозаполняет.
 
     `node_kind` различает k8s Service, workload (Deployment/StatefulSet/
     DaemonSet) и synthetic ingress-узлы. Дефолт 'service' — так все прежние
@@ -107,14 +127,56 @@ def upsert_service(
             namespace=namespace, name=name, owner_source=owner_source,
         )
         owner_source = None
+    if owner_fallback is not None:
+        # Источник None здесь законен: контракт прямо допускает владельца с
+        # неизвестным провенансом (`owner_source_valid(None)` истинно), и
+        # таких строк в графе больше шести тысяч. Требовать источник значило
+        # бы терять владельца при наследовании: workload создавался бы
+        # вообще без владельца там, где у Service он есть, но приехал из
+        # эпохи до учёта источников.
+        if not owner_source_valid(owner_fallback_source):
+            logger.warning(
+                "kg.owner_source_unknown",
+                namespace=namespace, name=name,
+                owner_source=owner_fallback_source,
+            )
+            owner_fallback = None
+            owner_fallback_source = None
+    elif owner_fallback_source is not None:
+        # А вот источник БЕЗ владельца бессмыслен в любом случае: он
+        # описывает значение, которого нет.
+        logger.warning(
+            "kg.owner_fallback_source_without_owner",
+            namespace=namespace, name=name,
+            owner_fallback_source=owner_fallback_source,
+        )
+        owner_fallback_source = None
     if _is_postgresql(db):
         return _upsert_service_pg(
             db, namespace, name, team_owner, metadata, synthetic, node_kind,
             stale_class, owner_source, k8s_uid,
+            owner_fallback, owner_fallback_source, owner_respect_trust,
         )
     return _upsert_service_fallback(
         db, namespace, name, team_owner, metadata, synthetic, node_kind,
         stale_class, owner_source, k8s_uid,
+        owner_fallback, owner_fallback_source, owner_respect_trust,
+    )
+
+
+def _trust_expr(col: Any) -> Any:
+    """SQL-выражение: вес доверия источника из колонки.
+
+    Та же таблица, что в контракте (`OWNER_SOURCE_TRUST`), перенесённая в
+    SQL, чтобы сравнение шло внутри одного UPDATE — без чтения строки
+    заранее и без гонки между чтением и записью.
+    """
+    return sa.case(
+        *[
+            (col == source, sa.literal(trust))
+            for source, trust in OWNER_SOURCE_TRUST.items()
+        ],
+        else_=sa.literal(0.0),
     )
 
 
@@ -129,6 +191,9 @@ def _upsert_service_pg(
     stale_class: Optional[str] = None,
     owner_source: Optional[str] = None,
     k8s_uid: Optional[str] = None,
+    owner_fallback: Optional[str] = None,
+    owner_fallback_source: Optional[str] = None,
+    owner_respect_trust: bool = False,
 ) -> Service:
     from sqlalchemy.dialects.postgresql import insert as pg_insert
 
@@ -137,8 +202,10 @@ def _upsert_service_pg(
         "namespace": namespace,
         "name": name,
         "node_kind": node_kind,
-        "team_owner": team_owner,
-        "owner_source": owner_source,
+        "team_owner": team_owner or owner_fallback,
+        "owner_source": owner_source if team_owner else (
+            owner_fallback_source if owner_fallback else None
+        ),
         "metadata_json": metadata,
         "synthetic": bool(synthetic) if synthetic is not None else False,
         "stale_class": stale_class,
@@ -148,11 +215,66 @@ def _upsert_service_pg(
         "updated_at": now,
     }
     set_clause: Dict[str, Any] = {"updated_at": now}
-    if team_owner:
+    tbl_ref = Service.__table__
+    if team_owner and owner_respect_trust:
+        # Перезапись только если новый источник не слабее существующего.
+        # Сравнение идёт с ПРОВЕНАНСОМ СТРОКИ, а не с константой: иначе
+        # лейбл Service (0.9) затирал бы ручную правку workload (1.0) на
+        # каждом проходе. NULL весит 0 — пустое поле заполняется всегда.
+        incoming = OWNER_SOURCE_TRUST.get(owner_source or "", 0.0)
+        # Пустой владелец в строке перебивает любой провенанс: там может
+        # остаться осиротевший `owner_source` от значения, которое уже
+        # затёрли, — и сравнение по силе тогда отвергало бы входящего
+        # владельца навсегда. Строка с сильным источником и пустым
+        # владельцем — то самое противоречие, которое этот код и чинит,
+        # так что доверять её провенансу нельзя.
+        stronger = sa.or_(
+            tbl_ref.c.team_owner.is_(None),
+            tbl_ref.c.team_owner == "",
+            _trust_expr(tbl_ref.c.owner_source) <= incoming,
+        )
+        set_clause["team_owner"] = sa.case(
+            (stronger, sa.literal(team_owner)), else_=tbl_ref.c.team_owner,
+        )
+        set_clause["owner_source"] = sa.case(
+            (stronger, sa.literal(owner_source)), else_=tbl_ref.c.owner_source,
+        )
+    elif team_owner:
         set_clause["team_owner"] = team_owner
         # Источник переписываем только вместе с владельцем: иначе у строки
         # остался бы провенанс от предыдущего, уже перезаписанного значения.
         set_clause["owner_source"] = owner_source
+    elif owner_fallback:
+        # Дозаполнение: COALESCE вместо присваивания. Пустое поле получает
+        # догадку, заполненное остаётся как есть — сильный источник
+        # (лейбл, ручная правка) слабым не перетирается.
+        #
+        # Пустая строка считается отсутствием наравне с NULL: в графе есть и
+        # то и другое, а для потребителя «владельца нет» — одно состояние.
+        empty_owner = sa.or_(
+            tbl_ref.c.team_owner.is_(None), tbl_ref.c.team_owner == "",
+        )
+        set_clause["team_owner"] = sa.case(
+            (empty_owner, sa.literal(owner_fallback)),
+            else_=tbl_ref.c.team_owner,
+        )
+        set_clause["owner_source"] = sa.case(
+            (empty_owner, sa.literal(owner_fallback_source)),
+            else_=tbl_ref.c.owner_source,
+        )
+    else:
+        # Ни владельца, ни догадки. Провенанс без владельца — противоречие:
+        # источник описывает значение, которого нет (33 таких строки в графе
+        # на 18.09.2026). Чистим его, когда проходим мимо.
+        set_clause["owner_source"] = sa.case(
+            (
+                sa.or_(
+                    tbl_ref.c.team_owner.is_(None), tbl_ref.c.team_owner == "",
+                ),
+                sa.null(),
+            ),
+            else_=tbl_ref.c.owner_source,
+        )
     # stale_class обновляем только когда вызывающий его посчитал: None здесь
     # означает «не знаю», а не «сбросить в NULL» (иначе topology-sync стирал бы
     # expected_stale, выставленный другим источником).
@@ -225,6 +347,9 @@ def _upsert_service_fallback(
     stale_class: Optional[str] = None,
     owner_source: Optional[str] = None,
     k8s_uid: Optional[str] = None,
+    owner_fallback: Optional[str] = None,
+    owner_fallback_source: Optional[str] = None,
+    owner_respect_trust: bool = False,
 ) -> Service:
     svc = (
         db.query(Service)
@@ -240,8 +365,11 @@ def _upsert_service_fallback(
             namespace=namespace,
             name=name,
             node_kind=node_kind,
-            team_owner=team_owner,
-            owner_source=owner_source,
+            team_owner=team_owner or owner_fallback,
+            owner_source=(
+                owner_source if team_owner
+                else (owner_fallback_source if owner_fallback else None)
+            ),
             metadata_json=metadata,
             synthetic=bool(synthetic) if synthetic is not None else False,
             stale_class=stale_class,
@@ -253,9 +381,37 @@ def _upsert_service_fallback(
         logger.info("kg.service_created", namespace=namespace, name=name)
     else:
         changed = False
-        if team_owner and svc.team_owner != team_owner:
+        if team_owner and owner_respect_trust:
+            # Зеркалит PG-путь: перезапись только если новый источник не
+            # слабее того, что стоит в строке.
+            incoming = OWNER_SOURCE_TRUST.get(owner_source or "", 0.0)
+            current = OWNER_SOURCE_TRUST.get(svc.owner_source or "", 0.0)
+            # Пустой владелец перебивает провенанс — см. PG-путь.
+            repairable = not svc.team_owner
+            if repairable or current <= incoming:
+                # Условие НЕ включает «владелец изменился»: у строки может
+                # совпадать владелец при отсутствующем или более слабом
+                # провенансе, и тогда чинить надо именно источник. PG-путь
+                # переписывает оба поля вместе, и расхождение путей здесь
+                # оставляло бы legacy-строки без провенанса навсегда — но
+                # только на sqlite, то есть ровно там, где это видно тестам
+                # и незаметно в проде.
+                if svc.team_owner != team_owner or svc.owner_source != owner_source:
+                    svc.team_owner = team_owner
+                    svc.owner_source = owner_source
+                    changed = True
+        elif team_owner and svc.team_owner != team_owner:
             svc.team_owner = team_owner
             svc.owner_source = owner_source
+            changed = True
+        elif owner_fallback and not svc.team_owner:
+            # Дозаполнение пустого — зеркалит COALESCE из PG-пути.
+            svc.team_owner = owner_fallback
+            svc.owner_source = owner_fallback_source
+            changed = True
+        elif not svc.team_owner and svc.owner_source is not None:
+            # Провенанс без владельца — противоречие; чистим, проходя мимо.
+            svc.owner_source = None
             changed = True
         # None = «вызывающий не считал», а не «сбросить» — зеркалит PG-путь.
         if stale_class is not None and svc.stale_class != stale_class:
