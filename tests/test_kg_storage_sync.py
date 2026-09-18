@@ -1113,3 +1113,116 @@ def test_get_all_paged_without_kubeconfig_raises_fetch_error():
         KubectlFetchError
     ):
         _get_all("pods")
+
+
+# ── Порог чистки не должен блокировать сам себя ──────────────────────────
+
+def test_accumulated_garbage_does_not_block_cleanup(db):
+    """Старые записи снесённых стендов не делают порог строже к себе.
+
+    Прежняя формула считала долю удаляемого от ВСЕЙ таблицы и потому
+    блокировала сама себя: мусор копится оттого, что чистка не идёт, доля
+    растёт, порог держит крепче. Замер 18.09.2026 — в графе 10 059 PV
+    против 1214 в кластере, delete_pct=88% при пороге 25%, и чистка не шла
+    ни разу с мая.
+    """
+    from datetime import datetime, timedelta
+
+    from app.knowledge_graph.schema import StorageVolume
+
+    # Один свежий том (его синк видит) и сорок старых из снесённых стендов.
+    _seed_volume_edges(db, count=1)
+    old = datetime.utcnow() - timedelta(days=40)
+    for i in range(40):
+        db.add(StorageVolume(
+            kind="pvc", namespace="squad-99-shared", name=f"dead-{i}",
+            phase="Bound", updated_at=old, created_at=old,
+        ))
+    db.commit()
+
+    with patch(
+        "app.knowledge_graph.k8s_storage_sync._get_all",
+        return_value=[_mk_pvc("data-0", "prod-shared")],
+    ):
+        stats = sync_pvcs(db)
+
+    assert stats["cleanup"]["skipped"] == "", (
+        "накопленный мусор не повод отменять чистку"
+    )
+    assert stats["cleanup"]["volumes_deleted"] == 40
+
+
+def test_shrinking_snapshot_still_blocks_cleanup(db):
+    """А вот подозрительно маленький снимок чистку по-прежнему отменяет.
+
+    Это и есть вопрос, ради которого порог заведён: вчера синк видел
+    четыре тома, сегодня kubectl отдал один — верить такому снимку и
+    сносить по нему узлы нельзя.
+    """
+    _seed_volume_edges(db, count=4)
+
+    with patch(
+        "app.knowledge_graph.k8s_storage_sync._get_all",
+        return_value=[_mk_pvc("data-0", "prod-shared")],
+    ):
+        stats = sync_pvcs(db)
+
+    assert stats["cleanup"]["skipped"] == "delete_pct"
+    assert len(_pvc_names(db)) == 4
+
+
+def test_cleanup_is_capped_per_run(db):
+    """За один проход сносим порцию, а не всё разом.
+
+    Снятие процентного порога не должно означать «снести восемь тысяч
+    строк одним движением»: ошибка видна на первой сотне, а не на всём
+    графе.
+    """
+    from datetime import datetime, timedelta
+
+    from app.knowledge_graph import k8s_storage_sync as sync_mod
+    from app.knowledge_graph.schema import StorageVolume
+
+    _seed_volume_edges(db, count=1)
+    old = datetime.utcnow() - timedelta(days=40)
+    for i in range(20):
+        db.add(StorageVolume(
+            kind="pvc", namespace="squad-98-shared", name=f"dead-{i}",
+            phase="Bound", updated_at=old, created_at=old,
+        ))
+    db.commit()
+
+    with patch.object(sync_mod, "_VOLUME_MAX_DELETE_PER_RUN", 5), patch(
+        "app.knowledge_graph.k8s_storage_sync._get_all",
+        return_value=[_mk_pvc("data-0", "prod-shared")],
+    ):
+        stats = sync_pvcs(db)
+
+    assert stats["cleanup"]["volumes_deleted"] == 5
+    assert stats["cleanup"]["capped_to"] == 5
+
+
+def test_pv_slice_reports_itself_as_a_source(db):
+    """Срез PV отчитывается: раньше его молчание было невидимо.
+
+    `check_source_coverage` спрашивает «а все ли отработали», и источник,
+    которого нет в реестре, молчит незаметно — при том что именно снимок
+    PV решает, чистить ли узлы.
+    """
+    from app.knowledge_graph.edge_decay_guard import (ALL_EDGE_SOURCES,
+                                                      SOURCE_STORAGE_PVS,
+                                                      get_source_report,
+                                                      reset_source_reports)
+
+    assert SOURCE_STORAGE_PVS in ALL_EDGE_SOURCES
+
+    reset_source_reports()
+    with patch(
+        "app.knowledge_graph.k8s_storage_sync._get_all",
+        return_value=[_mk_pv("pv-0")],
+    ):
+        sync_pvs(db)
+
+    report = get_source_report(SOURCE_STORAGE_PVS)
+    assert report is not None
+    assert report.fetched == 1

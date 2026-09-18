@@ -91,6 +91,11 @@ SOURCE_NATS_SUBJECTS_SYNC = "nats_subjects_sync"
 # независимы (разные `kubectl get`, разные объёмы, разные режимы отказа).
 SOURCE_STORAGE_PODS = "k8s_storage_sync/pods"
 SOURCE_STORAGE_PVCS = "k8s_storage_sync/pvcs"
+# Срез PV. Рёбер сам по себе не даёт (`bound_to` строится от PVC), но это
+# отдельный `kubectl get pv` со своим режимом отказа — и до 18.09.2026 он
+# не отчитывался вовсе: PV-часть синка была невидима для покрытия
+# источников, хотя именно её снимок решает, чистить ли узлы.
+SOURCE_STORAGE_PVS = "k8s_storage_sync/pvs"
 
 #: Все источники, отчитывающиеся через `record_source_run`. Нужен для
 #: вопроса «а все ли вообще отработали»: до сих пор отчёты читал только сам
@@ -106,6 +111,7 @@ ALL_EDGE_SOURCES: tuple = (
     SOURCE_NATS_SUBJECTS_SYNC,
     SOURCE_STORAGE_PODS,
     SOURCE_STORAGE_PVCS,
+    SOURCE_STORAGE_PVS,
 )
 
 
@@ -185,6 +191,7 @@ _SOURCE_FETCH_KEY: Dict[str, str] = {
     # — полученный PVC.
     SOURCE_STORAGE_PODS: "pods_scanned",
     SOURCE_STORAGE_PVCS: "pvcs_fetched",
+    SOURCE_STORAGE_PVS: "pvs_fetched",
 }
 
 # Окно свежести по умолчанию. Должно быть больше максимального интервала

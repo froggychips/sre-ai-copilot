@@ -57,8 +57,8 @@ from sqlalchemy.orm import Session
 from app.config import settings
 from app.knowledge_graph.kubectl_breaker import run_kubectl
 from app.knowledge_graph.edge_decay_guard import (
-    SOURCE_STORAGE_PODS, SOURCE_STORAGE_PVCS, record_source_run,
-    unhealthy_volume_sources, volume_edge_block_reason,
+    SOURCE_STORAGE_PODS, SOURCE_STORAGE_PVCS, SOURCE_STORAGE_PVS,
+    record_source_run, unhealthy_volume_sources, volume_edge_block_reason,
 )
 from app.knowledge_graph.schema import NODE_KIND_SERVICE, Service, StorageVolume, VolumeEdge
 
@@ -111,6 +111,17 @@ _VOLUME_MAX_DELETE_PCT = 25.0
 # Размер порции для `IN (...)`-удалений: не упираемся в лимит параметров
 # драйвера на больших чистках.
 _DELETE_CHUNK = 500
+
+# Сколько узлов можно снести за ОДИН проход. Порог в процентах отвечает на
+# вопрос «правду ли сказал kubectl», а этот — «не сносим ли мы слишком
+# много разом»: накопленное за месяцы разбирается порциями, и ошибка видна
+# на первой сотне строк, а не на всём графе.
+_VOLUME_MAX_DELETE_PER_RUN = 500
+
+# Окно «синк недавно это видел». Синк ходит дважды в час, так что сутки —
+# заведомо больше любого разумного пропуска и заведомо меньше срока, за
+# который снесённый стенд успевает испортить картину.
+_RECENTLY_SEEN_HOURS = 24
 
 # Причины пропуска чистки (уходят в stats и в логи).
 REASON_FETCH_FAILED = "fetch_failed"
@@ -814,17 +825,44 @@ def _cleanup_absent_volumes(
     if not absent:
         return stats
 
-    delete_pct = 100.0 * len(absent) / len(rows)
-    if delete_pct > _VOLUME_MAX_DELETE_PCT:
+    # Порог спрашивает «не соврал ли kubectl», а не «много ли мусора
+    # накопилось». Прежняя формула (доля удаляемого от размера графа)
+    # блокировала сама себя: мусор копится именно оттого, что чистка не
+    # идёт, доля растёт, порог держит крепче. Замер 18.09.2026 — в графе
+    # 10 059 PV против 1214 в кластере, delete_pct=88% при пороге 25%, и
+    # чистка не шла ни разу с мая.
+    #
+    # Ровно ту же ловушку уже разбирали в drift_cleanup: «доля растёт
+    # именно оттого, что чистка не идёт; перевалив порог однажды, чистка
+    # выключается навсегда». Там ответ нашли в усадке ЖИВОГО набора — и
+    # здесь он тот же, только сравнивать надо с предыдущим прогоном, а не
+    # с размером графа: у томов нет состояния active/missing, по которому
+    # namespace отличает живое от мёртвого.
+    shrink_pct = _live_set_shrink_pct(db, kind=kind, current=len(seen))
+    if shrink_pct > _VOLUME_MAX_DELETE_PCT:
         stats["skipped"] = REASON_DELETE_PCT
+        stats["shrink_pct"] = round(shrink_pct, 1)
         logger.warning(
             "k8s_storage.volume_cleanup_skipped kind=%s reason=%s "
-            "would_delete=%d of %d (%.1f%% > %.1f%%) — массовая пропажа это "
-            "симптом сбоя, не убыли storage",
-            kind, REASON_DELETE_PCT, len(absent), len(rows),
-            delete_pct, _VOLUME_MAX_DELETE_PCT,
+            "live_set_shrank=%.1f%% > %.1f%% (сейчас %d, было больше) — "
+            "снимок подозрительно мал, узлы не чистим",
+            kind, REASON_DELETE_PCT, shrink_pct, _VOLUME_MAX_DELETE_PCT,
+            len(seen),
         )
         return stats
+
+    # Абсолютный потолок на проход. Снятие процентного порога не должно
+    # означать «снести восемь тысяч строк одним движением»: чистка идёт
+    # порциями, накопленное разбирается за несколько проходов, и любая
+    # ошибка видна на первой сотне, а не на всём графе.
+    if len(absent) > _VOLUME_MAX_DELETE_PER_RUN:
+        stats["capped_to"] = _VOLUME_MAX_DELETE_PER_RUN
+        logger.info(
+            "k8s_storage.volume_cleanup_capped kind=%s absent=%d cap=%d — "
+            "чистим порцией, остальное следующими проходами",
+            kind, len(absent), _VOLUME_MAX_DELETE_PER_RUN,
+        )
+        absent = absent[:_VOLUME_MAX_DELETE_PER_RUN]
 
     stats["edges_deleted"] = _delete_edges_for_volume_ids(db, kind, absent)
     deleted = 0
@@ -841,6 +879,36 @@ def _cleanup_absent_volumes(
         kind, deleted, stats["edges_deleted"], len(rows),
     )
     return stats
+
+
+def _live_set_shrink_pct(db: Session, *, kind: str, current: int) -> float:
+    """На сколько ужался снимок против того, что синк видел НЕДАВНО.
+
+    Знаменатель — записи, обновлённые за `_RECENTLY_SEEN_HOURS`, а не все
+    строки таблицы. В этом вся разница с прежней формулой: старые записи
+    снесённых стендов в знаменатель не входят, поэтому накопленный мусор
+    не делает порог строже сам к себе. А вопрос, ради которого порог
+    заведён, — «не соврал ли kubectl» — остаётся: вчера видели 1214, а
+    сегодня лист отдал 300, значит снимок подозрительный, и чистить по
+    нему нельзя.
+
+    Ту же ловушку разбирали в drift_cleanup, и решение там такое же по
+    сути: сравнивать с живым набором, а не с размером графа. Там роль
+    «недавно виденного» играет `state='active'`, который ведёт lifecycle;
+    у томов своего состояния нет, поэтому им служит `updated_at`.
+
+    Ноль, когда сравнивать не с чем: пустая таблица или первый прогон —
+    не повод считать снимок подозрительным.
+    """
+    cutoff = datetime.utcnow() - timedelta(hours=_RECENTLY_SEEN_HOURS)
+    recently_seen = (
+        db.query(StorageVolume)
+        .filter(StorageVolume.kind == kind, StorageVolume.updated_at >= cutoff)
+        .count()
+    )
+    if recently_seen <= 0:
+        return 0.0
+    return max(100.0 * (recently_seen - current) / recently_seen, 0.0)
 
 
 def _stale_edge_clause(cutoff: datetime) -> Any:
@@ -976,6 +1044,10 @@ def sync_pvs(db: Session) -> Dict[str, Any]:
         db, kind=NODE_PV, seen=seen, fetch_ok=fetch_ok,
     )
     stats["cleanup"] = cleanup
+    # Отчёт о срезе PV: до 18.09.2026 эта часть синка не отчитывалась, и её
+    # молчание было невидимо для check_source_coverage — при том что именно
+    # её снимок решает, чистить ли узлы.
+    record_source_run(SOURCE_STORAGE_PVS, stats)
     db.commit()
     logger.info(
         "k8s_storage.pvs_done fetched=%d upserted=%d skipped=%d errors=%d "
