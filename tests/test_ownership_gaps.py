@@ -299,3 +299,94 @@ def test_classified_records_are_not_flagged(db):
     db.flush()
 
     assert check_orphan_namespaces(db).status == "ok"
+
+
+# --- наследование по силе источника ---------------------------------------
+
+def test_strong_owner_propagates_to_workload_by_assignment(db):
+    """Лейбл распространяется на workload присваиванием.
+
+    Он описывает конкретный объект, поэтому им можно переписать старую
+    догадку: иначе workload навсегда остался бы с префиксным владельцем,
+    даже когда у Service появился лейбл.
+    """
+    from app.knowledge_graph.k8s_topology_resources_sync import _inherited_owner
+
+    svc = type("N", (), {"team_owner": "squad-7", "owner_source": OWNER_SOURCE_K8S_LABELS})()
+
+    assert _inherited_owner(svc) == {
+        "team_owner": "squad-7", "owner_source": OWNER_SOURCE_K8S_LABELS,
+    }
+
+
+def test_weak_owner_propagates_to_workload_as_fallback(db):
+    """Догадка по префиксу — только дозаполнением.
+
+    Она описывает namespace целиком и ничего не знает про отдельный
+    объект, поэтому не должна переписывать то, что поставили осознанно.
+    """
+    from app.knowledge_graph.k8s_topology_resources_sync import _inherited_owner
+
+    svc = type("N", (), {
+        "team_owner": "squad-28", "owner_source": OWNER_SOURCE_NAMESPACE_PREFIX,
+    })()
+
+    assert _inherited_owner(svc) == {
+        "owner_fallback": "squad-28",
+        "owner_fallback_source": OWNER_SOURCE_NAMESPACE_PREFIX,
+    }
+
+
+def test_manual_owner_propagates_by_assignment(db):
+    from app.knowledge_graph.k8s_topology_resources_sync import _inherited_owner
+
+    svc = type("N", (), {"team_owner": "platform", "owner_source": OWNER_SOURCE_MANUAL})()
+    assert "team_owner" in _inherited_owner(svc)
+
+
+def test_owner_without_provenance_propagates_as_fallback(db):
+    """Владелец без источника доверия не заслуживает — только дозаполнение."""
+    from app.knowledge_graph.k8s_topology_resources_sync import _inherited_owner
+
+    svc = type("N", (), {"team_owner": "squad-3", "owner_source": None})()
+    assert _inherited_owner(svc) == {
+        "owner_fallback": "squad-3", "owner_fallback_source": None,
+    }
+
+
+def test_no_owner_propagates_nothing(db):
+    from app.knowledge_graph.k8s_topology_resources_sync import _inherited_owner
+
+    svc = type("N", (), {"team_owner": None, "owner_source": None})()
+    assert _inherited_owner(svc) == {}
+
+
+def test_weak_inheritance_does_not_overwrite_workload_label(db):
+    """Сквозная проверка: догадка Service не сносит лейбл workload."""
+    from app.knowledge_graph.k8s_topology_resources_sync import _inherited_owner
+    from app.knowledge_graph.schema import NODE_KIND_WORKLOAD
+
+    upsert_service(
+        db, namespace="squad-28-kingdom5", name="town-service",
+        team_owner="squad-7", owner_source=OWNER_SOURCE_K8S_LABELS,
+        node_kind=NODE_KIND_WORKLOAD,
+    )
+    weak_service = type("N", (), {
+        "team_owner": "squad-28", "owner_source": OWNER_SOURCE_NAMESPACE_PREFIX,
+    })()
+
+    upsert_service(
+        db, namespace="squad-28-kingdom5", name="town-service",
+        node_kind=NODE_KIND_WORKLOAD, **_inherited_owner(weak_service),
+    )
+
+    workload = (
+        db.query(Service)
+        .filter(
+            Service.namespace == "squad-28-kingdom5",
+            Service.name == "town-service",
+            Service.node_kind == NODE_KIND_WORKLOAD,
+        )
+        .one()
+    )
+    assert workload.team_owner == "squad-7", "лейбл workload сильнее догадки Service"
