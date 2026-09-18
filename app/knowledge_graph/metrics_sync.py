@@ -273,18 +273,6 @@ async def _fetch_namespace(
                 vm.by_label(_q_ns_5xx_by_service(namespace), "service"),
                 vm.by_label(_q_ns_p95_by_service(namespace), "service"),
             )
-            # Ни одно окно не измерено — про namespace неизвестно НИЧЕГО.
-            # Вернуться нормально значило бы записать «сигнала нет» для всех
-            # его сервисов: недоступная VictoriaMetrics выглядела бы как
-            # namespace, где никто не экспортирует метрик, а прогон — как
-            # успешный (errors=0, skipped_empty=N). Ровно та слепота,
-            # неотличимая от тишины, против которой стоит весь Этап 0.
-            if not any(m.measured for m in base):
-                reasons = {m.reason for m in base if m.reason}
-                return (namespace, None, MetricsUnavailable(
-                    f"{namespace}: ни одно окно не измерено "
-                    f"({'; '.join(sorted(reasons)) or 'источник молчит'})"
-                ))
             # Частичный отказ данные не отменяет: измеренные окна пишем,
             # неизмеренные дают пустоту — и для сервиса это обернётся None,
             # то есть честным «не знаем», а не нулём.
@@ -296,6 +284,9 @@ async def _fetch_namespace(
             # записался бы как «таймаутов не было».
             unmeasured: Set[str] = set()
             raw: Dict[str, Dict[str, float]] = {}
+            # Все измерения окна — нужны, чтобы собрать причину отказа
+            # после того, как выполнены и базовые запросы, и Orleans.
+            measurements = list(base)
             for key, m in (
                 ("cpu_pct", base[0]),
                 ("mem_pct", base[1]),
@@ -316,6 +307,7 @@ async def _fetch_namespace(
                     vm.by_label(_q_ns_orleans_churn_by_pod(namespace), "pod"),
                     vm.by_label(_q_ns_orleans_rerouted_by_pod(namespace), "pod"),
                 )
+                measurements.extend(orl)
                 for key, m in (
                     ("orleans_latency_sum", orl[0]),
                     ("orleans_latency_count", orl[1]),
@@ -328,6 +320,25 @@ async def _fetch_namespace(
                     raw[key] = m.or_else({})
                     if not m.measured:
                         unmeasured.add(key)
+            # Ни одно окно не измерено — про namespace неизвестно НИЧЕГО.
+            # Вернуться нормально значило бы записать «сигнала нет» для всех
+            # его сервисов: недоступная VictoriaMetrics выглядела бы как
+            # namespace, где никто не экспортирует метрик, а прогон — как
+            # успешный (errors=0, skipped_empty=N). Ровно та слепота,
+            # неотличимая от тишины, против которой стоит весь Этап 0.
+            #
+            # Решение принимается ПОСЛЕ всех запросов, включая Orleans:
+            # ранний выход отбрасывал их, не выполнив, — а они могли
+            # ответить, когда базовые пять споткнулись на своих таймаутах.
+            # Тогда живые данные о силосах терялись, и namespace шёл в
+            # ошибки, хотя источник отвечал.
+            measured_keys = set(raw) - unmeasured
+            if not measured_keys:
+                reasons = sorted({m.reason for m in measurements if m.reason})
+                return (namespace, None, MetricsUnavailable(
+                    f"{namespace}: ни одно окно не измерено "
+                    f"({'; '.join(reasons) or 'источник молчит'})"
+                ))
             if unmeasured:
                 # Кладём в сам raw под служебным ключом: сигнатура
                 # _aggregate_service_metrics остаётся прежней, а знание о

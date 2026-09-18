@@ -487,3 +487,62 @@ def test_failed_latency_sum_does_not_record_zero_latency():
     blind = metrics_sync._orleans_metrics(acc, {"orleans_latency_sum"})
 
     assert blind["orleans_latency_avg_ms"] is None
+
+
+@pytest.mark.asyncio
+async def test_orleans_survives_failed_base_queries(db, monkeypatch):
+    """Базовые пять споткнулись, Orleans ответил — данные не выбрасываем.
+
+    Ранний выход по базовым запросам отбрасывал Orleans, не выполнив их.
+    А они могли ответить: отказы бывают per-query (таймаут одного запроса),
+    и тогда живые данные о силосах терялись, а namespace шёл в ошибки, хотя
+    источник отвечал.
+    """
+    monkeypatch.setattr(settings, "VICTORIA_METRICS_URL", "http://vm:8428")
+    _seed_services(db, [("town-grainhost", "ns-orl")])
+
+    class _OrleansOnlyVM(_FakeVM):
+        async def by_label(self, query: str, label: str):
+            from app.providers.measurement import Measurement
+
+            if label == "namespace":          # discovery
+                return Measurement.of({"ns-orl": 1.0})
+            if "microsoft_orleans" in query:  # Orleans отвечает
+                return Measurement.of({"town-grainhost-a": 100.0})
+            return Measurement.unknown("vm_unavailable: synthetic")
+
+    monkeypatch.setattr(
+        metrics_sync, "make_metrics_provider", lambda *a, **kw: _OrleansOnlyVM(),
+    )
+
+    result = await _sync_service_health_async(db)
+
+    assert result["errors"] == 0, "источник отвечал — namespace не ошибка"
+    assert result["inserted"] == 1
+    row = db.query(ServiceHealth).first()
+    assert row.cpu_pct is None, "базовые метрики неизвестны"
+    assert row.orleans_latency_avg_ms is not None, "данные силоса сохранены"
+
+
+@pytest.mark.asyncio
+async def test_everything_unmeasured_including_orleans_is_an_error(db, monkeypatch):
+    """Молчат и базовые, и Orleans — вот это действительно отказ."""
+    monkeypatch.setattr(settings, "VICTORIA_METRICS_URL", "http://vm:8428")
+    _seed_services(db, [("town-grainhost", "ns-dead")])
+
+    class _DeadVM(_FakeVM):
+        async def by_label(self, query: str, label: str):
+            from app.providers.measurement import Measurement
+
+            if label == "namespace":
+                return Measurement.of({"ns-dead": 1.0})
+            return Measurement.unknown("vm_unavailable: synthetic")
+
+    monkeypatch.setattr(
+        metrics_sync, "make_metrics_provider", lambda *a, **kw: _DeadVM(),
+    )
+
+    result = await _sync_service_health_async(db)
+
+    assert result["errors"] == 1
+    assert result["inserted"] == 0
