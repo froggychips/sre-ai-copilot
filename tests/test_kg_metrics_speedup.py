@@ -396,3 +396,94 @@ async def test_partial_blindness_keeps_measured_data(db, monkeypatch):
     row = db.query(ServiceHealth).first()
     assert row.cpu_pct is not None
     assert row.restarts_rate is None, "неизмеренное остаётся неизвестным, не нулём"
+
+
+@pytest.mark.asyncio
+async def test_total_outage_is_reported_as_unavailable(db, monkeypatch):
+    """Полный отказ VM обязан читаться как UNAVAILABLE, а не EMPTY.
+
+    `status_from_counts` проверяет нулевые observed РАНЬШЕ, чем errors,
+    поэтому без маркера полная слепота классифицировалась как EMPTY. А
+    EMPTY в self-health намеренно не считается нездоровьем — пустое окно
+    бывает штатным, — и тревога не поднималась вовсе.
+    """
+    from app.knowledge_graph.source_status import SourceStatus, status_from_counts
+
+    monkeypatch.setattr(settings, "VICTORIA_METRICS_URL", "http://vm:8428")
+    _seed_services(db, [("svc-a", "ns-one"), ("svc-b", "ns-two")])
+    monkeypatch.setattr(
+        metrics_sync, "make_metrics_provider",
+        lambda *a, **kw: _FakeVM(
+            ns_pods={"ns-one": ["svc-a-1"], "ns-two": ["svc-b-1"]},
+            fail_on=("ns-one", "ns-two"),
+        ),
+    )
+
+    result = await _sync_service_health_async(db)
+
+    assert result.get("skipped"), "нужен маркер недоступности источника"
+    status = status_from_counts(
+        result, observed_keys=("fetched",), unavailable_keys=("skipped",)
+    )
+    assert status is SourceStatus.UNAVAILABLE
+
+
+@pytest.mark.asyncio
+async def test_partial_outage_is_not_reported_as_unavailable(db, monkeypatch):
+    """Один недоступный namespace из двух — это PARTIAL, а не отказ источника."""
+    from app.knowledge_graph.source_status import SourceStatus, status_from_counts
+
+    monkeypatch.setattr(settings, "VICTORIA_METRICS_URL", "http://vm:8428")
+    _seed_services(db, [("svc-a", "ns-one"), ("svc-b", "ns-two")])
+    monkeypatch.setattr(
+        metrics_sync, "make_metrics_provider",
+        lambda *a, **kw: _FakeVM(
+            ns_pods={"ns-one": ["svc-a-1"], "ns-two": ["svc-b-1"]},
+            pod_value=0.4, fail_on=("ns-two",),
+        ),
+    )
+
+    result = await _sync_service_health_async(db)
+
+    assert not result.get("skipped")
+    status = status_from_counts(
+        result, observed_keys=("fetched",), unavailable_keys=("skipped",)
+    )
+    assert status is SourceStatus.PARTIAL
+
+
+def test_failed_orleans_query_does_not_record_zero_failures():
+    """Упавший запрос про сбои не должен записаться как «сбоев не было».
+
+    Правило «нет серии при живом latency_count значит ноль» верно только
+    когда источник ответил: prometheus-net не экспортирует счётчик до
+    первого инкремента. Для упавшего запроса это утверждение неверно.
+    """
+    acc = {"orleans_latency_count": 100.0, "orleans_latency_sum": 2.0}
+
+    measured = metrics_sync._orleans_metrics(acc, set())
+    blind = metrics_sync._orleans_metrics(acc, {"orleans_timedout_rate"})
+
+    assert measured["orleans_timedout_rate"] == 0.0, "тишина источника = ноль сбоев"
+    assert blind["orleans_timedout_rate"] is None, "отказ источника ≠ ноль сбоев"
+    # Остальные метрики упавший запрос не портит.
+    assert blind["orleans_activation_churn"] == 0.0
+    assert blind["orleans_latency_avg_ms"] == measured["orleans_latency_avg_ms"]
+
+
+def test_failed_latency_count_makes_everything_unknown():
+    """Без счётчика вызовов ни одно из правил применить нельзя."""
+    acc = {"orleans_latency_count": 100.0, "orleans_latency_sum": 2.0}
+
+    blind = metrics_sync._orleans_metrics(acc, {"orleans_latency_count"})
+
+    assert all(v is None for v in blind.values())
+
+
+def test_failed_latency_sum_does_not_record_zero_latency():
+    """Упавший latency_sum не должен дать «латентность нулевая»."""
+    acc = {"orleans_latency_count": 100.0, "orleans_latency_sum": 5.0}
+
+    blind = metrics_sync._orleans_metrics(acc, {"orleans_latency_sum"})
+
+    assert blind["orleans_latency_avg_ms"] is None
