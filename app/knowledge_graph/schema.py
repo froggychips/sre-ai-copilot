@@ -792,6 +792,13 @@ class StorageVolume(Base):
     updated_at = Column(
         DateTime, default=datetime.utcnow, onupdate=datetime.utcnow,
     )
+    # «Синк видел этот том», в отличие от updated_at = «строка менялась».
+    # Различать обязательно: ORM не эмитит UPDATE, когда все поля совпали с
+    # прежними, а у PV они не меняются годами — 18.09.2026 из 10 059 строк
+    # моложе суток была 61 при живом снимке в 1214. Порог усадки, который
+    # считает по «недавно виденным», на таком знаменателе не работает.
+    # Обновляется явным batch-UPDATE в конце среза, см. _touch_last_seen.
+    last_seen_at = Column(DateTime, nullable=True, default=datetime.utcnow)
 
     __table_args__ = (
         UniqueConstraint(

@@ -17,6 +17,7 @@ from app.knowledge_graph.edge_decay_guard import (ALL_EDGE_SOURCES,
                                                   SOURCE_INGRESS_SYNC,
                                                   SOURCE_KG_SYNC,
                                                   record_source_run)
+from app.knowledge_graph.edge_decay_guard import SOURCE_STORAGE_PVS
 from app.knowledge_graph.schema import (Namespace, Service, ServiceHealth,
                                         StorageVolume)
 from app.knowledge_graph.self_health import (check_node_freshness,
@@ -325,3 +326,160 @@ def test_expired_report_raises_status(db, monkeypatch):
     r = check_source_coverage(db)
     assert SOURCE_KG_SYNC in r.detail["expired"]
     assert r.status == "warn"
+
+
+# ── Отменённая чистка узлов не должна выглядеть здоровым прогоном ────────
+
+def test_blocked_cleanup_reaches_self_health(db):
+    """Срез отработал, но чистку отменил — и это видно снаружи прогона.
+
+    Находка ревью: обещание «человек увидит цифры в дайджесте» не
+    выполнялось. `record_source_run` переносил в redis только ts, fetched,
+    errors и failed, поэтому прогон, отменивший чистку из-за недоверенного
+    снимка, выглядел здоровым: объекты получены, ошибок нет. Именно в этом
+    состоянии следующий прогон принял бы обрезанный снимок за опору.
+    """
+    for source in ALL_EDGE_SOURCES:
+        record_source_run(source, {"errors": 0})
+    record_source_run(SOURCE_STORAGE_PVS, {
+        "pvs_fetched": 300,
+        "errors": 0,
+        "cleanup": {
+            "skipped": "no_baseline",
+            "snapshot": 300,
+            "rows_total": 10059,
+        },
+    })
+
+    r = check_source_coverage(db)
+
+    blocked = r.detail["cleanup_blocked"]
+    assert SOURCE_STORAGE_PVS in blocked
+    assert blocked[SOURCE_STORAGE_PVS]["skipped"] == "no_baseline"
+    # Цифры рядом — по ним и видно, верить ли снимку: 300 против 10 059
+    # строк графа читается иначе, чем 1214 против тех же 10 059.
+    assert blocked[SOURCE_STORAGE_PVS]["snapshot"] == 300
+    assert blocked[SOURCE_STORAGE_PVS]["rows_total"] == 10059
+    # Именно fail: warn остаётся в метрике и логе, в Discord уходит только
+    # fail, а решение «верить ли снимку» живёт до следующего прогона синка.
+    assert r.status == "fail"
+    assert SOURCE_STORAGE_PVS not in r.detail["unhealthy"], (
+        "это не поломка источника: он отработал штатно и сам себя "
+        "притормозил — путать одно с другим значит обесценить оба сигнала"
+    )
+
+
+def test_successful_cleanup_stays_quiet(db):
+    """Прошедшая чистка статус не поднимает — иначе warn горел бы всегда."""
+    for source in ALL_EDGE_SOURCES:
+        record_source_run(source, {"errors": 0})
+    record_source_run(SOURCE_STORAGE_PVS, {
+        "pvs_fetched": 1214,
+        "errors": 0,
+        "cleanup": {"skipped": "", "volumes_deleted": 500},
+    })
+
+    r = check_source_coverage(db)
+
+    assert r.detail["cleanup_blocked"] == {}
+    assert r.status == "ok"
+
+
+def test_empty_cluster_does_not_hold_a_stuck_warning(db):
+    """Кластер без PV — законное состояние, а не остановленная чистка.
+
+    `empty_fetch` приходит от того же среза и тем же полем, но человеку с
+    ним делать нечего: инвентарь пуст, и чистить действительно нечего.
+    Считать это блокировкой значит зажечь статус навсегда — то есть
+    получить залипший `CopilotSelfHealthWarnStuck`, ровно тот шум, от
+    которого проверка уходит в других своих ветках.
+    """
+    for source in ALL_EDGE_SOURCES:
+        record_source_run(source, {"errors": 0})
+    record_source_run(SOURCE_STORAGE_PVS, {
+        "pvs_fetched": 0,
+        "errors": 0,
+        "cleanup": {"skipped": "empty_fetch"},
+    })
+
+    r = check_source_coverage(db)
+
+    assert r.detail["cleanup_blocked"] == {}
+    assert r.status == "ok"
+
+
+def test_suspicious_snapshot_carries_its_numbers(db):
+    """У `delete_pct` в отчёте есть и процент, и оба числа.
+
+    «Ужалось на 75%» без чисел не читается: это 1214 против 300 или 4
+    против 1? Решение принимает человек, и принимать его он будет по
+    тому, что дошло до отчёта.
+    """
+    for source in ALL_EDGE_SOURCES:
+        record_source_run(source, {"errors": 0})
+    record_source_run(SOURCE_STORAGE_PVS, {
+        "pvs_fetched": 300,
+        "errors": 0,
+        "cleanup": {
+            "skipped": "delete_pct",
+            "shrink_pct": 75.3,
+            "baseline": 1214,
+            "snapshot": 300,
+            "rows_total": 10059,
+        },
+    })
+
+    r = check_source_coverage(db)
+    blocked = r.detail["cleanup_blocked"][SOURCE_STORAGE_PVS]
+
+    assert blocked["shrink_pct"] == 75.3
+    # Оба числа усадки: было 1214, стало 300. `rows_total` отвечает на
+    # другой вопрос — сколько мусора в графе — и снимок им не подменяется.
+    assert blocked["baseline"] == 1214
+    assert blocked["snapshot"] == 300
+    assert r.status == "fail"
+
+
+def test_alert_line_carries_the_numbers_a_person_needs():
+    """Строка алерта содержит причину и цифры, а не одно имя проверки.
+
+    Discord рендерит warn-проверки списком имён и только fail — с деталями
+    (`_summarize_self_health_detail`). Раз чистка узлов поднимает статус до
+    fail, детали обязаны быть читаемыми: без «300 при 10 059 строках»
+    сообщение сводится к «чистка не пошла» и человеку не помогает.
+    """
+    from app.services.discord.embed_builder import (
+        _summarize_self_health_detail)
+
+    line = _summarize_self_health_detail("source_coverage", {
+        "sources_reported": 8,
+        "sources_total": 8,
+        "silent": [],
+        "cleanup_blocked": {
+            "k8s_storage_sync/pvs": {
+                "skipped": "no_baseline",
+                "snapshot": 300,
+                "rows_total": 10059,
+            },
+        },
+    })
+
+    assert "no_baseline" in line
+    assert "300" in line and "10059" in line
+    assert "k8s_storage_sync/pvs" in line
+
+
+def test_alert_line_without_blocks_reports_coverage():
+    """Без блокировок строка говорит о покрытии — прежний смысл проверки."""
+    from app.services.discord.embed_builder import (
+        _summarize_self_health_detail)
+
+    line = _summarize_self_health_detail("source_coverage", {
+        "sources_reported": 6,
+        "sources_total": 8,
+        "silent": ["k8s_storage_sync/pods"],
+        "cleanup_blocked": {},
+    })
+
+    assert "6/8" in line
+    assert "k8s_storage_sync/pods" in line

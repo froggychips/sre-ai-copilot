@@ -55,6 +55,27 @@ def _summarize_self_health_detail(name: str, detail: Dict[str, Any]) -> str:
         return f"stale={detail.get('stale_pct')}% of {detail.get('total')} edges"
     if name == "anomaly_signal_health":
         return f"count_24h={detail.get('count_24h')} — {detail.get('reason')}"
+    if name == "source_coverage":
+        blocked = detail.get("cleanup_blocked") or {}
+        if blocked:
+            parts = []
+            for source, info in list(blocked.items())[:4]:
+                # Цифры рядом с причиной: по ним человек и решает, снимок
+                # честный или обрезанный. Без них сообщение сводится к
+                # «чистка не пошла», то есть не помогает.
+                nums = ", ".join(
+                    f"{k}={v}" for k, v in info.items() if k != "skipped"
+                )
+                parts.append(
+                    f"{source}: {info.get('skipped')}"
+                    + (f" ({nums})" if nums else "")
+                )
+            return "чистка узлов остановлена — " + "; ".join(parts)
+        return (
+            f"источники: {detail.get('sources_reported')}/"
+            f"{detail.get('sources_total')}, "
+            f"молчат: {', '.join(detail.get('silent') or []) or '—'}"
+        )
     if name == "alerts_resolve_freshness":
         return f"stale_open={detail.get('stale_open_alerts')} alerts >7d unresolved"
     # generic fallback

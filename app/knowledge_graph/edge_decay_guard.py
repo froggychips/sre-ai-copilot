@@ -91,6 +91,11 @@ SOURCE_NATS_SUBJECTS_SYNC = "nats_subjects_sync"
 # независимы (разные `kubectl get`, разные объёмы, разные режимы отказа).
 SOURCE_STORAGE_PODS = "k8s_storage_sync/pods"
 SOURCE_STORAGE_PVCS = "k8s_storage_sync/pvcs"
+# Срез PV. Рёбер сам по себе не даёт (`bound_to` строится от PVC), но это
+# отдельный `kubectl get pv` со своим режимом отказа — и до 18.09.2026 он
+# не отчитывался вовсе: PV-часть синка была невидима для покрытия
+# источников, хотя именно её снимок решает, чистить ли узлы.
+SOURCE_STORAGE_PVS = "k8s_storage_sync/pvs"
 
 #: Все источники, отчитывающиеся через `record_source_run`. Нужен для
 #: вопроса «а все ли вообще отработали»: до сих пор отчёты читал только сам
@@ -106,6 +111,7 @@ ALL_EDGE_SOURCES: tuple = (
     SOURCE_NATS_SUBJECTS_SYNC,
     SOURCE_STORAGE_PODS,
     SOURCE_STORAGE_PVCS,
+    SOURCE_STORAGE_PVS,
 )
 
 
@@ -185,6 +191,7 @@ _SOURCE_FETCH_KEY: Dict[str, str] = {
     # — полученный PVC.
     SOURCE_STORAGE_PODS: "pods_scanned",
     SOURCE_STORAGE_PVCS: "pvcs_fetched",
+    SOURCE_STORAGE_PVS: "pvs_fetched",
 }
 
 # Окно свежести по умолчанию. Должно быть больше максимального интервала
@@ -211,6 +218,11 @@ class SourceReport:
     errors: int
     #: Синк завершился аварийно целиком (вернул `{"error": ...}`).
     failed: bool
+    #: Итог чистки узлов у тех источников, которые её делают: причина
+    #: пропуска и цифры, по которым видно, доверять ли снимку. В отличие от
+    #: `raw` переносится в redis — потому что читать это должен не сам
+    #: прогон, а self-health в соседнем процессе.
+    cleanup: Dict[str, Any] = field(default_factory=dict)
     raw: Dict[str, Any] = field(default_factory=dict)
 
 
@@ -255,12 +267,23 @@ def record_source_run(
     except (TypeError, ValueError):
         errors = 0
 
+    cleanup_raw = payload.get("cleanup")
+    cleanup: Dict[str, Any] = {}
+    if isinstance(cleanup_raw, dict):
+        # Только то, по чему принимается решение, — не весь блок: значение
+        # едет в redis и не должно расти вместе со stats синка.
+        for key in ("skipped", "shrink_pct", "baseline", "snapshot",
+                    "rows_total"):
+            if cleanup_raw.get(key) not in (None, ""):
+                cleanup[key] = cleanup_raw[key]
+
     report = SourceReport(
         source=source,
         ts=now or datetime.utcnow(),
         fetched=fetched,
         errors=errors,
         failed=bool(payload.get("error")),
+        cleanup=cleanup,
         raw=payload,
     )
     _REPORTS[source] = report
@@ -283,6 +306,7 @@ def _persist_report(report: SourceReport) -> None:
             "fetched": report.fetched,
             "errors": report.errors,
             "failed": report.failed,
+            "cleanup": report.cleanup,
         })
     except Exception:  # noqa: BLE001 — телеметрия не роняет синк
         pass
@@ -293,7 +317,9 @@ def _report_from_redis(source: str) -> Optional[SourceReport]:
 
     `raw` намеренно не переносится: он нужен только для отладки внутри
     одного прогона, а в redis раздувал бы значение полным stats-словарём
-    синка. Решения принимаются по fetched/errors/failed.
+    синка. Решения принимаются по fetched/errors/failed и по компактному
+    `cleanup` — последний переносится, потому что его читателем как раз и
+    является соседний процесс (self-health).
     """
     try:
         from app.services.digest.state import get_source_report
@@ -308,12 +334,14 @@ def _report_from_redis(source: str) -> Optional[SourceReport]:
         if ts.tzinfo is not None:
             ts = ts.astimezone(timezone.utc).replace(tzinfo=None)
         fetched = data.get("fetched")
+        cleanup = data.get("cleanup")
         return SourceReport(
             source=source,
             ts=ts,
             fetched=int(fetched) if fetched is not None else None,
             errors=int(data.get("errors") or 0),
             failed=bool(data.get("failed")),
+            cleanup=cleanup if isinstance(cleanup, dict) else {},
             raw={},
         )
     except Exception:  # noqa: BLE001 — читаем best-effort
