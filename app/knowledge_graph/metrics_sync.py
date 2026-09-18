@@ -33,7 +33,8 @@ from typing import Any, Dict, List, Optional, Tuple, cast
 from sqlalchemy.orm import Session
 
 from app.config import settings
-from app.context.vm_client import VMClient
+from app.providers.metrics import MetricsProvider
+from app.providers.vm_metrics import make_metrics_provider
 from app.knowledge_graph.namespace_lifecycle import missing_namespace_names
 from app.knowledge_graph.populator import insert_idempotent
 from app.knowledge_graph.schema import (NODE_KIND_SERVICE, Service,
@@ -234,9 +235,20 @@ def _insert_idempotent(
     return insert_idempotent(db, row)
 
 
+class MetricsUnavailable(RuntimeError):
+    """Источник метрик не ответил ни по одному окну namespace.
+
+    Отдельный тип, потому что смысл у него ровно противоположный пустому
+    результату: пустота — факт («серий нет»), а это — отсутствие факта.
+    Синк считает такой namespace неуспешным, и цифра `errors` перестаёт
+    быть нулевой при полной слепоте.
+    """
+
+
+
 async def _fetch_namespace(
     sem: asyncio.Semaphore,
-    vm: VMClient,
+    vm: MetricsProvider,
     namespace: str,
     orleans: bool = False,
 ) -> Tuple[str, Optional[Dict[str, Dict[str, float]]], Optional[BaseException]]:
@@ -248,38 +260,53 @@ async def _fetch_namespace(
     """
     async with sem:
         try:
-            by_pod = await asyncio.gather(
-                vm.query_instant_by(_q_ns_cpu_by_pod(namespace), "pod"),
-                vm.query_instant_by(_q_ns_mem_by_pod(namespace), "pod"),
-                vm.query_instant_by(_q_ns_restarts_by_pod(namespace), "pod"),
-                vm.query_instant_by(_q_ns_5xx_by_service(namespace), "service"),
-                vm.query_instant_by(_q_ns_p95_by_service(namespace), "service"),
+            base = await asyncio.gather(
+                vm.by_label(_q_ns_cpu_by_pod(namespace), "pod"),
+                vm.by_label(_q_ns_mem_by_pod(namespace), "pod"),
+                vm.by_label(_q_ns_restarts_by_pod(namespace), "pod"),
+                vm.by_label(_q_ns_5xx_by_service(namespace), "service"),
+                vm.by_label(_q_ns_p95_by_service(namespace), "service"),
             )
+            # Ни одно окно не измерено — про namespace неизвестно НИЧЕГО.
+            # Вернуться нормально значило бы записать «сигнала нет» для всех
+            # его сервисов: недоступная VictoriaMetrics выглядела бы как
+            # namespace, где никто не экспортирует метрик, а прогон — как
+            # успешный (errors=0, skipped_empty=N). Ровно та слепота,
+            # неотличимая от тишины, против которой стоит весь Этап 0.
+            if not any(m.measured for m in base):
+                reasons = {m.reason for m in base if m.reason}
+                return (namespace, None, MetricsUnavailable(
+                    f"{namespace}: ни одно окно не измерено "
+                    f"({'; '.join(sorted(reasons)) or 'источник молчит'})"
+                ))
+            # Частичный отказ данные не отменяет: измеренные окна пишем,
+            # неизмеренные дают пустоту — и для сервиса это обернётся None,
+            # то есть честным «не знаем», а не нулём.
             raw: Dict[str, Dict[str, float]] = {
-                "cpu_pct": by_pod[0],
-                "mem_pct": by_pod[1],
-                "restarts_rate": by_pod[2],
-                "http_5xx_rate": by_pod[3],
-                "p95_latency_ms": by_pod[4],
+                "cpu_pct": base[0].or_else({}),
+                "mem_pct": base[1].or_else({}),
+                "restarts_rate": base[2].or_else({}),
+                "http_5xx_rate": base[3].or_else({}),
+                "p95_latency_ms": base[4].or_else({}),
             }
             if orleans:
                 orl = await asyncio.gather(
-                    vm.query_instant_by(_q_ns_orleans_latency_sum_by_pod(namespace), "pod"),
-                    vm.query_instant_by(_q_ns_orleans_latency_count_by_pod(namespace), "pod"),
-                    vm.query_instant_by(_q_ns_orleans_timedout_by_pod(namespace), "pod"),
-                    vm.query_instant_by(_q_ns_orleans_faults_by_pod(namespace), "pod"),
-                    vm.query_instant_by(_q_ns_orleans_pings_missed_by_pod(namespace), "pod"),
-                    vm.query_instant_by(_q_ns_orleans_churn_by_pod(namespace), "pod"),
-                    vm.query_instant_by(_q_ns_orleans_rerouted_by_pod(namespace), "pod"),
+                    vm.by_label(_q_ns_orleans_latency_sum_by_pod(namespace), "pod"),
+                    vm.by_label(_q_ns_orleans_latency_count_by_pod(namespace), "pod"),
+                    vm.by_label(_q_ns_orleans_timedout_by_pod(namespace), "pod"),
+                    vm.by_label(_q_ns_orleans_faults_by_pod(namespace), "pod"),
+                    vm.by_label(_q_ns_orleans_pings_missed_by_pod(namespace), "pod"),
+                    vm.by_label(_q_ns_orleans_churn_by_pod(namespace), "pod"),
+                    vm.by_label(_q_ns_orleans_rerouted_by_pod(namespace), "pod"),
                 )
                 raw.update({
-                    "orleans_latency_sum": orl[0],
-                    "orleans_latency_count": orl[1],
-                    "orleans_timedout_rate": orl[2],
-                    "orleans_messaging_fault_rate": orl[3],
-                    "orleans_pings_missed_rate": orl[4],
-                    "orleans_activation_churn": orl[5],
-                    "orleans_rerouted_rate": orl[6],
+                    "orleans_latency_sum": orl[0].or_else({}),
+                    "orleans_latency_count": orl[1].or_else({}),
+                    "orleans_timedout_rate": orl[2].or_else({}),
+                    "orleans_messaging_fault_rate": orl[3].or_else({}),
+                    "orleans_pings_missed_rate": orl[4].or_else({}),
+                    "orleans_activation_churn": orl[5].or_else({}),
+                    "orleans_rerouted_rate": orl[6].or_else({}),
                 })
             return (namespace, raw, None)
         except BaseException as e:  # noqa: BLE001 — фиксируем всё, классифицируем выше
@@ -375,7 +402,10 @@ async def _sync_service_health_async(db: Session) -> Dict[str, Any]:
         log.info("metrics_sync.skipped reason=no_vm_url")
         return {"skipped": "no_vm_url"}
 
-    vm = VMClient(settings.VICTORIA_METRICS_URL, timeout=15.0)
+    # Провайдер, а не VMClient напрямую: синк не должен знать, откуда
+    # берутся метрики, а отказ источника обязан доезжать сюда отличимым
+    # от пустого ответа.
+    vm = make_metrics_provider(url=settings.VICTORIA_METRICS_URL, timeout=15.0)
     # node_kind='service': с contract 2.4 у пары «k8s Service foo + Deployment
     # foo» ДВА non-synthetic узла. Метрики агрегируются по имени, поэтому без
     # фильтра каждая пара писала бы две идентичные строки kg_service_health
@@ -433,11 +463,15 @@ async def _sync_service_health_async(db: Session) -> Dict[str, Any]:
     # Orleans discovery: где вообще есть метер силоса (07.09.2026 — 24 ns из
     # 231). Сбой discovery не роняет тик — просто без Orleans в этот раз.
     orleans_ns: set = set()
-    try:
-        found = await vm.query_instant_by(_q_orleans_namespaces(), "namespace")
-        orleans_ns = {ns for ns in found if ns in by_ns}
-    except Exception as e:  # noqa: BLE001
-        log.warning("metrics_sync.orleans_discovery_failed err=%s", e)
+    discovery = await vm.by_label(_q_orleans_namespaces(), "namespace")
+    if discovery.measured:
+        orleans_ns = {ns for ns in (discovery.value or {}) if ns in by_ns}
+    else:
+        # Discovery не удалось — просто без Orleans в этот раз, тик не роняем.
+        # Это не то же, что «силосов нет»: в лог уходит причина, а не тишина.
+        log.warning(
+            "metrics_sync.orleans_discovery_unmeasured reason=%s", discovery.reason
+        )
     stats["orleans_namespaces"] = len(orleans_ns)
     stats["orleans_queries"] = len(orleans_ns) * ORLEANS_QUERY_COUNT
 

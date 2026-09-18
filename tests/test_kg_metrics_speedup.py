@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import re
-from typing import Dict, List
+from typing import List
 
 import pytest
 from sqlalchemy import create_engine
@@ -64,14 +64,16 @@ _NS_RE = re.compile(r'namespace="([^"]+)"')
 
 
 class _FakeVM:
-    """In-process VMClient stub для query_instant_by.
+    """In-process MetricsProvider stub.
 
     ns_pods:     {namespace: [pod_name, ...]} — что вернут by(pod)-запросы.
     pod_value:   значение для каждого pod.
-    fail_on:     namespaces, на которых любой запрос рейзит (gather внутри
-                 _fetch_namespace проглотит — но мы тестим и явный raise через
-                 fail_hard).
+    fail_on:     namespaces, по которым источник НЕ отвечает — провайдер
+                 возвращает `Measurement.unknown`, и синк обязан считать
+                 такой namespace неуспешным, а не пустым.
     """
+
+    name = "fake-vm"
 
     def __init__(self, ns_pods=None, pod_value=0.5,
                  fail_on=(), per_query_delay=0.0):
@@ -84,7 +86,9 @@ class _FakeVM:
         self._lock = asyncio.Lock()
         self.queries: List[str] = []
 
-    async def query_instant_by(self, query: str, by_label: str) -> Dict[str, float]:
+    async def by_label(self, query: str, label: str):
+        from app.providers.measurement import Measurement
+
         async with self._lock:
             self.in_flight += 1
             self.peak_in_flight = max(self.peak_in_flight, self.in_flight)
@@ -95,11 +99,12 @@ class _FakeVM:
             m = _NS_RE.search(query)
             ns = m.group(1) if m else ""
             if ns in self._fail:
-                raise RuntimeError(f"synthetic failure for {ns}")
-            # 5xx/p95 (by service) — пусто, как в текущем кластере.
-            if by_label == "service":
-                return {}
-            return {pod: self._val for pod in self._ns_pods.get(ns, [])}
+                return Measurement.unknown(f"vm_unavailable: synthetic {ns}")
+            # 5xx/p95 (by service) — пусто, как в текущем кластере. Пустота
+            # измерена: источник ответил, серий нет.
+            if label == "service":
+                return Measurement.of({})
+            return Measurement.of({pod: self._val for pod in self._ns_pods.get(ns, [])})
         finally:
             async with self._lock:
                 self.in_flight -= 1
@@ -186,7 +191,7 @@ async def test_sync_skipped_when_no_vm_url(db, monkeypatch):
 @pytest.mark.asyncio
 async def test_sync_returns_empty_stats_when_no_services(db, monkeypatch):
     monkeypatch.setattr(settings, "VICTORIA_METRICS_URL", "http://vm:8428")
-    monkeypatch.setattr(metrics_sync, "VMClient", lambda *a, **kw: _FakeVM())
+    monkeypatch.setattr(metrics_sync, "make_metrics_provider", lambda *a, **kw: _FakeVM())
     result = await _sync_service_health_async(db)
     assert result["real_services"] == 0
     assert result["inserted"] == 0
@@ -207,7 +212,7 @@ async def test_sync_writes_rows_with_signal(db, monkeypatch):
         "prod-shared": ["push-service-eee-fff"],
     }
     monkeypatch.setattr(
-        metrics_sync, "VMClient",
+        metrics_sync, "make_metrics_provider",
         lambda *a, **kw: _FakeVM(ns_pods=ns_pods, pod_value=0.3),
     )
     result = await _sync_service_health_async(db)
@@ -231,7 +236,7 @@ async def test_sync_skips_empty_signal(db, monkeypatch):
     _seed_services(db, [("a-service", "ns-1"), ("b-service", "ns-1")])
     # ns_pods пуст → by(pod) вернёт {} → все метрики None.
     monkeypatch.setattr(
-        metrics_sync, "VMClient", lambda *a, **kw: _FakeVM(ns_pods={}),
+        metrics_sync, "make_metrics_provider", lambda *a, **kw: _FakeVM(ns_pods={}),
     )
     result = await _sync_service_health_async(db)
     assert result["with_signal"] == 0
@@ -254,7 +259,7 @@ async def test_sync_isolates_failed_namespace(db, monkeypatch):
     }
     # _fetch_namespace ловит BaseException → ns-bad даст errors+=1, ns-good пишется.
     monkeypatch.setattr(
-        metrics_sync, "VMClient",
+        metrics_sync, "make_metrics_provider",
         lambda *a, **kw: _FakeVM(ns_pods=ns_pods, pod_value=0.2, fail_on=("ns-bad",)),
     )
     result = await _sync_service_health_async(db)
@@ -277,7 +282,7 @@ async def test_sync_semaphore_caps_namespace_concurrency(db, monkeypatch):
     _seed_services(db, specs)
     ns_pods = {f"ns-{i}": [f"svc-{i}-pod"] for i in range(20)}
     fake = _FakeVM(ns_pods=ns_pods, pod_value=0.1, per_query_delay=0.02)
-    monkeypatch.setattr(metrics_sync, "VMClient", lambda *a, **kw: fake)
+    monkeypatch.setattr(metrics_sync, "make_metrics_provider", lambda *a, **kw: fake)
 
     await _sync_service_health_async(db)
 
@@ -303,7 +308,7 @@ async def test_sync_ignores_workload_twin_node(db, monkeypatch):
     db.add_all([svc, twin])
     db.commit()
     monkeypatch.setattr(
-        metrics_sync, "VMClient",
+        metrics_sync, "make_metrics_provider",
         lambda *a, **kw: _FakeVM(
             ns_pods={"prod-kingdom1": ["bot-service-aaa-bbb"]}, pod_value=0.3,
         ),
@@ -321,9 +326,73 @@ async def test_sync_records_duration_ms(db, monkeypatch):
     monkeypatch.setattr(settings, "VICTORIA_METRICS_URL", "http://vm:8428")
     _seed_services(db, [("svc", "ns-1")])
     monkeypatch.setattr(
-        metrics_sync, "VMClient",
+        metrics_sync, "make_metrics_provider",
         lambda *a, **kw: _FakeVM(ns_pods={"ns-1": ["svc-1"]}, pod_value=0.5),
     )
     result = await _sync_service_health_async(db)
     assert isinstance(result["duration_ms"], int)
     assert result["duration_ms"] >= 0
+
+
+@pytest.mark.asyncio
+async def test_blind_source_is_not_a_quiet_success(db, monkeypatch):
+    """Недоступная VictoriaMetrics обязана считаться ошибкой, а не тишиной.
+
+    До перевода на провайдер отказ глотался внутри клиента: `errors`
+    оставался нулевым, сервисы получали None по всем метрикам и уходили в
+    `skipped_empty`. Прогон выглядел образцовым — ошибок нет, просто ни у
+    кого нет сигнала, — и отличить это от namespace без экспортёров было
+    нельзя. Ровно та слепота, неотличимая от тишины, против которой стоит
+    нулевой слой.
+    """
+    monkeypatch.setattr(settings, "VICTORIA_METRICS_URL", "http://vm:8428")
+    _seed_services(db, [("svc-a", "ns-one"), ("svc-b", "ns-two")])
+    monkeypatch.setattr(
+        metrics_sync, "make_metrics_provider",
+        lambda *a, **kw: _FakeVM(
+            ns_pods={"ns-one": ["svc-a-1"], "ns-two": ["svc-b-1"]},
+            fail_on=("ns-one", "ns-two"),
+        ),
+    )
+
+    result = await _sync_service_health_async(db)
+
+    assert result["errors"] == 2, "оба namespace недоступны — оба в ошибках"
+    assert result["inserted"] == 0
+    assert result["skipped_empty"] == 0, (
+        "слепота не должна маскироваться под «нет сигнала»"
+    )
+    assert db.query(ServiceHealth).count() == 0
+
+
+@pytest.mark.asyncio
+async def test_partial_blindness_keeps_measured_data(db, monkeypatch):
+    """Часть окон не измерена — измеренные всё равно пишем.
+
+    Терять данные из-за одного молчащего запроса незачем: сервис получит
+    None по неизмеренной метрике, то есть честное «не знаем», а не ноль.
+    """
+    monkeypatch.setattr(settings, "VICTORIA_METRICS_URL", "http://vm:8428")
+    _seed_services(db, [("svc-a", "ns-one")])
+
+    class _PartialVM(_FakeVM):
+        async def by_label(self, query: str, label: str):
+            from app.providers.measurement import Measurement
+
+            # Молчит только запрос про рестарты; cpu/mem отвечают.
+            if "restart" in query:
+                return Measurement.unknown("vm_unavailable: synthetic")
+            return await super().by_label(query, label)
+
+    monkeypatch.setattr(
+        metrics_sync, "make_metrics_provider",
+        lambda *a, **kw: _PartialVM(ns_pods={"ns-one": ["svc-a-1"]}, pod_value=0.7),
+    )
+
+    result = await _sync_service_health_async(db)
+
+    assert result["errors"] == 0, "частичный отказ не делает namespace неуспешным"
+    assert result["inserted"] == 1
+    row = db.query(ServiceHealth).first()
+    assert row.cpu_pct is not None
+    assert row.restarts_rate is None, "неизмеренное остаётся неизвестным, не нулём"

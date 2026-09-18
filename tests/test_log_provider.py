@@ -196,7 +196,11 @@ def test_interface_does_not_depend_on_any_implementation():
         elif isinstance(node, ast.Import):
             imported.update(a.name for a in node.names)
 
-    leaked = [m for m in imported if m.startswith("app.")]
+    # `app.providers.measurement` — общий словарь измеримости, а не
+    # источник: один вопрос «данных нет или ноль» и один тип-ответ на него
+    # для логов и метрик. Запрещены зависимости от РЕАЛИЗАЦИЙ.
+    allowed = {"app.providers.measurement"}
+    leaked = [m for m in imported if m.startswith("app.") and m not in allowed]
     assert not leaked, f"интерфейс зависит от реализации: {leaked}"
 
 

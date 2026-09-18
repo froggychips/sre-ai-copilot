@@ -26,9 +26,16 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Dict, Generic, Mapping, Optional, Sequence, TypeVar
+from typing import Dict, Mapping, Optional, Sequence
 
-T = TypeVar("T")
+from app.providers.measurement import Measurement
+
+__all__ = [
+    "LogProvider",
+    "LogProviderError",
+    "Measurement",
+    "ServiceLogStats",
+]
 
 
 class LogProviderError(RuntimeError):
@@ -37,44 +44,6 @@ class LogProviderError(RuntimeError):
     Это НЕ «событий не найдено». Вызывающий, поймав это, не имеет права
     записать ноль: состояние логов неизвестно.
     """
-
-
-@dataclass(frozen=True)
-class Measurement(Generic[T]):
-    """Значение ИЛИ явное «не измеряли».
-
-    `measured=False` означает, что окно не наблюдалось: источник не
-    ответил, не настроен или отказал. `value` при этом None — не 0, не
-    пустой список, ничего, что можно спутать с ответом.
-
-    `exact=False` — значение измерено, но является НИЖНЕЙ оценкой: так
-    отвечает Seq, когда окно упирается в потолок пагинации. Отличать это
-    от точного счёта важно ровно там, где по счёту принимают решение:
-    «не меньше 20000» и «ровно 20000» — разные утверждения.
-    """
-
-    value: Optional[T]
-    measured: bool
-    exact: bool = True
-    reason: str = ""
-
-    @classmethod
-    def of(cls, value: T, *, exact: bool = True) -> "Measurement[T]":
-        return cls(value=value, measured=True, exact=exact)
-
-    @classmethod
-    def unknown(cls, reason: str) -> "Measurement[T]":
-        return cls(value=None, measured=False, reason=reason)
-
-    def or_else(self, fallback: T) -> T:
-        """Значение или запасное. Вызывать осознанно.
-
-        Существует для мест, где подстановка действительно уместна
-        (например, показать 0 в тексте для человека, который видит рядом
-        пометку о недоступности). В логике решений вместо этого нужно
-        смотреть на `measured`.
-        """
-        return self.value if self.measured and self.value is not None else fallback
 
 
 @dataclass(frozen=True)

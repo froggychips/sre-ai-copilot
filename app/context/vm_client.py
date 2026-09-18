@@ -162,6 +162,15 @@ class ClusterHealth:
         return {**self._m, "health_status": self.health_status}
 
 
+class VMQueryError(RuntimeError):
+    """VictoriaMetrics не ответила. Это НЕ «серий не найдено».
+
+    Пустой результат означает, что метрик за окно нет и записывать нечего;
+    исключение — что состояние метрик неизвестно, и вывод «у сервисов всё
+    тихо» из него не следует.
+    """
+
+
 class VMClient:
     """Тонкая обёртка над VictoriaMetrics /api/v1/query и /api/v1/query_range."""
 
@@ -221,6 +230,77 @@ class VMClient:
                     continue
         except Exception as e:
             logger.debug("vm_client.query_instant_by failed query=%r: %s", query, e)
+        return out
+
+    async def query_instant_by_strict(
+        self, query: str, by_label: str
+    ) -> Dict[str, float]:
+        """`query_instant_by`, но отказ поднимает VMQueryError.
+
+        Нужен там, где пустой ответ приводит к записи в граф: без разделения
+        «серий нет» и «источник молчит» недоступная VictoriaMetrics выглядит
+        как namespace, где никто не экспортирует метрик.
+        """
+        params = {"query": query}
+        try:
+            async with httpx.AsyncClient(timeout=self._timeout) as client:
+                r = await client.get(f"{self._url}/api/v1/query", params=params)
+                r.raise_for_status()
+                data = r.json()
+        except Exception as e:
+            raise VMQueryError(f"vm {self._url}: {type(e).__name__}: {e}") from e
+        return self._series_by_label(data, by_label)
+
+    async def query_instant_by_labels_strict(
+        self, query: str, by_labels: Tuple[str, ...],
+    ) -> Dict[Tuple[str, ...], float]:
+        """`query_instant_by_labels`, но отказ поднимает VMQueryError."""
+        params = {"query": query}
+        try:
+            async with httpx.AsyncClient(timeout=self._timeout) as client:
+                r = await client.get(f"{self._url}/api/v1/query", params=params)
+                r.raise_for_status()
+                data = r.json()
+        except Exception as e:
+            raise VMQueryError(f"vm {self._url}: {type(e).__name__}: {e}") from e
+        return self._series_by_labels(data, by_labels)
+
+    @staticmethod
+    def _series_by_label(data: Any, by_label: str) -> Dict[str, float]:
+        """Разбор ответа в {метка: значение}. Серии без метки и NaN/Inf — мимо."""
+        out: Dict[str, float] = {}
+        for series in data.get("data", {}).get("result", []):
+            key = series.get("metric", {}).get(by_label)
+            if not key:
+                continue
+            val = series.get("value", [None, None])[1]
+            if val in ("NaN", "Inf", "+Inf", "-Inf", None):
+                continue
+            try:
+                out[str(key)] = float(val)
+            except (TypeError, ValueError):
+                continue
+        return out
+
+    @staticmethod
+    def _series_by_labels(
+        data: Any, by_labels: Tuple[str, ...]
+    ) -> Dict[Tuple[str, ...], float]:
+        """То же с составным ключом. Неполный ключ пропускаем: по нему не
+        понять, к какой сущности относится значение."""
+        out: Dict[Tuple[str, ...], float] = {}
+        for series in data.get("data", {}).get("result", []):
+            metric = series.get("metric", {})
+            key = tuple(str(metric.get(lbl, "")) for lbl in by_labels)
+            if not all(key):
+                continue
+            val = series.get("value", [None, None])[1]
+            if val in ("NaN", "Inf", "+Inf", "-Inf", None):
+                continue
+            try:
+                out[key] = float(val)
+            except (TypeError, ValueError):
+                continue
         return out
 
     async def query_instant_by_labels(
