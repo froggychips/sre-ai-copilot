@@ -130,3 +130,71 @@ def test_aggregation_groups_identical_templates():
     assert counter.most_common(1)[0] == (
         "[BOT] Error processing active bot {BotUserId}", 6
     )
+
+
+# --- находки ревью: токен богаче своего имени -----------------------------
+
+def test_raw_text_keeps_destructuring():
+    """`{@Error}` не превращается в `{Error}`.
+
+    `@` перед именем — это деструктурирование: Seq разворачивает объект, а
+    не пишет его `ToString()`. Живой рекон 18.09.2026 (4000 событий всех
+    восьми Seq): 413 property-токенов из 10 207 несут `RawText`, и все —
+    именно такие: `{@Error}`, `{@Ops}`, `{@Op}`, `{@StatesBefore}`.
+    Собрать их из одного `PropertyName` значит записать в наблюдение
+    шаблон, которого в Seq нет.
+    """
+    event = {
+        "MessageTemplateTokens": [
+            {"Text": "sync failed: "},
+            {"PropertyName": "Error", "RawText": "{@Error}"},
+        ]
+    }
+    assert SeqClient.extract_message_template(event) == "sync failed: {@Error}"
+
+
+def test_formatted_token_does_not_collapse_into_plain_one():
+    """`{Elapsed:0.000}` и `{Elapsed}` — разные шаблоны, разные группы.
+
+    Для Seq это два разных шаблона, и схлопывать их в один
+    `top_message_hash` значит складывать в одну кучу события, которые
+    разошлись в коде.
+    """
+    formatted = SeqClient.extract_message_template({
+        "MessageTemplateTokens": [
+            {"Text": "done in "},
+            {"PropertyName": "Elapsed", "RawText": "{Elapsed:0.000}"},
+        ]
+    })
+    plain = SeqClient.extract_message_template({
+        "MessageTemplateTokens": [
+            {"Text": "done in "},
+            {"PropertyName": "Elapsed"},
+        ]
+    })
+    assert formatted == "done in {Elapsed:0.000}"
+    assert plain == "done in {Elapsed}"
+    assert formatted != plain
+
+
+def test_property_name_used_when_raw_text_absent():
+    """Без `RawText` плейсхолдер собирается по имени — как и раньше.
+
+    `RawText` есть у 4% токенов; остальные 96% должны работать по-старому.
+    """
+    event = {"MessageTemplateTokens": [{"PropertyName": "BotUserId"}]}
+    assert SeqClient.extract_message_template(event) == "{BotUserId}"
+
+
+def test_edge_whitespace_is_preserved():
+    """Крайние пробелы шаблона не срезаются.
+
+    Обрезка склеивала бы два разных шаблона Seq в один хэш, а сохранённый
+    `sample_message` переставал бы совпадать с тем, что написано в коде
+    сервиса.
+    """
+    padded = SeqClient.extract_message_template({
+        "MessageTemplateTokens": [{"Text": " bot stalled "}]
+    })
+    assert padded == " bot stalled "
+    assert padded != "bot stalled"
