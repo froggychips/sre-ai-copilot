@@ -198,3 +198,53 @@ def test_edge_whitespace_is_preserved():
     })
     assert padded == " bot stalled "
     assert padded != "bot stalled"
+
+
+def test_escaped_braces_do_not_merge_with_a_real_placeholder():
+    """`{{Name}}` в шаблоне и `{Name}` как свойство — разные события.
+
+    Seq отдаёт экранированную скобку уже развёрнутой: текстовый токен
+    приходит как `User {Name}`. Склеенный как есть, он совпал бы с
+    шаблоном, где `Name` — настоящее свойство, и два разных события легли
+    бы в один `top_message_hash`.
+    """
+    literal = SeqClient.extract_message_template({
+        "MessageTemplateTokens": [{"Text": "User {Name} is literal"}]
+    })
+    parametrized = SeqClient.extract_message_template({
+        "MessageTemplateTokens": [
+            {"Text": "User "},
+            {"PropertyName": "Name"},
+            {"Text": " is literal"},
+        ]
+    })
+    assert literal == "User {{Name}} is literal"
+    assert parametrized == "User {Name} is literal"
+    assert literal != parametrized
+
+
+def test_interpolated_json_is_left_alone():
+    """Скобки интерполированного JSON не удваиваются.
+
+    Рекон 18.09.2026: из 13 449 текстовых токенов скобки есть у 67, и все
+    они — JSON, вставленный в строку интерполяцией (`$"...{json}"`).
+    Плейсхолдером Serilog его не считает — сразу за скобкой кавычка, — и в
+    шаблоне он записан ровно так, как пришёл. Удвоить в нём скобки значило
+    бы исказить текст, который Seq отдал точным.
+    """
+    event = {"MessageTemplateTokens": [
+        {"Text": "Received LeaderboardUpdated message: "},
+        {"Text": '{"LeaderboardId":4002,"Score":20,"GroupId":null}'},
+    ]}
+    assert SeqClient.extract_message_template(event) == (
+        'Received LeaderboardUpdated message: '
+        '{"LeaderboardId":4002,"Score":20,"GroupId":null}'
+    )
+
+
+def test_formatted_placeholder_in_literal_text_is_escaped():
+    """Экранируется и плейсхолдер с форматом — Serilog принял бы и его."""
+    event = {"MessageTemplateTokens": [{"Text": "took {Elapsed:0.000} ms"}]}
+    assert SeqClient.extract_message_template(event) == (
+        "took {{Elapsed:0.000}} ms"
+    )

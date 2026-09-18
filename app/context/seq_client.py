@@ -19,6 +19,7 @@ per service per window и записи в `kg_log_observations`.
 from __future__ import annotations
 
 import logging
+import re
 from collections import Counter
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
@@ -56,6 +57,33 @@ class SeqQueryError(RuntimeError):
     записывать нечего, а исключение — что состояние логов неизвестно и
     делать вывод «ошибок нет» неправомерно.
     """
+
+
+# Что Serilog принял бы за плейсхолдер: имя свойства, опционально с
+# префиксом `@`/`$`, выравниванием (`,-5`) и форматом (`:0.000`). Нужно,
+# чтобы отличить литеральную скобку от экранированной — см.
+# `_reescape_placeholders`.
+_PLACEHOLDER_RE = re.compile(r"\{[@$]?[A-Za-z0-9_]+(?:,-?\d+)?(?::[^{}]*)?\}")
+
+
+def _reescape_placeholders(text: str) -> str:
+    """Вернуть текстовому токену экранирование, которое снял Seq.
+
+    В Serilog литеральная фигурная скобка пишется удвоенной: шаблон
+    `User {{Name}} is literal` — это текст, а не плейсхолдер. Seq отдаёт
+    такой токен уже развёрнутым, `User {Name} is literal`, и склеенный
+    как есть он совпадёт с ДРУГИМ шаблоном — тем, где `Name` настоящее
+    свойство. Два разных события слились бы в один `top_message_hash`.
+
+    Экранируется только то, что Serilog вообще счёл бы плейсхолдером.
+    Разница не теоретическая: рекон 13 449 текстовых токенов 18.09.2026
+    нашёл 67 со скобками, и все до единого — интерполированный в строку
+    JSON (`Received LeaderboardUpdated message: {"LeaderboardId":4002,…}`).
+    Плейсхолдером он не является — там кавычка сразу после скобки, — и
+    удвоить в нём скобки значило бы исказить текст, который Seq отдал
+    точно таким, каким он записан в шаблоне.
+    """
+    return _PLACEHOLDER_RE.sub(lambda m: "{" + m.group(0) + "}", text)
 
 
 class SeqClient:
@@ -341,7 +369,7 @@ class SeqClient:
                     continue
                 text = token.get("Text")
                 if text:
-                    parts.append(str(text))
+                    parts.append(_reescape_placeholders(str(text)))
                     continue
                 raw = token.get("RawText")
                 if raw:
