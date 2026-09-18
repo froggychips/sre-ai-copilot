@@ -482,3 +482,48 @@ def test_weak_inheritance_does_not_overwrite_workload_label(db):
         .one()
     )
     assert workload.team_owner == "squad-7", "лейбл workload сильнее догадки Service"
+
+
+def test_orphaned_provenance_does_not_block_repair(db):
+    """Осиротевший сильный провенанс при пустом владельце не должен запирать строку.
+
+    Состояние «owner_source=manual, team_owner пуст» — то самое
+    противоречие, которое этот PR и чинит. Если доверять его провенансу,
+    сравнение по силе отвергнет входящий лейбл (0.9 против 1.0), и строка
+    останется без владельца на каждом проходе синка.
+    """
+    from app.knowledge_graph.schema import NODE_KIND_WORKLOAD
+
+    upsert_service(
+        db, namespace="squad-13-kingdom2", name="town-service",
+        node_kind=NODE_KIND_WORKLOAD,
+    )
+    broken = (
+        db.query(Service)
+        .filter(
+            Service.namespace == "squad-13-kingdom2",
+            Service.node_kind == NODE_KIND_WORKLOAD,
+        )
+        .one()
+    )
+    broken.team_owner = None
+    broken.owner_source = OWNER_SOURCE_MANUAL   # провенанс без владельца
+    db.flush()
+
+    upsert_service(
+        db, namespace="squad-13-kingdom2", name="town-service",
+        node_kind=NODE_KIND_WORKLOAD,
+        team_owner="squad-13", owner_source=OWNER_SOURCE_K8S_LABELS,
+        owner_respect_trust=True,
+    )
+
+    fixed = (
+        db.query(Service)
+        .filter(
+            Service.namespace == "squad-13-kingdom2",
+            Service.node_kind == NODE_KIND_WORKLOAD,
+        )
+        .one()
+    )
+    assert fixed.team_owner == "squad-13", "битую строку обязан починить любой владелец"
+    assert fixed.owner_source == OWNER_SOURCE_K8S_LABELS

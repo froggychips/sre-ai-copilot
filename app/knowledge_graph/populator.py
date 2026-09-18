@@ -222,7 +222,17 @@ def _upsert_service_pg(
         # лейбл Service (0.9) затирал бы ручную правку workload (1.0) на
         # каждом проходе. NULL весит 0 — пустое поле заполняется всегда.
         incoming = OWNER_SOURCE_TRUST.get(owner_source or "", 0.0)
-        stronger = _trust_expr(tbl_ref.c.owner_source) <= incoming
+        # Пустой владелец в строке перебивает любой провенанс: там может
+        # остаться осиротевший `owner_source` от значения, которое уже
+        # затёрли, — и сравнение по силе тогда отвергало бы входящего
+        # владельца навсегда. Строка с сильным источником и пустым
+        # владельцем — то самое противоречие, которое этот код и чинит,
+        # так что доверять её провенансу нельзя.
+        stronger = sa.or_(
+            tbl_ref.c.team_owner.is_(None),
+            tbl_ref.c.team_owner == "",
+            _trust_expr(tbl_ref.c.owner_source) <= incoming,
+        )
         set_clause["team_owner"] = sa.case(
             (stronger, sa.literal(team_owner)), else_=tbl_ref.c.team_owner,
         )
@@ -376,7 +386,9 @@ def _upsert_service_fallback(
             # слабее того, что стоит в строке.
             incoming = OWNER_SOURCE_TRUST.get(owner_source or "", 0.0)
             current = OWNER_SOURCE_TRUST.get(svc.owner_source or "", 0.0)
-            if current <= incoming and svc.team_owner != team_owner:
+            # Пустой владелец перебивает провенанс — см. PG-путь.
+            repairable = not svc.team_owner
+            if (repairable or current <= incoming) and svc.team_owner != team_owner:
                 svc.team_owner = team_owner
                 svc.owner_source = owner_source
                 changed = True
