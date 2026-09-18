@@ -272,8 +272,8 @@ def record_source_run(
     if isinstance(cleanup_raw, dict):
         # Только то, по чему принимается решение, — не весь блок: значение
         # едет в redis и не должно расти вместе со stats синка.
-        for key in ("skipped", "shrink_pct", "baseline",
-                    "bootstrap_baseline", "rows_total"):
+        for key in ("skipped", "shrink_pct", "baseline", "snapshot",
+                    "rows_total"):
             if cleanup_raw.get(key) not in (None, ""):
                 cleanup[key] = cleanup_raw[key]
 

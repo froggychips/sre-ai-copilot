@@ -1359,7 +1359,7 @@ def test_bootstrap_without_baseline_refuses_to_clean(db):
     # Опорой станет именно этот снимок, проверить его нечем — значит он
     # обязан быть виден: снимок рядом с размером графа и есть та проверка,
     # которую вместо автоматики делает человек.
-    assert stats["cleanup"]["bootstrap_baseline"] == 1
+    assert stats["cleanup"]["snapshot"] == 1
     assert stats["cleanup"]["rows_total"] == 4
 
 

@@ -862,7 +862,7 @@ def _cleanup_absent_volumes(
         # даёт ту самую проверку: 1214 против 10 059 строк — накопленный
         # мусор, ожидаемая картина; 300 против 1214 — снимок, которому
         # верить нельзя, и это повод смотреть на кластер, а не на граф.
-        stats["bootstrap_baseline"] = len(seen)
+        stats["snapshot"] = len(seen)
         stats["rows_total"] = len(rows)
         logger.warning(
             "k8s_storage.volume_cleanup_skipped kind=%s reason=%s — синк не "
@@ -879,8 +879,12 @@ def _cleanup_absent_volumes(
         stats["shrink_pct"] = round(shrink_pct, 1)
         # Процент без обоих чисел не читается: «ужалось на 75%» — это 1214
         # против 300 или 4 против 1? Решение принимает человек, и принимать
-        # его он будет по тому, что попало в отчёт источника.
+        # его он будет по тому, что попало в отчёт источника. Два числа
+        # усадки — это `baseline` и размер СНИМКА; `rows_total` идёт третьим
+        # и отвечает на другой вопрос («сколько мусора в графе»), подменять
+        # им снимок нельзя.
         stats["baseline"] = baseline
+        stats["snapshot"] = len(seen)
         stats["rows_total"] = len(rows)
         logger.warning(
             "k8s_storage.volume_cleanup_skipped kind=%s reason=%s "

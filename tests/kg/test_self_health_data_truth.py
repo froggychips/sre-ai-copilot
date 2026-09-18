@@ -346,7 +346,7 @@ def test_blocked_cleanup_reaches_self_health(db):
         "errors": 0,
         "cleanup": {
             "skipped": "no_baseline",
-            "bootstrap_baseline": 300,
+            "snapshot": 300,
             "rows_total": 10059,
         },
     })
@@ -358,7 +358,7 @@ def test_blocked_cleanup_reaches_self_health(db):
     assert blocked[SOURCE_STORAGE_PVS]["skipped"] == "no_baseline"
     # Цифры рядом — по ним и видно, верить ли снимку: 300 против 10 059
     # строк графа читается иначе, чем 1214 против тех же 10 059.
-    assert blocked[SOURCE_STORAGE_PVS]["bootstrap_baseline"] == 300
+    assert blocked[SOURCE_STORAGE_PVS]["snapshot"] == 300
     assert blocked[SOURCE_STORAGE_PVS]["rows_total"] == 10059
     # Именно fail: warn остаётся в метрике и логе, в Discord уходит только
     # fail, а решение «верить ли снимку» живёт до следующего прогона синка.
@@ -424,6 +424,7 @@ def test_suspicious_snapshot_carries_its_numbers(db):
             "skipped": "delete_pct",
             "shrink_pct": 75.3,
             "baseline": 1214,
+            "snapshot": 300,
             "rows_total": 10059,
         },
     })
@@ -432,7 +433,10 @@ def test_suspicious_snapshot_carries_its_numbers(db):
     blocked = r.detail["cleanup_blocked"][SOURCE_STORAGE_PVS]
 
     assert blocked["shrink_pct"] == 75.3
+    # Оба числа усадки: было 1214, стало 300. `rows_total` отвечает на
+    # другой вопрос — сколько мусора в графе — и снимок им не подменяется.
     assert blocked["baseline"] == 1214
+    assert blocked["snapshot"] == 300
     assert r.status == "fail"
 
 
@@ -454,7 +458,7 @@ def test_alert_line_carries_the_numbers_a_person_needs():
         "cleanup_blocked": {
             "k8s_storage_sync/pvs": {
                 "skipped": "no_baseline",
-                "bootstrap_baseline": 300,
+                "snapshot": 300,
                 "rows_total": 10059,
             },
         },
