@@ -50,6 +50,7 @@ from app.knowledge_graph.kubectl_breaker import run_kubectl
 from app.knowledge_graph.edge_decay_guard import (
     SOURCE_TOPOLOGY_INGRESSES, SOURCE_TOPOLOGY_SERVICES, record_source_run)
 from app.knowledge_graph.k8s_endpoints_sync import DISCOVERED_BY_ENDPOINTS
+from app.knowledge_graph.contract import OWNER_SOURCE_NAMESPACE_PREFIX
 from app.knowledge_graph.populator import upsert_edge, upsert_service
 from app.knowledge_graph.schema import (NODE_KIND_SERVICE, NODE_KIND_WORKLOAD,
                                         Service, ServiceEdge)
@@ -255,6 +256,19 @@ def _kubectl_get_deployments_all() -> List[Dict[str, Any]]:
 
 
 # ── pure helpers ────────────────────────────────────────────────────────────
+
+
+def _derive_team_owner(namespace: str) -> Optional[str]:
+    """Владелец по префиксу namespace — та же таблица, что у kg_sync.
+
+    Делегируем в `ownership_suggester._try_prefix_match`, а не в
+    `kg_sync._derive_team_owner`: импорт kg_sync отсюда замкнул бы цикл
+    (он сам тянет этот синк). Источник правды один — префиксная таблица.
+    """
+    from app.services.ownership_suggester import _try_prefix_match
+
+    return _try_prefix_match(namespace)
+
 
 
 def _extract_service_meta(svc: Dict[str, Any]) -> Dict[str, Any]:
@@ -597,15 +611,27 @@ def _sync_one_service(
         return
 
     meta_json = _extract_service_meta(svc)
-    # upsert Service node. team_owner мы НЕ заполняем здесь — это
-    # делает kg_sync на основе ns-pattern (squad-N → squad). Если
-    # upsert_service видит существующий узел — он сохранит уже
-    # выставленный team_owner и просто обновит metadata_json.
+    # Владельца передаём как ДОЗАПОЛНЕНИЕ, а не как значение. Прежний
+    # комментарий гласил «team_owner мы НЕ заполняем здесь — это делает
+    # kg_sync на основе ns-pattern», и это оказалось неверно: kg_sync ходит
+    # по `kubectl get deployments`, а сюда приезжают Service и StatefulSet.
+    # Базы (`*-db-postgresql`) и `nats`/`nats-client` внутри squad-стенда
+    # деплойментами не являются, поэтому владельца им не проставлял НИКТО:
+    # 18.09.2026 таких живых узлов было 17 из 19 всех активных без
+    # владельца — в squad-28-kingdom5 26 сервисов получили `squad-28` по
+    # префиксу, а семь баз и NATS остались пустыми.
+    #
+    # Именно fallback, а не team_owner: префикс — самая слабая догадка
+    # (OWNER_SOURCE_TRUST = 0.4), и перезаписывать ею лейбл или ручную
+    # правку нельзя. Присваивание здесь однажды уже обвалило owner-coverage
+    # с 99.97% до ~50% (см. комментарий ниже в этом же файле).
     svc_node = upsert_service(
         db,
         namespace=ns,
         name=name,
         metadata={"k8s_service": meta_json},
+        owner_fallback=_derive_team_owner(ns),
+        owner_fallback_source=OWNER_SOURCE_NAMESPACE_PREFIX,
         # uid объекта был в руках всё это время — синк держит полный JSON.
         # Без него пересозданный Service неотличим от прежнего по имени.
         k8s_uid=meta.get("uid"),
@@ -644,7 +670,18 @@ def _sync_one_service(
             # команде. Без этого 2000+ новых узлов приехали бы без
             # team_owner и обвалили owner-coverage графа (99.97% → ~50%),
             # причём как «регрессия качества данных», которой нет.
+            #
+            # Вместе с владельцем наследуется и ПРОВЕНАНС. Раньше здесь
+            # передавался только team_owner, а upsert переписывает источник
+            # всегда вместе со значением — то есть каждый проход затирал
+            # owner_source в NULL. Отсюда живые узлы с владельцем и без
+            # источника (135 на 18.09.2026): по ним нельзя сказать, можно
+            # ли ссылаться на этого владельца в эскалации, хотя веса
+            # доверия в контракте для этого и заведены.
             team_owner=str(svc_node.team_owner) if svc_node.team_owner else None,
+            owner_source=(
+                str(svc_node.owner_source) if svc_node.owner_source else None
+            ),
             node_kind=NODE_KIND_WORKLOAD,
             metadata={"k8s_workload": _extract_workload_meta(dep)},
             k8s_uid=(dep.get("metadata") or {}).get("uid"),
