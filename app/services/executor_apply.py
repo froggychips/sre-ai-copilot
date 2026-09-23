@@ -459,10 +459,11 @@ def apply_intent(
         # и сверка uid с target_ref из графа (kg_remediation_decisions). Не
         # совпал — объект пересоздан после инцидента, действие отказано:
         # «починили Deployment, которого уже нет» выглядит успехом, и потому
-        # хуже любого отказа. Сверить нечем (uid не записан, kubectl
-        # недоступен) — идём дальше, но identity_check честно говорит unknown.
+        # хуже любого отказа. uid в графе есть, а снимка нет — отказ (ниже).
+        # uid не записан — сверить нечем: идём дальше, identity_check = unknown.
         expected_target = expected_identity(db, incident_id)
-        target_before = snapshot_target(intent)
+        # Мимо брейкера, как и dry-run выше: см. snapshot_target.
+        target_before = snapshot_target(intent, respect_breaker=False)
         mismatch = identity_mismatch(expected_target, target_before)
         if mismatch:
             audit_service.log_event(
@@ -475,6 +476,27 @@ def apply_intent(
                 },
             )
             return _refuse(incident_id, f"target_reincarnated:{mismatch}", applied_by)
+        # Граф ЗНАЕТ, какой объект чинить (uid записан), а живой снимок снять
+        # не удалось — сверку не прошли, write запрещён. Раньше такой случай
+        # шёл дальше как «сверить нечем», и пересозданный объект с тем же
+        # именем мог получить write, если kubectl get моргнул именно на
+        # снимке (dry-run выше проверяет доступность API и существование
+        # объекта, но не его uid). Внешнее ревью 23.09.2026, P0.
+        # Решения без uid (источник не сообщил) — по-прежнему Known Unknown:
+        # запрет для них остановил бы remediation по всем старым инцидентам.
+        if target_before.unknown and expected_target and expected_target.get("uid"):
+            audit_service.log_event(
+                "EXECUTOR_APPLY_REFUSED_TARGET_UNVERIFIED",
+                {
+                    "incident_id": incident_id,
+                    "applied_by": applied_by,
+                    "expected": expected_target,
+                    "live": target_before.to_dict(),
+                },
+            )
+            return _refuse(
+                incident_id, f"target_snapshot_unknown:{target_before.reason}", applied_by,
+            )
         analysis["executor_in_flight"] = {
             "claimed_at": datetime.now(timezone.utc).isoformat(),
             "claimed_by": applied_by,

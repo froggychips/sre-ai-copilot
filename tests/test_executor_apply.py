@@ -294,6 +294,116 @@ def test_apply_happy_path_calls_k8s_with_post_approval(mock_session):
     assert "executor_in_flight" not in record.analysis
 
 
+def _run_apply_with_identity(monkeypatch, record, query, *, expected, snapshot):
+    """apply_intent с заданными uid графа и живым снимком; возвращает (out, mock_exec)."""
+    monkeypatch.setattr(executor_apply, "expected_identity", lambda db, incident_id: expected)
+    monkeypatch.setattr(executor_apply, "snapshot_target", lambda intent, **kw: snapshot)
+    query.first.return_value = record
+    fake_result = {"success": True, "stdout": "ok", "stderr": "", "command": "kubectl …",
+                   "exit_code": 0, "dry_run": False}
+    with _approved(), patch.object(
+        executor_apply.k8s_service, "execute_intent",
+        side_effect=_fake_exec(write_result=fake_result),
+    ) as mock_exec:
+        out = executor_apply.apply_intent("inc-uid", "u1", _sig_for(_valid_intent_dict()))
+    return out, mock_exec
+
+
+@pytest.mark.parametrize("reason", [
+    "target_not_found",
+    "kubectl_failed:TimeoutExpired",
+    "kubectl_exit_1:Forbidden",
+    "kubectl_output_not_json",
+    "kubectl_output_empty",
+])
+def test_apply_refuses_when_uid_known_but_snapshot_unknown(mock_session, monkeypatch, reason):
+    """P0 (ревью 23.09.2026): граф знает uid цели, снимок не снят — write запрещён,
+    реальный kubectl не вызывается (только пере-dry-run)."""
+    from app.remediation.verification import TargetSnapshot
+    _session, query = mock_session
+    record = _make_record({"execution_intent": _valid_intent_dict(),
+                           "executor_result": {"status": "dry_run_ok"}})
+    out, mock_exec = _run_apply_with_identity(
+        monkeypatch, record, query,
+        expected={"uid": "uid-graph", "kind": "deployment"},
+        snapshot=TargetSnapshot.unavailable(reason),
+    )
+    assert out == {"ok": False, "reason": f"target_snapshot_unknown:{reason}"}
+    assert all(c.kwargs["dry_run"] is True for c in mock_exec.call_args_list)
+    assert "executor_applied" not in record.analysis
+    assert "executor_in_flight" not in record.analysis
+
+
+def test_pre_write_snapshot_bypasses_read_breaker(mock_session, monkeypatch):
+    """Снимок перед write — мимо общего брейкера чтений (как и dry-run): иначе
+    открытый чужими сбоями брейкер отказывал бы все write с известным uid."""
+    from app.remediation.verification import TargetSnapshot
+    _session, query = mock_session
+    seen = []
+
+    def snap(intent, **kw):
+        seen.append(kw.get("respect_breaker"))
+        return TargetSnapshot(kind="deployment", namespace="squad-1",
+                              name="town-service", uid="uid-1")
+
+    monkeypatch.setattr(executor_apply, "expected_identity", lambda db, incident_id: {"uid": "uid-1"})
+    monkeypatch.setattr(executor_apply, "snapshot_target", snap)
+    query.first.return_value = _make_record({"execution_intent": _valid_intent_dict(),
+                                             "executor_result": {"status": "dry_run_ok"}})
+    fake_result = {"success": True, "stdout": "ok", "stderr": "", "command": "kubectl …",
+                   "exit_code": 0, "dry_run": False}
+    with _approved(), patch.object(executor_apply.k8s_service, "execute_intent",
+                                   side_effect=_fake_exec(write_result=fake_result)):
+        out = executor_apply.apply_intent("inc-br", "u1", _sig_for(_valid_intent_dict()))
+    assert out["ok"] is True
+    assert seen[0] is False  # снимок ДО write
+
+
+def test_apply_proceeds_without_expected_uid_when_snapshot_unknown(mock_session, monkeypatch):
+    """Решение без uid (источник не сообщил) — Known Unknown, не отказ: иначе встал бы
+    remediation по всем старым инцидентам."""
+    from app.remediation.verification import TargetSnapshot
+    _session, query = mock_session
+    record = _make_record({"execution_intent": _valid_intent_dict(),
+                           "executor_result": {"status": "dry_run_ok"}})
+    out, mock_exec = _run_apply_with_identity(
+        monkeypatch, record, query, expected=None,
+        snapshot=TargetSnapshot.unavailable("kubectl_failed:TimeoutExpired"),
+    )
+    assert out["ok"] is True
+    assert mock_exec.call_args.kwargs["dry_run"] is False
+
+
+def test_apply_refuses_on_uid_mismatch(mock_session, monkeypatch):
+    from app.remediation.verification import TargetSnapshot
+    _session, query = mock_session
+    record = _make_record({"execution_intent": _valid_intent_dict(),
+                           "executor_result": {"status": "dry_run_ok"}})
+    out, mock_exec = _run_apply_with_identity(
+        monkeypatch, record, query,
+        expected={"uid": "uid-graph"},
+        snapshot=TargetSnapshot(kind="deployment", namespace="squad-1",
+                                name="town-service", uid="uid-live"),
+    )
+    assert out["ok"] is False and out["reason"].startswith("target_reincarnated:")
+    assert all(c.kwargs["dry_run"] is True for c in mock_exec.call_args_list)
+
+
+def test_apply_proceeds_when_uid_matches(mock_session, monkeypatch):
+    from app.remediation.verification import TargetSnapshot
+    _session, query = mock_session
+    record = _make_record({"execution_intent": _valid_intent_dict(),
+                           "executor_result": {"status": "dry_run_ok"}})
+    out, mock_exec = _run_apply_with_identity(
+        monkeypatch, record, query,
+        expected={"uid": "uid-1"},
+        snapshot=TargetSnapshot(kind="deployment", namespace="squad-1",
+                                name="town-service", uid="uid-1"),
+    )
+    assert out["ok"] is True
+    assert mock_exec.call_args.kwargs["dry_run"] is False
+
+
 def test_apply_persists_failure_result(mock_session):
     session, query = mock_session
     record = _make_record({
