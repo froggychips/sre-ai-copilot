@@ -1563,9 +1563,9 @@ class DiscordService:
         if node_ctxs:
             node_ns_field = _build_nodes_stands_field([
                 (
-                    c.node,
-                    getattr(c, "node_namespaces", None),
-                    (getattr(c, "source_status", None) or {}).get("node_namespaces"),
+                    c.node or "?",  # в node_ctxs только контексты с нодой
+                    c.node_namespaces,
+                    c.source_status.get("node_namespaces"),
                 )
                 for c in node_ctxs
             ])
