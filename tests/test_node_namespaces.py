@@ -311,6 +311,24 @@ class TestMultiNodeField:
             "`dev-4`: _нет данных_",
         ]
 
+    def test_busy_node_does_not_hide_others(self):
+        """Нода с кучей стендов не вытесняет остальные ноды шторма."""
+        busy = [_ns(f"squad-{i}-shared-with-a-very-long-namespace-name", 50 - i) for i in range(40)]
+        field = _build_nodes_stands_field([
+            ("dev-26", busy, None),
+            ("dev-17", [_ns("squad-29-shared", 40)], None),
+        ])
+        lines = field["value"].splitlines()
+        assert len(field["value"]) <= 1024
+        assert lines[0].startswith("`dev-26`: squad-0 (50), ") and lines[0].endswith(", +35")
+        assert lines[1] == "`dev-17`: squad-29 (40)"
+
+    def test_single_overlong_line_keeps_tail(self):
+        from app.services.discord.embed_builder import _fit_lines
+        value = _fit_lines(["x" * 2000], ["+ итог"], "нод.")
+        assert len(value) <= 1024
+        assert value.endswith("…\n+ итог")
+
     def test_empty(self):
         assert _build_nodes_stands_field([]) is None
 

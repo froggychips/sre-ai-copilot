@@ -469,6 +469,8 @@ def _build_nats_impact_field(
 
 _SQUAD_NS_RE = re.compile(r"^(squad-\d+)-(.+)$")
 _NODE_NS_FIELD = "Стенды на ноде"
+# Сколько стендов показывать в строке одной ноды, когда нод в группе несколько.
+_MULTI_NODE_MAX_STANDS = 5
 
 
 def _pods_word(n: int) -> str:
@@ -512,6 +514,10 @@ def _fit_lines(lines: List[str], tail: List[str], unit: str) -> str:
         kept.pop()
         dropped += 1
     more = [f"… ещё {dropped} {unit}"] if dropped else []
+    # Осталась одна строка, и та не влезает: режем её саму, а не маркер и итог.
+    over = len("\n".join(kept + more + tail)) - 1024
+    if over > 0:
+        kept = [kept[0][: max(0, len(kept[0]) - over - 1)] + "…"]
     return "\n".join(kept + more + tail)[:1024]
 
 
@@ -568,7 +574,11 @@ def _build_nodes_stands_field(
             lines.append(f"`{node}`: _нет данных_" if reason else f"`{node}`: —")
             continue
         stands, _sys_ns, _sys_pods = _group_node_stands(namespaces)
-        summary = ", ".join(f"{key} ({pods})" for key, pods, _parts in stands) or "стендов нет"
+        # Строка на ноду ограничена: нода с десятком стендов не должна
+        # вытеснить из поля остальные ноды шторма (ревью PR #420).
+        shown = [f"{key} ({pods})" for key, pods, _parts in stands[:_MULTI_NODE_MAX_STANDS]]
+        rest = len(stands) - len(shown)
+        summary = ", ".join(shown) + (f", +{rest}" if rest else "") if shown else "стендов нет"
         lines.append(f"`{node}`: {summary}")
     return {"name": _NODE_NS_FIELD, "value": _fit_lines(lines, [], "нод."), "inline": False}
 
