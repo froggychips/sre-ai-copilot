@@ -337,6 +337,43 @@ class TestEnrichment:
         assert "node_namespaces" not in ctx.source_status
 
 
+class TestPrefetch:
+    @pytest.mark.asyncio
+    async def test_group_nodes_fetched_in_parallel(self, monkeypatch):
+        """Шторм по нескольким нодам: запросы идут разом, а не по очереди."""
+        import time as real_time
+        from app.services.alert_enrichment import prefetch_node_namespaces
+        monkeypatch.setattr(deployments, "_load_k8s_once", lambda: True)
+        api = MagicMock()
+
+        def slow_ok(**_kwargs):
+            real_time.sleep(0.3)
+            return SimpleNamespace(items=[_pod("squad-38-shared")])
+
+        api.list_pod_for_all_namespaces.side_effect = slow_ok
+        incs = [_incident({**_NODE_LABELS, "node": f"dev-{i}"}) for i in range(5)]
+        incs.append(_incident({**_NODE_LABELS, "node": "dev-0"}))  # дубль ноды
+        started = real_time.monotonic()
+        with patch.object(deployments.client, "CoreV1Api", return_value=api):
+            await prefetch_node_namespaces(incs)
+            elapsed = real_time.monotonic() - started
+            # Кэш прогрет: enrichment больше в API не ходит.
+            assert deployments.fetch_node_namespaces("dev-3") is not None
+        assert api.list_pod_for_all_namespaces.call_count == 5
+        assert elapsed < 1.0  # последовательно было бы ~1.5 с
+
+    @pytest.mark.asyncio
+    async def test_single_node_and_kill_switch_skip(self, monkeypatch):
+        from app.services import alert_enrichment
+        with patch("app.context.deployments.fetch_node_namespaces") as fetch:
+            await alert_enrichment.prefetch_node_namespaces(
+                [_incident({**_NODE_LABELS, "node": "dev-26"})])
+            monkeypatch.setattr(alert_enrichment.settings, "ENRICH_NODE_NAMESPACES_ENABLED", False)
+            await alert_enrichment.prefetch_node_namespaces(
+                [_incident({**_NODE_LABELS, "node": f"dev-{i}"}) for i in range(3)])
+        fetch.assert_not_called()
+
+
 class TestMultiNodeField:
     def test_single_node_is_full_format(self):
         field = _build_nodes_stands_field([("dev-26", _DEV26, None)])

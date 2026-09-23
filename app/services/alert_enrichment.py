@@ -816,6 +816,32 @@ async def enrich_alert_async(db: Session, incident: Incident) -> EnrichedContext
     return await asyncio.to_thread(enrich_alert, db, incident)
 
 
+async def prefetch_node_namespaces(incidents: List[Incident]) -> None:
+    """Прогреть кэш «стендов на ноде» для всех нод группы ПАРАЛЛЕЛЬНО.
+
+    Enrichment группы идёт последовательно (одна SQLAlchemy-сессия на всех),
+    и шторм по N нодам при медленном, но живом API стоил бы N запросов
+    подряд (ревью PR #420). k8s-фаза сессии не трогает, поэтому её выносим
+    вперёд и гоняем разом: дальше enrich_alert берёт снимки из кэша
+    fetch_node_namespaces, и задержка группы — один запрос, а не сумма.
+    Ничего не бросает: не прогрелось — enrich_alert сходит сам.
+    """
+    if not getattr(settings, "ENRICH_NODE_NAMESPACES_ENABLED", True):
+        return
+    nodes = sorted({n for inc in incidents if (n := (inc.labels or {}).get("node"))})
+    if len(nodes) < 2:
+        return  # одну ноду enrich_alert и так спросит один раз
+    try:
+        from app.context.deployments import fetch_node_namespaces
+        timeout = getattr(settings, "LIVE_K8S_TIMEOUT_SEC", 3.0)
+        await asyncio.gather(*(
+            asyncio.to_thread(fetch_node_namespaces, node, timeout_sec=timeout)
+            for node in nodes
+        ), return_exceptions=True)
+    except Exception as e:
+        log.warning("enrich.node_namespaces_prefetch_failed", error=type(e).__name__)
+
+
 def enrich_alert(db: Session, incident: Incident) -> EnrichedContext:
     """Главная точка — синхронный, без LLM, ~5 SQL-запросов.
 
