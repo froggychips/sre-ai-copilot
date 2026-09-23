@@ -2,6 +2,61 @@
 
 All notable changes to this project are documented in this file.
 
+## [1.0.18] — 2026-09-23 — Чьи стенды на ноде и граница доверия вебхука
+
+### Добавлено
+
+- **Нодовый алерт показывает, чьи стенды сидят на ноде (#420).** Запрос
+  дежурного: `NodeMemoryWillExhaustSoon` на dev-26 говорил «где», но не
+  «чьё» — за ответом шли в kubectl. Новое поле «Стенды на ноде»: live-список
+  подов по `spec.nodeName` (в графе привязки под→нода нет), namespace'ы
+  склеены по стенду (`squad-38 — 71 под (kingdom7, shared)`), системные
+  DaemonSet-ns — одним счётчиком, при сбое API — «нет данных», а не «пусто».
+  Шторм по нескольким нодам — строка на ноду, поле «Нода» перечисляет все.
+  Кэш на ноду 30 с, предохранитель после сбоя API, single-flight по ноде и
+  параллельный прогрев для группы: задержка уведомления — один запрос, а не
+  сумма. Kill-switch `ENRICH_NODE_NAMESPACES_ENABLED`.
+
+### Безопасность
+
+- **Вебхук AlertManager больше не открыт всему кластеру (#421).** Прод
+  работает с `ALERTMANAGER_ALLOW_UNAUTHENTICATED=true` (стоковый AlertManager
+  не умеет подписывать body), и границей доверия объявлена NetworkPolicy. Но
+  ingress на 8000 был `namespaceSelector: {}` — любой namespace, включая
+  сквады с кодом из произвольных веток. Теперь только `monitoring`
+  (vmalertmanager) и `mcp` (squad-medic, HMAC); клиенты сверены по
+  access-логу за 5 суток. Применено в кластер 23.09.2026: из monitoring API
+  отвечает, из squad-namespace — таймаут.
+- **Remediation: uid цели известен, а снимок не снят — write запрещён (#422).**
+  Внешнее ревью, P0. При `unknown`-снимке сверка uid молча пропускалась, и
+  пересозданный объект с тем же именем мог получить write, если `kubectl
+  get` моргнул именно на снимке (server-side dry-run ловит недоступный API
+  и отсутствующий объект, но uid не сверяет). Теперь отказ
+  `target_snapshot_unknown:<причина>` + аудит
+  `EXECUTOR_APPLY_REFUSED_TARGET_UNVERIFIED`; снимок перед write идёт мимо
+  общего брейкера чтений, как и dry-run. Решения без uid — прежний Known
+  Unknown.
+
+### Документация
+
+- **FAQ и SECURITY.md описывают аутентификацию вебхука как на самом деле
+  (#423).** FAQ писал «no authentication by default» (на деле fail-closed
+  HMAC, 401 без секрета), SECURITY.md — «опт-аут только для локальной
+  разработки», хотя прод работает именно с ним. Теперь: вне dev опт-аут
+  допустим только вместе с NetworkPolicy на namespace AlertManager.
+
+### Исправлено
+
+- **`test_targeted_deploy_makes_service_active` падал на master сам по себе.**
+  Дата билда была зашита (2026-08-21) и вышла из окна stale-классификатора;
+  теперь время относительное.
+
+### Зависимости
+
+- anthropic 1.3.0 → 1.7.0 (#419), pyjwt 2.13.0 → 2.14.0 (#418), sqlalchemy
+  2.0.52 → 2.0.54 (#417), alembic 1.19.1 → 1.20.0 (#416), psycopg2-binary
+  2.9.12 → 2.9.13 (#391), astral-sh/setup-uv 6 → 7 (#415).
+
 ## [1.0.17] — 2026-09-18 — Владелец стенда: тот, кто его занял
 
 Один тикет ([WO-16030](https://juicybuttons.atlassian.net/browse/WO-16030)),
