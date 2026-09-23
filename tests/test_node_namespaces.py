@@ -174,6 +174,19 @@ class TestFetch:
         assert results == [None] * 10
         assert api.list_pod_for_all_namespaces.call_count == 1
 
+    def test_breaker_does_not_hide_valid_cache(self, monkeypatch):
+        """Сбой по dev-27 не прячет свежий снимок dev-26."""
+        monkeypatch.setattr(deployments, "_load_k8s_once", lambda: True)
+        api = MagicMock()
+        api.list_pod_for_all_namespaces.side_effect = [
+            SimpleNamespace(items=[_pod("squad-38-shared")]), TimeoutError(),
+        ]
+        with patch.object(deployments.client, "CoreV1Api", return_value=api):
+            first = deployments.fetch_node_namespaces("dev-26")
+            assert deployments.fetch_node_namespaces("dev-27") is None
+            assert deployments.fetch_node_namespaces("dev-26") == first
+        assert api.list_pod_for_all_namespaces.call_count == 2
+
     def test_breaker_expires(self, monkeypatch):
         monkeypatch.setattr(deployments, "_load_k8s_once", lambda: True)
         clock = [1000.0]

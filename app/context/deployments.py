@@ -179,11 +179,13 @@ def fetch_node_namespaces(
     # обогащается ПОСЛЕДОВАТЕЛЬНО — см. enrich-and-forward. Без кэша и
     # предохранителя лежащий API стоил бы N×timeout_sec задержки уведомления.
     now = time.monotonic()
-    if now < _node_ns_api_down_until:
-        return None
+    # Сначала свой кэш, потом предохранитель: сбой запроса по ДРУГОЙ ноде не
+    # повод прятать ещё валидный снимок этой (ревью PR #420).
     cached = _node_ns_cache.get(node)
     if cached and now - cached[0] < _NODE_NS_CACHE_TTL_SEC:
         return cached[1]
+    if now < _node_ns_api_down_until:
+        return None
     if not _load_k8s_once():
         return None
     try:
