@@ -509,6 +509,10 @@ def _group_node_stands(
 def _fit_lines(lines: List[str], tail: List[str], unit: str) -> str:
     """Discord режет поле на 1024: жертвуем хвостом строк, а `tail` (короткий
     итог вроде счётчика системных) сохраняем всегда."""
+    if len("\n".join(lines + tail)) <= 1024:
+        return "\n".join(lines + tail)
+    # Не влезает: место под маркер резервируем только теперь, когда без
+    # выброса строк уже не обойтись.
     kept, dropped = list(lines), 0
     while len(kept) > 1 and len("\n".join(kept + [f"… ещё {dropped} {unit}"] + tail)) > 1024:
         kept.pop()
@@ -564,6 +568,10 @@ def _build_nodes_stands_field(
     `(нода, namespaces | None, причина «нет данных» | None)`.
     """
     if not per_node:
+        return None
+    # Ни данных, ни причины их отсутствия — список не запрашивался (kill-switch
+    # ENRICH_NODE_NAMESPACES_ENABLED): поля нет, как и для одной ноды.
+    if all(namespaces is None and not reason for _n, namespaces, reason in per_node):
         return None
     if len(per_node) == 1:
         _node, namespaces, reason = per_node[0]

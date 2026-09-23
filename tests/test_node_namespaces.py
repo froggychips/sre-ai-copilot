@@ -329,6 +329,16 @@ class TestMultiNodeField:
         assert len(value) <= 1024
         assert value.endswith("…\n+ итог")
 
+    def test_kill_switch_group_has_no_field(self):
+        """Список не запрашивался ни по одной ноде — поля нет и у группы."""
+        assert _build_nodes_stands_field([("dev-26", None, None), ("dev-17", None, None)]) is None
+
+    def test_fit_lines_no_needless_drop(self):
+        """Влезает как есть — ничего не выбрасываем ради маркера."""
+        from app.services.discord.embed_builder import _fit_lines
+        lines = ["a" * 500, "b" * 500]
+        assert _fit_lines(lines, [], "нод.") == "\n".join(lines)
+
     def test_empty(self):
         assert _build_nodes_stands_field([]) is None
 
