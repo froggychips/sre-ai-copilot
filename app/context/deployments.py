@@ -131,6 +131,71 @@ def fetch_live_replicas(
         return None
 
 
+# Namespace'ы DaemonSet'ов и агентов: их поды стоят на КАЖДОЙ ноде, поэтому на
+# вопрос «чьи стенды на этой ноде» они не отвечают и только вытесняют ответ.
+# Рендер сворачивает их в один счётчик. Сверено с `kubectl get ds -A`
+# 23.09.2026: cattle-system, jupyter, kube-system, logging, metallb-system,
+# monitoring; остальное — штатные системные ns кластера.
+NODE_SYSTEM_NAMESPACES = frozenset({
+    "calico-system",
+    "cattle-system",
+    "cert-manager",
+    "ingress-nginx",
+    "jupyter",
+    "kube-node-lease",
+    "kube-public",
+    "kube-system",
+    "local-path-storage",
+    "logging",
+    "metallb-system",
+    "monitoring",
+    "tigera-operator",
+})
+
+
+def fetch_node_namespaces(
+    node: str,
+    *,
+    timeout_sec: float = 3.0,
+) -> Optional[List[Dict[str, Any]]]:
+    """Какие namespace'ы живут на ноде: live-список подов по `spec.nodeName`.
+
+    Запрос дежурного (23.09.2026): в нодовом алерте видно имя ноды, но не
+    видно, чьи стенды на ней сидят, — приходилось идти в kubectl. В графе
+    привязки под→нода нет, поэтому источник — live API (у SA `sre-ai` есть
+    `list pods` по всем namespace'ам).
+
+    Возвращает `[{"namespace", "pods", "system"}]` по убыванию числа подов;
+    завершённые поды (Succeeded/Failed — отработавшие миграции и job'ы) не
+    считаются: память и CPU ноды они уже не занимают. `None` = «не знаю»
+    (нет kube-config, таймаут, любая ошибка) — рендер обязан сказать, что
+    данных нет, а не «на ноде пусто». Никогда не пробрасывает исключение;
+    дедлайн — `_request_timeout` (см. комментарий в `fetch_live_replicas`).
+    """
+    if not node or not _load_k8s_once():
+        return None
+    try:
+        pods = client.CoreV1Api().list_pod_for_all_namespaces(
+            field_selector=f"spec.nodeName={node}",
+            _request_timeout=timeout_sec,
+        )
+    except Exception as e:
+        logger.warning("node_namespaces_fetch_failed", node=node, error=type(e).__name__)
+        return None
+
+    counts: Dict[str, int] = {}
+    for pod in pods.items or []:
+        phase = getattr(pod.status, "phase", None) if pod.status else None
+        if phase in ("Succeeded", "Failed"):
+            continue
+        ns = pod.metadata.namespace
+        counts[ns] = counts.get(ns, 0) + 1
+    return [
+        {"namespace": ns, "pods": n, "system": ns in NODE_SYSTEM_NAMESPACES}
+        for ns, n in sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))
+    ]
+
+
 def fetch_last_log_line(
     namespace: str,
     pod_name: str,

@@ -44,6 +44,7 @@ from .embed_builder import (
     _build_orleans_field,
     _build_log_error_rate_field,
     _build_nats_impact_field,
+    _build_node_namespaces_field,
     _build_pod_trail_field,
     _build_runbook_field,
     _build_similar_past_field,
@@ -155,6 +156,9 @@ _EMBED_PROTECTED_FIELDS: Tuple[str, ...] = (
     # Для нодового алерта имя ноды — это и есть ответ «где», без него
     # остаётся только IP пода-экспортёра. Дропу не подлежит.
     "Нода",
+    # Парное к «Нода»: чьи стенды там сидят. Короткое (склейка по стенду,
+    # системные одним счётчиком), а без него нодовый алерт не говорит «чьё».
+    "Стенды на ноде",
 )
 
 
@@ -1545,6 +1549,14 @@ class DiscordService:
                 "value": "_сервис не в graph — topology unknown_",
                 "inline": True,
             })
+        # Чьи стенды на ноде — ответ «на кого идти» для нодового алерта.
+        if head.node:
+            node_ns_field = _build_node_namespaces_field(
+                getattr(head, "node_namespaces", None),
+                (getattr(head, "source_status", None) or {}).get("node_namespaces"),
+            )
+            if node_ns_field:
+                fields.append(node_ns_field)
 
         # A1: AM inhibit/silence state. Если в AM payload пришло
         # `status: {state: suppressed, silencedBy/inhibitedBy: [...]}` —

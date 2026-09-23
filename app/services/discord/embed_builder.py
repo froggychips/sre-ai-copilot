@@ -6,6 +6,7 @@
 изолирован try/except).
 """
 
+import re
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple, cast
 
@@ -464,6 +465,74 @@ def _build_nats_impact_field(
         "value": "\n".join(lines)[:1024],
         "inline": False,
     }
+
+
+_SQUAD_NS_RE = re.compile(r"^(squad-\d+)-(.+)$")
+
+
+def _pods_word(n: int) -> str:
+    """1 под, 2 пода, 5 подов, 11 подов, 21 под."""
+    if n % 10 == 1 and n % 100 != 11:
+        return f"{n} под"
+    if 2 <= n % 10 <= 4 and not 12 <= n % 100 <= 14:
+        return f"{n} пода"
+    return f"{n} подов"
+
+
+def _build_node_namespaces_field(
+    namespaces: Optional[List[Dict[str, Any]]],
+    unknown_reason: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
+    """«Стенды на ноде» для нодового алерта — чьи namespace'ы там живут.
+
+    Запрос дежурного 23.09.2026: алерт про ноду говорил «где», но не «чьё»,
+    и за ответом шли в kubectl. Сквадовые namespace'ы склеиваются в один
+    стенд (`squad-38-shared` + `squad-38-kingdom7` → `squad-38`), системные
+    (DaemonSet'ы на каждой ноде) сворачиваются в один счётчик в конце.
+
+    `namespaces=None` — список не получен: при `unknown_reason` поле честно
+    говорит «нет данных», без него (не нодовый алерт) не рендерится вовсе.
+    """
+    name = "Стенды на ноде"
+    if namespaces is None:
+        if not unknown_reason:
+            return None
+        return {"name": name, "value": f"_нет данных: {unknown_reason}_", "inline": False}
+
+    stands: Dict[str, Dict[str, Any]] = {}
+    sys_ns = sys_pods = 0
+    for item in namespaces:
+        ns, pods = item["namespace"], int(item.get("pods") or 0)
+        if item.get("system"):
+            sys_ns += 1
+            sys_pods += pods
+            continue
+        m = _SQUAD_NS_RE.match(ns)
+        key, part = (m.group(1), m.group(2)) if m else (ns, None)
+        stand = stands.setdefault(key, {"pods": 0, "parts": []})
+        stand["pods"] += pods
+        if part:
+            stand["parts"].append(part)
+
+    lines = []
+    for key, stand in sorted(stands.items(), key=lambda kv: (-kv[1]["pods"], kv[0])):
+        parts = f" ({', '.join(sorted(stand['parts']))})" if stand["parts"] else ""
+        lines.append(f"`{key}` — {_pods_word(stand['pods'])}{parts}")
+    system = f"системные: {sys_ns} ns, {_pods_word(sys_pods)}" if sys_ns else ""
+    if not lines:
+        value = f"стендов нет, только {system}" if system else "_на ноде нет подов_"
+    else:
+        # Discord режет поле на 1024: жертвуем хвостом самых мелких стендов, а
+        # счётчик системных оставляем — он короткий и закрывает вопрос «это всё».
+        tail = [f"+ {system}"] if system else []
+        kept = lines
+        dropped = 0
+        while len(kept) > 1 and len("\n".join(kept + [f"… ещё {dropped} стенд."] + tail)) > 1024:
+            kept = kept[:-1]
+            dropped += 1
+        more = [f"… ещё {dropped} стенд."] if dropped else []
+        value = "\n".join(kept + more + tail)
+    return {"name": name, "value": value[:1024], "inline": False}
 
 
 def _build_pod_trail_field(

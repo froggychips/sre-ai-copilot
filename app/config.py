@@ -303,6 +303,11 @@ class Settings(BaseSettings):
     # `pod` через kube_pod_info на входе вебхука. kill-switch; при выключенном
     # флаге или пустом VICTORIA_METRICS_URL алерт уходит с IP, как раньше.
     NODE_NAME_RESOLVE_ENABLED: bool = True
+    # Какие стенды сидят на ноде нодового алерта (поле «Стенды на ноде»):
+    # live-список подов по spec.nodeName, namespace'ы с числом подов. Один
+    # вызов API на алерт с меткой `node`, дедлайн LIVE_K8S_TIMEOUT_SEC.
+    # kill-switch; при False поле не рендерится.
+    ENRICH_NODE_NAMESPACES_ENABLED: bool = True
 
     # Kube-resource alert attribution (баг «vm-kube-state-metrics 52% noisemaker»).
     # У KubeDeployment*/KubeStatefulSet*/KubeDaemonSet*-алертов лейбл `service`

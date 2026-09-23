@@ -192,6 +192,11 @@ class EnrichedContext:
     # заголовке. Заполняется из метки `node`, которую кладёт node_resolver на
     # входе вебхука; None для всех остальных алертов.
     node: Optional[str] = None
+    # Namespace'ы подов на ноде нодового алерта: [{"namespace", "pods",
+    # "system"}] (см. fetch_node_namespaces). None — не нодовый алерт или
+    # список не запрашивался; сбой запроса отмечается в source_status
+    # ["node_namespaces"], чтобы рендер сказал «нет данных», а не «пусто».
+    node_namespaces: Optional[List[Dict[str, Any]]] = None
     team_owner: Optional[str] = None
     in_kg: bool = False
 
@@ -864,6 +869,20 @@ def enrich_alert(db: Session, incident: Incident) -> EnrichedContext:
         node=labels.get("node") or None,
         inhibition_state=_inhibition_state(incident),
     )
+    # Стенды на ноде нодового алерта. Здесь, а не ниже: у нодовых алертов нет
+    # сервиса, и enrichment уходит в ранний выход `not namespace or not service`.
+    if ctx.node and getattr(settings, "ENRICH_NODE_NAMESPACES_ENABLED", True):
+        try:
+            from app.context.deployments import fetch_node_namespaces
+            ctx.node_namespaces = fetch_node_namespaces(
+                ctx.node,
+                timeout_sec=getattr(settings, "LIVE_K8S_TIMEOUT_SEC", 3.0),
+            )
+        except Exception as e:
+            log.warning("enrich.node_namespaces_import_failed", error=type(e).__name__)
+        if ctx.node_namespaces is None:
+            ctx.source_status["node_namespaces"] = "k8s API не ответил"
+
     if probe_ns_from is not None:
         # debug-сигнал: какой ns был в label и куда срезолвили из URL пробы
         ctx.extras["probe_ns_resolved"] = namespace
