@@ -6,6 +6,7 @@
 изолирован try/except).
 """
 
+import re
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple, cast
 
@@ -464,6 +465,130 @@ def _build_nats_impact_field(
         "value": "\n".join(lines)[:1024],
         "inline": False,
     }
+
+
+_SQUAD_NS_RE = re.compile(r"^(squad-\d+)-(.+)$")
+_NODE_NS_FIELD = "Стенды на ноде"
+# Сколько стендов показывать в строке одной ноды, когда нод в группе несколько.
+_MULTI_NODE_MAX_STANDS = 5
+
+
+def _pods_word(n: int) -> str:
+    """1 под, 2 пода, 5 подов, 11 подов, 21 под."""
+    if n % 10 == 1 and n % 100 != 11:
+        return f"{n} под"
+    if 2 <= n % 10 <= 4 and not 12 <= n % 100 <= 14:
+        return f"{n} пода"
+    return f"{n} подов"
+
+
+def _group_node_stands(
+    namespaces: List[Dict[str, Any]],
+) -> Tuple[List[Tuple[str, int, List[str]]], int, int]:
+    """Склеить namespace'ы ноды по стенду: `squad-38-shared` + `squad-38-kingdom7`
+    → `squad-38`. Возвращает стенды по убыванию подов `(имя, поды, части)` и
+    отдельно число системных ns и их подов (DaemonSet'ы на каждой ноде)."""
+    stands: Dict[str, Dict[str, Any]] = {}
+    sys_ns = sys_pods = 0
+    for item in namespaces:
+        ns, pods = item["namespace"], int(item.get("pods") or 0)
+        if item.get("system"):
+            sys_ns += 1
+            sys_pods += pods
+            continue
+        m = _SQUAD_NS_RE.match(ns)
+        key, part = (m.group(1), m.group(2)) if m else (ns, None)
+        stand = stands.setdefault(key, {"pods": 0, "parts": []})
+        stand["pods"] += pods
+        if part:
+            stand["parts"].append(part)
+    ordered = sorted(stands.items(), key=lambda kv: (-kv[1]["pods"], kv[0]))
+    return [(k, v["pods"], sorted(v["parts"])) for k, v in ordered], sys_ns, sys_pods
+
+
+def _fit_lines(lines: List[str], tail: List[str], unit: str) -> str:
+    """Discord режет поле на 1024: жертвуем хвостом строк, а `tail` (короткий
+    итог вроде счётчика системных) сохраняем всегда."""
+    if len("\n".join(lines + tail)) <= 1024:
+        return "\n".join(lines + tail)
+    # Не влезает: место под маркер резервируем только теперь, когда без
+    # выброса строк уже не обойтись.
+    kept, dropped = list(lines), 0
+    while len(kept) > 1 and len("\n".join(kept + [f"… ещё {dropped} {unit}"] + tail)) > 1024:
+        kept.pop()
+        dropped += 1
+    more = [f"… ещё {dropped} {unit}"] if dropped else []
+    # Осталась одна строка, и та не влезает: режем её саму, а не маркер и итог.
+    over = len("\n".join(kept + more + tail)) - 1024
+    if over > 0:
+        kept = [kept[0][: max(0, len(kept[0]) - over - 1)] + "…"]
+    return "\n".join(kept + more + tail)[:1024]
+
+
+def _build_node_namespaces_field(
+    namespaces: Optional[List[Dict[str, Any]]],
+    unknown_reason: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
+    """«Стенды на ноде» для нодового алерта — чьи namespace'ы там живут.
+
+    Запрос дежурного 23.09.2026: алерт про ноду говорил «где», но не «чьё»,
+    и за ответом шли в kubectl. Сквадовые namespace'ы склеиваются в один
+    стенд, системные сворачиваются в один счётчик в конце.
+
+    `namespaces=None` — список не получен: при `unknown_reason` поле честно
+    говорит «нет данных», без него (не нодовый алерт) не рендерится вовсе.
+    """
+    if namespaces is None:
+        if not unknown_reason:
+            return None
+        return {"name": _NODE_NS_FIELD, "value": f"_нет данных: {unknown_reason}_", "inline": False}
+
+    stands, sys_ns, sys_pods = _group_node_stands(namespaces)
+    system = f"системные: {sys_ns} ns, {_pods_word(sys_pods)}" if sys_ns else ""
+    if not stands:
+        value = f"стендов нет, только {system}" if system else "_на ноде нет подов_"
+    else:
+        lines = [
+            f"`{key}` — {_pods_word(pods)}" + (f" ({', '.join(parts)})" if parts else "")
+            for key, pods, parts in stands
+        ]
+        value = _fit_lines(lines, [f"+ {system}"] if system else [], "стенд.")
+    return {"name": _NODE_NS_FIELD, "value": value, "inline": False}
+
+
+def _build_nodes_stands_field(
+    per_node: List[Tuple[str, Optional[List[Dict[str, Any]]], Optional[str]]],
+) -> Optional[Dict[str, Any]]:
+    """«Стенды на ноде» для группы: один embed на шторм по нескольким нодам.
+
+    Alertmanager присылает одноимённые алерты по разным нодам одной группой,
+    и embed один на группу. Показать стенды только первой ноды — значит
+    соврать про остальные (ревью PR #420), поэтому при >1 ноде — по строке
+    на ноду: стенды с числом подов, без системных. `per_node` —
+    `(нода, namespaces | None, причина «нет данных» | None)`.
+    """
+    if not per_node:
+        return None
+    # Ни данных, ни причины их отсутствия — список не запрашивался (kill-switch
+    # ENRICH_NODE_NAMESPACES_ENABLED): поля нет, как и для одной ноды.
+    if all(namespaces is None and not reason for _n, namespaces, reason in per_node):
+        return None
+    if len(per_node) == 1:
+        _node, namespaces, reason = per_node[0]
+        return _build_node_namespaces_field(namespaces, reason)
+    lines = []
+    for node, namespaces, reason in per_node:
+        if namespaces is None:
+            lines.append(f"`{node}`: _нет данных_" if reason else f"`{node}`: —")
+            continue
+        stands, _sys_ns, _sys_pods = _group_node_stands(namespaces)
+        # Строка на ноду ограничена: нода с десятком стендов не должна
+        # вытеснить из поля остальные ноды шторма (ревью PR #420).
+        shown = [f"{key} ({pods})" for key, pods, _parts in stands[:_MULTI_NODE_MAX_STANDS]]
+        rest = len(stands) - len(shown)
+        summary = ", ".join(shown) + (f", +{rest}" if rest else "") if shown else "стендов нет"
+        lines.append(f"`{node}`: {summary}")
+    return {"name": _NODE_NS_FIELD, "value": _fit_lines(lines, [], "нод."), "inline": False}
 
 
 def _build_pod_trail_field(

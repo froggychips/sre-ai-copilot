@@ -44,6 +44,7 @@ from .embed_builder import (
     _build_orleans_field,
     _build_log_error_rate_field,
     _build_nats_impact_field,
+    _build_nodes_stands_field,
     _build_pod_trail_field,
     _build_runbook_field,
     _build_similar_past_field,
@@ -155,6 +156,9 @@ _EMBED_PROTECTED_FIELDS: Tuple[str, ...] = (
     # Для нодового алерта имя ноды — это и есть ответ «где», без него
     # остаётся только IP пода-экспортёра. Дропу не подлежит.
     "Нода",
+    # Парное к «Нода»: чьи стенды там сидят. Короткое (склейка по стенду,
+    # системные одним счётчиком), а без него нодовый алерт не говорит «чьё».
+    "Стенды на ноде",
 )
 
 
@@ -1527,10 +1531,20 @@ class DiscordService:
         })
         # Нода отдельным полем, а не только в заголовке: у нодовых алертов это
         # единственная координата «где именно», а заголовок сворачивается.
-        if head.node:
+        # Группа может нести шторм по нескольким нодам (одно имя алерта, N нод):
+        # перечисляем все, а не только первую — иначе остальные молча теряются.
+        node_ctxs: List["EnrichedContext"] = []
+        seen_nodes: set = set()
+        for c in contexts:
+            if c.node and c.node not in seen_nodes:
+                seen_nodes.add(c.node)
+                node_ctxs.append(c)
+        if node_ctxs:
+            node_names = [c.node for c in node_ctxs]
             fields.append({
                 "name": "Нода",
-                "value": f"`{head.node}`",
+                "value": ", ".join(f"`{n}`" for n in node_names[:4])
+                + (f" (+{len(node_names) - 4})" if len(node_names) > 4 else ""),
                 "inline": True,
             })
         if head.team_owner:
@@ -1545,6 +1559,18 @@ class DiscordService:
                 "value": "_сервис не в graph — topology unknown_",
                 "inline": True,
             })
+        # Чьи стенды на ноде — ответ «на кого идти» для нодового алерта.
+        if node_ctxs:
+            node_ns_field = _build_nodes_stands_field([
+                (
+                    c.node or "?",  # в node_ctxs только контексты с нодой
+                    c.node_namespaces,
+                    c.source_status.get("node_namespaces"),
+                )
+                for c in node_ctxs
+            ])
+            if node_ns_field:
+                fields.append(node_ns_field)
 
         # A1: AM inhibit/silence state. Если в AM payload пришло
         # `status: {state: suppressed, silencedBy/inhibitedBy: [...]}` —

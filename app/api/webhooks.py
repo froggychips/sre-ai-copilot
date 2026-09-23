@@ -643,7 +643,7 @@ async def alertmanager_webhook_enrich_and_forward(
     Если DISCORD_ENRICH_ENABLED=false — поведение идентично /store.
     """
     from app.knowledge_graph.auto_populator import populate_from_incident
-    from app.services.alert_enrichment import enrich_alert_async
+    from app.services.alert_enrichment import enrich_alert_async, prefetch_node_namespaces
     from app.services.discord_service import DiscordService
     from app.services.node_resolver import annotate_node_label
 
@@ -808,6 +808,10 @@ async def alertmanager_webhook_enrich_and_forward(
                 # Await-ы ПОСЛЕДОВАТЕЛЬНЫЕ (не gather): SQLAlchemy Session
                 # не потокобезопасна, конкурентные вызовы с одной и той же
                 # `db` рвут сессию.
+                # k8s-фаза «стендов на ноде» сессию не трогает — её гоняем
+                # параллельно заранее, иначе шторм по N нодам стоил бы N
+                # последовательных запросов к API.
+                await prefetch_node_namespaces(incs)
                 ctxs = [await enrich_alert_async(db, inc) for inc in incs]
                 # Инцидент наследует решение о шуме: gen-mismatch при здоровых
                 # репликах, meta-агрегаты, rollout-в-процессе. Строка остаётся,
