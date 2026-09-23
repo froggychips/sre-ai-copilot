@@ -187,32 +187,78 @@ class TestFetch:
             assert deployments.fetch_node_namespaces("dev-26") == first
         assert api.list_pod_for_all_namespaces.call_count == 2
 
-    def test_concurrent_misses_cost_one_request(self, monkeypatch):
-        """Параллельные вебхуки при лежащем API: один запрос, а не по одному на поток."""
+    @staticmethod
+    def _run_threads(targets):
         import threading
-        import time as real_time
+        threads = [threading.Thread(target=t) for t in targets]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
 
+    def test_same_node_single_flight(self, monkeypatch):
+        """Одновременные промахи по одной ноде: один запрос, остальные ждут его."""
+        import time as real_time
         monkeypatch.setattr(deployments, "_load_k8s_once", lambda: True)
         api = MagicMock()
 
-        def slow_timeout(**_kwargs):
+        def slow_ok(**_kwargs):
             real_time.sleep(0.2)
-            raise TimeoutError()
+            return SimpleNamespace(items=[_pod("squad-38-shared")])
 
-        api.list_pod_for_all_namespaces.side_effect = slow_timeout
+        api.list_pod_for_all_namespaces.side_effect = slow_ok
         results = []
         with patch.object(deployments.client, "CoreV1Api", return_value=api):
-            threads = [
-                threading.Thread(target=lambda i=i: results.append(
-                    deployments.fetch_node_namespaces(f"dev-{i}")))
-                for i in range(8)
-            ]
-            for t in threads:
-                t.start()
-            for t in threads:
-                t.join()
-        assert results == [None] * 8
+            self._run_threads([
+                lambda: results.append(deployments.fetch_node_namespaces("dev-26"))
+                for _ in range(8)
+            ])
         assert api.list_pod_for_all_namespaces.call_count == 1
+        assert results == [[{"namespace": "squad-38-shared", "pods": 1, "system": False}]] * 8
+
+    def test_different_nodes_not_serialized(self, monkeypatch):
+        """Медленный, но живой API: разные ноды идут параллельно — задержка
+        ограничена одним запросом, а не суммой (лок не держится на время I/O)."""
+        import time as real_time
+        monkeypatch.setattr(deployments, "_load_k8s_once", lambda: True)
+        api = MagicMock()
+
+        def slow_ok(**_kwargs):
+            real_time.sleep(0.3)
+            return SimpleNamespace(items=[_pod("squad-38-shared")])
+
+        api.list_pod_for_all_namespaces.side_effect = slow_ok
+        started = real_time.monotonic()
+        with patch.object(deployments.client, "CoreV1Api", return_value=api):
+            self._run_threads([
+                lambda i=i: deployments.fetch_node_namespaces(f"dev-{i}") for i in range(6)
+            ])
+        assert api.list_pod_for_all_namespaces.call_count == 6
+        assert real_time.monotonic() - started < 1.2  # сериализация дала бы ~1.8 с
+
+    def test_cache_hit_does_not_wait_for_other_node(self, monkeypatch):
+        import threading
+        import time as real_time
+        monkeypatch.setattr(deployments, "_load_k8s_once", lambda: True)
+        api = MagicMock()
+        release = threading.Event()
+
+        def call(**kwargs):
+            if kwargs["field_selector"].endswith("dev-slow"):
+                release.wait(2)
+            return SimpleNamespace(items=[_pod("squad-38-shared")])
+
+        api.list_pod_for_all_namespaces.side_effect = call
+        with patch.object(deployments.client, "CoreV1Api", return_value=api):
+            deployments.fetch_node_namespaces("dev-26")  # прогрели кэш
+            slow = threading.Thread(target=lambda: deployments.fetch_node_namespaces("dev-slow"))
+            slow.start()
+            real_time.sleep(0.05)
+            t0 = real_time.monotonic()
+            assert deployments.fetch_node_namespaces("dev-26") is not None
+            assert real_time.monotonic() - t0 < 0.1
+            release.set()
+            slow.join()
 
     def test_breaker_expires(self, monkeypatch):
         monkeypatch.setattr(deployments, "_load_k8s_once", lambda: True)

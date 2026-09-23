@@ -176,29 +176,57 @@ def fetch_node_namespaces(
     """
     if not node:
         return None
-    # Шторм нодовых алертов (одно имя, N нод) приходит одной группой и
-    # обогащается ПОСЛЕДОВАТЕЛЬНО — см. enrich-and-forward. Без кэша и
-    # предохранителя лежащий API стоил бы N×timeout_sec задержки уведомления.
-    # Под общей блокировкой: enrich_alert_async гоняет эти вызовы в пуле
-    # потоков, и без неё параллельные вебхуки разом видели бы промах кэша и
-    # холодный предохранитель — по таймауту на каждый (ревью PR #420). Держать
-    # блокировку на время запроса дёшево: живой API отвечает за десятки мс,
-    # а лежащий — ровно один раз, дальше все ждущие упираются в предохранитель.
+    # Шторм нодовых алертов (одно имя, N нод) приходит одной группой, а
+    # параллельные вебхуки гоняют enrichment в пуле потоков. Поэтому:
+    #  - кэш на ноду (30 с) и предохранитель: после сбоя API 30 с не ходим;
+    #  - single-flight по ноде: одновременные промахи по ОДНОЙ ноде ждут
+    #    первый запрос, а не шлют свой;
+    #  - лок держится только на чтение/запись состояния, НЕ на время запроса:
+    #    разные ноды идут параллельно, попадания в кэш не ждут чужой I/O, и
+    #    задержка уведомления ограничена одним timeout_sec (ревью PR #420).
     with _node_ns_lock:
-        return _fetch_node_namespaces_locked(node, timeout_sec)
+        hit, value = _node_ns_cached_or_down(node)
+        if hit:
+            return value
+        flight = _node_ns_inflight.get(node)
+        owner = flight is None
+        if owner:
+            flight = threading.Event()
+            _node_ns_inflight[node] = flight
+    assert flight is not None
+
+    if not owner:
+        flight.wait(timeout_sec + 1.0)
+        with _node_ns_lock:
+            return _node_ns_cached_or_down(node)[1]
+
+    result: Optional[List[Dict[str, Any]]] = None
+    try:
+        result = _query_node_namespaces(node, timeout_sec)
+    finally:
+        with _node_ns_lock:
+            if result is not None:
+                _node_ns_cache[node] = (time.monotonic(), result)
+            _node_ns_inflight.pop(node, None)
+        flight.set()
+    return result
 
 
-def _fetch_node_namespaces_locked(
-    node: str, timeout_sec: float,
-) -> Optional[List[Dict[str, Any]]]:
+def _node_ns_cached_or_down(node: str) -> Tuple[bool, Optional[List[Dict[str, Any]]]]:
+    """Под `_node_ns_lock`. (True, снимок) — валидный кэш ноды; (True, None) —
+    предохранитель взведён; (False, None) — надо идти в API. Сначала свой
+    кэш, потом предохранитель: сбой по ДРУГОЙ ноде не прячет снимок этой."""
     now = time.monotonic()
-    # Сначала свой кэш, потом предохранитель: сбой запроса по ДРУГОЙ ноде не
-    # повод прятать ещё валидный снимок этой (ревью PR #420).
     cached = _node_ns_cache.get(node)
     if cached and now - cached[0] < _NODE_NS_CACHE_TTL_SEC:
-        return cached[1]
+        return True, cached[1]
     if now < _node_ns_api_down_until:
-        return None
+        return True, None
+    return False, None
+
+
+def _query_node_namespaces(node: str, timeout_sec: float) -> Optional[List[Dict[str, Any]]]:
+    """Сам запрос к API, без лока. None при любой ошибке (взводит предохранитель)."""
     if not _load_k8s_once():
         return None
     try:
@@ -218,12 +246,10 @@ def _fetch_node_namespaces_locked(
             continue
         ns = pod.metadata.namespace
         counts[ns] = counts.get(ns, 0) + 1
-    result = [
+    return [
         {"namespace": ns, "pods": n, "system": ns in NODE_SYSTEM_NAMESPACES}
         for ns, n in sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))
     ]
-    _node_ns_cache[node] = (now, result)
-    return result
 
 
 # Кэш стендов ноды и предохранитель API (см. fetch_node_namespaces). 30 с
@@ -231,20 +257,24 @@ def _fetch_node_namespaces_locked(
 # мало, чтобы список стендов не устарел для дежурного.
 _NODE_NS_CACHE_TTL_SEC = 30.0
 _node_ns_cache: Dict[str, Tuple[float, List[Dict[str, Any]]]] = {}
+_node_ns_inflight: Dict[str, threading.Event] = {}
 _node_ns_api_down_until = 0.0
 _node_ns_lock = threading.Lock()
 
 
 def _trip_node_ns_breaker() -> None:
     global _node_ns_api_down_until
-    _node_ns_api_down_until = time.monotonic() + _NODE_NS_CACHE_TTL_SEC
+    with _node_ns_lock:
+        _node_ns_api_down_until = time.monotonic() + _NODE_NS_CACHE_TTL_SEC
 
 
 def reset_node_namespaces_cache() -> None:
-    """Для тестов: кэш и предохранитель — модульные."""
+    """Для тестов: кэш, предохранитель и in-flight — модульные."""
     global _node_ns_api_down_until
-    _node_ns_cache.clear()
-    _node_ns_api_down_until = 0.0
+    with _node_ns_lock:
+        _node_ns_cache.clear()
+        _node_ns_inflight.clear()
+        _node_ns_api_down_until = 0.0
 
 
 def fetch_last_log_line(
