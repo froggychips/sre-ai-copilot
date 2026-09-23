@@ -462,7 +462,8 @@ def apply_intent(
         # хуже любого отказа. uid в графе есть, а снимка нет — отказ (ниже).
         # uid не записан — сверить нечем: идём дальше, identity_check = unknown.
         expected_target = expected_identity(db, incident_id)
-        target_before = snapshot_target(intent)
+        # Мимо брейкера, как и dry-run выше: см. snapshot_target.
+        target_before = snapshot_target(intent, respect_breaker=False)
         mismatch = identity_mismatch(expected_target, target_before)
         if mismatch:
             audit_service.log_event(

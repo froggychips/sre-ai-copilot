@@ -146,9 +146,15 @@ def parse_snapshot(obj: Dict[str, Any], intent: ExecutionIntent) -> TargetSnapsh
 
 def snapshot_target(
     intent: ExecutionIntent, *, runner: Optional[Callable[..., Any]] = None, timeout: float = 15.0,
+    respect_breaker: bool = True,
 ) -> TargetSnapshot:
     """`kubectl get <kind> <name> -n <ns> -o json` → TargetSnapshot. Fail-open в
-    `unknown`: верификация никогда не должна ронять действие."""
+    `unknown`: верификация никогда не должна ронять действие.
+
+    `respect_breaker=False` — для снимка перед write: при известном uid unknown
+    означает отказ, и открытый общий брейкер чтений (открытый чужими сбоями)
+    не должен блокировать запись, когда server-side dry-run того же действия —
+    который брейкер обходит намеренно — только что прошёл."""
     if runner is None:
         from app.knowledge_graph.kubectl_breaker import run_kubectl
         runner = run_kubectl
@@ -157,7 +163,8 @@ def snapshot_target(
         return TargetSnapshot.unavailable(f"unsupported_resource_type:{intent.resource_type}", intent)
     argv = ["kubectl", "get", kind, intent.resource_name, "-n", intent.namespace, "-o", "json"]
     try:
-        proc = runner(argv, timeout=timeout, operation="remediation_snapshot", respect_breaker=True)
+        proc = runner(argv, timeout=timeout, operation="remediation_snapshot",
+                      respect_breaker=respect_breaker)
     except Exception as e:  # kubectl нет, брейкер открыт, таймаут
         return TargetSnapshot.unavailable(f"kubectl_failed:{type(e).__name__}", intent)
     if getattr(proc, "returncode", 1) != 0:

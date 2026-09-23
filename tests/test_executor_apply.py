@@ -334,6 +334,31 @@ def test_apply_refuses_when_uid_known_but_snapshot_unknown(mock_session, monkeyp
     assert "executor_in_flight" not in record.analysis
 
 
+def test_pre_write_snapshot_bypasses_read_breaker(mock_session, monkeypatch):
+    """Снимок перед write — мимо общего брейкера чтений (как и dry-run): иначе
+    открытый чужими сбоями брейкер отказывал бы все write с известным uid."""
+    from app.remediation.verification import TargetSnapshot
+    _session, query = mock_session
+    seen = []
+
+    def snap(intent, **kw):
+        seen.append(kw.get("respect_breaker"))
+        return TargetSnapshot(kind="deployment", namespace="squad-1",
+                              name="town-service", uid="uid-1")
+
+    monkeypatch.setattr(executor_apply, "expected_identity", lambda db, incident_id: {"uid": "uid-1"})
+    monkeypatch.setattr(executor_apply, "snapshot_target", snap)
+    query.first.return_value = _make_record({"execution_intent": _valid_intent_dict(),
+                                             "executor_result": {"status": "dry_run_ok"}})
+    fake_result = {"success": True, "stdout": "ok", "stderr": "", "command": "kubectl …",
+                   "exit_code": 0, "dry_run": False}
+    with _approved(), patch.object(executor_apply.k8s_service, "execute_intent",
+                                   side_effect=_fake_exec(write_result=fake_result)):
+        out = executor_apply.apply_intent("inc-br", "u1", _sig_for(_valid_intent_dict()))
+    assert out["ok"] is True
+    assert seen[0] is False  # снимок ДО write
+
+
 def test_apply_proceeds_without_expected_uid_when_snapshot_unknown(mock_session, monkeypatch):
     """Решение без uid (источник не сообщил) — Known Unknown, не отказ: иначе встал бы
     remediation по всем старым инцидентам."""
