@@ -187,6 +187,33 @@ class TestFetch:
             assert deployments.fetch_node_namespaces("dev-26") == first
         assert api.list_pod_for_all_namespaces.call_count == 2
 
+    def test_concurrent_misses_cost_one_request(self, monkeypatch):
+        """Параллельные вебхуки при лежащем API: один запрос, а не по одному на поток."""
+        import threading
+        import time as real_time
+
+        monkeypatch.setattr(deployments, "_load_k8s_once", lambda: True)
+        api = MagicMock()
+
+        def slow_timeout(**_kwargs):
+            real_time.sleep(0.2)
+            raise TimeoutError()
+
+        api.list_pod_for_all_namespaces.side_effect = slow_timeout
+        results = []
+        with patch.object(deployments.client, "CoreV1Api", return_value=api):
+            threads = [
+                threading.Thread(target=lambda i=i: results.append(
+                    deployments.fetch_node_namespaces(f"dev-{i}")))
+                for i in range(8)
+            ]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join()
+        assert results == [None] * 8
+        assert api.list_pod_for_all_namespaces.call_count == 1
+
     def test_breaker_expires(self, monkeypatch):
         monkeypatch.setattr(deployments, "_load_k8s_once", lambda: True)
         clock = [1000.0]

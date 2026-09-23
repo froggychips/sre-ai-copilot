@@ -7,6 +7,7 @@ flaky kube API.
 """
 from __future__ import annotations
 
+import threading
 import time
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
@@ -178,6 +179,18 @@ def fetch_node_namespaces(
     # Шторм нодовых алертов (одно имя, N нод) приходит одной группой и
     # обогащается ПОСЛЕДОВАТЕЛЬНО — см. enrich-and-forward. Без кэша и
     # предохранителя лежащий API стоил бы N×timeout_sec задержки уведомления.
+    # Под общей блокировкой: enrich_alert_async гоняет эти вызовы в пуле
+    # потоков, и без неё параллельные вебхуки разом видели бы промах кэша и
+    # холодный предохранитель — по таймауту на каждый (ревью PR #420). Держать
+    # блокировку на время запроса дёшево: живой API отвечает за десятки мс,
+    # а лежащий — ровно один раз, дальше все ждущие упираются в предохранитель.
+    with _node_ns_lock:
+        return _fetch_node_namespaces_locked(node, timeout_sec)
+
+
+def _fetch_node_namespaces_locked(
+    node: str, timeout_sec: float,
+) -> Optional[List[Dict[str, Any]]]:
     now = time.monotonic()
     # Сначала свой кэш, потом предохранитель: сбой запроса по ДРУГОЙ ноде не
     # повод прятать ещё валидный снимок этой (ревью PR #420).
@@ -219,6 +232,7 @@ def fetch_node_namespaces(
 _NODE_NS_CACHE_TTL_SEC = 30.0
 _node_ns_cache: Dict[str, Tuple[float, List[Dict[str, Any]]]] = {}
 _node_ns_api_down_until = 0.0
+_node_ns_lock = threading.Lock()
 
 
 def _trip_node_ns_breaker() -> None:
