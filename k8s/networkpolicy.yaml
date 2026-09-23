@@ -24,12 +24,24 @@ spec:
   - Ingress
   - Egress
   ingress:
-  # 8000 (API): ingress-nginx живёт в другом namespace, плюс vmalertmanager
-  # (ns monitoring) постит вебхуки напрямую в Service — поэтому пускаем
-  # in-cluster трафик на 8000 из любого namespace. Голый podSelector (как
-  # раньше) матчится ТОЛЬКО в своём namespace и молча резал бы оба источника.
+  # 8000 (API): только реальные клиенты, по namespace.
+  #   monitoring — vmalertmanager постит /webhooks/alertmanager/* напрямую в
+  #                Service (HMAC у него нет, см. ALERTMANAGER_ALLOW_UNAUTHENTICATED:
+  #                граница доверия — именно это правило);
+  #   mcp        — squad-medic постит /webhooks/remediation (HMAC).
+  # До 23.09.2026 здесь стоял `namespaceSelector: {}` — любой namespace
+  # кластера, включая сквады с кодом из произвольных веток, то есть изоляции,
+  # на которую опирается отказ от HMAC, не было вовсе. Клиенты сверены по
+  # access-логу sre-ai-api за 5 суток: кроме этих двух — только пробы kubelet
+  # с хоста ноды, их namespaceSelector не касается. Ingress у API нет.
+  # Новый клиент API = новая строка здесь, иначе молча получит таймаут.
   - from:
-    - namespaceSelector: {}
+    - namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: monitoring
+    - namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: mcp
     ports:
     - protocol: TCP
       port: 8000
