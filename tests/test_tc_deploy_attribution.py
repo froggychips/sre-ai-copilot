@@ -15,6 +15,7 @@
 Точный ответ лежал в параметрах билда: NAMESPACE есть у всех
 deploy-конфигов, SERVICE_NAME — у тех, что деплоят один сервис.
 """
+from datetime import datetime, timedelta
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -44,14 +45,21 @@ def _svc(db, name, ns):
     return s
 
 
+# Время билда — относительно «сейчас», а не зашитой датой: stale-классификатор
+# считает деплой свежим только в своём окне, и зашитое 2026-08-21 через месяц
+# превратило `active` в `suspicious_stale` (тест упал 23.09.2026 сам по себе).
+_STARTED = datetime.utcnow() - timedelta(hours=1)
+_FINISHED = _STARTED + timedelta(minutes=9, seconds=20)
+
+
 def _build(**over):
     b = {
         "id": 179660, "number": "2917", "status": "SUCCESS",
         "branch": "<default>",
         "buildtype_id": "Wo_Backend_K8sNewCluster_BuildAndDeploy",
         "buildtype_name": "Build and update",
-        "started_at": "2026-08-21T08:41:20",
-        "finished_at": "2026-08-21T08:50:40",
+        "started_at": _STARTED.strftime("%Y-%m-%dT%H:%M:%S"),
+        "finished_at": _FINISHED.strftime("%Y-%m-%dT%H:%M:%S"),
         "triggered_by": "romeo", "sha": "a3124ff5",
         "all_revisions": [{"sha": "a3124ff5", "root": "wo-backend"}],
         "url": None, "target_realm": None, "target_service": None,

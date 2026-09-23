@@ -7,8 +7,9 @@ flaky kube API.
 """
 from __future__ import annotations
 
+import time
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import structlog
 from kubernetes import client
@@ -172,7 +173,18 @@ def fetch_node_namespaces(
     данных нет, а не «на ноде пусто». Никогда не пробрасывает исключение;
     дедлайн — `_request_timeout` (см. комментарий в `fetch_live_replicas`).
     """
-    if not node or not _load_k8s_once():
+    if not node:
+        return None
+    # Шторм нодовых алертов (одно имя, N нод) приходит одной группой и
+    # обогащается ПОСЛЕДОВАТЕЛЬНО — см. enrich-and-forward. Без кэша и
+    # предохранителя лежащий API стоил бы N×timeout_sec задержки уведомления.
+    now = time.monotonic()
+    if now < _node_ns_api_down_until:
+        return None
+    cached = _node_ns_cache.get(node)
+    if cached and now - cached[0] < _NODE_NS_CACHE_TTL_SEC:
+        return cached[1]
+    if not _load_k8s_once():
         return None
     try:
         pods = client.CoreV1Api().list_pod_for_all_namespaces(
@@ -181,6 +193,7 @@ def fetch_node_namespaces(
         )
     except Exception as e:
         logger.warning("node_namespaces_fetch_failed", node=node, error=type(e).__name__)
+        _trip_node_ns_breaker()
         return None
 
     counts: Dict[str, int] = {}
@@ -190,10 +203,32 @@ def fetch_node_namespaces(
             continue
         ns = pod.metadata.namespace
         counts[ns] = counts.get(ns, 0) + 1
-    return [
+    result = [
         {"namespace": ns, "pods": n, "system": ns in NODE_SYSTEM_NAMESPACES}
         for ns, n in sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))
     ]
+    _node_ns_cache[node] = (now, result)
+    return result
+
+
+# Кэш стендов ноды и предохранитель API (см. fetch_node_namespaces). 30 с
+# хватает, чтобы шторм по одной ноде и повторы группы AM не долбили API, и
+# мало, чтобы список стендов не устарел для дежурного.
+_NODE_NS_CACHE_TTL_SEC = 30.0
+_node_ns_cache: Dict[str, Tuple[float, List[Dict[str, Any]]]] = {}
+_node_ns_api_down_until = 0.0
+
+
+def _trip_node_ns_breaker() -> None:
+    global _node_ns_api_down_until
+    _node_ns_api_down_until = time.monotonic() + _NODE_NS_CACHE_TTL_SEC
+
+
+def reset_node_namespaces_cache() -> None:
+    """Для тестов: кэш и предохранитель — модульные."""
+    global _node_ns_api_down_until
+    _node_ns_cache.clear()
+    _node_ns_api_down_until = 0.0
 
 
 def fetch_last_log_line(

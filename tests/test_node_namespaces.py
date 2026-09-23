@@ -11,6 +11,9 @@ namespace'ы, склеенные по стенду.
   - «нет данных» при сбое API вместо ложного «пусто»;
   - лимит поля Discord 1024 без потери счётчика системных;
   - фильтр завершённых подов и поведение fetch при ошибке API;
+  - кэш на ноду и предохранитель: шторм по N нодам при лежащем API стоит
+    один таймаут, а не N (ревью PR #420);
+  - группа по нескольким нодам: поле «Нода» и стенды — по каждой ноде;
   - enrichment: запрос только для нодового алерта, kill-switch, source_status.
 """
 from types import SimpleNamespace
@@ -21,8 +24,17 @@ import pytest
 from app.context import deployments
 from app.models.incident import Incident
 from app.services.alert_enrichment import EnrichedContext, enrich_alert
-from app.services.discord.embed_builder import _build_node_namespaces_field, _pods_word
+from app.services.discord.embed_builder import (_build_node_namespaces_field,
+                                                _build_nodes_stands_field, _pods_word)
 from app.services.discord_service import DiscordService
+
+
+@pytest.fixture(autouse=True)
+def _clean_node_ns_cache():
+    """Кэш и предохранитель модульные — между тестами сбрасываем."""
+    deployments.reset_node_namespaces_cache()
+    yield
+    deployments.reset_node_namespaces_cache()
 
 
 def _ns(namespace, pods, system=False):
@@ -141,6 +153,42 @@ class TestFetch:
         monkeypatch.setattr(deployments, "_load_k8s_once", lambda: False)
         assert deployments.fetch_node_namespaces("dev-26") is None
 
+    def test_cached_per_node(self, monkeypatch):
+        monkeypatch.setattr(deployments, "_load_k8s_once", lambda: True)
+        api = MagicMock()
+        api.list_pod_for_all_namespaces.return_value = SimpleNamespace(items=[_pod("squad-38-shared")])
+        with patch.object(deployments.client, "CoreV1Api", return_value=api):
+            first = deployments.fetch_node_namespaces("dev-26")
+            second = deployments.fetch_node_namespaces("dev-26")
+            deployments.fetch_node_namespaces("dev-27")
+        assert first == second
+        assert api.list_pod_for_all_namespaces.call_count == 2  # dev-26 один раз + dev-27
+
+    def test_breaker_after_failure_skips_other_nodes(self, monkeypatch):
+        """Лежащий API: шторм по N нодам стоит один таймаут, а не N."""
+        monkeypatch.setattr(deployments, "_load_k8s_once", lambda: True)
+        api = MagicMock()
+        api.list_pod_for_all_namespaces.side_effect = TimeoutError()
+        with patch.object(deployments.client, "CoreV1Api", return_value=api):
+            results = [deployments.fetch_node_namespaces(f"dev-{i}") for i in range(10)]
+        assert results == [None] * 10
+        assert api.list_pod_for_all_namespaces.call_count == 1
+
+    def test_breaker_expires(self, monkeypatch):
+        monkeypatch.setattr(deployments, "_load_k8s_once", lambda: True)
+        clock = [1000.0]
+        monkeypatch.setattr(deployments.time, "monotonic", lambda: clock[0])
+        api = MagicMock()
+        api.list_pod_for_all_namespaces.side_effect = [
+            TimeoutError(), SimpleNamespace(items=[_pod("squad-38-shared")]),
+        ]
+        with patch.object(deployments.client, "CoreV1Api", return_value=api):
+            assert deployments.fetch_node_namespaces("dev-26") is None
+            clock[0] += deployments._NODE_NS_CACHE_TTL_SEC + 1
+            assert deployments.fetch_node_namespaces("dev-26") == [
+                {"namespace": "squad-38-shared", "pods": 1, "system": False},
+            ]
+
 
 _NODE_LABELS = {
     "alertname": "NodeMemoryWillExhaustSoon",
@@ -203,8 +251,35 @@ class TestEnrichment:
         assert "node_namespaces" not in ctx.source_status
 
 
+class TestMultiNodeField:
+    def test_single_node_is_full_format(self):
+        field = _build_nodes_stands_field([("dev-26", _DEV26, None)])
+        assert field == _build_node_namespaces_field(_DEV26)
+
+    def test_line_per_node(self):
+        field = _build_nodes_stands_field([
+            ("dev-26", _DEV26, None),
+            ("dev-17", [_ns("squad-29-shared", 40), _ns("squad-29-kingdom5", 30),
+                        _ns("squad-5-shared", 3), _ns("kube-system", 2, True)], None),
+            ("dev-9", [_ns("kube-system", 2, True)], None),
+            ("dev-4", None, "k8s API не ответил"),
+        ])
+        assert field["value"].splitlines() == [
+            "`dev-26`: squad-38 (71)",
+            "`dev-17`: squad-29 (70), squad-5 (3)",
+            "`dev-9`: стендов нет",
+            "`dev-4`: _нет данных_",
+        ]
+
+    def test_empty(self):
+        assert _build_nodes_stands_field([]) is None
+
+
 class TestEmbed:
     async def _embed(self, ctx):
+        return await self._embed_many([ctx])
+
+    async def _embed_many(self, ctxs):
         sent = {}
 
         async def fake_post(self, url, json=None, **_):
@@ -217,7 +292,7 @@ class TestEmbed:
              patch("app.services.discord_service.settings.DISCORD_WEBHOOK_URL",
                    "https://example.com/wh"), \
              patch("httpx.AsyncClient.post", new=fake_post):
-            await DiscordService().send_enriched_alert([ctx], env="dev")
+            await DiscordService().send_enriched_alert(ctxs, env="dev")
         return sent["payload"]["embeds"][0]
 
     @pytest.mark.asyncio
@@ -240,6 +315,25 @@ class TestEmbed:
         embed = await self._embed(ctx)
         fields = [f for f in embed["fields"] if f["name"] == "Стенды на ноде"]
         assert fields and "нет данных" in fields[0]["value"]
+
+    @pytest.mark.asyncio
+    async def test_group_of_nodes_lists_every_node(self):
+        """Шторм по двум нодам — один embed, но обе ноды и стенды обеих."""
+        a = EnrichedContext(
+            incident=_incident({**_NODE_LABELS, "node": "dev-26"}),
+            node="dev-26", node_namespaces=_DEV26,
+        )
+        b = EnrichedContext(
+            incident=_incident({**_NODE_LABELS, "node": "dev-17"}),
+            node="dev-17", node_namespaces=[_ns("squad-29-shared", 40)],
+        )
+        embed = await self._embed_many([a, b])
+        by_name = {f["name"]: f["value"] for f in embed["fields"]}
+        assert by_name["Нода"] == "`dev-26`, `dev-17`"
+        assert by_name["Стенды на ноде"].splitlines() == [
+            "`dev-26`: squad-38 (71)",
+            "`dev-17`: squad-29 (40)",
+        ]
 
     @pytest.mark.asyncio
     async def test_no_field_for_regular_alert(self):
