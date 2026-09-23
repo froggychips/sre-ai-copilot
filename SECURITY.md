@@ -43,7 +43,7 @@ This is the highest-severity threat surface in this project.
 
 ### `POST /webhooks/alertmanager` — HMAC-authenticated ingress
 
-The alertmanager webhook endpoints (`/webhooks/alertmanager`, `/store`, `/enrich-and-forward`) require an HMAC-SHA256 signature (`X-Alertmanager-Signature`, keyed by `ALERTMANAGER_WEBHOOK_SECRET`) and **fail closed**: if no secret is configured, all requests are rejected with 401 in every environment. The only way to run without authentication is the explicit dev opt-out `ALERTMANAGER_ALLOW_UNAUTHENTICATED=true`, which logs a warning on every request. Never set it outside local development.
+The alertmanager webhook endpoints (`/webhooks/alertmanager`, `/store`, `/enrich-and-forward`) require an HMAC-SHA256 signature (`X-Alertmanager-Signature`, keyed by `ALERTMANAGER_WEBHOOK_SECRET`) and **fail closed**: if no secret is configured, all requests are rejected with 401 in every environment. The only way to run without authentication is the explicit opt-out `ALERTMANAGER_ALLOW_UNAUTHENTICATED=true`, which logs a warning on every request. Outside local development it is acceptable **only** together with a NetworkPolicy that limits ingress on port 8000 to the AlertManager namespace: stock AlertManager cannot sign the body, and the production deployment uses exactly this combination (`k8s/networkpolicy.yaml` admits `monitoring` and `mcp` only). The opt-out without such a policy exposes the endpoint to every pod in the cluster — until 2026-09-23 the policy admitted any namespace, so the isolation this mode relies on did not exist.
 
 Additional request validation:
 - Anti-replay, three layers, strongest first (`app/security/replay.py`):

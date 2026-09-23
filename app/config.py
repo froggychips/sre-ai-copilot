@@ -685,7 +685,8 @@ class Settings(BaseSettings):
     # неаутентифицированные вебхуки. Теперь пропуск требует ЯВНОГО опт-аута.
     ALERTMANAGER_ALLOW_UNAUTHENTICATED: bool = Field(
         False,
-        description="Явно разрешить вебхук без подписи (только локальная разработка)",
+        description="Явно разрешить вебхук без подписи: локально, либо в проде ТОЛЬКО "
+        "вместе с NetworkPolicy, пускающей на 8000 лишь namespace AlertManager",
     )
     # Вебхук внешних исполнителей (squad-medic): POST /webhooks/remediation.
     # Та же схема, что у AlertManager, но timestamp ОБЯЗАТЕЛЕН: подпись

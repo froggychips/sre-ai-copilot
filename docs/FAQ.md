@@ -59,7 +59,10 @@ receivers:
         send_resolved: true
 ```
 
-The endpoint has no authentication by default — restrict it at the network level (Kubernetes NetworkPolicy or ingress IP allowlist) so only AlertManager can reach it.
+The endpoint **fails closed**: it requires an HMAC-SHA256 signature (`X-Alertmanager-Signature`, keyed by `ALERTMANAGER_WEBHOOK_SECRET`), and without a configured secret every request is rejected with 401. Stock AlertManager cannot sign the body, so you have two options (details in [SECURITY.md](../SECURITY.md) and `k8s/vmalertmanagerconfig.yaml`):
+
+- put a signing proxy next to AlertManager (preferred; set `ALERTMANAGER_REQUIRE_SIGNED_TIMESTAMP=true`);
+- or set the explicit opt-out `ALERTMANAGER_ALLOW_UNAUTHENTICATED=true` **and** restrict ingress on port 8000 with a NetworkPolicy to the AlertManager namespace only. The opt-out without that NetworkPolicy leaves the endpoint open to every pod in the cluster.
 
 Each alert in the payload generates a separate Celery task and goes through the full agent pipeline independently.
 
