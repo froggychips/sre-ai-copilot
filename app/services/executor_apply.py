@@ -462,7 +462,11 @@ def apply_intent(
         from app.remediation.executor_gate import (PolicyMode,
                                                    evaluate_intent_gate)
 
-        gate = evaluate_intent_gate(intent)
+        # Снимок отбора playbook-ов пишет pipeline; gate читает его только
+        # под REMEDIATION_PLAYBOOK_BINDING_ENABLED (см. remediation.binding).
+        gate = evaluate_intent_gate(
+            intent, match_snapshot=analysis.get("playbook_match"),
+        )
         gate_dict = gate.to_dict()
         if gate.mode == PolicyMode.BLOCK:
             reason_code = "no_match"

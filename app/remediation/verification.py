@@ -385,6 +385,85 @@ def assess(
     return {"outcome": OUTCOME_VERIFIED, "checks": checks, "reasons": reasons}
 
 
+def playbook_verify_names(
+    intent: ExecutionIntent, analysis: Dict[str, Any],
+) -> Optional[Dict[str, Any]]:
+    """Какие проверки требует playbook, по которому исполнен intent.
+
+    Источник — серверный снимок отбора (`analysis["playbook_match"]`):
+    список verify зафиксирован там на момент одобрения, и правка YAML после
+    исполнения не меняет требований задним числом. Снимок потерян (analysis
+    перезаписан) — берём playbook из реестра по имени: здесь это не граница
+    доверия, а лишь выбор, какие проверки считать обязательными.
+    Привязанным считается intent с `playbook_match` — его ставит только
+    pipeline по серверному снимку. Имя playbook-а без hash-а могла вписать
+    модель при выключенном флаге; ужесточать по нему проверку незачем.
+    Не привязан — None, оценка assess() остаётся как есть.
+    """
+    if not intent.playbook or not intent.playbook_match:
+        return None
+    from app.remediation.binding import find_entry
+    entry = find_entry(analysis.get("playbook_match"), intent.playbook)
+    if entry is not None:
+        names = [str(n) for n in entry.get("verify") or ()]
+        return {"playbook": intent.playbook, "source": "match_snapshot", "names": names}
+    try:
+        from app.remediation.matcher import default_registry
+        pb = default_registry().get(intent.playbook)
+    except Exception as e:
+        log.warning("verification.playbook_registry_failed",
+                    playbook=intent.playbook, error=type(e).__name__)
+        pb = None
+    if pb is None:
+        return None
+    return {"playbook": pb.name, "source": "registry", "names": list(pb.verify or ())}
+
+
+def apply_playbook_verify(
+    result: Dict[str, Any],
+    verify: Optional[Dict[str, Any]],
+    *,
+    attempt: int,
+    max_attempts: int,
+) -> Dict[str, Any]:
+    """Наложить обязательные проверки playbook-а на исход assess().
+
+    Playbook только ужесточает: FAILED и UNKNOWN из assess() остаются как
+    есть. Для VERIFIED/PENDING:
+      * проверка из списка вернула False — ждём следующей попытки, на
+        последней — FAILED (converged/healthy со временем могут стать True);
+      * проверка вернула None — «не удалось проверить» не засчитывается как
+        успех: ждём, на последней попытке — UNKNOWN. Без playbook-а тот же
+        пробел (например, uid до действия неизвестен) остаётся лишь
+        пометкой в reasons.
+    """
+    if not verify or not verify.get("names"):
+        return result
+    from app.remediation.verify_checks import VERIFY_CHECKS, evaluate_verify
+    names = [n for n in verify["names"] if n in VERIFY_CHECKS]
+    unknown_names = [n for n in verify["names"] if n not in VERIFY_CHECKS]
+    evaluated = evaluate_verify(names, result.get("checks") or {})
+    out = dict(result)
+    out["reasons"] = list(result.get("reasons") or [])
+    out["playbook_verify"] = {
+        "playbook": verify.get("playbook"),
+        "source": verify.get("source"),
+        "checks": evaluated,
+    }
+    if out["outcome"] not in (OUTCOME_VERIFIED, OUTCOME_PENDING):
+        return out
+    last = attempt >= max_attempts
+    failed = [n for n, v in evaluated.items() if v is False]
+    gaps = [n for n, v in evaluated.items() if v is None] + unknown_names
+    if failed:
+        out["reasons"].append(f"playbook {verify.get('playbook')}: не выполнены {failed}")
+        out["outcome"] = OUTCOME_FAILED if last else OUTCOME_PENDING
+    elif gaps:
+        out["reasons"].append(f"playbook {verify.get('playbook')}: не проверены {gaps}")
+        out["outcome"] = OUTCOME_UNKNOWN if last else OUTCOME_PENDING
+    return out
+
+
 def _applied_attempt(db: Any, incident_id: str) -> Any:
     """Попытка, дошедшая до записи (kg_remediation_attempts), или None.
 
@@ -476,6 +555,10 @@ def verify_remediation(
             attempt=attempt,
             max_attempts=max_attempts,
         )
+        result = apply_playbook_verify(
+            result, playbook_verify_names(intent, analysis),
+            attempt=attempt, max_attempts=max_attempts,
+        )
         entry = {
             "attempt": attempt,
             "max_attempts": max_attempts,
@@ -485,6 +568,8 @@ def verify_remediation(
             "reasons": result["reasons"],
             "snapshot": now_snap.to_dict(),
         }
+        if "playbook_verify" in result:
+            entry["playbook_verify"] = result["playbook_verify"]
         history = list(analysis.get("executor_verification_history") or [])
         history.append({k: entry[k] for k in ("attempt", "checked_at", "outcome")})
         analysis["executor_verification"] = entry

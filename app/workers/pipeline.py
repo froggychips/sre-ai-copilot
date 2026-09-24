@@ -293,7 +293,7 @@ def transition_to(record, new_state: IncidentState, db) -> None:
     db.commit()
 
 
-def _enforce_candidate_binding(intent, candidates, incident_id):
+def _enforce_candidate_binding(intent, candidates, incident_id, snapshot=None):
     """Привязка intent-а → playbook действительна, только если matcher выбрал
     этот playbook для ЭТОГО инцидента.
 
@@ -305,11 +305,24 @@ def _enforce_candidate_binding(intent, candidates, incident_id):
     чужая ссылка снимается: intent сохраняется без playbook-а, и gate
     блокирует его как `playbook_missing`. Сверка идёт до сохранения intent-а,
     так что подпись (и одобрение человека) покрывает уже очищенную версию.
+
+    `playbook_match` (hash записи серверного снимка) ставится здесь и
+    только здесь: значение, которое могла вписать модель, затирается всегда.
     """
-    if intent is None or candidates is None or not intent.playbook:
+    if intent is None:
+        return intent
+    if intent.playbook_match:
+        intent = intent.model_copy(update={"playbook_match": None})
+    if candidates is None or not intent.playbook:
         return intent
     allowed = {pb.name for pb in candidates}
     if intent.playbook in allowed:
+        from app.remediation.binding import find_entry
+        entry = find_entry(snapshot, intent.playbook)
+        if entry is not None:
+            return intent.model_copy(update={"playbook_match": entry.get("binding")})
+        # Кандидат есть, а записи снимка нет — снимок не собрался. Ссылку
+        # оставляем (её видно в аудите), gate заблокирует по binding_missing.
         return intent
     audit_service.log_event(
         "EXECUTION_INTENT_PLAYBOOK_REJECTED",
@@ -376,6 +389,9 @@ class IncidentPipeline:
         self.jira_context: Optional[Dict[str, Any]] = None
         self.fix_suggestion: Optional[str] = None
         self.execution_intent: Optional[ExecutionIntent] = None
+        # Серверный снимок отбора playbook-ов (remediation.binding); None —
+        # флаг привязки выключен или отбор не удался.
+        self.playbook_match: Optional[Dict[str, Any]] = None
         self.executor_result: Optional[Dict[str, Any]] = None
         self.risk_report: Optional[str] = None
         self.synthesis: Optional[str] = None
@@ -468,6 +484,7 @@ class IncidentPipeline:
                     if self.execution_intent is not None
                     else None
                 ),
+                "playbook_match": self.playbook_match,
                 "traces": self.traces,
             }
             self.record.analysis = {
@@ -537,6 +554,7 @@ class IncidentPipeline:
                     if intent_raw
                     else None
                 )
+                self.playbook_match = cp.get("playbook_match")
             prior_traces = cp.get("traces")
             if isinstance(prior_traces, list):
                 self.traces = list(prior_traces)
@@ -1119,6 +1137,20 @@ class IncidentPipeline:
             "sre.incident.candidate_playbooks",
             ",".join(pb.name for pb in candidates),
         )
+        from app.remediation.binding import build_match_snapshot
+        try:
+            self.playbook_match = build_match_snapshot(
+                candidates,
+                facts=self.fact_store,
+                namespace=self.incident.namespace or "",
+                alertname=(self.incident.labels or {}).get("alertname"),
+                classification=None,
+            )
+        except Exception as e:
+            # Без снимка gate заблокирует мутирующий intent (binding_missing)
+            # — отказ, а не тихий пропуск.
+            logger.warning("playbook_snapshot_failed", error=type(e).__name__)
+            self.playbook_match = None
         return candidates
 
     async def stage_fix(self) -> None:
@@ -1132,6 +1164,7 @@ class IncidentPipeline:
             )
         self.execution_intent = _enforce_candidate_binding(
             self.execution_intent, candidates, self.incident_id,
+            self.playbook_match,
         )
         snap = t.snapshot().to_dict()
         # Метрика на root-span: смог ли LLM выдать structured-intent.
@@ -1324,6 +1357,7 @@ class IncidentPipeline:
                     else None
                 ),
                 "executor_result": self.executor_result,
+                "playbook_match": self.playbook_match,
             }
             merged_analysis = {**(record.analysis or {}), **fresh_analysis}
             # Служебные ключи прошлых попыток зачищаем: прогон завершён.

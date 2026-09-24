@@ -61,6 +61,10 @@ def _fact(kind: str, verdict: str, **evidence) -> Fact:
                 verdict=verdict, evidence=dict(evidence))
 
 
+def default_registry_pb(name: str) -> Playbook:
+    return load_registry()[name]
+
+
 def _intent(namespace: str = "squad-1", action: str = "restart_deployment",
             **kw) -> ExecutionIntent:
     data = {
@@ -282,12 +286,20 @@ def test_binding_off_ignores_playbook_field() -> None:
     assert evaluate_intent_gate(_intent(playbook="no_such_playbook")) == base
 
 
+def _bound(pb: Playbook, namespace: str = "squad-1", **kw):
+    """Intent, привязанный к серверному снимку с одной записью `pb`."""
+    from app.remediation.binding import build_match_snapshot
+    snap = build_match_snapshot([pb], facts=None, namespace=namespace,
+                                alertname="KubePodCrashLooping", classification=None)
+    intent = _intent(namespace, playbook=pb.name,
+                     playbook_match=snap["entries"][0]["binding"], **kw)
+    return intent, snap
+
+
 @pytest.mark.parametrize("kw, reason", [
     ({}, "playbook_missing"),
-    ({"playbook": "no_such_playbook"}, "playbook_unknown"),
-    ({"playbook": "cleanup_stale_failed_job"}, "playbook_not_executable"),
-    ({"playbook": _RESTART, "action": "scale_deployment",
-      "params": {"replicas": 2}}, "action_not_in_plan"),
+    # Имя без серверного снимка — привязки нет, как бы модель ни назвала playbook.
+    ({"playbook": _RESTART}, "match_snapshot_missing"),
 ])
 def test_binding_blocks(binding_on, kw, reason) -> None:
     decision = evaluate_intent_gate(_intent(**kw))
@@ -297,7 +309,8 @@ def test_binding_blocks(binding_on, kw, reason) -> None:
 
 
 def test_binding_allows_bound_restart_and_readonly(binding_on) -> None:
-    assert evaluate_intent_gate(_intent(playbook=_RESTART)).mode == PolicyMode.APPROVE
+    intent, snap = _bound(default_registry_pb(_RESTART))
+    assert evaluate_intent_gate(intent, match_snapshot=snap).mode == PolicyMode.APPROVE
     readonly = _intent(action="describe_resource")
     assert evaluate_intent_gate(readonly).mode == PolicyMode.APPROVE
 
@@ -305,7 +318,8 @@ def test_binding_allows_bound_restart_and_readonly(binding_on) -> None:
 def test_binding_cannot_loosen_gate(binding_on) -> None:
     """Политика playbook-а складывается по строжайшему: prod остаётся BLOCK
     по gate, даже если бы playbook разрешал."""
-    decision = evaluate_intent_gate(_intent("prod-k1", playbook=_RESTART))
+    intent, snap = _bound(default_registry_pb(_RESTART), "prod-k1")
+    decision = evaluate_intent_gate(intent, match_snapshot=snap)
     assert decision.mode == PolicyMode.BLOCK
     assert decision.reasons[0]["axis"] == "namespace_tier"
 
@@ -315,7 +329,8 @@ def test_binding_applies_stricter_playbook_policy(binding_on, monkeypatch) -> No
         "block": {"any": {"namespace_tier": ["squad"]}},
     }))
     monkeypatch.setattr(matcher, "default_registry", lambda: {"t_strict": strict})
-    decision = evaluate_intent_gate(_intent(playbook="t_strict"))
+    intent, snap = _bound(strict)
+    decision = evaluate_intent_gate(intent, match_snapshot=snap)
     assert decision.mode == PolicyMode.BLOCK
     assert decision.reasons[0]["rule"] == "block.any"
 
