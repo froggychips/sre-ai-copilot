@@ -89,11 +89,37 @@ fi
 # (k8s/executor.yaml). Лишний RoleBinding на sre-ai молча вернул бы
 # write-токен api-поду, который принимает вебхуки из интернета; манифест
 # этого не покажет, покажет только can-i.
-if kubectl auth can-i patch deployments.apps \
-        --as="system:serviceaccount:${NAMESPACE}:sre-ai" \
+#
+# Проверяем по-настоящему, а не одним `can-i --all-namespaces`: тот отвечает
+# лишь на вопрос о праве во ВСЕХ ns сразу и не видит RoleBinding в одном
+# squad-foo — а write-роль именно так и выдаётся. Поэтому: cluster-wide плюс
+# каждый ns, где есть RoleBinding с субъектом sre-ai. Имя субъекта — только
+# фильтр кандидатов; решает can-i с реальной идентичностью SA.
+#
+# Нарушение = отказ деплоя, а не WARNING: выкатить api/worker, у которых
+# остался write-токен, значит отрапортовать изоляцию, которой нет. Лечится
+# переносом binding-а на sre-ai-executor (см. пример в k8s/base/rbac.yaml).
+sre_ai_sa="system:serviceaccount:${NAMESPACE}:sre-ai"
+write_leaks=""
+if kubectl auth can-i patch deployments.apps --as="${sre_ai_sa}" \
         --all-namespaces >/dev/null 2>&1; then
-    echo "WARNING: SA sre-ai может patch deployments — запись должна быть только у sre-ai-executor." >&2
-    echo "  Найти лишний bind: kubectl get rolebindings,clusterrolebindings -A -o wide | grep ' sre-ai\b'" >&2
+    write_leaks="cluster-wide"
+fi
+while read -r rb_ns; do
+    [[ -z "${rb_ns}" ]] && continue
+    if kubectl auth can-i patch deployments.apps --as="${sre_ai_sa}" \
+            -n "${rb_ns}" >/dev/null 2>&1; then
+        write_leaks="${write_leaks} ${rb_ns}"
+    fi
+done < <(kubectl get rolebindings -A --no-headers \
+            -o custom-columns='NS:.metadata.namespace,SUBJ:.subjects[*].name' \
+            | awk '{n=split($2, s, ","); for (i=1; i<=n; i++) if (s[i]=="sre-ai") {print $1; break}}' \
+            | sort -u)
+if [[ -n "${write_leaks}" ]]; then
+    echo "ERROR: SA sre-ai может patch deployments (${write_leaks# }) — запись должна быть только у sre-ai-executor." >&2
+    echo "  Перенести binding-и: kubectl get rolebindings,clusterrolebindings -A -o wide | grep ' sre-ai\b'" >&2
+    echo "  subject → sre-ai-executor (ns ${NAMESPACE}), затем повторить ./deploy.sh." >&2
+    exit 1
 fi
 
 # ── 3. Миграции: отдельный Job ДО выката приложения ──────────────────────

@@ -404,3 +404,65 @@ def test_dispatch_apply_targets_executor_queue() -> None:
         assert executor_tasks.dispatch_apply("inc-1", "u", _SIG, "tok") == "t-9"
     assert aa.call_args.kwargs == {"args": ["inc-1", "u", _SIG, "tok"],
                                    "queue": executor_tasks.settings.EXECUTOR_QUEUE_NAME}
+
+
+@pytest.mark.asyncio
+async def test_approve_queue_dispatch_failure_keeps_buttons_for_retry(monkeypatch) -> None:
+    """Брокер лёг на Approve: одобрение уже записано, повторный Approve упрётся
+    в already_decided — значит кнопки снимать нельзя, иначе действие
+    пропущено навсегда. Повтор — через Apply → apply_confirm."""
+    from sqlalchemy import create_engine
+    from sqlalchemy.orm import sessionmaker
+
+    from app.database import Base
+    from app.knowledge_graph import schema  # noqa: F401
+    from app.services.intent_signature import compute_signature
+
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    monkeypatch.setattr(discord_interactions, "SessionLocal",
+                        sessionmaker(bind=engine, autocommit=False, autoflush=False))
+    sig = compute_signature(_intent())
+    payload = {
+        "type": 3,
+        "data": {"custom_id": f"approve:inc-F:{sig}"},
+        "member": {"user": {"id": "u-1", "username": "operator"}},
+        "token": "tok-abc",
+        "message": {"id": "m-1", "channel_id": "c-1",
+                    "embeds": [{"title": "t", "footer": {"text": "incident/inc-F"}}]},
+    }
+
+    with patch.object(discord_interactions, "_verify_signature", return_value=True), \
+         patch.object(discord_interactions.settings, "DISCORD_PUBLIC_KEY", "deadbeef"), \
+         patch.object(discord_interactions.settings, "EXECUTOR_ENABLED", True), \
+         patch.object(discord_interactions.settings, "EXECUTOR_APPROVAL_ENABLED", True), \
+         patch.object(discord_interactions.settings, "DISCORD_APPROVERS_USER_IDS", "u-1"), \
+         patch.object(discord_interactions.audit_service, "log_event"), \
+         patch.object(executor_tasks.settings, "EXECUTOR_DISPATCH", "queue"), \
+         patch.object(executor_tasks, "dispatch_apply", side_effect=ConnectionError("redis")), \
+         patch.object(discord_interactions, "_edit_message_after_decision") as edit:
+        resp = await discord_interactions.discord_interactions(
+            _request(payload), x_signature_ed25519="00" * 64, x_signature_timestamp="0",
+        )
+
+    edit.assert_not_called()
+    assert "kubectl не запущен" in resp["data"]["content"]
+    assert "Apply" in resp["data"]["content"]
+
+
+def test_apply_confirm_retries_for_already_approved_action() -> None:
+    """Путь повтора, на который ссылается ответ выше: apply_confirm отменяет
+    запуск только для решения, отличного от approved."""
+    src = (_REPO_ROOT / "app" / "api" / "discord_interactions.py").read_text(encoding="utf-8")
+    assert 'if decision["already_decided"] and decision["status"] != "approved":' in src
+
+
+def test_deploy_sh_write_leak_check_is_per_namespace_and_fatal() -> None:
+    """`can-i --all-namespaces` не видит RoleBinding в одном squad-foo — а
+    write-роль выдаётся именно так. И найденная утечка валит деплой."""
+    text = (_REPO_ROOT / "deploy.sh").read_text(encoding="utf-8")
+    block = text[text.index('sre_ai_sa="system:serviceaccount'):]
+    block = block[:block.index("# ── 3. Миграции")]
+    assert "kubectl get rolebindings -A" in block
+    assert '-n "${rb_ns}"' in block
+    assert "exit 1" in block
