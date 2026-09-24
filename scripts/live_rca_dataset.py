@@ -750,12 +750,15 @@ async def _run_async(args) -> int:
     # auto = оба режима на ОДНИХ И ТЕХ ЖЕ кейсах: alert_only для всех,
     # medic_observed — где наблюдения есть. Иначе by_context сравнивал бы
     # разные популяции инцидентов, а не эффект наблюдений.
+    # getattr: вызывающие код программно (тесты) могут собрать args без --context.
+    context_mode = getattr(args, "context", "auto")
+
     def modes(c: Dict[str, Any]) -> List[str]:
-        if args.context == "auto":
+        if context_mode == "auto":
             return ["alert_only"] + (["medic_observed"] if c.get("observed_medic") else [])
-        if args.context == "medic_observed" and not c.get("observed_medic"):
+        if context_mode == "medic_observed" and not c.get("observed_medic"):
             return []
-        return [args.context]
+        return [context_mode]
 
     work = [(c, m) for c in cases for m in modes(c) if (c["event_id"], m) not in done]
     todo = work[: args.limit]
