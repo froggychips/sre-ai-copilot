@@ -30,7 +30,14 @@
            умеренная: отсутствие фразы в выборке логов — не доказательство.
   (нет факта) — смотреть было не во что (ни логов, ни снимка, ни событий):
            «не проверяли» не должно читаться как ✗.
-  UNKNOWN — источник упал; делает Rule.run() через source_status.
+  UNKNOWN — источник упал: при пустых полях — явный ?, иначе ✗ понижает
+           до ? Rule.run() через source_status.
+
+Привязка (как в oom.py / pod_events.py): без pod/service в алерте снимок и
+события собираются по всему namespace-у, и упавшая миграция соседнего
+сервиса иначе стала бы жёстким якорем чужого инцидента. Такие находки — в
+soft-зоне критика; Job мигратора другого workload-а при известном target —
+тоже.
 """
 from __future__ import annotations
 
@@ -38,7 +45,7 @@ import re
 from typing import Any, Dict, List, Optional
 
 from app.diagnostics.facts import Fact, FactKind
-from app.diagnostics.rules.base import Rule
+from app.diagnostics.rules.base import Rule, same_workload
 from app.diagnostics.rules.pod_events import _event_object
 
 _DIRTY_VERSION = re.compile(r"dirty database version\s*(\d+)", re.IGNORECASE)
@@ -71,6 +78,10 @@ _CONF = {
 }
 # Уверенность ✗: просмотрели выборку логов/снимка, сигналов нет.
 _ABSENT_CONFIDENCE = 0.6
+# Находка, которую не к чему привязать (алерт без pod/service → материал со
+# всего namespace-а) или Job мигратора чужого workload-а. Soft-зона
+# fact_critic [0.25, 0.5): гипотеза живёт, но жёстким якорем не становится.
+_UNATTRIBUTED_CONFIDENCE = 0.45
 _MAX_OBJECTS = 3
 
 
@@ -105,6 +116,7 @@ class MigrationFailedRule(Rule):
     def evaluate(self, ctx: Dict[str, Any]) -> List[Fact]:
         text = self.text_haystack(ctx)
         events = [e for e in (ctx.get("k8s_events") or []) if isinstance(e, dict)]
+        target = ctx.get("pod") or ctx.get("service")
         subject = ctx.get("service") or ctx.get("pod") or ctx.get("namespace")
 
         signals: List[str] = []
@@ -144,6 +156,10 @@ class MigrationFailedRule(Rule):
 
         if signals:
             confidence = max(_CONF[s] for s in signals)
+            attribution = self._attribution(target, evidence.get("job"), signals)
+            if attribution != "scoped":
+                confidence = min(confidence, _UNATTRIBUTED_CONFIDENCE)
+                evidence["attribution"] = attribution
             return [Fact(
                 kind=FactKind.MIGRATION_FAILED,
                 observed=True,
@@ -154,6 +170,15 @@ class MigrationFailedRule(Rule):
             )]
 
         if not self._scanned_anything(ctx, events):
+            # Смотреть было не во что. Если это потому, что источник упал, —
+            # явный ?: без факта критик не отличит «не проверяли» от «нет».
+            failed = self.failed_sources(ctx)
+            if failed:
+                return [Fact.unknown(
+                    FactKind.MIGRATION_FAILED,
+                    "; ".join(f"{src}: {why}" for src, why in failed.items()),
+                    subject=subject, source_rule=self.name,
+                )]
             return []
         return [Fact(
             kind=FactKind.MIGRATION_FAILED,
@@ -163,6 +188,20 @@ class MigrationFailedRule(Rule):
             evidence={"note": "no migration signals in scanned logs/snapshot/events"},
             source_rule=self.name,
         )]
+
+    @staticmethod
+    def _attribution(target: Optional[str], job: Optional[str], signals: List[str]) -> str:
+        """scoped | unverified (нет target) | foreign (Job чужого workload-а).
+
+        Текстовые сигналы при известном target приходят из уже скоупленного
+        снимка/логов (k8s_facts), поэтому считаются привязанными. Job
+        мигратора сверяется по имени: `bravo-migrate` ↔ `bravo-service`.
+        """
+        if not target:
+            return "unverified"
+        if job and signals == ["migrate_job"] and not same_workload(job, target):
+            return "foreign"
+        return "scoped"
 
     @staticmethod
     def _scanned_anything(ctx: Dict[str, Any], events: List[Dict[str, Any]]) -> bool:

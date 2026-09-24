@@ -19,9 +19,9 @@
 Пароли в таких строках postgres не печатает, но строку целиком мы всё равно
 не копируем: сообщение драйвера может нести DSN.
 
-Исходы как у MigrationFailedRule: FOUND по сигналу, ABSENT только если было
-что просмотреть, без материала — ни одного факта; UNKNOWN — через
-source_status в Rule.run().
+Исходы и привязка как у MigrationFailedRule: FOUND по сигналу (без
+pod/service — в soft-зоне), ABSENT только если было что просмотреть, без
+материала — ни одного факта, упавший источник — ?.
 """
 from __future__ import annotations
 
@@ -55,6 +55,8 @@ _SUBTYPE_CONF = (
     ("auth", 0.85),
 )
 _ABSENT_CONFIDENCE = 0.6
+# См. MigrationFailedRule: soft-зона fact_critic для непривязанной находки.
+_UNATTRIBUTED_CONFIDENCE = 0.45
 _MAX_OBJECTS = 3
 
 
@@ -88,6 +90,11 @@ class DbPermissionRule(Rule):
         if found:
             subtype, confidence = next((s, c) for s, c in _SUBTYPE_CONF if s in found)
             evidence: Dict[str, Any] = {"subtype": subtype, "subtypes": sorted(found)}
+            # Без pod/service логи и снимок — со всего namespace-а: отказ базы
+            # у соседа не должен стать жёстким якорем этого инцидента.
+            if not (ctx.get("pod") or ctx.get("service")):
+                confidence = min(confidence, _UNATTRIBUTED_CONFIDENCE)
+                evidence["attribution"] = "unverified"
             for details in found.values():
                 evidence.update({k: v for k, v in details.items() if v})
             return [Fact(
@@ -100,6 +107,13 @@ class DbPermissionRule(Rule):
             )]
 
         if not (ctx.get("logs_summary") or ctx.get("k8s_summary")):
+            failed = self.failed_sources(ctx)
+            if failed:
+                return [Fact.unknown(
+                    FactKind.DB_PERMISSION,
+                    "; ".join(f"{src}: {why}" for src, why in failed.items()),
+                    subject=subject, source_rule=self.name,
+                )]
             return []
         return [Fact(
             kind=FactKind.DB_PERMISSION,

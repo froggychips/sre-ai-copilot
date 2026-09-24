@@ -49,6 +49,7 @@ def test_schema_migrations_dirty_flag_found():
 def test_failed_migrate_job_event_found():
     events = [{"reason": "BackoffLimitExceeded", "message": "Job has reached the specified backoff limit",
                "object": "bravo-migrate"}]
+    # bravo-migrate ↔ bravo-service — один workload.
     f = _one(MIG, _ctx(k8s_events=events))
     assert f.evidence["signals"] == ["migrate_job"]
     assert f.evidence["job"] == "bravo-migrate"
@@ -205,3 +206,47 @@ def test_facts_reach_hypothesis_prompt():
     assert "✓ db_permission" in user_context
     anchors = user_context.split("<allowed_anchors>")[1]
     assert "migration_failed" in anchors and "db_permission" in anchors
+
+
+# ── Привязка к target (ревью #448, P1) ──────────────────────────────────
+
+
+def test_namespace_wide_migration_is_soft_without_target():
+    ctx = {"namespace": "squad-alpha", "alertname": "KubeDeploymentGenerationMismatch",
+           "k8s_events": [{"reason": "BackoffLimitExceeded", "object": "charlie-migrate"}],
+           "logs_summary": "Dirty database version 9"}
+    f = _one(MIG, ctx)
+    assert f.verdict == Verdict.FOUND.value
+    assert f.confidence == 0.45
+    assert f.evidence["attribution"] == "unverified"
+
+
+def test_foreign_migrate_job_is_soft_with_known_target():
+    events = [{"reason": "BackoffLimitExceeded", "object": "charlie-migrate"}]
+    f = _one(MIG, _ctx(k8s_events=events))
+    assert f.confidence == 0.45
+    assert f.evidence["attribution"] == "foreign"
+
+
+def test_scoped_text_signal_keeps_full_confidence_even_with_foreign_job():
+    events = [{"reason": "BackoffLimitExceeded", "object": "charlie-migrate"}]
+    f = _one(MIG, _ctx(k8s_events=events, logs_summary="Dirty database version 9"))
+    assert f.confidence == 0.95
+    assert "attribution" not in f.evidence
+
+
+def test_db_permission_without_target_is_soft():
+    ctx = {"namespace": "squad-alpha", "logs_summary": "permission denied for table foo"}
+    f = _one(DBP, ctx)
+    assert f.confidence == 0.45 and f.evidence["attribution"] == "unverified"
+
+
+# ── Упавший источник без данных → явный ? (ревью #448, P2) ──────────────
+
+
+def test_failed_sources_with_empty_fields_emit_unknown():
+    ctx = _ctx(source_status={"logs_summary": "failed: timeout", "k8s_events": "failed: 403"})
+    m = _one(MIG, ctx)
+    d = _one(DBP, ctx)
+    assert m.verdict == Verdict.UNKNOWN.value and "logs_summary" in m.unknown_reason
+    assert d.verdict == Verdict.UNKNOWN.value
