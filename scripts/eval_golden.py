@@ -21,6 +21,7 @@ import asyncio
 import json
 import os
 import sys
+import time
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -97,8 +98,11 @@ async def _main_async(args) -> int:
             return 2
 
     results = []
+    latencies: dict = {}
     for case in cases:
+        started = time.monotonic()
         result = await _run_one(case, args.mode)
+        latencies[case.id] = round(time.monotonic() - started, 1)
         results.append(result)
         if result.skipped:
             print(f"⏭  {case.id:42} пропущен: {result.skip_reason}")
@@ -114,6 +118,17 @@ async def _main_async(args) -> int:
             print(f"     · {note}")
 
     summary = summarize(results)
+    # Латентность — только для живых прогонов: в replay она меряет скорость
+    # раннера, а не модели, и дёргала бы baseline без причины. В регресс не
+    # входит: одна и та же модель отвечает то за 5, то за 15 минут, и порог
+    # на это врал бы в обе стороны. Цифра информативная — видно, во что
+    # обходится прогон и куда уходит время.
+    if args.mode == "live":
+        summary["latency_s"] = {
+            "total": round(sum(latencies.values()), 1),
+            "max": max(latencies.values(), default=0.0),
+            "by_case": latencies,
+        }
     print("\n— сводка —")
     skipped = summary.get("cases_skipped", 0)
     print(f"кейсы:    {summary['cases_passed']}/{summary['cases_total']} "
@@ -123,6 +138,9 @@ async def _main_async(args) -> int:
           f"({summary['check_pass_rate']:.0%})")
     for group, rate in summary["by_check"].items():
         print(f"  {group:18} {rate:.0%}")
+    if "latency_s" in summary:
+        lat = summary["latency_s"]
+        print(f"время:    {lat['total']:.0f} с всего, максимум на кейс {lat['max']:.0f} с")
 
     if args.json_out:
         Path(args.json_out).write_text(
@@ -141,30 +159,39 @@ async def _main_async(args) -> int:
         )
         return 1
 
+    baseline_path = Path(args.baseline) if getattr(args, "baseline", None) else BASELINE_PATH
     if args.update_baseline:
-        BASELINE_PATH.write_text(
+        baseline_path.write_text(
             json.dumps(summary, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
         )
-        print(f"\nbaseline обновлён: {BASELINE_PATH.relative_to(REPO_ROOT)}")
+        print(f"\nbaseline обновлён: {_display(baseline_path)}")
         return 0
 
     if args.check_baseline:
-        return _check_baseline(summary)
+        return _check_baseline(summary, baseline_path)
 
     return 0 if summary["cases_passed"] == summary["cases_total"] else 1
 
 
 
-def _check_baseline(summary) -> int:
+def _display(path: Path) -> str:
+    try:
+        return str(path.resolve().relative_to(REPO_ROOT))
+    except ValueError:
+        return str(path)
+
+
+def _check_baseline(summary, baseline_path: Path = BASELINE_PATH) -> int:
     """Метрики не должны просесть относительно эталона.
 
     Сверяем и агрегат, и разрез по группам проверок: без разреза «плюс два
     новых кейса на факты» замаскировали бы «минус один на гейт».
     """
-    if not BASELINE_PATH.exists():
-        print("\nbaseline отсутствует — зафиксировать: --update-baseline", file=sys.stderr)
+    if not baseline_path.exists():
+        print(f"\nbaseline {_display(baseline_path)} отсутствует — зафиксировать: "
+              "--update-baseline", file=sys.stderr)
         return 2
-    baseline = json.loads(BASELINE_PATH.read_text(encoding="utf-8"))
+    baseline = json.loads(baseline_path.read_text(encoding="utf-8"))
     problems = []
     if summary["case_pass_rate"] < baseline.get("case_pass_rate", 0):
         problems.append(
@@ -193,6 +220,10 @@ def main() -> int:
     ap.add_argument("--check-baseline", action="store_true")
     ap.add_argument("--update-baseline", action="store_true")
     ap.add_argument("--json-out", help="куда записать сводку в JSON")
+    # Эталон replay и эталон live — разные числа: replay меряет обвес на
+    # записанных ответах, live — текущую модель. Сверять live с replay-эталоном
+    # значило бы получать «регресс» от любой перефразировки модели.
+    ap.add_argument("--baseline", help="путь к эталону (по умолчанию tests/golden/baseline.json)")
     return asyncio.run(_main_async(ap.parse_args()))
 
 

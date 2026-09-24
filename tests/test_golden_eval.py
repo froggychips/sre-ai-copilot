@@ -118,3 +118,59 @@ def test_all_cases_skipped_is_not_success(monkeypatch, tmp_path, update_baseline
     )
     assert asyncio.run(mod._main_async(args)) == 1
     assert not baseline.exists()
+
+
+def _passing_run(mod, monkeypatch):
+    from app.evaluation.golden import CaseResult
+
+    monkeypatch.setattr(mod, "load_cases", lambda ids=None: CASES[:2])
+
+    async def _pass(case, mode):
+        return CaseResult(case_id=case.id, checks={"gate": True})
+
+    monkeypatch.setattr(mod, "_run_one", _pass)
+
+
+def test_live_run_checks_its_own_baseline_not_replay(monkeypatch, tmp_path):
+    """`--baseline` сверяет с указанным эталоном, а replay-эталон не трогает.
+
+    Живую модель с replay-эталоном не сравнивают: тот меряет обвес на
+    записанных ответах, и перефразировка модели читалась бы как регресс.
+    """
+    from types import SimpleNamespace
+
+    mod = _load_eval_script()
+    replay_baseline = tmp_path / "baseline.json"
+    monkeypatch.setattr(mod, "BASELINE_PATH", replay_baseline)
+    live_baseline = tmp_path / "baseline_live.json"
+    _passing_run(mod, monkeypatch)
+    monkeypatch.setenv("LLM_BACKEND", "claude_cli")  # live без ключа
+
+    args = SimpleNamespace(
+        case=None, mode="live", json_out=None, baseline=str(live_baseline),
+        update_baseline=True, check_baseline=False,
+    )
+    assert asyncio.run(mod._main_async(args)) == 0
+    assert live_baseline.exists() and not replay_baseline.exists()
+    saved = json.loads(live_baseline.read_text(encoding="utf-8"))
+    # latency_s — в live-сводке, по каждому кейсу.
+    assert set(saved["latency_s"]["by_case"]) == {c.id for c in CASES[:2]}
+
+    live_baseline.write_text(json.dumps({**saved, "case_pass_rate": 1.5}), encoding="utf-8")
+    args.update_baseline, args.check_baseline = False, True
+    assert asyncio.run(mod._main_async(args)) == 1  # регресс против live-эталона
+
+
+def test_replay_summary_has_no_latency(monkeypatch, tmp_path):
+    """В replay латентность меряет раннер, а не модель — в сводку не пишется."""
+    from types import SimpleNamespace
+
+    mod = _load_eval_script()
+    out = tmp_path / "summary.json"
+    _passing_run(mod, monkeypatch)
+    args = SimpleNamespace(
+        case=None, mode="replay", json_out=str(out),
+        update_baseline=False, check_baseline=False,
+    )
+    assert asyncio.run(mod._main_async(args)) == 0
+    assert "latency_s" not in json.loads(out.read_text(encoding="utf-8"))

@@ -33,6 +33,19 @@ All notable changes to this project are documented in this file.
   `cause_contains` принимает «памяти»: live-ответ «лимит памяти занижен»
   верен, а проверка его не засчитывала. Baseline 30/30.
 
+- **Live golden-eval по расписанию без API-ключа.** `eval-live.yml` на
+  ARC-раннере ставит запиненный `claude` CLI (`@anthropic-ai/claude-code@2.1.281`)
+  и гоняет `LLM_BACKEND=claude_cli` с подписочным токеном из секрета
+  `CLAUDE_CODE_OAUTH_TOKEN` (`claude setup-token`); `ANTHROPIC_API_KEY` —
+  запасной путь. Ни токена, ни ключа — джоба красная, как с #431; протухший
+  токен ловится одним вызовом до набора, а не в каждом кейсе. Добавлены
+  `timeout-minutes: 150`, concurrency-группа, input `cases` для частичного
+  прогона. `eval_golden.py --baseline PATH` — отдельный эталон live
+  (`tests/golden/baseline_live.json`, фиксируется человеком по первому
+  прогону), в live-сводке `latency_s` (всего, максимум, по кейсам).
+  Мак с уже залогиненным CLI не используется намеренно: CI ушёл с него в
+  ARC ради изоляции от ключей разработчика.
+
 - **Live RCA-датасет на реальных инцидентах, без ключа.**
   `scripts/live_rca_dataset.py`: `export` берёт из БД copilot (read-only
   транзакция) инциденты, причину которых установил squad-medic

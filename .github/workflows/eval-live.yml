@@ -8,11 +8,24 @@
 # Результат не блокирует ветку: деградация метрики — повод посмотреть, а не
 # автоматически считать код сломанным (модель могла ответить иначе на том же
 # промпте). Сводка уезжает артефактом, а падение — в лог джобы.
+#
+# БЭКЕНД. По умолчанию — `claude_cli` (`claude --print`) с подписочным токеном
+# `CLAUDE_CODE_OAUTH_TOKEN`: API-ключа у проекта нет, а токен подписки
+# выпускается один раз командой `claude setup-token` на машине, где CLI
+# залогинен, и кладётся секретом репозитория. `ANTHROPIC_API_KEY`, если
+# когда-нибудь появится, остаётся запасным путём.
+#
+# Почему не мак с уже залогиненным `claude`: CI съехал с личного мака в ARC
+# 17.09.2026 именно затем, чтобы код из CI не видел ~/.kube, ~/.aws и ~/.ssh
+# разработчика (шапка ci.yml). Вернуть туда один workflow ради готового
+# логина — вернуть и эту дыру. К тому же launchd-сервис раннера не видит
+# login-keychain, где CLI держит свой логин, — «залогинен» там без того же
+# токена в env всё равно не работал бы.
 name: Golden Eval (live)
 
 on:
   schedule:
-    # Воскресенье 05:00 UTC — раннер один и делится с CI/CodeQL, длинный
+    # Воскресенье 05:00 UTC — раннеров три и они делятся с CI, длинный
     # прогон не должен драться с проверками PR-ов в рабочее время.
     - cron: '0 5 * * 0'
   workflow_dispatch:
@@ -23,6 +36,17 @@ on:
         default: live
         type: choice
         options: [live, record]
+      cases:
+        description: 'id кейсов через пробел (пусто = весь набор)'
+        required: false
+        default: ''
+        type: string
+
+# Один живой прогон за раз: второй параллельный прогон по часу отнял бы у
+# PR-ов раннер, а нового результата не дал бы.
+concurrency:
+  group: eval-live
+  cancel-in-progress: false
 
 permissions:
   contents: read
@@ -31,7 +55,12 @@ jobs:
   eval:
     name: Golden Eval
     runs-on: sre-copilot-k8s
-    # Форки расписание не гоняют. Наличие ключа проверяет шаг «Run golden
+    # Живой кейс с LLM — ~12 минут (≈16 вызовов, из них ~11 — FactCritic по
+    # гипотезе), таких кейсов в наборе семь: весь набор ~1,5 ч. Потолок с
+    # запасом, но конечный: зависший `claude` не должен держать раннер сутки,
+    # как прогон 30.08.2026, снятый GitHub-ом только через 24 ч.
+    timeout-minutes: 150
+    # Форки расписание не гоняют. Наличие токена проверяет шаг «Run golden
     # eval» и без него валит джобу сразу, а не на середине набора.
     if: ${{ github.event_name == 'workflow_dispatch' || github.repository == 'froggychips/sre-ai-copilot' }}
     steps:
@@ -61,29 +90,79 @@ jobs:
           uv pip install --python .venv/bin/python -r requirements.txt
           uv pip install --python .venv/bin/python pyyaml
 
+      # Node нужен только ради claude CLI: в стоковом образе actions-runner
+      # своя node лежит в externals/ и служит самому раннеру, npm там нет.
+      - name: Setup Node
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: '22'
+
+      # Версия CLI пинится: `claude --print` — часть измеряемого контура, и
+      # тихое обновление CLI меняло бы результат без единого коммита в репо.
+      # Поднимать осознанно, вместе с пересмотром baseline_live.
+      - name: Install claude CLI
+        run: |
+          npm install -g --no-fund --no-audit @anthropic-ai/claude-code@2.1.281
+          claude --version
+
       - name: Run golden eval
         env:
+          CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
-          LLM_BACKEND: anthropic
+          CASES: ${{ inputs.cases }}
+          MODE: ${{ inputs.mode || 'live' }}
         run: |
-          # Без ключа — ПАДЕНИЕ, а не warning с exit 0. Прежний вариант давал
-          # зелёную галочку над прогоном, который не измерил ничего (20.09.2026
-          # «success» за 21 с): по списку прогонов нельзя было понять, что
-          # качество промптов не меряется вовсе. Красный раз в неделю —
-          # честная цена, пока ключа нет; причина — в summary джобы.
-          if [ -z "$ANTHROPIC_API_KEY" ]; then
-            msg="ANTHROPIC_API_KEY не задан — live-прогон НЕ выполнен, качество промптов не измерено"
+          # Без токена и без ключа — ПАДЕНИЕ, а не warning с exit 0. Прежний
+          # вариант давал зелёную галочку над прогоном, который не измерил
+          # ничего (20.09.2026 «success» за 21 с). Красный раз в неделю —
+          # честная цена, пока секрета нет; причина — в summary джобы.
+          if [ -n "$CLAUDE_CODE_OAUTH_TOKEN" ]; then
+            export LLM_BACKEND=claude_cli
+            # С ключом в env CLI переходит в режим «внешний API-ключ» и
+            # игнорирует токен подписки. claude_cli_service вычищает ключ
+            # из env дочернего процесса и сам, но проверка токена ниже
+            # зовёт `claude` напрямую.
+            unset ANTHROPIC_API_KEY
+          elif [ -n "$ANTHROPIC_API_KEY" ]; then
+            export LLM_BACKEND=anthropic
+          else
+            msg="нет ни CLAUDE_CODE_OAUTH_TOKEN, ни ANTHROPIC_API_KEY — live-прогон НЕ выполнен, качество промптов не измерено"
             echo "::error::${msg}"
             {
               echo "### Golden Eval (live): не выполнен"
               echo
-              echo "${msg}. Добавьте секрет \`ANTHROPIC_API_KEY\` в настройки репозитория"
-              echo "или отключите расписание этого workflow."
+              echo "${msg}."
+              echo
+              echo "Токен подписки: \`claude setup-token\` на машине, где CLI залогинен,"
+              echo "затем секрет репозитория \`CLAUDE_CODE_OAUTH_TOKEN\`."
             } >> "$GITHUB_STEP_SUMMARY"
             exit 1
           fi
+          echo "бэкенд: ${LLM_BACKEND}"
+
+          # Жив ли токен — одним дешёвым вызовом ДО набора: протухший токен
+          # иначе всплыл бы ошибкой в каждом кейсе через полтора часа.
+          if [ "$LLM_BACKEND" = claude_cli ] && ! echo "ответь одним словом: ok" | claude --print >/dev/null; then
+            echo "::error::claude CLI не авторизовался — CLAUDE_CODE_OAUTH_TOKEN недействителен или протух"
+            exit 1
+          fi
+
+          case_args=()
+          for c in $CASES; do case_args+=(--case "$c"); done
+
+          # Эталон live — отдельный файл: replay-эталон меряет обвес на
+          # записанных ответах, а не модель, и сверка с ним давала бы
+          # «регресс» от любой перефразировки. Нет эталона — прогон всё
+          # равно идёт (измерить важнее, чем сверить), а зафиксировать его —
+          # решение человека: `--update-baseline --baseline
+          # tests/golden/baseline_live.json` по сводке прогона. Частичный
+          # набор (`cases`) с эталоном всего набора не сверяется.
+          check=()
+          if [ "$MODE" = live ] && [ -z "$CASES" ] && [ -f tests/golden/baseline_live.json ]; then
+            check=(--check-baseline --baseline tests/golden/baseline_live.json)
+          fi
           .venv/bin/python scripts/eval_golden.py \
-            --mode "${{ inputs.mode || 'live' }}" \
+            --mode "$MODE" "${case_args[@]}" "${check[@]}" \
             --json-out eval-summary.json
 
       - name: Upload summary
@@ -99,13 +178,13 @@ jobs:
       - name: Show diff against baseline
         if: always()
         run: |
-          # Информативно: что изменилось относительно эталона. Не блокирует —
-          # решение «поднять baseline или чинить» принимает человек.
+          # Информативно: что изменилось относительно эталона live. Не
+          # блокирует — решение «поднять baseline или чинить» за человеком.
           if [ -f eval-summary.json ]; then
             .venv/bin/python - <<'PY'
           import json, pathlib
           cur = json.loads(pathlib.Path("eval-summary.json").read_text())
-          base_path = pathlib.Path("tests/golden/baseline.json")
+          base_path = pathlib.Path("tests/golden/baseline_live.json")
           base = json.loads(base_path.read_text()) if base_path.exists() else {}
           print(f"кейсы: {cur['cases_passed']}/{cur['cases_total']} "
                 f"(baseline {base.get('cases_passed', '?')}/{base.get('cases_total', '?')})")
@@ -113,5 +192,11 @@ jobs:
               was = base.get("by_check", {}).get(group)
               mark = "" if was is None else (" ↓" if rate < was else (" ↑" if rate > was else " ="))
               print(f"  {group:18} {rate:.0%}{mark}")
+          lat = cur.get("latency_s")
+          if lat:
+              print(f"время: {lat['total']:.0f} с, максимум на кейс {lat['max']:.0f} с")
+              slow = sorted(lat.get("by_case", {}).items(), key=lambda kv: -kv[1])[:5]
+              for case_id, sec in slow:
+                  print(f"  {case_id:42} {sec:.0f} с")
           PY
           fi
