@@ -608,6 +608,13 @@ def cmd_export(args) -> int:
         for k in ("applied", "manual", "gaps", "extras"):
             r.pop(k, None)
         cases.append(r)
+    if keep is not None:
+        missing = keep - {c["event_id"] for c in cases}
+        if missing:
+            # Кейс выпал из окна --days: перезапись молча сузила бы набор,
+            # а старые результаты по нему тихо перестали бы считаться.
+            raise SystemExit(f"--keep-ids: не вернулись event_id {sorted(missing)} "
+                             f"(окно --days {args.days}?) — cases.jsonl не перезаписан")
     with_snapshot = attach_context_snapshots(args, cases)
     with_kg = reconstruct_from_kg(args, cases)
     path = out / "cases.jsonl"
@@ -740,24 +747,27 @@ async def _run_async(args) -> int:
             res_path.write_text("".join(ln + "\n" for ln in kept))
         done = {d for d in done if d[0] not in wanted}
 
-    def mode(c: Dict[str, Any]) -> str:
+    # auto = оба режима на ОДНИХ И ТЕХ ЖЕ кейсах: alert_only для всех,
+    # medic_observed — где наблюдения есть. Иначе by_context сравнивал бы
+    # разные популяции инцидентов, а не эффект наблюдений.
+    def modes(c: Dict[str, Any]) -> List[str]:
         if args.context == "auto":
-            return c.get("context") or "alert_only"
-        return args.context
+            return ["alert_only"] + (["medic_observed"] if c.get("observed_medic") else [])
+        if args.context == "medic_observed" and not c.get("observed_medic"):
+            return []
+        return [args.context]
 
-    if args.context == "medic_observed":
-        cases = [c for c in cases if c.get("observed_medic")]
-    todo = [c for c in cases if (c["event_id"], mode(c)) not in done][: args.limit]
+    work = [(c, m) for c in cases for m in modes(c) if (c["event_id"], m) not in done]
+    todo = work[: args.limit]
     print(f"кейсов всего {len(cases)}, прогнано {len(done)}, в этом заходе {len(todo)}")
-    for c in todo:
-        m = mode(c)
+    for c, m in todo:
         try:
             r = await _run_case(c, m)
         except Exception as e:  # кейс, а не прогон: остальные должны пройти
             r = {"event_id": c["event_id"], "context": m, "error": f"{type(e).__name__}: {e}"}
         with res_path.open("a", encoding="utf-8") as f:
             f.write(json.dumps(r, ensure_ascii=False) + "\n")
-        print(f"  #{c['event_id']}: {'ошибка' if r.get('error') else 'ok'} "
+        print(f"  #{c['event_id']} [{m}]: {'ошибка' if r.get('error') else 'ok'} "
               f"{r.get('latency_s', '-')}s")
     return 0
 

@@ -131,6 +131,31 @@ def test_observations_feed_rules_as_partial_sources():
     assert lrd.case_summary("Alert in ns", []) == "Alert in ns"
 
 
+def _run_args(tmp_path, context="auto"):
+    import argparse
+    return argparse.Namespace(out=str(tmp_path), ids="", limit=100, context=context)
+
+
+def test_auto_runs_both_modes_on_the_same_cases(tmp_path, monkeypatch):
+    import asyncio
+    import json
+    (tmp_path / "cases.jsonl").write_text(
+        json.dumps({"event_id": 1, "observed_medic": ["состояние подов: OOMKilled"]}) + "\n"
+        + json.dumps({"event_id": 2, "observed_medic": []}) + "\n")
+    seen = []
+
+    async def fake(case, context):
+        seen.append((case["event_id"], context))
+        return {"event_id": case["event_id"], "context": context}
+
+    monkeypatch.setattr(lrd, "_run_case", fake)
+    asyncio.run(lrd._run_async(_run_args(tmp_path)))
+    assert sorted(seen) == [(1, "alert_only"), (1, "medic_observed"), (2, "alert_only")]
+    seen.clear()
+    asyncio.run(lrd._run_async(_run_args(tmp_path)))
+    assert seen == []  # повтор ничего не перегоняет
+
+
 def test_score_is_split_by_context():
     cases = [{"event_id": 1, "expected_primary": "image_missing"}]
     results = [
