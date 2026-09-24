@@ -50,6 +50,11 @@ def _valid_label(value: str) -> bool:
     return bool(value) and bool(_K8S_NAME_RE.match(value))
 
 
+# Публичное имя для вызывающих, которые решают «спрашивать ли VM вообще»
+# до вызова get_pod_metrics (пайплайн: нет метки pod → метрики не опрошены).
+valid_promql_label = _valid_label
+
+
 class ClusterHealth:
     """Snapshot кластерного здоровья — результат get_cluster_health()."""
 
@@ -73,6 +78,15 @@ class ClusterHealth:
     def _missing(self, *keys: str) -> bool:
         """True если хоть одна из метрик отсутствует или None («нет данных»)."""
         return any(self._m.get(k) is None for k in keys)
+
+    @property
+    def all_missing(self) -> bool:
+        """True если не ответила ни одна метрика — VM недоступна целиком.
+
+        Отличает отказ источника от частичного снимка: частичный честно
+        несёт health_status, а полностью пустой — не наблюдение вовсе.
+        """
+        return all(v is None for v in self._m.values())
 
     # ── Сырые числа ────────────────────────────────────────────────────────
 
@@ -473,6 +487,22 @@ class VMClient:
             memory_limit_bytes  int (0 если лимит не задан)
             memory_pct          float  (0.0–1.0, NaN если нет лимита)
             cpu_throttle_ratio  float
+            vm_errors           dict — {сигнал: тип исключения} для сигналов
+                                («memory» / «cpu»), чьи запросы упали; их
+                                `*_pressure` = None, а не False
+
+        Сбой VM — не «давления нет». Раньше любой отказ глушился в нулевой
+        result, и ResourcePressureRule уверенно отвечал ✗ по метрикам, которых
+        не видел. Теперь:
+          * упали все три запроса или ответ не разобрался → VMQueryError:
+            сборщик пайплайна пометит `metrics_summary` в source_status;
+          * упала часть → `*_pressure` этого сигнала = None, сигнал попадает в
+            `vm_errors`; уцелевший отдаётся как есть — найденное давление по
+            CPU остаётся найденным, даже если память не ответила;
+          * невалидная метка namespace/pod → ValueError: запрос не строим
+            (PromQL-инъекция), а «не спрашивали» ≠ «ноль».
+        Пустые серии (запрос прошёл, данных нет) — по-прежнему нули: это ответ
+        VM, а не отказ.
         """
         end = incident_time or datetime.now(timezone.utc)
         start = end - timedelta(minutes=window_minutes)
@@ -488,15 +518,15 @@ class VMClient:
         }
 
         # Fail-safe против PromQL-инъекции: namespace/pod из alert-label'ов могут
-        # содержать спецсимволы. На невалидном значении не строим запрос — отдаём
-        # тот же нулевой result, что и при ошибке VM.
+        # содержать спецсимволы. На невалидном значении запрос не строим — и
+        # нули не отдаём: метрики не спрошены, судить о давлении нечем.
         if not _valid_label(namespace) or not _valid_label(pod):
             logger.warning(
                 "vm_client.get_pod_metrics: invalid namespace/pod label "
                 "ns=%r pod=%r — пропускаю запрос",
                 namespace, pod,
             )
-            return result
+            raise ValueError("invalid namespace/pod label for PromQL")
 
         try:
             # gather(return_exceptions=True) даёт tuple[list | BaseException, ...] —
@@ -518,6 +548,30 @@ class VMClient:
                 return_exceptions=True,
             )
             mem_series, limit_series, throttle_series = gathered
+
+            failures = {
+                name: val for name, val in (
+                    ("memory_usage", mem_series),
+                    ("memory_limit", limit_series),
+                    ("cpu_throttle", throttle_series),
+                ) if isinstance(val, BaseException)
+            }
+            if len(failures) == len(gathered):
+                first = next(iter(failures.values()))
+                raise VMQueryError(
+                    f"all pod metric queries failed: {type(first).__name__}: {first}"
+                ) from first
+            # Память судится по паре usage+limit: упал любой — сигнал неизвестен.
+            vm_errors: Dict[str, str] = {}
+            mem_failed = failures.get("memory_usage") or failures.get("memory_limit")
+            if mem_failed is not None:
+                vm_errors["memory"] = type(mem_failed).__name__
+                result["memory_pressure"] = None
+            if "cpu_throttle" in failures:
+                vm_errors["cpu"] = type(failures["cpu_throttle"]).__name__
+                result["cpu_pressure"] = None
+            if vm_errors:
+                result["vm_errors"] = vm_errors
 
             # Memory working set
             if isinstance(mem_series, list) and mem_series:
@@ -555,8 +609,15 @@ class VMClient:
                     result["cpu_throttle_ratio"] = round(ratio, 3)
                     result["cpu_pressure"] = ratio > _CPU_THROTTLE_PCT
 
+        except VMQueryError:
+            raise
         except Exception as e:
+            # Ответ пришёл, но не разобрался (мусор в values и т.п.): состояние
+            # метрик неизвестно — наружу как отказ, а не как нулевой result.
             logger.warning("vm_client.get_pod_metrics failed: %s", e)
+            raise VMQueryError(
+                f"pod metrics parse failed: {type(e).__name__}: {e}"
+            ) from e
 
         return result
 

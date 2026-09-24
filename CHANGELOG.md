@@ -65,6 +65,15 @@ All notable changes to this project are documented in this file.
   `k8s_events`, и `OOMKilledRule`/`CrashLoopBackOffRule` отвечали «не было» с высокой
   уверенностью. Теперь снапшот несёт `error`, поля помечаются, правила
   отвечают ?. То же для не настроенной VictoriaMetrics (`metrics_summary`).
+- **Сбой VictoriaMetrics — не «давления нет».** `VMClient.get_pod_metrics`
+  глушил любой отказ в нулевой result (`memory_pressure: False`), и
+  `ResourcePressureRule` отвечал ✗ по метрикам, которых не видел. Теперь
+  полный отказ или неразобранный ответ — `VMQueryError` (сборщик помечает
+  `metrics_summary`), частичный — `*_pressure = None` и `vm_errors` по упавшему
+  сигналу; найденное давление по уцелевшему сигналу остаётся ✓. Пустая или
+  невалидная метка pod больше не даёт нулей: метрики помечены «не опрошены».
+  Снимок кластера, где не ответила ни одна метрика, помечает `cluster_health`.
+  Пустые серии (запрос прошёл, данных нет) по-прежнему нули.
 
 ## [1.0.18] — 2026-09-23 — Чьи стенды на ноде и граница доверия вебхука
 
