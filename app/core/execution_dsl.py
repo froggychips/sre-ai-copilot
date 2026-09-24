@@ -108,6 +108,19 @@ def is_mutating(action: "ActionType") -> bool:
     return action_spec(action).mutating
 
 
+# Поля, которые заполняет только сервер. Модель могла их вписать (или
+# prompt-injection заставил): значение отбрасывается ДО валидации, чтобы
+# кривое `playbook_match` не роняло весь intent и чтобы вписанное не
+# выдавало себя за серверную привязку.
+_SERVER_ONLY_FIELDS = ("playbook_match",)
+
+
+def _drop_server_fields(obj: Any) -> Any:
+    if isinstance(obj, dict):
+        return {k: v for k, v in obj.items() if k not in _SERVER_ONLY_FIELDS}
+    return obj
+
+
 class ExecutionIntent(BaseModel):
     action: ActionType
     resource_type: str = Field(..., pattern="^(deployment|pod|service|ingress)$")
@@ -120,6 +133,10 @@ class ExecutionIntent(BaseModel):
     # Со включённым флагом мутирующий intent без playbook-а блокируется, а
     # действие обязано входить в plan.steps (см. executor_gate).
     playbook: Optional[str] = Field(None, pattern=r"^[a-z0-9_]{1,64}$")
+    # Hash записи серверного снимка совпадения (`remediation.binding`). Ставит
+    # его ТОЛЬКО pipeline после отбора кандидатов — значение из вывода модели
+    # затирается. Входит в подпись: одобрение покрывает конкретный снимок.
+    playbook_match: Optional[str] = Field(default=None, pattern=r"^[0-9a-f]{12}$")
 
     @field_validator("namespace")
     @classmethod
@@ -197,7 +214,7 @@ class ExecutionIntent(BaseModel):
         # Прямой парс — нормальный happy path по нашему prompt-у.
         try:
             obj = json.loads(cleaned)
-            return cls.model_validate(obj)
+            return cls.model_validate(_drop_server_fields(obj))
         except (json.JSONDecodeError, ValidationError):
             pass
 
@@ -208,7 +225,7 @@ class ExecutionIntent(BaseModel):
             return None
         try:
             obj = json.loads(match.group(0))
-            return cls.model_validate(obj)
+            return cls.model_validate(_drop_server_fields(obj))
         except json.JSONDecodeError as e:
             logger.warning(
                 "execution_intent.json_invalid",

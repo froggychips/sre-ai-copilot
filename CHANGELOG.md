@@ -30,6 +30,26 @@ All notable changes to this project are documented in this file.
 
 ### Изменено
 
+- **Привязка intent → playbook держится на серверном снимке, а не на имени
+  из вывода модели.** При отборе кандидатов pipeline фиксирует
+  `analysis["playbook_match"]` (`app/remediation/binding.py`): какие
+  playbook-и совпали, digest их YAML, вердикты preconditions, шаги плана и
+  список verify; у каждой записи свой hash. Intent несёт этот hash в новом
+  поле `playbook_match` (ставит только pipeline, значение от модели
+  отбрасывается), hash входит в подпись — одобрение покрывает конкретный
+  снимок. Gate на apply-пути сверяет intent со снимком: запись и её hash,
+  namespace, digest YAML (playbook не правили после отбора) и совпадение с
+  конкретным шагом плана — литеральный параметр шага обязан совпасть,
+  лишний параметр не проходит. Флаг `REMEDIATION_PLAYBOOK_BINDING_ENABLED`
+  по-прежнему выключен; подписи intent-ов без привязки не сдвинулись.
+- **Verify из playbook-а участвует в отложенной проверке.** Для привязанного
+  intent-а `verify_remediation` проверяет перечисленные в playbook-е
+  проверки (список берётся из снимка, без него — из реестра). Playbook только
+  ужесточает исход `assess()`: требуемая проверка с ответом «не удалось
+  проверить» больше не засчитывается как успех — на последней попытке исход
+  `unknown`, а не `verified`. Результат — в `executor_verification.playbook_verify`
+  и в строке `kg_remediation_attempts`.
+
 - **Единый контракт сборщиков контекста: `source_status` выводится, а не
   пишется руками.** `app/context/collector.py`: сборщик отдаёт
   `CollectorResult` (статус из того же словаря, что у задач-источников графа —

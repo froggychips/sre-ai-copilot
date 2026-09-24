@@ -45,6 +45,11 @@ def compute_signature(intent: "ExecutionIntent") -> str:
     playbook = getattr(intent, "playbook", None)
     if playbook:
         payload["playbook"] = str(playbook)
+    # Hash серверного снимка — по той же схеме: только когда задан, чтобы
+    # подписи прежних intent-ов не сдвинулись.
+    playbook_match = getattr(intent, "playbook_match", None)
+    if playbook_match:
+        payload["playbook_match"] = str(playbook_match)
     raw = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
     return hashlib.sha256(raw).hexdigest()[:12]
 

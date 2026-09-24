@@ -28,7 +28,7 @@ from __future__ import annotations
 import os
 import re
 from dataclasses import replace
-from typing import Any, Dict
+from typing import Any, Dict, Mapping, Optional
 
 from app.config import settings
 from app.core.execution_dsl import ExecutionIntent, action_spec
@@ -152,8 +152,17 @@ def _apply_fail_closed_axes(axes: RiskAxes, intent: ExecutionIntent) -> RiskAxes
     )
 
 
-def evaluate_intent_gate(intent: ExecutionIntent) -> PolicyDecision:
+def evaluate_intent_gate(
+    intent: ExecutionIntent,
+    *,
+    match_snapshot: Optional[Mapping[str, Any]] = None,
+) -> PolicyDecision:
     """Детерминированно оценить ExecutionIntent против executor safety-policy.
+
+    `match_snapshot` — серверный снимок отбора playbook-ов из
+    `analysis["playbook_match"]` (см. `remediation.binding`). Читается только
+    с включённым REMEDIATION_PLAYBOOK_BINDING_ENABLED; без снимка мутирующий
+    intent в этом режиме блокируется.
 
     Возвращает `PolicyDecision`; `mode == PolicyMode.BLOCK` → реальный apply
     запрещён. Не зависит от LLM-`risk` поля intent-а — namespace/kind/replicas
@@ -186,7 +195,9 @@ def evaluate_intent_gate(intent: ExecutionIntent) -> PolicyDecision:
     # требование привязки для них только выключило бы расследование.
     if not spec.mutating:
         return decision
-    return _strictest(decision, _playbook_binding_decision(intent, axes, target))
+    return _strictest(
+        decision, _playbook_binding_decision(intent, axes, target, match_snapshot),
+    )
 
 
 # --- Привязка к playbook-у (REMEDIATION_PLAYBOOK_BINDING_ENABLED) ----------
@@ -209,35 +220,30 @@ def _binding_block(reason: str, **extra: Any) -> PolicyDecision:
 
 
 def _playbook_binding_decision(
-    intent: ExecutionIntent, axes: RiskAxes, target: Dict[str, Any],
+    intent: ExecutionIntent,
+    axes: RiskAxes,
+    target: Dict[str, Any],
+    match_snapshot: Optional[Mapping[str, Any]],
 ) -> PolicyDecision:
-    """Проверить, что мутирующий intent исполняет план v2-playbook-а.
+    """Проверить, что мутирующий intent исполняет план из серверного снимка.
 
-    Не проверяет preconditions: фактов на apply-пути нет, а отбор по ним
-    уже сделан до FixAgent (`matcher.match_playbooks`). Здесь — то, что
-    модель могла нарушить: сослаться на несуществующий или preview-only
-    playbook либо выдать действие, которого в его плане нет. Политика
-    playbook-а считается по тем же fail-closed осям, что и gate.
+    Preconditions здесь не пересчитываются — фактов на apply-пути нет. Их
+    результат зафиксирован в снимке на момент отбора, и intent обязан нести
+    hash именно той записи (`playbook_match`), которую сервер тогда выдал.
+    Сверяются: запись снимка, digest YAML (playbook не правили после
+    отбора), namespace и совпадение intent-а с конкретным шагом плана.
+    Политика playbook-а считается по тем же fail-closed осям, что и gate.
     """
-    if not intent.playbook:
-        return _binding_block("playbook_missing")
-    # Ленивый импорт: matcher тянет diagnostics/FactStore, которые gate-у
-    # без флага не нужны.
+    # Ленивый импорт: matcher/binding тянут diagnostics/FactStore, которые
+    # gate-у без флага не нужны.
+    from app.remediation.binding import BindingViolation, check_intent_binding
     from app.remediation.matcher import default_registry
     try:
         registry = default_registry()
     except Exception as e:
         return _binding_block("registry_unavailable", error=type(e).__name__)
-    pb = registry.get(intent.playbook)
-    if pb is None:
-        return _binding_block("playbook_unknown", playbook=intent.playbook)
-    if not pb.executable:
-        return _binding_block("playbook_not_executable", playbook=pb.name)
-    if intent.action.value not in pb.step_actions():
-        return _binding_block(
-            "action_not_in_plan",
-            playbook=pb.name,
-            action=intent.action.value,
-            plan=sorted(pb.step_actions()),
-        )
+    try:
+        pb = check_intent_binding(intent, match_snapshot, registry)
+    except BindingViolation as v:
+        return _binding_block(v.reason, **v.extra)
     return evaluate_policy(pb, axes, target=target)
