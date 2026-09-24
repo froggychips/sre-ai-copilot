@@ -1,23 +1,48 @@
-# RBAC для sre-ai (api + worker).
+# RBAC для sre-ai-copilot.
+#
+# Два ServiceAccount-а, и разница между ними — вся суть файла:
+#   * sre-ai          — api, worker, beat, migrate-Job. ТОЛЬКО чтение.
+#   * sre-ai-executor — deployment copilot-executor (k8s/executor.yaml), и
+#                       больше никто. Единственный, к кому привязывается
+#                       write-роль sre-ai-remediate.
+#
+# До 24.09.2026 SA был один: write-роль, привязанная к sre-ai, доставалась
+# и api-поду, который принимает вебхуки из интернета, и worker-у, который
+# гоняет LLM по логам и тексту алертов. Теперь api и worker только кладут
+# задачу в очередь executor (EXECUTOR_DISPATCH=queue, см. app/config.py), а
+# kubectl-запись делает отдельный процесс под своим SA.
 #
 # Принципы:
-#   * ОТКАЗ default-SA: pod-ы используют sre-ai SA с явным наборов прав.
+#   * ОТКАЗ default-SA: pod-ы используют явный SA с явным набором прав.
 #   * Чтение — широкое (pod/pod log/event/deployment в большинстве ns).
-#   * Запись — только то, что реально дёргает agent fix/synthesis:
-#       - deployments rollout (patch/scale) — в whitelisted namespace-ах.
-#       - pod eviction (delete) — там же.
+#   * Запись — только то, что реально исполняет executor
+#     (app/core/execution_dsl.py): rollout restart и scale deployment-а.
+#     `--dry-run=server` для RBAC — тот же patch, поэтому и dry-run живёт в
+#     executor-е, а не в worker-е.
 #   * forbidden ns (kube-system, kube-public, kube-node-lease, chaos-mesh, mcp)
 #     не покрываются НИЧЕМ — guard в коде дополнительно блокирует, но и API
 #     уровень тоже отрезан.
 #
-# Применять отдельно для каждого target-namespace (squad-*):
+# Write-роль применяется отдельно для каждого target-namespace (squad-*):
 #   kubectl -n squad-foo apply -f rbac.yaml
-# либо через kustomize patch — добавлять RoleBinding для нужных namespace-ов.
+# и RoleBinding на sre-ai-executor — осознанно, по одному (пример ниже).
 
 apiVersion: v1
 kind: ServiceAccount
 metadata:
   name: sre-ai
+  labels:
+    app.kubernetes.io/part-of: sre-ai-copilot
+automountServiceAccountToken: true
+
+---
+# SA исполнителя. Только его токен может менять кластер (через RoleBinding
+# на sre-ai-remediate в конкретных squad-* ns). Токен монтируется только в
+# под copilot-executor.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: sre-ai-executor
   labels:
     app.kubernetes.io/part-of: sre-ai-copilot
 automountServiceAccountToken: true
@@ -55,8 +80,15 @@ roleRef:
   apiGroup: rbac.authorization.k8s.io
 
 ---
-# Write-Role применяется ТОЛЬКО в squad-* (через отдельный RoleBinding).
-# Не делать ClusterRoleBinding — иначе обходим principle of least privilege.
+# Write-Role применяется ТОЛЬКО в squad-* (через отдельный RoleBinding) и
+# ТОЛЬКО на SA sre-ai-executor. Не делать ClusterRoleBinding — иначе обходим
+# principle of least privilege.
+#
+# Состав — ровно то, что умеет execution_dsl: `rollout restart` (patch
+# deployment) и `scale` (patch/update deployments/scale); get/list — для
+# `--current-replicas` и снимков verification. Прежние `delete pods` и
+# `create pods/exec` сняты 24.09.2026: ни один путь кода их не вызывал, а
+# exec под write-SA — это произвольная команда в любом контейнере ns.
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata:
@@ -65,16 +97,12 @@ rules:
 - apiGroups: ["apps"]
   resources: ["deployments", "deployments/scale"]
   verbs: ["get", "list", "patch", "update"]
-- apiGroups: [""]
-  resources: ["pods"]
-  verbs: ["delete"]  # для restart/eviction
-- apiGroups: [""]
-  resources: ["pods/exec"]
-  verbs: ["create"]  # под жёстким allowlist в k8s_guard
 
 ---
 # Пример write-binding в squad-* namespace. Размножать через kustomize.
 # Не применять автоматически — каждый bind должен быть осознанным merge'ем.
+# Subject — ТОЛЬКО sre-ai-executor: bind на sre-ai вернул бы write-права
+# api-поду.
 # apiVersion: rbac.authorization.k8s.io/v1
 # kind: RoleBinding
 # metadata:
@@ -82,8 +110,8 @@ rules:
 #   namespace: squad-foo
 # subjects:
 # - kind: ServiceAccount
-#   name: sre-ai
-#   namespace: default
+#   name: sre-ai-executor
+#   namespace: sre-ai
 # roleRef:
 #   kind: Role
 #   name: sre-ai-remediate
@@ -193,6 +221,12 @@ subjects:
 - kind: ServiceAccount
   name: sre-ai
   namespace: sre-ai   # namespace куда деплоится app; поменять через kustomize-overlay
+# Executor-у чтение нужно для своей же работы: `--current-replicas` у scale,
+# снимок цели до/после записи (app/remediation/verification.py), резолв
+# target-а. Чтение без записи — то же, что у sre-ai.
+- kind: ServiceAccount
+  name: sre-ai-executor
+  namespace: sre-ai
 roleRef:
   kind: ClusterRole
   name: sre-ai-deployments-reader

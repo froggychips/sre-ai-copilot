@@ -314,20 +314,27 @@ async def _apply_in_background(
     import asyncio
     from app.services.executor_apply import apply_intent
     outcome = await asyncio.to_thread(apply_intent, incident_id, user_id, intent_sig)
+    await _send_followup(interaction_token, _format_apply_outcome(incident_id, outcome))
 
+
+def _format_apply_outcome(incident_id: str, outcome: Dict[str, Any]) -> str:
+    """Текст followup-а по итогу apply_intent.
+
+    Общий для inline-пути (фоновая таска api) и для задачи в очереди
+    executor (`app.workers.executor_tasks`): оператор видит одно и то же, где
+    бы ни исполнилась команда.
+    """
     if not outcome["ok"]:
-        content = _format_apply_refusal(incident_id, outcome.get("reason", "unknown"))
-    else:
-        result = outcome.get("result") or {}
-        success = bool(result.get("success"))
-        emoji = "✅" if success else "❌"
-        command = result.get("command", "(unknown)")
-        out = (result.get("stdout") or result.get("stderr") or result.get("error") or "").strip()
-        content = f"{emoji} kubectl {'выполнен' if success else 'упал'}: `{command}`"
-        if out:
-            content += f"\n```\n{out[:600]}\n```"
-
-    await _send_followup(interaction_token, content)
+        return _format_apply_refusal(incident_id, outcome.get("reason", "unknown"))
+    result = outcome.get("result") or {}
+    success = bool(result.get("success"))
+    emoji = "✅" if success else "❌"
+    command = result.get("command", "(unknown)")
+    out = (result.get("stdout") or result.get("stderr") or result.get("error") or "").strip()
+    content = f"{emoji} kubectl {'выполнен' if success else 'упал'}: `{command}`"
+    if out:
+        content += f"\n```\n{out[:600]}\n```"
+    return content
 
 
 def _confirm_neg_buttons(incident_id: str) -> list:
@@ -659,6 +666,25 @@ async def discord_interactions(
         # Discord даёт 15 минут на followup через PATCH @original — этого хватит
         # даже для большого rollout restart с тяжёлыми initContainers.
         # Strong-ref + done-callback: см. _spawn_background_task.
+        #
+        # EXECUTOR_DISPATCH=queue: kubectl исполняет copilot-executor под
+        # своим SA, у api write-прав нет. followup отправит сама задача —
+        # interaction token живёт 15 минут, передаём его с задачей.
+        from app.workers.executor_tasks import (dispatch_apply,
+                                                queue_dispatch_enabled)
+        if queue_dispatch_enabled():
+            try:
+                dispatch_apply(incident_id, user_id, intent_sig, interaction_token)
+            except Exception as e:
+                # Брокер недоступен — задачи нет, kubectl не запущен. Ответ
+                # сразу, а не deferred: иначе оператор смотрит на вечный loader.
+                logger.error("executor_dispatch_failed kind=apply_confirm error=%s",
+                             str(e), exc_info=True)
+                return _ephemeral(
+                    f"❌ Не удалось поставить apply в очередь executor "
+                    f"({type(e).__name__}) — kubectl не запущен."
+                )
+            return _deferred_ephemeral()
         _spawn_background_task(
             _apply_in_background(incident_id, user_id, intent_sig, interaction_token),
             context={"kind": "apply_confirm", "incident_id": incident_id,
@@ -786,16 +812,24 @@ async def discord_interactions(
         # достижим через флаг, задокументированный как dry-run-only.
         if settings.EXECUTOR_ENABLED and settings.EXECUTOR_APPROVAL_ENABLED:
             try:
-                from app.services.executor_apply import apply_intent
-                # intent_sig из custom_id → integrity-сверка в apply_intent (TOCTOU).
-                # Strong-ref + done-callback: упавший apply_intent логируется и
-                # аудируется, а не исчезает молча.
-                _spawn_background_task(
-                    asyncio.to_thread(apply_intent, incident_id, user_name, intent_sig),
-                    context={"kind": "approve_apply", "incident_id": incident_id,
-                             "intent_signature": intent_sig,
-                             "approved_by": user_name},
-                )
+                from app.workers.executor_tasks import (dispatch_apply,
+                                                        queue_dispatch_enabled)
+                if queue_dispatch_enabled():
+                    # kubectl — в copilot-executor под своим SA (см.
+                    # EXECUTOR_DISPATCH). followup-а у этого пути нет и не
+                    # было: итог — в audit-trail, как и написано в ответе.
+                    dispatch_apply(incident_id, user_name, intent_sig)
+                else:
+                    from app.services.executor_apply import apply_intent
+                    # intent_sig из custom_id → integrity-сверка в apply_intent (TOCTOU).
+                    # Strong-ref + done-callback: упавший apply_intent логируется и
+                    # аудируется, а не исчезает молча.
+                    _spawn_background_task(
+                        asyncio.to_thread(apply_intent, incident_id, user_name, intent_sig),
+                        context={"kind": "approve_apply", "incident_id": incident_id,
+                                 "intent_signature": intent_sig,
+                                 "approved_by": user_name},
+                    )
                 return _ephemeral(
                     f"✅ Approved by @{user_name}. Executor launched в фоне — "
                     "итог (включая отказ) смотри в audit-trail "

@@ -84,6 +84,18 @@ if [[ "${missing_rbac}" == "1" ]]; then
     echo "WARNING: RBAC неполный. Деплой продолжается, но граф будет неполным." >&2
 fi
 
+# Обратный инвариант: у sre-ai (api, worker, beat) права на запись быть НЕ
+# должно — её исполняет только copilot-executor под sre-ai-executor
+# (k8s/executor.yaml). Лишний RoleBinding на sre-ai молча вернул бы
+# write-токен api-поду, который принимает вебхуки из интернета; манифест
+# этого не покажет, покажет только can-i.
+if kubectl auth can-i patch deployments.apps \
+        --as="system:serviceaccount:${NAMESPACE}:sre-ai" \
+        --all-namespaces >/dev/null 2>&1; then
+    echo "WARNING: SA sre-ai может patch deployments — запись должна быть только у sre-ai-executor." >&2
+    echo "  Найти лишний bind: kubectl get rolebindings,clusterrolebindings -A -o wide | grep ' sre-ai\b'" >&2
+fi
+
 # ── 3. Миграции: отдельный Job ДО выката приложения ──────────────────────
 # Job immutable по spec → пересоздаём.
 #
@@ -119,6 +131,11 @@ if ! kubectl -n "${NAMESPACE}" wait --for=condition=complete --timeout=300s job/
 fi
 
 # ── 4. Приложение ─────────────────────────────────────────────────────────
+# executor — ПЕРВЫМ: api и worker выкатываются с EXECUTOR_DISPATCH=queue и
+# сразу начинают класть dry-run/apply в его очередь. Поднятый позже, он
+# стоил бы окна, где dry-run упирается в таймаут (без Apply — fail-closed,
+# но зря).
+apply_with_image k8s/executor.yaml
 apply_with_image k8s/base/deployment.yaml
 apply_with_image k8s/worker.yaml
 kubectl -n "${NAMESPACE}" apply -f k8s/networkpolicy.yaml
@@ -130,7 +147,7 @@ kubectl -n "${NAMESPACE}" apply -f k8s/networkpolicy.yaml
 # CI/оператор верит exit code. Теперь неуспешный rollout = явный не-OK и exit 1.
 #
 # Цикл при этом НЕ выходит на первом упавшем (`if !`, а не голый вызов под
-# set -e): оператору нужна полная картина по всем трём деплойментам, поэтому
+# set -e): оператору нужна полная картина по всем деплойментам, поэтому
 # провалы копятся в rollout_failed, а exit — после цикла. `|| true` осталось
 # только на диагностических kubectl-вызовах: их отказ не должен подменять
 # причину падения (например, при отозванных правах на describe).
@@ -147,7 +164,7 @@ kubectl -n "${NAMESPACE}" apply -f k8s/networkpolicy.yaml
 ROLLOUT_TIMEOUT="${ROLLOUT_TIMEOUT:-600s}"
 
 rollout_failed=""
-for d in sre-ai-api copilot-worker copilot-beat; do
+for d in copilot-executor sre-ai-api copilot-worker copilot-beat; do
     if ! kubectl -n "${NAMESPACE}" rollout status "deploy/${d}" \
             --timeout="${ROLLOUT_TIMEOUT}"; then
         echo "ERROR: rollout deploy/${d} не сошёлся за ${ROLLOUT_TIMEOUT}." >&2

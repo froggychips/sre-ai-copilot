@@ -1,0 +1,138 @@
+# copilot-executor — единственный процесс, который меняет кластер.
+#
+# Слушает только Celery-очередь `executor` (EXECUTOR_QUEUE_NAME) и исполняет
+# две задачи из app/workers/executor_tasks.py:
+#   * executor_dry_run — `kubectl ... --dry-run=server` для стадии пайплайна;
+#   * executor_apply   — реальная запись после двухшагового одобрения в
+#                        Discord (все проверки — внутри apply_intent).
+#
+# Работает под SA `sre-ai-executor`: write-роль `sre-ai-remediate`
+# привязывается только к нему (см. k8s/base/rbac.yaml). api, worker и beat
+# остаются под `sre-ai` без записи — у пода, принимающего вебхуки из
+# интернета, и у пода, который гоняет LLM по данным инцидента, токена с
+# правом patch больше нет.
+#
+# Задачи сюда кладут api и worker при EXECUTOR_DISPATCH=queue (выставлено в
+# k8s/base/deployment.yaml и k8s/worker.yaml). Если этот deployment не
+# поднят, dry-run упирается в EXECUTOR_DRY_RUN_TIMEOUT_SECONDS и кнопки Apply
+# нет (fail-closed), а поставленный apply ждёт в очереди.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: copilot-executor
+  labels:
+    app: copilot-executor
+spec:
+  # Одна реплика и concurrency=1: записи в кластер редкие (клик человека),
+  # параллелизм им не нужен, а последовательное исполнение проще читать в
+  # audit-логе. Двойной apply отбивает claim в apply_intent, а не число
+  # реплик.
+  replicas: 1
+  # Recreate: при rollout старый под сначала останавливается. Два executor-а
+  # одновременно безопасны (claim), но незачем.
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: copilot-executor
+  template:
+    metadata:
+      labels:
+        app: copilot-executor
+    spec:
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: env
+                    operator: In
+                    values: ["dev"]
+      serviceAccountName: sre-ai-executor
+      automountServiceAccountToken: true
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        fsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+      - name: executor
+        # IMAGE_PLACEHOLDER подставляет deploy.sh — тот же образ, что у worker.
+        image: IMAGE_PLACEHOLDER
+        imagePullPolicy: IfNotPresent
+        command:
+        - celery
+        - -A
+        - app.workers.tasks.celery_app
+        - worker
+        - --loglevel=info
+        # ТОЛЬКО очередь executor: default-очередь (pipeline, синки KG)
+        # этот под не берёт, иначе LLM-работа снова шла бы под write-SA.
+        - -Q
+        - executor
+        - --concurrency=1
+        # Имя celery-нода отличается от воркеров (`celery@<pod>` тоже
+        # уникально, но явный префикс читается в `inspect`-выводе).
+        - -n
+        - executor@%h
+        securityContext:
+          readOnlyRootFilesystem: true
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop: ["ALL"]
+        envFrom:
+        - secretRef:
+            name: sre-ai-secrets
+        env:
+        # Тот же набор, что у copilot-worker (см. комментарии там), без
+        # ownership/people/дайджестов: executor их не читает.
+        - name: PROMETHEUS_MULTIPROC_DIR
+          value: /tmp/prometheus-multiproc
+        - name: ENV
+          value: "production"
+        - name: SAFE_MODE
+          value: "true"
+        - name: ALERTMANAGER_ALLOW_UNAUTHENTICATED
+          value: "true"
+        - name: BUILD_VERSION
+          value: "BUILD_VERSION_PLACEHOLDER"
+        - name: DISCORD_DRY_RUN
+          value: "false"
+        # Сам executor исполняет inline — он и есть исполнитель. Явно, чтобы
+        # случайное queue из секрета не заставило его ставить задачи самому
+        # себе.
+        - name: EXECUTOR_DISPATCH
+          value: "inline"
+        # Проба та же, что у worker-а, и по тем же причинам: `-b` вместо
+        # `-A` (не импортировать стек), `-d` на свой нод (не broadcast).
+        livenessProbe:
+          exec:
+            command:
+            - sh
+            - -c
+            - 'celery -b "$REDIS_URL" inspect ping -d "executor@${HOSTNAME:-$(hostname)}" -t 10'
+          initialDelaySeconds: 120
+          periodSeconds: 60
+          timeoutSeconds: 15
+          failureThreshold: 5
+        # Память: 1 родитель + 1 ребёнок × ~170Mi стека (замер в worker.yaml)
+        # ≈ 340Mi, плюс kubectl-subprocess в том же cgroup. Тяжёлых выборок
+        # KG здесь нет.
+        resources:
+          limits:
+            cpu: 300m
+            memory: 768Mi
+          requests:
+            cpu: 100m
+            memory: 768Mi
+        volumeMounts:
+        - name: tmp
+          mountPath: /tmp
+        - name: prometheus-multiproc
+          mountPath: /tmp/prometheus-multiproc
+      volumes:
+      - name: tmp
+        emptyDir: {}
+      - name: prometheus-multiproc
+        emptyDir: {}
