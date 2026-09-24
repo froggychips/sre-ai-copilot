@@ -4,6 +4,30 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+### Добавлено
+
+- **Playbook v2: исполнимый контракт вместо двух параллельных систем.**
+  Раньше playbook-и реестра были только preview (голый argv в `plan.command`,
+  `match` под stale-job), а executor жил своей жизнью: FixAgent сочинял
+  intent, `executor_gate` собирал в коде фиктивный playbook ради схемы.
+  Схема `remediation.playbook/v2`: `plan.steps` ссылаются на `ActionType`
+  (argv собирает только `DSLTranslator`), `preconditions` — вердикты фактов
+  (UNKNOWN не удовлетворяет ни found, ни absent; `evidence_not_in` отсекает
+  SIGSEGV/SIGABRT у широкого `process_crash`), `verify` — имена проверок
+  `verification.assess()`. Всё валидируется на загрузке YAML. Первый
+  v2-playbook — `restart_crashloop_deployment` (crashloop без OOM, выката и
+  падения по сигналу; только dev/squad через approve). Детерминированный
+  `matcher.match_playbooks` и golden-группа `playbooks` (кейсы 021/022 —
+  позитив и fail-closed при упавшем источнике деплоев).
+- **Gate-политика executor-а — в YAML** (`registry/_executor_apply_gate.yaml`),
+  решения бит-в-бит прежние. Её `plan.steps` теперь работает: действие вне
+  списка блокируется, новое `ActionType` надо допустить явно.
+- **Привязка intent → playbook за флагом `REMEDIATION_PLAYBOOK_BINDING_ENABLED`**
+  (по умолчанию выключен). FixAgent получает только отобранных кандидатов,
+  gate блокирует мутирующий intent без `playbook` или с действием вне плана,
+  политика playbook-а складывается с gate по строжайшему. `playbook` входит
+  в подпись intent-а только когда задан — подписи уже одобренных не сдвигаются.
+
 ### Изменено
 
 - **Единый контракт сборщиков контекста: `source_status` выводится, а не

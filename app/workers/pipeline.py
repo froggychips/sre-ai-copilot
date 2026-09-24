@@ -1009,12 +1009,37 @@ class IncidentPipeline:
     # Stage 6 — FixAgent
     # ------------------------------------------------------------------
 
+    def _candidate_playbooks(self) -> Optional[list]:
+        """v2-кандидаты для FixAgent — только под флагом привязки.
+
+        Ошибка реестра не роняет стадию: FixAgent получит прежний промпт, а
+        gate с включённым флагом сам заблокирует мутирующий intent без
+        playbook-а (fail-closed на apply-пути, а не здесь).
+        """
+        if not getattr(settings, "REMEDIATION_PLAYBOOK_BINDING_ENABLED", False):
+            return None
+        from app.remediation.matcher import match_playbooks
+        try:
+            candidates = match_playbooks(
+                alertname=(self.incident.labels or {}).get("alertname"),
+                facts=self.fact_store,
+            )
+        except Exception as e:
+            logger.warning("playbook_match_failed", error=type(e).__name__)
+            return None
+        self.root_span.set_attribute(
+            "sre.incident.candidate_playbooks",
+            ",".join(pb.name for pb in candidates),
+        )
+        return candidates
+
     async def stage_fix(self) -> None:
         async with StageTimer("fix") as t:
             self.fix_suggestion, self.execution_intent = await FixAgent().suggest(
                 self.final_cause,
                 is_recurrence=self.is_recurrence,
                 jira_context=self.jira_context,
+                playbooks=self._candidate_playbooks(),
             )
         snap = t.snapshot().to_dict()
         # Метрика на root-span: смог ли LLM выдать structured-intent.

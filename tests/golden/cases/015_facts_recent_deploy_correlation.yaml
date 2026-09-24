@@ -12,6 +12,8 @@ context:
   recent_deployments:
     - {name: Wo_Backend_BuildApi, ts: "2026-08-10T09:50:00Z", status: SUCCESS}
 expect:
+  # Свежий выкат — нужен rollback, а не restart.
+  playbooks: []
   facts:
     recent_deploy: true
     crashloop: true

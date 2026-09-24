@@ -45,6 +45,8 @@ context:
     - {type: Warning, reason: BackOff, count: 12,
        message: "Back-off restarting failed container bot-service in pod bot-service-56567b98-5jmct"}
 expect:
+  # SIGABRT (134) — не транзиентный краш, restart-playbook не кандидат.
+  playbooks: []
   facts:
     process_crash: true
     oom_killed: false

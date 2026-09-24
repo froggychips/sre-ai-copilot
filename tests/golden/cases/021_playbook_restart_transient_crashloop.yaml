@@ -1,0 +1,28 @@
+id: 021_playbook_restart_transient_crashloop
+title: транзиентный crashloop (exit 1, зависимость не готова) — restart-playbook кандидат
+source: synthetic
+llm: false
+incident: {incident_id: golden-021, severity: warning, status: firing,
+           summary: "Pod worker-5d8f-abcde crash-looping", description: "CrashLoopBackOff",
+           namespace: squad-3,
+           labels: {alertname: KubePodCrashLooping, pod: worker-5d8f-abcde, service: worker, namespace: squad-3},
+           annotations: {description: "CrashLoopBackOff"},
+           starts_at: "2026-08-10T10:00:00Z", ends_at: null, generator_url: null, raw: {}}
+context:
+  k8s_pod_state:
+    worker-5d8f-abcde: {exit_code: 1, reason: Error, restart_count: 6}
+  logs_summary: |
+    Last state: terminated, exit code 1
+    connection refused: upstream cache not ready, exiting
+  k8s_events:
+    - {type: Warning, reason: BackOff, count: 6,
+       message: "Back-off restarting failed container worker in pod worker-5d8f-abcde"}
+  recent_deployments: []
+expect:
+  # Позитивный случай restart_crashloop_deployment: crashloop FOUND, OOM и
+  # выкат доказанно ABSENT, exit 1 — не падение по сигналу.
+  facts:
+    crashloop: true
+    oom_killed: false
+    recent_deploy: false
+  playbooks: [restart_crashloop_deployment]

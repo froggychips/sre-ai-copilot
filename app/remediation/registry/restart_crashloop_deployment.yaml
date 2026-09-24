@@ -1,0 +1,53 @@
+# Рестарт Deployment при crashloop, который рестарт в принципе может снять.
+#
+# Рестарт лечит транзиентное: зависший старт, недоступную на момент запуска
+# зависимость, протухшее соединение. Он НЕ лечит OOM (упрётся в тот же лимит)
+# и плохой выкат (нужен rollback). Поэтому preconditions требуют доказанного
+# отсутствия обоих — именно ABSENT: UNKNOWN («логи недоступны», «пайплайн
+# деплоев молчит») playbook не пропустит.
+#
+# process_crash — catch-all ProcessCrashRule на любой ненулевой exit, кроме
+# 137/143: FOUND у него почти в каждом crashloop (exit 1 от «connection
+# refused» — тоже). По одному вердикту SIGSEGV от транзиентного exit 1 не
+# отличить, поэтому фильтр по evidence: exit-коды падения по сигналу
+# (132 SIGILL, 134 SIGABRT, 135 SIGBUS, 136 SIGFPE, 138 SIGUSR1, 139 SIGSEGV)
+# — это баг в коде, рестарт его не лечит.
+#
+# NB: "no"/"yes"/"maybe" в кавычках — иначе PyYAML прочтёт no/yes как bool.
+schema_version: remediation.playbook/v2
+name: restart_crashloop_deployment
+kind: remediation
+description: |
+  rollout restart Deployment-а в crashloop без признаков OOM, без падения
+  процесса по сигналу (SIGSEGV/SIGABRT/...) и без свежего выката. Только dev/squad и только через
+  одобрение человека; prod/preprod/system/data-plane — block.
+match:
+  alertnames: ["KubePodCrashLooping", "PodCrashLooping"]
+preconditions:
+  - {fact: crashloop, verdict: found}
+  - {fact: oom_killed, verdict: absent}
+  - {fact: recent_deploy, verdict: absent}
+  - fact: process_crash
+    verdict: found
+    evidence_not_in:
+      exit_code: [132, 134, 135, 136, 138, 139]
+policy:
+  approve:
+    namespace_tier: ["dev", "squad"]
+    data_plane: ["no", "maybe"]
+  block:
+    any:
+      namespace_tier: ["prod", "preprod", "system"]
+      data_plane: ["yes"]
+      reversibility: ["hard"]
+      confidence: ["weak"]
+plan:
+  steps:
+    - action: describe_resource
+    - action: restart_deployment
+verify:
+  - same_identity
+  - action_took_effect
+  - converged
+  - healthy
+  - no_new_crash_events

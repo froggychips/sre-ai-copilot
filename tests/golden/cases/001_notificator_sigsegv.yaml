@@ -35,6 +35,8 @@ context:
     - {type: Warning, reason: BackOff, count: 7,
        message: "Back-off restarting failed container notificator in pod notificator-ddb645b4b-s5cv6"}
 expect:
+  # SIGSEGV (139) — баг в коде, рестарт не лечит: playbook не кандидат.
+  playbooks: []
   facts:
     process_crash: true
     oom_killed: false      # 137 ≠ 139 — регрессия combat run 1/3
