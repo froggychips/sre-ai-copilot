@@ -148,12 +148,18 @@ class FactKind:
     # инцидента. Мёртвые записи силосов без них — хронический фон (ABSENT с
     # evidence.chronic), см. rules/orleans_membership.py.
     ORLEANS_MEMBERSHIP_DEGRADED = "orleans_membership_degraded"
+    # Контейнер не стартовал: образ не вытянулся (тега нет / доступ / сеть).
+    IMAGE_PULL = "image_pull"
+    # Контейнер не стартовал: kubelet не собрал окружение — нет ключа или
+    # самого Secret/ConfigMap (CreateContainerConfigError).
+    CONTAINER_CONFIG = "container_config"
 
     ALL = frozenset({
         OOM_KILLED, CRASHLOOP, FAILED_SCHEDULING,
         RECENT_DEPLOY, RESOURCE_PRESSURE, UPSTREAM_DEGRADED,
         PROCESS_CRASH, MIGRATION_FAILED, DB_PERMISSION,
         ORLEANS_MEMBERSHIP_DEGRADED,
+        IMAGE_PULL, CONTAINER_CONFIG,
     })
 
 
@@ -164,6 +170,10 @@ class FactKind:
 # другого) — не конфликт, а два независимых наблюдения (см. _same_subject).
 MUTUALLY_EXCLUSIVE_PAIRS: List[FrozenSet[str]] = [
     frozenset({FactKind.OOM_KILLED, FactKind.PROCESS_CRASH}),
+    # Образ не вытянулся → процесс не стартовал → restart-цикла быть не может.
+    # Оба ✓ про один subject = какой-то сигнал прочитан неверно (обычно
+    # BackOff «pulling image», принятый за рестарт) — обоим срезаем confidence.
+    frozenset({FactKind.IMAGE_PULL, FactKind.CRASHLOOP}),
 ]
 
 

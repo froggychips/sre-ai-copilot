@@ -4,10 +4,12 @@
 Добавить новое — отнаследовать Rule из base.py и заявить в DEFAULT_RULES.
 """
 from app.diagnostics.rules.base import Rule
+from app.diagnostics.rules.container_config import ContainerConfigRule
 from app.diagnostics.rules.crashloop import CrashLoopBackOffRule
 from app.diagnostics.rules.db_permission import DbPermissionRule
 from app.diagnostics.rules.failed_scheduling import FailedSchedulingRule
 from app.diagnostics.rules.migration_failed import MigrationFailedRule
+from app.diagnostics.rules.image_pull import ImagePullRule
 from app.diagnostics.rules.oom import OOMKilledRule
 from app.diagnostics.rules.orleans_membership import OrleansMembershipRule
 from app.diagnostics.rules.pod_events import PodEventsRule
@@ -28,6 +30,8 @@ DEFAULT_RULES: list[Rule] = [
     MigrationFailedRule(),
     DbPermissionRule(),
     OrleansMembershipRule(),
+    ImagePullRule(),
+    ContainerConfigRule(),
 ]
 
 __all__ = [
@@ -44,4 +48,6 @@ __all__ = [
     "MigrationFailedRule",
     "DbPermissionRule",
     "OrleansMembershipRule",
+    "ImagePullRule",
+    "ContainerConfigRule",
 ]

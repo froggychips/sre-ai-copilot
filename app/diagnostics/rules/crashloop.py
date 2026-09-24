@@ -12,6 +12,7 @@ import re
 from typing import Any, Dict, List
 
 from app.diagnostics.facts import Fact, FactKind
+from app.diagnostics.rules._container_start import is_image_pull_backoff
 from app.diagnostics.rules.base import Rule
 
 _CRASHLOOP_PATTERN = re.compile(
@@ -35,6 +36,10 @@ def _recent_backoff_events(events: List[Dict[str, Any]]) -> List[Dict[str, Any]]
             continue
         reason = e.get("reason") or ""
         message = (e.get("message") or "").lower()
+        # «Back-off pulling image» — тот же reason BackOff, но процесс не
+        # стартовал ни разу: это ImagePullRule, не restart-цикл.
+        if is_image_pull_backoff(e):
+            continue
         if reason in _BACKOFF_EVENT_REASONS or "back-off restarting" in message:
             out.append(e)
     return out

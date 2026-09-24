@@ -3,8 +3,8 @@
   "cases_passed": 30,
   "cases_skipped": 0,
   "case_pass_rate": 1.0,
-  "checks_total": 95,
-  "checks_passed": 95,
+  "checks_total": 98,
+  "checks_passed": 98,
   "check_pass_rate": 1.0,
   "by_check": {
     "cause_contains": 1.0,

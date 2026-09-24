@@ -47,4 +47,6 @@ expect:
     oom_killed: false
     process_crash: false
     failed_scheduling: false
+    crashloop: false
+    image_pull: true
   playbooks: []

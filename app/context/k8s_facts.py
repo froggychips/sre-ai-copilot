@@ -16,6 +16,8 @@ logger = structlog.get_logger()
 
 # Длина хвоста terminated.message в blob-е (как было до редакции).
 _TERMINATED_MSG_LEN = 200
+# Штатные короткие waiting-состояния при старте пода — не сигнал о поломке.
+_BENIGN_WAITING = frozenset({"", "ContainerCreating", "PodInitializing"})
 
 
 @dataclass
@@ -89,6 +91,10 @@ class K8sFacts:
 
         results: List[str] = []
         container_terminated: Dict[str, Dict[str, Any]] = {}
+        # pod → [(container, reason, message)] для waiting-state: ImagePull*,
+        # CreateContainerConfigError. Процесс в таком контейнере не стартовал,
+        # terminated-state у него нет — без этого снапшот про под молчал.
+        container_waiting: Dict[str, List[tuple]] = {}
         pod_events: List[Dict[str, Any]] = []
 
         try:
@@ -112,6 +118,17 @@ class K8sFacts:
                             if cs.last_state and cs.last_state.terminated
                             else cs.state.terminated if cs.state else None
                         )
+                        waiting = getattr(cs.state, "waiting", None) if cs.state else None
+                        w_reason = getattr(waiting, "reason", None)
+                        if isinstance(w_reason, str) and w_reason not in _BENIGN_WAITING:
+                            container_waiting.setdefault(p.metadata.name, []).append((
+                                cs.name, w_reason,
+                                # waiting.message пишет kubelet (образ, имя
+                                # Secret/ключа), но режем и редактируем так же,
+                                # как terminated.message: blob уходит в LLM.
+                                redact_pii(getattr(waiting, "message", None) or "",
+                                           max_len=_TERMINATED_MSG_LEN),
+                            ))
                         if terminated:
                             container_terminated[p.metadata.name] = {
                                 "reason": terminated.reason or "",
@@ -153,6 +170,18 @@ class K8sFacts:
                     f"reason={info['reason']} exit_code={info['exit_code']}"
                     + (f" — {info['message']}" if info.get("message") else "")
                 )
+            # waiting-state — по тем же правилам скоупинга, что terminated:
+            # reason чужого workload-а в тексте стал бы false anchor-ом.
+            for pod_name, items in container_waiting.items():
+                if pod and not same_workload(pod_name, pod):
+                    if pod_name not in foreign_terminated:
+                        foreign_terminated.append(pod_name)
+                    continue
+                for container, reason, message in items:
+                    results.append(
+                        f"Container waiting: {pod_name}/{container} reason={reason}"
+                        + (f" — {message}" if message else "")
+                    )
             if foreign_terminated:
                 results.append(
                     "Other pods in namespace with terminated containers "
