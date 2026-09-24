@@ -4,6 +4,8 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+## [1.0.19] — 2026-09-24 — Playbook v2, таблица попыток и исполнитель под своим SA
+
 ### Добавлено
 
 - **Покрытие источников сохраняется в инциденте.** Прогоны сборщиков
@@ -30,9 +32,11 @@ All notable changes to this project are documented in this file.
   падения по сигналу; только dev/squad через approve). Детерминированный
   `matcher.match_playbooks` и golden-группа `playbooks` (кейсы 021/022 —
   позитив и fail-closed при упавшем источнике деплоев).
+
 - **Gate-политика executor-а — в YAML** (`registry/_executor_apply_gate.yaml`),
   решения бит-в-бит прежние. Её `plan.steps` теперь работает: действие вне
   списка блокируется, новое `ActionType` надо допустить явно.
+
 - **Привязка intent → playbook за флагом `REMEDIATION_PLAYBOOK_BINDING_ENABLED`**
   (по умолчанию выключен). FixAgent получает только отобранных кандидатов,
   gate блокирует мутирующий intent без `playbook` или с действием вне плана,
@@ -48,6 +52,7 @@ All notable changes to this project are documented in this file.
   шаблон `{replicas}`, его видит человек при одобрении. Golden-кейсы 023
   (кандидат) и 024 (выкат за 8 минут — нет кандидата, это откат).
   Playbook под rollback не добавлен: действия отката нет в `ACTION_SPECS`.
+
 - **Classification доходит до matcher-а.** Pipeline и golden передают
   `classify_alert(labels)` — тот же классификатор, что у preview, без KG и
   enrichment-сигналов; UNKNOWN → None, и playbook с `match.classification`
@@ -67,6 +72,7 @@ All notable changes to this project are documented in this file.
   конкретным шагом плана — литеральный параметр шага обязан совпасть,
   лишний параметр не проходит. Флаг `REMEDIATION_PLAYBOOK_BINDING_ENABLED`
   по-прежнему выключен; подписи intent-ов без привязки не сдвинулись.
+
 - **Verify из playbook-а участвует в отложенной проверке.** Для привязанного
   intent-а `verify_remediation` проверяет перечисленные в playbook-е
   проверки (список берётся из снимка, без него — из реестра). Playbook только
@@ -130,6 +136,7 @@ All notable changes to this project are documented in this file.
   `k8s_events`, и `OOMKilledRule`/`CrashLoopBackOffRule` отвечали «не было» с высокой
   уверенностью. Теперь снапшот несёт `error`, поля помечаются, правила
   отвечают ?. То же для не настроенной VictoriaMetrics (`metrics_summary`).
+
 - **Сбой VictoriaMetrics — не «давления нет».** `VMClient.get_pod_metrics`
   глушил любой отказ в нулевой result (`memory_pressure: False`), и
   `ResourcePressureRule` отвечал ✗ по метрикам, которых не видел. Теперь
@@ -158,16 +165,6 @@ All notable changes to this project are documented in this file.
   summary. `scripts/eval_golden.py`: если пропущены все кейсы («0 из 0»), итог
   — код 1, и `--update-baseline` не записывает пустую сводку эталоном.
 
-### Безопасность
-
-- **Все GitHub Actions запинены на SHA коммита** (`owner/repo@<sha> # vX.Y.Z`)
-  вместо плавающих тегов: репо публичное, а подмена тега экшена исполняется
-  с секретами CI. SHA взяты разыменованием тега до коммита (у аннотированных
-  тегов ref указывает на объект тега). Для `cosign-installer` и
-  `sbom-action` пин — на ТОТ коммит, куда смотрел плавающий тег (`v3.9.1`,
-  `v0.24.0`), а не на свежий патч: поведение CI не меняется. Обновление пинов
-  — dependabot (`github-actions` уже настроен).
-
 - **Непроверенный снимок томов больше не становится опорой чистки.** При
   `no_baseline` (синк вернулся после суток простоя) снимок всё равно
   отмечался `last_seen_at` и на следующем прогоне служил знаменателем порога
@@ -179,6 +176,14 @@ All notable changes to this project are documented in this file.
   но виден в stats как `baseline_unverified`.
 
 ### Безопасность
+
+- **Все GitHub Actions запинены на SHA коммита** (`owner/repo@<sha> # vX.Y.Z`)
+  вместо плавающих тегов: репо публичное, а подмена тега экшена исполняется
+  с секретами CI. SHA взяты разыменованием тега до коммита (у аннотированных
+  тегов ref указывает на объект тега). Для `cosign-installer` и
+  `sbom-action` пин — на ТОТ коммит, куда смотрел плавающий тег (`v3.9.1`,
+  `v0.24.0`), а не на свежий патч: поведение CI не меняется. Обновление пинов
+  — dependabot (`github-actions` уже настроен).
 
 - **Инструкции агентов — в `system`, данные инцидента — в user-сообщении.**
   `BaseAgent.ask` слал одним user-сообщением и «Role/Task», и логи пода,
@@ -194,8 +199,6 @@ All notable changes to this project are documented in this file.
   `prompt_guard`), а снятие двусмысленности. Записи golden-replay не
   перезаписывались: ключ считается по склейке system + user и совпадает с
   ключом прежнего промпта.
-
-### Безопасность
 
 - **Запись в кластер — только у отдельного процесса copilot-executor.**
   api, worker и beat работали под одним SA `sre-ai`, и write-роль,
@@ -214,6 +217,19 @@ All notable changes to this project are documented in this file.
   путь кода их не вызывал. `deploy.sh` поднимает executor первым и
   предупреждает, если у `sre-ai` нашлось право patch. Default
   `EXECUTOR_DISPATCH=inline` — docker-compose и тесты без изменений.
+
+### Что изменится для оператора
+
+- Миграция `20260924_0100` создаёт пустую таблицу `kg_remediation_attempts`,
+  её нужно применить до выката кода. `deploy.sh` и TeamCity-билд
+  `SreAiCopilotBuildAndDeploy` (шаг Migrations, wo/teamcity!171) делают это сами.
+- Новый deployment `copilot-executor` под SA `sre-ai-executor`, единственный с
+  правом записи в кластер. Первый раз его создаёт `deploy.sh`, дальше TeamCity
+  обновляет его вместе с остальными. Роль на запись ни к кому не привязана:
+  executor по-прежнему выключен (`EXECUTOR_ENABLED=false`).
+- api и worker ставят apply и dry-run в очередь `executor`
+  (`EXECUTOR_DISPATCH=queue`). Откат —
+  `kubectl -n sre-ai set env deploy/sre-ai-api deploy/copilot-worker EXECUTOR_DISPATCH=inline`.
 
 ## [1.0.18] — 2026-09-23 — Чьи стенды на ноде и граница доверия вебхука
 
