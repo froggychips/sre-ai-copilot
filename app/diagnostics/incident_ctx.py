@@ -64,6 +64,10 @@ def _extract_deploys_from_tc(tc_ctx: Optional[Dict[str, Any]]) -> List[Dict[str,
 
 
 
+#: Ключ ctx со списком CollectorResult-ов, собранных при построении ctx.
+#: Правила его не читают; pipeline забирает список до DiagnosticEngine.
+COLLECTOR_RESULTS_KEY = "collector_results"
+
 _UPSTREAM_ALERTS = Collector(
     name="upstream_alerts",
     ctx_fields=("upstream_alerts",),
@@ -104,6 +108,10 @@ def build_diagnostics_ctx(
     # Known Unknowns (контракт app/context/collector.py): сюда же pipeline
     # дописывает статусы своих сборщиков (k8s, VM) после enrichment-а.
     source_status: Dict[str, str] = {}
+    # Прогоны сборщиков этого ctx — pipeline забирает их (pop) в свой
+    # collector_results до правил: покрытие источников в analysis иначе
+    # теряло бы соседние алерты.
+    collector_results: List[Any] = []
     if kg_session is not None and incident.namespace and labels.get("service"):
         if incident_starts_at is not None:
             # Граф недоступен / повреждён — не валим pipeline: None + причина
@@ -118,6 +126,7 @@ def build_diagnostics_ctx(
             )
             merge_source_status(source_status, res)
             upstream_alerts = res.data if res.ok else None
+            collector_results.append(res)
 
     return {
         "incident": incident.model_dump(),
@@ -137,4 +146,5 @@ def build_diagnostics_ctx(
         "upstream_alerts": upstream_alerts,
         "incident_starts_at": incident_starts_at,
         "source_status": source_status,
+        COLLECTOR_RESULTS_KEY: collector_results,
     }

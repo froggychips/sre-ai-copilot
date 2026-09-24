@@ -36,7 +36,7 @@ from app.config import settings
 from app.context.jira_client import JiraClient, build_jira_context
 from app.context.collector import (Collector, CollectorResult, Outcome,
                                    SourceStatus, default_classify,
-                                   merge_source_status)
+                                   merge_source_status, summarize_coverage)
 from app.context.k8s_facts import K8sFacts, K8sSnapshot
 from app.context.vm_client import (ClusterHealth, VMClient,
                                    valid_promql_label)
@@ -48,7 +48,8 @@ from app.database import IncidentRecord
 from app.agents.models.hypothesis import Hypothesis, HypothesisSet
 from app.diagnostics import default_engine as diag_engine
 from app.diagnostics.facts import Fact, FactStore
-from app.diagnostics.incident_ctx import build_diagnostics_ctx
+from app.diagnostics.incident_ctx import (COLLECTOR_RESULTS_KEY,
+                                          build_diagnostics_ctx)
 from app.knowledge_graph.auto_populator import populate_from_incident
 from app.knowledge_graph.schema import NODE_KIND_SERVICE, Deployment, Service
 from app.models.incident import Incident
@@ -374,6 +375,10 @@ class IncidentPipeline:
         # Прогоны сборщиков stage_diagnose (статус/provenance/длительность) —
         # из них выведен diag_ctx["source_status"].
         self.collector_results: List[CollectorResult] = []
+        # Компактные сводки сборщиков из checkpoint-а: при resume после
+        # ретрая stage_diagnose не перезапускается, и без них покрытие
+        # источников в analysis пропало бы.
+        self._restored_collectors: List[Dict[str, Any]] = []
         self.similar_past: List[dict] = []
         self.is_recurrence: bool = False
         self.flap_count: int = incident_data.get("flap_count", 0)
@@ -486,6 +491,7 @@ class IncidentPipeline:
                 ),
                 "playbook_match": self.playbook_match,
                 "traces": self.traces,
+                "collectors": self._collector_summaries(),
             }
             self.record.analysis = {
                 **(self.record.analysis or {}),
@@ -527,6 +533,11 @@ class IncidentPipeline:
                 self.statics_check_context = cp.get("statics_check_context")
                 self.deploy_correlation = cp.get("deploy_correlation")
                 self.team_owner = cp.get("team_owner")
+                restored = cp.get("collectors")
+                self._restored_collectors = (
+                    [c for c in restored if isinstance(c, dict)]
+                    if isinstance(restored, list) else []
+                )
                 if self.incident is not None and self.incident.teamcity_context is None:
                     self.incident.teamcity_context = cp.get("teamcity_context")
             if "critique" in completed:
@@ -613,6 +624,9 @@ class IncidentPipeline:
                 analyzer_summary=self.analysis,
                 kg_session=self.db,
             )
+            # source_status от этих прогонов уже в ctx; сами прогоны нужны
+            # только для покрытия источников в analysis.
+            self.collector_results.extend(diag_ctx.pop(COLLECTOR_RESULTS_KEY, None) or [])
             await asyncio.gather(
                 self._enrich_k8s(diag_ctx),
                 self._enrich_vm(diag_ctx),
@@ -852,6 +866,21 @@ class IncidentPipeline:
                 "TC_ENRICHMENT_FAILED",
                 {"incident_id": self.incident_id, "error": type(e).__name__},
             )
+
+    def _collector_summaries(self) -> List[Dict[str, Any]]:
+        """Компактные сводки сборщиков: восстановленные + этого прогона."""
+        return self._restored_collectors + [
+            r.to_compact_dict() for r in self.collector_results
+        ]
+
+    def _source_coverage(self) -> Dict[str, Any]:
+        """Покрытие источников для analysis: кто опрошен, с каким итогом.
+
+        Рядом с `source_status` (он только про пробелы и читается правилами)
+        — чтобы в аудите было видно и «опрошено, пусто», и сколько длился
+        каждый сборщик.
+        """
+        return summarize_coverage(self._collector_summaries())
 
     def _record_collector(self, diag_ctx: dict, result: CollectorResult) -> None:
         """Запомнить прогон сборщика и вывести из него source_status.
@@ -1359,6 +1388,7 @@ class IncidentPipeline:
                 ),
                 "executor_result": self.executor_result,
                 "playbook_match": self.playbook_match,
+                "source_coverage": self._source_coverage(),
             }
             merged_analysis = {**(record.analysis or {}), **fresh_analysis}
             # Служебные ключи прошлых попыток зачищаем: прогон завершён.
@@ -1571,6 +1601,7 @@ class IncidentPipeline:
                 if self.fact_store is not None
                 else []
             ),
+            "source_coverage": self._source_coverage(),
         }
         merged.pop(_CHECKPOINT_KEY, None)
         self.record.analysis = merged
