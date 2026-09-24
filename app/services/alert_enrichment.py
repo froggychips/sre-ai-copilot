@@ -853,6 +853,69 @@ def _detect_gen_mismatch_noise(
     return ready >= 1 and ready == desired
 
 
+GENERATION_CHURN_NOISE_KIND = "controller_lag_rancher_churn"
+
+
+def classify_generation_churn(
+    state: Optional[Dict[str, Any]],
+    *,
+    background_managers: List[str],
+    quiet_minutes: float,
+    now: Optional[datetime] = None,
+) -> bool:
+    """True, если GenerationMismatch — churn фонового писателя, а не накат.
+
+    Путь /store (сквады) не делает enrichment и `replicas_ready_desired` не
+    видит, поэтому health-gate `_detect_gen_mismatch_noise` там не работал:
+    за сутки 533 таких инцидента в squad-* без флага noise (замер 24.09.2026).
+    Здесь критерий строже, по живому Deployment-у (fetch_deployment_rollout_state):
+
+      * наката нет: Progressing=NewReplicaSetAvailable, и последний прогресс
+        старше `quiet_minutes`; все реплики обновлены и готовы (ready ==
+        updated == desired >= 1, unavailable == 0);
+      * spec последним писал фоновый контроллер: самая свежая запись
+        managedFields вне subresource=status — от менеджера из
+        `background_managers` (Rancher дописывает publicEndpoints раз в
+        минуту, и каждая запись бьёт generation).
+
+    Любая неоднозначность (нет снимка, нет времени, нет писателей, накат
+    идёт или упал по ProgressDeadlineExceeded) — False: алерт остаётся
+    инцидентом. Лучше лишний инцидент, чем спрятанный зависший накат.
+    """
+    if not state or not background_managers:
+        return False
+    desired = state.get("desired") or 0
+    if desired < 1:
+        return False
+    if not (
+        state.get("ready") == desired
+        and state.get("updated") == desired
+        and not state.get("unavailable")
+    ):
+        return False
+    if state.get("progressing_reason") != "NewReplicaSetAvailable":
+        return False
+    now = now or datetime.now(timezone.utc)
+    progressed_at = state.get("progressing_updated_at")
+    if not isinstance(progressed_at, datetime):
+        return False
+    if progressed_at.tzinfo is None:
+        progressed_at = progressed_at.replace(tzinfo=timezone.utc)
+    if (now - progressed_at).total_seconds() < quiet_minutes * 60:
+        return False
+    spec_writers = [
+        w for w in (state.get("writers") or [])
+        if w.get("subresource") != "status" and isinstance(w.get("time"), datetime)
+    ]
+    if not spec_writers:
+        return False
+    latest = max(
+        spec_writers,
+        key=lambda w: w["time"] if w["time"].tzinfo else w["time"].replace(tzinfo=timezone.utc),
+    )
+    return latest.get("manager") in set(background_managers)
+
+
 async def enrich_alert_async(db: Session, incident: Incident) -> EnrichedContext:
     """Async-безопасная обёртка над enrich_alert для вызова из event loop.
 

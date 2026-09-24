@@ -235,3 +235,61 @@ def test_store_endpoint_persists_batch_truncation(app_client):
         assert (row.raw or {}).get("batch_truncated_alerts") == 12
     finally:
         db.close()
+
+
+def _gen_mismatch_payload(fingerprint: str, deployment: str) -> dict:
+    return {
+        "version": "4",
+        "groupKey": f"store-gen-{fingerprint}",
+        "status": "firing",
+        "receiver": "sre-copilot",
+        "groupLabels": {},
+        "commonLabels": {},
+        "commonAnnotations": {},
+        "externalURL": "https://alertmanager.local",
+        "alerts": [{
+            "status": "firing",
+            "labels": {
+                "alertname": "KubeDeploymentGenerationMismatch",
+                "severity": "warning",
+                "namespace": "squad-18-shared",
+                "service": "vm-kube-state-metrics",
+                "deployment": deployment,
+            },
+            "annotations": {"description": f"Deployment generation for squad-18-shared/{deployment} does not match"},
+            "startsAt": "2026-09-24T09:00:00Z",
+            "endsAt": None,
+            "generatorURL": "https://prometheus.local",
+            "fingerprint": fingerprint,
+        }],
+    }
+
+
+@pytest.mark.parametrize("churn, expected_noise", [(True, True), (False, False)])
+def test_store_marks_generation_churn_incident_as_noise(app_client, churn, expected_noise):
+    """Rancher-churn GenerationMismatch в /store → инцидент noise; реальный — нет."""
+    from app.database import SessionLocal
+    from app.knowledge_graph.schema import AlertEvent, KGIncident
+
+    fingerprint = f"store-gen-{uuid.uuid4().hex[:12]}"
+    deployment = f"svc-{uuid.uuid4().hex[:6]}"
+    target = {("squad-18-shared", deployment)} if churn else set()
+
+    async def fake_targets(_alerts):
+        return target
+
+    with patch("app.api.webhooks._generation_churn_targets", side_effect=fake_targets):
+        resp = _post_signed(app_client, "/webhooks/alertmanager/store",
+                            _gen_mismatch_payload(fingerprint, deployment))
+    assert resp.status_code == 202, resp.text
+
+    db = SessionLocal()
+    try:
+        key = db.query(AlertEvent.incident_id).filter(AlertEvent.fingerprint == fingerprint).scalar()
+        assert key, "алерт должен лечь в kg_alerts с инцидентом"
+        inc = db.query(KGIncident).filter(KGIncident.incident_key == key).one()
+        assert bool(inc.noise) is expected_noise
+        if churn:
+            assert "controller_lag_rancher_churn" in (inc.extras or {})["noise_fingerprints"][fingerprint]
+    finally:
+        db.close()

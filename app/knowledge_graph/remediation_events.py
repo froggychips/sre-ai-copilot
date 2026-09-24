@@ -87,11 +87,17 @@ def open_incident_for_namespaces(
         KGIncident.opened_at <= at_n,
     )
     rows = q.order_by(KGIncident.opened_at.desc()).limit(20).all()
+    # Шумовой инцидент — только если другого нет: иначе действие медика
+    # цеплялось к мигающему GenerationMismatch-у (Rancher churn, ~500 в сутки
+    # в squad-*), а не к тому, что он на самом деле чинил.
+    fallback: Optional[KGIncident] = None
     for inc in rows:
         resolved = cast(Optional[datetime], inc.resolved_at)
         if inc.status == "open" or (resolved is not None and ensure_naive(resolved) >= at_n):
-            return inc
-    return None
+            if not inc.noise:
+                return inc
+            fallback = fallback or inc
+    return fallback
 
 
 def record_external_remediation(db: Session, payload: RemediationEventIn) -> Dict[str, Any]:

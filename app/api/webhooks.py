@@ -71,6 +71,45 @@ def _is_self_noise(alert: AlertManagerAlert) -> bool:
     return sev == "info" and service == "monitoring"
 
 
+async def _generation_churn_targets(alerts: Iterable[AlertManagerAlert]) -> set:
+    """(namespace, deployment) firing-GenerationMismatch-ей, где наката нет.
+
+    Для пути /store: enrichment-а там нет, поэтому health-gate enrich-пути
+    сюда не доходит. Живые Deployment-ы читаем параллельно (по потоку на
+    объект, дедлайн LIVE_K8S_TIMEOUT_SEC) ДО записи в БД: SQLAlchemy-сессию
+    потоки не трогают. Ошибка/таймаут у объекта → его просто нет в ответе,
+    инцидент остаётся громким.
+    """
+    import asyncio
+
+    if not getattr(settings, "GEN_MISMATCH_STORE_NOISE_ENABLED", True):
+        return set()
+    keys = sorted({
+        (str(a.labels["namespace"]), str(a.labels["deployment"]))
+        for a in alerts
+        if a.status == "firing"
+        and a.labels.get("alertname") == "KubeDeploymentGenerationMismatch"
+        and a.labels.get("namespace") and a.labels.get("deployment")
+    })
+    if not keys:
+        return set()
+    from app.context.deployments import fetch_deployment_rollout_state
+    from app.services.alert_enrichment import classify_generation_churn
+
+    timeout = getattr(settings, "LIVE_K8S_TIMEOUT_SEC", 3.0)
+    states = await asyncio.gather(*(
+        asyncio.to_thread(fetch_deployment_rollout_state, ns, name, timeout_sec=timeout)
+        for ns, name in keys
+    ), return_exceptions=True)
+    managers = list(getattr(settings, "GEN_MISMATCH_BACKGROUND_MANAGERS", ["rancher"]))
+    quiet = float(getattr(settings, "GEN_MISMATCH_QUIET_MINUTES", 30.0))
+    return {
+        key for key, state in zip(keys, states)
+        if not isinstance(state, BaseException)
+        and classify_generation_churn(state, background_managers=managers, quiet_minutes=quiet)
+    }
+
+
 def _mark_incidents_noise(db, incidents, kinds) -> None:
     """Пометить инциденты алертов шумовыми. Best-effort: пометка не важнее
     отправки embed'а, любая ошибка — warning и дальше."""
@@ -619,6 +658,7 @@ async def alertmanager_webhook_store_only(
     # A3: allowlist filter — pure-noise alerts даже в KG-store не пишем,
     # чтобы recurrence/incidents_on метрики не были загажены Watchdog'ом.
     payload_alerts, suppressed_count = _filter_suppressed(payload.alerts)
+    churn = await _generation_churn_targets(payload_alerts)
 
     stored = []
     for alert in payload_alerts:
@@ -641,6 +681,13 @@ async def alertmanager_webhook_store_only(
         try:
             stats = populate_from_incident(db, incident)
             stored.append({"incident_id": incident.incident_id, "result": "stored", **stats})
+            if (alert.labels.get("namespace"), alert.labels.get("deployment")) in churn:
+                from app.services.alert_enrichment import GENERATION_CHURN_NOISE_KIND
+                ALERTS_SUPPRESSED.labels(
+                    reason=GENERATION_CHURN_NOISE_KIND,
+                    alertname=alert.labels.get("alertname", ""),
+                ).inc()
+                _mark_incidents_noise(db, [incident], [GENERATION_CHURN_NOISE_KIND])
         except Exception as e:
             # Откатываем failed-транзакцию, иначе session остаётся в
             # сорванном состоянии и финальный db.commit() уронит весь batch.
