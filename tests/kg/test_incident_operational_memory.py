@@ -241,3 +241,32 @@ def test_unknown_attempt_is_visible_and_not_counted_as_applied(db):
     assert ev["details"]["error"] == "stale_claim"
     assert tl["memory"]["actions"] == 0
     assert tl["memory"]["outcome"] == "action_state_unknown"
+
+
+def test_evidence_event_carries_source_coverage_when_present(db):
+    inc = _incident(db)
+    a = _analysis(with_action=False, with_verification=False)
+    a["source_coverage"] = {
+        "collectors": [
+            {"name": "k8s_snapshot", "status": "success", "ctx_fields": ["k8s_events"]},
+            {"name": "upstream_alerts", "status": "failed", "ctx_fields": ["upstream_alerts"],
+             "reason": "kg_alerts недоступен: OperationalError"},
+        ],
+        "fields": {}, "problems": 1,
+    }
+    db.add(IncidentRecord(incident_id=FP, status="COMPLETED", data={}, analysis=a,
+                          created_at=T0 + 3 * M))
+    db.commit()
+    ev = next(e for e in build_timeline(db, inc, now=T0 + 30 * M)["events"] if e["kind"] == "evidence")
+    assert ev["details"]["sources"] == {
+        "polled": 2,
+        "problems": [{"name": "upstream_alerts", "status": "failed",
+                      "reason": "kg_alerts недоступен: OperationalError"}],
+    }
+
+
+def test_evidence_event_without_coverage_says_none_not_zero(db):
+    # Записи до появления покрытия: None, а не «опрошено 0».
+    inc = _seed_memory(db)
+    ev = next(e for e in build_timeline(db, inc, now=T0 + 30 * M)["events"] if e["kind"] == "evidence")
+    assert ev["details"]["sources"] is None

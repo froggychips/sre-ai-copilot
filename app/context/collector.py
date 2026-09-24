@@ -39,8 +39,8 @@ from __future__ import annotations
 import asyncio
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import (Any, Awaitable, Callable, Dict, MutableMapping, Optional,
-                    Tuple)
+from typing import (Any, Awaitable, Callable, Dict, Mapping, MutableMapping,
+                    Optional, Sequence, Tuple)
 
 import structlog
 
@@ -54,6 +54,7 @@ __all__ = [
     "SourceStatus",
     "default_classify",
     "merge_source_status",
+    "summarize_coverage",
 ]
 
 logger = structlog.get_logger()
@@ -133,6 +134,17 @@ class CollectorResult:
             "reason": self.reason,
         }
 
+    def to_compact_dict(self) -> Dict[str, Any]:
+        """Сводка для `analysis` инцидента: без `data` и без меток времени.
+
+        Строка инцидента живёт долго и читается timeline-ом и отчётами —
+        отметки начала/конца там лишние, длительности достаточно.
+        """
+        full = self.to_dict()
+        for key in ("started_at", "finished_at"):
+            full.pop(key, None)
+        return full
+
 
 def merge_source_status(
     dst: MutableMapping[str, str],
@@ -151,6 +163,43 @@ def merge_source_status(
             dst[f] = why
         else:
             dst.setdefault(f, why)
+
+
+_PROBLEM_VALUES = frozenset(s.value for s in PROBLEM_STATUSES)
+
+
+def summarize_coverage(collectors: Sequence[Mapping[str, Any]]) -> Dict[str, Any]:
+    """Покрытие источников из компактных сводок сборщиков (`to_compact_dict`).
+
+    `fields` — поле ctx → {status, collector, reason}. Проблема «липкая», как
+    в `source_status`: успех соседнего сборщика по тому же полю не отменяет
+    «его не удалось наполнить» — иначе покрытие показало бы ✓ там, где
+    правило ответило ?. Без проблем побеждает последний прогон.
+
+    Это НЕ замена `source_status`: тот хранит только пробелы (и читается
+    правилами), здесь — все опрошенные поля, в том числе «опрошено, пусто».
+    """
+    fields: Dict[str, Dict[str, Any]] = {}
+    problems = 0
+    for c in collectors:
+        status = str(c.get("status") or "")
+        is_problem = status in _PROBLEM_VALUES
+        if is_problem:
+            problems += 1
+        for f in c.get("ctx_fields") or ():
+            prev = fields.get(f)
+            if prev is not None and prev["status"] in _PROBLEM_VALUES and not is_problem:
+                continue
+            fields[f] = {
+                "status": status,
+                "collector": c.get("name"),
+                "reason": c.get("reason") if is_problem else None,
+            }
+    return {
+        "collectors": [dict(c) for c in collectors],
+        "fields": fields,
+        "problems": problems,
+    }
 
 
 def default_classify(data: Any) -> Outcome:

@@ -333,6 +333,24 @@ def _naive(dt: Any) -> Optional[datetime]:
     return ensure_naive(dt)
 
 
+def _coverage_details(coverage: Any) -> Optional[Dict[str, Any]]:
+    """Покрытие источников из analysis.source_coverage — кратко для timeline.
+
+    Записи до появления покрытия его не несут — тогда None, а не «0 из 0».
+    """
+    if not isinstance(coverage, dict):
+        return None
+    collectors = [c for c in (coverage.get("collectors") or []) if isinstance(c, dict)]
+    return {
+        "polled": len(collectors),
+        "problems": [
+            {"name": c.get("name"), "status": c.get("status"), "reason": c.get("reason")}
+            for c in collectors
+            if c.get("status") in ("unavailable", "failed", "invalid")
+        ][:5],
+    }
+
+
 def _operational_memory(db: Session, incident: KGIncident):
     """События «что копилот сделал» + сводка + Known Unknown, если разбора не было."""
     from app.database import IncidentRecord
@@ -390,6 +408,7 @@ def _operational_memory(db: Session, incident: KGIncident):
                               for f in found[:5]],
                     "unknown": [{"kind": f.get("kind"), "reason": f.get("unknown_reason")}
                                 for f in facts if f.get("verdict") == "unknown"][:5],
+                    "sources": _coverage_details(analysis.get("source_coverage")),
                 },
             ))
 
