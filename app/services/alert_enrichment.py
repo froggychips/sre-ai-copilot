@@ -21,6 +21,8 @@ import structlog
 from sqlalchemy.orm import Session
 
 from app.config import settings
+from app.context.kg_incident_context import (build_kg_context,
+                                             service_pod_events)
 from app.context.collector import (Collector, CollectorResult, Outcome,
                                    SourceStatus, merge_source_status)
 from app.diagnostics.facts import Fact
@@ -294,6 +296,10 @@ class EnrichedContext:
     outgoing_deps: List[Dict[str, Any]] = field(default_factory=list)
     # Pod-events (kg_pod_events) — k8s diagnostic signal в окне инцидента.
     pod_events: List[Dict[str, Any]] = field(default_factory=list)
+    # Контекст инцидента из графа (app/context/kg_incident_context.py) — тот
+    # же, что видят правила и модель пайплайна; события подов эмбеда берутся
+    # из него, а не отдельным запросом.
+    kg_context: Optional[Dict[str, Any]] = None
     # UX polish (on-call feedback 10:38): конкретный pod-name, последний
     # containerStatus.reason, current ready/desired — чтобы on-call видел
     # «какой pod, что с ним, сколько реплик жилых».
@@ -1226,11 +1232,27 @@ def enrich_alert(db: Session, incident: Incident) -> EnrichedContext:
     # как причины текущего alert-а). Если пусто — расширяем до 7д fallback,
     # чтобы embed для длительных хроник всё равно показывал последние k8s
     # события. effective_at (точка роста #1) — same adapt для хроник.
+    # Контекст графа на СЕЙЧАС: эмбед — живой вид стенда, а не реконструкция.
+    # Сбой сборки не роняет enrichment и не пишет source_status полей эмбеда
+    # (у них свои сборщики): результат только в покрытии источников.
+    kg_res = build_kg_context(
+        db, namespace=namespace, service=service,
+        alertname=(incident.labels or {}).get("alertname"), as_of=now,
+    )
+    if kg_res is not None:
+        ctx.collector_results.append(kg_res)
+        ctx.kg_context = kg_res.data if isinstance(kg_res.data, dict) else None
+
     def _collect_pod_events() -> Any:
-        events = recent_pod_events_for(
-            db, namespace, service, around=effective_at,
+        events = service_pod_events(
+            ctx.kg_context, namespace, service, around=effective_at,
             window_minutes=60, limit=5,
         )
+        if events is None:
+            events = recent_pod_events_for(
+                db, namespace, service, around=effective_at,
+                window_minutes=60, limit=5,
+            )
         if not events:
             events = recent_pod_events_for(
                 db, namespace, service, around=effective_at,

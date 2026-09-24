@@ -389,6 +389,13 @@ Drift-test `tests/test_contract_drift.py` исключает эти kinds из �
 прогона инцидент по любому namespace стенда). Уникальность
 `(actor, run_id, namespace)` — повтор идемпотентен.
 
+`observations` (JSON, `medic_obs/v1`, 2026-09-24) — что робот ВИДЕЛ на стенде
+(состояния подов, коды выхода, dirty-миграция, отсутствующие ключи Secret),
+извлечённое при приёме белым списком шаблонов из `summary`/`applied`/
+`manual`/`gaps`; `root_cause`/`next_action` в него не попадают. Читает сборщик
+контекста инцидента (`app/context/kg_incident_context.py`) как источник
+`squad-medic`; у событий до поля — тот же экстрактор на чтении.
+
 Пишется только через `POST /webhooks/remediation` (HMAC над `ts.body`,
 fail-closed); читается `incident_timeline` (kind `remediation.external`,
 epistemic observed) и MCP-тулами. Отличие от `kg_remediation_decisions`: там

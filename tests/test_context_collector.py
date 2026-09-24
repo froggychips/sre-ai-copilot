@@ -296,6 +296,9 @@ def test_diagnostics_ctx_upstream_alerts_status(monkeypatch, raises):
         return []
 
     monkeypatch.setattr(incident_ctx, "nearby_alerts", fake_nearby)
+    # Контекст графа — отдельный сборщик со своими тестами
+    # (tests/test_kg_incident_context.py); здесь только соседние алерты.
+    monkeypatch.setattr(incident_ctx, "build_kg_context", lambda *_a, **_kw: None)
     inc = Incident(
         incident_id="fp-collector", severity="warning", status="firing",
         summary="test", namespace="squad-1",

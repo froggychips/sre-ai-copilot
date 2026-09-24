@@ -13,6 +13,8 @@
   * `migration_error`— явная ошибка мигратора («migration failed», alembic
                        CommandError / «Can't locate revision»).
   * `migrate_job`    — Job мигратора в BackoffLimitExceeded/DeadlineExceeded
+                       (событие) или с failed_count>0 без успеха в графе
+                       (`kg_jobs`, kg_k8s_jobs на момент инцидента)
                        или его под не стартовал из-за образа (ImagePullBackOff
                        у `*migrat*`: тег без образа мигратора — отдельный
                        класс image_pull, здесь только кросс-ссылка
@@ -105,13 +107,32 @@ def _migrate_job_signal(events: List[Dict[str, Any]]) -> Optional[Dict[str, Any]
     return None
 
 
+def _kg_migrate_job_signal(jobs: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """Упавший Job мигратора из графа (kg_k8s_jobs на момент инцидента).
+
+    Живой API к разбору его часто уже не показывает: Job пересоздан следующим
+    деплоем или снесён ttl, а граф помнит failed_count. Строка, обновлённая
+    уже после инцидента (`state_after_as_of`), наблюдением на его момент не
+    считается.
+    """
+    for j in jobs:
+        if not isinstance(j, dict) or not j.get("migrate") or j.get("state_after_as_of"):
+            continue
+        if (j.get("failed") or 0) > 0 and not (j.get("succeeded") or 0):
+            reason = "Failed"
+            if j.get("exit_code") is not None:
+                reason += f" exit_code={j['exit_code']}"
+            return {"job": str(j.get("name") or ""), "reason": reason}
+    return None
+
+
 def _recent_deploy_present(ctx: Dict[str, Any]) -> bool:
     return bool(ctx.get("recent_deployments"))
 
 
 class MigrationFailedRule(Rule):
     name = "MigrationFailedRule"
-    sources = ("k8s_events", "k8s_summary", "logs_summary")
+    sources = ("k8s_events", "k8s_summary", "logs_summary", "kg_jobs")
 
     def evaluate(self, ctx: Dict[str, Any]) -> List[Fact]:
         text = self.text_haystack(ctx)
@@ -129,7 +150,7 @@ class MigrationFailedRule(Rule):
             if versions:
                 evidence["version"] = versions[0]
 
-        job = _migrate_job_signal(events)
+        job = _migrate_job_signal(events) or _kg_migrate_job_signal(ctx.get("kg_jobs") or [])
         if job:
             signals.append("migrate_job")
             evidence["job"] = job["job"]
@@ -206,5 +227,6 @@ class MigrationFailedRule(Rule):
     @staticmethod
     def _scanned_anything(ctx: Dict[str, Any], events: List[Dict[str, Any]]) -> bool:
         """Был ли вообще наблюдаемый материал, кроме самого алерта."""
-        return bool(ctx.get("logs_summary") or ctx.get("k8s_summary") or events)
+        return bool(ctx.get("logs_summary") or ctx.get("k8s_summary") or events
+                    or ctx.get("kg_jobs"))
 

@@ -62,7 +62,9 @@ def test_dataset_inside_repo_is_refused(tmp_path):
     assert lrd._guard_out_dir(tmp_path / "ok").is_dir()
 
 
-# --- наблюдения медика ------------------------------------------------------
+# --- наблюдения медика (экстрактор живёт в app, наблюдения — в графе) -------
+
+from app.context import medic_observations as mo  # noqa: E402
 
 # Обезличенная копия формы реального события: наблюдения вперемешку с
 # выводами. Выводы («retention снёс», «из-за», «вероятно») в вход модели
@@ -92,7 +94,7 @@ _MEDIC_EVENT = {
 
 
 def test_medic_observations_are_templated_whitelist():
-    facts = lrd.extract_medic_observations(_MEDIC_EVENT)
+    facts = mo.extract_medic_observations(_MEDIC_EVENT)
     text = "\n".join(facts)
     assert "состояние подов: CreateContainerConfigError, ImagePullBackOff" in facts
     assert "рестартов контейнера: до 88" in facts
@@ -109,26 +111,15 @@ def test_medic_observations_are_templated_whitelist():
 def test_root_cause_and_next_action_are_never_read():
     only_answer = {"root_cause": "поды в CrashLoopBackOff, exit code 137, OOMKilled",
                    "next_action": "ImagePullBackOff dirty BOT_KEY"}
-    assert lrd.extract_medic_observations(only_answer) == []
+    assert mo.extract_medic_observations(only_answer) == []
 
 
 def test_no_root_cause_ngram_leaks_into_facts():
-    facts = lrd.extract_medic_observations(_MEDIC_EVENT)
+    facts = mo.extract_medic_observations(_MEDIC_EVENT)
     assert lrd.answer_leak(facts, _MEDIC_EVENT["root_cause"]) == []
     # сама страховка работает: подсунутый кусок вывода ловится
     assert lrd.answer_leak(facts + ["теги которых нет в реестре"],
                            _MEDIC_EVENT["root_cause"])
-
-
-def test_observations_feed_rules_as_partial_sources():
-    facts = ["состояние подов: CrashLoopBackOff, OOMKilled", "код выхода контейнера: 137"]
-    ctx = lrd.apply_medic_observations({"source_status": {}}, facts)
-    assert {e["reason"] for e in ctx["k8s_events"]} == {"BackOff", "OOMKilled"}
-    assert ctx["source_status"]["k8s_pod_state"].startswith("partial")
-    assert "код выхода контейнера: 137" in ctx["k8s_summary"]
-    summary = lrd.case_summary("Alert in ns", facts)
-    assert "без выводов" in summary and "- код выхода контейнера: 137" in summary
-    assert lrd.case_summary("Alert in ns", []) == "Alert in ns"
 
 
 def _run_args(tmp_path, context="auto"):
@@ -136,54 +127,49 @@ def _run_args(tmp_path, context="auto"):
     return argparse.Namespace(out=str(tmp_path), ids="", limit=100, context=context)
 
 
-def test_auto_runs_both_modes_on_the_same_cases(tmp_path, monkeypatch):
-    import asyncio
-    import json
-    (tmp_path / "cases.jsonl").write_text(
-        json.dumps({"event_id": 1, "observed_medic": ["состояние подов: OOMKilled"]}) + "\n"
-        + json.dumps({"event_id": 2, "observed_medic": []}) + "\n")
-    seen = []
-
-    async def fake(case, context):
-        seen.append((case["event_id"], context))
-        return {"event_id": case["event_id"], "context": context}
-
-    monkeypatch.setattr(lrd, "_run_case", fake)
-    asyncio.run(lrd._run_async(_run_args(tmp_path)))
-    assert sorted(seen) == [(1, "alert_only"), (1, "medic_observed"), (2, "alert_only")]
-    seen.clear()
-    asyncio.run(lrd._run_async(_run_args(tmp_path)))
-    assert seen == []  # повтор ничего не перегоняет
-
-
 def test_score_is_split_by_context():
     cases = [{"event_id": 1, "expected_primary": "image_missing"}]
     results = [
         {"event_id": 1, "best_cause": None, "ranked_causes": [], "latency_s": 20},
-        {"event_id": 1, "context": "medic_observed",
+        {"event_id": 1, "context": "kg",
          "best_cause": "ImagePullBackOff: tag not found in registry",
          "ranked_causes": ["ImagePullBackOff: tag not found in registry"], "latency_s": 600},
     ]
     s = lrd.score(cases, results)
     assert s["by_context"]["alert_only"]["abstention_rate"] == 1.0
-    assert s["by_context"]["medic_observed"]["top1"] == 1.0
+    assert s["by_context"]["kg"]["top1"] == 1.0
     assert s["cases_run"] == 2
 
-# --- ctx кейса по режимам входа ------------------------------------------------
+# --- ctx кейса: тот же build_diagnostics_ctx, что у прода ------------------------
 
-_KG_CASE = {
-    "event_id": 7, "alert_name": "KubeDeploymentReplicasMismatch", "namespace": "squad-alpha",
-    "service_name": "bravo-service", "severity": "warning", "opened_at": "2026-09-20T10:00:00",
-    "observed_medic": ["состояние подов: OOMKilled"],
-    "kg_context": {
-        "pod_events": [{"pod": "bravo-service-1", "type": "Warning", "reason": "BackOff",
-                        "message": "Back-off restarting failed container", "count": 12,
-                        "last_seen": "2026-09-20T09:55:00"}],
-        "deployments": [{"service": "bravo-service", "status": "success",
-                         "started_at": "2026-09-20T09:40:00", "finished_at": "2026-09-20T09:45:00"}],
-        "alerts": [],
-    },
-}
+_AS_OF = "2026-09-20T10:00:00+00:00"
+
+
+def _kgc(pod_events=(), code=(), statics=0, medic=(), jobs=()):
+    """Контекст графа в той форме, в какой его хранит кейс (JSON сборщика)."""
+    from app.context.kg_incident_context import SCHEMA, select_targets
+
+    kgc = {"schema": SCHEMA, "as_of": _AS_OF, "namespace": "squad-alpha-shared",
+           "ns_scope": "squad-alpha-%", "namespaces": ["squad-alpha-shared"],
+           "pod_events": list(pod_events), "alerts": [],
+           "deployments": {"code": list(code), "rollouts": [], "statics_count": statics},
+           "jobs": list(jobs), "incident_history": [], "remediation_history": [],
+           "medic_observations": ([{"event_id": 7, "observed_at": _AS_OF,
+                                    "namespace": "squad-alpha-shared", "facts": list(medic)}]
+                                  if medic else []),
+           "logs": [], "sources": {}}
+    kgc["targets"] = select_targets(kgc)
+    return kgc
+
+
+_BACKOFF = {"namespace": "squad-alpha-shared", "pod": "bravo-service-7d9f8b6c5d-x2k4q",
+            "service": "bravo-service", "type": "Warning", "reason": "BackOff",
+            "message": "Back-off restarting failed container", "count": 12,
+            "first_seen": "2026-09-20T09:30:00+00:00", "last_seen": "2026-09-20T09:55:00+00:00"}
+_DEPLOY = {"namespace": "squad-alpha-shared", "service": "bravo-service", "kind": "code",
+           "status": "success", "buildtype_id": "Wo_Backend_BuildAndUpdate",
+           "started_at": "2026-09-20T09:40:00+00:00", "finished_at": "2026-09-20T09:45:00+00:00",
+           "attribution_scope": "service"}
 
 
 @pytest.fixture(autouse=True)
@@ -192,236 +178,167 @@ def _cli_backend(monkeypatch):
     monkeypatch.setenv("LLM_BACKEND", "claude_cli")
 
 
+def _kg_case():
+    return {
+        "event_id": 7, "alert_name": "KubeDeploymentReplicasMismatch",
+        "namespace": "squad-alpha-shared", "service_name": "bravo-service", "severity": "warning",
+        "opened_at": "2026-09-20T10:00:00", "started_at": _AS_OF,
+        "kg_context": _kgc([_BACKOFF], [_DEPLOY], medic=["состояние подов: OOMKilled"]),
+    }
+
+
 def test_available_modes_follow_case_inputs():
-    assert lrd.available_modes(_KG_CASE) == list(lrd.MODES)
+    assert lrd.available_modes(_kg_case()) == list(lrd.MODES)
     assert lrd.available_modes({"event_id": 1}) == ["alert_only"]
-    assert lrd.available_modes({"event_id": 1, "observed_medic": ["x"]}) == ["alert_only", "medic_observed"]
+    no_medic = dict(_kg_case(), kg_context=_kgc([_BACKOFF]))
+    assert lrd.available_modes(no_medic) == ["alert_only", "kg"]
 
 
 def test_alert_only_never_sees_graph_and_answers_unknown_not_absent():
-    ctx = lrd.build_case_ctx(_KG_CASE, "alert_only")
+    case = _kg_case()
+    ctx = lrd.build_case_ctx(case, "alert_only")
     assert not ctx.get("k8s_events") and not ctx.get("k8s_summary")
     assert ctx["source_status"]["k8s_events"].startswith(lrd.NOT_RECONSTRUCTED)
-    v = lrd.rule_facts(_KG_CASE, "alert_only")["by_verdict"]
+    v = lrd.rule_facts(case, "alert_only")["by_verdict"]
     # Без пометки источника пустое поле давало уверенное ✗ «OOM не было».
     assert "absent" not in v
     assert "oom_killed" in v["unknown"]
 
 
-def test_kg_events_reach_both_structured_and_text_rules():
-    ctx = lrd.build_case_ctx(_KG_CASE, "kg_reconstructed")
+def test_kg_mode_feeds_rules_like_prod():
+    case = _kg_case()
+    ctx = lrd.build_case_ctx(case, "kg")
     assert ctx["k8s_events"][0]["reason"] == "BackOff"
     assert ctx["recent_deployments"][0]["name"] == "bravo-service"
-    assert ctx["k8s_summary"].startswith("[kg_pod_events]")
-    assert ctx["source_status"]["k8s_events"].startswith("partial")
-    assert "crashloop" in lrd.rule_facts(_KG_CASE, "kg_reconstructed")["observed"]
-    # Режим kg_reconstructed наблюдений медика не видит.
-    assert "squad-medic" not in ctx["k8s_summary"]
-
-
-def test_kg_plus_medic_appends_not_overwrites():
-    ctx = lrd.build_case_ctx(_KG_CASE, "kg+medic")
-    assert [e["reason"] for e in ctx["k8s_events"]] == ["BackOff", "OOMKilled"]
     assert "[kg_pod_events]" in ctx["k8s_summary"] and "[squad-medic]" in ctx["k8s_summary"]
-    assert {"crashloop", "oom_killed"} <= set(lrd.rule_facts(_KG_CASE, "kg+medic")["observed"])
+    assert ctx["source_status"]["k8s_events"].startswith("partial")
+    assert {"crashloop", "oom_killed"} <= set(lrd.rule_facts(case, "kg")["observed"])
+
+
+def test_kg_no_medic_drops_only_the_medic_source():
+    case = _kg_case()
+    ctx = lrd.build_case_ctx(case, "kg_no_medic")
+    assert "squad-medic" not in (ctx.get("k8s_summary") or "")
+    assert [e["reason"] for e in ctx["k8s_events"]] == ["BackOff"]
+    assert "oom_killed" not in lrd.rule_facts(case, "kg_no_medic")["observed"]
+
+
+def test_case_prompt_is_the_pipeline_block():
+    from app.context.kg_incident_context import kg_context_prompt
+
+    case = _kg_case()
+    text = lrd.case_prompt(case, "kg")
+    assert kg_context_prompt(case["kg_context"]) in text
+    assert "[squad-medic]" in text
+    assert "[squad-medic]" not in lrd.case_prompt(case, "kg_no_medic")
+    assert lrd.case_prompt(case, "alert_only") == lrd._to_incident(case).summary
 
 
 def test_foreign_workload_events_never_become_text_facts():
-    case = dict(_KG_CASE, observed_medic=[], kg_context={
-        "pod_events": [{"pod": "charlie-worker-5f9c-x1", "type": "Warning", "reason": "OOMKilled",
-                        "message": "Container charlie was OOMKilled", "count": 3}],
-        "deployments": [], "alerts": []})
-    ctx = lrd.build_case_ctx(case, "kg_reconstructed")
+    foreign = dict(_BACKOFF, pod="charlie-worker-5f9c8d7b6c-x1k2m", service="charlie-worker",
+                   reason="OOMKilled", message="Container charlie was OOMKilled")
+    case = dict(_kg_case(), kg_context=_kgc([foreign]))
+    ctx = lrd.build_case_ctx(case, "kg")
     # В тексте чужого OOM нет, а структурированное событие несёт pod_name —
     # PodEventsRule видит, что оно у другого workload-а.
-    assert not ctx.get("k8s_summary")
-    assert ctx["k8s_events"][0]["pod_name"] == "charlie-worker-5f9c-x1"
-    assert "oom_killed" not in lrd.rule_facts(case, "kg_reconstructed")["observed"]
+    assert "OOMKilled" not in (ctx.get("k8s_summary") or "")
+    assert ctx["k8s_events"][0]["pod_name"] == foreign["pod"]
+    assert "oom_killed" not in lrd.rule_facts(case, "kg")["observed"]
 
 
 def test_snapshot_without_graph_rows_still_has_a_mode():
     case = {"event_id": 9, "context_snapshot": {"schema": "incident_ctx/v1",
                                                   "k8s_pod_state": {"x": 1}}}
-    assert "kg_reconstructed" in lrd.available_modes(case)
+    assert "kg" in lrd.available_modes(case)
     assert lrd.build_case_ctx(dict(case, alert_name="A", namespace="squad-alpha"),
-                              "kg_reconstructed")["k8s_pod_state"] == {"x": 1}
+                              "kg")["k8s_pod_state"] == {"x": 1}
 
 
-def test_statics_counter_never_becomes_recent_deploy():
-    # Статику SQL в строки деплоев не берёт, только счётчиком: «недавний
-    # деплой» по веерной раскатке статики был бы истиной почти всегда.
-    case = dict(_KG_CASE, observed_medic=[], kg_context={
-        "pod_events": [], "alerts": [], "deployments": [], "statics_rollouts": 12})
-    ctx = lrd.build_case_ctx(case, "kg_reconstructed")
+def test_statics_never_becomes_recent_deploy():
+    case = dict(_kg_case(), kg_context=_kgc(statics=12))
+    ctx = lrd.build_case_ctx(case, "kg")
     assert not ctx.get("recent_deployments")
     assert ctx["source_status"]["recent_deployments"].startswith(lrd.NOT_RECONSTRUCTED)
-    assert "статики" in ctx["description"]
-    assert "recent_deploy" not in lrd.rule_facts(case, "kg_reconstructed")["observed"]
+    assert "recent_deploy" not in lrd.rule_facts(case, "kg")["observed"]
 
 
 def test_unknown_mode_is_refused():
     with pytest.raises(ValueError):
-        lrd.build_case_ctx(_KG_CASE, "snapshot")
+        lrd.build_case_ctx(_kg_case(), "medic_observed")
 
 
 def test_auto_runs_every_available_mode(tmp_path, monkeypatch):
     import asyncio
     import json
-    (tmp_path / "cases.jsonl").write_text(json.dumps(_KG_CASE) + "\n")
+    (tmp_path / "cases.jsonl").write_text(json.dumps(_kg_case()) + "\n"
+                                          + json.dumps({"event_id": 2}) + "\n")
     seen = []
 
     async def fake(case, context):
-        seen.append(context)
+        seen.append((case["event_id"], context))
         return {"event_id": case["event_id"], "context": context}
 
     monkeypatch.setattr(lrd, "_run_case", fake)
     asyncio.run(lrd._run_async(_run_args(tmp_path)))
-    assert seen == list(lrd.MODES)
+    assert sorted(seen) == sorted([(7, m) for m in lrd.MODES] + [(2, "alert_only")])
+    seen.clear()
+    asyncio.run(lrd._run_async(_run_args(tmp_path)))
+    assert seen == []  # повтор ничего не перегоняет
 
 
-# --- target кейса: сломанный workload, а не ближайший инцидент ---------------
-
-_T0 = "2026-09-20T10:00:00+00:00"
-
-
-def _target_case(**kg):
-    base = {"pod_events": [], "alerts": [], "deployments": []}
-    base.update(kg)
-    return {"event_id": 7, "namespace": "squad-9-shared", "service_name": "alpha-service",
-            "started_at": _T0, "alert_name": "KubeDeploymentGenerationMismatch",
-            "kg_context": base}
+def test_case_scope_is_point_in_time_without_own_conclusion():
+    scope = lrd.case_scope(_kg_case())
+    assert scope.as_of.isoformat() == _AS_OF
+    assert scope.exclude_remediation_ids == (7,) and scope.with_conclusions is False
 
 
-@pytest.mark.parametrize("pod,workload", [
-    ("bravo-service-7d9f8b6c5d-x2k4q", "bravo-service"),
-    ("town-db-0", "town-db"),
-    ("migrate-job-7x2kq", "migrate-job"),
-    ("backup-29812217-q5z7m", "backup"),
-    ("plain", "plain"),
-])
-def test_workload_of_strips_controller_suffixes(pod, workload):
-    assert lrd.workload_of(pod) == workload
+def _json_copy(x):
+    import json
+    return json.loads(json.dumps(x))
 
 
-def test_broken_workload_wins_over_noise_incident_service():
-    """Сервис инцидента (шумовой GenerationMismatch) — не target: target там,
-    где плохие события подов."""
-    case = _target_case(
-        pod_events=[
-            {"namespace": "squad-9-kingdom2", "pod": "bravo-service-7d9f8b6c5d-x2k4q",
-             "type": "Warning", "reason": "BackOff", "count": 12,
-             "last_seen": "2026-09-20T09:55:00+00:00"},
-            {"namespace": "squad-9-shared", "pod": "alpha-service-5c7b9d8f6g-k2m4n",
-             "type": "Normal", "reason": "Pulled", "count": 1,
-             "last_seen": "2026-09-20T09:58:00+00:00"},
-        ],
-        alerts=[{"namespace": "squad-9-shared", "service": "alpha-service",
-                 "alertname": "KubeDeploymentGenerationMismatch",
-                 "fired_at": "2026-09-20T09:50:00+00:00"}],
-    )
-    targets = lrd.select_targets(case)
-    assert [t["workload"] for t in targets] == ["bravo-service"]
-    assert targets[0]["namespace"] == "squad-9-kingdom2"
+def test_fetch_kg_contexts_filters_leaked_observations(monkeypatch):
+    from app.context import kg_incident_context as kgi
+
+    kgc = _kgc([_BACKOFF], medic=["состояние подов: OOMKilled", "теги которых нет в реестре"])
+    monkeypatch.setattr(kgi, "fetch_kg_incident_context", lambda reader, scope: _json_copy(kgc))
+    case = {"event_id": 7, "namespace": "squad-alpha-shared", "service_name": "alpha-service",
+            "started_at": _AS_OF, "root_cause": "теги которых нет в реестре снёс retention"}
+    st = lrd.fetch_kg_contexts(object(), [case])
+    assert st["with_kg"] == 1 and st["leaks"] == 1
+    facts = case["kg_context"]["medic_observations"][0]["facts"]
+    assert facts == ["состояние подов: OOMKilled"]
+    assert case["target_workload"] == "bravo-service" and st["retargeted"] == 1
 
 
-def test_generation_mismatch_counts_only_with_code_deploy():
-    alert = {"namespace": "squad-9-shared", "service": "alpha-service",
-             "alertname": "KubeDeploymentGenerationMismatch",
-             "fired_at": "2026-09-20T09:50:00+00:00"}
-    assert lrd.select_targets(_target_case(alerts=[alert])) == []
-    with_deploy = _target_case(alerts=[alert], deployments=[
-        {"namespace": "squad-9-shared", "service": "alpha-service", "kind": "code"}])
-    assert [t["workload"] for t in lrd.select_targets(with_deploy)] == ["alpha-service"]
-
-
-def test_closer_events_rank_higher():
-    case = _target_case(pod_events=[
-        {"namespace": "n", "pod": "old-svc-7d9f8b6c5d-x2k4q", "reason": "BackOff", "count": 5,
-         "last_seen": "2026-09-20T08:00:00+00:00"},
-        {"namespace": "n", "pod": "new-svc-7d9f8b6c5d-x2k4q", "reason": "BackOff", "count": 5,
-         "last_seen": "2026-09-20T09:58:00+00:00"},
-    ])
-    assert lrd.select_targets(case)[0]["workload"] == "new-svc"
-
-
-def test_medic_names_only_boost_known_candidates():
-    """Имя из applied медика усиливает кандидата, но нового не рождает."""
-    case = _target_case(pod_events=[
-        {"namespace": "n", "pod": "a-svc-7d9f8b6c5d-x2k4q", "reason": "BackOff", "count": 4,
-         "last_seen": _T0},
-        {"namespace": "n", "pod": "b-svc-7d9f8b6c5d-x2k4q", "reason": "BackOff", "count": 5,
-         "last_seen": _T0},
-    ])
-    text = '[["rollout restart a-svc", "restart ghost-svc"], []]'
-    targets = lrd.select_targets(case, text)
-    assert targets[0]["workload"] == "a-svc" and "medic_applied" in targets[0]["sources"]
-    assert "ghost-svc" not in {t["workload"] for t in targets}
-
-
-def test_probe_failures_during_rollout_do_not_pick_target():
-    """Unhealthy у раскатывавшегося workload-а — прогрев, не поломка: рестарты
-    grainhost от медика не должны делать его target-ом."""
-    case = _target_case(
-        pod_events=[
-            {"namespace": "n", "pod": "town-grainhost-7d9f8b6c5d-x2k4q", "reason": "Unhealthy",
-             "count": 20, "last_seen": _T0},
-            {"namespace": "n", "pod": "map-service-7d9f8b6c5d-x2k4q", "reason": "BackOff",
-             "count": 2, "last_seen": _T0},
-        ],
-        deployments=[{"namespace": "n", "service": "town-grainhost", "buildtype_id": "k8s_rollout"}],
-    )
-    assert [t["workload"] for t in lrd.select_targets(case)] == ["map-service"]
-
-
-def test_probe_failures_are_soft_without_rollout():
-    case = _target_case(pod_events=[
-        {"namespace": "n", "pod": "a-svc-7d9f8b6c5d-x2k4q", "reason": "Unhealthy", "count": 10,
-         "last_seen": _T0},
-        {"namespace": "n", "pod": "b-svc-7d9f8b6c5d-x2k4q", "reason": "BackOff", "count": 3,
-         "last_seen": _T0},
-    ])
-    assert lrd.select_targets(case)[0]["workload"] == "b-svc"
-
-
-def test_metric_source_is_never_a_target():
-    case = _target_case(alerts=[{"namespace": "n", "service": "vm-kube-state-metrics",
-                                 "alertname": "KubeContainerWaiting", "fired_at": _T0}])
-    assert lrd.select_targets(case) == []
-
-
-def test_medic_does_not_boost_probe_only_candidates():
-    case = _target_case(pod_events=[
-        {"namespace": "n", "pod": "a-svc-7d9f8b6c5d-x2k4q", "reason": "Unhealthy", "count": 5,
-         "last_seen": _T0}])
-    t = lrd.select_targets(case, '[["rollout restart a-svc"], []]')[0]
-    assert "medic_applied" not in t["sources"]
+# --- target кейса ---------------------------------------------------------------
 
 
 def test_incident_is_built_around_primary_target():
-    case = _target_case(pod_events=[
-        {"namespace": "squad-9-kingdom2", "pod": "bravo-service-7d9f8b6c5d-x2k4q",
-         "reason": "ImagePullBackOff", "count": 3, "last_seen": _T0}])
-    assert lrd.assign_targets([case]) == 1
+    case = dict(_kg_case(), alert_name="KubeDeploymentGenerationMismatch",
+                service_name="alpha-service")
+    assert lrd.set_case_target(case) is True
     assert case["incident_service"] == "alpha-service"
     inc = lrd._to_incident(case)
     assert inc.labels["service"] == "bravo-service"
-    assert inc.namespace == "squad-9-kingdom2"
+    assert inc.namespace == "squad-alpha-shared"
 
 
 def test_no_graph_keeps_incident_service_unless_noise():
-    case = dict(_target_case(), alert_name="KubeContainerWaiting")
-    assert lrd.assign_targets([case]) == 0
+    case = {"event_id": 1, "namespace": "n", "service_name": "alpha-service",
+            "alert_name": "KubeContainerWaiting", "kg_context": _kgc()}
+    assert lrd.set_case_target(case) is False
     assert lrd._to_incident(case).labels["service"] == "alpha-service"
-    noise = _target_case()  # GenerationMismatch → сервис инцидента не target
-    lrd.assign_targets([noise])
+    noise = dict(case, alert_name="KubeDeploymentGenerationMismatch")
+    lrd.set_case_target(noise)
     assert lrd._to_incident(noise).labels["service"] == ""
 
 
 def test_target_event_share():
-    case = _target_case(pod_events=[
-        {"pod": "bravo-service-7d9f8b6c5d-x2k4q"}, {"pod": "alpha-service-5c7b9d8f6g-k2m4n"}])
+    other = dict(_BACKOFF, pod="alpha-service-5c7b9d8f6g-k2m4n")
+    case = {"kg_context": _kgc([_BACKOFF, other])}
     assert lrd.target_event_share(case, "bravo-service") == 0.5
-    assert lrd.target_event_share(_target_case(), "x") is None
+    assert lrd.target_event_share({"kg_context": _kgc()}, "x") is None
 
 
 # --- исход кейса -------------------------------------------------------------
@@ -445,16 +362,6 @@ def test_outcome_before_cutover_needs_evidence():
     assert lrd.outcome_evidence(row, uncovered)["confirmed"] is False
 
 
-def test_alert_resolved_before_run_does_not_pick_target():
-    case = _target_case(
-        alerts=[{"namespace": "n", "service": "healed-svc", "alertname": "KubePodCrashLooping",
-                 "fired_at": _T0, "resolved_at": _T0}],
-        pod_events=[{"namespace": "n", "pod": "sick-svc-7d9f8b6c5d-x2k4q", "reason": "Unhealthy",
-                     "count": 1, "last_seen": _T0}],
-    )
-    assert [t["workload"] for t in lrd.select_targets(case)] == ["sick-svc"]
-
-
 def test_outcome_after_cutover_fixed_means_healthy():
     row = {"started_at": "2026-09-24T09:30:00", "fixed": True, "outcome": "partial",
            "still_unhealthy": None}
@@ -471,9 +378,9 @@ def test_medic_saw_healthy_is_confirmed():
 def test_score_is_split_by_outcome():
     cases = [{"event_id": 1, "expected_primary": "image_missing", "outcome_confirmed": True},
              {"event_id": 2, "expected_primary": "image_missing", "outcome_confirmed": False}]
-    results = [{"event_id": 1, "context": "kg+medic", "best_cause": "образ не найден в registry",
+    results = [{"event_id": 1, "context": "kg", "best_cause": "образ не найден в registry",
                 "ranked_causes": ["образ не найден в registry"]},
-               {"event_id": 2, "context": "kg+medic", "best_cause": None, "ranked_causes": []}]
+               {"event_id": 2, "context": "kg", "best_cause": None, "ranked_causes": []}]
     s = lrd.score(cases, results)
-    assert s["by_outcome"]["confirmed"]["kg+medic"]["cases_run"] == 1
-    assert s["by_outcome"]["unconfirmed"]["kg+medic"]["abstention_rate"] == 1.0
+    assert s["by_outcome"]["confirmed"]["kg"]["cases_run"] == 1
+    assert s["by_outcome"]["unconfirmed"]["kg"]["abstention_rate"] == 1.0

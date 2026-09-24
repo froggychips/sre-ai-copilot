@@ -1029,6 +1029,13 @@ class KGRemediationEvent(Base):
     owner_login = Column(String, nullable=True)
     incident_id = Column(Integer, ForeignKey("kg_incidents.id"), nullable=True, index=True)
     extras = Column(JSON, nullable=True)
+    #: Наблюдения прогона (что робот ВИДЕЛ на стенде: состояния подов, коды
+    #: выхода, dirty-миграция, отсутствующие ключи Secret) — без его выводов.
+    #: Схема `medic_obs/v1`, пишет POST /webhooks/remediation через
+    #: app/context/medic_observations.build_observations; читает сборщик
+    #: контекста инцидента из графа как источник `squad-medic`. NULL у событий,
+    #: принятых до поля: их наблюдения извлекаются тем же экстрактором на чтении.
+    observations = Column(JSON, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
 
     __table_args__ = (
