@@ -676,8 +676,13 @@ def test_apply_refuses_while_state_unknown_marker_present(mock_session):
     mock_exec.assert_not_called()
 
 
-def test_apply_allows_after_reapprove_following_state_unknown(mock_session):
-    """Единственный выход: approve, выданный ПОСЛЕ пометки (человек проверил кластер)."""
+def test_apply_refuses_after_reapprove_following_state_unknown(mock_session):
+    """Пометка конечна: даже approve, выданный ПОСЛЕ неё, write не открывает.
+
+    Раньше это был «единственный выход», но достижим он был по сути только
+    для другой команды после re-fire — второй write в инцидент, где первый
+    мог пройти. Теперь инцидент разбирает человек.
+    """
     _, query = mock_session
     record = _make_record({
         "execution_intent": _valid_intent_dict(),
@@ -694,13 +699,15 @@ def test_apply_allows_after_reapprove_following_state_unknown(mock_session):
 
     with _approved(age_seconds=30), patch.object(
         executor_apply.k8s_service, "execute_intent", side_effect=_fake_exec(),
-    ):
+    ) as mock_exec:
         out = executor_apply.apply_intent(
             "inc-reapproved", "user1", _sig_for(_valid_intent_dict())
         )
 
-    assert out["ok"] is True
-    assert "executor_applied" in record.analysis
+    assert out["ok"] is False
+    assert out["reason"] == "cluster_state_unknown:manual_intervention_required"
+    mock_exec.assert_not_called()
+    assert "executor_applied" not in record.analysis
 
 
 def test_apply_refuses_on_unparseable_in_flight_claim(mock_session):

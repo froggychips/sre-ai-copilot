@@ -12,7 +12,8 @@
     → apply_in_flight, второго write нет;
   - протухший claim в таблице → unknown, write НЕ выполняется, повтор тем же
     одобрением тоже отказан;
-  - unknown + одобрение позже пометки → CAS unknown→claimed → applied;
+  - unknown конечен: ни одобрение позже пометки, ни другой intent после
+    re-fire его не снимают, write нет;
   - legacy: executor_applied в JSON без строки → already_applied, строка не
     создаётся;
   - kubectl вернул ошибку → failed, повтор запрещён;
@@ -216,9 +217,9 @@ def test_stale_claim_goes_unknown_without_second_write(Session, monkeypatch):
     with patch.object(executor_apply.k8s_service, "execute_intent", fake):
         out = executor_apply.apply_intent(INCIDENT, "tester", SIG)
         again = executor_apply.apply_intent(INCIDENT, "tester", SIG)
-    assert out["reason"] == "cluster_state_unknown:manual_verify_then_reapprove"
-    # То же одобрение старше пометки — само себя не разблокирует.
-    assert again["reason"] == "cluster_state_unknown:manual_verify_then_reapprove"
+    assert out["reason"] == "cluster_state_unknown:manual_intervention_required"
+    # unknown конечен: повтор с тем же одобрением — тот же отказ.
+    assert again["reason"] == "cluster_state_unknown:manual_intervention_required"
     assert fake.writes == 0
     [row] = _rows(Session)
     assert row.status == attempts_store.STATUS_UNKNOWN and row.error == "stale_claim"
@@ -237,9 +238,9 @@ def test_fresh_claim_row_refuses_in_flight(Session):
     assert out["reason"] == "apply_in_flight" and fake.writes == 0
 
 
-def test_unknown_reclaimed_by_approval_after_mark(Session):
-    """Выход из unknown: человек проверил кластер и одобрил ПОСЛЕ пометки.
-    JSON-пометку при этом могли потерять — момент берётся из строки."""
+def test_unknown_is_terminal_even_after_later_approval(Session):
+    """unknown конечен: одобрение, выданное ПОСЛЕ пометки, его не снимает.
+    Запись в кластер могла состояться — дальше разбирает человек."""
     _seed(Session, approval_decided_at=_naive_now())
     db = Session()
     row = attempts_store.new_claim(INCIDENT, SIG, INTENT, "crashed-worker")
@@ -251,14 +252,16 @@ def test_unknown_reclaimed_by_approval_after_mark(Session):
     fake = _Exec()
     with patch.object(executor_apply.k8s_service, "execute_intent", fake):
         out = executor_apply.apply_intent(INCIDENT, "tester", SIG)
-    assert out["ok"] is True and fake.writes == 1
+    assert out["reason"] == "cluster_state_unknown:manual_intervention_required"
+    assert fake.writes == 0
     [row] = _rows(Session)
-    assert row.status == attempts_store.STATUS_APPLIED and row.applied_by == "tester"
+    assert row.status == attempts_store.STATUS_UNKNOWN
 
 
-def test_unknown_row_for_other_intent_gets_new_attempt(Session):
-    """Re-fire после пометки принёс другой intent: старая строка остаётся
-    unknown со своим intent-ом, новая команда получает свою строку."""
+def test_unknown_blocks_other_intent_after_refire(Session):
+    """Re-fire после пометки принёс другой intent (своё одобрение, свежее
+    пометки). Раньше это давало новую строку и второй write в инцидент, где
+    первый мог уже пройти, — теперь отказ, новой строки нет."""
     _seed(Session, approval_decided_at=_naive_now())
     old_intent = {**INTENT, "resource_name": "other-service"}
     old_sig = compute_signature(ExecutionIntent.model_validate(old_intent))
@@ -272,12 +275,10 @@ def test_unknown_row_for_other_intent_gets_new_attempt(Session):
     fake = _Exec()
     with patch.object(executor_apply.k8s_service, "execute_intent", fake):
         out = executor_apply.apply_intent(INCIDENT, "tester", SIG)
-    assert out["ok"] is True and fake.writes == 1
-    by_sig = {r.signature: r for r in _rows(Session)}
-    assert by_sig[old_sig].status == attempts_store.STATUS_UNKNOWN
-    assert by_sig[old_sig].resource_name == "other-service"
-    assert by_sig[SIG].status == attempts_store.STATUS_APPLIED
-    assert by_sig[SIG].resource_name == "town-service"
+    assert out["reason"] == "cluster_state_unknown:manual_intervention_required"
+    assert fake.writes == 0
+    [row] = _rows(Session)
+    assert row.signature == old_sig and row.status == attempts_store.STATUS_UNKNOWN
 
 
 def test_unknown_row_without_later_approval_refused(Session):
@@ -292,7 +293,7 @@ def test_unknown_row_without_later_approval_refused(Session):
     fake = _Exec()
     with patch.object(executor_apply.k8s_service, "execute_intent", fake):
         out = executor_apply.apply_intent(INCIDENT, "tester", SIG)
-    assert out["reason"] == "cluster_state_unknown:manual_verify_then_reapprove"
+    assert out["reason"] == "cluster_state_unknown:manual_intervention_required"
     assert fake.writes == 0
 
 

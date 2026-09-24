@@ -19,8 +19,18 @@ SQLite `FOR UPDATE` вообще не существует).
     claimed ──► applied ──► verified
        │           └──────► verification_failed
        ├──────► failed            (kubectl вернул ошибку — терминально)
-       └──────► unknown ──► claimed   (протухший claim; обратно — только
-                                       по одобрению, выданному позже пометки)
+       └──────► unknown           (протухший claim — терминально, дальше
+                                   только руками человека)
+
+`unknown` — конечный статус. Протухший claim значит «kubectl мог
+выполниться, а финализация — нет», и ни одно состояние БД не отвечает, была
+ли запись в кластер. Автоматического выхода нет: раньше тут был путь
+unknown → claimed по одобрению, выданному позже пометки, но на практике он
+был недостижим (одобрение уникально по (incident, signature), повторный клик
+не обновляет `decided_at`), а достижимым становился только для ДРУГОЙ
+команды после re-fire — то есть второй write в инцидент, где первый мог уже
+пройти. Такой инцидент дальше разбирает человек: смотрит кластер и действует
+сам, исполнитель в него больше не пишет.
 
 Отказы до claim-а строк не создают: строка занимает уникальный ключ, и
 транзиентный отказ (моргнувший пере-dry-run) навсегда закрыл бы действие.
@@ -37,7 +47,7 @@ from datetime import datetime, timezone
 from typing import Any, Dict, Optional
 
 from sqlalchemy import (JSON, Column, DateTime, Index, Integer, String, Text,
-                        UniqueConstraint, update)
+                        UniqueConstraint)
 
 from app.database import Base
 
@@ -175,32 +185,6 @@ def new_claim(
         updated_at=now,
     )
 
-
-def reclaim_unknown(db: Any, row: RemediationAttempt, applied_by: str) -> bool:
-    """unknown → claimed compare-and-swap. False — строку уже перехватили.
-
-    Условный UPDATE, а не присваивание атрибута: два претендента, прочитавшие
-    unknown одновременно, не должны оба получить claim.
-    """
-    now = _utcnow_naive()
-    res = db.execute(
-        update(RemediationAttempt)
-        .where(
-            RemediationAttempt.id == row.id,
-            RemediationAttempt.status == STATUS_UNKNOWN,
-        )
-        .values(
-            status=STATUS_CLAIMED, claimed_at=now, applied_by=applied_by,
-            error=None, updated_at=now,
-        )
-        .execution_options(synchronize_session=False)
-    )
-    if getattr(res, "rowcount", 0) != 1:
-        return False
-    # synchronize_session=False не трогает объект в памяти — перечитываем,
-    # чтобы дальнейшие переходы видели claimed, а не прежний unknown.
-    db.refresh(row)
-    return True
 
 
 def set_status(row: Any, status: str, **fields: Any) -> None:
