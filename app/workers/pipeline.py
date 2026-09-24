@@ -37,6 +37,7 @@ from app.context.jira_client import JiraClient, build_jira_context
 from app.context.collector import (Collector, CollectorResult, Outcome,
                                    SourceStatus, default_classify,
                                    merge_source_status, summarize_coverage)
+from app.context.incident_snapshot import build_context_snapshot
 from app.context.k8s_facts import K8sFacts, K8sSnapshot
 from app.context.vm_client import (ClusterHealth, VMClient,
                                    valid_promql_label)
@@ -381,6 +382,9 @@ class IncidentPipeline:
         self.incident: Optional[Incident] = None
         self.analysis: Optional[str] = None
         self.fact_store: Optional[FactStore] = None
+        # Снимок того, что видели правила и агенты (app/context/incident_snapshot.py):
+        # вход live-RCA датасета. Собирается в конце stage_diagnose.
+        self.context_snapshot: Optional[Dict[str, Any]] = None
         # Прогоны сборщиков stage_diagnose (статус/provenance/длительность) —
         # из них выведен diag_ctx["source_status"].
         self.collector_results: List[CollectorResult] = []
@@ -476,6 +480,7 @@ class IncidentPipeline:
                 "statics_check_context": self.statics_check_context,
                 "deploy_correlation": self.deploy_correlation,
                 "team_owner": self.team_owner,
+                "context_snapshot": self.context_snapshot,
                 "facts": (
                     self.fact_store.to_dict()["facts"]
                     if self.fact_store is not None
@@ -548,6 +553,7 @@ class IncidentPipeline:
                 self.statics_check_context = cp.get("statics_check_context")
                 self.deploy_correlation = cp.get("deploy_correlation")
                 self.team_owner = cp.get("team_owner")
+                self.context_snapshot = cp.get("context_snapshot")
                 raw_collectors = cp.get("collectors")
                 if isinstance(raw_collectors, list):
                     restored_collectors = [
@@ -660,9 +666,21 @@ class IncidentPipeline:
             # Wave 3 severity-routing уже умеет пропускать info.
             self._filter_rollout_noise(diag_ctx)
             self.fact_store = diag_engine.run(diag_ctx)
+            self._capture_context_snapshot(diag_ctx)
         snap = t.snapshot().to_dict()
         self._safe_transition(IncidentState.FACTS_COLLECTED, snap)
         self.traces.append(snap)
+
+    def _capture_context_snapshot(self, diag_ctx: dict) -> None:
+        """Best-effort: сбой сборки снимка не должен ронять диагностику."""
+        try:
+            self.context_snapshot = build_context_snapshot(diag_ctx, self.fact_store)
+        except Exception as e:
+            logger.warning(
+                "pipeline.context_snapshot_failed",
+                incident_id=self.incident_id, error=type(e).__name__,
+            )
+            self.context_snapshot = None
 
     async def _enrich_clickhouse(self, diag_ctx: dict) -> None:
         if not self.incident.namespace or not self.incident.starts_at:
@@ -1427,6 +1445,7 @@ class IncidentPipeline:
                 "executor_result": self.executor_result,
                 "playbook_match": self.playbook_match,
                 "source_coverage": self._source_coverage(),
+                "context_snapshot": self.context_snapshot,
             }
             merged_analysis = {**(record.analysis or {}), **fresh_analysis}
             # Служебные ключи прошлых попыток зачищаем: прогон завершён.
@@ -1640,6 +1659,7 @@ class IncidentPipeline:
                 else []
             ),
             "source_coverage": self._source_coverage(),
+            "context_snapshot": self.context_snapshot,
         }
         merged.pop(_CHECKPOINT_KEY, None)
         self.record.analysis = merged
