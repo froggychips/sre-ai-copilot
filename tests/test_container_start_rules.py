@@ -104,6 +104,30 @@ def test_pull_backoff_is_not_crashloop_any_more():
                    for f in PodEventsRule().run(ctx))
 
 
+def test_any_pull_signal_is_not_crashloop():
+    """reason ImagePullBackOff содержит «backoff»; BackOff c «Failed to pull» — тоже pull."""
+    for ev in (_ev("ImagePullBackOff", f'Back-off pulling image "{_IMAGE}"'),
+               _ev("BackOff", f'Failed to pull image "{_IMAGE}": not found'),
+               _ev("ErrImagePull", "rpc error")):
+        ctx = {"pod": _POD, "k8s_events": [ev]}
+        assert not any(f.kind == FactKind.CRASHLOOP and f.observed
+                       for f in PodEventsRule().run(ctx)), ev["reason"]
+        assert _one(CrashLoopBackOffRule(), ctx).is_absent, ev["reason"]
+
+
+def test_detailed_failed_event_wins_over_frequent_backoff():
+    f = _one(ImagePullRule(), {"pod": _POD, "k8s_events": [
+        _pull_not_found() | {"count": 2}, _pull_backoff() | {"count": 400}]})
+    assert f.evidence["cause"] == "not_found"
+
+
+def test_app_log_secret_not_found_is_not_container_config():
+    """Живой процесс пишет в лог ошибку клиента k8s — это не CreateContainerConfigError."""
+    ctx = {"pod": _POD, "k8s_events": [],
+           "logs_summary": 'ERROR reconcile: secrets "tls-cert" not found, retrying'}
+    assert _one(ContainerConfigRule(), ctx).is_absent
+
+
 def test_restart_backoff_still_crashloop():
     ctx = {"pod": _POD, "k8s_events": [
         _ev("BackOff", f"Back-off restarting failed container app in pod {_POD}")]}

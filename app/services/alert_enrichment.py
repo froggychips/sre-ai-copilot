@@ -1411,6 +1411,16 @@ def enrich_alert(db: Session, incident: Incident) -> EnrichedContext:
         ctx.rule_facts.extend(PodEventsRule().run(rule_ctx))
     except Exception as e:
         log.warning("enrich.pod_events_rule_failed", error=str(e))
+    # «Контейнер не стартовал»: образ не вытянулся / нет ключа в Secret. Те же
+    # k8s_events, что у PodEventsRule; в эмбеде — только найденное (✗ по
+    # этим классам карточку не информирует).
+    try:
+        from app.diagnostics.rules.container_config import ContainerConfigRule
+        from app.diagnostics.rules.image_pull import ImagePullRule
+        for rule in (ImagePullRule(), ContainerConfigRule()):
+            ctx.rule_facts.extend(f for f in rule.run(rule_ctx) if f.observed)
+    except Exception as e:
+        log.warning("enrich.container_start_rules_failed", error=str(e))
 
     # 7. Rollout-noise heuristic — `KubeDeploymentGenerationMismatch` сразу
     # после деплоя обычно безобиден (rollout в процессе).

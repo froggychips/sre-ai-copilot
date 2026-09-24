@@ -79,12 +79,22 @@ _UNVERIFIED = "unverified"  # проверить нечем
 # kubelet пишет «Back-off pulling image» под тем же reason BackOff, что и
 # «Back-off restarting failed container»; первое — про образ (ImagePullRule),
 # процесс в таком поде не запускался ни разу, и crashloop-ом оно не является.
-_PULL_BACKOFF_RE = re.compile(r"back-?off pulling image", re.IGNORECASE)
+# Любой признак pull-а: reason `ImagePullBackOff` сам содержит подстроку
+# «backoff», и _match_reason иначе отдал бы его в crashloop.
+_PULL_REASONS = frozenset({"imagepullbackoff", "errimagepull", "errimageneverpull",
+                           "invalidimagename"})
+_PULL_MESSAGE_RE = re.compile(
+    r"(back-?off pulling image|failed to pull image|pulling image .* failed|"
+    r"imagepullbackoff|errimagepull)",
+    re.IGNORECASE,
+)
 
 
 def is_image_pull_backoff(event: Dict[str, Any]) -> bool:
-    """BackOff-событие про вытягивание образа, а не про рестарт процесса."""
-    return bool(_PULL_BACKOFF_RE.search(event.get("message") or ""))
+    """Событие про вытягивание образа, а не про рестарт процесса."""
+    if (event.get("reason") or "").lower() in _PULL_REASONS:
+        return True
+    return bool(_PULL_MESSAGE_RE.search(event.get("message") or ""))
 
 
 def _match_reason(reason: str) -> Tuple[str, float] | None:

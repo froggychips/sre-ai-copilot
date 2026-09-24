@@ -34,9 +34,12 @@ _MISSING_OBJECT_RE = re.compile(
     r"\b(secrets?|configmaps?)\s+\"([\w.\-]+)\"\s+not found", re.IGNORECASE,
 )
 _CONFIG_REASONS = frozenset({"createcontainerconfigerror"})
+# Текстовый fallback — только по маркерам kubelet. Голое `secret "x" not
+# found` здесь не годится: logs_summary несёт логи приложения, и ошибка
+# клиента k8s внутри живого процесса выглядела бы как не созданный контейнер.
+# Такие фразы разбираются только в evidence, когда маркер уже найден.
 _TEXT_RE = re.compile(
-    r"(createcontainerconfigerror|couldn'?t find key\s+\S+\s+in\s+(?:secret|configmap)|"
-    r"\b(?:secrets?|configmaps?)\s+\"[\w.\-]+\"\s+not found)",
+    r"(createcontainerconfigerror|couldn'?t find key\s+\S+\s+in\s+(?:secret|configmap))",
     re.IGNORECASE,
 )
 

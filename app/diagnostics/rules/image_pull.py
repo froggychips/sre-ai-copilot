@@ -109,7 +109,11 @@ class ImagePullRule(Rule):
                 continue
             prev = best.get(attribution)
             count = int(ev.get("count") or 1)
-            if prev is None or count > prev["count"]:
+            known = pull_cause(ev.get("message") or "") != "unknown"
+            # Детальное `Failed` (manifest unknown / 401 / no such host) важнее
+            # многократного общего `BackOff`: иначе счётчик BackOff перетирал
+            # причину в unknown. Среди равных по «причина распознана» — больший count.
+            if prev is None or (known, count) > (prev["cause"] != "unknown", prev["count"]):
                 message = ev.get("message") or ""
                 best[attribution] = {
                     "source": "k8s_event",
