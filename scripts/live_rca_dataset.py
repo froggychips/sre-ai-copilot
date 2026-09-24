@@ -208,7 +208,7 @@ def ctx_from_snapshot(ctx: Dict[str, Any], snap: Optional[Dict[str, Any]]) -> Di
 _KG_SQL = """
 SET TRANSACTION READ ONLY;
 SELECT to_jsonb(t) FROM (
-  SELECT e.id AS event_id,
+  SELECT e.id AS event_id, sc.scope AS ns_scope, sc.ns AS ns_list,
     (SELECT coalesce(jsonb_agg(x), '[]'::jsonb) FROM (
        -- Последнее событие на (под, reason): иначе 40 мест съедают сотни
        -- одинаковых Unhealthy от readiness-пробы, а BackOff/OOMKilled не влезают.
@@ -216,35 +216,67 @@ SELECT to_jsonb(t) FROM (
        -- следующими синками. last_seen срезаем по отсечке, а count, если
        -- строка обновлялась ПОСЛЕ неё, неизвестен на момент инцидента → NULL.
        SELECT * FROM (
-         SELECT DISTINCT ON (pe.pod_name, pe.reason)
-                pe.pod_name AS pod, pe.type, pe.reason, left(pe.message, 300) AS message,
+         SELECT DISTINCT ON (pe.namespace, pe.pod_name, pe.reason)
+                pe.namespace, pe.pod_name AS pod, pe.type, pe.reason,
+                left(pe.message, 300) AS message,
                 CASE WHEN coalesce(pe.last_seen, pe.first_seen) <= e.started_at
                      THEN pe.count END AS count,
                 pe.first_seen,
                 least(coalesce(pe.last_seen, pe.first_seen), e.started_at) AS last_seen
          FROM kg_pod_events pe
-         WHERE pe.namespace = i.namespace
+         -- first_seen не старше 7 суток: без нижней границы индекс по
+         -- first_seen бесполезен и запрос сканирует всю историю с апреля.
+         -- Строка, начавшаяся раньше и всё ещё обновлявшаяся, теряется —
+         -- цена приемлемая для датасета.
+         WHERE pe.namespace = ANY(sc.ns)
+           AND pe.first_seen BETWEEN e.started_at - interval '7 days' AND e.started_at
            AND least(coalesce(pe.last_seen, pe.first_seen), e.started_at)
                >= e.started_at - interval '2 hours'
-           AND pe.first_seen <= e.started_at
-         ORDER BY pe.pod_name, pe.reason,
+         ORDER BY pe.namespace, pe.pod_name, pe.reason,
                   least(coalesce(pe.last_seen, pe.first_seen), e.started_at) DESC) d
-       ORDER BY (d.type = 'Warning') DESC, d.last_seen DESC
+       ORDER BY (d.namespace = i.namespace) DESC, (d.type = 'Warning') DESC, d.last_seen DESC
        LIMIT 40) x) AS pod_events,
     (SELECT coalesce(jsonb_agg(x), '[]'::jsonb) FROM (
-       SELECT s.name AS service, a.alertname, a.severity, a.fired_at, a.resolved_at
+       SELECT s.namespace, s.name AS service, a.alertname, a.severity, a.fired_at,
+              CASE WHEN a.resolved_at <= e.started_at THEN a.resolved_at END AS resolved_at
        FROM kg_alerts a JOIN kg_services s ON s.id = a.service_id
-       WHERE s.namespace = i.namespace
+       WHERE s.namespace = ANY(sc.ns)
          AND a.fired_at BETWEEN e.started_at - interval '2 hours' AND e.started_at
        ORDER BY a.fired_at DESC LIMIT 20) x) AS alerts,
     (SELECT coalesce(jsonb_agg(x), '[]'::jsonb) FROM (
-       SELECT s.name AS service, d.status, d.buildtype_id, d.started_at, d.finished_at
+       -- Статика отдельно от кода: StaticsNewCluster раскатывается веером на
+       -- все сервисы сквада (сотни «деплоев» на сервис в месяц), и «недавний
+       -- деплой» по ней почти всегда true, хотя кода никто не менял.
+       SELECT s.namespace, s.name AS service, d.status, d.buildtype_id, d.started_at,
+              CASE WHEN d.finished_at <= e.started_at THEN d.finished_at END AS finished_at,
+              'code' AS kind
        FROM kg_deployments d JOIN kg_services s ON s.id = d.service_id
-       WHERE s.namespace = i.namespace
+       WHERE s.namespace = ANY(sc.ns)
          AND d.started_at BETWEEN e.started_at - interval '6 hours' AND e.started_at
-       ORDER BY d.started_at DESC LIMIT 10) x) AS deployments
+         AND d.buildtype_id NOT LIKE '%StaticsNewCluster%'
+       ORDER BY d.started_at DESC
+       LIMIT 10) x) AS deployments,
+    -- Статика — только счётчиком: её строки заняли бы весь лимит.
+    (SELECT count(*) FROM kg_deployments d JOIN kg_services s ON s.id = d.service_id
+     WHERE s.namespace = ANY(sc.ns) AND d.buildtype_id LIKE '%StaticsNewCluster%'
+       AND d.started_at BETWEEN e.started_at - interval '6 hours' AND e.started_at
+    ) AS statics_rollouts
   FROM kg_remediation_events e
   JOIN kg_incidents i ON i.id = e.incident_id
+  -- Сквад живёт в нескольких ns: медик пишет основной `squad-N-shared`, а
+  -- деплои и события сервисов ложатся в `squad-N-kingdomX`. Точный джойн по
+  -- namespace находил деплои у 7% кейсов, по префиксу сквада — у 76%.
+  -- Вне сквадов — точный namespace (в имени ns нет `_`/`%`, LIKE безопасен).
+  -- Список ns сквада — из kg_services (таблица маленькая), дальше точное
+  -- равенство по списку: LIKE с вычисляемым шаблоном по kg_pod_events
+  -- индекс не берёт и упирался в таймаут.
+  CROSS JOIN LATERAL (
+    SELECT p.scope, array_append(coalesce(
+             (SELECT array_agg(DISTINCT s2.namespace) FROM kg_services s2
+              WHERE s2.namespace LIKE p.scope), '{{}}'::text[]), i.namespace) AS ns
+    FROM (SELECT coalesce(substring(i.namespace from '^(squad-[^-]+-)') || '%',
+                          i.namespace) AS scope) p
+  ) sc
   WHERE e.id IN ({ids})
 ) t;
 """
@@ -264,12 +296,15 @@ def reconstruct_from_kg(args, cases: List[Dict[str, Any]]) -> int:
     n = 0
     for c in cases:
         r = by_id.get(c.get("event_id"))
-        if not r or not (r.get("pod_events") or r.get("alerts") or r.get("deployments")):
+        if not r or not (r.get("pod_events") or r.get("alerts") or r.get("deployments")
+                         or r.get("statics_rollouts")):
             continue
         for ev in r.get("pod_events") or []:
             if ev.get("message"):
                 ev["message"] = redact_pii(ev["message"], max_len=300)
         c["kg_context"] = {k: r.get(k) or [] for k in ("pod_events", "alerts", "deployments")}
+        c["kg_context"]["ns_scope"] = r.get("ns_scope")
+        c["kg_context"]["statics_rollouts"] = int(r.get("statics_rollouts") or 0)
         c.setdefault("context", "kg_reconstructed")
         n += 1
     return n
@@ -284,23 +319,32 @@ def ctx_from_kg(ctx: Dict[str, Any], kg: Optional[Dict[str, Any]]) -> Dict[str, 
     if kg.get("pod_events"):
         ctx["k8s_events"] = [
             {"type": e.get("type"), "reason": e.get("reason"), "message": e.get("message"),
-             "count": e.get("count"), "pod": e.get("pod"),
+             "count": e.get("count"), "pod": e.get("pod"), "namespace": e.get("namespace"),
              "last_timestamp": e.get("last_seen") or e.get("first_seen")}
             for e in kg["pod_events"]
         ]
-    if kg.get("deployments"):
+    # В правило recent_deploy — только деплои кода (SQL статику в строки не
+    # берёт): веерная раскатка статики сделала бы «недавний деплой» истиной
+    # почти для любого кейса сквада. Статика — счётчиком в описание.
+    code = kg.get("deployments") or []
+    statics = int(kg.get("statics_rollouts") or 0)
+    if code:
         ctx["recent_deployments"] = [
             {"name": d.get("service") or d.get("buildtype_id") or "deploy",
              "ts": d.get("finished_at") or d.get("started_at"), "status": d.get("status"),
-             "buildtype_id": d.get("buildtype_id"), "attribution_scope": "namespace"}
-            for d in kg["deployments"]
+             "buildtype_id": d.get("buildtype_id"), "namespace": d.get("namespace"),
+             "attribution_scope": "namespace"}
+            for d in code
         ]
+    if statics:
+        ctx["description"] = ((ctx.get("description") or "")
+                              + f"\nРаскатки статики на сквад за 6ч: {statics}").strip()
     # Соседние алерты графа — не upstream по рёбрам зависимостей (правило
     # UpstreamDegraded ждёт edge_kind), поэтому идут в описание, не в правило.
     if kg.get("alerts"):
         names = sorted({a.get("alertname") for a in kg["alerts"] if a.get("alertname")})
         ctx["description"] = ((ctx.get("description") or "")
-                              + f"\nАлерты namespace за 2ч: {', '.join(names)}").strip()
+                              + f"\nАлерты сквада за 2ч: {', '.join(names)}").strip()
     return ctx
 
 

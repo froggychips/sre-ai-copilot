@@ -264,7 +264,7 @@ def test_reconstruct_from_kg_labels_and_redacts(monkeypatch):
 
 def test_reconstruct_sql_window_stops_at_medic_start():
     # Верхняя граница — начало разбора медика: события починки — это ответ.
-    assert "pe.first_seen <= e.started_at" in lrd._KG_SQL
+    assert "pe.first_seen BETWEEN e.started_at - interval '7 days' AND e.started_at" in lrd._KG_SQL
     assert "+ interval" not in lrd._KG_SQL
 
 
@@ -301,7 +301,20 @@ def test_pod_event_aggregates_are_clamped_to_cutoff():
     sql = lrd._KG_SQL
     assert "least(coalesce(pe.last_seen, pe.first_seen), e.started_at) AS last_seen" in sql
     assert "THEN pe.count END AS count" in sql
-    assert "ORDER BY (d.type = 'Warning') DESC, d.last_seen DESC" in sql
+    assert "(d.type = 'Warning') DESC, d.last_seen DESC" in sql
+
+
+def test_reconstruction_scopes_by_squad_and_splits_statics():
+    sql = lrd._KG_SQL
+    # Сквад — все его ns через kg_services; вне сквадов — точный namespace.
+    assert "substring(i.namespace from '^(squad-[^-]+-)') || '%'" in sql
+    assert sql.count("= ANY(sc.ns)") == 4
+    # Статика — не строками деплоя, а счётчиком.
+    assert "NOT LIKE '%StaticsNewCluster%'" in sql and "AS statics_rollouts" in sql
+    ctx = lrd.ctx_from_kg({"description": "d"}, {"pod_events": [], "deployments": [],
+                                                 "alerts": [], "statics_rollouts": 7})
+    assert "recent_deployments" not in ctx
+    assert "статики на сквад за 6ч: 7" in ctx["description"]
 
 
 def test_fact_metadata_is_redacted_and_bounded():
