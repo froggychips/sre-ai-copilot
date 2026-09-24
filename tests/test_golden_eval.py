@@ -79,3 +79,42 @@ def test_baseline_matches_deterministic_reality():
         assert actual >= expected, (
             f"группа {group} просела: {actual} < {expected} (baseline)"
         )
+
+
+def _load_eval_script():
+    import importlib.util
+    from pathlib import Path
+
+    path = Path(__file__).resolve().parents[1] / "scripts" / "eval_golden.py"
+    spec = importlib.util.spec_from_file_location("eval_golden_script", path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+@pytest.mark.parametrize("update_baseline", [False, True])
+def test_all_cases_skipped_is_not_success(monkeypatch, tmp_path, update_baseline):
+    """«0 из 0 прошло» — не зелёный итог и не новый baseline.
+
+    До фикса прогон, где все кейсы пропущены (нет записей / нет ключа),
+    возвращал 0: cases_passed == cases_total == 0.
+    """
+    from types import SimpleNamespace
+
+    from app.evaluation.golden import CaseResult
+
+    mod = _load_eval_script()
+    baseline = tmp_path / "baseline.json"
+    monkeypatch.setattr(mod, "BASELINE_PATH", baseline)
+    monkeypatch.setattr(mod, "load_cases", lambda ids=None: CASES[:2])
+
+    async def _skip(case, mode):
+        return CaseResult(case_id=case.id, skipped=True, skip_reason="test")
+
+    monkeypatch.setattr(mod, "_run_one", _skip)
+    args = SimpleNamespace(
+        case=None, mode="replay", json_out=None,
+        update_baseline=update_baseline, check_baseline=False,
+    )
+    assert asyncio.run(mod._main_async(args)) == 1
+    assert not baseline.exists()
