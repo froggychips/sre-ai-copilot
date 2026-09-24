@@ -6,6 +6,21 @@ All notable changes to this project are documented in this file.
 
 ### Добавлено
 
+- **Правила `migration_failed` и `db_permission`.** Проваленная миграция —
+  самый частый класс поломок сквадов в live-RCA (10 из 31), гранты БД — ещё
+  3, и ни одно правило на них не указывало: признаки лежали в логах, фактов
+  было ноль, гипотез тоже. `MigrationFailedRule` ловит dirty-версию
+  golang-migrate / `schema_migrations dirty=true`, ошибку мигратора (в том
+  числе alembic), упавший Job `*migrat*` (BackoffLimitExceeded; ImagePullBackOff
+  мигратора — с кросс-ссылкой `related=image_pull`), Orleans «Field not found
+  in row» и «column/relation … does not exist» (последнее уверенно только при
+  деплое в окне). `DbPermissionRule` — «permission denied for/to …», «must be
+  owner of», 42501 (`grants`), «role … does not exist» (`role_missing`) и
+  отдельным подтипом «password authentication failed» (`auth`: это Secret, а
+  не гранты). В evidence только объект, операция и имена — строка лога
+  целиком не копируется. Без наблюдаемого материала оба правила молчат, а не
+  ставят ✗; упавший источник даёт ?. Kind-ы доступны как якоря гипотез.
+
 - **Live RCA-датасет на реальных инцидентах, без ключа.**
   `scripts/live_rca_dataset.py`: `export` берёт из БД copilot (read-only
   транзакция) инциденты, причину которых установил squad-medic
