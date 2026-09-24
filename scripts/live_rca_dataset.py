@@ -99,12 +99,18 @@ SELECT row_to_json(t) FROM (
   SELECT e.id AS event_id, e.started_at, e.outcome, e.root_cause, e.summary,
          i.incident_key, i.namespace, i.service_name, i.severity,
          i.alertnames, i.opened_at,
-         (SELECT a.raw->>'description' FROM kg_alerts a
-           WHERE a.incident_id = i.incident_key
-           ORDER BY a.fired_at DESC LIMIT 1) AS alert_description
+         al.alertname AS alert_name, al.description AS alert_description
   FROM kg_remediation_events e
   JOIN kg_incidents i ON i.id = e.incident_id
-  WHERE e.fixed AND length(coalesce(e.root_cause, '')) > 40
+  -- Алерт, который горел К МОМЕНТУ разбора медика, и его имя вместе с его же
+  -- описанием: самый свежий алерт инцидента мог прийти после разбора, а имя
+  -- из incident-wide alertnames — от другого алерта той же группы.
+  LEFT JOIN LATERAL (
+    SELECT a.alertname, a.raw->>'description' AS description FROM kg_alerts a
+    WHERE a.incident_id = i.incident_key AND a.fired_at <= e.started_at
+    ORDER BY a.fired_at DESC LIMIT 1
+  ) al ON true
+  WHERE e.fixed AND e.actor = 'squad-medic' AND length(coalesce(e.root_cause, '')) > 40
     AND e.started_at > now() - make_interval(days => {days})
   ORDER BY e.started_at DESC
 ) t;
@@ -159,7 +165,7 @@ def cmd_export(args) -> int:
 def _to_incident(case: Dict[str, Any]):
     from app.models.incident import Incident
 
-    alertname = (case.get("alertnames") or ["unknown"])[0]
+    alertname = case.get("alert_name") or (case.get("alertnames") or ["unknown"])[0]
     desc = case.get("alert_description") or ""
     summary = f"{alertname} in {case.get('namespace')} ({case.get('service_name')})"
     return Incident(
@@ -180,7 +186,8 @@ def _to_incident(case: Dict[str, Any]):
 
 
 async def _run_case(case: Dict[str, Any]) -> Dict[str, Any]:
-    from app.agents.fact_critic import FactCriticAgent, best_candidate
+    from app.agents.fact_critic import (FactCriticAgent, best_candidate,
+                                         survivors)
     from app.agents.multi_hypothesis import MultiHypothesisAgent
     from app.diagnostics import default_engine
     from app.diagnostics.incident_ctx import build_diagnostics_ctx
@@ -199,8 +206,10 @@ async def _run_case(case: Dict[str, Any]) -> Dict[str, Any]:
     def _cause(h) -> str:
         return str(getattr(h, "cause", "") or "")
 
+    # Только выжившие, как у best_candidate: опровергнутая критиком гипотеза
+    # в Top-3 засчитала бы модели причину, от которой пайплайн сам отказался.
     ranked = sorted(
-        critiqued.items, key=lambda h: float(getattr(h, "confidence", 0.0) or 0.0), reverse=True
+        survivors(critiqued).items, key=lambda h: float(getattr(h, "confidence", 0.0) or 0.0), reverse=True
     )
     return {
         "event_id": case["event_id"],
