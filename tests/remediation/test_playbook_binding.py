@@ -22,7 +22,7 @@ from app.database import IncidentRecord
 from app.remediation import matcher
 from app.remediation import verification as v
 from app.remediation.binding import (SNAPSHOT_VERSION, BindingViolation,
-                                     build_match_snapshot,
+                                     bind_server_params, build_match_snapshot,
                                      check_intent_binding, entry_binding,
                                      playbook_digest)
 from app.remediation.executor_gate import PolicyMode, evaluate_intent_gate
@@ -31,6 +31,9 @@ from app.services.intent_signature import compute_signature
 
 _RESTART = "restart_crashloop_deployment"
 _NOW = datetime(2026, 9, 24, 10, 0, tzinfo=timezone.utc)
+
+
+_SCALE_PARAMS = {"replicas": "{replicas}", "current_replicas": "{current_replicas}"}
 
 
 def _pb(name: str = "t_scale", steps=None, **overrides) -> Playbook:
@@ -45,7 +48,7 @@ def _pb(name: str = "t_scale", steps=None, **overrides) -> Playbook:
             "block": {"any": {"namespace_tier": ["prod", "system"]}},
         },
         "plan": {"steps": steps or [
-            {"action": "scale_deployment", "params": {"replicas": "{replicas}"}},
+            {"action": "scale_deployment", "params": _SCALE_PARAMS},
         ]},
         "verify": ["converged", "healthy"],
     }
@@ -70,9 +73,12 @@ def _intent(action: str = "scale_deployment", namespace: str = "squad-1",
     return ExecutionIntent.model_validate(data)
 
 
-def _bound(pb: Playbook, snap: dict, **kw) -> ExecutionIntent:
+def _bound(pb: Playbook, snap: dict, current: int | None = 2, **kw) -> ExecutionIntent:
+    """Intent, привязанный так же, как это делает pipeline: hash записи
+    снимка + серверные параметры с «живого» объекта (probe)."""
     binding = next(e["binding"] for e in snap["entries"] if e["playbook"] == pb.name)
-    return _intent(playbook=pb.name, playbook_match=binding, **kw)
+    intent = _intent(playbook=pb.name, playbook_match=binding, **kw)
+    return bind_server_params(intent, snap, lambda _i: current)
 
 
 @pytest.fixture
@@ -90,7 +96,7 @@ def test_snapshot_records_plan_verify_digest_and_stable_binding() -> None:
     (entry,) = snap["entries"]
     assert entry["playbook"] == "t_scale"
     assert entry["plan"] == [{"action": "scale_deployment", "resource_type": None,
-                              "params": {"replicas": "{replicas}"}}]
+                              "params": _SCALE_PARAMS}]
     assert entry["verify"] == ["converged", "healthy"]
     assert entry["playbook_digest"] == playbook_digest(pb)
     # Факты не переданы — precondition честно помечен как невыполненный.
@@ -149,7 +155,8 @@ def test_violations_each_have_their_own_reason() -> None:
 
 def test_intent_must_equal_a_plan_step() -> None:
     literal = _pb(name="t_literal", steps=[
-        {"action": "scale_deployment", "params": {"replicas": 2}},
+        {"action": "scale_deployment",
+         "params": {"replicas": 2, "current_replicas": "{current_replicas}"}},
     ])
     snap = _snapshot(literal)
     reg = {literal.name: literal}
@@ -289,9 +296,11 @@ def test_verify_names_only_for_server_bound_intent(monkeypatch) -> None:
     got = v.playbook_verify_names(bound, {"playbook_match": snap})
     assert got == {"playbook": "t_scale", "source": "match_snapshot",
                    "names": ["converged", "healthy"]}
-    # Снимок потерян — список берётся из реестра по имени.
+    # Снимок потерян — реестр НЕ подставляется: его редакция могла выкинуть
+    # обязательную проверку. Исход — binding_lost, не verified.
     monkeypatch.setattr(matcher, "default_registry", lambda: {pb.name: pb})
-    assert v.playbook_verify_names(bound, {})["source"] == "registry"
+    lost = v.playbook_verify_names(bound, {})
+    assert lost["source"] == "binding_lost" and lost["binding_lost"] is True
     # Имя без серверного hash-а (модель вписала при выключенном флаге) — не привязка.
     assert v.playbook_verify_names(_intent(playbook=pb.name), {"playbook_match": snap}) is None
 
@@ -376,8 +385,7 @@ def test_scale_playbook_gate_approves_squad_blocks_prod_and_data_plane(binding_o
                            ("prod-k1", "town-service", PolicyMode.BLOCK),
                            ("squad-1", "town-postgres", PolicyMode.BLOCK)):
         snap = _snapshot(scale, namespace=ns)
-        intent = _intent(namespace=ns, resource_name=name, playbook=_SCALE,
-                         playbook_match=snap["entries"][0]["binding"])
+        intent = _bound(scale, snap, namespace=ns, resource_name=name)
         assert evaluate_intent_gate(intent, match_snapshot=snap).mode == want, (ns, name)
 
 

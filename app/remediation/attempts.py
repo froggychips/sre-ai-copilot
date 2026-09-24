@@ -162,15 +162,26 @@ def claim_is_fresh(row: RemediationAttempt, ttl_seconds: int) -> bool:
     return (_utcnow_naive() - claimed).total_seconds() <= ttl_seconds
 
 
+# Ключ в JSON `intent` строки попытки: запись серверного снимка playbook-а,
+# под которую одобрен intent. Лежит рядом с intent-ом, а не отдельной
+# колонкой: читается только вместе с ним, и миграция ради одного поля
+# не нужна. ExecutionIntent.model_validate лишний ключ игнорирует.
+BOUND_ENTRY_KEY = "bound_playbook_entry"
+
+
 def new_claim(
     incident_id: str,
     signature: str,
     intent: Dict[str, Any],
     applied_by: str,
+    *,
+    bound_playbook_entry: Optional[Dict[str, Any]] = None,
 ) -> RemediationAttempt:
     """Строка claim-а. Добавляется в сессию вызывающим и коммитится вместе
     с JSON-claim-ом: конфликт уникальности на commit = проигранная гонка."""
     now = _utcnow_naive()
+    if bound_playbook_entry is not None:
+        intent = {**intent, BOUND_ENTRY_KEY: dict(bound_playbook_entry)}
     return RemediationAttempt(
         incident_id=incident_id,
         signature=signature,

@@ -26,13 +26,15 @@ Schema requirements:
 from __future__ import annotations
 
 import os
+import re
 from typing import Any, Iterable, Literal
 
 import yaml
 from pydantic import (BaseModel, ConfigDict, ValidationError, field_validator,
                       model_validator)
 
-from app.core.execution_dsl import ActionType
+from app.core.execution_dsl import (ActionType, ConcurrencyPolicy,
+                                    action_spec)
 from app.diagnostics.facts import FactKind
 from app.remediation.verify_checks import VERIFY_CHECKS
 
@@ -151,6 +153,30 @@ class _PolicySection(_StrictModel):
 
 _ACTION_VALUES = frozenset(a.value for a in ActionType)
 
+# Шаблон параметра — строка ЦЕЛИКОМ вида `{name}`. Один паттерн на всех:
+# рендер (`matcher.render_plan`) и сверка intent-а с планом
+# (`binding._step_matches`) обязаны понимать шаблон одинаково. Иначе
+# `"{replicas}oops"` рендер оставил бы литералом, а сверка приняла бы за
+# шаблон с любым значением — gate пропустил бы intent, которого план
+# отрендерить не может.
+TEMPLATE_RE = re.compile(r"^\{([a-z_][a-z0-9_]*)\}$")
+
+# Параметры, которые заполняет ТОЛЬКО сервер при привязке intent-а (не
+# модель): их значение — живое состояние кластера на момент отбора.
+# `current_replicas` — precondition `kubectl scale --current-replicas`:
+# конкурентный скейл (HPA, оператор, человек) между одобрением и записью
+# роняет dry-run/write, а не перезаписывается нашим планом.
+SERVER_PARAMS = frozenset({"current_replicas"})
+
+
+def template_name(value: object) -> str | None:
+    """Имя шаблона `{name}` или None, если значение — литерал."""
+    if isinstance(value, str):
+        m = TEMPLATE_RE.match(value)
+        if m:
+            return m.group(1)
+    return None
+
 
 class _PlanStep(_StrictModel):
     """Шаг v2-плана: ссылка на действие из реестра execution_dsl.
@@ -176,6 +202,31 @@ class _PlanStep(_StrictModel):
                 f"(известные: {sorted(_ACTION_VALUES)})"
             )
         return v
+
+    @model_validator(mode="after")
+    def _check_concurrency_guard(self) -> "_PlanStep":
+        # Действие с PRECONDITION-политикой (scale) без `current_replicas` в
+        # плане исполнилось бы без `--current-replicas`: привязка требует
+        # точного набора параметров, так что intent не смог бы нести
+        # precondition, и одобренный scale перезаписал бы чужой.
+        #
+        # Шаг без params — allowlist действия (gate-политика
+        # `_executor_apply_gate.yaml`), а не исполнимый план: исполнимый scale
+        # всегда несёт `replicas` (render_plan требует required_params).
+        spec = action_spec(ActionType(self.action))
+        if spec.concurrency is ConcurrencyPolicy.PRECONDITION and self.params:
+            if template_name(self.params.get("current_replicas")) != "current_replicas":
+                raise ValueError(
+                    f"step '{self.action}': concurrency=PRECONDITION требует "
+                    "params.current_replicas: \"{current_replicas}\" (заполняет сервер)"
+                )
+        for key, value in self.params.items():
+            if key in SERVER_PARAMS and template_name(value) != key:
+                raise ValueError(
+                    f"step '{self.action}': {key} — серверный параметр, "
+                    f"только шаблон \"{{{key}}}\", литерал запрещён"
+                )
+        return self
 
 
 class _PlanSection(_StrictModel):

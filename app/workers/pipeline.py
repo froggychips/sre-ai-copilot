@@ -336,6 +336,15 @@ def _enforce_candidate_binding(intent, candidates, incident_id, snapshot=None):
     return intent.model_copy(update={"playbook": None})
 
 
+def _probe_current_replicas(intent: ExecutionIntent) -> Optional[int]:
+    """Живое spec.replicas цели или None, если снять не удалось."""
+    from app.remediation.verification import snapshot_target
+    snap = snapshot_target(intent)
+    if snap.unknown:
+        return None
+    return snap.replicas_desired
+
+
 def _serialize_hypotheses(critiqued, facts: FactStore) -> str:
     lines = ["=== HYPOTHESES (fact-anchored multi-perspective) ==="]
     surv = survivors(critiqued).items
@@ -1204,6 +1213,14 @@ class IncidentPipeline:
             self.execution_intent, candidates, self.incident_id,
             self.playbook_match,
         )
+        if self.execution_intent is not None and self.execution_intent.playbook_match:
+            # Серверные параметры (current_replicas) — с живого объекта, после
+            # того как цель выбрана. Запись снимка получает новый hash.
+            from app.remediation.binding import bind_server_params
+            self.execution_intent = await asyncio.to_thread(
+                bind_server_params, self.execution_intent, self.playbook_match,
+                _probe_current_replicas,
+            )
         snap = t.snapshot().to_dict()
         # Метрика на root-span: смог ли LLM выдать structured-intent.
         self.root_span.set_attribute(

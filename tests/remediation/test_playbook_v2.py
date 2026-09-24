@@ -213,11 +213,12 @@ def test_render_plan_goes_through_dsl() -> None:
 
 def test_render_plan_templates_and_required_params() -> None:
     pb = Playbook.model_validate(_v2(plan={"steps": [
-        {"action": "scale_deployment", "params": {"replicas": "{replicas}"}},
+        {"action": "scale_deployment",
+         "params": {"replicas": "{replicas}", "current_replicas": "{current_replicas}"}},
     ]}))
     (intent, argv), = render_plan(pb, namespace="squad-3", resource_name="worker",
-                                  context={"replicas": 2})
-    assert "--replicas=2" in argv
+                                  context={"replicas": 2, "current_replicas": 1})
+    assert "--replicas=2" in argv and "--current-replicas=1" in argv
     with pytest.raises(PlanRenderError, match="has no value"):
         render_plan(pb, namespace="squad-3", resource_name="worker")
     bare = Playbook.model_validate(_v2(plan={"steps": [{"action": "scale_deployment"}]}))

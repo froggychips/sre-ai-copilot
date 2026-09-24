@@ -57,6 +57,27 @@ All notable changes to this project are documented in this file.
   Данные пишутся только вне репо (`~/.cache/sre-ai-copilot/live-rca/<дата>/`),
   путь внутри репо скрипт отвергает: в кейсах живые namespace-ы и выводы медика.
 
+### Изменено
+
+- **Restart- и scale-playbook доведены до строгого контракта**
+  (`docs/REMEDIATION_PLAYBOOK_CONTRACT.md`, `tests/remediation/test_playbook_contracts.py`):
+  каждая ветка отказа от preconditions до verify проверяется тестом.
+  - **Scale не перезаписывает чужой скейл.** `current_replicas` — серверный
+    параметр: pipeline снимает живое `spec.replicas` после выбора цели, кладёт
+    в запись снимка привязки (hash пересчитывается, подпись его покрывает), и
+    команда уходит как `kubectl scale --current-replicas=N`. HPA или человек
+    отскейлил между одобрением и кликом — пере-dry-run падает, записи нет.
+    Не снялось — `server_param_missing`. Значение из вывода модели
+    отбрасывается; схема не пропустит PRECONDITION-шаг без шаблона.
+  - **Verify судит по одобренному снимку.** Запись снимка едет вместе с
+    попыткой (`kg_remediation_attempts.intent.bound_playbook_entry`); re-fire,
+    заменивший `analysis.playbook_match`, не подменит список обязательных
+    проверок. Не нашлось записи с тем же hash — `binding_lost`, никогда не
+    verified; подстановки из текущего реестра больше нет.
+  - **Сверка intent-а с планом понимает шаблоны как рендер.** Шаблон — только
+    строка целиком `{name}` (`"{replicas}oops"` больше не wildcard), литералы
+    сравниваются после валидаторов `ExecutionIntent` (`"2"` == `2`).
+
 ## [1.0.19] — 2026-09-24 — Playbook v2, таблица попыток и исполнитель под своим SA
 
 ### Добавлено

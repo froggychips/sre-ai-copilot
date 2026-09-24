@@ -115,9 +115,21 @@ def is_mutating(action: "ActionType") -> bool:
 _SERVER_ONLY_FIELDS = ("playbook_match",)
 
 
+# То же для параметров: `current_replicas` — живое число реплик, которое
+# сервер снимает при привязке к playbook-у. Значение из вывода модели не
+# знание кластера, а догадка; оставить его — значит дать модели выбрать
+# precondition, против которого сверится `kubectl scale`.
+_SERVER_ONLY_PARAMS = ("current_replicas",)
+
+
 def _drop_server_fields(obj: Any) -> Any:
     if isinstance(obj, dict):
-        return {k: v for k, v in obj.items() if k not in _SERVER_ONLY_FIELDS}
+        out = {k: v for k, v in obj.items() if k not in _SERVER_ONLY_FIELDS}
+        if isinstance(out.get("params"), dict):
+            out["params"] = {
+                k: v for k, v in out["params"].items() if k not in _SERVER_ONLY_PARAMS
+            }
+        return out
     return obj
 
 
@@ -180,6 +192,15 @@ class ExecutionIntent(BaseModel):
                 v["replicas"] = r
             if isinstance(r, bool) or not isinstance(r, int) or not (1 <= r <= 100):
                 raise ValueError(f"Invalid replicas: {v['replicas']!r}")
+        if "current_replicas" in v:
+            # Precondition `--current-replicas`: 0 допустим (Deployment,
+            # отскейленный в ноль), верхняя граница — та же, что у replicas.
+            c = v["current_replicas"]
+            if isinstance(c, str) and c.isdigit():
+                c = int(c)
+                v["current_replicas"] = c
+            if isinstance(c, bool) or not isinstance(c, int) or not (0 <= c <= 100):
+                raise ValueError(f"Invalid current_replicas: {v['current_replicas']!r}")
         label = v.get("label")
         if label:
             if not re.fullmatch(r"[A-Za-z0-9._/=,\-]{1,253}", str(label)):

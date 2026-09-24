@@ -7,6 +7,12 @@
 #   * свежий выкат: регресс в новой версии лечится откатом, а не репликами;
 #   * UNKNOWN любого из них (источник упал) — не доказательство отсутствия.
 #
+# Конкурентный скейл. `current_replicas` ставит СЕРВЕР при привязке intent-а
+# (живое число реплик на момент отбора), модель его не пишет. Команда уходит
+# как `kubectl scale --current-replicas=N`: если между одобрением и записью
+# Deployment отмасштабировал HPA, оператор или человек, apiserver отказывает
+# и пере-dry-run перед записью роняет apply — чужое решение не затирается.
+#
 # Чего playbook проверить не может (фактов нет) и что остаётся человеку при
 # одобрении: есть ли у Deployment-а HPA (он перезапишет ручной scale — тогда
 # verify action_took_effect покажет расхождение) и в какую сторону меняется
@@ -43,6 +49,7 @@ plan:
     - action: scale_deployment
       params:
         replicas: "{replicas}"
+        current_replicas: "{current_replicas}"
 verify:
   - same_identity
   - action_took_effect
