@@ -47,7 +47,7 @@ from typing import (Any, Callable, Dict, List, Optional, Protocol,
                     Sequence, Set, Tuple)
 
 import structlog
-from sqlalchemy import func, or_, select
+from sqlalchemy import func, literal_column, or_, select, text
 from sqlalchemy.dialects import postgresql
 from sqlalchemy.sql import Select
 
@@ -172,8 +172,11 @@ class PsqlReader:
         self._columns: Dict[str, Set[str]] = {}
 
     def _json_rows(self, sql: str) -> List[Dict[str, Any]]:
+        # `sql` — только результат render_sql(Select) (значения экранирует
+        # literal_binds SQLAlchemy), не текст снаружи; обёртка — транзакция
+        # READ ONLY и построчный JSON.
         wrapped = ("BEGIN; SET TRANSACTION READ ONLY; "
-                   f"SELECT to_jsonb(t) FROM ({sql}) t; COMMIT;")
+                   f"SELECT to_jsonb(t) FROM ({sql}) t; COMMIT;")  # nosec B608
         out = self.run_psql(wrapped)
         if out is None:
             raise RuntimeError("psql не ответил")
@@ -186,9 +189,10 @@ class PsqlReader:
         if table not in self._columns:
             if not re.fullmatch(r"[a-z_]+", table):
                 return False
-            rows = self._json_rows(
-                "SELECT column_name FROM information_schema.columns "
-                f"WHERE table_name = '{table}'")
+            stmt: Select = (select(literal_column("column_name"))
+                    .select_from(text("information_schema.columns"))
+                    .where(literal_column("table_name") == table))
+            rows = self.rows(stmt)
             self._columns[table] = {str(r["column_name"]) for r in rows if r.get("column_name")}
         return column in self._columns[table]
 
