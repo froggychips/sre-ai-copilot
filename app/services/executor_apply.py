@@ -582,7 +582,15 @@ def apply_intent(
         # транзакцией с JSON-claim-ом ниже; конфликт уникальности на commit
         # = параллельный apply того же intent-а успел первым.
         claim_from: Optional[str] = None
-        if attempt is not None and attempt.status == attempts_store.STATUS_UNKNOWN:
+        # Переклеймить можно только ТУ ЖЕ команду. Если после пометки re-fire
+        # принёс другой intent (другая подпись), это новая попытка — своя
+        # строка: иначе результат новой команды лёг бы в строку со старыми
+        # intent/target, и верификация по строке проверяла бы не то действие.
+        if (
+            attempt is not None
+            and attempt.status == attempts_store.STATUS_UNKNOWN
+            and attempt.signature == expected_signature
+        ):
             if not attempts_store.reclaim_unknown(db, attempt, applied_by):
                 db.rollback()
                 return _refuse(incident_id, "apply_in_flight", applied_by)

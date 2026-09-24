@@ -256,6 +256,30 @@ def test_unknown_reclaimed_by_approval_after_mark(Session):
     assert row.status == attempts_store.STATUS_APPLIED and row.applied_by == "tester"
 
 
+def test_unknown_row_for_other_intent_gets_new_attempt(Session):
+    """Re-fire после пометки принёс другой intent: старая строка остаётся
+    unknown со своим intent-ом, новая команда получает свою строку."""
+    _seed(Session, approval_decided_at=_naive_now())
+    old_intent = {**INTENT, "resource_name": "other-service"}
+    old_sig = compute_signature(ExecutionIntent.model_validate(old_intent))
+    db = Session()
+    row = attempts_store.new_claim(INCIDENT, old_sig, old_intent, "crashed-worker")
+    row.status = attempts_store.STATUS_UNKNOWN
+    row.updated_at = _naive_now() - timedelta(minutes=10)
+    db.add(row)
+    db.commit()
+    db.close()
+    fake = _Exec()
+    with patch.object(executor_apply.k8s_service, "execute_intent", fake):
+        out = executor_apply.apply_intent(INCIDENT, "tester", SIG)
+    assert out["ok"] is True and fake.writes == 1
+    by_sig = {r.signature: r for r in _rows(Session)}
+    assert by_sig[old_sig].status == attempts_store.STATUS_UNKNOWN
+    assert by_sig[old_sig].resource_name == "other-service"
+    assert by_sig[SIG].status == attempts_store.STATUS_APPLIED
+    assert by_sig[SIG].resource_name == "town-service"
+
+
 def test_unknown_row_without_later_approval_refused(Session):
     _seed(Session, approval_decided_at=_naive_now() - timedelta(minutes=10))
     db = Session()
