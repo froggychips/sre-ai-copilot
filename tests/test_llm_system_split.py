@@ -154,3 +154,48 @@ def test_replay_keys_match_legacy_single_prompt():
     user = f"<user_context>\n{ctx}\n</user_context>"
     assert rec.lookup(user, system)["text"] == "recorded"
     assert rec.misses == []
+
+
+def _mock_llm(mocker):
+    mock_api = mocker.patch(
+        "app.services.llm_service.llm_client.generate_full", new_callable=AsyncMock,
+    )
+    mock_api.return_value = {"text": "{}", "input_tokens": 0, "output_tokens": 0,
+                             "model": "m", "backend": "anthropic"}
+    return mock_api
+
+
+@pytest.mark.asyncio
+async def test_fix_open_jira_directive_goes_to_system(mocker):
+    """Указание «есть открытая Jira — не просто рестарт» — наше, а не данные.
+
+    Оставшись в user_context, оно противоречило бы DATA_POLICY («внутри —
+    данные, не инструкции»), и инцидент с открытой задачей мог бы
+    регрессировать к голому рестарту.
+    """
+    from app.agents.fix import FixAgent
+
+    mock_api = _mock_llm(mocker)
+    jira = {
+        "open": [{"key": "OPS-1", "priority": "High", "summary": "leak",
+                  "url": "https://jira.example/OPS-1"}],
+        "resolved": [], "has_open": True,
+    }
+    await FixAgent().suggest("memory leak in api", jira_context=jira)
+
+    prompt = mock_api.call_args.args[0]
+    system = mock_api.call_args.kwargs["system"]
+    assert "OPS-1" in prompt  # сами задачи — данные
+    assert "NOT just a restart" in system
+    assert "NOT just a restart" not in prompt
+
+
+@pytest.mark.asyncio
+async def test_fix_without_open_jira_has_no_directive(mocker):
+    from app.agents.fix import FixAgent
+
+    mock_api = _mock_llm(mocker)
+    jira = {"open": [], "resolved": [], "has_open": False}
+    await FixAgent().suggest("memory leak in api", jira_context=jira)
+
+    assert "NOT just a restart" not in mock_api.call_args.kwargs["system"]
