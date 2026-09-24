@@ -467,3 +467,13 @@ def test_pipeline_probe_reports_unknown_as_none(monkeypatch) -> None:
     monkeypatch.setattr("app.remediation.verification.snapshot_target",
                         lambda i, **kw: live)
     assert pipeline._probe_current_replicas(intent) == 4
+
+
+def test_scale_live_replicas_above_intent_limit_still_approvable() -> None:
+    """Живой Deployment на 101 реплике: current_replicas — состояние кластера,
+    лимит 100 у replicas к нему не относится; даунскейл до 4 валиден."""
+    snap = _snapshot(SCALE)
+    intent = _bind(SCALE, snap, current=101)
+    again = ExecutionIntent.model_validate(intent.model_dump(mode="json"))
+    assert again.params == {"replicas": 4, "current_replicas": 101}
+    assert check_intent_binding(again, snap, _REG).name == SCALE

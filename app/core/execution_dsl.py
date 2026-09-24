@@ -193,13 +193,16 @@ class ExecutionIntent(BaseModel):
             if isinstance(r, bool) or not isinstance(r, int) or not (1 <= r <= 100):
                 raise ValueError(f"Invalid replicas: {v['replicas']!r}")
         if "current_replicas" in v:
-            # Precondition `--current-replicas`: 0 допустим (Deployment,
-            # отскейленный в ноль), верхняя граница — та же, что у replicas.
+            # Precondition `--current-replicas` описывает ТЕКУЩЕЕ состояние
+            # кластера, а не наш выбор: 0 допустим (Deployment отскейлен в
+            # ноль), верхняя граница — int32 spec.replicas, а не лимит 100
+            # у replicas. Иначе живой Deployment на 101 реплике делал бы
+            # одобренный intent невалидным даже для даунскейла до 4.
             c = v["current_replicas"]
             if isinstance(c, str) and c.isdigit():
                 c = int(c)
                 v["current_replicas"] = c
-            if isinstance(c, bool) or not isinstance(c, int) or not (0 <= c <= 100):
+            if isinstance(c, bool) or not isinstance(c, int) or not (0 <= c <= 2**31 - 1):
                 raise ValueError(f"Invalid current_replicas: {v['current_replicas']!r}")
         label = v.get("label")
         if label:
