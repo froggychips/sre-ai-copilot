@@ -4,6 +4,22 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+### Изменено
+
+- **Контекст кейса live RCA доходит до правил тем же путём, что в бою.**
+  `scripts/live_rca_dataset.py`: `build_case_ctx(case, mode)` собирает ctx
+  правил по режиму входа — `alert_only`, `medic_observed`, `kg_reconstructed`,
+  `kg+medic`; `run --context auto` гоняет все режимы, для которых у кейса
+  есть вход, на одних и тех же кейсах. `alert_only` граф больше не видит.
+  События подов из графа — в `k8s_events` с `pod_name` (PodEventsRule
+  отличает чужой workload вместо «unverified») и строками в `k8s_summary`
+  с маркером источника, но только события target-workload-а: текстовые
+  правила события не перепроверяют. Наблюдения медика дописываются к
+  событиям графа, а не подменяют их. Всё, чего в кейсе нет, помечается
+  `not_reconstructed` в `source_status` — правила отвечают «?», а не
+  уверенным ✗. Кейс со снимком, но без строк графа, получает графовый
+  режим. Новая подкоманда `facts` — покрытие правил по режимам без LLM.
+
 ### Добавлено
 
 - **Пакетный режим FactCritic (`FACT_CRITIC_MODE=batch`).** Раньше критик

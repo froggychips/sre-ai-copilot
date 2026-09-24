@@ -168,3 +168,112 @@ def test_score_is_split_by_context():
     assert s["by_context"]["alert_only"]["abstention_rate"] == 1.0
     assert s["by_context"]["medic_observed"]["top1"] == 1.0
     assert s["cases_run"] == 2
+
+# --- ctx кейса по режимам входа ------------------------------------------------
+
+_KG_CASE = {
+    "event_id": 7, "alert_name": "KubeDeploymentReplicasMismatch", "namespace": "squad-alpha",
+    "service_name": "bravo-service", "severity": "warning", "opened_at": "2026-09-20T10:00:00",
+    "observed_medic": ["состояние подов: OOMKilled"],
+    "kg_context": {
+        "pod_events": [{"pod": "bravo-service-1", "type": "Warning", "reason": "BackOff",
+                        "message": "Back-off restarting failed container", "count": 12,
+                        "last_seen": "2026-09-20T09:55:00"}],
+        "deployments": [{"service": "bravo-service", "status": "success",
+                         "started_at": "2026-09-20T09:40:00", "finished_at": "2026-09-20T09:45:00"}],
+        "alerts": [],
+    },
+}
+
+
+@pytest.fixture(autouse=True)
+def _cli_backend(monkeypatch):
+    # Settings валидируется при импорте app.*; LLM в этих тестах не зовётся.
+    monkeypatch.setenv("LLM_BACKEND", "claude_cli")
+
+
+def test_available_modes_follow_case_inputs():
+    assert lrd.available_modes(_KG_CASE) == list(lrd.MODES)
+    assert lrd.available_modes({"event_id": 1}) == ["alert_only"]
+    assert lrd.available_modes({"event_id": 1, "observed_medic": ["x"]}) == ["alert_only", "medic_observed"]
+
+
+def test_alert_only_never_sees_graph_and_answers_unknown_not_absent():
+    ctx = lrd.build_case_ctx(_KG_CASE, "alert_only")
+    assert not ctx.get("k8s_events") and not ctx.get("k8s_summary")
+    assert ctx["source_status"]["k8s_events"].startswith(lrd.NOT_RECONSTRUCTED)
+    v = lrd.rule_facts(_KG_CASE, "alert_only")["by_verdict"]
+    # Без пометки источника пустое поле давало уверенное ✗ «OOM не было».
+    assert "absent" not in v
+    assert "oom_killed" in v["unknown"]
+
+
+def test_kg_events_reach_both_structured_and_text_rules():
+    ctx = lrd.build_case_ctx(_KG_CASE, "kg_reconstructed")
+    assert ctx["k8s_events"][0]["reason"] == "BackOff"
+    assert ctx["recent_deployments"][0]["name"] == "bravo-service"
+    assert ctx["k8s_summary"].startswith("[kg_pod_events]")
+    assert ctx["source_status"]["k8s_events"].startswith("partial")
+    assert "crashloop" in lrd.rule_facts(_KG_CASE, "kg_reconstructed")["observed"]
+    # Режим kg_reconstructed наблюдений медика не видит.
+    assert "squad-medic" not in ctx["k8s_summary"]
+
+
+def test_kg_plus_medic_appends_not_overwrites():
+    ctx = lrd.build_case_ctx(_KG_CASE, "kg+medic")
+    assert [e["reason"] for e in ctx["k8s_events"]] == ["BackOff", "OOMKilled"]
+    assert "[kg_pod_events]" in ctx["k8s_summary"] and "[squad-medic]" in ctx["k8s_summary"]
+    assert {"crashloop", "oom_killed"} <= set(lrd.rule_facts(_KG_CASE, "kg+medic")["observed"])
+
+
+def test_foreign_workload_events_never_become_text_facts():
+    case = dict(_KG_CASE, observed_medic=[], kg_context={
+        "pod_events": [{"pod": "charlie-worker-5f9c-x1", "type": "Warning", "reason": "OOMKilled",
+                        "message": "Container charlie was OOMKilled", "count": 3}],
+        "deployments": [], "alerts": []})
+    ctx = lrd.build_case_ctx(case, "kg_reconstructed")
+    # В тексте чужого OOM нет, а структурированное событие несёт pod_name —
+    # PodEventsRule видит, что оно у другого workload-а.
+    assert not ctx.get("k8s_summary")
+    assert ctx["k8s_events"][0]["pod_name"] == "charlie-worker-5f9c-x1"
+    assert "oom_killed" not in lrd.rule_facts(case, "kg_reconstructed")["observed"]
+
+
+def test_snapshot_without_graph_rows_still_has_a_mode():
+    case = {"event_id": 9, "context_snapshot": {"schema": "incident_ctx/v1",
+                                                  "k8s_pod_state": {"x": 1}}}
+    assert "kg_reconstructed" in lrd.available_modes(case)
+    assert lrd.build_case_ctx(dict(case, alert_name="A", namespace="squad-alpha"),
+                              "kg_reconstructed")["k8s_pod_state"] == {"x": 1}
+
+
+def test_statics_counter_never_becomes_recent_deploy():
+    # Статику SQL в строки деплоев не берёт, только счётчиком: «недавний
+    # деплой» по веерной раскатке статики был бы истиной почти всегда.
+    case = dict(_KG_CASE, observed_medic=[], kg_context={
+        "pod_events": [], "alerts": [], "deployments": [], "statics_rollouts": 12})
+    ctx = lrd.build_case_ctx(case, "kg_reconstructed")
+    assert not ctx.get("recent_deployments")
+    assert ctx["source_status"]["recent_deployments"].startswith(lrd.NOT_RECONSTRUCTED)
+    assert "статики" in ctx["description"]
+    assert "recent_deploy" not in lrd.rule_facts(case, "kg_reconstructed")["observed"]
+
+
+def test_unknown_mode_is_refused():
+    with pytest.raises(ValueError):
+        lrd.build_case_ctx(_KG_CASE, "snapshot")
+
+
+def test_auto_runs_every_available_mode(tmp_path, monkeypatch):
+    import asyncio
+    import json
+    (tmp_path / "cases.jsonl").write_text(json.dumps(_KG_CASE) + "\n")
+    seen = []
+
+    async def fake(case, context):
+        seen.append(context)
+        return {"event_id": case["event_id"], "context": context}
+
+    monkeypatch.setattr(lrd, "_run_case", fake)
+    asyncio.run(lrd._run_async(_run_args(tmp_path)))
+    assert seen == list(lrd.MODES)
