@@ -17,7 +17,7 @@ pipeline не должен падать, если populator упал.
 from __future__ import annotations
 
 from app.core.timeutil import parse_ts
-from typing import Dict, cast
+from typing import Any, Dict, cast
 
 import structlog
 from sqlalchemy.orm import Session
@@ -127,6 +127,13 @@ def populate_from_incident(db: Session, incident: Incident) -> Dict[str, int]:
 
     # AlertEvent — идемпотентен по fingerprint.
     fired_at = parse_ts(incident.starts_at)
+    alert_raw: Dict[str, Any] = {"description": incident.description}
+    # Batch, из которого AM выбросил алерты по `max_alerts`: без пометки в
+    # самой строке «соседей по группе мало» в nearby/recurrence читалось бы
+    # как «соседей нет». Ключ пишется только при >0: raw перезаписывается
+    # каждым уведомлением, и следующий полный batch честно снимает пометку.
+    if incident.batch_truncated_alerts:
+        alert_raw["batch_truncated_alerts"] = incident.batch_truncated_alerts
     if fired_at is not None:
         try:
             with db.begin_nested():
@@ -141,7 +148,7 @@ def populate_from_incident(db: Session, incident: Incident) -> Dict[str, int]:
                     # incident_key инцидента сервиса. Оставлено, чтобы строка
                     # без инцидента (attach упал) не осталась с NULL.
                     incident_id=incident.incident_id,
-                    raw={"description": incident.description},
+                    raw=alert_raw,
                 )
             stats["alerts_added"] += 1
         except Exception as e:

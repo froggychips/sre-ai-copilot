@@ -17,7 +17,7 @@ from app.ingestion.raw_collector import raw_collector
 from app.knowledge_graph.remediation_events import (SignatureError,
                                                     check_remediation_signature,
                                                     record_external_remediation)
-from app.metrics import ALERTS_SUPPRESSED
+from app.metrics import ALERTS_SUPPRESSED, ALERTS_TRUNCATED
 from app.models.remediation_event import RemediationEventIn
 from app.models.incident import AlertManagerAlert, AlertManagerWebhook, Incident
 from app.workers.pipeline_scope import SCOPE_APPROVED_KEY as _SCOPE_APPROVED_KEY
@@ -85,6 +85,38 @@ def _mark_incidents_noise(db, incidents, kinds) -> None:
                 "enrich_forward.incident_noise_mark_failed",
                 incident_id=inc.incident_id, error=type(e).__name__,
             )
+
+
+def _note_truncation(payload: AlertManagerWebhook, endpoint: str) -> int:
+    """Учесть алерты, которые AM выбросил по `max_alerts`. Вернуть их число.
+
+    Усечённый batch иначе неотличим от полного: группа из 40 CrashLoop-ов
+    приходит десятью, и copilot честно считает, что их десять. Сами
+    отброшенные алерты не восстановить — у webhook-а нет их меток, — но
+    факт неполноты должен быть виден: в логе, в метрике и на каждом
+    инциденте batch-а (`batch_truncated_alerts`), чтобы «соседей по группе
+    мало» не читалось как «соседей нет».
+
+    Резолв по отсутствию в batch-е здесь не делается нигде: резолвит только
+    явный `status=resolved` алерта, а сверка с активными алертами
+    (`alerts_resolve_sync`) берёт снимок из API AM, а не из webhook-а. Так
+    что усечение не закрывает инциденты — оно лишь прячет часть группы.
+    """
+    truncated = int(payload.truncatedAlerts or 0)
+    if truncated <= 0:
+        return 0
+    ALERTS_TRUNCATED.labels(
+        endpoint=endpoint, receiver=payload.receiver or "",
+    ).inc(truncated)
+    log.warning(
+        "webhook.batch_truncated",
+        endpoint=endpoint,
+        receiver=payload.receiver,
+        group_key=payload.groupKey,
+        delivered=len(payload.alerts),
+        truncated=truncated,
+    )
+    return truncated
 
 
 def _filter_suppressed(
@@ -360,6 +392,7 @@ async def alertmanager_webhook(
     raw_payload = payload.model_dump()
     raw_payload.setdefault("id", payload.groupKey)
     raw_collector.ingest(raw_payload)
+    truncated = _note_truncation(payload, "alertmanager")
 
     # A3: allowlist filter. Применяем сразу после raw-store, чтобы суrnu trace
     # сохранил исходный batch, но дальше идут только не-noise alerts.
@@ -389,7 +422,7 @@ async def alertmanager_webhook(
             # AM-retry вечно бьётся в тот же битый alert.
             log.warning("webhook.skipped_invalid_alert", labels=alert.labels)
             continue
-        incident = Incident.from_alertmanager(alert)
+        incident = Incident.from_alertmanager(alert, batch_truncated_alerts=truncated)
 
         existing = (
             db.query(IncidentRecord)
@@ -552,7 +585,7 @@ async def alertmanager_webhook(
             task = process_incident_task.delay(dispatched)
             accepted.append({"incident_id": incident.incident_id, "task_id": task.id})
 
-    return {"status": "accepted", "alerts": accepted}
+    return {"status": "accepted", "alerts": accepted, "truncated_alerts": truncated}
 
 
 @router.post(
@@ -581,6 +614,7 @@ async def alertmanager_webhook_store_only(
     raw_payload = payload.model_dump()
     raw_payload.setdefault("id", payload.groupKey)
     raw_collector.ingest(raw_payload)
+    truncated = _note_truncation(payload, "store")
 
     # A3: allowlist filter — pure-noise alerts даже в KG-store не пишем,
     # чтобы recurrence/incidents_on метрики не были загажены Watchdog'ом.
@@ -590,7 +624,9 @@ async def alertmanager_webhook_store_only(
     for alert in payload_alerts:
         try:
             validate_alert_labels(alert)
-            incident = Incident.from_alertmanager(alert)
+            incident = Incident.from_alertmanager(
+                alert, batch_truncated_alerts=truncated,
+            )
         except HTTPException:
             # Малформированные alerts skip-аем, не падаем на batch.
             log.warning("kg_store.skipped_invalid_alert", labels=alert.labels)
@@ -618,7 +654,12 @@ async def alertmanager_webhook_store_only(
             stored.append({"incident_id": incident.incident_id, "result": "failed"})
 
     db.commit()
-    return {"status": "stored", "alerts": stored, "suppressed_allowlist": suppressed_count}
+    return {
+        "status": "stored",
+        "alerts": stored,
+        "suppressed_allowlist": suppressed_count,
+        "truncated_alerts": truncated,
+    }
 
 
 @router.post(
@@ -650,6 +691,7 @@ async def alertmanager_webhook_enrich_and_forward(
     raw_payload = payload.model_dump()
     raw_payload.setdefault("id", payload.groupKey)
     raw_collector.ingest(raw_payload)
+    truncated = _note_truncation(payload, "enrich_and_forward")
 
     # A3: allowlist filter — Watchdog/InfoInhibitor и self-noise отсеиваем
     # ДО enrichment-стадии. Это снимает ~30-40% бесполезного шума.
@@ -662,7 +704,9 @@ async def alertmanager_webhook_enrich_and_forward(
     for alert in payload_alerts:
         try:
             validate_alert_labels(alert)
-            incident = Incident.from_alertmanager(alert)
+            incident = Incident.from_alertmanager(
+                alert, batch_truncated_alerts=truncated,
+            )
         except HTTPException:
             log.warning("enrich_forward.skipped_invalid_alert", labels=alert.labels)
             continue
@@ -905,6 +949,7 @@ async def alertmanager_webhook_enrich_and_forward(
         "suppressed_inhibited": suppressed_inhibited,
         "suppressed_allowlist": suppressed_allowlist,
         "enrich_enabled": settings.DISCORD_ENRICH_ENABLED,
+        "truncated_alerts": truncated,
     }
 
 

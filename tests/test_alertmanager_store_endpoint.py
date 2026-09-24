@@ -192,3 +192,46 @@ def test_store_endpoint_rejects_unsigned_request(app_client):
         },
     )
     assert resp.status_code == 401
+
+
+def test_store_endpoint_persists_batch_truncation(app_client):
+    """`truncatedAlerts` доезжает до kg_alerts.raw, а не только до лога.
+
+    enrich-and-forward (живой путь) пишет тем же populate_from_incident, так
+    что проверки через /store достаточно: смотрим в саму строку БД.
+    """
+    from app.database import SessionLocal
+    from app.knowledge_graph.schema import AlertEvent
+
+    fingerprint = f"store-trunc-{uuid.uuid4().hex[:12]}"
+    payload = {
+        "version": "4",
+        "groupKey": "store-trunc",
+        "status": "firing",
+        "receiver": "sre-copilot",
+        "truncatedAlerts": 12,
+        "alerts": [
+            {
+                "status": "firing",
+                "labels": {
+                    "alertname": "KubePodCrashLooping",
+                    "severity": "warning",
+                    "namespace": "squad-1",
+                    "service": "town-service",
+                },
+                "annotations": {"summary": "stub", "description": "stub"},
+                "startsAt": "2026-05-14T10:00:00Z",
+                "fingerprint": fingerprint,
+            }
+        ],
+    }
+    resp = _post_signed(app_client, "/webhooks/alertmanager/store", payload)
+    assert resp.status_code == 202, resp.text
+    assert resp.json()["truncated_alerts"] == 12
+
+    db = SessionLocal()
+    try:
+        row = db.query(AlertEvent).filter(AlertEvent.fingerprint == fingerprint).one()
+        assert (row.raw or {}).get("batch_truncated_alerts") == 12
+    finally:
+        db.close()

@@ -65,6 +65,25 @@ def test_populate_creates_service_and_alert(db):
     assert alerts[0]["fingerprint"] == "inc-1"
 
 
+def test_populate_persists_batch_truncation_in_alert_raw(db):
+    """Усечённый batch AM виден в самой строке kg_alerts, а полный — нет.
+
+    raw перезаписывается каждым уведомлением: следующий полный batch того же
+    fingerprint-а должен снять пометку, а не тащить её вечно.
+    """
+    inc = _incident(incident_id="trunc-1")
+    inc.batch_truncated_alerts = 9
+    populate_from_incident(db, inc)
+    db.commit()
+    row = db.query(AlertEvent).filter(AlertEvent.fingerprint == "trunc-1").one()
+    assert row.raw == {"description": "y", "batch_truncated_alerts": 9}
+
+    populate_from_incident(db, _incident(incident_id="trunc-1"))
+    db.commit()
+    db.refresh(row)
+    assert row.raw == {"description": "y"}
+
+
 def test_populate_records_deployments_from_tc(db):
     # auto_populator достаёт sha из changes[0].version (фикс 039c80c) — TC-context
     # не выдаёт sha напрямую на верхнем уровне билда, только через changes.

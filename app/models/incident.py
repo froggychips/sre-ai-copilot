@@ -79,6 +79,11 @@ class AlertManagerWebhook(BaseModel):
     commonAnnotations: Dict[str, str] = Field(default_factory=dict)
     externalURL: Optional[str] = None
     alerts: List[AlertManagerAlert]
+    # Сколько алертов группы AM отбросил из-за `max_alerts` в receiver-е
+    # (webhook v4). У наших receiver-ов стоит `max_alerts: 10`
+    # (k8s/vmalertmanagerconfig.yaml): группа из 30 алертов приходит
+    # десятью, и без этого поля усечённый batch неотличим от полного.
+    truncatedAlerts: int = Field(0, ge=0)
 
 
 class Incident(BaseModel):
@@ -105,9 +110,15 @@ class Incident(BaseModel):
     # AM API v2 — `status: {state, silencedBy, inhibitedBy}`). None — обычный
     # active alert. См. AlertManagerAlert._extract_status_extra.
     status_extra: Optional[Dict[str, Any]] = None
+    # >0 — алерт пришёл в batch-е, из которого AM выбросил столько алертов
+    # по `max_alerts`. Соседи по группе видны не все: «в группе один под»
+    # может означать «первые десять из сорока». См. AlertManagerWebhook.
+    batch_truncated_alerts: int = 0
 
     @classmethod
-    def from_alertmanager(cls, alert: AlertManagerAlert) -> "Incident":
+    def from_alertmanager(
+        cls, alert: AlertManagerAlert, *, batch_truncated_alerts: int = 0,
+    ) -> "Incident":
         labels = alert.labels
         annotations = alert.annotations
         return cls(
@@ -126,6 +137,7 @@ class Incident(BaseModel):
             generator_url=alert.generatorURL,
             raw=alert.model_dump(),
             status_extra=alert.status_extra,
+            batch_truncated_alerts=batch_truncated_alerts,
         )
 
 
