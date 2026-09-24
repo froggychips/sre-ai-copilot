@@ -41,6 +41,7 @@ process_crash.py):
 """
 from __future__ import annotations
 
+import re
 from typing import Any, Dict, List, Optional, Tuple
 
 from app.diagnostics.facts import Fact, FactKind
@@ -73,6 +74,17 @@ _FOREIGN_OBJECT_CONFIDENCE = 0.5
 _SCOPED = "scoped"        # объект события = target workload
 _FOREIGN = "foreign"      # объект события — другой workload namespace-а
 _UNVERIFIED = "unverified"  # проверить нечем
+
+
+# kubelet пишет «Back-off pulling image» под тем же reason BackOff, что и
+# «Back-off restarting failed container»; первое — про образ (ImagePullRule),
+# процесс в таком поде не запускался ни разу, и crashloop-ом оно не является.
+_PULL_BACKOFF_RE = re.compile(r"back-?off pulling image", re.IGNORECASE)
+
+
+def is_image_pull_backoff(event: Dict[str, Any]) -> bool:
+    """BackOff-событие про вытягивание образа, а не про рестарт процесса."""
+    return bool(_PULL_BACKOFF_RE.search(event.get("message") or ""))
 
 
 def _match_reason(reason: str) -> Tuple[str, float] | None:
@@ -145,6 +157,8 @@ class PodEventsRule(Rule):
             _SCOPED: {}, _FOREIGN: {}, _UNVERIFIED: {},
         }
         for ev in events:
+            if is_image_pull_backoff(ev):
+                continue
             match = _match_reason(ev.get("reason", ""))
             if match is None:
                 continue

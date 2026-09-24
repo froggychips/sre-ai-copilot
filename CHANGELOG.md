@@ -129,6 +129,19 @@ All notable changes to this project are documented in this file.
   partial: правило, не нашедшее сигнала, отвечает «?», а не «не было».
   `export --keep-ids` перевыгружает прежний набор кейсов.
 
+- **Правила «контейнер не стартовал»: `image_pull` и `container_config`.**
+  На реальных инцидентах сквадов (тег без образа, нет ключа в Secret)
+  движок не выдавал ни одного факта — правил под эти классы не было, —
+  гипотез не появлялось, и live-RCA отказывался в 100% таких кейсов.
+  `ImagePullRule` читает `ErrImagePull`/`ImagePullBackOff`/`Failed … pull
+  image` и различает причину по ответу реестра (`not_found` / `auth` /
+  `network`); `ContainerConfigRule` — `CreateContainerConfigError` и
+  «couldn't find key … in Secret/ConfigMap», в evidence объект и имена
+  отсутствующих ключей (значения не читаются). Привязка к target-workload —
+  как у PodEventsRule. Снапшот k8s теперь кладёт в текст waiting-state
+  контейнеров target-workload-а (штатные ContainerCreating/PodInitializing —
+  нет), иначе про Pending-под он молчал.
+
 - **Live RCA-датасет на реальных инцидентах, без ключа.**
   `scripts/live_rca_dataset.py`: `export` берёт из БД copilot (read-only
   транзакция) инциденты, причину которых установил squad-medic
@@ -192,6 +205,11 @@ All notable changes to this project are documented in this file.
   про Orleans, рост числа мёртвых записей (`ctx.orleans_membership`), всплеск
   промахов пингов, сбоев доставки или таймаутов выше шума и на +50 % от суточной
   базы (`ctx.orleans_health`). При упавших логах ✗ понижается до ?.
+
+- **«Back-off pulling image» больше не считается crashloop-ом.** kubelet
+  пишет его под тем же reason `BackOff`, что и «Back-off restarting failed
+  container», и `CrashLoopBackOffRule` / `PodEventsRule` выдавали `crashloop`
+  по поду, процесс в котором ни разу не запускался. Теперь это `image_pull`.
 
 ## [1.0.19] — 2026-09-24 — Playbook v2, таблица попыток и исполнитель под своим SA
 

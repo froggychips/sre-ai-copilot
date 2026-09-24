@@ -148,12 +148,18 @@ class FactKind:
     # инцидента. Мёртвые записи силосов без них — хронический фон (ABSENT с
     # evidence.chronic), см. rules/orleans_membership.py.
     ORLEANS_MEMBERSHIP_DEGRADED = "orleans_membership_degraded"
+    # Контейнер не стартовал: образ не вытянулся (тега нет / доступ / сеть).
+    IMAGE_PULL = "image_pull"
+    # Контейнер не стартовал: kubelet не собрал окружение — нет ключа или
+    # самого Secret/ConfigMap (CreateContainerConfigError).
+    CONTAINER_CONFIG = "container_config"
 
     ALL = frozenset({
         OOM_KILLED, CRASHLOOP, FAILED_SCHEDULING,
         RECENT_DEPLOY, RESOURCE_PRESSURE, UPSTREAM_DEGRADED,
         PROCESS_CRASH, MIGRATION_FAILED, DB_PERMISSION,
         ORLEANS_MEMBERSHIP_DEGRADED,
+        IMAGE_PULL, CONTAINER_CONFIG,
     })
 
 

@@ -441,6 +441,26 @@ def _fact_to_short_text(fact: Fact) -> str:
         return "Pod в CrashLoopBackOff — startup ошибка / зависимости недоступны"
     if fact.source_rule == "FailedSchedulingRule":
         return "FailedScheduling — нет nodes для pod (resource constraints)"
+    if fact.source_rule == "ImagePullRule":
+        image = ev.get("image")
+        what = f" `{image}`" if image else ""
+        cause = {
+            "not_found": "тега/манифеста нет в registry",
+            "auth": "registry отказал в доступе",
+            "network": "registry недоступен",
+        }.get(ev.get("cause") or "", "причина не распознана")
+        return f"Образ{what} не вытягивается — {cause}"
+    if fact.source_rule == "ContainerConfigRule":
+        kind = "ConfigMap" if ev.get("object_kind") == "configmap" else "Secret"
+        name = ev.get("object_name")
+        where = f" `{name}`" if name else ""
+        keys = ev.get("missing_keys") or []
+        if keys:
+            shown = ", ".join(keys[:3]) + (f" +{len(keys) - 3}" if len(keys) > 3 else "")
+            return f"CreateContainerConfigError: в {kind}{where} нет ключей {shown}"
+        if ev.get("missing_object"):
+            return f"CreateContainerConfigError: {kind}{where} не найден"
+        return "CreateContainerConfigError — контейнер не собран из Secret/ConfigMap"
     return f"{fact.source_rule}: observed"
 
 
