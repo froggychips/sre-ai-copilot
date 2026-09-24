@@ -170,6 +170,10 @@ class FactKind:
 # другого) — не конфликт, а два независимых наблюдения (см. _same_subject).
 MUTUALLY_EXCLUSIVE_PAIRS: List[FrozenSet[str]] = [
     frozenset({FactKind.OOM_KILLED, FactKind.PROCESS_CRASH}),
+    # Образ не вытянулся → процесс не стартовал → restart-цикла быть не может.
+    # Оба ✓ про один subject = какой-то сигнал прочитан неверно (обычно
+    # BackOff «pulling image», принятый за рестарт) — обоим срезаем confidence.
+    frozenset({FactKind.IMAGE_PULL, FactKind.CRASHLOOP}),
 ]
 
 

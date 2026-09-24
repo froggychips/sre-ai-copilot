@@ -230,3 +230,27 @@ def test_snapshot_text_carries_waiting_state_scoped_to_target(monkeypatch):
     # и правило ловит это по тексту снапшота
     f = _one(ImagePullRule(), {"pod": _POD, "k8s_events": [], "logs_summary": snap.text})
     assert f.observed and f.evidence["image"] == _IMAGE
+
+
+def test_image_pull_backoff_pod_yields_image_pull_not_crashloop_in_engine():
+    """Под в ImagePullBackOff: image_pull ✓, crashloop не ✓ ни одним правилом."""
+    store = default_engine.run({"pod": _POD, "k8s_events": [
+        _ev("Failed", f'Failed to pull image "{_IMAGE}": {_IMAGE}: not found'),
+        _ev("Failed", "Error: ErrImagePull"),
+        _pull_backoff(),
+    ]})
+    assert store.has_observed(FactKind.IMAGE_PULL)
+    assert not store.has_observed(FactKind.CRASHLOOP)
+    assert store.conflicts() == []
+
+
+def test_image_pull_and_crashloop_same_subject_is_conflict_with_cap():
+    """Если оба всё же ✓ про один под (текстовый сигнал рестарта) — конфликт."""
+    store = default_engine.run({"pod": _POD, "k8s_events": [_pull_backoff()],
+                                "description": "CrashLoopBackOff"})
+    assert store.has_observed(FactKind.IMAGE_PULL)
+    assert store.has_observed(FactKind.CRASHLOOP)
+    pairs = {frozenset({a.kind, b.kind}) for a, b in store.conflicts()}
+    assert frozenset({FactKind.IMAGE_PULL, FactKind.CRASHLOOP}) in pairs
+    assert all(f.confidence <= 0.60 for f in store.facts
+               if f.kind in (FactKind.IMAGE_PULL, FactKind.CRASHLOOP) and f.observed)
