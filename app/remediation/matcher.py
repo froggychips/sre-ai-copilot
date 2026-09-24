@@ -27,6 +27,7 @@ from app.remediation.playbook import Playbook, load_registry
 __all__ = [
     "PlanRenderError",
     "check_preconditions",
+    "classify_alert",
     "default_registry",
     "match_playbooks",
     "render_plan",
@@ -93,6 +94,28 @@ def check_preconditions(
         if not ok:
             return False, checks
     return True, checks
+
+
+def classify_alert(labels: Mapping[str, Any] | None) -> str | None:
+    """Classification инцидента по лейблам алерта — для `match.classification`.
+
+    Тот же классификатор, что у preview (`classifier.classify`), но без KG и
+    без enrichment-сигналов: стадия FixAgent не должна ходить в БД ради
+    отбора кандидатов. Классы, которым нужны сигналы (возраст Job-а, число
+    упавших), здесь не определятся — UNKNOWN возвращается как None, и
+    playbook с `match.classification` такой инцидент просто не выберет
+    (fail-closed). Ошибка классификатора — тоже None.
+    """
+    from app.remediation.classifier import Classification, classify
+    from app.remediation.target_resolver import resolve_target
+    try:
+        target = resolve_target({"labels": dict(labels or {})}, kg_session=None)
+        result = classify(target.to_dict(), {})
+    except Exception:
+        return None
+    if result.classification == Classification.UNKNOWN:
+        return None
+    return result.classification.value
 
 
 def _match_section_ok(

@@ -44,7 +44,7 @@ from app.diagnostics import default_engine as diag_engine
 from app.diagnostics.incident_ctx import build_diagnostics_ctx
 from app.models.incident import Incident
 from app.remediation.executor_gate import evaluate_intent_gate
-from app.remediation.matcher import match_playbooks
+from app.remediation.matcher import classify_alert, match_playbooks
 
 GOLDEN_DIR = Path(__file__).resolve().parents[2] / "tests" / "golden"
 CASES_DIR = GOLDEN_DIR / "cases"
@@ -183,8 +183,13 @@ def check_playbooks(case: GoldenCase, store, expected: List[str], result: CaseRe
     (playbook вдруг матчит OOM или перестал матчить свой случай) виден в
     baseline отдельной группой `playbooks`.
     """
-    alertname = (case.incident.get("labels") or {}).get("alertname")
-    actual = sorted(pb.name for pb in match_playbooks(alertname=alertname, facts=store))
+    labels = case.incident.get("labels") or {}
+    # classification — тем же путём, что в pipeline (classify_alert по лейблам).
+    actual = sorted(pb.name for pb in match_playbooks(
+        alertname=labels.get("alertname"),
+        classification=classify_alert(labels),
+        facts=store,
+    ))
     want = sorted(expected or [])
     result.checks["playbooks"] = actual == want
     if actual != want:
