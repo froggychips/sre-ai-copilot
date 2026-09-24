@@ -361,10 +361,13 @@ def test_engine_runs_all_rules():
     kinds = store.observed_kinds()
     assert FactKind.OOM_KILLED in kinds
     assert FactKind.CRASHLOOP in kinds
-    # Каждое правило выдаёт >= 1 Fact (✓ или ✗). PodEventsRule при пустом
-    # k8s_events выдаёт 0, поэтому проверяем >= len(DEFAULT_RULES) - 1.
+    # Каждое правило выдаёт >= 1 Fact (✓ или ✗), кроме тех, что молчат без
+    # наблюдаемого материала: PodEventsRule при пустом k8s_events,
+    # MigrationFailedRule и DbPermissionRule без логов/снимка/событий
+    # («не проверяли» не должно читаться как ✗).
     from app.diagnostics.rules import DEFAULT_RULES
-    assert len(store.facts) >= len(DEFAULT_RULES) - 1
+    silent_without_material = {"PodEventsRule", "MigrationFailedRule", "DbPermissionRule"}
+    assert len(store.facts) >= len(DEFAULT_RULES) - len(silent_without_material)
 
 
 def test_engine_skips_failing_rule_and_continues():

@@ -5,7 +5,9 @@
 """
 from app.diagnostics.rules.base import Rule
 from app.diagnostics.rules.crashloop import CrashLoopBackOffRule
+from app.diagnostics.rules.db_permission import DbPermissionRule
 from app.diagnostics.rules.failed_scheduling import FailedSchedulingRule
+from app.diagnostics.rules.migration_failed import MigrationFailedRule
 from app.diagnostics.rules.oom import OOMKilledRule
 from app.diagnostics.rules.pod_events import PodEventsRule
 from app.diagnostics.rules.process_crash import ProcessCrashRule
@@ -22,6 +24,8 @@ DEFAULT_RULES: list[Rule] = [
     UpstreamDegradedRule(),
     PodEventsRule(),
     ProcessCrashRule(),
+    MigrationFailedRule(),
+    DbPermissionRule(),
 ]
 
 __all__ = [
@@ -35,4 +39,6 @@ __all__ = [
     "UpstreamDegradedRule",
     "PodEventsRule",
     "ProcessCrashRule",
+    "MigrationFailedRule",
+    "DbPermissionRule",
 ]

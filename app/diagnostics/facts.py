@@ -139,11 +139,16 @@ class FactKind:
     # Отличается от oom_killed (SIGKILL=137) тем, что причина — баг в коде,
     # а не нехватка памяти.
     PROCESS_CRASH = "process_crash"
+    # Миграция схемы упала или не доехала (dirty-версия, упавший Job
+    # мигратора, колонки нет в схеме). Самый частый класс поломок сквадов.
+    MIGRATION_FAILED = "migration_failed"
+    # База отказала по правам (гранты/роль) или по аутентификации.
+    DB_PERMISSION = "db_permission"
 
     ALL = frozenset({
         OOM_KILLED, CRASHLOOP, FAILED_SCHEDULING,
         RECENT_DEPLOY, RESOURCE_PRESSURE, UPSTREAM_DEGRADED,
-        PROCESS_CRASH,
+        PROCESS_CRASH, MIGRATION_FAILED, DB_PERMISSION,
     })
 
 
