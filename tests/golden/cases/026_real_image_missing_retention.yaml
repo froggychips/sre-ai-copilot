@@ -1,0 +1,50 @@
+id: 026_real_image_missing_retention
+title: тега образа нет в реестре (retention) — ImagePullBackOff, контейнер не стартовал
+source: real          # класс image_missing: 7 из 31 кейса live-RCA датасета 24.09
+llm: false
+incident:
+  incident_id: golden-026
+  severity: warning
+  status: firing
+  summary: pod/foxtrot-worker-6b8f-q7r2s waiting for longer than 1 hour
+  description: >-
+    pod/foxtrot-worker-6b8f-q7r2s in namespace squad-9-shared on container
+    foxtrot-worker has been in waiting state for longer than 1 hour.
+    (reason: "ImagePullBackOff")
+  namespace: squad-9-shared
+  labels:
+    alertname: KubeContainerWaiting
+    severity: warning
+    namespace: squad-9-shared
+    pod: foxtrot-worker-6b8f-q7r2s
+    container: foxtrot-worker
+    reason: ImagePullBackOff
+  annotations:
+    description: >-
+      pod/foxtrot-worker-6b8f-q7r2s in namespace squad-9-shared on container
+      foxtrot-worker has been in waiting state for longer than 1 hour.
+      (reason: "ImagePullBackOff")
+  starts_at: "2026-09-22T12:00:00Z"
+  ends_at: null
+  generator_url: null
+  raw: {}
+context:
+  incident_starts_at: "2026-09-22T12:00:00Z"
+  k8s_pod_state:
+    foxtrot-worker-6b8f-q7r2s: {reason: ImagePullBackOff, restart_count: 0}
+  k8s_events:
+    - {type: Warning, reason: Failed, count: 40,
+       message: 'Failed to pull image "registry.example/wo/foxtrot-worker:preprod-3013": manifest unknown'}
+    - {type: Normal, reason: BackOff, count: 120,
+       message: 'Back-off pulling image "registry.example/wo/foxtrot-worker:preprod-3013"'}
+  recent_deployments: []
+expect:
+  # Контейнер ни разу не стартовал — ни exit-кода, ни OOM, ни падения
+  # процесса. «BackOff pulling image» — это не crashloop процесса, и
+  # restart-playbook (алерт тут и не CrashLooping) кандидатом не становится:
+  # пересоздание пода вытянет тот же несуществующий тег.
+  facts:
+    oom_killed: false
+    process_crash: false
+    failed_scheduling: false
+  playbooks: []

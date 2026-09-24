@@ -1,0 +1,42 @@
+id: 028_real_orleans_zombie_membership
+title: мёртвая запись Orleans membership — силосы не собираются в кластер
+source: real          # класс orleans_membership: 2 из 31 кейса live-RCA датасета 24.09
+llm: false
+incident:
+  incident_id: golden-028
+  severity: warning
+  status: firing
+  summary: Deployment hotel-grainhost replicas mismatch in squad-12-kingdom7
+  description: >-
+    Deployment squad-12-kingdom7/hotel-grainhost has not matched the expected
+    number of replicas for longer than 15 minutes.
+  namespace: squad-12-kingdom7
+  labels:
+    alertname: KubeDeploymentReplicasMismatch
+    severity: warning
+    namespace: squad-12-kingdom7
+    deployment: hotel-grainhost
+  annotations:
+    description: >-
+      Deployment squad-12-kingdom7/hotel-grainhost has not matched the expected
+      number of replicas for longer than 15 minutes.
+  starts_at: "2026-09-17T09:00:00Z"
+  ends_at: null
+  generator_url: null
+  raw: {}
+context:
+  incident_starts_at: "2026-09-17T09:00:00Z"
+  k8s_pod_state:
+    hotel-grainhost-7f6d-a1b2c: {exit_code: 1, reason: Error, restart_count: 1}
+  logs_summary: |
+    Orleans.Runtime.OrleansException: Silo 10.42.3.17:11111 is marked Dead in the membership table
+    Failed to join the cluster: 3 of 3 probes to stale silo timed out
+  recent_deployments: []
+expect:
+  # Состояние лежит в БД (orleansmembershiptable), а не в поде: ни OOM, ни
+  # проблем планировщика. Алерт — ReplicasMismatch, ни один playbook его не
+  # матчит; scale-out тут бессилен так же, как restart.
+  facts:
+    oom_killed: false
+    failed_scheduling: false
+  playbooks: []

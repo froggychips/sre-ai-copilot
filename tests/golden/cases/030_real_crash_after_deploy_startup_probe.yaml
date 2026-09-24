@@ -1,0 +1,42 @@
+id: 030_real_crash_after_deploy_startup_probe
+title: новый ReplicaSet падает на startup probe сразу после выката — нужен rollback, не restart
+source: real          # класс crash_after_deploy: 3 из 31 кейса live-RCA датасета 24.09
+llm: false
+incident:
+  incident_id: golden-030
+  severity: critical
+  status: firing
+  summary: Pod juliet-service-84fd-z9y8x crash-looping in squad-15-kingdom5
+  description: CrashLoopBackOff
+  namespace: squad-15-kingdom5
+  labels:
+    alertname: KubePodCrashLooping
+    severity: critical
+    namespace: squad-15-kingdom5
+    pod: juliet-service-84fd-z9y8x
+    service: juliet-service
+  annotations:
+    description: CrashLoopBackOff
+  starts_at: "2026-09-15T08:05:00Z"
+  ends_at: null
+  generator_url: null
+  raw: {}
+context:
+  incident_starts_at: "2026-09-15T08:05:00Z"
+  k8s_pod_state:
+    juliet-service-84fd-z9y8x: {exit_code: 1, reason: Error, restart_count: 9}
+  logs_summary: |
+    Startup probe failed: Get "http://10.42.1.9:8080/health": dial tcp 10.42.1.9:8080: connect: connection refused
+  k8s_events:
+    - {type: Warning, reason: Unhealthy, count: 27,
+       message: "Startup probe failed: HTTP probe failed with statuscode: 503"}
+    - {type: Warning, reason: BackOff, count: 9,
+       message: "Back-off restarting failed container juliet-service in pod juliet-service-84fd-z9y8x"}
+  recent_deployments:
+    - {name: juliet-service, ts: "2026-09-15T07:49:00Z", repo: backend, sha: d4e5f6a}
+expect:
+  facts:
+    crashloop: true
+    oom_killed: false
+    recent_deploy: true
+  playbooks: []
