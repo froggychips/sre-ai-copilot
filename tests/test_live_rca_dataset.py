@@ -432,12 +432,27 @@ def test_outcome_before_cutover_needs_evidence():
            "still_unhealthy": True}
     ev = lrd.outcome_evidence(row, None)
     assert ev["confirmed"] is False and ev["fixed_semantics"] == "applied_something"
-    quiet = {"observable": True, "bad_events_after": 0, "alerts_open_after": 0}
+    quiet = {"observable": True, "bad_events_before": 4, "bad_events_after": 0,
+             "alerts_open_after": 0}
     assert lrd.outcome_evidence(row, quiet)["confirmed"] is True
-    noisy = {"observable": True, "bad_events_after": 3, "alerts_open_after": 0}
+    noisy = dict(quiet, bad_events_after=3)
     assert lrd.outcome_evidence(row, noisy)["kg_quiet"] is False
-    early = {"observable": False, "bad_events_after": 0, "alerts_open_after": 0}
+    early = dict(quiet, observable=False)
     assert lrd.outcome_evidence(row, early)["kg_quiet"] is None
+    # Нули без поломки в графе до разбора — нет покрытия, а не тишина.
+    uncovered = dict(quiet, bad_events_before=0)
+    assert lrd.outcome_evidence(row, uncovered)["kg_quiet"] is None
+    assert lrd.outcome_evidence(row, uncovered)["confirmed"] is False
+
+
+def test_alert_resolved_before_run_does_not_pick_target():
+    case = _target_case(
+        alerts=[{"namespace": "n", "service": "healed-svc", "alertname": "KubePodCrashLooping",
+                 "fired_at": _T0, "resolved_at": _T0}],
+        pod_events=[{"namespace": "n", "pod": "sick-svc-7d9f8b6c5d-x2k4q", "reason": "Unhealthy",
+                     "count": 1, "last_seen": _T0}],
+    )
+    assert [t["workload"] for t in lrd.select_targets(case)] == ["sick-svc"]
 
 
 def test_outcome_after_cutover_fixed_means_healthy():

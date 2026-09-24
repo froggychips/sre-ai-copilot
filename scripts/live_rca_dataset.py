@@ -664,6 +664,9 @@ def select_targets(case: Dict[str, Any], medic_action_text: str = "",
         svc, ns = a.get("service"), a.get("namespace")
         if not svc or svc in _NOT_TARGETS:
             continue
+        # Резолвнувшийся до разбора алерт — уже выздоровевший сервис, не target.
+        if a.get("resolved_at"):
+            continue
         if a.get("alertname") in _NOISE_ALERTS and (ns, svc) not in rolled:
             continue
         t = slot(ns, svc)
@@ -726,6 +729,14 @@ SET TRANSACTION READ ONLY;
 SELECT to_jsonb(t) FROM (
   SELECT e.id AS event_id,
     (now() >= coalesce(e.finished_at, e.started_at) + interval '2 hours') AS observable,
+    -- Покрытие: граф видел поломку ДО разбора. Без этого нули ниже могут
+    -- значить «синк не писал сквад / строки ушли по retention», а не «затих».
+    (SELECT count(*) FROM kg_pod_events pe
+      WHERE pe.namespace = ANY(sc.ns) AND pe.type = 'Warning'
+        AND pe.reason = ANY('{{{reasons}}}'::text[])
+        AND pe.first_seen BETWEEN e.started_at - interval '7 days' AND e.started_at
+        AND coalesce(pe.last_seen, pe.first_seen) >= e.started_at - interval '2 hours'
+    ) AS bad_events_before,
     (SELECT count(*) FROM kg_pod_events pe
       WHERE pe.namespace = ANY(sc.ns) AND pe.type = 'Warning'
         AND pe.reason = ANY('{{{reasons}}}'::text[])
@@ -773,16 +784,17 @@ def outcome_evidence(row: Dict[str, Any], kg: Optional[Dict[str, Any]]) -> Dict[
 
     medic_healthy — медик сам видел стенд здоровым после разбора
     (still_unhealthy=false / outcome=fixed; после отсечки !115 это же значит
-    fixed=true). kg_quiet — через 1–2 ч после разбора у сквада нет плохих
-    Warning-событий и открытых не-шумовых алертов; None — рано или граф не
-    ответил.
+    fixed=true). kg_quiet — граф видел поломку до разбора, а через 1–2 ч
+    после него у сквада нет плохих Warning-событий и открытых не-шумовых
+    алертов; None — рано, граф не ответил или поломки в графе не было вовсе
+    (нули тогда не доказывают тишину: синк мог сквад не писать).
     """
     started = _parse_ts(row.get("started_at"))
     after_cutover = bool(started and started >= MEDIC_FIXED_SEMANTICS_CUTOVER)
     medic_healthy = (row.get("still_unhealthy") is False or row.get("outcome") == "fixed"
                      or (after_cutover and bool(row.get("fixed", True))))
     kg_quiet: Optional[bool] = None
-    if kg and kg.get("observable"):
+    if kg and kg.get("observable") and int(kg.get("bad_events_before") or 0) > 0:
         kg_quiet = (int(kg.get("bad_events_after") or 0) == 0
                     and int(kg.get("alerts_open_after") or 0) == 0)
     return {"medic_healthy": medic_healthy, "kg_quiet": kg_quiet,
