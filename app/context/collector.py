@@ -80,6 +80,9 @@ class Outcome:
     status: SourceStatus
     data: Any = None
     reason: Optional[str] = None
+    # Тип исключения, которое клиент поймал сам (снапшот k8s глушит сбой
+    # API внутри) — чтобы FAILED не терял его в CollectorResult.error.
+    error: Optional[str] = None
 
 
 @dataclass
@@ -259,7 +262,9 @@ class Collector:
         reason = out.reason
         if reason is None and out.status in PROBLEM_STATUSES:
             reason = self.unavailable_reason
-        return self._result(out.status, out.data, started, reason=reason)
+        return self._result(
+            out.status, out.data, started, error=out.error, reason=reason,
+        )
 
     def _result(
         self,

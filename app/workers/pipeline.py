@@ -117,7 +117,8 @@ def _classify_k8s_snapshot(snap: Any) -> Outcome:
     """
     if isinstance(snap, K8sSnapshot) and snap.error:
         return Outcome(
-            SourceStatus.FAILED, snap, reason=f"k8s API недоступен: {snap.error}",
+            SourceStatus.FAILED, snap,
+            reason=f"k8s API недоступен: {snap.error}", error=snap.error,
         )
     return Outcome(SourceStatus.SUCCESS, snap)
 

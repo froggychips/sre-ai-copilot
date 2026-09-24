@@ -204,7 +204,11 @@ def test_failed_k8s_snapshot_marks_fields_and_turns_absent_into_unknown(monkeypa
             text="[k8s_facts unavailable: Forbidden]", error="ApiException",
         )
 
+    events = []
     monkeypatch.setattr(pl.K8sFacts, "collect_snapshot", failed_snapshot)
+    monkeypatch.setattr(
+        pl.audit_service, "log_event", lambda name, data: events.append((name, data)),
+    )
     p = _pipeline_stub()
     ctx = _pipeline_ctx()
     asyncio.run(p._enrich_k8s(ctx))
@@ -216,6 +220,11 @@ def test_failed_k8s_snapshot_marks_fields_and_turns_absent_into_unknown(monkeypa
         "logs_summary": reason, "k8s_pod_state": reason, "k8s_events": reason,
     }
     assert p.collector_results[0].status is SourceStatus.FAILED
+    # Ошибку, пойманную внутри клиента, результат не теряет — и аудит видит сбой.
+    assert p.collector_results[0].error == "ApiException"
+    assert events == [(
+        "K8S_ENRICHMENT_FAILED", {"incident_id": "inc-1", "error": "ApiException"},
+    )]
 
     # Раньше: ✗ «OOM не было» по заглушке. Теперь: ? — API не видели.
     facts = OOMKilledRule().run(ctx)
