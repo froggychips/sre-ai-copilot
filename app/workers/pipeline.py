@@ -895,8 +895,8 @@ class IncidentPipeline:
         )
 
     async def _enrich_pod_metrics(self, diag_ctx: dict, vm: VMClient) -> None:
-        if not self.incident.namespace:
-            return
+        # Пустой namespace не выходит молча: проверка меток ниже пометит
+        # metrics_summary «не опрошены», иначе правило ответило бы ✗.
         incident_ts = None
         if self.incident.starts_at:
             try:
@@ -906,7 +906,7 @@ class IncidentPipeline:
             except ValueError:
                 pass
         pod = self.incident.labels.get("pod", "")
-        if not (valid_promql_label(self.incident.namespace)
+        if not (valid_promql_label(self.incident.namespace or "")
                 and valid_promql_label(pod)):
             # Раньше get_pod_metrics молча отдавал нули на пустую/невалидную
             # метку, и «давления памяти нет» выводилось из запроса, которого
@@ -916,7 +916,7 @@ class IncidentPipeline:
                 status=SourceStatus.UNAVAILABLE,
                 ctx_fields=_VM_POD_METRICS.ctx_fields,
                 provenance=_VM_POD_METRICS.provenance,
-                reason="метрики пода не опрошены: нет валидной метки pod",
+                reason="метрики пода не опрошены: нет валидной метки namespace/pod",
             ))
             return
         res = await _VM_POD_METRICS.run(

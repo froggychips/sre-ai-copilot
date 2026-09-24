@@ -175,9 +175,26 @@ def test_partial_failure_without_pressure_is_unknown(monkeypatch):
 def test_missing_pod_label_is_not_zeros(monkeypatch):
     p, ctx = _run_enrich_vm(monkeypatch, {}, labels={})
     assert ctx["source_status"]["metrics_summary"] == (
-        "метрики пода не опрошены: нет валидной метки pod"
+        "метрики пода не опрошены: нет валидной метки namespace/pod"
     )
     assert "metrics_summary" not in ctx
+    assert _verdicts(ctx) == {Verdict.UNKNOWN}
+
+
+def test_missing_namespace_is_marked_too(monkeypatch):
+    from app.workers import pipeline as pl
+
+    monkeypatch.setattr(pl.settings, "VICTORIA_METRICS_URL", "http://vm", raising=False)
+    monkeypatch.setattr(VMClient, "query_range", _fake_range({}))
+    p = pl.IncidentPipeline.__new__(pl.IncidentPipeline)
+    p.incident = SimpleNamespace(namespace=None, labels={"pod": "api-7f9"}, starts_at=None)
+    p.incident_id = "inc-1"
+    p.collector_results = []
+    ctx: Dict[str, Any] = {"source_status": {}}
+    asyncio.run(p._enrich_pod_metrics(ctx, VMClient("http://vm")))
+    assert ctx["source_status"]["metrics_summary"] == (
+        "метрики пода не опрошены: нет валидной метки namespace/pod"
+    )
     assert _verdicts(ctx) == {Verdict.UNKNOWN}
 
 
