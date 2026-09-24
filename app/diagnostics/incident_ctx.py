@@ -19,6 +19,8 @@ from typing import Any, Dict, List, Optional
 
 from sqlalchemy.orm import Session
 
+from app.context.collector import Collector, merge_source_status
+
 from app.knowledge_graph.queries import nearby_alerts
 from app.models.incident import Incident
 
@@ -62,6 +64,15 @@ def _extract_deploys_from_tc(tc_ctx: Optional[Dict[str, Any]]) -> List[Dict[str,
 
 
 
+_UPSTREAM_ALERTS = Collector(
+    name="upstream_alerts",
+    ctx_fields=("upstream_alerts",),
+    provenance="kg_alerts",
+    failure_label="kg_alerts недоступен",
+    log_event="diagnostics_ctx.nearby_alerts_failed",
+)
+
+
 def build_diagnostics_ctx(
     incident: Incident,
     analyzer_summary: str,
@@ -82,7 +93,7 @@ def build_diagnostics_ctx(
     Returns:
         dict с полями: incident, namespace, service, pod, alertname,
         description, analyzer_summary, k8s_summary, recent_deployments,
-        metrics_summary, upstream_alerts, incident_starts_at.
+        metrics_summary, upstream_alerts, incident_starts_at, source_status.
     """
     labels = incident.labels or {}
     annotations = incident.annotations or {}
@@ -90,19 +101,23 @@ def build_diagnostics_ctx(
     incident_starts_at = parse_ts(incident.starts_at)
 
     upstream_alerts: Optional[List[Dict[str, Any]]] = None
+    # Known Unknowns (контракт app/context/collector.py): сюда же pipeline
+    # дописывает статусы своих сборщиков (k8s, VM) после enrichment-а.
+    source_status: Dict[str, str] = {}
     if kg_session is not None and incident.namespace and labels.get("service"):
         if incident_starts_at is not None:
-            try:
-                upstream_alerts = nearby_alerts(
-                    kg_session,
-                    namespace=incident.namespace,
-                    service_name=labels["service"],
-                    around=incident_starts_at,
-                    window_minutes=15,
-                )
-            except Exception:
-                # Граф недоступен / повреждён — не валим pipeline.
-                upstream_alerts = None
+            # Граф недоступен / повреждён — не валим pipeline: None + причина
+            # в source_status (правило ответит ?, а не ✗).
+            res = _UPSTREAM_ALERTS.run_sync(
+                nearby_alerts,
+                kg_session,
+                namespace=incident.namespace,
+                service_name=labels["service"],
+                around=incident_starts_at,
+                window_minutes=15,
+            )
+            merge_source_status(source_status, res)
+            upstream_alerts = res.data if res.ok else None
 
     return {
         "incident": incident.model_dump(),
@@ -121,4 +136,5 @@ def build_diagnostics_ctx(
         "metrics_summary": None,  # TODO: brать из ContextBuilder.metrics
         "upstream_alerts": upstream_alerts,
         "incident_starts_at": incident_starts_at,
+        "source_status": source_status,
     }
