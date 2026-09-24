@@ -63,8 +63,31 @@ def report_state_of(record) -> Optional[str]:
     return record.report_state or _from_legacy(record.analysis, _REPORT_LEGACY)
 
 
-def executor_state_of(record) -> Optional[str]:
-    """Состояние исполнения: колонка, иначе старые ключи analysis."""
+#: Статус строки kg_remediation_attempts → значение `executor_state`.
+#: `failed` (kubectl вернул ошибку) — запись состоялась, поэтому `applied`:
+#: колонка отвечает «было ли действие», а исход несёт сама строка.
+_ATTEMPT_STATUS_TO_STATE = {
+    "claimed": EXECUTOR_IN_FLIGHT,
+    "applied": EXECUTOR_APPLIED,
+    "failed": EXECUTOR_APPLIED,
+    "verified": EXECUTOR_VERIFIED,
+    "verification_failed": EXECUTOR_VERIFY_FAILED,
+    "unknown": EXECUTOR_STATE_UNKNOWN,
+}
+
+
+def executor_state_of(record, attempt: Any = None) -> Optional[str]:
+    """Состояние исполнения: строка попытки, иначе колонка, иначе JSON.
+
+    `attempt` — последняя строка kg_remediation_attempts по инциденту
+    (`attempts.blocking_attempt`). Она — источник истины: её переходы
+    исполнитель коммитит той же транзакцией, что и write-claim, а колонку
+    `executor_state` apply-путь не ведёт вовсе. Колонка и JSON остаются для
+    записей, сделанных до таблицы.
+    """
+    status = getattr(attempt, "status", None)
+    if status in _ATTEMPT_STATUS_TO_STATE:
+        return _ATTEMPT_STATUS_TO_STATE[status]
     return record.executor_state or _from_legacy(record.analysis, _EXECUTOR_LEGACY)
 
 

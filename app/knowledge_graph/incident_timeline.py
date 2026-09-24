@@ -19,9 +19,10 @@ Known Unknowns — часть ответа, а не его отсутствие.
 Операционная память (roadmap п.7, 07.09.2026). Та же лента продолжается
 тем, что копилот СДЕЛАЛ с инцидентом: собранные свидетельства
 (`incidents.analysis.facts`), диагноз (`cause` / `triage_note`), решения
-плейбуков (`kg_remediation_decisions`), применённое действие
-(`executor_applied` со снимками идентичности) и верификация исхода
-(`executor_verification`). Это не новая таблица — цепочка
+плейбуков (`kg_remediation_decisions`), применённое действие со снимками
+идентичности и верификация исхода — из `kg_remediation_attempts` (для
+записей до этой таблицы — из `executor_applied` / `executor_verification`
+в analysis); попытка в `unknown` — отдельное событие. Это не новая таблица — цепочка
 Incident → Evidence → Diagnosis → Decision → Action → Verification уже
 записана в трёх местах, ей не хватало одной оси времени и связи с
 `kg_incidents` (через fingerprint: LLM-путь пишет `incident_id ==
@@ -45,6 +46,8 @@ from app.knowledge_graph.remediation_events import external_events_for_timeline
 from app.knowledge_graph.schema import (AlertEvent, AnomalyObservation,
                                         Deployment, KGIncident, LogObservation,
                                         PodEvent)
+from app.remediation.attempts import (APPLIED_STATUSES, STATUS_FAILED,
+                                      STATUS_UNKNOWN, RemediationAttempt)
 from app.remediation.models import RemediationDecision
 
 #: Сколько смотреть ДО первого алерта: деплой, который его вызвал, обычно
@@ -352,6 +355,14 @@ def _operational_memory(db: Session, incident: KGIncident):
         .order_by(RemediationDecision.created_at)
         .all()
     )
+    attempts_by_incident: Dict[str, List[Any]] = defaultdict(list)
+    for row in (
+        db.query(RemediationAttempt)
+        .filter(RemediationAttempt.incident_id.in_(fps))
+        .order_by(RemediationAttempt.id)
+        .all()
+    ):
+        attempts_by_incident[str(row.incident_id)].append(row)
     memory["records"] = len(records)
     memory["decisions"] = len(decisions)
 
@@ -398,44 +409,27 @@ def _operational_memory(db: Session, incident: KGIncident):
                          "is_recurrence": analysis.get("is_recurrence")},
             ))
 
-        applied = analysis.get("executor_applied")
-        if isinstance(applied, dict):
-            intent = analysis.get("execution_intent") or {}
-            result = applied.get("result") or {}
-            before = applied.get("target_before") or {}
-            after = applied.get("target_after") or {}
-            memory["actions"] += 1
-            memory["identity_check"] = applied.get("identity_check")
-            events.append(_ev(
-                _naive(applied.get("applied_at")) or base_ts, "action.applied",
-                f"Действие: {intent.get('action', '?')} {intent.get('resource_type', '')}/"
-                f"{intent.get('resource_name', '?')} — "
-                f"{'ok' if result.get('success') else 'ошибка'}",
-                epistemic=Epistemic.OBSERVED, provenance="incidents.analysis.executor_applied",
-                details={
-                    "action": intent.get("action"), "resource": intent.get("resource_name"),
-                    "applied_by": applied.get("applied_by"), "success": result.get("success"),
-                    "command": result.get("command"), "identity_check": applied.get("identity_check"),
-                    "uid_before": before.get("uid"), "uid_after": after.get("uid"),
-                    "generation_before": before.get("generation"),
-                    "generation_after": after.get("generation"),
-                    "verification_scheduled": (applied.get("verification") or {}).get("scheduled"),
-                },
-            ))
-
-        ver = analysis.get("executor_verification")
-        if isinstance(ver, dict):
-            outcome = ver.get("outcome")
-            memory["verification"] = outcome
-            events.append(_ev(
-                _naive(ver.get("checked_at")) or base_ts, "verification",
-                f"Верификация: {outcome}" + (f" — {ver['reasons'][0]}" if ver.get("reasons") else ""),
-                epistemic=(Epistemic.OBSERVED if outcome in ("verified", "failed")
-                           else Epistemic.UNKNOWN),
-                provenance="incidents.analysis.executor_verification",
-                details={"outcome": outcome, "attempt": ver.get("attempt"),
-                         "checks": ver.get("checks") or {}, "reasons": ver.get("reasons") or []},
-            ))
+        rows = attempts_by_incident.get(rec.incident_id) or []
+        if rows:
+            # Таблица попыток — источник истины: intent строки — тот, что
+            # реально применили (analysis.execution_intent re-fire
+            # перезаписывает новым планом).
+            for row in rows:
+                _attempt_events(row, base_ts, events, memory)
+        else:
+            # Записи до kg_remediation_attempts — из JSON, как раньше.
+            applied = analysis.get("executor_applied")
+            if isinstance(applied, dict):
+                events.append(_applied_event(
+                    applied, analysis.get("execution_intent") or {}, base_ts, memory,
+                    provenance="incidents.analysis.executor_applied",
+                ))
+            ver = analysis.get("executor_verification")
+            if isinstance(ver, dict):
+                events.append(_verification_event(
+                    ver, base_ts, memory,
+                    provenance="incidents.analysis.executor_verification",
+                ))
 
     for d in decisions:
         events.append(_ev(
@@ -461,10 +455,92 @@ def _operational_memory(db: Session, incident: KGIncident):
     return events, memory, unknown
 
 
+
+def _applied_event(applied: Dict[str, Any], intent: Dict[str, Any], base_ts: Any,
+                   memory: Dict[str, Any], *, provenance: str) -> Dict[str, Any]:
+    """Событие «действие применено» из записи executor_applied (JSON или строка)."""
+    result = applied.get("result") or {}
+    before = applied.get("target_before") or {}
+    after = applied.get("target_after") or {}
+    memory["actions"] += 1
+    memory["identity_check"] = applied.get("identity_check")
+    return _ev(
+        _naive(applied.get("applied_at")) or base_ts, "action.applied",
+        f"Действие: {intent.get('action', '?')} {intent.get('resource_type', '')}/"
+        f"{intent.get('resource_name', '?')} — "
+        f"{'ok' if result.get('success') else 'ошибка'}",
+        epistemic=Epistemic.OBSERVED, provenance=provenance,
+        details={
+            "action": intent.get("action"), "resource": intent.get("resource_name"),
+            "applied_by": applied.get("applied_by"), "success": result.get("success"),
+            "command": result.get("command"), "identity_check": applied.get("identity_check"),
+            "uid_before": before.get("uid"), "uid_after": after.get("uid"),
+            "generation_before": before.get("generation"),
+            "generation_after": after.get("generation"),
+            "verification_scheduled": (applied.get("verification") or {}).get("scheduled"),
+        },
+    )
+
+
+def _verification_event(ver: Dict[str, Any], base_ts: Any, memory: Dict[str, Any],
+                        *, provenance: str) -> Dict[str, Any]:
+    """Событие верификации исхода (JSON executor_verification или строка)."""
+    outcome = ver.get("outcome")
+    memory["verification"] = outcome
+    return _ev(
+        _naive(ver.get("checked_at")) or base_ts, "verification",
+        f"Верификация: {outcome}" + (f" — {ver['reasons'][0]}" if ver.get("reasons") else ""),
+        epistemic=(Epistemic.OBSERVED if outcome in ("verified", "failed")
+                   else Epistemic.UNKNOWN),
+        provenance=provenance,
+        details={"outcome": outcome, "attempt": ver.get("attempt"),
+                 "checks": ver.get("checks") or {}, "reasons": ver.get("reasons") or []},
+    )
+
+
+def _attempt_events(row: Any, base_ts: Any, events: List[Dict[str, Any]],
+                    memory: Dict[str, Any]) -> None:
+    """События одной строки kg_remediation_attempts.
+
+    `claimed` без исхода событий не даёт: запись ещё идёт (или только что
+    протухла — тогда следующий apply переведёт её в unknown). `unknown` —
+    отдельное событие: копилот не знает, была ли запись в кластер, и это
+    должно быть видно в хронологии, а не выглядеть как «действий не было».
+    """
+    intent = row.intent if isinstance(row.intent, dict) else {}
+    provenance = f"kg_remediation_attempts#{row.id}"
+    if row.status in APPLIED_STATUSES or row.status == STATUS_FAILED:
+        applied = row.result if isinstance(row.result, dict) else {}
+        if not applied:
+            # Строка дошла до записи, но итог не сохранён (не должно быть):
+            # показываем то, что есть в колонках, а не молчим.
+            applied = {"applied_at": row.applied_at, "applied_by": row.applied_by,
+                       "result": {"success": row.status != STATUS_FAILED}}
+        events.append(_applied_event(applied, intent, base_ts, memory,
+                                     provenance=provenance))
+        if isinstance(row.verification, dict):
+            events.append(_verification_event(row.verification, base_ts, memory,
+                                              provenance=provenance))
+    elif row.status == STATUS_UNKNOWN:
+        # Не `actions += 1`: иначе итог прочитался бы как «применено, не
+        # проверено», а применено ли — как раз неизвестно.
+        memory["state_unknown"] = True
+        events.append(_ev(
+            _naive(row.updated_at) or base_ts, "action.state_unknown",
+            f"Действие: {intent.get('action', '?')} {intent.get('resource_type', '')}/"
+            f"{intent.get('resource_name', '?')} — состояние кластера неизвестно, "
+            "разбирает человек",
+            epistemic=Epistemic.UNKNOWN, provenance=provenance,
+            details={"action": intent.get("action"), "resource": intent.get("resource_name"),
+                     "claimed_by": row.applied_by, "error": row.error},
+        ))
+
 def _outcome(memory: Dict[str, Any], incident: KGIncident) -> str:
     """Итог операционной памяти одной строкой."""
     if memory.get("verification"):
         return f"action_{memory['verification']}"
+    if memory.get("state_unknown") and not memory.get("actions"):
+        return "action_state_unknown"
     if memory.get("actions"):
         return "action_applied_unverified"
     if incident.status == "resolved":

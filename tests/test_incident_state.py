@@ -13,6 +13,7 @@
 миграция оказались бы связаны порядком.
 """
 from datetime import datetime, timedelta
+from types import SimpleNamespace
 
 import pytest
 
@@ -63,6 +64,31 @@ def test_no_state_at_all_is_none():
 ])
 def test_executor_legacy_keys_map_to_states(key, expected):
     assert executor_state_of(_record(analysis={key: {"any": "payload"}})) == expected
+
+
+@pytest.mark.parametrize("status,expected", [
+    ("claimed", EXECUTOR_IN_FLIGHT),
+    ("applied", EXECUTOR_APPLIED),
+    # kubectl вернул ошибку — запись всё равно состоялась.
+    ("failed", EXECUTOR_APPLIED),
+    ("verified", "verified"),
+    ("verification_failed", "verification_failed"),
+    ("unknown", "state_unknown"),
+])
+def test_attempt_row_wins_over_column_and_json(status, expected):
+    """Строка kg_remediation_attempts — источник истины: колонку apply-путь
+    не ведёт, JSON может отстать или быть стёрт re-fire-ом."""
+    rec = _record(executor_state=EXECUTOR_IN_FLIGHT,
+                  analysis={"executor_in_flight": {"claimed_at": "x"}})
+    assert executor_state_of(rec, SimpleNamespace(status=status)) == expected
+
+
+def test_no_attempt_row_falls_back_to_column_then_json():
+    """Записи до таблицы попыток читаются как раньше."""
+    assert executor_state_of(_record(executor_state=EXECUTOR_APPLIED), None) == EXECUTOR_APPLIED
+    assert executor_state_of(
+        _record(analysis={"executor_applied": {"any": 1}}), None,
+    ) == EXECUTOR_APPLIED
 
 
 def test_broken_analysis_does_not_raise():

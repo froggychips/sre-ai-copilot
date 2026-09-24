@@ -86,6 +86,17 @@ All notable changes to this project are documented in this file.
   теперь `cluster_state_unknown:manual_intervention_required` — дальше
   инцидент разбирает человек.
 
+- **Читатели состояния исполнителя — из `kg_remediation_attempts`.**
+  Хронология инцидента (`incident_timeline`) берёт применённое действие и
+  верификацию из строки попытки, JSON `executor_applied` /
+  `executor_verification` — только для записей до таблицы. Попытка в
+  `unknown` видна отдельным событием `action.state_unknown`, итог
+  `memory.outcome = action_state_unknown`, а не «применено, не проверено».
+  `incident_state.executor_state_of(record, attempt)` отдаёт состояние по
+  строке. Отложенная верификация проверяет intent строки, а не
+  `analysis.execution_intent`, который re-fire перезаписывает новым планом.
+  Dual-write JSON-ключей остаётся.
+
 ### Исправлено
 
 - **Упавший k8s API больше не даёт правилам пайплайна уверенного ✗.**
