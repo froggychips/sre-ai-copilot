@@ -42,6 +42,18 @@ All notable changes to this project are documented in this file.
   уверенностью. Теперь снапшот несёт `error`, поля помечаются, правила
   отвечают ?. То же для не настроенной VictoriaMetrics (`metrics_summary`).
 
+- **Усечённый batch Alertmanager больше не выглядит полным.** У наших
+  receiver-ов стоит `max_alerts: 10` (`k8s/vmalertmanagerconfig.yaml`), и
+  группа шире приходила десятью алертами — поле `truncatedAlerts` webhook-а
+  не читалось вовсе. Теперь оно принято моделью; при >0 — warning
+  `webhook.batch_truncated`, счётчик `alertmanager_alerts_truncated_total`
+  (по endpoint/receiver, считает отброшенные алерты) и
+  `batch_truncated_alerts` на каждом инциденте batch-а; ответ всех трёх
+  `/webhooks/alertmanager*` несёт `truncated_alerts`. Резолв по отсутствию
+  в batch-е нигде не делается (закрывает только явный `resolved` и сверка
+  `alerts_resolve_sync` по API AM), так что усечение инциденты не закрывало —
+  оно прятало часть группы.
+
 ## [1.0.18] — 2026-09-23 — Чьи стенды на ноде и граница доверия вебхука
 
 ### Добавлено

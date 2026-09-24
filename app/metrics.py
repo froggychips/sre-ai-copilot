@@ -21,6 +21,18 @@ ALERTS_SUPPRESSED = Counter(
 )
 
 
+# Алерты, которые AM не доставил из-за `max_alerts` у receiver-а
+# (`truncatedAlerts` webhook-payload-а). Растёт — группа шире лимита, и
+# часть её copilot не видит вовсе: ни в KG, ни в Discord. `endpoint` —
+# какой из /webhooks/alertmanager* принял batch; `receiver` — имя из AM
+# (их три, кардинальность ограничена).
+ALERTS_TRUNCATED = Counter(
+    "alertmanager_alerts_truncated_total",
+    "Alerts dropped by Alertmanager max_alerts before reaching the webhook",
+    ["endpoint", "receiver"],
+)
+
+
 def observe_request_latency(duration):
     REQUEST_LATENCY.observe(duration)
 
