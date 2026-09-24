@@ -84,6 +84,18 @@ All notable changes to this project are documented in this file.
     при разборе по одному алерту (crashloop 8, recent_deploy 4,
     failed_scheduling 1).
 
+- **Live RCA: вход из наблюдений squad-medic, пока снимков контекста нет.**
+  `export` извлекает из summary/applied/manual/gaps события медика только
+  наблюдаемое: состояния подов, коды выхода, рестарты, dirty-миграцию,
+  ошибки БД, отсутствующие ключи Secret, мёртвые силосы Orleans. Каждый
+  сигнал рендерится своим шаблоном, текст медика дословно в вход не
+  попадает, root_cause и next_action экстрактор не читает. Факт, у которого
+  есть общая 4-грамма с выводом медика, отбрасывается. Кейс получает метку
+  `context=medic_observed`, `score` считает метрики по режимам раздельно.
+  В ctx правил наблюдения идут как `k8s_summary`/`k8s_events` с пометкой
+  partial: правило, не нашедшее сигнала, отвечает «?», а не «не было».
+  `export --keep-ids` перевыгружает прежний набор кейсов.
+
 - **Live RCA-датасет на реальных инцидентах, без ключа.**
   `scripts/live_rca_dataset.py`: `export` берёт из БД copilot (read-only
   транзакция) инциденты, причину которых установил squad-medic

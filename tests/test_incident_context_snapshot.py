@@ -342,8 +342,8 @@ def test_run_with_ids_reruns_and_replaces_prior_result(tmp_path, monkeypatch):
         + json.dumps({"event_id": 2, "best_cause": "keep"}) + "\n")
     monkeypatch.setattr(lrd, "REPO_ROOT", Path("/nonexistent-repo-root"))
 
-    async def fake_run(case):
-        return {"event_id": case["event_id"], "best_cause": "new"}
+    async def fake_run(case, mode="alert_only"):
+        return {"event_id": case["event_id"], "context": mode, "best_cause": "new"}
 
     monkeypatch.setattr(lrd, "_run_case", fake_run)
     args = types.SimpleNamespace(out=str(out), ids="1", limit=5)
