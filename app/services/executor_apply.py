@@ -73,8 +73,11 @@
   успеть мутировать кластер, а финализация — не закоммититься. Поэтому
   переклейм больше НЕ выполняет write молча: инцидент помечается
   analysis.executor_state_unknown (состояние кластера неизвестно → manual), и
-  apply отказывает. Разблокировать может только одобрение, выданное ПОСЛЕ
-  этой пометки (человек сходил в кластер, увидел факт и одобрил заново).
+  apply отказывает. Это конечное состояние: автоматического выхода нет, ни
+  по новому одобрению, ни по другой команде после re-fire. Человек смотрит
+  кластер и действует сам; исполнитель в этот инцидент больше не пишет
+  (см. докстринг app/remediation/attempts.py — почему путь «переодобрить»
+  убран).
 """
 from __future__ import annotations
 
@@ -95,10 +98,14 @@ from app.remediation.verification import (expected_identity, identity_check,
                                           identity_mismatch,
                                           schedule_verification, snapshot_target)
 from app.services.audit_logger import audit_service
-from app.services.intent_signature import intent_recorded_at, parse_utc_ts
+from app.services.intent_signature import intent_recorded_at
 from app.services.k8s_service import k8s_service
 
 log = structlog.get_logger()
+
+# Отказ по «состоянию кластера неизвестно». Суффикс — что делать дальше:
+# исполнитель в инцидент больше не пишет, разбирает человек.
+_STATE_UNKNOWN_REASON = "cluster_state_unknown:manual_intervention_required"
 
 _ELIGIBLE_RISKS = {"low", "medium"}
 
@@ -137,23 +144,6 @@ def _in_flight_is_fresh(entry: Dict[str, Any], ttl_sec: int) -> bool:
     age = (datetime.now(timezone.utc) - claimed_at).total_seconds()
     return age <= ttl_sec
 
-
-def _approved_after(approval: Any, state_unknown: Any) -> bool:
-    """True если approve выдан ПОЗЖЕ пометки executor_state_unknown.
-
-    Единственный легальный выход из состояния «кластер в неизвестном виде»:
-    человек проверил кластер и одобрил действие уже после пометки. Одобрение
-    того же прогона всегда старше пометки (сначала клик, потом протухший
-    claim), поэтому само себя разблокировать не может. Любая неоднозначность
-    (нет даты, битая дата, пометка не dict) → False, fail-closed.
-    """
-    if not isinstance(state_unknown, dict):
-        return False
-    detected_at = parse_utc_ts(state_unknown.get("detected_at"))
-    decided_at = parse_utc_ts(getattr(approval, "decided_at", None))
-    if detected_at is None or decided_at is None:
-        return False
-    return decided_at > detected_at
 
 
 def _mark_state_unknown(
@@ -310,7 +300,7 @@ def apply_intent(
             )
             return _refuse(
                 incident_id,
-                "cluster_state_unknown:manual_verify_then_reapprove",
+                _STATE_UNKNOWN_REASON,
                 applied_by,
             )
 
@@ -362,11 +352,19 @@ def apply_intent(
                 )
                 return _refuse(
                     incident_id,
-                    "cluster_state_unknown:manual_verify_then_reapprove",
+                    _STATE_UNKNOWN_REASON,
                     applied_by,
                 )
-            # STATUS_UNKNOWN — разбирается ниже вместе с executor_state_unknown:
-            # выйти из него можно только одобрением, выданным позже пометки.
+            if attempt.status == attempts_store.STATUS_UNKNOWN:
+                # Конечный статус: запись в кластер могла состояться, и
+                # никакое одобрение этого не отменяет. Любая команда по
+                # этому инциденту — отказ, дальше человек.
+                return _refuse(incident_id, _STATE_UNKNOWN_REASON, applied_by)
+
+        # JSON-пометка — то же самое для записей до таблицы (и на случай, если
+        # строку ещё не создали: протухший JSON-claim без строки).
+        if analysis.get("executor_state_unknown"):
+            return _refuse(incident_id, _STATE_UNKNOWN_REASON, applied_by)
 
         intent_data = analysis.get("execution_intent")
         if not intent_data:
@@ -407,26 +405,6 @@ def apply_intent(
         if _approval_is_stale(approval, approval_max_age):
             return _refuse(incident_id, "approval_stale", applied_by)
 
-        # ── Инцидент уже помечен «состояние кластера неизвестно» (M2) ───
-        # Пометку ставит переклейм протухшего claim-а выше. Снять её может
-        # только одобрение, выданное ПОСЛЕ пометки: человек сходил в кластер,
-        # убедился, что первого write не было (или откатил его), и одобрил
-        # заново. Одобрение того же прогона всегда старше пометки.
-        state_unknown = analysis.get("executor_state_unknown")
-        if (
-            not state_unknown
-            and attempt is not None
-            and attempt.status == attempts_store.STATUS_UNKNOWN
-        ):
-            # JSON-пометку могли потерять (analysis перезаписан), строка —
-            # нет. Момент пометки = последнее обновление строки.
-            state_unknown = {"detected_at": attempt.updated_at}
-        if state_unknown and not _approved_after(approval, state_unknown):
-            return _refuse(
-                incident_id,
-                "cluster_state_unknown:manual_verify_then_reapprove",
-                applied_by,
-            )
 
         # ── Binding intent ↔ инцидент ──────────────────────────────────
         # Intent генерирует LLM из обогащённого промпта (логи/алерты =
@@ -577,31 +555,15 @@ def apply_intent(
             return _refuse(
                 incident_id, f"target_snapshot_unknown:{target_before.reason}", applied_by,
             )
-        # Claim в таблице: INSERT новой строки или unknown → claimed по CAS
-        # (переодобренная после пометки попытка). Коммитится ОДНОЙ
-        # транзакцией с JSON-claim-ом ниже; конфликт уникальности на commit
-        # = параллельный apply того же intent-а успел первым.
-        claim_from: Optional[str] = None
-        # Переклеймить можно только ТУ ЖЕ команду. Если после пометки re-fire
-        # принёс другой intent (другая подпись), это новая попытка — своя
-        # строка: иначе результат новой команды лёг бы в строку со старыми
-        # intent/target, и верификация по строке проверяла бы не то действие.
-        if (
-            attempt is not None
-            and attempt.status == attempts_store.STATUS_UNKNOWN
-            and attempt.signature == expected_signature
-        ):
-            if not attempts_store.reclaim_unknown(db, attempt, applied_by):
-                db.rollback()
-                return _refuse(incident_id, "apply_in_flight", applied_by)
-            attempt_row = attempt
-            claim_from = attempts_store.STATUS_UNKNOWN
-        else:
-            attempt_row = attempts_store.new_claim(
-                incident_id, expected_signature,
-                intent.model_dump(mode="json"), applied_by,
-            )
-            db.add(attempt_row)
+        # Claim в таблице — INSERT новой строки. Коммитится ОДНОЙ транзакцией
+        # с JSON-claim-ом ниже; конфликт уникальности на commit = параллельный
+        # apply того же intent-а успел первым. Переклейма нет: unknown
+        # конечен и отсечён выше.
+        attempt_row = attempts_store.new_claim(
+            incident_id, expected_signature,
+            intent.model_dump(mode="json"), applied_by,
+        )
+        db.add(attempt_row)
         analysis["executor_in_flight"] = {
             "claimed_at": datetime.now(timezone.utc).isoformat(),
             "claimed_by": applied_by,
@@ -621,7 +583,7 @@ def apply_intent(
             db.rollback()
             log.warning("executor_apply.claim_conflict", incident_id=incident_id)
             return _refuse(incident_id, "apply_in_flight", applied_by)
-        track_remediation_attempt_transition(claim_from, attempts_store.STATUS_CLAIMED)
+        track_remediation_attempt_transition(None, attempts_store.STATUS_CLAIMED)
 
         # ── Фаза 2: выполнение ─────────────────────────────────────────
         result = k8s_service.execute_intent(intent, dry_run=False, post_approval=True)

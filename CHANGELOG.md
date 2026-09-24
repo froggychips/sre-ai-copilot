@@ -33,6 +33,15 @@ All notable changes to this project are documented in this file.
   `executor_applied`. Метрика `remediation_attempt_transitions_total`.
   Миграция `20260924_0100` — новая пустая таблица, без блокировок.
 
+- **`unknown` у попытки исполнения — конечный статус.** Протухший claim
+  значит «kubectl мог выполниться, финализация — нет», и выхода обратно в
+  `claimed` больше нет: убран `reclaim_unknown` и переодобрение после пометки
+  `executor_state_unknown`. Тот путь был недостижим для той же команды
+  (одобрение уникально по incident+signature), а для другой команды после
+  re-fire давал второй write в инцидент, где первый мог уже пройти. Отказ
+  теперь `cluster_state_unknown:manual_intervention_required` — дальше
+  инцидент разбирает человек.
+
 ### Исправлено
 
 - **Упавший k8s API больше не даёт правилам пайплайна уверенного ✗.**
