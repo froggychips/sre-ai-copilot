@@ -22,6 +22,7 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')
 from app.models import Base as ModelsBase
 from app.database import Base as DatabaseBase
 import app.knowledge_graph.schema  # noqa: F401 — kg_services, kg_alerts, ... (14 таблиц)
+import app.remediation.attempts  # noqa: F401 — kg_remediation_attempts
 import app.remediation.models  # noqa: F401 — kg_remediation_decisions
 import app.services.discord.dedup_store  # noqa: F401 — discord_dedup
 from app.config import settings

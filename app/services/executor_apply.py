@@ -14,8 +14,11 @@
   1. Загружает IncidentRecord, читает analysis.execution_intent + executor_result.
   2. Проверяет eligibility:
        - запись существует
-       - executor_applied отсутствует (идемпотентность)
+       - executor_applied отсутствует (идемпотентность; ключ JSON — для
+         записей, сделанных до kg_remediation_attempts)
        - нет свежего executor_in_flight-клейма (двухфазный apply, см. ниже)
+       - в kg_remediation_attempts нет попытки, дошедшей до записи, и нет
+         свежего claim-а (источник истины, app/remediation/attempts.py)
        - execution_intent распарсен
        - expected_signature ОБЯЗАТЕЛЕН и совпадает с compute_signature(intent)
          (TOCTOU: intent в БД == тому, что видел оператор)
@@ -34,15 +37,18 @@
        - ДЕТЕРМИНИРОВАННЫЙ policy-gate (evaluate_intent_gate) != BLOCK —
          пересчёт риска из самого intent-а, не из LLM-`risk` (см. executor_gate)
        - executor_result.status == "dry_run_ok"
-  3. Двухфазный claim: ПЕРЕД kubectl пишет и КОММИТИТ analysis.executor_in_flight
-     (timestamp + user). Краш/таймаут между мутацией кластера и записью
+  3. Двухфазный claim: ПЕРЕД kubectl вставляет строку kg_remediation_attempts
+     (status=claimed, UNIQUE(incident_id, signature)) и в той же транзакции
+     пишет analysis.executor_in_flight (timestamp + user), затем КОММИТИТ.
+     Конфликт уникальности = отказ apply_in_flight. Краш/таймаут между мутацией кластера и записью
      executor_applied больше не оставляет живую кнопку: свежий claim = отказ
      apply_in_flight; протухший (EXECUTOR_IN_FLIGHT_TTL_SECONDS) снимается, но
      БЕЗ повторного write (M2, см. ниже).
   4. Пере-dry-run: kubectl --dry-run=server ещё раз, непосредственно перед
      реальным write (M1в). Провал → отказ, write не выполняется.
   5. Вызывает k8s_service.execute_intent(intent, dry_run=False, post_approval=True).
-  6. Записывает результат в record.analysis.executor_applied (claim снимается)
+  6. Переводит попытку в applied/failed и записывает тот же результат в
+     record.analysis.executor_applied (claim снимается)
      с timestamp + user + якорем времени intent-а.
   7. Audit-event EXECUTOR_APPLIED (или EXECUTOR_APPLY_REFUSED при отказе).
 
@@ -76,12 +82,15 @@ from datetime import datetime, timezone
 from typing import Any, Dict, Optional
 
 import structlog
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm.attributes import flag_modified
 
 from app.config import settings
 from app.core.execution_dsl import ExecutionIntent
 from app.database import IncidentRecord, SessionLocal
-from app.observability.ai_metrics import track_executor_applied
+from app.observability.ai_metrics import (track_executor_applied,
+                                          track_remediation_attempt_transition)
+from app.remediation import attempts as attempts_store
 from app.remediation.verification import (expected_identity, identity_check,
                                           identity_mismatch,
                                           schedule_verification, snapshot_target)
@@ -225,6 +234,15 @@ def _load_approval(db, incident_id: str, signature: str):
     )
 
 
+def _load_attempt(db, incident_id: str):
+    """Последняя строка kg_remediation_attempts по инциденту или None.
+
+    Отдельной функцией по той же причине, что и _load_approval: юнит-тесты
+    подменяют источник, не поднимая БД.
+    """
+    return attempts_store.blocking_attempt(db, incident_id)
+
+
 def apply_intent(
     incident_id: str, applied_by: str, expected_signature: Optional[str] = None
 ) -> Dict[str, Any]:
@@ -296,6 +314,60 @@ def apply_intent(
                 applied_by,
             )
 
+        # ── Таблица попыток (kg_remediation_attempts) ──────────────────
+        # Источник истины для «была ли запись в кластер». JSON-проверки выше
+        # остаются для записей, сделанных до таблицы: у них executor_applied
+        # есть, а строки нет — и повторный apply после деплоя недопустим.
+        # Таблица же не зависит от того, что очередной писатель analysis
+        # смержил блоб аккуратно.
+        attempt = _load_attempt(db, incident_id)
+        if attempt is not None:
+            if attempt.status in attempts_store.DONE_STATUSES:
+                log.info(
+                    "executor_apply.already_applied",
+                    incident_id=incident_id, attempt_status=attempt.status,
+                )
+                return {"ok": False, "reason": "already_applied"}
+            if attempt.status == attempts_store.STATUS_CLAIMED:
+                if attempts_store.claim_is_fresh(attempt, in_flight_ttl):
+                    return _refuse(incident_id, "apply_in_flight", applied_by)
+                # Протухший claim — та же логика M2, что для JSON-claim-а выше:
+                # kubectl мог выполниться, не записалась финализация. Второй
+                # write не делаем, попытка уходит в unknown → manual.
+                stale_claim = {
+                    "claimed_at": (
+                        attempt.claimed_at.isoformat()
+                        if isinstance(attempt.claimed_at, datetime) else None
+                    ),
+                    "claimed_by": attempt.applied_by,
+                    "attempt_id": attempt.id,
+                }
+                log.warning(
+                    "executor_apply.stale_attempt_state_unknown",
+                    incident_id=incident_id,
+                    stale_claim=stale_claim,
+                )
+                attempts_store.set_status(
+                    attempt, attempts_store.STATUS_UNKNOWN, error="stale_claim",
+                )
+                # Коммитит и строку, и JSON-пометку одной транзакцией.
+                _mark_state_unknown(db, record, analysis, stale_claim, applied_by)
+                audit_service.log_event(
+                    "EXECUTOR_STATE_UNKNOWN",
+                    {
+                        "incident_id": incident_id,
+                        "applied_by": applied_by,
+                        "stale_claim": stale_claim,
+                    },
+                )
+                return _refuse(
+                    incident_id,
+                    "cluster_state_unknown:manual_verify_then_reapprove",
+                    applied_by,
+                )
+            # STATUS_UNKNOWN — разбирается ниже вместе с executor_state_unknown:
+            # выйти из него можно только одобрением, выданным позже пометки.
+
         intent_data = analysis.get("execution_intent")
         if not intent_data:
             return _refuse(incident_id, "no_intent", applied_by)
@@ -341,6 +413,14 @@ def apply_intent(
         # убедился, что первого write не было (или откатил его), и одобрил
         # заново. Одобрение того же прогона всегда старше пометки.
         state_unknown = analysis.get("executor_state_unknown")
+        if (
+            not state_unknown
+            and attempt is not None
+            and attempt.status == attempts_store.STATUS_UNKNOWN
+        ):
+            # JSON-пометку могли потерять (analysis перезаписан), строка —
+            # нет. Момент пометки = последнее обновление строки.
+            state_unknown = {"detected_at": attempt.updated_at}
         if state_unknown and not _approved_after(approval, state_unknown):
             return _refuse(
                 incident_id,
@@ -497,6 +577,23 @@ def apply_intent(
             return _refuse(
                 incident_id, f"target_snapshot_unknown:{target_before.reason}", applied_by,
             )
+        # Claim в таблице: INSERT новой строки или unknown → claimed по CAS
+        # (переодобренная после пометки попытка). Коммитится ОДНОЙ
+        # транзакцией с JSON-claim-ом ниже; конфликт уникальности на commit
+        # = параллельный apply того же intent-а успел первым.
+        claim_from: Optional[str] = None
+        if attempt is not None and attempt.status == attempts_store.STATUS_UNKNOWN:
+            if not attempts_store.reclaim_unknown(db, attempt, applied_by):
+                db.rollback()
+                return _refuse(incident_id, "apply_in_flight", applied_by)
+            attempt_row = attempt
+            claim_from = attempts_store.STATUS_UNKNOWN
+        else:
+            attempt_row = attempts_store.new_claim(
+                incident_id, expected_signature,
+                intent.model_dump(mode="json"), applied_by,
+            )
+            db.add(attempt_row)
         analysis["executor_in_flight"] = {
             "claimed_at": datetime.now(timezone.utc).isoformat(),
             "claimed_by": applied_by,
@@ -507,7 +604,16 @@ def apply_intent(
         record.analysis = analysis
         # SQLAlchemy не видит in-place изменения внутри JSON Column без явного флага.
         flag_modified(record, "analysis")
-        db.commit()
+        try:
+            db.commit()
+        except IntegrityError:
+            # На Postgres конкурента сериализует FOR UPDATE выше, и сюда он
+            # не доходит; на SQLite (и при любом пути мимо лока) последний
+            # рубеж — UNIQUE(incident_id, signature). Write не выполняется.
+            db.rollback()
+            log.warning("executor_apply.claim_conflict", incident_id=incident_id)
+            return _refuse(incident_id, "apply_in_flight", applied_by)
+        track_remediation_attempt_transition(claim_from, attempts_store.STATUS_CLAIMED)
 
         # ── Фаза 2: выполнение ─────────────────────────────────────────
         result = k8s_service.execute_intent(intent, dry_run=False, post_approval=True)
@@ -551,6 +657,18 @@ def apply_intent(
             schedule_verification(incident_id, attempt=1)
             if result.get("success", False)
             else {"scheduled": False, "reason": "apply_failed"}
+        )
+        success = bool(result.get("success", False))
+        attempts_store.set_status(
+            attempt_row,
+            attempts_store.STATUS_APPLIED if success else attempts_store.STATUS_FAILED,
+            applied_at=_utcnow_naive(),
+            result=applied_entry,
+            error=None if success else str(
+                result.get("error")
+                or (result.get("stderr") or "").strip()
+                or f"exit_code={result.get('exit_code')}"
+            )[:2000],
         )
         analysis["executor_applied"] = applied_entry
         analysis.pop("executor_in_flight", None)
