@@ -195,6 +195,26 @@ All notable changes to this project are documented in this file.
   перезаписывались: ключ считается по склейке system + user и совпадает с
   ключом прежнего промпта.
 
+### Безопасность
+
+- **Запись в кластер — только у отдельного процесса copilot-executor.**
+  api, worker и beat работали под одним SA `sre-ai`, и write-роль,
+  привязанная к нему, доставалась api-поду, который принимает вебхуки из
+  интернета, и worker-у, который гоняет LLM по логам и тексту алертов. Теперь
+  при `EXECUTOR_DISPATCH=queue` apply (кнопка в Discord) и server-side
+  dry-run стадии пайплайна (`--dry-run=server` для RBAC — тот же patch)
+  уходят в Celery-очередь `executor`; её слушает deployment
+  `copilot-executor` (`k8s/executor.yaml`) под SA `sre-ai-executor`, и
+  write-роль `sre-ai-remediate` привязывается только к нему. Все проверки
+  apply остались внутри `apply_intent`; задача apply — `acks_late=False`
+  (не больше одного раза), followup в Discord отправляет сама задача.
+  Недоступная очередь — ответ оператору сразу; не поднятый executor —
+  таймаут dry-run (`EXECUTOR_DRY_RUN_TIMEOUT_SECONDS`) и нет кнопки Apply.
+  Из `sre-ai-remediate` сняты `delete pods` и `create pods/exec`: ни один
+  путь кода их не вызывал. `deploy.sh` поднимает executor первым и
+  предупреждает, если у `sre-ai` нашлось право patch. Default
+  `EXECUTOR_DISPATCH=inline` — docker-compose и тесты без изменений.
+
 ## [1.0.18] — 2026-09-23 — Чьи стенды на ноде и граница доверия вебхука
 
 ### Добавлено

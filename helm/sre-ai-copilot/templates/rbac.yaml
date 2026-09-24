@@ -49,8 +49,19 @@ roleRef:
   apiGroup: rbac.authorization.k8s.io
 
 ---
-# Write-Role — применяется ТОЛЬКО в squad-* namespace-ах (через отдельный RoleBinding).
-# Не делать ClusterRoleBinding — иначе обходим principle of least privilege.
+# Write-Role — применяется ТОЛЬКО в squad-* namespace-ах (через отдельный
+# RoleBinding) и ТОЛЬКО на SA исполнителя. Не делать ClusterRoleBinding —
+# иначе обходим principle of least privilege.
+#
+# Живой путь деплоя — deploy.sh + k8s/ (чарт не source of truth). Там запись
+# исполняет отдельный deployment copilot-executor под SA sre-ai-executor
+# (k8s/executor.yaml, k8s/base/rbac.yaml), а SA приложения — только чтение.
+# В чарте executor-а пока нет: пока его не добавят, эту роль НЕ привязывать
+# к serviceAccountName чарта — тот же SA у api, принимающего вебхуки.
+#
+# Состав — ровно то, что умеет execution_dsl (rollout restart, scale);
+# `delete pods` и `create pods/exec` сняты 24.09.2026 — ни один путь кода их
+# не вызывал.
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata:
@@ -62,29 +73,6 @@ rules:
 - apiGroups: ["apps"]
   resources: ["deployments", "deployments/scale"]
   verbs: ["get", "list", "patch", "update"]
-- apiGroups: [""]
-  resources: ["pods"]
-  verbs: ["delete"]  # для restart/eviction
-- apiGroups: [""]
-  resources: ["pods/exec"]
-  verbs: ["create"]  # под жёстким allowlist в k8s_guard
-
-# NOTE: To grant remediation rights in a target namespace (e.g. squad-foo),
-# create a RoleBinding there manually or via a kustomize overlay:
-#
-# apiVersion: rbac.authorization.k8s.io/v1
-# kind: RoleBinding
-# metadata:
-#   name: {{ include "sre-ai-copilot.fullname" . }}-remediate
-#   namespace: squad-foo
-# subjects:
-# - kind: ServiceAccount
-#   name: {{ include "sre-ai-copilot.serviceAccountName" . }}
-#   namespace: {{ .Release.Namespace }}
-# roleRef:
-#   kind: Role
-#   name: {{ include "sre-ai-copilot.fullname" . }}-remediate
-#   apiGroup: rbac.authorization.k8s.io
 
 ---
 # ClusterRole: read-only на deployments / services / ingresses cluster-wide.

@@ -314,20 +314,27 @@ async def _apply_in_background(
     import asyncio
     from app.services.executor_apply import apply_intent
     outcome = await asyncio.to_thread(apply_intent, incident_id, user_id, intent_sig)
+    await _send_followup(interaction_token, _format_apply_outcome(incident_id, outcome))
 
+
+def _format_apply_outcome(incident_id: str, outcome: Dict[str, Any]) -> str:
+    """Текст followup-а по итогу apply_intent.
+
+    Общий для inline-пути (фоновая таска api) и для задачи в очереди
+    executor (`app.workers.executor_tasks`): оператор видит одно и то же, где
+    бы ни исполнилась команда.
+    """
     if not outcome["ok"]:
-        content = _format_apply_refusal(incident_id, outcome.get("reason", "unknown"))
-    else:
-        result = outcome.get("result") or {}
-        success = bool(result.get("success"))
-        emoji = "✅" if success else "❌"
-        command = result.get("command", "(unknown)")
-        out = (result.get("stdout") or result.get("stderr") or result.get("error") or "").strip()
-        content = f"{emoji} kubectl {'выполнен' if success else 'упал'}: `{command}`"
-        if out:
-            content += f"\n```\n{out[:600]}\n```"
-
-    await _send_followup(interaction_token, content)
+        return _format_apply_refusal(incident_id, outcome.get("reason", "unknown"))
+    result = outcome.get("result") or {}
+    success = bool(result.get("success"))
+    emoji = "✅" if success else "❌"
+    command = result.get("command", "(unknown)")
+    out = (result.get("stdout") or result.get("stderr") or result.get("error") or "").strip()
+    content = f"{emoji} kubectl {'выполнен' if success else 'упал'}: `{command}`"
+    if out:
+        content += f"\n```\n{out[:600]}\n```"
+    return content
 
 
 def _confirm_neg_buttons(incident_id: str) -> list:
@@ -659,6 +666,25 @@ async def discord_interactions(
         # Discord даёт 15 минут на followup через PATCH @original — этого хватит
         # даже для большого rollout restart с тяжёлыми initContainers.
         # Strong-ref + done-callback: см. _spawn_background_task.
+        #
+        # EXECUTOR_DISPATCH=queue: kubectl исполняет copilot-executor под
+        # своим SA, у api write-прав нет. followup отправит сама задача —
+        # interaction token живёт 15 минут, передаём его с задачей.
+        from app.workers.executor_tasks import (dispatch_apply,
+                                                queue_dispatch_enabled)
+        if queue_dispatch_enabled():
+            try:
+                dispatch_apply(incident_id, user_id, intent_sig, interaction_token)
+            except Exception as e:
+                # Брокер недоступен — задачи нет, kubectl не запущен. Ответ
+                # сразу, а не deferred: иначе оператор смотрит на вечный loader.
+                logger.error("executor_dispatch_failed kind=apply_confirm error=%s",
+                             str(e), exc_info=True)
+                return _ephemeral(
+                    f"❌ Не удалось поставить apply в очередь executor "
+                    f"({type(e).__name__}) — kubectl не запущен."
+                )
+            return _deferred_ephemeral()
         _spawn_background_task(
             _apply_in_background(incident_id, user_id, intent_sig, interaction_token),
             context={"kind": "apply_confirm", "incident_id": incident_id,
@@ -753,18 +779,36 @@ async def discord_interactions(
 
         # Edit оригинального сообщения: убрать buttons + дописать footer.
         # Не блокируем основной response — Discord ждёт ≤3s.
-        if message_id and channel_id:
-            _spawn_background_task(
-                _edit_message_after_decision(
-                    channel_id=channel_id,
-                    message_id=message_id,
-                    verdict=verdict,
-                    user_name=user_name,
-                    decided_at=decision["decided_at"],
-                    original_message=message,
-                ),
-                context={"kind": "edit_after_decision", "incident_id": incident_id},
-            )
+        def _schedule_edit() -> None:
+            if message_id and channel_id:
+                _spawn_background_task(
+                    _edit_message_after_decision(
+                        channel_id=channel_id,
+                        message_id=message_id,
+                        verdict=verdict,
+                        user_name=user_name,
+                        decided_at=decision["decided_at"],
+                        original_message=message,
+                    ),
+                    context={"kind": "edit_after_decision", "incident_id": incident_id},
+                )
+
+        from app.workers.executor_tasks import (dispatch_apply,
+                                                queue_dispatch_enabled)
+        # При queue постановка в очередь может упасть синхронно (брокер
+        # недоступен). Кнопки тогда снимать нельзя: повторный Approve упрётся
+        # в already_decided, а Apply → «Да, запустить kubectl» для уже
+        # одобренного действия ставит задачу заново — это и есть путь
+        # повтора. Поэтому в этом случае edit — только после успешной
+        # постановки.
+        dispatch_via_queue = (
+            verdict == "approved"
+            and settings.EXECUTOR_ENABLED
+            and settings.EXECUTOR_APPROVAL_ENABLED
+            and queue_dispatch_enabled()
+        )
+        if not dispatch_via_queue:
+            _schedule_edit()
 
         audit_service.log_event(
             "INCIDENT_ACTION_APPROVED" if verdict == "approved" else "INCIDENT_ACTION_DECLINED",
@@ -785,6 +829,29 @@ async def discord_interactions(
         # запускала apply_intent на одном EXECUTOR_ENABLED — реальный write был
         # достижим через флаг, задокументированный как dry-run-only.
         if settings.EXECUTOR_ENABLED and settings.EXECUTOR_APPROVAL_ENABLED:
+            if dispatch_via_queue:
+                # kubectl — в copilot-executor под своим SA (см.
+                # EXECUTOR_DISPATCH). followup-а у этого пути нет и не было:
+                # итог — в audit-trail, как и написано в ответе.
+                try:
+                    dispatch_apply(incident_id, user_name, intent_sig)
+                except Exception as e:
+                    logger.error(
+                        "approved_executor_dispatch_failed error=%s", str(e),
+                        exc_info=True,
+                    )
+                    return _ephemeral(
+                        f"✅ Approved by @{user_name}, но поставить apply в очередь "
+                        f"executor не удалось ({type(e).__name__}) — kubectl не "
+                        "запущен. Кнопки оставлены: повтори через Apply → "
+                        "«Да, запустить kubectl»."
+                    )
+                _schedule_edit()
+                return _ephemeral(
+                    f"✅ Approved by @{user_name}. Executor launched в фоне — "
+                    "итог (включая отказ) смотри в audit-trail "
+                    "(EXECUTOR_APPLIED / EXECUTOR_APPLY_REFUSED)."
+                )
             try:
                 from app.services.executor_apply import apply_intent
                 # intent_sig из custom_id → integrity-сверка в apply_intent (TOCTOU).

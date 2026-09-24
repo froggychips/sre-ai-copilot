@@ -91,6 +91,11 @@ spec:
           value: "production"
         - name: SAFE_MODE
           value: "true"
+        # kubectl-запись (apply по кнопке Discord) — не здесь: задача уходит
+        # в очередь copilot-executor (k8s/executor.yaml), у SA этого пода
+        # write-прав нет. inline тут упёрся бы в Forbidden.
+        - name: EXECUTOR_DISPATCH
+          value: "queue"
         # ── дальше: то, что жило ТОЛЬКО в кластере ────────────────────────
         #
         # 21.08.2026 выяснилось, что этот манифест и работающий Deployment

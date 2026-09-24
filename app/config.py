@@ -966,6 +966,35 @@ class Settings(BaseSettings):
     EXECUTOR_IN_FLIGHT_TTL_SECONDS: int = Field(
         600, description="TTL (сек) для незавершённого in_flight claim в executor"
     )
+    # Где исполняются команды executor-а, требующие write-прав в кластере:
+    # реальный apply (кнопка в Discord, api-под) и server-side dry-run
+    # (стадия пайплайна, worker). `--dry-run=server` для RBAC — тот же
+    # `patch`: права на него = права на запись, достаточно убрать флаг.
+    #
+    #   inline — в процессе вызывающего (api / worker), как до 24.09.2026.
+    #            Годится для локальной разработки и тестов; в кластере
+    #            работает, только если у SA этого пода есть write-роль.
+    #   queue  — Celery-очередь EXECUTOR_QUEUE_NAME, которую слушает ОТДЕЛЬНЫЙ
+    #            deployment `copilot-executor` под SA `sre-ai-executor`.
+    #            Write-роль привязана только к нему: api, принимающий
+    #            вебхуки из интернета, и worker, гоняющий LLM по данным
+    #            инцидента, кластер менять не могут вовсе.
+    #
+    # Default inline — чтобы docker-compose и тесты работали без отдельного
+    # воркера; в k8s-манифестах api и worker выставлено queue.
+    EXECUTOR_DISPATCH: str = Field(
+        "inline", description="inline|queue — где исполнять dry-run и apply executor-а"
+    )
+    EXECUTOR_QUEUE_NAME: str = Field(
+        "executor", description="Celery-очередь, которую слушает copilot-executor"
+    )
+    # Сколько стадия пайплайна ждёт dry-run из очереди. Истёк — dry-run не
+    # подтверждён: executor_result.status='error', кнопки Apply нет
+    # (fail-closed). Упавший или не раскатанный copilot-executor не должен
+    # подвешивать пайплайн дольше этого.
+    EXECUTOR_DRY_RUN_TIMEOUT_SECONDS: int = Field(
+        60, description="Таймаут ожидания dry-run из очереди executor (сек)"
+    )
     # Верификация исхода после apply (remediation/verification.py): снимок
     # цели до/после и отложенные проверки «та же цель, сошёлся rollout,
     # ready==desired, алерт resolved, новых CrashLoop/OOM нет».
@@ -1088,6 +1117,13 @@ class Settings(BaseSettings):
             raise ValueError(
                 "ANTHROPIC_API_KEY is required when LLM_BACKEND=anthropic. "
                 "For local dev without an API key, set LLM_BACKEND=claude_cli."
+            )
+        # Опечатка в EXECUTOR_DISPATCH («Queue», «queued») не должна молча
+        # превращаться в inline: тогда apply снова пошёл бы из api-пода, и
+        # разделение прав держалось бы только на том, что у его SA нет роли.
+        if self.EXECUTOR_DISPATCH not in ("inline", "queue"):
+            raise ValueError(
+                f"EXECUTOR_DISPATCH must be 'inline' or 'queue', got {self.EXECUTOR_DISPATCH!r}"
             )
         # Условие включения пайплайна, записанное исполняемым правилом.
         # Раньше оно жило комментарием у LLM_PIPELINE_ENABLED («включать

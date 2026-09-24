@@ -2096,3 +2096,11 @@ def _record_beat_heartbeat(sender=None, task_id=None, task=None, state=None, **k
         _record_task_heartbeat(task_name)
     except Exception as e:
         logger.warning("beat_heartbeat.write_failed: %s", e)
+
+
+# Задачи executor-а (очередь EXECUTOR_QUEUE_NAME, deployment copilot-executor)
+# живут в отдельном модуле, но регистрируются на ЭТОМ celery_app: worker
+# стартует с `-A app.workers.tasks.celery_app`, и задачи, не импортированные
+# отсюда, ему неизвестны. Импорт в конце — модулю нужен уже созданный
+# celery_app.
+from app.workers import executor_tasks  # noqa: E402,F401

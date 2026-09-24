@@ -82,6 +82,10 @@ spec:
           value: "production"
         - name: SAFE_MODE
           value: "true"
+        # `--dry-run=server` стадии пайплайна — это RBAC-patch, то есть
+        # write-право; исполняет его copilot-executor (k8s/executor.yaml).
+        - name: EXECUTOR_DISPATCH
+          value: "queue"
         # ── дальше: то, что жило ТОЛЬКО в кластере ────────────────────────
         #
         # 21.08.2026: манифест и работающий Deployment разошлись полностью. В

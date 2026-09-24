@@ -1264,15 +1264,27 @@ class IncidentPipeline:
             return
 
         from app.services.k8s_service import k8s_service
+        from app.workers.executor_tasks import (queue_dispatch_enabled,
+                                                run_dry_run_via_queue)
 
         async with StageTimer("executor") as t:
             try:
-                # K8sService.execute_intent — sync (subprocess), не блокируем loop.
-                result = await asyncio.to_thread(
-                    k8s_service.execute_intent,
-                    self.execution_intent,
-                    True,  # dry_run=True
-                )
+                if queue_dispatch_enabled():
+                    # `--dry-run=server` для RBAC — тот же patch, то есть
+                    # write-право. У worker-а его нет: dry-run исполняет
+                    # copilot-executor, здесь только ждём ответ. Таймаут
+                    # уходит в except ниже → status='error', Apply нет.
+                    result = await asyncio.to_thread(
+                        run_dry_run_via_queue,
+                        self.execution_intent.model_dump(mode="json"),
+                    )
+                else:
+                    # K8sService.execute_intent — sync (subprocess), не блокируем loop.
+                    result = await asyncio.to_thread(
+                        k8s_service.execute_intent,
+                        self.execution_intent,
+                        True,  # dry_run=True
+                    )
                 self.executor_result = {
                     "status": "dry_run_ok" if result.get("success") else "dry_run_failed",
                     "command": result.get("command"),

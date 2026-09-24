@@ -19,7 +19,11 @@ spec:
     matchExpressions:
     - key: app
       operator: In
-      values: ["sre-ai-api", "copilot-worker", "copilot-beat", "sre-ai-migrate"]
+      # copilot-executor (24.09.2026) — ему нужен тот же egress, что worker-у:
+      # kube-apiserver 6443 (kubectl), postgres, redis, Discord API 443
+      # (followup после apply). Не попав в список, он остался бы вне
+      # политики вовсе, то есть с открытым egress/ingress.
+      values: ["sre-ai-api", "copilot-worker", "copilot-beat", "sre-ai-migrate", "copilot-executor"]
   policyTypes:
   - Ingress
   - Egress
