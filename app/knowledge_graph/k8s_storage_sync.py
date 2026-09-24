@@ -123,6 +123,13 @@ _VOLUME_MAX_DELETE_PER_RUN = 500
 # который снесённый стенд успевает испортить картину.
 _RECENTLY_SEEN_HOURS = 24
 
+# Окно «последний известный живой набор» — запасная опора, когда за сутки
+# синк не отметил ничего (вернулся после простоя). Неделя: достаточно, чтобы
+# пережить любой разумный простой синка, и достаточно мало, чтобы настоящая
+# массовая убыль томов за время простоя не держала отметки вечно — через
+# неделю запасная опора пустеет, и снимок снова принимается как бутстрап.
+_BASELINE_FALLBACK_HOURS = 24 * 7
+
 # Причины пропуска чистки (уходят в stats и в логи).
 REASON_FETCH_FAILED = "fetch_failed"
 REASON_EMPTY_FETCH = "empty_fetch"
@@ -857,8 +864,10 @@ def _cleanup_absent_volumes(
     # узлов. Ждём прогона, который опору поставит.
     if baseline <= 0:
         stats["skipped"] = REASON_NO_BASELINE
-        # Опорой станет ИМЕННО этот снимок, и проверить его нечем — значит
-        # он должен быть виден человеку. Размер графа рядом со снимком
+        # Станет ли этот снимок опорой, решает _snapshot_trusted (сверка с
+        # последним известным живым набором). Когда сверять не с чем совсем,
+        # опорой станет он сам, и проверить его нечем — значит он должен
+        # быть виден человеку. Размер графа рядом со снимком
         # даёт ту самую проверку: 1214 против 10 059 строк — накопленный
         # мусор, ожидаемая картина; 300 против 1214 — снимок, которому
         # верить нельзя, и это повод смотреть на кластер, а не на граф.
@@ -867,7 +876,7 @@ def _cleanup_absent_volumes(
         logger.warning(
             "k8s_storage.volume_cleanup_skipped kind=%s reason=%s — синк не "
             "отмечал тома этого вида за последние %dч, сравнивать снимок "
-            "(%d при %d строках в графе) не с чем; опорой станет он сам",
+            "(%d при %d строках в графе) не с чем",
             kind, REASON_NO_BASELINE, _RECENTLY_SEEN_HOURS,
             len(seen), len(rows),
         )
@@ -981,7 +990,12 @@ def _recently_seen_count(db: Session, *, kind: str) -> int:
     живой набор. Пустая опора честнее: она видна как `no_baseline` и
     чистку останавливает.
     """
-    cutoff = datetime.utcnow() - timedelta(hours=_RECENTLY_SEEN_HOURS)
+    return _seen_within_count(db, kind=kind, hours=_RECENTLY_SEEN_HOURS)
+
+
+def _seen_within_count(db: Session, *, kind: str, hours: int) -> int:
+    """Сколько томов этого вида синк отмечал за последние `hours` часов."""
+    cutoff = datetime.utcnow() - timedelta(hours=hours)
     return int(
         db.query(StorageVolume)
         .filter(
@@ -992,6 +1006,118 @@ def _recently_seen_count(db: Session, *, kind: str) -> int:
         .count()
         or 0
     )
+
+
+def _fallback_baseline(db: Session, *, kind: str, baseline: int) -> int:
+    """Последний известный живой набор — только когда суточной опоры нет.
+
+    Считать, как и `baseline`, ДО апсертов: новые строки получают
+    `last_seen_at` дефолтом колонки при вставке и иначе попали бы в
+    знаменатель, которым проверяют их же снимок.
+    """
+    if baseline > 0:
+        return 0
+    return _seen_within_count(db, kind=kind, hours=_BASELINE_FALLBACK_HOURS)
+
+
+def _mark_snapshot(
+    db: Session,
+    *,
+    kind: str,
+    baseline: int,
+    fallback: int,
+    seen: Set[Tuple[str, str]],
+    seen_ids: Sequence[int],
+    run_started: datetime,
+) -> Tuple[int, Dict[str, Any]]:
+    """Отметить снимок как виденный — или, если он не доверен, не дать ему
+    стать опорой. Возвращает (сколько отмечено, решение _snapshot_trusted).
+
+    Недоверенному снимку мало не вызвать `_touch_last_seen`: строки, которых
+    не было в графе, этот прогон вставил, и `last_seen_at` у них уже стоит
+    дефолтом колонки. Не снять его — и следующий прогон насчитает их в
+    суточную опору, а такой же обрезанный лист пройдёт порог с усадкой 0%.
+    """
+    trust = _snapshot_trusted(
+        kind=kind, baseline=baseline, fallback=fallback, seen=seen,
+    )
+    if trust["trusted"]:
+        return _touch_last_seen(db, seen_ids), trust
+    for part in _chunked(list(seen_ids)):
+        db.query(StorageVolume).filter(
+            StorageVolume.id.in_(part),
+            StorageVolume.last_seen_at.isnot(None),
+            StorageVolume.last_seen_at >= run_started,
+        ).update(
+            {
+                StorageVolume.last_seen_at: None,
+                # Как и в _touch_last_seen: не дать `onupdate` сдвинуть
+                # `updated_at` — строку только что вставили, поля те же.
+                StorageVolume.updated_at: StorageVolume.updated_at,
+            },
+            synchronize_session=False,
+        )
+    return 0, trust
+
+
+def _snapshot_trusted(
+    *,
+    kind: str,
+    baseline: int,
+    fallback: int,
+    seen: Set[Tuple[str, str]],
+) -> Dict[str, Any]:
+    """Можно ли отметить этот снимок `last_seen_at`, то есть сделать опорой.
+
+    Отметка — не просто «видели»: следующий прогон возьмёт отмеченное как
+    знаменатель порога усадки. До 24.09.2026 снимок без опоры отмечался
+    безусловно, и дыра была такая: синк вернулся после суток простоя,
+    kubectl отдал обрезанный лист (300 из 1214) — чистка на этом прогоне
+    честно не пошла (`no_baseline`), но 300 стали опорой, и следующий такой
+    же обрезанный лист проходил порог с усадкой 0% и сносил живые узлы.
+
+    Правила:
+      * опора за сутки есть — отмечаем, как раньше: прежний полный набор
+        ещё в окне, обрезанный снимок против него виден как усадка;
+      * опоры за сутки нет, но есть последний известный живой набор (тома,
+        отмеченные за неделю) — снимок доверен, только если не ужался против
+        него больше порога. Иначе НЕ отмечаем: пусть следующий прогон снова
+        сверяется с живым набором, а не с этим снимком;
+      * не было отметок и за неделю — сравнивать не с чем совсем (первый
+        прогон после миграции, простой дольше недели). Отмечаем: иначе опора
+        не появится никогда. Этот снимок виден в stats как непроверенный.
+    """
+    if baseline > 0:
+        return {"trusted": True}
+    if fallback <= 0:
+        return {"trusted": True, "unverified_bootstrap": True}
+    shrink_pct = _live_set_shrink_pct(baseline=fallback, current=len(seen))
+    trusted = bool(seen) and shrink_pct <= _VOLUME_MAX_DELETE_PCT
+    if not trusted:
+        logger.warning(
+            "k8s_storage.baseline_candidate_rejected kind=%s snapshot=%d "
+            "last_known_live=%d shrink=%.1f%% — снимок не станет опорой",
+            kind, len(seen), fallback, shrink_pct,
+        )
+    return {
+        "trusted": trusted,
+        "fallback_baseline": fallback,
+        "fallback_shrink_pct": round(shrink_pct, 1),
+    }
+
+
+def _annotate_trust(cleanup: Dict[str, Any], trust: Dict[str, Any]) -> None:
+    """Вынести решение об опоре в stats чистки — рядом со `skipped`.
+
+    Человеку, который читает отчёт источника, важно видеть не только «чистку
+    пропустили», но и «этот снимок опорой не стал» и почему.
+    """
+    if trust.get("unverified_bootstrap"):
+        cleanup["baseline_unverified"] = True
+    if "fallback_baseline" in trust:
+        cleanup["fallback_baseline"] = trust["fallback_baseline"]
+        cleanup["fallback_shrink_pct"] = trust["fallback_shrink_pct"]
+        cleanup["baseline_candidate_rejected"] = not trust["trusted"]
 
 
 def _live_set_shrink_pct(*, baseline: int, current: int) -> float:
@@ -1144,6 +1270,8 @@ def sync_pvs(db: Session) -> Dict[str, Any]:
     # без учёта текущего снимка. Посчитать её после `_touch_last_seen`
     # значило бы сравнивать снимок с ним же самим.
     baseline = _recently_seen_count(db, kind=NODE_PV)
+    fallback = _fallback_baseline(db, kind=NODE_PV, baseline=baseline)
+    run_started = datetime.utcnow()
     pvs, fetch_ok = _fetch_items("persistentvolumes", stats)
     stats["pvs_fetched"] = len(pvs)
     seen: Set[Tuple[str, str]] = set()
@@ -1158,11 +1286,17 @@ def sync_pvs(db: Session) -> Dict[str, Any]:
         seen.add((fields["namespace"], fields["name"]))
         stats["pvs_upserted"] += 1
     # Строго до чистки: порог усадки спрашивает у графа, сколько томов
-    # видели недавно, и этот прогон обязан быть уже посчитан.
-    stats["last_seen_touched"] = _touch_last_seen(db, seen_ids)
+    # видели недавно, и этот прогон обязан быть уже посчитан. Но отмечать
+    # можно только снимок, которому есть основание верить, — иначе он сам
+    # станет опорой для следующего прогона (см. _snapshot_trusted).
+    stats["last_seen_touched"], trust = _mark_snapshot(
+        db, kind=NODE_PV, baseline=baseline, fallback=fallback,
+        seen=seen, seen_ids=seen_ids, run_started=run_started,
+    )
     cleanup = _cleanup_absent_volumes(
         db, kind=NODE_PV, seen=seen, fetch_ok=fetch_ok, baseline=baseline,
     )
+    _annotate_trust(cleanup, trust)
     stats["cleanup"] = cleanup
     db.commit()
     # Отчёт о срезе PV — ПОСЛЕ коммита: до 18.09.2026 эта часть синка не
@@ -1209,6 +1343,8 @@ def sync_pvcs(
         "fetch_failed": False,
     }
     baseline = _recently_seen_count(db, kind=NODE_PVC)
+    fallback = _fallback_baseline(db, kind=NODE_PVC, baseline=baseline)
+    run_started = datetime.utcnow()
     pvcs, fetch_ok = _fetch_items("persistentvolumeclaims", stats)
     stats["pvcs_fetched"] = len(pvcs)
     seen: Set[Tuple[str, str]] = set()
@@ -1246,10 +1382,14 @@ def sync_pvcs(
                 extras={"phase": fields.get("phase")},
             )
             stats["edges_bound_to"] += 1
-    stats["last_seen_touched"] = _touch_last_seen(db, seen_ids)
+    stats["last_seen_touched"], trust = _mark_snapshot(
+        db, kind=NODE_PVC, baseline=baseline, fallback=fallback,
+        seen=seen, seen_ids=seen_ids, run_started=run_started,
+    )
     cleanup = _cleanup_absent_volumes(
         db, kind=NODE_PVC, seen=seen, fetch_ok=fetch_ok, baseline=baseline,
     )
+    _annotate_trust(cleanup, trust)
     stats["cleanup"] = cleanup
     db.commit()
     logger.info(
