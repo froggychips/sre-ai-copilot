@@ -11,7 +11,8 @@
 он есть почти всегда и о текущем инциденте ничего не говорит. Причиной он
 становится только со СВЕЖИМ признаком в окне инцидента:
 
-  * текст: силос не активен / вычищен из membership, отказ доставки на
+  * текст или событие СВОЕГО workload-а (чужое событие отбрасывается,
+    непроверяемое даёт только слабый ✓): силос не активен / вычищен из membership, отказ доставки на
     мёртвый силос (`SyncMapSourceEffects` на вычищенный силос — dev-17
     21.09.2026), падение кворума (только в строке про Orleans);
   * `ctx["orleans_membership"]`: мёртвых записей стало больше, чем было
@@ -36,7 +37,8 @@ import re
 from typing import Any, Dict, List, Optional
 
 from app.diagnostics.facts import Fact, FactKind
-from app.diagnostics.rules.base import Rule
+from app.diagnostics.rules.base import Rule, same_workload
+from app.diagnostics.rules.pod_events import _event_object
 from app.knowledge_graph.epistemic import Epistemic
 
 # Упоминание мёртвых записей. Нужны ОБА признака в одной строке: «Orleans»
@@ -74,6 +76,8 @@ _HEALTH_FLOORS: Dict[str, float] = {
 _HEALTH_MIN_DELTA_PCT = 50.0
 
 _PROVENANCE = "orleans_membership"
+# Признак только в событии без проверяемой привязки к workload-у.
+_UNVERIFIED_CONFIDENCE = 0.4
 
 
 def _dead_record_lines(text: str) -> List[str]:
@@ -92,13 +96,32 @@ def _fresh_in(text: str) -> List[str]:
     return hits
 
 
-def _fresh_text_hits(text: str, events: List[Dict[str, Any]]) -> List[str]:
-    hits = _fresh_in(text)
+def _fresh_event_hits(
+    events: List[Dict[str, Any]], target: Optional[str],
+) -> Dict[str, List[str]]:
+    """Свежие признаки в k8s_events, разложенные по привязке к target.
+
+    Без target-а K8sFacts отдаёт Warning-события всего namespace-а, а в нём
+    несколько grainhost-ов: `SiloUnavailable` соседа не должен становиться
+    причиной чужого инцидента. Та же разметка, что у PodEventsRule: событие
+    своего workload-а — сильный признак, чужого — отбрасывается, непроверяемое
+    (нет target-а или объекта) — только слабый.
+    """
+    out: Dict[str, List[str]] = {"scoped": [], "unverified": [], "foreign": []}
     for e in events:
         if not isinstance(e, dict):
             continue
-        hits.extend(_fresh_in(f"{e.get('reason') or ''} {e.get('message') or ''}"))
-    return hits
+        hits = _fresh_in(f"{e.get('reason') or ''} {e.get('message') or ''}")
+        if not hits:
+            continue
+        obj = _event_object(e)
+        if not target or not obj:
+            out["unverified"].extend(hits)
+        elif same_workload(obj, target):
+            out["scoped"].extend(hits)
+        else:
+            out["foreign"].extend(hits)
+    return out
 
 
 def _membership_growth(ctx: Dict[str, Any]) -> Optional[Dict[str, int]]:
@@ -129,35 +152,50 @@ def _health_spikes(ctx: Dict[str, Any]) -> Dict[str, float]:
             continue
         delta = deltas.get(metric)
         base = baseline.get(metric)
-        # База нулевая или её нет — рост от нуля до уровня выше шума и есть
-        # всплеск; иначе нужен относительный рост.
-        if not base or (isinstance(delta, (int, float)) and delta >= _HEALTH_MIN_DELTA_PCT):
+        # Явная нулевая база — рост от нуля до уровня выше шума и есть
+        # всплеск. База None — истории нет (новый деплой, дыра в замерах), и
+        # роста не установить: первый замер выше шума всплеском не считается.
+        if (isinstance(base, (int, float)) and base == 0) or (
+            isinstance(delta, (int, float)) and delta >= _HEALTH_MIN_DELTA_PCT
+        ):
             out[metric] = float(value)
     return out
 
 
 class OrleansMembershipRule(Rule):
     name = "OrleansMembershipRule"
-    sources = ("k8s_summary", "logs_summary", "k8s_events")
+    # Все поля, на которых держится «свежих признаков нет»: упади любое —
+    # ABSENT понижается до UNKNOWN базовым Rule.run().
+    sources = (
+        "k8s_summary", "logs_summary", "k8s_events",
+        "orleans_membership", "orleans_health",
+    )
 
     def evaluate(self, ctx: Dict[str, Any]) -> List[Fact]:
         text = self.text_haystack(ctx)
         events = ctx.get("k8s_events") or []
         subject = ctx.get("service")
+        target = ctx.get("pod") or ctx.get("service")
 
         dead_lines = _dead_record_lines(text)
-        fresh_text = _fresh_text_hits(text, events)
+        fresh_text = _fresh_in(text)
+        fresh_events = _fresh_event_hits(events, target)
         growth = _membership_growth(ctx)
         spikes = _health_spikes(ctx)
 
-        if fresh_text or growth or spikes:
+        strong = fresh_text or fresh_events["scoped"] or growth or spikes
+        if strong or fresh_events["unverified"]:
+            signals = fresh_text + fresh_events["scoped"] + fresh_events["unverified"]
             return [Fact(
                 kind=FactKind.ORLEANS_MEMBERSHIP_DEGRADED,
                 observed=True,
-                confidence=0.8,
+                # Только непроверяемые события — soft-зона, как у PodEventsRule.
+                confidence=0.8 if strong else _UNVERIFIED_CONFIDENCE,
                 subject=subject,
                 evidence={
-                    "fresh_signals": sorted({h.lower() for h in fresh_text})[:5],
+                    "fresh_signals": sorted({h.lower() for h in signals})[:5],
+                    "unverified_events": len(fresh_events["unverified"]),
+                    "foreign_events_ignored": len(fresh_events["foreign"]),
                     "dead_records_growth": growth,
                     "health_spikes": spikes,
                     "dead_records_mentioned": bool(dead_lines),

@@ -145,3 +145,47 @@ def test_prompt_has_no_background_note_for_found():
 def test_engine_keeps_background_out_of_observed_kinds():
     store = DiagnosticEngine().run({"service": "alpha-grainhost", "k8s_summary": BACKGROUND})
     assert FactKind.ORLEANS_MEMBERSHIP_DEGRADED not in store.observed_kinds()
+
+
+def test_foreign_workload_event_is_ignored():
+    # SiloUnavailable соседнего grainhost-а — не причина этого инцидента.
+    f = _one(_run(
+        k8s_summary=BACKGROUND,
+        k8s_events=[{"reason": "Unhealthy", "object": "bravo-grainhost-5d8f9-xk2lp",
+                     "message": "SiloUnavailableException"}],
+    ))
+    assert f.verdict == Verdict.ABSENT.value
+    assert f.evidence["chronic"] is True
+
+
+def test_scoped_workload_event_is_strong():
+    f = _one(_run(
+        k8s_summary=BACKGROUND,
+        k8s_events=[{"reason": "Unhealthy", "object": "alpha-grainhost-5d8f9-xk2lp",
+                     "message": "SiloUnavailableException"}],
+    ))
+    assert f.verdict == Verdict.FOUND.value
+    assert f.confidence == 0.8
+
+
+def test_unverified_event_is_weak():
+    f = _one(_run(
+        k8s_summary=BACKGROUND,
+        k8s_events=[{"reason": "Unhealthy", "message": "silo S1 is not active"}],
+    ))
+    assert f.verdict == Verdict.FOUND.value
+    assert f.confidence < 0.5
+    assert f.evidence["unverified_events"] == 1
+
+
+def test_missing_health_baseline_is_not_growth_from_zero():
+    f = _one(_run(k8s_summary=BACKGROUND, orleans_health=_health(
+        {"orleans_timedout_rate": 2.0}, {"orleans_timedout_rate": None},
+        {"orleans_timedout_rate": None},
+    )))
+    assert f.verdict == Verdict.ABSENT.value
+
+
+def test_failed_health_source_demotes_background_to_unknown():
+    f = _one(_run(k8s_summary=BACKGROUND, source_status={"orleans_health": "failed: VMQueryError"}))
+    assert f.verdict == Verdict.UNKNOWN.value
