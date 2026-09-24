@@ -1,8 +1,11 @@
-from typing import Any, Dict, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Dict, Optional, Sequence, Tuple
 
 from app.agents.base import BaseAgent
 from app.core.execution_dsl import ExecutionIntent
 from app.services.telemetry_utils import trace_agent
+
+if TYPE_CHECKING:
+    from app.remediation.playbook import Playbook
 
 _BASE_INSTRUCTION = """
 Suggest a Kubernetes fix using a Structured Execution Intent.
@@ -54,6 +57,31 @@ def _build_jira_prefix(jira_context: Dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+def _build_playbook_prefix(playbooks: Sequence["Playbook"]) -> str:
+    """Кандидаты-playbook-и, отобранные детерминированно (matcher).
+
+    Модель выбирает среди них, а не сочиняет действие: executor_gate с
+    REMEDIATION_PLAYBOOK_BINDING_ENABLED заблокирует мутирующий intent без
+    `playbook` или с действием вне его плана. Описание playbook-а — наш YAML,
+    не данные инцидента, так что в промпт оно попадает без экранирования.
+    """
+    lines = ["=== ALLOWED REMEDIATION PLAYBOOKS ==="]
+    if not playbooks:
+        lines.append("(none — no playbook matches this incident)")
+    for pb in playbooks:
+        actions = ", ".join(step.action for step in pb.plan.steps or ())
+        desc = " ".join((pb.description or "").split())
+        lines.append(f"- {pb.name}: actions [{actions}] — {desc}")
+    lines.append(
+        "\nIf you propose a state-changing action (restart_deployment, "
+        "scale_deployment), it MUST be one of the actions of a playbook above, "
+        'and the JSON MUST include "playbook": "<playbook name>". '
+        "If none of the playbooks fits, propose a read-only action "
+        "(get_logs, describe_resource) without a playbook."
+    )
+    return "\n".join(lines)
+
+
 class FixAgent(BaseAgent):
     def __init__(self):
         super().__init__(
@@ -67,12 +95,17 @@ class FixAgent(BaseAgent):
         finalized_cause: str,
         is_recurrence: bool = False,
         jira_context: Optional[Dict[str, Any]] = None,
+        playbooks: Optional[Sequence["Playbook"]] = None,
     ) -> Tuple[str, Optional[ExecutionIntent]]:
         """Вернуть пару (raw LLM-ответ, распарсенный ExecutionIntent).
 
         LLM инструктируется выдавать JSON по схеме ExecutionIntent. Если парсинг
         или валидация не прошли — intent=None (advisory-fallback: prose всё равно
         показывается в Discord-embed, executor-стадия просто пропускается).
+
+        `playbooks` — кандидаты от `matcher.match_playbooks`; передаются
+        только при REMEDIATION_PLAYBOOK_BINDING_ENABLED. None — промпт
+        прежний; [] — в промпте явно «кандидатов нет, только чтение».
         """
         instruction = (
             _RECURRENCE_PREFIX + _BASE_INSTRUCTION if is_recurrence else _BASE_INSTRUCTION
@@ -80,6 +113,12 @@ class FixAgent(BaseAgent):
         context = finalized_cause
         if jira_context:
             context = _build_jira_prefix(jira_context) + "\n\n" + finalized_cause
+        # None — привязка выключена, промпт прежний. [] — привязка включена,
+        # но под инцидент ничего не подошло: модель должна знать, что
+        # мутировать нечем, иначе она предложит restart, dry-run пройдёт, и
+        # в Discord появится кнопка Apply, которую gate всё равно отвергнет.
+        if playbooks is not None:
+            context = _build_playbook_prefix(playbooks) + "\n\n" + context
         raw = await self.ask(user_context=context, instruction=instruction)
         intent = ExecutionIntent.from_llm_response(raw)
         return raw, intent

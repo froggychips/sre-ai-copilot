@@ -1,0 +1,28 @@
+id: 022_playbook_unknown_deploys_fail_closed
+title: тот же транзиентный crashloop, но источник деплоев упал — playbook не кандидат
+source: synthetic
+llm: false
+incident: {incident_id: golden-022, severity: warning, status: firing,
+           summary: "Pod worker-5d8f-abcde crash-looping", description: "CrashLoopBackOff",
+           namespace: squad-3,
+           labels: {alertname: KubePodCrashLooping, pod: worker-5d8f-abcde, service: worker, namespace: squad-3},
+           annotations: {description: "CrashLoopBackOff"},
+           starts_at: "2026-08-10T10:00:00Z", ends_at: null, generator_url: null, raw: {}}
+context:
+  k8s_pod_state:
+    worker-5d8f-abcde: {exit_code: 1, reason: Error, restart_count: 6}
+  logs_summary: |
+    Last state: terminated, exit code 1
+    connection refused: upstream cache not ready, exiting
+  k8s_events:
+    - {type: Warning, reason: BackOff, count: 6,
+       message: "Back-off restarting failed container worker in pod worker-5d8f-abcde"}
+  recent_deployments: []
+  source_status:
+    recent_deployments: "failed: OperationalError"
+expect:
+  # Пустой список деплоев при упавшем источнике — UNKNOWN, а не ABSENT.
+  # «Выката не было» не доказано → precondition не выполнен (fail-closed).
+  facts:
+    crashloop: true
+  playbooks: []

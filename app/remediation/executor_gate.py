@@ -17,18 +17,22 @@ executor-а). LLM-`risk` теперь — лишь advisory-подсказка �
 структурного ExecutionIntent, а не из свободного LLM-текста, поэтому
 модель не может «уговорить» gate пропустить prod/system/data-plane-цель.
 
-NB: это НЕ classification-playbook из registry (тот матчится по классу
-алерта в `build_decision_preview`). Это явный safety-инвариант именно
-executor-пути для уже-утверждённого человеком прямого intent-а.
+NB: gate-политика лежит в `registry/_executor_apply_gate.yaml`, но это НЕ
+кандидат для матчинга (файл с «_» load_registry пропускает). Это явный
+safety-инвариант именно executor-пути для уже-утверждённого человеком
+прямого intent-а. С флагом REMEDIATION_PLAYBOOK_BINDING_ENABLED поверх него
+накладывается политика v2-playbook-а, на который сослался intent.
 """
 from __future__ import annotations
 
+import os
 import re
 from dataclasses import replace
 from typing import Any, Dict
 
+from app.config import settings
 from app.core.execution_dsl import ExecutionIntent, action_spec
-from app.remediation.playbook import Playbook
+from app.remediation.playbook import Playbook, load_playbook
 from app.remediation.policy import PolicyDecision, PolicyMode, evaluate_policy
 from app.remediation.risk_axes import (Confidence, DataPlane, Reversibility,
                                        RiskAxes, compute_risk_axes)
@@ -46,39 +50,18 @@ __all__ = ["evaluate_intent_gate", "PolicyDecision", "PolicyMode"]
 # прошло бы проверку риска как безвредное чтение.
 
 
-# Серверная safety-policy для human-approved direct-intent applies:
-#   - block.any: prod/system ns, data-plane, необратимое, weak-confidence;
-#   - approve : только dev/squad ns c data_plane no/maybe;
-#   - всё остальное (preprod, unknown tier) → default BLOCK.
-# `match`/`plan` присутствуют лишь чтобы удовлетворить strict-схему Playbook;
-# `evaluate_policy` читает только секцию `policy`.
-_EXECUTOR_GATE_POLICY: Playbook = Playbook.model_validate(
-    {
-        "schema_version": "remediation.playbook/v1",
-        "name": "_executor_apply_gate",
-        "kind": "remediation",
-        "description": (
-            "Deterministic safety gate for human-approved direct "
-            "ExecutionIntent applies (not LLM-trusted)."
-        ),
-        "match": {"classification": "executor_intent"},
-        "policy": {
-            "approve": {
-                "namespace_tier": ["dev", "squad"],
-                "data_plane": ["no", "maybe"],
-            },
-            "block": {
-                "any": {
-                    "namespace_tier": ["prod", "system"],
-                    "data_plane": ["yes"],
-                    "reversibility": ["hard"],
-                    "confidence": ["weak"],
-                },
-            },
-        },
-        "plan": {"command": ["kubectl"]},
-    }
+# Серверная safety-policy для human-approved direct-intent applies живёт в
+# реестре YAML (`registry/_executor_apply_gate.yaml`), а не в коде: раньше
+# здесь собирался Playbook из dict-а с фиктивными `match`/`plan` — только
+# чтобы пройти strict-схему. Теперь это v2-документ, и его `plan.steps`
+# работает: действие, которого там нет, gate блокирует.
+#
+# Загрузка на импорте: сломанный YAML роняет воркер на старте, а не
+# превращает apply в «политики нет — пропускаем».
+_GATE_POLICY_PATH = os.path.join(
+    os.path.dirname(__file__), "registry", "_executor_apply_gate.yaml",
 )
+_EXECUTOR_GATE_POLICY: Playbook = load_playbook(_GATE_POLICY_PATH)
 
 
 # Маркеры data-plane-нагрузок в ИМЕНИ ресурса. У прямого ExecutionIntent нет
@@ -179,7 +162,82 @@ def evaluate_intent_gate(intent: ExecutionIntent) -> PolicyDecision:
     """
     target = _intent_to_target(intent)
     spec = action_spec(intent.action)
+
+    # Действие вне plan.steps gate-политики — не «не знаем, пропустим», а
+    # отказ: новое ActionType должно быть явно допущено в YAML.
+    if intent.action.value not in _EXECUTOR_GATE_POLICY.step_actions():
+        return PolicyDecision(
+            mode=PolicyMode.BLOCK,
+            reasons=[{
+                "rule": "block_action_not_in_gate_plan",
+                "action": intent.action.value,
+                "reason": "action is not listed in executor gate plan.steps",
+            }],
+        )
+
     hint = {"command_kind": spec.command_kind or "unknown"}
     axes = compute_risk_axes(target, classification_signals=None, playbook_hint=hint)
     axes = _apply_fail_closed_axes(axes, intent)
-    return evaluate_policy(_EXECUTOR_GATE_POLICY, axes, target=target)
+    decision = evaluate_policy(_EXECUTOR_GATE_POLICY, axes, target=target)
+
+    if not getattr(settings, "REMEDIATION_PLAYBOOK_BINDING_ENABLED", False):
+        return decision
+    # Чтение не требует playbook-а: describe/logs ничего не меняют, а
+    # требование привязки для них только выключило бы расследование.
+    if not spec.mutating:
+        return decision
+    return _strictest(decision, _playbook_binding_decision(intent, axes, target))
+
+
+# --- Привязка к playbook-у (REMEDIATION_PLAYBOOK_BINDING_ENABLED) ----------
+
+_MODE_RANK = {PolicyMode.AUTO: 0, PolicyMode.APPROVE: 1, PolicyMode.BLOCK: 2}
+
+
+def _strictest(base: PolicyDecision, other: PolicyDecision) -> PolicyDecision:
+    """Более строгое из двух решений; при равенстве — base (его reasons)."""
+    if _MODE_RANK[other.mode] > _MODE_RANK[base.mode]:
+        return other
+    return base
+
+
+def _binding_block(reason: str, **extra: Any) -> PolicyDecision:
+    return PolicyDecision(
+        mode=PolicyMode.BLOCK,
+        reasons=[{"rule": "block_playbook_binding", "reason": reason, **extra}],
+    )
+
+
+def _playbook_binding_decision(
+    intent: ExecutionIntent, axes: RiskAxes, target: Dict[str, Any],
+) -> PolicyDecision:
+    """Проверить, что мутирующий intent исполняет план v2-playbook-а.
+
+    Не проверяет preconditions: фактов на apply-пути нет, а отбор по ним
+    уже сделан до FixAgent (`matcher.match_playbooks`). Здесь — то, что
+    модель могла нарушить: сослаться на несуществующий или preview-only
+    playbook либо выдать действие, которого в его плане нет. Политика
+    playbook-а считается по тем же fail-closed осям, что и gate.
+    """
+    if not intent.playbook:
+        return _binding_block("playbook_missing")
+    # Ленивый импорт: matcher тянет diagnostics/FactStore, которые gate-у
+    # без флага не нужны.
+    from app.remediation.matcher import default_registry
+    try:
+        registry = default_registry()
+    except Exception as e:
+        return _binding_block("registry_unavailable", error=type(e).__name__)
+    pb = registry.get(intent.playbook)
+    if pb is None:
+        return _binding_block("playbook_unknown", playbook=intent.playbook)
+    if not pb.executable:
+        return _binding_block("playbook_not_executable", playbook=pb.name)
+    if intent.action.value not in pb.step_actions():
+        return _binding_block(
+            "action_not_in_plan",
+            playbook=pb.name,
+            action=intent.action.value,
+            plan=sorted(pb.step_actions()),
+        )
+    return evaluate_policy(pb, axes, target=target)

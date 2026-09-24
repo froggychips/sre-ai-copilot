@@ -255,6 +255,35 @@ def transition_to(record, new_state: IncidentState, db) -> None:
     db.commit()
 
 
+def _enforce_candidate_binding(intent, candidates, incident_id):
+    """Привязка intent-а → playbook действительна, только если matcher выбрал
+    этот playbook для ЭТОГО инцидента.
+
+    Gate на apply-пути фактов не видит и проверяет лишь, что playbook
+    существует и действие входит в его план. Без этой сверки модель
+    (или prompt-injection в логах) могла бы сослаться на
+    `restart_crashloop_deployment` при OOM — preconditions не выполнены,
+    кандидатов нет, а gate ответил бы APPROVE. Здесь факты есть, поэтому
+    чужая ссылка снимается: intent сохраняется без playbook-а, и gate
+    блокирует его как `playbook_missing`. Сверка идёт до сохранения intent-а,
+    так что подпись (и одобрение человека) покрывает уже очищенную версию.
+    """
+    if intent is None or candidates is None or not intent.playbook:
+        return intent
+    allowed = {pb.name for pb in candidates}
+    if intent.playbook in allowed:
+        return intent
+    audit_service.log_event(
+        "EXECUTION_INTENT_PLAYBOOK_REJECTED",
+        {
+            "incident_id": incident_id,
+            "playbook": intent.playbook,
+            "candidates": sorted(allowed),
+        },
+    )
+    return intent.model_copy(update={"playbook": None})
+
+
 def _serialize_hypotheses(critiqued, facts: FactStore) -> str:
     lines = ["=== HYPOTHESES (fact-anchored multi-perspective) ==="]
     surv = survivors(critiqued).items
@@ -1009,13 +1038,42 @@ class IncidentPipeline:
     # Stage 6 — FixAgent
     # ------------------------------------------------------------------
 
+    def _candidate_playbooks(self) -> Optional[list]:
+        """v2-кандидаты для FixAgent — только под флагом привязки.
+
+        Ошибка реестра не роняет стадию: FixAgent получит прежний промпт, а
+        gate с включённым флагом сам заблокирует мутирующий intent без
+        playbook-а (fail-closed на apply-пути, а не здесь).
+        """
+        if not getattr(settings, "REMEDIATION_PLAYBOOK_BINDING_ENABLED", False):
+            return None
+        from app.remediation.matcher import match_playbooks
+        try:
+            candidates = match_playbooks(
+                alertname=(self.incident.labels or {}).get("alertname"),
+                facts=self.fact_store,
+            )
+        except Exception as e:
+            logger.warning("playbook_match_failed", error=type(e).__name__)
+            return None
+        self.root_span.set_attribute(
+            "sre.incident.candidate_playbooks",
+            ",".join(pb.name for pb in candidates),
+        )
+        return candidates
+
     async def stage_fix(self) -> None:
+        candidates = self._candidate_playbooks()
         async with StageTimer("fix") as t:
             self.fix_suggestion, self.execution_intent = await FixAgent().suggest(
                 self.final_cause,
                 is_recurrence=self.is_recurrence,
                 jira_context=self.jira_context,
+                playbooks=candidates,
             )
+        self.execution_intent = _enforce_candidate_binding(
+            self.execution_intent, candidates, self.incident_id,
+        )
         snap = t.snapshot().to_dict()
         # Метрика на root-span: смог ли LLM выдать structured-intent.
         self.root_span.set_attribute(

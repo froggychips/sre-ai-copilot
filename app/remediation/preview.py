@@ -148,7 +148,7 @@ def _render_command_preview(
                 ctx[k] = v
 
     rendered: list[str] = []
-    for token in playbook.plan.command:
+    for token in playbook.plan.command or ():
         try:
             rendered.append(token.format_map(_SafeDict(ctx)))
         except Exception:
@@ -192,6 +192,10 @@ def _select_candidate_playbooks(
     """Список имён playbook-ов, у которых `match` сработал."""
     candidates: list[str] = []
     for name, pb in registry.items():
+        # v2 (исполнимые) матчит matcher.match_playbooks по фактам; здесь —
+        # только preview-only v1 с plan.command для рендера строкой.
+        if pb.executable:
+            continue
         if _match_playbook(pb, classification.classification, signals):
             candidates.append(name)
     return candidates
@@ -293,7 +297,7 @@ def build_decision_preview(
 
     # Hint для risk axes из playbook.plan.command — нужен idempotency/
     # reversibility.
-    command_kind = _classify_command_kind(selected.plan.command)
+    command_kind = _classify_command_kind(selected.plan.command or ())
     playbook_hint = {"command_kind": command_kind}
 
     axes = compute_risk_axes(

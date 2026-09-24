@@ -934,6 +934,16 @@ class Settings(BaseSettings):
     # Default False — нужен явный опт-ин на проде.
     EXECUTOR_APPROVAL_ENABLED: bool = Field(False, description="Show Apply button on Discord embed")
 
+    # Привязка intent-а к v2-playbook-у (app/remediation/matcher.py). Если
+    # True: FixAgent получает только кандидатов, отобранных детерминированно
+    # по алерту и фактам, а executor_gate блокирует мутирующий intent без
+    # playbook-а или с действием вне его plan.steps; политика playbook-а
+    # складывается с gate-политикой по строжайшему. Default False — пока в
+    # реестре один v2-playbook, включение сузит executor почти до нуля.
+    REMEDIATION_PLAYBOOK_BINDING_ENABLED: bool = Field(
+        False, description="Require mutating ExecutionIntent to reference a matching v2 playbook"
+    )
+
     # Запись об одобрении в kg_action_approvals не имела привязки ко времени:
     # approval четырёхчасовой давности продолжал авторизовывать реальный write
     # (особенно после re-fire алерта). Ограничиваем срок годности одобрения.

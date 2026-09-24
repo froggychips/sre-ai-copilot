@@ -115,6 +115,11 @@ class ExecutionIntent(BaseModel):
     namespace: str = "default"
     params: Dict[str, Any] = Field(default_factory=dict)
     risk: str = "medium"
+    # Имя v2-playbook-а, на план которого ссылается intent. Необязательно:
+    # пока REMEDIATION_PLAYBOOK_BINDING_ENABLED выключен, gate поле не читает.
+    # Со включённым флагом мутирующий intent без playbook-а блокируется, а
+    # действие обязано входить в plan.steps (см. executor_gate).
+    playbook: Optional[str] = Field(None, pattern=r"^[a-z0-9_]{1,64}$")
 
     @field_validator("namespace")
     @classmethod

@@ -11,6 +11,8 @@ context:
   k8s_pod_state:
     api-1: {exit_code: 137, reason: OOMKilled, restart_count: 5}
 expect:
+  # OOM: рестарт упрётся в тот же лимит.
+  playbooks: []
   facts:
     oom_killed: true
     process_crash: false

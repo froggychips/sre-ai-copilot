@@ -38,6 +38,13 @@ def compute_signature(intent: "ExecutionIntent") -> str:
         # в Python 3.7+ insertion-preserving, но LLM может вернуть в разном порядке).
         "params": intent.params or {},
     }
+    # playbook входит в подпись только когда задан: подписи intent-ов без
+    # привязки (всё, что уже лежит в kg_action_approvals) не меняются, а
+    # подмена playbook-а после одобрения ломает TOCTOU-сверку, как и любое
+    # другое поле.
+    playbook = getattr(intent, "playbook", None)
+    if playbook:
+        payload["playbook"] = str(playbook)
     raw = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
     return hashlib.sha256(raw).hexdigest()[:12]
 

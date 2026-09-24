@@ -1,0 +1,41 @@
+# Серверная safety-policy для human-approved direct-intent applies.
+#
+# Файл начинается с «_»: load_registry() его пропускает, поэтому gate-политика
+# никогда не попадёт в кандидаты match_playbooks. Грузит её только
+# executor_gate (load_playbook по пути) — при импорте, так что сломанный YAML
+# роняет процесс на старте, а не пропускает apply.
+#
+#   - block.any: prod/system ns, data-plane, необратимое, weak-confidence;
+#   - approve : только dev/squad ns c data_plane no/maybe;
+#   - всё остальное (preprod, unknown tier) → default BLOCK.
+#
+# plan.steps — действия, которые executor вообще готов применять. Новое
+# ActionType, не добавленное сюда, gate блокирует (fail-closed), даже если
+# ACTION_SPECS его знает.
+#
+# NB: "no"/"yes" в кавычках — иначе PyYAML прочтёт их как bool.
+schema_version: remediation.playbook/v2
+name: _executor_apply_gate
+kind: remediation
+description: |
+  Deterministic safety gate for human-approved direct ExecutionIntent
+  applies (not LLM-trusted).
+match:
+  classification: executor_intent
+policy:
+  approve:
+    namespace_tier: ["dev", "squad"]
+    data_plane: ["no", "maybe"]
+  block:
+    any:
+      namespace_tier: ["prod", "system"]
+      data_plane: ["yes"]
+      reversibility: ["hard"]
+      confidence: ["weak"]
+plan:
+  steps:
+    - action: restart_deployment
+    - action: scale_deployment
+    - action: get_logs
+    - action: describe_resource
+    - action: get_pods

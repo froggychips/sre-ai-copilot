@@ -1,21 +1,44 @@
 """YAML playbook loader + strict schema validation.
 
 Schema requirements:
-- `schema_version` mandatory; only `remediation.playbook/v1` accepted.
+- `schema_version` mandatory; `remediation.playbook/v1` или `/v2`.
 - `kind: remediation` mandatory.
 - Pydantic v2 model with `model_config={"extra": "forbid"}` — typo'и
   в YAML падают на parse, не на использовании.
 
 Без strict schema YAML rot за месяц: накопятся опечатки в `auto:`/`approve:`/
 `block:` и при review никто не заметит дрейф.
+
+Две версии схемы (24.09.2026):
+
+- **v1** — preview-only (Phase A). `plan.command` — голый argv, который
+  только рендерится строкой в UI; `match` понимает classification и
+  numeric-поля stale-job. Так описан `cleanup_stale_failed_job`: удаления
+  Job нет в `ACTION_SPECS`, поэтому перевести его на v2 нельзя, не заводя
+  новое мутирующее действие, — и это правильно.
+- **v2** — исполнимый контракт. `plan.steps` ссылаются на `ActionType` из
+  `app/core/execution_dsl.ACTION_SPECS`; argv собирает только
+  `DSLTranslator.to_argv`, в YAML команды нет вовсе. Плюс `preconditions`
+  по вердиктам фактов из FactStore и `verify` — имена проверок из
+  `verify_checks.VERIFY_CHECKS`. Всё это валидируется на загрузке: playbook
+  с несуществующим действием, фактом или проверкой не загрузится.
 """
 from __future__ import annotations
 
 import os
-from typing import Any, Iterable
+from typing import Any, Iterable, Literal
 
 import yaml
-from pydantic import BaseModel, ConfigDict, ValidationError, field_validator
+from pydantic import (BaseModel, ConfigDict, ValidationError, field_validator,
+                      model_validator)
+
+from app.core.execution_dsl import ActionType
+from app.diagnostics.facts import FactKind
+from app.remediation.verify_checks import VERIFY_CHECKS
+
+SCHEMA_V1 = "remediation.playbook/v1"
+SCHEMA_V2 = "remediation.playbook/v2"
+_SCHEMA_VERSIONS = (SCHEMA_V1, SCHEMA_V2)
 
 
 class PlaybookValidationError(ValueError):
@@ -66,10 +89,15 @@ class _NumericConstraint(_StrictModel):
 class _MatchSection(_StrictModel):
     """Условие срабатывания playbook-а: classification + numeric guards.
 
-    `classification` mandatory — без этого playbook нельзя матчить. Остальные
-    поля — optional numeric guards с явным набором.
+    v1: `classification` обязателен — без него playbook нельзя матчить.
+    v2: хотя бы одно из `classification` / `alertnames` (проверка в
+    `Playbook._check_version_contract`). Остальные поля — optional numeric
+    guards с явным набором.
     """
-    classification: str
+    classification: str | None = None
+    # v2: точные имена алертов AlertManager. Без glob-ов: `*CrashLoop*`
+    # незаметно подхватил бы новый алерт, про который автор playbook-а не думал.
+    alertnames: list[str] | None = None
     job_age_hours: _NumericConstraint | None = None
     active_jobs: _NumericConstraint | None = None
     failed_jobs: _NumericConstraint | None = None
@@ -121,16 +149,79 @@ class _PolicySection(_StrictModel):
     block: _BlockSection | None = None
 
 
-class _PlanSection(_StrictModel):
-    """Команда remediation в виде списка argv (НЕ shell).
+_ACTION_VALUES = frozenset(a.value for a in ActionType)
 
-    `command` — реальная команда (НЕ выполняется в Phase A — только
-    подставляется в preview как строка).
-    `preview` — read-only вспомогательная команда для contextual UI
-    (`kubectl get` / `rollout history`).
+
+class _PlanStep(_StrictModel):
+    """Шаг v2-плана: ссылка на действие из реестра execution_dsl.
+
+    `params` — значения или шаблоны `{name}` (целиком строка), которые
+    подставляются при рендере (`matcher.render_plan`). Команду шаг не несёт
+    намеренно: argv собирает только `DSLTranslator.to_argv`, иначе YAML снова
+    стал бы вторым, непроверяемым источником kubectl-команд.
     """
-    command: list[str]
+    action: str
+    params: dict[str, int | str] = {}
+    # По умолчанию — `requires_resource_type` из ActionSpec, иначе deployment.
+    resource_type: str | None = None
+
+    @field_validator("action")
+    @classmethod
+    def _check_action(cls, v: str) -> str:
+        # Проверяем по ActionType, а не по ACTION_SPECS напрямую: полнота
+        # реестра спецификаций гарантируется на импорте execution_dsl.
+        if v not in _ACTION_VALUES:
+            raise ValueError(
+                f"unknown action '{v}': нет в ActionType/ACTION_SPECS "
+                f"(известные: {sorted(_ACTION_VALUES)})"
+            )
+        return v
+
+
+class _PlanSection(_StrictModel):
+    """План remediation.
+
+    v1: `command` — argv (НЕ shell), только рендерится в preview строкой;
+    `preview` — read-only вспомогательная команда для contextual UI.
+    v2: `steps` — действия из ACTION_SPECS; `command`/`preview` запрещены.
+    """
+    command: list[str] | None = None
     preview: list[str] | None = None
+    steps: list[_PlanStep] | None = None
+
+
+class _Precondition(_StrictModel):
+    """Требование к вердикту факта из FactStore (v2).
+
+    `verdict: unknown` в YAML не допускается: «требую, чтобы не удалось
+    проверить» — бессмыслица. А UNKNOWN у факта никогда не удовлетворяет ни
+    found, ни absent (fail-closed, см. `matcher.check_preconditions`).
+    """
+    fact: str
+    verdict: Literal["found", "absent"]
+    # Только с `verdict: found`: каждый FOUND-факт обязан нести ключ evidence,
+    # и его значение не должно входить в список. Нужен, когда kind слишком
+    # широкий: process_crash FOUND и у SIGSEGV (139), и у транзиентного exit 1.
+    # Ключа в evidence нет → условие не выполнено (fail-closed).
+    evidence_not_in: dict[str, list[int | str]] | None = None
+
+    @model_validator(mode="after")
+    def _check_evidence_filter(self) -> "_Precondition":
+        if self.evidence_not_in is not None:
+            if self.verdict != "found":
+                raise ValueError("evidence_not_in applies only to verdict: found")
+            if not self.evidence_not_in:
+                raise ValueError("evidence_not_in must not be empty")
+        return self
+
+    @field_validator("fact")
+    @classmethod
+    def _check_fact(cls, v: str) -> str:
+        if v not in FactKind.ALL:
+            raise ValueError(
+                f"unknown fact kind '{v}' (известные: {sorted(FactKind.ALL)})"
+            )
+        return v
 
 
 class _ObserveSuccessFailure(_StrictModel):
@@ -159,18 +250,77 @@ class Playbook(_StrictModel):
     kind: str
     description: str | None = None
     match: _MatchSection
+    preconditions: list[_Precondition] | None = None
     policy: _PolicySection
     plan: _PlanSection
+    verify: list[str] | None = None
     observe: _ObserveSection | None = None
 
     @field_validator("schema_version")
     @classmethod
     def _check_schema_version(cls, v: str) -> str:
-        if v != "remediation.playbook/v1":
+        if v not in _SCHEMA_VERSIONS:
             raise ValueError(
-                f"schema_version must be 'remediation.playbook/v1', got '{v}'"
+                f"schema_version must be one of {list(_SCHEMA_VERSIONS)}, got '{v}'"
             )
         return v
+
+    @field_validator("verify")
+    @classmethod
+    def _check_verify(cls, v: list[str] | None) -> list[str] | None:
+        for name in v or ():
+            if name not in VERIFY_CHECKS:
+                raise ValueError(
+                    f"unknown verify check '{name}' "
+                    f"(известные: {sorted(VERIFY_CHECKS)})"
+                )
+        return v
+
+    @model_validator(mode="after")
+    def _check_version_contract(self) -> "Playbook":
+        """Поля v1 и v2 не смешиваются.
+
+        Молча игнорировать «чужое» поле нельзя: `steps` в v1 выглядели бы
+        исполнимыми, а не исполнялись бы; `command` в v2 — вторым источником
+        argv в обход DSL.
+        """
+        if self.schema_version == SCHEMA_V1:
+            if self.match.classification is None:
+                raise ValueError("v1: match.classification is required")
+            if self.plan.command is None:
+                raise ValueError("v1: plan.command is required")
+            v2_only = [
+                name for name, present in (
+                    ("match.alertnames", self.match.alertnames is not None),
+                    ("plan.steps", self.plan.steps is not None),
+                    ("preconditions", self.preconditions is not None),
+                    ("verify", self.verify is not None),
+                ) if present
+            ]
+            if v2_only:
+                raise ValueError(f"v1 does not support: {v2_only} (use v2)")
+        else:
+            if not self.plan.steps:
+                raise ValueError("v2: plan.steps is required and non-empty")
+            if self.plan.command is not None or self.plan.preview is not None:
+                raise ValueError(
+                    "v2: plan.command/plan.preview are forbidden — argv "
+                    "собирается только через execution_dsl"
+                )
+            if self.match.classification is None and not self.match.alertnames:
+                raise ValueError(
+                    "v2: match needs classification or non-empty alertnames"
+                )
+        return self
+
+    @property
+    def executable(self) -> bool:
+        """v2 — исполнимый контракт; v1 — только preview."""
+        return self.schema_version == SCHEMA_V2
+
+    def step_actions(self) -> frozenset[str]:
+        """Имена действий плана (пусто у v1)."""
+        return frozenset(step.action for step in self.plan.steps or ())
 
     @field_validator("kind")
     @classmethod
