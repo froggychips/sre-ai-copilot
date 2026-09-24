@@ -26,11 +26,19 @@ LLM-цепочку, что и golden (`MultiHypothesisAgent` → `FactCriticAgen
 Оценка — грубая и честная: причину медика и причину модели раскладываем по
 одним и тем же классам (`CAUSE_CLASSES`, регулярки RU+EN), попадание — это
 пересечение классов. Это нижняя оценка: модель могла назвать ту же причину
-словами, которых нет в регулярках. Вход — алерт, плюс снимок контекста
-инцидента (`analysis.context_snapshot`), если пайплайн его записал: `export`
-подтягивает снимок, `run` накладывает его на ctx правил. У кейсов без снимка
-цифры меряют «разбор по алерту», а не «разбор с полным контекстом» — в
-results это видно по `had_snapshot`.
+словами, которых нет в регулярках. У кейса несколько источников входа
+(`context` — метка режима, `had_snapshot`/`kg_context` — что подмешано):
+
+  alert_only      только алерт;
+  medic_observed  алерт + наблюдения медика (`extract_medic_observations`):
+                  состояния подов, коды выхода, dirty-миграция, отсутствующие
+                  ключи секрета — шаблонами из белого списка, без его выводов.
+
+Поверх режима `run` накладывает снимок контекста инцидента
+(`analysis.context_snapshot`, если пайплайн его записал) и реконструкцию из
+графа (`kg-context`). Метрики считаются по режимам раздельно. medic_observed —
+нижняя граница «разбора с контекстом», а не он сам: медик записал не всё, что
+видел.
 """
 from __future__ import annotations
 
@@ -86,6 +94,179 @@ def primary_class(text: Optional[str]) -> Optional[str]:
     return min(hits)[1] if hits else None
 
 
+# --- наблюдения медика ----------------------------------------------------
+#
+# Снимка кластера на момент инцидента в БД нет, а медик его видел: в summary,
+# applied, manual и gaps события лежит то, что он наблюдал (состояния подов,
+# коды выхода, dirty-миграция, отсутствующие ключи секрета). Но там же лежат
+# и его ВЫВОДЫ («теги ушли из реестра из-за retention») — а вывод и есть
+# ответ, с которым сверяется модель. Поэтому текст медика в вход модели не
+# копируется НИКОГДА: экстрактор ищет белый список наблюдаемых сигналов и
+# рендерит каждый своим шаблоном. Из исходного текста в вход попадают только
+# захваченные токены — reason из словаря k8s, числа, имена ключей и таблиц.
+# root_cause и next_action экстрактор не читает вовсе.
+
+_POD_REASONS = (
+    "ImagePullBackOff", "ErrImagePull", "CreateContainerConfigError",
+    "CreateContainerError", "RunContainerError", "CrashLoopBackOff",
+    "OOMKilled", "Evicted", "ContainerCreating", "Init:CrashLoopBackOff",
+    "Init:Error", "FailedScheduling", "FailedMount", "Pending",
+)
+_REASON_RE = re.compile(
+    r"(?<![\w:])(" + "|".join(re.escape(r) for r in _POD_REASONS) + r")(?![\w])", re.I
+)
+_EXIT_RE = re.compile(r"(?:exit(?:\s*code)?|exitcode|код(?:ом)?\s+выхода)\s*[=:]?\s*(\d{1,3})\b", re.I)
+_SIGNAL_RE = re.compile(r"\bSIG(SEGV|ABRT|KILL|TERM|BUS|ILL|FPE)\b")
+_RESTARTS_RE = re.compile(r"(\d{1,6})\s*(?:рестарт\w*|restarts?)\b|restarts?\s*[=:]\s*(\d{1,6})", re.I)
+_FAILED_PODS_RE = re.compile(r"(?:(\d{1,4})\s*)?(failed|evicted)[\s-]*(?:под\w*|pods?)\b", re.I)
+_DIRTY_RE = re.compile(r"\bdirty\b", re.I)
+_MIGRATION_VERSION_RE = re.compile(r"(?:верси\w+|version|v)\s*[=:]?\s*(\d{8,14})\b", re.I)
+_RELATION_RE = re.compile(r'(relation|column)\s+"?([\w.]{1,80})"?\s+does not exist', re.I)
+_PERMISSION_RE = re.compile(r"permission denied for (table|schema|relation|database|sequence)\s+\"?([\w.]{1,80})", re.I)
+_SECRET_CTX_RE = re.compile(r"secret|секрет", re.I)
+_MISSING_RE = re.compile(r"нет|отсутств|не хвата|недолит|missing|couldn't find|not found", re.I)
+_ENV_KEY_RE = re.compile(r"\b([A-Z][A-Z0-9]*_[A-Z0-9_]*\*?|[A-Z]{3,}_\*)")
+_COULDNT_FIND_KEY_RE = re.compile(r"couldn't find key\s+([A-Za-z0-9_.-]{1,80})", re.I)
+_ORLEANS_RE = re.compile(r"orleans|membership|силос|silo", re.I)
+_ZOMBIE_RE = re.compile(r"zombie|status\s*=\s*6|мёртв\w* (?:силос|запис)|dead silo", re.I)
+_PROBE_RE = re.compile(r"\b(readiness|liveness|startup)[\s-]*probe\b", re.I)
+_CONN_REFUSED_RE = re.compile(r"connection refused", re.I)
+
+# Каналы k8s-событий, которые понимает PodEventsRule: так наблюдение станет
+# фактом FactStore (OOM, evicted, crashloop, scheduling), а не только строкой.
+_REASON_TO_EVENT = {
+    "crashloopbackoff": "BackOff", "init:crashloopbackoff": "BackOff",
+    "oomkilled": "OOMKilled", "evicted": "Evicted",
+    "failedscheduling": "FailedScheduling",
+}
+
+
+def _medic_texts(event: Dict[str, Any]) -> List[str]:
+    """Тексты медика, из которых МОЖНО извлекать наблюдения.
+
+    root_cause и next_action сюда не входят намеренно: это вывод и план,
+    то есть ответ. summary/applied/manual/gaps тоже содержат выводы, но из
+    них берутся только совпадения белого списка, а не фразы.
+    """
+    out: List[str] = []
+    if event.get("summary"):
+        out.append(str(event["summary"]))
+    for key in ("applied", "manual", "gaps"):
+        val = event.get(key)
+        if isinstance(val, str):
+            try:
+                val = json.loads(val)
+            except ValueError:
+                val = [val]
+        if isinstance(val, list):
+            out.extend(str(x) for x in val if x)
+    extras = event.get("extras")
+    if isinstance(extras, dict):
+        out.extend(str(v) for v in extras.values() if isinstance(v, (str, int, float)))
+    return out
+
+
+def _sentences(text: str) -> List[str]:
+    return [s for s in re.split(r"(?<=[.;!?])\s+|\n+", text) if s.strip()]
+
+
+def extract_medic_observations(event: Dict[str, Any]) -> List[str]:
+    """Наблюдаемые факты из события медика — строки фиксированных шаблонов."""
+    texts = _medic_texts(event)
+    reasons: Dict[str, str] = {}
+    exits: Set[int] = set()
+    signals: Set[str] = set()
+    restarts = 0
+    failed_pods = False
+    dirty_versions: Set[str] = set()
+    dirty = False
+    db_errors: Set[str] = set()
+    secret_keys: Set[str] = set()
+    orleans_zombie = False
+    probes: Set[str] = set()
+    conn_refused = False
+    for text in texts:
+        for m in _REASON_RE.finditer(text):
+            canon = next(r for r in _POD_REASONS if r.lower() == m.group(1).lower())
+            reasons[canon.lower()] = canon
+        exits |= {int(x) for x in _EXIT_RE.findall(text) if int(x) <= 255}
+        signals |= {f"SIG{s}" for s in _SIGNAL_RE.findall(text)}
+        for a, b in _RESTARTS_RE.findall(text):
+            restarts = max(restarts, int(a or b or 0))
+        failed_pods = failed_pods or bool(_FAILED_PODS_RE.search(text))
+        for m in _RELATION_RE.finditer(text):
+            db_errors.add(f'{m.group(1).lower()} "{m.group(2)}" does not exist')
+        for m in _PERMISSION_RE.finditer(text):
+            db_errors.add(f'permission denied for {m.group(1).lower()} "{m.group(2)}"')
+        secret_keys |= set(_COULDNT_FIND_KEY_RE.findall(text))
+        for sent in _sentences(text):
+            if _DIRTY_RE.search(sent):
+                dirty = True
+                dirty_versions |= set(_MIGRATION_VERSION_RE.findall(sent))
+            if _SECRET_CTX_RE.search(sent) and _MISSING_RE.search(sent):
+                secret_keys |= set(_ENV_KEY_RE.findall(sent))
+            if _ORLEANS_RE.search(sent) and _ZOMBIE_RE.search(sent):
+                orleans_zombie = True
+        probes |= {p.lower() for p in _PROBE_RE.findall(text)}
+        conn_refused = conn_refused or bool(_CONN_REFUSED_RE.search(text))
+
+    facts: List[str] = []
+    if reasons:
+        facts.append("состояние подов: " + ", ".join(sorted(reasons.values())))
+    if exits:
+        facts.append("код выхода контейнера: " + ", ".join(str(x) for x in sorted(exits)))
+    if signals:
+        facts.append("сигнал завершения процесса: " + ", ".join(sorted(signals)))
+    if restarts:
+        facts.append(f"рестартов контейнера: до {restarts}")
+    if failed_pods:
+        facts.append("в namespace есть поды в фазе Failed/Evicted")
+    if dirty:
+        v = f" (версия {', '.join(sorted(dirty_versions))})" if dirty_versions else ""
+        facts.append(f"schema_migrations: dirty=true{v}")
+    for err in sorted(db_errors):
+        facts.append(f"ошибка БД: {err}")
+    if secret_keys:
+        facts.append("в Secret нет ключей: " + ", ".join(sorted(secret_keys)))
+    if orleans_zombie:
+        facts.append("Orleans membership: есть записи мёртвых силосов (status=6)")
+    if probes:
+        facts.append("проба не проходит: " + ", ".join(sorted(probes)))
+    if conn_refused:
+        facts.append("в логах: connection refused")
+    return facts
+
+
+def observation_events(facts: List[str]) -> List[Dict[str, Any]]:
+    """k8s-события для PodEventsRule из строки «состояние подов: …»."""
+    events: List[Dict[str, Any]] = []
+    for f in facts:
+        if not f.startswith("состояние подов: "):
+            continue
+        for r in f.split(": ", 1)[1].split(", "):
+            reason = _REASON_TO_EVENT.get(r.lower())
+            if reason:
+                events.append({"type": "Warning", "reason": reason,
+                               "message": f"observed by squad-medic: {r}", "count": 1})
+    return events
+
+
+def answer_leak(facts: List[str], root_cause: Optional[str], n: int = 4) -> List[str]:
+    """n-граммы слов root_cause, которые нашлись в фактах (пусто = утечки нет).
+
+    Страховка поверх белого списка: шаблоны сами фраз медика не содержат,
+    но если когда-нибудь захваченный токен окажется куском вывода — кейс
+    не должен тихо уехать в датасет с подсказкой.
+    """
+    def words(s: str) -> List[str]:
+        return re.findall(r"[\w*]+", s.lower())
+
+    rc = words(root_cause or "")
+    grams = {" ".join(rc[i:i + n]) for i in range(len(rc) - n + 1)}
+    text = " ".join(" ".join(words(f)) for f in facts)
+    return sorted(g for g in grams if g and g in text)
+
+
 def _guard_out_dir(out: Path) -> Path:
     out = out.expanduser().resolve()
     if out == REPO_ROOT or REPO_ROOT in out.parents:
@@ -100,6 +281,7 @@ _EXPORT_SQL = """
 SET TRANSACTION READ ONLY;
 SELECT row_to_json(t) FROM (
   SELECT e.id AS event_id, e.started_at, e.outcome, e.root_cause, e.summary,
+         e.applied, e.manual, e.gaps, e.extras,
          i.incident_key, i.namespace, i.service_name, i.severity,
          i.alertnames, i.opened_at,
          al.alertname AS alert_name, al.description AS alert_description
@@ -383,21 +565,48 @@ def cmd_export(args) -> int:
         json.loads(ln) for ln in proc.stdout.splitlines() if ln.startswith("{")
     ]
 
+    path = out / "cases.jsonl"
+    keep: Optional[Set[int]] = None
+    if args.keep_ids:
+        # Тот же набор кейсов, что уже прогонялся: иначе сравнение «только
+        # алерт» против «наблюдения медика» шло бы на разных инцидентах.
+        if not path.exists():
+            raise SystemExit(f"--keep-ids: нет {path}")
+        keep = {json.loads(ln)["event_id"] for ln in path.read_text().splitlines() if ln}
+
     # Медик часто разбирает один и тот же стенд несколько раз подряд с той же
     # причиной: 114 событий KubeContainerWaiting — почти все «retention снёс
     # теги». Без дедупа датасет меряет один случай сотню раз.
     seen: Set[tuple] = set()
     cases = []
+    leaks = 0
     for r in rows:
+        if keep is not None and r["event_id"] not in keep:
+            continue
         alertnames = r.get("alertnames") or []
         labels = sorted(classify(r.get("root_cause")))
         primary = primary_class(r.get("root_cause"))
         key = (tuple(alertnames), primary, r.get("namespace"))
-        if key in seen:
+        if keep is None and key in seen:
             continue
         seen.add(key)
         r["expected_classes"] = labels
         r["expected_primary"] = primary
+        observed = extract_medic_observations(r)
+        # Строка факта, у которой есть общая n-грамма с выводом медика,
+        # выбрасывается, даже если это наблюдение: медик цитирует текст
+        # ошибки («relation X does not exist») и в root_cause, и граница
+        # «наблюдение / подсказка» тут не проверяема. Остальные факты кейса
+        # остаются.
+        clean = [f for f in observed if not answer_leak([f], r.get("root_cause"))]
+        leaks += len(observed) - len(clean)
+        observed = clean
+        r["observed_medic"] = observed
+        r["context"] = "medic_observed" if observed else "alert_only"
+        # Сырые поля медика дальше не нужны: наблюдения уже извлечены, а
+        # выводы в applied/manual/gaps — лишний шанс протечь в вход.
+        for k in ("applied", "manual", "gaps", "extras"):
+            r.pop(k, None)
         cases.append(r)
     with_snapshot = attach_context_snapshots(args, cases)
     with_kg = reconstruct_from_kg(args, cases)
@@ -405,8 +614,10 @@ def cmd_export(args) -> int:
     with path.open("w", encoding="utf-8") as f:
         for c in cases:
             f.write(json.dumps(c, ensure_ascii=False, default=str) + "\n")
-    print(f"событий медика: {len(rows)}, после дедупа: {len(cases)}, "
-          f"со снимком: {with_snapshot}, с реконструкцией из графа: {with_kg} → {path}")
+    with_obs = sum(1 for c in cases if c["context"] == "medic_observed")
+    print(f"событий медика: {len(rows)}, кейсов: {len(cases)}, с наблюдениями: {with_obs}, "
+          f"со снимком: {with_snapshot}, с реконструкцией из графа: {with_kg}, "
+          f"фактов отброшено из-за совпадения с выводом медика: {leaks} → {path}")
     return 0
 
 
@@ -436,7 +647,30 @@ def _to_incident(case: Dict[str, Any]):
     )
 
 
-async def _run_case(case: Dict[str, Any]) -> Dict[str, Any]:
+# Снимок медика — частичный: он записывал то, что счёл важным, а не весь
+# namespace. Поля, которые он наполняет, помечаются partial, и правило,
+# не нашедшее своего сигнала, отвечает «?», а не «не было».
+_MEDIC_PARTIAL = "partial: восстановлено из наблюдений squad-medic, не полный снимок"
+
+
+def apply_medic_observations(ctx: Dict[str, Any], facts: List[str]) -> Dict[str, Any]:
+    ctx["k8s_summary"] = "\n".join(facts)
+    ctx["k8s_events"] = observation_events(facts)
+    status = dict(ctx.get("source_status") or {})
+    for field in ("k8s_summary", "k8s_events", "k8s_pod_state"):
+        status.setdefault(field, _MEDIC_PARTIAL)
+    ctx["source_status"] = status
+    return ctx
+
+
+def case_summary(incident_summary: str, facts: List[str]) -> str:
+    if not facts:
+        return incident_summary
+    return (incident_summary + "\n\nНаблюдения на момент разбора (только наблюдаемое "
+            "состояние, без выводов):\n" + "\n".join(f"- {f}" for f in facts))
+
+
+async def _run_case(case: Dict[str, Any], context: str) -> Dict[str, Any]:
     from app.agents.fact_critic import (FactCriticAgent, best_candidate,
                                          survivors)
     from app.agents.multi_hypothesis import MultiHypothesisAgent
@@ -444,14 +678,17 @@ async def _run_case(case: Dict[str, Any]) -> Dict[str, Any]:
     from app.diagnostics.incident_ctx import build_diagnostics_ctx
 
     incident = _to_incident(case)
+    facts = (case.get("observed_medic") or []) if context == "medic_observed" else []
     ctx = build_diagnostics_ctx(incident, analyzer_summary="", kg_session=None)
     ctx.pop("collector_results", None)
     ctx = ctx_from_kg(ctx, case.get("kg_context"))
     ctx = ctx_from_snapshot(ctx, case.get("context_snapshot"))
+    if facts:
+        apply_medic_observations(ctx, facts)
     store = default_engine.run(ctx)
     t0 = time.monotonic()
     hypotheses = await MultiHypothesisAgent().generate(
-        incident_summary=incident.summary, facts=store
+        incident_summary=case_summary(incident.summary, facts), facts=store
     )
     critiqued = await FactCriticAgent().critique_all(hypotheses, store)
     best = best_candidate(critiqued)
@@ -466,6 +703,7 @@ async def _run_case(case: Dict[str, Any]) -> Dict[str, Any]:
     )
     return {
         "event_id": case["event_id"],
+        "context": context,
         "latency_s": round(time.monotonic() - t0, 1),
         "hypotheses_raw": len(hypotheses.items),
         "hypotheses_critiqued": len(critiqued.items),
@@ -482,9 +720,15 @@ async def _run_async(args) -> int:
     out = _guard_out_dir(Path(args.out))
     cases = [json.loads(ln) for ln in (out / "cases.jsonl").read_text().splitlines() if ln]
     res_path = out / "results.jsonl"
-    done = set()
+    # Ключ прогона — (кейс, режим входа): один инцидент меряется и «только
+    # по алерту», и «с наблюдениями медика», и эти результаты не затирают
+    # друг друга. У результатов до меток режима — alert_only.
+    done: Set[tuple] = set()
     if res_path.exists():
-        done = {json.loads(ln)["event_id"] for ln in res_path.read_text().splitlines() if ln}
+        for ln in res_path.read_text().splitlines():
+            if ln:
+                r = json.loads(ln)
+                done.add((r["event_id"], r.get("context", "alert_only")))
     if args.ids:
         wanted = {int(x) for x in args.ids.split(",")}
         cases = [c for c in cases if c["event_id"] in wanted]
@@ -494,14 +738,23 @@ async def _run_async(args) -> int:
             kept = [ln for ln in res_path.read_text().splitlines()
                     if ln and json.loads(ln)["event_id"] not in wanted]
             res_path.write_text("".join(ln + "\n" for ln in kept))
-        done -= wanted
-    todo = [c for c in cases if c["event_id"] not in done][: args.limit]
+        done = {d for d in done if d[0] not in wanted}
+
+    def mode(c: Dict[str, Any]) -> str:
+        if args.context == "auto":
+            return c.get("context") or "alert_only"
+        return args.context
+
+    if args.context == "medic_observed":
+        cases = [c for c in cases if c.get("observed_medic")]
+    todo = [c for c in cases if (c["event_id"], mode(c)) not in done][: args.limit]
     print(f"кейсов всего {len(cases)}, прогнано {len(done)}, в этом заходе {len(todo)}")
     for c in todo:
+        m = mode(c)
         try:
-            r = await _run_case(c)
+            r = await _run_case(c, m)
         except Exception as e:  # кейс, а не прогон: остальные должны пройти
-            r = {"event_id": c["event_id"], "error": f"{type(e).__name__}: {e}"}
+            r = {"event_id": c["event_id"], "context": m, "error": f"{type(e).__name__}: {e}"}
         with res_path.open("a", encoding="utf-8") as f:
             f.write(json.dumps(r, ensure_ascii=False) + "\n")
         print(f"  #{c['event_id']}: {'ошибка' if r.get('error') else 'ok'} "
@@ -518,6 +771,21 @@ def cmd_run(args) -> int:
 
 
 def score(cases: List[Dict[str, Any]], results: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Метрики всего прогона и отдельно по режиму входа.
+
+    Смешивать режимы в одну цифру нельзя: «только алерт» почти всегда даёт
+    отказ, и общий abstain-rate говорил бы о составе выборки, а не о модели.
+    """
+    summary = _score_block(cases, results)
+    contexts = sorted({r.get("context", "alert_only") for r in results})
+    summary["by_context"] = {
+        ctx: _score_block(cases, [r for r in results if r.get("context", "alert_only") == ctx])
+        for ctx in contexts
+    }
+    return summary
+
+
+def _score_block(cases: List[Dict[str, Any]], results: List[Dict[str, Any]]) -> Dict[str, Any]:
     by_id = {c["event_id"]: c for c in cases}
     rows: List[Dict[str, Any]] = []
     for r in results:
@@ -561,7 +829,8 @@ def score(cases: List[Dict[str, Any]], results: List[Dict[str, Any]]) -> Dict[st
         "latency_p50_s": lat[len(lat) // 2] if lat else None,
         "latency_max_s": lat[-1] if lat else None,
         "note": ("попадание = первичный класс причины медика среди классов ответа "
-                 "модели (регулярки CAUSE_CLASSES); вход — только алерт, без снимка кластера"),
+                 "модели (регулярки CAUSE_CLASSES); alert_only — только алерт, "
+                 "medic_observed — алерт + наблюдения медика без выводов"),
     }
 
 
@@ -572,6 +841,13 @@ def cmd_score(args) -> int:
     summary = score(cases, results)
     (out / "summary.json").write_text(json.dumps(summary, ensure_ascii=False, indent=2) + "\n")
     for k, v in summary.items():
+        if k == "by_context":
+            for ctx, block in v.items():
+                print(f"--- {ctx}")
+                for bk, bv in block.items():
+                    if bk != "note":
+                        print(f"  {bk:24} {bv}")
+            continue
         print(f"{k:26} {v}")
     return 0
 
@@ -582,6 +858,8 @@ def main() -> int:
     sub = ap.add_subparsers(dest="cmd", required=True)
     ex = sub.add_parser("export")
     ex.add_argument("--days", type=int, default=30)
+    ex.add_argument("--keep-ids", action="store_true",
+                    help="перевыгрузить ровно те кейсы, что уже лежат в cases.jsonl")
     kc = sub.add_parser("kg-context", help="дописать снимки/реконструкцию в готовый cases.jsonl")
     for p in (ex, kc):
         p.add_argument("--context", default="lastoasisgame-local")
@@ -590,6 +868,8 @@ def main() -> int:
         p.add_argument("--db-name", default="sre_copilot")
     rn = sub.add_parser("run")
     rn.add_argument("--limit", type=int, default=3, help="кейсов за заход (каждый ≈ 15 вызовов LLM)")
+    rn.add_argument("--context", choices=("auto", "alert_only", "medic_observed"), default="auto",
+                    help="вход модели: auto — по метке кейса")
     rn.add_argument("--ids", default="", help="event_id через запятую — прогнать только их")
     sub.add_parser("score")
     args = ap.parse_args()
