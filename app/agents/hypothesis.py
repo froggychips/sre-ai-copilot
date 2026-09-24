@@ -48,9 +48,15 @@ class HypothesisAgent(BaseAgent):
             user_context = (
                 f"{analysis}\n\n"
                 f"Past similar incidents that were marked as ACCEPTED resolutions "
-                f"(most relevant first):\n{bullets}\n\n"
-                f"Consider these patterns when ranking causes, but verify they fit "
-                f"the current evidence — do not blindly repeat past hypotheses."
+                f"(most relevant first):\n{bullets}"
+            )
+            # Указание — наше, а не часть данных: ему место в инструкции
+            # (system), а не в user_context рядом с текстом прошлых
+            # инцидентов, которому модель не должна подчиняться.
+            instruction += (
+                " Past similar incidents are listed in the context: consider "
+                "these patterns when ranking causes, but verify they fit the "
+                "current evidence — do not blindly repeat past hypotheses."
             )
 
         return await self.ask(user_context=user_context, instruction=instruction)

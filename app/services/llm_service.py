@@ -153,8 +153,17 @@ class LLMService:
         return client
 
     @llm_retry_strategy
-    async def generate_full(self, prompt: str) -> Dict[str, Any]:
+    async def generate_full(
+        self, prompt: str, system: Optional[str] = None,
+    ) -> Dict[str, Any]:
         """Single LLM round-trip с возвратом usage-info.
+
+        `system` — инструкции агента (роль, задача, формат ответа); `prompt`
+        уходит user-сообщением и несёт только недоверенные данные инцидента.
+        Раздельные роли — не защита сами по себе (см. prompt_guard), но модель
+        приоритизирует system над user, и текст из логов/алерта больше не
+        стоит в одном ряду с нашими инструкциями. None — прежнее поведение
+        (один user-message), для вызовов без агентской обвязки.
 
         Возвращает:
           {text: str, input_tokens: int, output_tokens: int,
@@ -180,7 +189,7 @@ class LLMService:
         try:
             if self.backend == "claude_cli":
                 assert self.cli is not None
-                text = await self.cli.generate_content(prompt)
+                text = await self.cli.generate_content(prompt, system=system)
                 return {
                     "text": text,
                     "input_tokens": 0,
@@ -253,7 +262,9 @@ class LLMService:
             # обработчик отмены о нём не знает. Дожидаемся результата и
             # только потом пробрасываем отмену дальше.
             _reserve_task = asyncio.ensure_future(
-                asyncio.to_thread(reserve, self.model, prompt)
+                # System-часть тоже входные токены — без неё оценка резерва
+                # занижена ровно на длину инструкций каждого агента.
+                asyncio.to_thread(reserve, self.model, (system or "") + prompt)
             )
             try:
                 verdict = await asyncio.shield(_reserve_task)
@@ -275,13 +286,16 @@ class LLMService:
                     f"(model={self.model}, spent={verdict.spent_usd}, "
                     f"limit={verdict.limit_usd})"
                 )
+            create_kwargs: Dict[str, Any] = {
+                "model": self.model,
+                "max_tokens": settings.MAX_TOKENS,
+                "messages": [{"role": "user", "content": prompt}],
+                "timeout": llm_timeout,
+            }
+            if system:
+                create_kwargs["system"] = system
             response = await asyncio.wait_for(
-                client.messages.create(
-                    model=self.model,
-                    max_tokens=settings.MAX_TOKENS,
-                    messages=[{"role": "user", "content": prompt}],
-                    timeout=llm_timeout,
-                ),
+                client.messages.create(**create_kwargs),
                 timeout=llm_timeout,
             )
             # Anthropic ContentBlock = TextBlock | ToolUseBlock; .text только у TextBlock.
@@ -418,9 +432,11 @@ class LLMService:
             logging.error(f"LLM call attempt failed: {e}")
             raise
 
-    async def generate_content(self, prompt: str) -> str:
+    async def generate_content(
+        self, prompt: str, system: Optional[str] = None,
+    ) -> str:
         """Backward-compat: возвращает только text. Внутри идёт через generate_full."""
-        return (await self.generate_full(prompt))["text"]
+        return (await self.generate_full(prompt, system=system))["text"]
 
 
 llm_client = LLMService()

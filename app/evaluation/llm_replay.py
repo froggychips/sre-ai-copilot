@@ -37,8 +37,11 @@ from typing import Any, Dict, List, Optional
 
 __all__ = ["Recordings", "MissingRecording", "install_replay", "install_recorder"]
 
-# BaseAgent.ask собирает промпт как:
-#   Role: {role}\nTask: {instruction}\n<user_context>\n{ctx}\n</user_context>
+# BaseAgent.ask шлёт system = «Role: {role}\nTask: {instruction}\n\n…»
+# и user = «<user_context>\n{ctx}\n</user_context>». До разделения ролей
+# всё шло одной строкой того же вида — поэтому ключ считается по склейке
+# system + user: хэши роли и контекста выходят те же, что у старых записей,
+# и перезаписывать tests/golden/recordings не нужно.
 _ROLE_RE = re.compile(r"^Role:\s*(.*?)\nTask:", re.DOTALL | re.MULTILINE)
 _CTX_RE = re.compile(r"<user_context>\n(.*?)\n</user_context>", re.DOTALL)
 
@@ -49,6 +52,10 @@ class MissingRecording(RuntimeError):
 
 def _sha(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
+
+
+def _joined(prompt: str, system: Optional[str]) -> str:
+    return f"{system}\n{prompt}" if system else prompt
 
 
 def _role_of(prompt: str) -> str:
@@ -90,7 +97,14 @@ class Recordings:
             encoding="utf-8",
         )
 
-    def add(self, prompt: str, task_type: str, result: Dict[str, Any]) -> None:
+    def add(
+        self,
+        prompt: str,
+        task_type: str,
+        result: Dict[str, Any],
+        system: Optional[str] = None,
+    ) -> None:
+        prompt = _joined(prompt, system)
         self.calls.append({
             "role": _role_of(prompt),
             "ctx": _ctx_of(prompt),
@@ -98,7 +112,8 @@ class Recordings:
             "text": result.get("text", ""),
         })
 
-    def lookup(self, prompt: str) -> Dict[str, Any]:
+    def lookup(self, prompt: str, system: Optional[str] = None) -> Dict[str, Any]:
+        prompt = _joined(prompt, system)
         role, ctx = _role_of(prompt), _ctx_of(prompt)
         for call in self.calls:
             if call.get("role") == role and call.get("ctx") == ctx:
@@ -137,11 +152,11 @@ def install_replay(monkeypatch_like, recordings: Recordings) -> None:
     """
     from app.llm.router import ModelRouter
 
-    async def _full(task_type: str, prompt: str):
-        return recordings.lookup(prompt)
+    async def _full(task_type: str, prompt: str, system: Optional[str] = None):
+        return recordings.lookup(prompt, system)
 
-    async def _text(task_type: str, prompt: str) -> str:
-        return recordings.lookup(prompt).get("text", "")
+    async def _text(task_type: str, prompt: str, system: Optional[str] = None) -> str:
+        return recordings.lookup(prompt, system).get("text", "")
 
     monkeypatch_like.setattr(ModelRouter, "route_and_call_full", staticmethod(_full))
     monkeypatch_like.setattr(ModelRouter, "route_and_call", staticmethod(_text))
@@ -153,11 +168,11 @@ def install_recorder(monkeypatch_like, recordings: Recordings) -> None:
 
     original = ModelRouter.route_and_call_full
 
-    async def _full(task_type: str, prompt: str):
-        result = await original(task_type, prompt)
+    async def _full(task_type: str, prompt: str, system: Optional[str] = None):
+        result = await original(task_type, prompt, system=system)
         if not isinstance(result, dict):  # старый text-only контракт
             result = {"text": str(result)}
-        recordings.add(prompt, task_type, result)
+        recordings.add(prompt, task_type, result, system=system)
         return result
 
     monkeypatch_like.setattr(ModelRouter, "route_and_call_full", staticmethod(_full))

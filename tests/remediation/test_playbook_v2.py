@@ -369,11 +369,13 @@ async def test_fix_agent_prompt_lists_candidates_only_when_given() -> None:
                      '"namespace": "squad-3", "playbook": "%s"}' % _RESTART)
     with patch("app.agents.base.BaseAgent.ask", new=fake):
         _, intent = await FixAgent().suggest("cause", playbooks=[load_registry()[_RESTART]])
-        ctx = fake.await_args.kwargs["user_context"]
-        assert "ALLOWED REMEDIATION PLAYBOOKS" in ctx and _RESTART in ctx
+        # Список playbook-ов — наш текст, а не данные: в instruction (system).
+        instr = fake.await_args.kwargs["instruction"]
+        assert "ALLOWED REMEDIATION PLAYBOOKS" in instr and _RESTART in instr
+        assert "ALLOWED REMEDIATION PLAYBOOKS" not in fake.await_args.kwargs["user_context"]
         assert intent is not None and intent.playbook == _RESTART
         await FixAgent().suggest("cause")
-        assert "ALLOWED REMEDIATION PLAYBOOKS" not in fake.await_args.kwargs["user_context"]
+        assert "ALLOWED REMEDIATION PLAYBOOKS" not in fake.await_args.kwargs["instruction"]
 
 
 def test_preview_ignores_v2(monkeypatch) -> None:
@@ -393,8 +395,8 @@ async def test_fix_agent_prompt_says_none_when_binding_on_but_no_candidates() ->
     fake = AsyncMock(return_value="{}")
     with patch("app.agents.base.BaseAgent.ask", new=fake):
         await FixAgent().suggest("cause", playbooks=[])
-    ctx = fake.await_args.kwargs["user_context"]
-    assert "ALLOWED REMEDIATION PLAYBOOKS" in ctx and "(none" in ctx
+    instr = fake.await_args.kwargs["instruction"]
+    assert "ALLOWED REMEDIATION PLAYBOOKS" in instr and "(none" in instr
 
 
 def test_pipeline_strips_playbook_not_selected_for_incident() -> None:

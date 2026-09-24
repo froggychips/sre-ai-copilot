@@ -57,8 +57,8 @@ def _svc_with_stop_reason(text: str, stop_reason: str) -> LLMService:
 
 def _route_through(svc: LLMService):
     """patch-объект для ModelRouter.route_and_call_full → svc.generate_full."""
-    async def _route(task_type, prompt):
-        return await svc.generate_full(prompt)
+    async def _route(task_type, prompt, system=None):
+        return await svc.generate_full(prompt, system=system)
 
     return AsyncMock(side_effect=_route)
 
