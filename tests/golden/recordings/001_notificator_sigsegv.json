@@ -95,6 +95,18 @@
       "ctx": "8784795fa2c3642b",
       "task_type": "critic",
       "text": "{\"refutations\": [\"crashloop (conf=0.80) has max_restart_count=0, which directly contradicts the hypothesis claim that 'every restart crashes reproducibly within seconds' — zero recorded restarts means the asserted multi-restart deterministic crash pattern is not evidenced in the observed data.\", \"crashloop (conf=0.38) shows phrase_hits=0 and is marked attribution=unverified with note=namespace-wide event; a heap corruption scenario producing repeated SIGSEGV on startup would be expected to leave log-level crash traces, but phrase_hits=0 means no such log evidence was captured, and the BackOff event cannot be attributed to this specific workload at all, undermining the 'reproducible crashloop' anchor the hypothesis relies on.\"]}"
+    },
+    {
+      "role": "177236372fcc2908",
+      "ctx": "2fac25436d4ad73a",
+      "task_type": "critic",
+      "text": "```json\n{\"critiques\": [{\"id\": \"h1\", \"refutations\": []}, {\"id\": \"h2\", \"refutations\": []}, {\"id\": \"h3\", \"refutations\": [\"Факт ✗ recent_deploy (conf=0.95, deploys_checked=0) фиксирует полное отсутствие деплоев за последние 60 минут, тогда как гипотеза явно постулирует недавнюю смену версии нативной библиотеки как необходимое причинное условие сбоя.\"]}, {\"id\": \"h4\", \"refutations\": []}, {\"id\": \"h5\", \"refutations\": []}, {\"id\": \"h6\", \"refutations\": []}]}\n```"
+    },
+    {
+      "role": "177236372fcc2908",
+      "ctx": "4d28d160d9130162",
+      "task_type": "critic",
+      "text": "```json\n{\"critiques\": [{\"id\": \"h1\", \"refutations\": []}, {\"id\": \"h2\", \"refutations\": []}, {\"id\": \"h3\", \"refutations\": []}, {\"id\": \"h4\", \"refutations\": []}, {\"id\": \"h5\", \"refutations\": []}, {\"id\": \"h6\", \"refutations\": []}]}\n```"
     }
   ]
 }

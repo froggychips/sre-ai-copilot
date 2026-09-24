@@ -95,6 +95,30 @@
       "ctx": "2412a06c6c40a058",
       "task_type": "critic",
       "text": "{\"refutations\": [\"The hypothesis explicitly uses 'BackOff count=12 at namespace event level' as supporting evidence for the container 'exiting quickly and consistently each restart cycle,' but the ✓ crashloop (conf=0.38) fact states attribution=unverified and 'namespace-wide event; alert has no pod/service label to attribute it to the target workload' — this count cannot be reliably attributed to bot-service, undermining that pillar of the hypothesis.\", \"The pod-level ✓ crashloop (conf=0.80) fact shows recent_backoff_events=1 (not 12) and max_restart_count=0, directly contradicting the hypothesis's portrayal of 12 consistent restart cycles; a single observed backoff event does not establish the repeated, stable crash pattern the hypothesis relies on to argue the abort is deterministic and reproducible.\"]}"
+    },
+    {
+      "role": "177236372fcc2908",
+      "ctx": "e55788d6c0647ca4",
+      "task_type": "critic",
+      "text": "```json\n{\"critiques\": [{\"id\": \"h1\", \"refutations\": []}]}\n```"
+    },
+    {
+      "role": "177236372fcc2908",
+      "ctx": "09fc9007b9f43e97",
+      "task_type": "critic",
+      "text": "```json\n{\"critiques\":[{\"id\":\"h1\",\"refutations\":[]},{\"id\":\"h2\",\"refutations\":[\"The observed `process_crash` fact shows exit_code=134, signal=SIGABRT, and reason=Error clearly visible in the Kubernetes terminated-state, directly contradicting H2's claim that this class of crash is 'silent in Kubernetes terminated-state logs'.\",\"The observed `crashloop` fact (conf=0.80) reports max_restart_count=0 for the target pod, undermining H2's assertion that the corrupting state 'repeats identically on every restart', since there is no evidence of multiple completed restart cycles at the container level.\"]}]}\n```"
+    },
+    {
+      "role": "177236372fcc2908",
+      "ctx": "4b1e615d1ced0d30",
+      "task_type": "critic",
+      "text": "```json\n{\"critiques\":[{\"id\":\"h1\",\"refutations\":[]},{\"id\":\"h2\",\"refutations\":[]},{\"id\":\"h3\",\"refutations\":[\"The ✓ crashloop fact (fact_kind: 'crashloop', conf=0.80) reports max_restart_count=0 for the specific pod, directly contradicting the hypothesis's central claim that the container crashes persistently on every start — a pod that had crashed through many restart cycles would show a nonzero restart count rather than zero.\"]}]}\n```"
+    },
+    {
+      "role": "177236372fcc2908",
+      "ctx": "791c40b3477de878",
+      "task_type": "critic",
+      "text": "```json\n{\"critiques\":[{\"id\":\"h1\",\"refutations\":[]},{\"id\":\"h2\",\"refutations\":[]},{\"id\":\"h3\",\"refutations\":[]},{\"id\":\"h4\",\"refutations\":[]},{\"id\":\"h5\",\"refutations\":[]},{\"id\":\"h6\",\"refutations\":[]}]}\n```"
     }
   ]
 }

@@ -9,6 +9,11 @@
                  промптах. Стоит денег, поэтому по расписанию и вручную.
   --mode record  как live, но ещё и перезаписывает tests/golden/recordings/ —
                  после осознанной смены промпта.
+  --mode record-missing
+                 replay, а вызовы роли, у которой записей нет вовсе, идут в
+                 модель и ДОПИСЫВАЮТСЯ в запись. Для нового агента рядом со
+                 старыми записями (FACT_CRITIC_MODE=batch): прежние ответы не
+                 трогаются, новый вызов видит воспроизводимый контекст.
 
 Выход: таблица по кейсам + сводка. `--check-baseline` сверяет метрики с
 tests/golden/baseline.json и возвращает ненулевой код, если стало хуже;
@@ -30,7 +35,7 @@ sys.path.insert(0, str(REPO_ROOT))
 from app.evaluation.golden import (BASELINE_PATH, GoldenCase,  # noqa: E402
                                    CaseResult, load_cases, run_case, summarize)
 from app.evaluation.llm_replay import (Recordings, install_recorder,  # noqa: E402
-                                       install_replay)
+                                       install_replay, install_replay_filling)
 
 
 class _Patcher:
@@ -52,7 +57,7 @@ class _Patcher:
 async def _run_one(case: GoldenCase, mode: str) -> CaseResult:
     patcher = _Patcher()
     recordings = Recordings.load(case.recording_path)
-    if mode == "replay" and case.llm and not recordings.calls:
+    if mode in ("replay", "record-missing") and case.llm and not recordings.calls:
         # Записей нет — кейс не прогоняется и в метрики не попадает. Считать
         # это провалом значило бы зафиксировать в baseline отсутствие записи
         # как норму; молча проходить — врать, что кейс проверен.
@@ -67,9 +72,14 @@ async def _run_one(case: GoldenCase, mode: str) -> CaseResult:
         elif mode == "record":
             recordings = Recordings([])
             install_recorder(patcher, recordings)
+        elif mode == "record-missing":
+            install_replay_filling(patcher, recordings)
         result = await run_case(case)
         if mode == "record" and case.llm and recordings.calls:
             recordings.save(case.recording_path)
+        if mode == "record-missing" and recordings.filled:
+            recordings.save(case.recording_path)
+            result.notes.append(f"дописано вызовов: {recordings.filled}")
         if mode == "replay" and recordings.misses:
             result.notes.append(
                 f"записи разъехались с контекстом ({len(recordings.misses)} шт) — "
@@ -86,7 +96,7 @@ async def _main_async(args) -> int:
         print("кейсов не найдено", file=sys.stderr)
         return 2
 
-    if args.mode in ("live", "record"):
+    if args.mode in ("live", "record", "record-missing"):
         # claude_cli ходит в локальный `claude --print` и ключа не требует —
         # им же удобно перезаписывать записи на машине разработчика.
         backend = os.environ.get("LLM_BACKEND", "anthropic")
@@ -215,7 +225,7 @@ def _check_baseline(summary, baseline_path: Path = BASELINE_PATH) -> int:
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--mode", choices=("replay", "live", "record"), default="replay")
+    ap.add_argument("--mode", choices=("replay", "live", "record", "record-missing"), default="replay")
     ap.add_argument("--case", action="append", help="id кейса (можно несколько раз)")
     ap.add_argument("--check-baseline", action="store_true")
     ap.add_argument("--update-baseline", action="store_true")

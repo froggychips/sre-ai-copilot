@@ -95,6 +95,18 @@
       "ctx": "8c3ba37615a76aad",
       "task_type": "critic",
       "text": "{\"refutations\": [\"crashloop (conf=0.38): attribution=unverified, note=namespace-wide event; alert has no pod/service label to attribute it to the target workload — the count=27 BackOff repetitions the hypothesis uses to argue determinism cannot be attributed to the target pod, removing the primary behavioral evidence for repeated deterministic failure.\", \"crashloop (conf=0.80): max_restart_count=0, recent_backoff_events=1 — the higher-confidence crashloop observation shows only 1 recent BackOff event and zero restart count, directly contradicting the hypothesis's claim that 27 repeated BackOff events indicate a deterministic early-startup failure pattern.\", \"process_crash (conf=0.55): signal= (empty) — the hypothesis claims a liveness/readiness probe SIGTERM would register as exit_code=1; if SIGTERM had been delivered by the kubelet, Kubernetes would record signal=15 in the terminated state; the empty signal field refutes the probe-kill-via-SIGTERM sub-claim and instead indicates a self-exit, which is also consistent with the deadlock sub-claim but removes the probe-kill pathway.\"]}"
+    },
+    {
+      "role": "177236372fcc2908",
+      "ctx": "79bad79ff7531e97",
+      "task_type": "critic",
+      "text": "```json\n{\"critiques\":[{\"id\":\"h1\",\"refutations\":[]},{\"id\":\"h2\",\"refutations\":[]},{\"id\":\"h3\",\"refutations\":[]},{\"id\":\"h4\",\"refutations\":[]},{\"id\":\"h5\",\"refutations\":[\"Fact `resource_pressure` is ✗ (not observed) on node squad-4-kingdom2; the hypothesis explicitly invokes 'I/O error on a degraded node disk' as the CRI failure mechanism, which would typically surface as disk or node resource pressure — its absence directly contradicts that stated sub-cause.\"]},{\"id\":\"h6\",\"refutations\":[\"Fact `process_crash` shows exit_code=1 with signal= (empty), but the hypothesis's primary kill path is a kubelet-issued SIGKILL after liveness probe failure — SIGKILL (signal 9) is uncatchable by any process in Linux and always produces exit_code=137, never exit_code=1, making the described kill mechanism physically inconsistent with the observed terminated state.\",\"Fact `recent_deploy` is ✗ (not observed, 0 deploys in the 60-minute lookback); liveness probe misconfiguration is a configuration change that must be delivered via a deployment, so without any recent deploy there is no plausible trigger for a newly introduced probe threshold error.\"]}]}\n```"
+    },
+    {
+      "role": "177236372fcc2908",
+      "ctx": "ade9da58742decf6",
+      "task_type": "critic",
+      "text": "{\"critiques\": [{\"id\": \"h1\", \"refutations\": []}, {\"id\": \"h2\", \"refutations\": []}, {\"id\": \"h3\", \"refutations\": []}, {\"id\": \"h4\", \"refutations\": []}, {\"id\": \"h5\", \"refutations\": []}, {\"id\": \"h6\", \"refutations\": [\"process_crash shows signal= (empty), meaning the process exited on its own; a liveness/readiness probe kill via SIGTERM would be recorded in the k8s terminated state as signal=15 (not an empty signal field), which directly contradicts the probe-kill sub-scenario described in h6.\"]}]}"
     }
   ]
 }

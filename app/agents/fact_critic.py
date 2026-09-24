@@ -22,18 +22,28 @@
 Лёгкая первая проверка делается алгоритмически (anchor vs observed),
 тяжёлая семантическая — через LLM-промпт «найди контрпример». Это
 дешевле и точнее, чем гонять LLM на простые случаи.
+
+Два режима LLM-части (`FACT_CRITIC_MODE`):
+    per_hypothesis (default) — вызов на гипотезу. Замер 24.09.2026 на
+        claude_cli: ~11 из ~16 вызовов кейса и основная латентность.
+    batch — все гипотезы, пережившие algo-проверку, одним вызовом с
+        ответом по id. Гипотеза, по которой ответа нет, считается НЕ
+        проверенной и получает refutation — молчание модели не
+        превращается в «противоречий не найдено».
 """
 from __future__ import annotations
 
 import json
 import time
-from typing import List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import structlog
 
 from app.agents.base import BaseAgent
 from app.agents.models.hypothesis import Hypothesis, HypothesisSet
+from app.config import settings
 from app.diagnostics.facts import FactStore
+from app.evaluation.llm_replay import MissingRecording
 from app.observability.ai_metrics import track_refuted, track_stage_duration
 from app.services.llm_service import LLMTruncatedResponse
 from app.services.telemetry_utils import trace_agent
@@ -187,6 +197,163 @@ def _parse_refutations(raw: str) -> List[str]:
     return [str(r) for r in refs if r]
 
 
+# ── batch-режим ──────────────────────────────────────────────────────────
+
+# Refutation для гипотезы, по которой пакетный ответ вердикта не дал. Это
+# НЕ «критик не нашёл противоречий»: модель пропустила id, ответила не тем
+# форматом или JSON не разобрался. Пропустить такую гипотезу в survivors
+# значило бы выдать непроверенное за проверенное — ровно то, от чего
+# adversarial-критик и защищает.
+BATCH_NO_VERDICT = "critic: no verdict for this hypothesis in batch response"
+# Гипотеза за пределами FACT_CRITIC_BATCH_TOP_N: LLM её не видела. Та же
+# логика — не проверена, значит не выживает.
+BATCH_NOT_REVIEWED = "critic: not reviewed (outside batch top-N by confidence)"
+
+
+def _batch_prompt(
+    items: List[Tuple[str, Hypothesis]], facts: FactStore
+) -> tuple[str, str]:
+    """(user_context, instruction) для пакетного критика.
+
+    Факты — один раз на весь пакет: они общие для всех гипотез, и именно
+    их повтор делал per-hypothesis режим дорогим по входу.
+    """
+    blocks = []
+    for hid, h in items:
+        blocks.append(
+            f'<hypothesis id="{hid}">\n'
+            f"  cause: {h.cause}\n"
+            f"  detail: {h.detail}\n"
+            f"  anchored_facts: {h.anchored_facts}\n"
+            f"  confidence: {h.confidence}\n"
+            f"  perspective: {h.perspective}\n"
+            f"</hypothesis>"
+        )
+    user_context = (
+        "<hypotheses>\n" + "\n".join(blocks) + "\n</hypotheses>\n\n"
+        f"{facts.to_prompt_context()}"
+    )
+    instruction = (
+        "You are an ADVERSARIAL critic. For EACH hypothesis in <hypotheses> "
+        "independently, find concrete facts that REFUTE it (counter-examples). "
+        "Do not compare hypotheses with each other and do not rank them.\n\n"
+        "Rules:\n"
+        "  1. A refutation MUST point to a specific fact_kind in <facts>. "
+        "Quote the fact_kind verbatim.\n"
+        "  2. If a fact is marked ✗ (checked and NOT observed), and the "
+        "hypothesis needs it to be true, that's a refutation. A fact marked "
+        "? (unknown: the check could not be performed) is NOT a refutation "
+        "— never cite a ? fact as evidence against a hypothesis.\n"
+        "  3. If an observed fact directly contradicts the cause "
+        "(e.g. recent_deploy observed but hypothesis blames hardware), "
+        "that's a refutation.\n"
+        "  4. A caveat, low confidence or weak attribution attached to an "
+        "OBSERVED fact (e.g. 'attribution=namespace', 'may not have touched "
+        "it') is NOT a refutation — the fact is still observed. Refute only "
+        "with ✗ facts or observed facts that contradict the cause.\n"
+        "  5. Judge each hypothesis on its own. Do not reuse the same "
+        "objection for every hypothesis unless it really refutes each one.\n"
+        "  6. If you find NO refutations for a hypothesis after honest "
+        "analysis, give it an empty list. Do not invent weaknesses.\n"
+        "  7. Each refutation is one short sentence; at most 3 per hypothesis.\n\n"
+        "Output VALID JSON ONLY, exactly one entry per hypothesis id:\n"
+        '  {"critiques": [{"id": "h1", "refutations": ["..."]}, ...]}\n'
+        "No prose, no markdown fences."
+    )
+    return user_context, instruction
+
+
+def _parse_batch(raw: str, ids: List[str]) -> Dict[str, List[str]]:
+    """id → refutations только для id, по которым ответ разобрался.
+
+    Отсутствующий в результате id = вердикта нет (вызывающий ставит
+    BATCH_NO_VERDICT). Чужие id и повторы игнорируются: первый ответ по
+    id выигрывает, чтобы модель не могла «переписать» вердикт вторым.
+    """
+    if not raw or not raw.strip():
+        return {}
+    s = raw.strip()
+    if s.startswith("```"):
+        s = "\n".join(line for line in s.splitlines() if not line.startswith("```"))
+    try:
+        data = json.loads(s)
+    except json.JSONDecodeError:
+        logger.warning("critic_batch_parse_failed", raw_head=raw[:200])
+        return {}
+    entries = data.get("critiques") if isinstance(data, dict) else None
+    if not isinstance(entries, list):
+        return {}
+    wanted = set(ids)
+    out: Dict[str, List[str]] = {}
+    for e in entries:
+        if not isinstance(e, dict):
+            continue
+        hid = str(e.get("id", ""))
+        refs = e.get("refutations")
+        if hid not in wanted or hid in out or not isinstance(refs, list):
+            continue
+        out[hid] = [str(r) for r in refs if r]
+    return out
+
+
+def _precheck(h: Hypothesis, facts: FactStore) -> Tuple[Hypothesis, bool]:
+    """Algo-часть критики, общая для обоих режимов.
+
+    Возвращает (гипотеза, нужна_ли_LLM). Algo-refutation — гипотеза уже
+    опровергнута, LLM не нужна. Иначе — копия с мягким down-weight-ом
+    (если anchor в soft-зоне), которую дальше смотрит LLM.
+    """
+    algo = _algorithmic_refutations(h, facts)
+    if algo:
+        # Если уже на дешёвой проверке валится — LLM не дёргаем,
+        # это экономит токены и даёт стабильный воспроизводимый
+        # refutation для обвалившихся anchor-ов.
+        track_refuted("algo")
+        return h.model_copy(update={"refutations": algo}), False
+
+    # Мягкий down-weight для «слабых-но-observed» anchor-ов (soft-зона).
+    # Гипотеза НЕ опровергается (survivors её пропустит), но confidence
+    # снижается ДО прогона LLM, чтобы уверенные конкуренты честно её
+    # обошли в best_candidate/synthesis. Grounding и LLM-refutation-логику
+    # это не трогает — только ранжирование единственного слабого сигнала.
+    penalty = _algorithmic_confidence_penalty(h, facts)
+    if penalty < 1.0:
+        working = h.model_copy(
+            update={"confidence": round(h.confidence * penalty, 4)}
+        )
+        logger.debug(
+            "critic_soft_downweight",
+            hypothesis_cause=h.cause,
+            from_confidence=h.confidence,
+            to_confidence=working.confidence,
+        )
+        return working, True
+    return h, True
+
+
+class _BatchCritic(BaseAgent):
+    """LLM-вызов пакетного режима.
+
+    Отдельный агент, а не второй метод FactCriticAgent: у него своя роль,
+    а по роли replay golden-eval (llm_replay) ключует записи. Общая роль
+    подсунула бы пакетному вызову записанный ответ per-hypothesis режима
+    («n-й ответ той же роли») — разобрался бы как «вердиктов нет», и кейс
+    упал бы не из-за модели, а из-за записи.
+    """
+
+    def __init__(self) -> None:
+        super().__init__(
+            name="FactCriticBatch",
+            role=(
+                "Adversarial fact-checker for a batch of hypotheses. For each "
+                "hypothesis find facts that refute it. Never judge "
+                "persuasiveness, only evidence consistency."
+            ),
+            task_type="critic",
+            json_response=True,
+        )
+
+
 class FactCriticAgent(BaseAgent):
     """LLM-критик, работающий поверх anchor-структуры.
 
@@ -213,31 +380,9 @@ class FactCriticAgent(BaseAgent):
     async def critique(
         self, hypothesis: Hypothesis, facts: FactStore
     ) -> Hypothesis:
-        algo = _algorithmic_refutations(hypothesis, facts)
-        if algo:
-            # Если уже на дешёвой проверке валится — LLM не дёргаем,
-            # это экономит токены и даёт стабильный воспроизводимый
-            # refutation для обвалившихся anchor-ов.
-            track_refuted("algo")
-            return hypothesis.model_copy(update={"refutations": algo})
-
-        # Мягкий down-weight для «слабых-но-observed» anchor-ов (soft-зона).
-        # Гипотеза НЕ опровергается (survivors её пропустит), но confidence
-        # снижается ДО прогона LLM, чтобы уверенные конкуренты честно её
-        # обошли в best_candidate/synthesis. Grounding и LLM-refutation-логику
-        # это не трогает — только ранжирование единственного слабого сигнала.
-        working = hypothesis
-        penalty = _algorithmic_confidence_penalty(hypothesis, facts)
-        if penalty < 1.0:
-            working = hypothesis.model_copy(
-                update={"confidence": round(hypothesis.confidence * penalty, 4)}
-            )
-            logger.debug(
-                "critic_soft_downweight",
-                hypothesis_cause=hypothesis.cause,
-                from_confidence=hypothesis.confidence,
-                to_confidence=working.confidence,
-            )
+        working, needs_llm = _precheck(hypothesis, facts)
+        if not needs_llm:
+            return working
 
         user_context, instruction = _llm_refutation_prompt(working, facts)
         _t0 = time.monotonic()
@@ -271,13 +416,156 @@ class FactCriticAgent(BaseAgent):
     async def critique_all(
         self, hyp_set: HypothesisSet, facts: FactStore
     ) -> HypothesisSet:
-        """Прогон всех гипотез из set-а. Последовательно — параллелить
+        """Прогон всех гипотез из set-а в режиме FACT_CRITIC_MODE.
+
+        per_hypothesis — последовательно, по вызову на гипотезу: параллелить
         не нужно, у каждой гипотезы свой кэш в LLM-провайдере не сработает,
-        а скачок 3× нагрузки на API вреднее, чем доп. латентность."""
+        а скачок 3× нагрузки на API вреднее, чем доп. латентность.
+        """
+        if settings.FACT_CRITIC_MODE == "batch":
+            return await self._critique_batch(hyp_set, facts)
         critiqued: List[Hypothesis] = []
         for h in hyp_set.items:
             critiqued.append(await self.critique(h, facts))
         return HypothesisSet(items=critiqued)
+
+    @trace_agent("FactCriticBatch")
+    async def _critique_batch(
+        self, hyp_set: HypothesisSet, facts: FactStore
+    ) -> HypothesisSet:
+        """Algo-проверка по каждой, затем один LLM-вызов на все оставшиеся.
+
+        Порядок гипотез в результате — исходный: вызывающие (отчёт, replay)
+        не должны зависеть от режима критика.
+        """
+        out: List[Optional[Hypothesis]] = []
+        pending: List[Tuple[int, Hypothesis]] = []
+        for i, h in enumerate(hyp_set.items):
+            working, needs_llm = _precheck(h, facts)
+            out.append(working)
+            if needs_llm:
+                pending.append((i, working))
+
+        top_n = settings.FACT_CRITIC_BATCH_TOP_N
+        if top_n > 0 and len(pending) > top_n:
+            # Самые уверенные — модели, остальные не проверены и не выживают.
+            # Стабильная сортировка: при равной confidence — исходный порядок.
+            ranked = sorted(pending, key=lambda p: -p[1].confidence)
+            pending, skipped = ranked[:top_n], ranked[top_n:]
+            for i, h in skipped:
+                track_refuted("batch_not_reviewed")
+                out[i] = h.model_copy(update={"refutations": [BATCH_NOT_REVIEWED]})
+            pending.sort(key=lambda p: p[0])
+
+        if pending:
+            # Весь критик идёт под стадийным cap-ом pipeline
+            # (PIPELINE_STAGE_TIMEOUT_SECONDS). Деление пакета после сбоя
+            # имеет смысл, только пока половинки успевают в этот cap: иначе
+            # стадия падает PipelineStageTimeout и инцидент уходит в FAILED
+            # целиком — хуже, чем честно непроверенные гипотезы.
+            deadline = time.monotonic() + float(settings.PIPELINE_STAGE_TIMEOUT_SECONDS)
+            verdicts = await self._ask_batch(pending, facts, deadline)
+            for i, h in pending:
+                refs = verdicts.get(i)
+                if refs is None:
+                    track_refuted("batch_no_verdict")
+                    logger.warning(
+                        "critic_batch_missing_verdict", hypothesis_cause=h.cause,
+                    )
+                    out[i] = h.model_copy(update={"refutations": [BATCH_NO_VERDICT]})
+                    continue
+                if refs:
+                    track_refuted("llm")
+                out[i] = h.model_copy(update={"refutations": refs})
+        return HypothesisSet(items=[h for h in out if h is not None])
+
+    async def _ask_batch(
+        self,
+        pending: List[Tuple[int, Hypothesis]],
+        facts: FactStore,
+        deadline: float,
+    ) -> Dict[int, Optional[List[str]]]:
+        """index → refutations; None / отсутствие ключа — вердикта нет.
+
+        Пакет больше FACT_CRITIC_BATCH_MAX режется на части. Обрезка ответа
+        по max_tokens — не повод ронять стадию: пакет делится пополам и
+        переспрашивается, пока не останется одна гипотеза; обрезка на одной —
+        тот же терминальный LLMTruncatedResponse, что и в per_hypothesis.
+
+        Деление после сбоя — только если до `deadline` осталось не меньше,
+        чем занял упавший вызов (половинки идут последовательно и обычно не
+        быстрее целого). Не успеваем: сбой — вердиктов нет (fail-closed,
+        гипотезы не проверены), обрезка — терминальный LLMTruncatedResponse.
+        """
+        size = max(1, settings.FACT_CRITIC_BATCH_MAX)
+        if len(pending) > size:
+            merged: Dict[int, Optional[List[str]]] = {}
+            for start in range(0, len(pending), size):
+                merged.update(
+                    await self._ask_batch(pending[start:start + size], facts, deadline)
+                )
+            return merged
+
+        ids = [f"h{n + 1}" for n in range(len(pending))]
+        user_context, instruction = _batch_prompt(
+            [(hid, h) for hid, (_, h) in zip(ids, pending)], facts
+        )
+        _t0 = time.monotonic()
+        try:
+            raw = await _BatchCritic().ask(
+                user_context=user_context, instruction=instruction
+            )
+        except LLMTruncatedResponse:
+            took = time.monotonic() - _t0
+            track_stage_duration("llm_critic", took)
+            if len(pending) == 1 or deadline - time.monotonic() < took:
+                raise
+            half = len(pending) // 2
+            logger.warning("critic_batch_truncated_split", size=len(pending))
+            first = await self._ask_batch(pending[:half], facts, deadline)
+            first.update(await self._ask_batch(pending[half:], facts, deadline))
+            return first
+        except MissingRecording:
+            # Replay golden-eval: записи пакетного вызова нет. Проглотить это
+            # как «LLM недоступна» значило бы молча пропустить гипотезы без
+            # критики — и зелёный replay не проверял бы batch-режим вовсе.
+            raise
+        except Exception as e:
+            took = time.monotonic() - _t0
+            track_stage_duration("llm_critic", took)
+            if len(pending) > 1 and deadline - time.monotonic() < took:
+                logger.warning(
+                    "critic_batch_failed_no_time_to_split",
+                    error=type(e).__name__, size=len(pending),
+                    took_s=round(took, 1),
+                )
+                return {i: None for i, _ in pending}
+            if len(pending) > 1:
+                # Сбой пакета — чаще всего таймаут на длинном ответе (замер
+                # 24.09: claude_cli, пакет из 6 гипотез упирался в 180 с). В
+                # per_hypothesis один отказ стоил одной непроверенной гипотезы,
+                # здесь — всего пакета; поэтому делим и переспрашиваем.
+                half = len(pending) // 2
+                logger.warning(
+                    "critic_batch_failed_split",
+                    error=type(e).__name__, size=len(pending),
+                )
+                first = await self._ask_batch(pending[:half], facts, deadline)
+                first.update(await self._ask_batch(pending[half:], facts, deadline))
+                return first
+            # Паритет с per_hypothesis: LLM недоступна — критик молчит, а не
+            # опровергает всё подряд. Fail-closed относится к ОТВЕТУ модели
+            # (пропущенный id), а не к её отсутствию: отказ провайдера виден
+            # в метриках и audit-е (LLM_CALL_FAILED), отказ по id — только здесь.
+            logger.warning(
+                "critic_batch_llm_failed",
+                error=type(e).__name__, size=len(pending),
+            )
+            return {i: [] for i, _ in pending}
+        track_stage_duration("llm_critic", time.monotonic() - _t0)
+
+        by_id = _parse_batch(raw, ids)
+        return {i: by_id.get(hid) for hid, (i, _) in zip(ids, pending)}
 
 
 def survivors(hyp_set: HypothesisSet) -> HypothesisSet:

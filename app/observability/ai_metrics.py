@@ -128,6 +128,11 @@ HYPOTHESES_GROUNDED = Counter(
 # Сколько гипотез отбраковал критик. Label `by`:
 #   "algo" — алгоритмическая проверка (low-conf anchor, unobserved kind)
 #   "llm"  — LLM-стадия adversarial-критика
+#   "batch_no_verdict"   — пакетный ответ не дал вердикта по гипотезе
+#                          (fail-closed, FACT_CRITIC_MODE=batch)
+#   "batch_not_reviewed" — гипотеза за пределами FACT_CRITIC_BATCH_TOP_N
+# Рост batch_no_verdict = модель теряет id в пакете: уменьшить
+# FACT_CRITIC_BATCH_MAX или вернуть per_hypothesis.
 # Большое преобладание algo над llm = LLM-критик можно отключить и
 # экономить токены. Преобладание llm = алгоритмическая часть недостаточна.
 HYPOTHESES_REFUTED = Counter(
@@ -258,7 +263,7 @@ def track_grounded(perspective: str) -> None:
 
 
 def track_refuted(branch: str) -> None:
-    """branch ∈ {"algo", "llm"}."""
+    """branch ∈ {"algo", "llm", "batch_no_verdict", "batch_not_reviewed"}."""
     HYPOTHESES_REFUTED.labels(by=branch).inc()
 
 

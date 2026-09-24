@@ -35,7 +35,10 @@ import re
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-__all__ = ["Recordings", "MissingRecording", "install_replay", "install_recorder"]
+__all__ = [
+    "Recordings", "MissingRecording", "install_replay", "install_replay_filling",
+    "install_recorder",
+]
 
 # BaseAgent.ask шлёт system = «Role: {role}\nTask: {instruction}\n\n…»
 # и user = «<user_context>\n{ctx}\n</user_context>». До разделения ролей
@@ -82,6 +85,8 @@ class Recordings:
         self.calls: List[Dict[str, Any]] = list(calls or [])
         self._used_by_role: Dict[str, int] = {}
         self.misses: List[str] = []
+        # Сколько вызовов install_replay_filling дописал живой моделью.
+        self.filled = 0
 
     @classmethod
     def load(cls, path: Path) -> "Recordings":
@@ -157,6 +162,42 @@ def install_replay(monkeypatch_like, recordings: Recordings) -> None:
 
     async def _text(task_type: str, prompt: str, system: Optional[str] = None) -> str:
         return recordings.lookup(prompt, system).get("text", "")
+
+    monkeypatch_like.setattr(ModelRouter, "route_and_call_full", staticmethod(_full))
+    monkeypatch_like.setattr(ModelRouter, "route_and_call", staticmethod(_text))
+
+
+def install_replay_filling(monkeypatch_like, recordings: Recordings) -> None:
+    """Replay, а там, где записи нет, — настоящий вызов с дозаписью.
+
+    Для новой роли агента (FactCriticBatch) рядом со старыми записями:
+    гипотезы и fix берутся из записи, как в обычном replay, поэтому новый
+    вызов видит ровно тот контекст, который потом будет воспроизводиться, а
+    прежние ответы не переписываются. Полный `--mode record` здесь хуже:
+    он перезапишет и гипотезы — и replay-проверки остальных стадий начнут
+    мерить уже другой ответ модели.
+
+    Дозаписывается только роль, у которой в записи НЕТ ни одного вызова.
+    Роль с записями, но с разъехавшимся контекстом, идёт по штатному
+    ctx-miss (n-й ответ роли) — её лечит осознанный `--mode record`.
+    """
+    from app.llm.router import ModelRouter
+
+    original = ModelRouter.route_and_call_full
+
+    async def _full(task_type: str, prompt: str, system: Optional[str] = None):
+        try:
+            return recordings.lookup(prompt, system)
+        except MissingRecording:
+            result = await original(task_type, prompt, system=system)
+            if not isinstance(result, dict):
+                result = {"text": str(result)}
+            recordings.add(prompt, task_type, result, system=system)
+            recordings.filled += 1
+            return result
+
+    async def _text(task_type: str, prompt: str, system: Optional[str] = None) -> str:
+        return (await _full(task_type, prompt, system)).get("text", "")
 
     monkeypatch_like.setattr(ModelRouter, "route_and_call_full", staticmethod(_full))
     monkeypatch_like.setattr(ModelRouter, "route_and_call", staticmethod(_text))
