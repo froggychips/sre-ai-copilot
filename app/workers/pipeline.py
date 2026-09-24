@@ -35,9 +35,11 @@ from app.agents.synthesis import SynthesisAgent
 from app.config import settings
 from app.context.jira_client import JiraClient, build_jira_context
 from app.context.collector import (Collector, CollectorResult, Outcome,
-                                   SourceStatus, merge_source_status)
+                                   SourceStatus, default_classify,
+                                   merge_source_status)
 from app.context.k8s_facts import K8sFacts, K8sSnapshot
-from app.context.vm_client import VMClient
+from app.context.vm_client import (ClusterHealth, VMClient,
+                                   valid_promql_label)
 from app.core.execution_dsl import ExecutionIntent
 from app.core.intelligence.similar_incidents import SimilarIncidentEngine
 from app.core.state_machine import IncidentState, StateMachine
@@ -121,6 +123,42 @@ def _classify_k8s_snapshot(snap: Any) -> Outcome:
             reason=f"k8s API недоступен: {snap.error}", error=snap.error,
         )
     return Outcome(SourceStatus.SUCCESS, snap)
+
+
+def _classify_pod_metrics(metrics: Any) -> Outcome:
+    """Частичный отказ VM — FAILED с данными, а не SUCCESS.
+
+    `get_pod_metrics` при полном отказе бросает VMQueryError (раннер сделает
+    FAILED сам), а при частичном отдаёт упавшие сигналы в `vm_errors` с
+    `*_pressure = None`. Поле помечается в source_status: ABSENT по давлению
+    без половины метрик — пробел, а не факт. Данные при этом доходят до ctx:
+    FOUND по уцелевшему сигналу `Rule.run()` не понижает.
+    """
+    if isinstance(metrics, dict) and metrics.get("vm_errors"):
+        errors = metrics["vm_errors"]
+        detail = ", ".join(f"{sig}: {err}" for sig, err in sorted(errors.items()))
+        return Outcome(
+            SourceStatus.FAILED, metrics,
+            reason=f"VictoriaMetrics недоступна частично ({detail})",
+            error=next(iter(errors.values())),
+        )
+    return default_classify(metrics)
+
+
+def _classify_cluster_health(health: Any) -> Outcome:
+    """Снимок, где не ответила ни одна метрика, — UNAVAILABLE.
+
+    `get_cluster_health` глушит отказы запросов в None и отдаёт снимок
+    «unknown»: без классификации сборщик считал его SUCCESS, и в source_status
+    полностью лежащая VM не попадала. Частичный снимок остаётся SUCCESS —
+    его неполноту уже честно отражает health_status.
+    """
+    if isinstance(health, ClusterHealth) and health.all_missing:
+        return Outcome(
+            SourceStatus.UNAVAILABLE, health,
+            reason="VictoriaMetrics недоступна: ни одна метрика кластера не ответила",
+        )
+    return default_classify(health)
 
 
 class PipelineStageTimeout(Exception):
@@ -857,8 +895,8 @@ class IncidentPipeline:
         )
 
     async def _enrich_pod_metrics(self, diag_ctx: dict, vm: VMClient) -> None:
-        if not self.incident.namespace:
-            return
+        # Пустой namespace не выходит молча: проверка меток ниже пометит
+        # metrics_summary «не опрошены», иначе правило ответило бы ✗.
         incident_ts = None
         if self.incident.starts_at:
             try:
@@ -867,15 +905,32 @@ class IncidentPipeline:
                 )
             except ValueError:
                 pass
+        pod = self.incident.labels.get("pod", "")
+        if not (valid_promql_label(self.incident.namespace or "")
+                and valid_promql_label(pod)):
+            # Раньше get_pod_metrics молча отдавал нули на пустую/невалидную
+            # метку, и «давления памяти нет» выводилось из запроса, которого
+            # не было. Не спросили — так и пишем.
+            self._record_collector(diag_ctx, CollectorResult(
+                name=_VM_POD_METRICS.name,
+                status=SourceStatus.UNAVAILABLE,
+                ctx_fields=_VM_POD_METRICS.ctx_fields,
+                provenance=_VM_POD_METRICS.provenance,
+                reason="метрики пода не опрошены: нет валидной метки namespace/pod",
+            ))
+            return
         res = await _VM_POD_METRICS.run(
             vm.get_pod_metrics,
             namespace=self.incident.namespace,
-            pod=self.incident.labels.get("pod", ""),
+            pod=pod,
             window_minutes=settings.VICTORIA_METRICS_WINDOW_MINUTES,
             incident_time=incident_ts,
+            classify=_classify_pod_metrics,
         )
         self._record_collector(diag_ctx, res)
-        if res.ok:
+        # Частичный отказ несёт данные уцелевших сигналов: кладём их, а поле
+        # уже помечено в source_status — ✗ по ним правило не скажет.
+        if isinstance(res.data, dict):
             diag_ctx["metrics_summary"] = res.data
         if res.error:
             audit_service.log_event(
@@ -884,9 +939,13 @@ class IncidentPipeline:
             )
 
     async def _enrich_cluster_health(self, diag_ctx: dict, vm: VMClient) -> None:
-        res = await _VM_CLUSTER_HEALTH.run(vm.get_cluster_health)
+        res = await _VM_CLUSTER_HEALTH.run(
+            vm.get_cluster_health, classify=_classify_cluster_health,
+        )
         self._record_collector(diag_ctx, res)
-        if res.ok and res.data is not None:
+        # Пустой снимок тоже кладём: LLM видит «UNKNOWN (VictoriaMetrics
+        # unavailable)», как и раньше; отказ теперь ещё и в source_status.
+        if res.data is not None:
             health = res.data
             diag_ctx["cluster_health"] = health.to_dict()
             self.cluster_health_context = health.to_prompt_context()
