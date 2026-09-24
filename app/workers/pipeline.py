@@ -517,6 +517,12 @@ class IncidentPipeline:
         cp = analysis.get(_CHECKPOINT_KEY) if isinstance(analysis, dict) else None
         if not isinstance(cp, dict):
             return False
+        # Сводки сборщиков применяются только если checkpoint прошёл ЦЕЛИКОМ:
+        # при откате в полный перезапуск diagnose прогонится заново, и
+        # старые сводки задвоили бы опросы, а «липкий» пробел из них остался
+        # бы висеть, даже если новый прогон источник увидел.
+        restored_collectors: List[Dict[str, Any]] = []
+        self._restored_collectors = []
         try:
             if "analyze" in completed:
                 if cp.get("summary") is None:
@@ -533,11 +539,11 @@ class IncidentPipeline:
                 self.statics_check_context = cp.get("statics_check_context")
                 self.deploy_correlation = cp.get("deploy_correlation")
                 self.team_owner = cp.get("team_owner")
-                restored = cp.get("collectors")
-                self._restored_collectors = (
-                    [c for c in restored if isinstance(c, dict)]
-                    if isinstance(restored, list) else []
-                )
+                raw_collectors = cp.get("collectors")
+                if isinstance(raw_collectors, list):
+                    restored_collectors = [
+                        c for c in raw_collectors if isinstance(c, dict)
+                    ]
                 if self.incident is not None and self.incident.teamcity_context is None:
                     self.incident.teamcity_context = cp.get("teamcity_context")
             if "critique" in completed:
@@ -569,6 +575,7 @@ class IncidentPipeline:
             prior_traces = cp.get("traces")
             if isinstance(prior_traces, list):
                 self.traces = list(prior_traces)
+            self._restored_collectors = restored_collectors
             audit_service.log_event(
                 "PIPELINE_RESUMED_FROM_CHECKPOINT",
                 {

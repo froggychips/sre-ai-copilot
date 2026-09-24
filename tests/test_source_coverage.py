@@ -96,6 +96,28 @@ def test_pipeline_coverage_survives_checkpoint_resume():
     assert cov["fields"]["metrics_summary"]["reason"] == "VictoriaMetrics не настроена"
 
 
+def test_failed_restore_does_not_leak_stale_collectors():
+    """diagnose восстановился, critique — нет: откат в полный перезапуск.
+
+    Старые сводки не должны пережить откат — иначе новый прогон diagnose
+    задвоит опросы, а «липкий» пробел из старого сбоя останется висеть.
+    """
+    from app.workers.pipeline import _CHECKPOINT_KEY
+
+    stale = _result("vm_pod_metrics", SourceStatus.FAILED, ["metrics_summary"],
+                    reason="старый сбой").to_compact_dict()
+    resumed = _pipeline_stub()
+    resumed.record = SimpleNamespace(analysis={_CHECKPOINT_KEY: {
+        "summary": "s", "facts": [], "collectors": [stale],
+        # critique в completed, но данных под него нет → restore == False.
+        "critiqued": None,
+    }})
+    assert resumed._restore_checkpoint(
+        frozenset({"analyze", "diagnose", "critique"}),
+    ) is False
+    assert resumed._restored_collectors == []
+
+
 def test_restore_without_collectors_key_is_empty_coverage():
     """Checkpoint прежних версий ключа не несёт — resume не падает."""
     from app.workers.pipeline import _CHECKPOINT_KEY
