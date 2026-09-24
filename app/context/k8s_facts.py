@@ -39,12 +39,18 @@ class K8sSnapshot:
         по last_timestamp DESC. Каждый элемент: {type, reason, message, count}.
     core_dump_node — имя ноды, на которой найден core dump в /tmp/dump,
         или None если не найден / проверка не проводилась.
+    error — тип исключения, если сбор namespace-а упал целиком. Тогда
+        `text` — заглушка «[k8s_facts unavailable: …]», а пустые
+        `pod_events` / `container_terminated` — не «ничего не было», а «не
+        видели»: сборщик пайплайна отдаёт по такому снапшоту FAILED, и
+        правила отвечают ?, а не ✗ (app/context/collector.py).
     """
 
     text: str
     container_terminated: Dict[str, Dict[str, Any]] = field(default_factory=dict)
     pod_events: List[Dict[str, Any]] = field(default_factory=list)
     core_dump_node: Optional[str] = None
+    error: Optional[str] = None
 
 
 class K8sFacts:
@@ -270,7 +276,9 @@ class K8sFacts:
             logger.error(
                 "k8s_facts_collection_failed", namespace=namespace, error=str(e)
             )
-            return K8sSnapshot(text=f"[k8s_facts unavailable: {e}]")
+            return K8sSnapshot(
+                text=f"[k8s_facts unavailable: {e}]", error=type(e).__name__,
+            )
 
         # ── Core dump check ───────────────────────────────────────────────
         # Если у пода смонтирован host-dump (/tmp/dump), проверяем наличие

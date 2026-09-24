@@ -21,6 +21,8 @@ import structlog
 from sqlalchemy.orm import Session
 
 from app.config import settings
+from app.context.collector import (Collector, CollectorResult, Outcome,
+                                   SourceStatus, merge_source_status)
 from app.diagnostics.facts import Fact
 from app.diagnostics.rules.recent_deploy import RecentDeployRule
 from app.diagnostics.rules.upstream_degraded import UpstreamDegradedRule
@@ -175,6 +177,57 @@ def _matter_signals(
     return out[:3]
 
 
+# ── Сборщики enrichment-а (контракт — app/context/collector.py) ─────────────
+# source_status больше не пишется руками по месту: он выводится из статуса
+# прогона. Причины (`failure_label` / `*_reason`) — прежние строки дословно:
+# их рисуют embed и timeline, а тесты сверяют их буквально.
+_NODE_NAMESPACES = Collector(
+    name="node_namespaces",
+    ctx_fields=("node_namespaces",),
+    provenance="k8s API: pods по spec.nodeName",
+    failure_reason="k8s API не ответил",
+    unavailable_reason="k8s API не ответил",
+    log_event="enrich.node_namespaces_import_failed",
+)
+_RECENT_DEPLOYS = Collector(
+    name="recent_deployments",
+    ctx_fields=("recent_deployments",),
+    provenance="kg_deployments",
+    failure_label="kg_deployments недоступен",
+    log_event="enrich.recent_deploys_failed",
+)
+_UPSTREAM_ALERTS = Collector(
+    name="upstream_alerts",
+    ctx_fields=("upstream_alerts",),
+    provenance="kg_alerts",
+    failure_label="kg_alerts недоступен",
+    log_event="enrich.nearby_alerts_failed",
+)
+_POD_EVENTS = Collector(
+    name="k8s_events",
+    ctx_fields=("k8s_events",),
+    provenance="kg_pod_events",
+    failure_label="kg_pod_events недоступен",
+    log_event="enrich.pod_events_failed",
+)
+# Сервиса нет в графе: запросы по нему вернули бы [] не потому, что пусто, а
+# потому, что искать негде — источник не опрошен.
+_NOT_IN_KG_FIELDS: Tuple[str, ...] = ("recent_deployments", "upstream_alerts", "k8s_events")
+_NOT_IN_KG_REASON = "сервис не найден в KG — источник не опрошен"
+
+
+def _record(ctx: "EnrichedContext", result: CollectorResult, *, overwrite: bool = True) -> None:
+    """Запомнить прогон и вывести из него записи source_status."""
+    ctx.collector_results.append(result)
+    merge_source_status(ctx.source_status, result, overwrite=overwrite)
+
+
+def _fetch_node_namespaces(node: str, timeout_sec: float) -> Optional[List[Dict[str, Any]]]:
+    # Локальный импорт — модуль тянет kubernetes-client (см. fetch_live_replicas).
+    from app.context.deployments import fetch_node_namespaces
+    return fetch_node_namespaces(node, timeout_sec=timeout_sec)
+
+
 @dataclass
 class EnrichedContext:
     """Готовая структура для рисовалки Discord-embed.
@@ -261,6 +314,10 @@ class EnrichedContext:
     # confidence 0.95 — уверенный вердикт из отсутствия данных. Правила
     # читают этот словарь через Rule.run() и отвечают ? вместо ✗.
     source_status: Dict[str, str] = field(default_factory=dict)
+    # Прогоны сборщиков (app/context/collector.py), из которых выведен
+    # source_status: статус, provenance, длительность. Для трейса и аудита,
+    # в embed не рисуется.
+    collector_results: List[CollectorResult] = field(default_factory=list)
 
     # rollout-noise — выставляется heuristic-ом в enrich_alert ниже
     rollout_noise: bool = False
@@ -898,16 +955,13 @@ def enrich_alert(db: Session, incident: Incident) -> EnrichedContext:
     # Стенды на ноде нодового алерта. Здесь, а не ниже: у нодовых алертов нет
     # сервиса, и enrichment уходит в ранний выход `not namespace or not service`.
     if ctx.node and getattr(settings, "ENRICH_NODE_NAMESPACES_ENABLED", True):
-        try:
-            from app.context.deployments import fetch_node_namespaces
-            ctx.node_namespaces = fetch_node_namespaces(
-                ctx.node,
-                timeout_sec=getattr(settings, "LIVE_K8S_TIMEOUT_SEC", 3.0),
-            )
-        except Exception as e:
-            log.warning("enrich.node_namespaces_import_failed", error=type(e).__name__)
-        if ctx.node_namespaces is None:
-            ctx.source_status["node_namespaces"] = "k8s API не ответил"
+        # None от клиента = «не знаю» → UNAVAILABLE; [] = на ноде пусто.
+        res = _NODE_NAMESPACES.run_sync(
+            _fetch_node_namespaces, ctx.node,
+            timeout_sec=getattr(settings, "LIVE_K8S_TIMEOUT_SEC", 3.0),
+        )
+        _record(ctx, res)
+        ctx.node_namespaces = res.data
 
     if probe_ns_from is not None:
         # debug-сигнал: какой ns был в label и куда срезолвили из URL пробы
@@ -989,46 +1043,52 @@ def enrich_alert(db: Session, incident: Incident) -> EnrichedContext:
     # «deploy за N минут до alert-а»), если пусто — расширяем до 7 дней,
     # чтобы embed всё равно показал последние deploys (для редко-катящихся
     # сервисов 60-мин окно почти всегда пустое).
-    try:
-        ctx.recent_deploys = recent_deploys_for(
+    def _collect_recent_deploys() -> Any:
+        deploys = recent_deploys_for(
             db, namespace, service, before=effective_at,
             lookback_minutes=settings.ENRICH_DEPLOY_LOOKBACK_MIN,
         )
-        if not ctx.recent_deploys:
-            ctx.recent_deploys = recent_deploys_for(
+        if not deploys:
+            deploys = recent_deploys_for(
                 db, namespace, service, before=effective_at,
                 lookback_minutes=7 * 24 * 60,  # 7 дней fallback
             )
-    except Exception as e:
-        log.warning("enrich.recent_deploys_failed", error=str(e))
-        ctx.source_status["recent_deployments"] = f"kg_deployments недоступен: {type(e).__name__}"
-    if not ctx.recent_deploys and "recent_deployments" not in ctx.source_status:
+        if deploys:
+            return deploys
         # Пустой список двусмыслен (инцидент 2026-08-11): «деплоя не было»
         # или «kg_deployments не пополняется». До сих пор это различали
         # только в NS-fallback ветке; сервисный путь отвечал ✗ 0.95 и при
-        # мёртвом потоке. Если поток стоит — источник помечен, RecentDeployRule
-        # ответит ?, рендер скажет «не проверено».
+        # мёртвом потоке. Если поток стоит — пустота не наблюдение, а пробел:
+        # UNAVAILABLE, RecentDeployRule ответит ?, рендер скажет «не проверено».
+        # Сбой самой справки о свежести — не повод терять ответ источника.
         try:
             stream = deploy_stream_freshness(db, before=effective_at)
-            ctx.deploy_stream = stream
-            if stream.get("stale"):
-                age_h = stream.get("age_hours")
-                ctx.source_status["recent_deployments"] = (
-                    f"поток деплоев не пополняется: последняя запись {age_h}ч назад"
-                    if age_h is not None else "в kg_deployments нет ни одной записи"
-                )
         except Exception as e:
             log.warning("enrich.deploy_stream_freshness_failed", error=str(e))
+            return deploys
+        ctx.deploy_stream = stream
+        if stream.get("stale"):
+            age_h = stream.get("age_hours")
+            return Outcome(
+                SourceStatus.UNAVAILABLE, deploys,
+                reason=(
+                    f"поток деплоев не пополняется: последняя запись {age_h}ч назад"
+                    if age_h is not None else "в kg_deployments нет ни одной записи"
+                ),
+            )
+        return deploys
+
+    res = _RECENT_DEPLOYS.run_sync(_collect_recent_deploys)
+    _record(ctx, res)
+    ctx.recent_deploys = res.data or []
 
     # 2. Upstream alerts (±15 мин)
-    try:
-        ctx.upstream_alerts = nearby_alerts(
-            db, namespace, service, around=incident_at,
-            window_minutes=settings.ENRICH_UPSTREAM_WINDOW_MIN,
-        )
-    except Exception as e:
-        log.warning("enrich.nearby_alerts_failed", error=str(e))
-        ctx.source_status["upstream_alerts"] = f"kg_alerts недоступен: {type(e).__name__}"
+    res = _UPSTREAM_ALERTS.run_sync(
+        nearby_alerts, db, namespace, service, around=incident_at,
+        window_minutes=settings.ENRICH_UPSTREAM_WINDOW_MIN,
+    )
+    _record(ctx, res)
+    ctx.upstream_alerts = res.data or []
 
     # 3. Recurrence (24h окно)
     try:
@@ -1083,19 +1143,21 @@ def enrich_alert(db: Session, incident: Incident) -> EnrichedContext:
     # как причины текущего alert-а). Если пусто — расширяем до 7д fallback,
     # чтобы embed для длительных хроник всё равно показывал последние k8s
     # события. effective_at (точка роста #1) — same adapt для хроник.
-    try:
-        ctx.pod_events = recent_pod_events_for(
+    def _collect_pod_events() -> Any:
+        events = recent_pod_events_for(
             db, namespace, service, around=effective_at,
             window_minutes=60, limit=5,
         )
-        if not ctx.pod_events:
-            ctx.pod_events = recent_pod_events_for(
+        if not events:
+            events = recent_pod_events_for(
                 db, namespace, service, around=effective_at,
                 window_minutes=7 * 24 * 60, limit=5,
             )
-    except Exception as e:
-        log.warning("enrich.pod_events_failed", error=str(e))
-        ctx.source_status["k8s_events"] = f"kg_pod_events недоступен: {type(e).__name__}"
+        return events
+
+    res = _POD_EVENTS.run_sync(_collect_pod_events)
+    _record(ctx, res)
+    ctx.pod_events = res.data or []
 
     # 4e. Wave 7 enrichment: blast radius / NATS impact / pod trail.
     # Все три — best-effort, silent fail. Render в embed только при
@@ -1214,9 +1276,15 @@ def enrich_alert(db: Session, incident: Incident) -> EnrichedContext:
         # Сервиса нет в графе: recent_deploys_for / nearby_alerts /
         # recent_pod_events_for возвращают [] не потому, что пусто, а потому,
         # что искать негде (см. докстринг recent_deploys_for: «эквивалентно
-        # "не знаем"»). Помечаем все три — правила ответят ?, не ✗.
-        for src in ("recent_deployments", "upstream_alerts", "k8s_events"):
-            ctx.source_status.setdefault(src, "сервис не найден в KG — источник не опрошен")
+        # "не знаем"»). Помечаем все три — правила ответят ?, не ✗. Причину
+        # конкретного сбоя выше не перетираем (overwrite=False).
+        _record(ctx, CollectorResult(
+            name="kg_service_lookup",
+            status=SourceStatus.UNAVAILABLE,
+            ctx_fields=_NOT_IN_KG_FIELDS,
+            provenance="kg_services",
+            reason=_NOT_IN_KG_REASON,
+        ), overwrite=False)
 
     # 6. Rule-based hypotheses — без LLM. Передаём в их интерфейс
     #    `recent_deployments` и `upstream_alerts`, как ожидают rules.

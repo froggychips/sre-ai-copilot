@@ -34,7 +34,9 @@ from app.agents.risk import RiskAgent
 from app.agents.synthesis import SynthesisAgent
 from app.config import settings
 from app.context.jira_client import JiraClient, build_jira_context
-from app.context.k8s_facts import K8sFacts
+from app.context.collector import (Collector, CollectorResult, Outcome,
+                                   SourceStatus, merge_source_status)
+from app.context.k8s_facts import K8sFacts, K8sSnapshot
 from app.context.vm_client import VMClient
 from app.core.execution_dsl import ExecutionIntent
 from app.core.intelligence.similar_incidents import SimilarIncidentEngine
@@ -75,6 +77,50 @@ logger = structlog.get_logger()
 # PipelineStageTimeout — вызывающий код переводит инцидент в FAILED.
 # getattr с дефолтом, чтобы не трогать config.py (отдельный batch/миграция).
 _STAGE_TIMEOUT = float(getattr(settings, "PIPELINE_STAGE_TIMEOUT_SECONDS", 240.0))
+
+
+# ── Сборщики stage_diagnose (контракт — app/context/collector.py) ───────────
+# Таймаут не задан: у k8s-снапшота и VM свои дедлайны внутри клиента, а общий
+# потолок держит _STAGE_TIMEOUT; второй, более короткий, резал бы и то, что
+# раньше успевало.
+_K8S_SNAPSHOT = Collector(
+    name="k8s_snapshot",
+    # k8s_summary в пайплайне не наполняется вовсе (всегда None), поэтому
+    # его здесь нет: помечать можно только то, что сборщик реально несёт.
+    ctx_fields=("logs_summary", "k8s_pod_state", "k8s_events"),
+    provenance="k8s API: pods/events namespace-а",
+    failure_label="k8s API недоступен",
+    log_event="pipeline.k8s_snapshot_failed",
+)
+_VM_POD_METRICS = Collector(
+    name="vm_pod_metrics",
+    ctx_fields=("metrics_summary",),
+    provenance="VictoriaMetrics: memory/CPU пода",
+    failure_label="VictoriaMetrics недоступна",
+    log_event="pipeline.vm_pod_metrics_failed",
+)
+_VM_CLUSTER_HEALTH = Collector(
+    name="vm_cluster_health",
+    ctx_fields=("cluster_health",),
+    provenance="VictoriaMetrics: здоровье кластера",
+    failure_label="VictoriaMetrics недоступна",
+    log_event="pipeline.vm_cluster_health_failed",
+)
+
+
+def _classify_k8s_snapshot(snap: Any) -> Outcome:
+    """Снапшот упавшего API — FAILED, хотя данные-заглушка есть.
+
+    Раньше заглушка «[k8s_facts unavailable: …]» уходила в logs_summary с
+    пустыми k8s_events, и правила отвечали ✗ «OOM/CrashLoop не было» —
+    уверенный вердикт из недоступного API.
+    """
+    if isinstance(snap, K8sSnapshot) and snap.error:
+        return Outcome(
+            SourceStatus.FAILED, snap,
+            reason=f"k8s API недоступен: {snap.error}", error=snap.error,
+        )
+    return Outcome(SourceStatus.SUCCESS, snap)
 
 
 class PipelineStageTimeout(Exception):
@@ -245,6 +291,9 @@ class IncidentPipeline:
         self.incident: Optional[Incident] = None
         self.analysis: Optional[str] = None
         self.fact_store: Optional[FactStore] = None
+        # Прогоны сборщиков stage_diagnose (статус/provenance/длительность) —
+        # из них выведен diag_ctx["source_status"].
+        self.collector_results: List[CollectorResult] = []
         self.similar_past: List[dict] = []
         self.is_recurrence: bool = False
         self.flap_count: int = incident_data.get("flap_count", 0)
@@ -719,33 +768,57 @@ class IncidentPipeline:
                 {"incident_id": self.incident_id, "error": type(e).__name__},
             )
 
+    def _record_collector(self, diag_ctx: dict, result: CollectorResult) -> None:
+        """Запомнить прогон сборщика и вывести из него source_status.
+
+        Записи Known Unknowns пишутся ТОЛЬКО отсюда: руками по месту их больше
+        никто не ставит (контракт app/context/collector.py).
+        """
+        self.collector_results.append(result)
+        merge_source_status(diag_ctx.setdefault("source_status", {}), result)
+
     async def _enrich_k8s(self, diag_ctx: dict) -> None:
         if not self.incident.namespace:
             return
-        try:
-            # Fallback на service/app: у сервисных алертов (5xx, latency) нет
-            # pod-label, а без target K8sFacts собирает ns-wide blob — и
-            # text-fallback правил ловил в нём «reason=OOMKilled» СОСЕДНЕГО
-            # сервиса как факт этого инцидента. same_workload() принимает и
-            # имя сервиса (см. его докстринг), так что скоупинг работает и тут.
-            labels = self.incident.labels or {}
-            snap = await K8sFacts.collect_snapshot(
-                namespace=self.incident.namespace,
-                pod=labels.get("pod") or labels.get("service") or labels.get("app"),
-            )
+        # Fallback на service/app: у сервисных алертов (5xx, latency) нет
+        # pod-label, а без target K8sFacts собирает ns-wide blob — и
+        # text-fallback правил ловил в нём «reason=OOMKilled» СОСЕДНЕГО
+        # сервиса как факт этого инцидента. same_workload() принимает и
+        # имя сервиса (см. его докстринг), так что скоупинг работает и тут.
+        labels = self.incident.labels or {}
+        res = await _K8S_SNAPSHOT.run(
+            K8sFacts.collect_snapshot,
+            namespace=self.incident.namespace,
+            pod=labels.get("pod") or labels.get("service") or labels.get("app"),
+            classify=_classify_k8s_snapshot,
+        )
+        self._record_collector(diag_ctx, res)
+        snap = res.data
+        if isinstance(snap, K8sSnapshot):
+            # Заглушку упавшего снапшота кладём как раньше (её видит LLM), но
+            # поля уже помечены в source_status: ✗ по ней правила не скажут.
             diag_ctx["logs_summary"] = snap.text
             diag_ctx["k8s_pod_state"] = snap.container_terminated
             diag_ctx["k8s_events"] = snap.pod_events
             if snap.core_dump_node:
                 diag_ctx["core_dump_node"] = snap.core_dump_node
-        except Exception as e:
+        if res.error:
             audit_service.log_event(
                 "K8S_ENRICHMENT_FAILED",
-                {"incident_id": self.incident_id, "error": type(e).__name__},
+                {"incident_id": self.incident_id, "error": res.error},
             )
 
     async def _enrich_vm(self, diag_ctx: dict) -> None:
         if not settings.VICTORIA_METRICS_URL:
+            # Не настроено — метрики не опрошены: «давления памяти нет» из
+            # этого не следует (ResourcePressureRule ответит ?, а не ✗).
+            self._record_collector(diag_ctx, CollectorResult(
+                name=_VM_POD_METRICS.name,
+                status=SourceStatus.UNAVAILABLE,
+                ctx_fields=_VM_POD_METRICS.ctx_fields,
+                provenance=_VM_POD_METRICS.provenance,
+                reason="VictoriaMetrics не настроен",
+            ))
             return
         vm = VMClient(settings.VICTORIA_METRICS_URL, timeout=10.0)
         await asyncio.gather(
@@ -757,38 +830,42 @@ class IncidentPipeline:
     async def _enrich_pod_metrics(self, diag_ctx: dict, vm: VMClient) -> None:
         if not self.incident.namespace:
             return
-        try:
-            incident_ts = None
-            if self.incident.starts_at:
-                try:
-                    incident_ts = datetime.fromisoformat(
-                        self.incident.starts_at.replace("Z", "+00:00")
-                    )
-                except ValueError:
-                    pass
-            metrics = await vm.get_pod_metrics(
-                namespace=self.incident.namespace,
-                pod=self.incident.labels.get("pod", ""),
-                window_minutes=settings.VICTORIA_METRICS_WINDOW_MINUTES,
-                incident_time=incident_ts,
-            )
-            diag_ctx["metrics_summary"] = metrics
-        except Exception as e:
+        incident_ts = None
+        if self.incident.starts_at:
+            try:
+                incident_ts = datetime.fromisoformat(
+                    self.incident.starts_at.replace("Z", "+00:00")
+                )
+            except ValueError:
+                pass
+        res = await _VM_POD_METRICS.run(
+            vm.get_pod_metrics,
+            namespace=self.incident.namespace,
+            pod=self.incident.labels.get("pod", ""),
+            window_minutes=settings.VICTORIA_METRICS_WINDOW_MINUTES,
+            incident_time=incident_ts,
+        )
+        self._record_collector(diag_ctx, res)
+        if res.ok:
+            diag_ctx["metrics_summary"] = res.data
+        if res.error:
             audit_service.log_event(
                 "VM_POD_ENRICHMENT_FAILED",
-                {"incident_id": self.incident_id, "error": type(e).__name__},
+                {"incident_id": self.incident_id, "error": res.error},
             )
 
     async def _enrich_cluster_health(self, diag_ctx: dict, vm: VMClient) -> None:
-        try:
-            health = await vm.get_cluster_health()
+        res = await _VM_CLUSTER_HEALTH.run(vm.get_cluster_health)
+        self._record_collector(diag_ctx, res)
+        if res.ok and res.data is not None:
+            health = res.data
             diag_ctx["cluster_health"] = health.to_dict()
             self.cluster_health_context = health.to_prompt_context()
             diag_ctx["cluster_health_context"] = self.cluster_health_context
-        except Exception as e:
+        if res.error:
             audit_service.log_event(
                 "VM_CLUSTER_HEALTH_FAILED",
-                {"incident_id": self.incident_id, "error": type(e).__name__},
+                {"incident_id": self.incident_id, "error": res.error},
             )
 
     # ------------------------------------------------------------------

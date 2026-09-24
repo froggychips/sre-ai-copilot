@@ -2,6 +2,33 @@
 
 All notable changes to this project are documented in this file.
 
+## [Unreleased]
+
+### Изменено
+
+- **Единый контракт сборщиков контекста: `source_status` выводится, а не
+  пишется руками.** `app/context/collector.py`: сборщик отдаёт
+  `CollectorResult` (статус из того же словаря, что у задач-источников графа —
+  success/partial/empty/unavailable/failed/invalid, плюс provenance,
+  длительность, тип исключения), раннер ловит исключения и держит таймаут у
+  асинхронных прогонов. Запись Known Unknowns появляется только при
+  unavailable/failed/invalid; empty — «опрошено, пусто», законный ABSENT.
+  Переведены сборщики enrichment-а (`node_namespaces`, `recent_deployments` с
+  проверкой свежести потока, `upstream_alerts`, `k8s_events`, «сервиса нет в
+  KG») — строки причин дословно прежние — и пайплайн (`upstream_alerts` в
+  `build_diagnostics_ctx`, k8s-снапшот, метрики пода и здоровье кластера из
+  VictoriaMetrics). LLM tool-calling не появился: контекст по-прежнему
+  собирается кодом до промпта.
+
+### Исправлено
+
+- **Упавший k8s API больше не даёт правилам пайплайна уверенного ✗.**
+  `stage_diagnose` не вёл `source_status` вовсе: при сбое API в
+  `logs_summary` уезжала заглушка «[k8s_facts unavailable: …]» с пустыми
+  `k8s_events`, и `OOMKilledRule`/`CrashLoopBackOffRule` отвечали «не было» с высокой
+  уверенностью. Теперь снапшот несёт `error`, поля помечаются, правила
+  отвечают ?. То же для не настроенной VictoriaMetrics (`metrics_summary`).
+
 ## [1.0.18] — 2026-09-23 — Чьи стенды на ноде и граница доверия вебхука
 
 ### Добавлено
