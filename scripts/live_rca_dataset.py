@@ -39,6 +39,20 @@ LLM-цепочку, что и golden (`MultiHypothesisAgent` → `FactCriticAgen
 графа (`kg-context`). Метрики считаются по режимам раздельно. medic_observed —
 нижняя граница «разбора с контекстом», а не он сам: медик записал не всё, что
 видел.
+
+Target кейса — не сервис ближайшего инцидента, а сломанный workload: тот, у
+кого в окне больше всего «плохих» событий подов (`select_targets`). Ближайший
+инцидент стендового разбора медика — чаще всего шумовой
+KubeDeploymentGenerationMismatch от Rancher-churn на сервисе с ingress
+(analytics/admin), и привязка к нему уводила правила в «чужой workload».
+
+Исход (`outcome_confirmed`): до 24.09.2026 08:56 UTC (external/mcp!115)
+`fixed=true` значило «медик что-то применил», а не «стенд здоров» — 514 из 521
+таких прогонов стенд остался больным, и их root_cause — догадка, а не ответ.
+Подтверждённым считается кейс, где медик сам видел стенд здоровым
+(`still_unhealthy=false`), или граф через 1–2 ч после разбора затих: плохие
+события подов сквада кончились, алерты резолвнулись. score считает метрики
+отдельно по подтверждённым.
 """
 from __future__ import annotations
 
@@ -50,7 +64,7 @@ import re
 import subprocess
 import sys
 import time
-from datetime import date
+from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set
 
@@ -280,8 +294,8 @@ def _guard_out_dir(out: Path) -> Path:
 _EXPORT_SQL = """
 SET TRANSACTION READ ONLY;
 SELECT row_to_json(t) FROM (
-  SELECT e.id AS event_id, e.started_at, e.outcome, e.root_cause, e.summary,
-         e.applied, e.manual, e.gaps, e.extras,
+  SELECT e.id AS event_id, e.started_at, e.finished_at, e.outcome, e.still_unhealthy,
+         e.root_cause, e.summary, e.applied, e.manual, e.gaps, e.extras,
          i.incident_key, i.namespace, i.service_name, i.severity,
          i.alertnames, i.opened_at,
          al.alertname AS alert_name, al.description AS alert_description
@@ -333,7 +347,12 @@ def _psql_rows(args, sql: str) -> Optional[List[Dict[str, Any]]]:
         "--", "psql", "-U", args.db_user, "-d", args.db_name, "-At", "-v", "ON_ERROR_STOP=1",
         "-c", "BEGIN;" + sql + "COMMIT;",
     ]
-    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+    except subprocess.TimeoutExpired:
+        # Сбой обогащения не роняет выгрузку: кейс без него — прежний вход.
+        print("psql: таймаут 120 с, порция пропущена", file=sys.stderr)
+        return None
     if proc.returncode != 0:
         print(proc.stderr, file=sys.stderr)
         return None
@@ -473,7 +492,12 @@ def reconstruct_from_kg(args, cases: List[Dict[str, Any]]) -> int:
     ids = [int(c["event_id"]) for c in cases if c.get("event_id") is not None]
     if not ids:
         return 0
-    rows = _psql_rows(args, _KG_SQL.format(ids=",".join(map(str, ids)))) or []
+    # Порциями: 31 кейс одним запросом упирался в 120-секундный таймаут
+    # (у каждого — свой lateral-скан kg_pod_events по скваду).
+    rows: List[Dict[str, Any]] = []
+    for i in range(0, len(ids), 8):
+        part = ids[i:i + 8]
+        rows += _psql_rows(args, _KG_SQL.format(ids=",".join(map(str, part)))) or []
     by_id = {r["event_id"]: r for r in rows}
     n = 0
     for c in cases:
@@ -533,6 +557,246 @@ def ctx_from_kg(ctx: Dict[str, Any], kg: Optional[Dict[str, Any]]) -> Dict[str, 
     return ctx
 
 
+# --- target кейса: сломанный workload, а не ближайший инцидент --------------
+
+# Причины событий подов, которые означают поломку, а не штатную жизнь пода.
+_BAD_POD_REASONS = frozenset({
+    "BackOff", "CrashLoopBackOff", "Failed", "FailedCreate", "FailedMount",
+    "FailedAttachVolume", "FailedScheduling", "ErrImagePull", "ImagePullBackOff",
+    "ErrImageNeverPull", "InspectFailed", "CreateContainerConfigError",
+    "CreateContainerError", "Unhealthy", "OOMKilling", "OOMKilled", "Evicted",
+    "BackoffLimitExceeded", "DeadlineExceeded",
+})
+# Алерты, которые target не выбирают: GenerationMismatch в сквадах мигает от
+# Rancher-churn (он переписывает Deployment раз в минуту, controller отстаёт) —
+# на сервисах с ingress, где ничего не сломано. Признак настоящего rollout-а —
+# деплой кода этого сервиса в окне; без него алерт в выбор не идёт.
+_NOISE_ALERTS = frozenset({"KubeDeploymentGenerationMismatch"})
+# Провал пробы — симптом, а не поломка: его даёт любой rollout, пока новый под
+# не прогрелся. Замер v4 (24.09.2026): без поправки target-ом в 24 из 31 кейса
+# становился town-grainhost — его Unhealthy от рестартов, которые медик сам
+# делал каждые 2 часа (цикл orleans-zombie, external/mcp!115).
+_SOFT_REASONS = frozenset({"Unhealthy"})
+_SOFT_WEIGHT = 0.2
+# Метрика-источник, а не workload: алерты kube-state-metrics с неразобранной
+# атрибуцией несут его имя в service.
+_NOT_TARGETS = frozenset({"vm-kube-state-metrics", "kube-state-metrics"})
+
+# Алфавит суффиксов k8s (без гласных и 0/1/3) — чтобы `town-db-0` не резался
+# как job-под, а `map-service` не терял «service».
+_K8S_SFX = "[bcdfghjklmnpqrstvwxz2456789]"
+_RS_POD_RE = re.compile(rf"^(?P<w>.+)-{_K8S_SFX}{{6,10}}-{_K8S_SFX}{{5}}$")
+_CRONJOB_POD_RE = re.compile(rf"^(?P<w>.+)-\d{{8,10}}-{_K8S_SFX}{{5}}$")
+_STS_POD_RE = re.compile(r"^(?P<w>.+)-\d{1,3}$")
+_JOB_POD_RE = re.compile(rf"^(?P<w>.+)-{_K8S_SFX}{{5}}$")
+
+
+def workload_of(pod: str) -> str:
+    """Имя workload-а по имени пода: Deployment (`x-<rs>-<pod>`), CronJob
+    (`x-<ts>-<pod>`), StatefulSet (`x-0`), Job (`x-<pod>`)."""
+    for rx in (_RS_POD_RE, _CRONJOB_POD_RE, _STS_POD_RE, _JOB_POD_RE):
+        m = rx.match(pod or "")
+        if m:
+            return m.group("w")
+    return pod or ""
+
+
+def _parse_ts(v: Any) -> Optional[datetime]:
+    if not v:
+        return None
+    try:
+        dt = datetime.fromisoformat(str(v).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+
+
+def _proximity(ts: Any, started: Optional[datetime]) -> float:
+    """Вес по близости к началу разбора: событие за 5 минут до разбора важнее
+    события двухчасовой давности (1.0 → ~0.2 к краю окна)."""
+    t = _parse_ts(ts)
+    if not t or not started:
+        return 0.5
+    age_min = max((started - t).total_seconds() / 60.0, 0.0)
+    return 1.0 / (1.0 + age_min / 30.0)
+
+
+def select_targets(case: Dict[str, Any], medic_action_text: str = "",
+                   limit: int = 5) -> List[Dict[str, Any]]:
+    """Кандидаты в target кейса, самый «больной» первым.
+
+    Вес workload-а — сумма по его плохим событиям подов (count, обрезанный до
+    20, × близость к началу разбора) плюс не-шумовые алерты его сервиса.
+    Провал пробы у workload-а, который в окне раскатывался, не считается вовсе
+    (прогрев нового пода), в остальных случаях — с весом 0.2.
+    Имена, которые медик назвал в applied/manual, только УСИЛИВАЮТ уже
+    известных кандидатов с «жёсткой» причиной (×1.5): нового имени из текста
+    медика не рождается, собственные рестарты медика не усиливают сами себя,
+    а выводы (root_cause/summary) не читаются вовсе.
+    """
+    kg = case.get("kg_context") or {}
+    started = _parse_ts(case.get("started_at"))
+    rolled = {(d.get("namespace"), d.get("service")) for d in kg.get("deployments") or []}
+    acc: Dict[tuple, Dict[str, Any]] = {}
+
+    def slot(ns: Optional[str], wl: str) -> Dict[str, Any]:
+        return acc.setdefault((ns, wl), {"namespace": ns, "workload": wl, "score": 0.0,
+                                         "reasons": set(), "sources": set()})
+
+    for e in kg.get("pod_events") or []:
+        reason = e.get("reason")
+        if reason not in _BAD_POD_REASONS:
+            continue
+        wl = workload_of(e.get("pod") or "")
+        if not wl or wl in _NOT_TARGETS:
+            continue
+        weight = 1.0
+        if reason in _SOFT_REASONS:
+            if (e.get("namespace"), wl) in rolled:
+                continue
+            weight = _SOFT_WEIGHT
+        t = slot(e.get("namespace"), wl)
+        t["score"] += (weight * min(int(e.get("count") or 1), 20)
+                       * _proximity(e.get("last_seen"), started))
+        t["reasons"].add(reason)
+        t["sources"].add("kg_pod_events")
+    for a in kg.get("alerts") or []:
+        svc, ns = a.get("service"), a.get("namespace")
+        if not svc or svc in _NOT_TARGETS:
+            continue
+        if a.get("alertname") in _NOISE_ALERTS and (ns, svc) not in rolled:
+            continue
+        t = slot(ns, svc)
+        t["score"] += 5.0 * _proximity(a.get("fired_at"), started)
+        t["reasons"].add(a.get("alertname") or "alert")
+        t["sources"].add("kg_alerts")
+    if medic_action_text:
+        for t in acc.values():
+            if not (t["reasons"] - _SOFT_REASONS):
+                continue
+            if re.search(rf"(?<![\w-]){re.escape(t['workload'])}(?![\w-])", medic_action_text):
+                t["score"] *= 1.5
+                t["sources"].add("medic_applied")
+    ranked = sorted(acc.values(), key=lambda t: -t["score"])[:limit]
+    return [{**t, "score": round(t["score"], 2), "reasons": sorted(t["reasons"]),
+             "sources": sorted(t["sources"])} for t in ranked if t["score"] > 0]
+
+
+def assign_targets(cases: List[Dict[str, Any]],
+                   medic_texts: Optional[Dict[Any, str]] = None) -> int:
+    """Проставить `targets`/`target_workload`; сервис инцидента сохраняется
+    как `incident_service`. Возвращает число кейсов, сменивших target."""
+    from app.diagnostics.rules.base import same_workload
+
+    changed = 0
+    for c in cases:
+        c.setdefault("incident_service", c.get("service_name"))
+        targets = select_targets(c, (medic_texts or {}).get(c.get("event_id"), ""))
+        c["targets"] = targets
+        if not targets:
+            c.pop("target_workload", None)
+            c.pop("target_namespace", None)
+            continue
+        c["target_workload"] = targets[0]["workload"]
+        c["target_namespace"] = targets[0]["namespace"]
+        if not same_workload(c["target_workload"], c.get("incident_service") or ""):
+            changed += 1
+    return changed
+
+
+def target_event_share(case: Dict[str, Any], target: Optional[str]) -> Optional[float]:
+    """Доля событий подов окна, принадлежащих target-у: мера того, насколько
+    вход кейса вообще про его target."""
+    from app.diagnostics.rules.base import same_workload
+
+    evs = (case.get("kg_context") or {}).get("pod_events") or []
+    if not evs or not target:
+        return None
+    return sum(1 for e in evs if same_workload(e.get("pod") or "", target)) / len(evs)
+
+
+# Отсечка семантики `fixed` у медика (external/mcp!115 раскатан 24.09.2026 08:56
+# UTC): после неё fixed=true = «стенд здоров», до — «что-то применил».
+MEDIC_FIXED_SEMANTICS_CUTOVER = datetime(2026, 9, 24, 8, 56, tzinfo=timezone.utc)
+
+# Затих ли сквад через 1–2 ч после разбора. Только метка исхода — во вход
+# кейса отсюда не попадает ничего: это было бы будущее относительно инцидента.
+_OUTCOME_SQL = """
+SET TRANSACTION READ ONLY;
+SELECT to_jsonb(t) FROM (
+  SELECT e.id AS event_id,
+    (now() >= coalesce(e.finished_at, e.started_at) + interval '2 hours') AS observable,
+    (SELECT count(*) FROM kg_pod_events pe
+      WHERE pe.namespace = ANY(sc.ns) AND pe.type = 'Warning'
+        AND pe.reason = ANY('{{{reasons}}}'::text[])
+        AND pe.first_seen BETWEEN e.started_at - interval '7 days'
+                              AND coalesce(e.finished_at, e.started_at) + interval '2 hours'
+        AND coalesce(pe.last_seen, pe.first_seen)
+            >= coalesce(e.finished_at, e.started_at) + interval '1 hour') AS bad_events_after,
+    (SELECT count(*) FROM kg_alerts a JOIN kg_services s ON s.id = a.service_id
+      WHERE s.namespace = ANY(sc.ns)
+        AND a.alertname <> ALL('{{{noise}}}'::text[])
+        AND a.fired_at BETWEEN e.started_at - interval '2 hours'
+                           AND coalesce(e.finished_at, e.started_at) + interval '2 hours'
+        AND (a.resolved_at IS NULL
+             OR a.resolved_at > coalesce(e.finished_at, e.started_at) + interval '2 hours')
+    ) AS alerts_open_after
+  FROM kg_remediation_events e
+  JOIN kg_incidents i ON i.id = e.incident_id
+  CROSS JOIN LATERAL (
+    SELECT array_append(coalesce(
+             (SELECT array_agg(DISTINCT s2.namespace) FROM kg_services s2
+              WHERE s2.namespace LIKE p.scope), '{{}}'::text[]), i.namespace) AS ns
+    FROM (SELECT coalesce(substring(i.namespace from '^(squad-[^-]+-)') || '%',
+                          i.namespace) AS scope) p
+  ) sc
+  WHERE e.id IN ({ids})
+) t;
+"""
+
+
+def fetch_kg_outcomes(args, ids: List[int], chunk: int = 60) -> Dict[int, Dict[str, Any]]:
+    """Исход по графу для событий медика; сбой запроса = исход неизвестен."""
+    out: Dict[int, Dict[str, Any]] = {}
+    for i in range(0, len(ids), chunk):
+        part = ids[i:i + chunk]
+        sql = _OUTCOME_SQL.format(ids=",".join(map(str, part)),
+                                  reasons=",".join(sorted(_BAD_POD_REASONS)),
+                                  noise=",".join(sorted(_NOISE_ALERTS)))
+        for r in _psql_rows(args, sql) or []:
+            out[int(r["event_id"])] = r
+    return out
+
+
+def outcome_evidence(row: Dict[str, Any], kg: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """Подтверждён ли исход кейса и чем.
+
+    medic_healthy — медик сам видел стенд здоровым после разбора
+    (still_unhealthy=false / outcome=fixed; после отсечки !115 это же значит
+    fixed=true). kg_quiet — через 1–2 ч после разбора у сквада нет плохих
+    Warning-событий и открытых не-шумовых алертов; None — рано или граф не
+    ответил.
+    """
+    started = _parse_ts(row.get("started_at"))
+    after_cutover = bool(started and started >= MEDIC_FIXED_SEMANTICS_CUTOVER)
+    medic_healthy = (row.get("still_unhealthy") is False or row.get("outcome") == "fixed"
+                     or (after_cutover and bool(row.get("fixed", True))))
+    kg_quiet: Optional[bool] = None
+    if kg and kg.get("observable"):
+        kg_quiet = (int(kg.get("bad_events_after") or 0) == 0
+                    and int(kg.get("alerts_open_after") or 0) == 0)
+    return {"medic_healthy": medic_healthy, "kg_quiet": kg_quiet,
+            "fixed_semantics": "healthy" if after_cutover else "applied_something",
+            "confirmed": bool(medic_healthy or kg_quiet)}
+
+
+def _medic_action_text(row: Dict[str, Any]) -> str:
+    """applied/manual медика одной строкой — только для сверки имён workload-ов
+    в select_targets. root_cause/summary/next_action сюда не входят."""
+    return json.dumps([row.get("applied") or [], row.get("manual") or []],
+                      ensure_ascii=False, default=str)
+
+
 def cmd_kg_context(args) -> int:
     """Ретроактивно: дописать снимки и реконструкцию из графа в УЖЕ собранный
     cases.jsonl, не пересобирая выборку (прогнанные results остаются валидны
@@ -542,11 +806,14 @@ def cmd_kg_context(args) -> int:
     cases = [json.loads(ln) for ln in path.read_text().splitlines() if ln]
     with_snapshot = attach_context_snapshots(args, cases)
     with_kg = reconstruct_from_kg(args, cases)
+    # Текста applied/manual здесь уже нет (export его выбрасывает) — target
+    # только по графу.
+    retargeted = assign_targets(cases)
     with path.open("w", encoding="utf-8") as f:
         for c in cases:
             f.write(json.dumps(c, ensure_ascii=False, default=str) + "\n")
     print(f"кейсов: {len(cases)}, со снимком: {with_snapshot}, "
-          f"с реконструкцией из графа: {with_kg} → {path}")
+          f"с реконструкцией из графа: {with_kg}, сменили target: {retargeted} → {path}")
     return 0
 
 
@@ -577,15 +844,28 @@ def cmd_export(args) -> int:
             raise SystemExit(f"--keep-ids: нет {path}")
         keep = {json.loads(ln)["event_id"] for ln in path.read_text().splitlines() if ln}
 
+    if keep is not None:
+        rows = [r for r in rows if r["event_id"] in keep]
+    # Исход — ДО дедупа: из серии разборов одного стенда с той же причиной
+    # в датасет должен попасть подтверждённый (стенд потом правда выздоровел),
+    # а не самый свежий «что-то применил».
+    kg_outcomes = fetch_kg_outcomes(args, [int(r["event_id"]) for r in rows])
+    for r in rows:
+        ev = outcome_evidence(r, kg_outcomes.get(int(r["event_id"])))
+        r["outcome_evidence"] = ev
+        r["outcome_confirmed"] = ev["confirmed"]
+    # sorted стабилен: внутри «подтверждённых» и «нет» сохраняется порядок
+    # started_at DESC из SQL.
+    rows = sorted(rows, key=lambda r: not r["outcome_confirmed"])
+
     # Медик часто разбирает один и тот же стенд несколько раз подряд с той же
     # причиной: 114 событий KubeContainerWaiting — почти все «retention снёс
     # теги». Без дедупа датасет меряет один случай сотню раз.
     seen: Set[tuple] = set()
     cases = []
+    medic_texts: Dict[Any, str] = {}
     leaks = 0
     for r in rows:
-        if keep is not None and r["event_id"] not in keep:
-            continue
         alertnames = r.get("alertnames") or []
         labels = sorted(classify(r.get("root_cause")))
         primary = primary_class(r.get("root_cause"))
@@ -606,6 +886,9 @@ def cmd_export(args) -> int:
         observed = clean
         r["observed_medic"] = observed
         r["context"] = "medic_observed" if observed else "alert_only"
+        # Имена из applied/manual — только для сверки с кандидатами в target,
+        # в кейс текст не пишется.
+        medic_texts[r["event_id"]] = _medic_action_text(r)
         # Сырые поля медика дальше не нужны: наблюдения уже извлечены, а
         # выводы в applied/manual/gaps — лишний шанс протечь в вход.
         for k in ("applied", "manual", "gaps", "extras"):
@@ -620,13 +903,16 @@ def cmd_export(args) -> int:
                              f"(окно --days {args.days}?) — cases.jsonl не перезаписан")
     with_snapshot = attach_context_snapshots(args, cases)
     with_kg = reconstruct_from_kg(args, cases)
+    retargeted = assign_targets(cases, medic_texts)
     path = out / "cases.jsonl"
     with path.open("w", encoding="utf-8") as f:
         for c in cases:
             f.write(json.dumps(c, ensure_ascii=False, default=str) + "\n")
     with_obs = sum(1 for c in cases if c["context"] == "medic_observed")
+    confirmed = sum(1 for c in cases if c.get("outcome_confirmed"))
     print(f"событий медика: {len(rows)}, кейсов: {len(cases)}, с наблюдениями: {with_obs}, "
           f"со снимком: {with_snapshot}, с реконструкцией из графа: {with_kg}, "
+          f"сменили target: {retargeted}, исход подтверждён: {confirmed}, "
           f"фактов отброшено из-за совпадения с выводом медика: {leaks} → {path}")
     return 0
 
@@ -639,18 +925,26 @@ def _to_incident(case: Dict[str, Any]):
 
     alertname = case.get("alert_name") or (case.get("alertnames") or ["unknown"])[0]
     desc = case.get("alert_description") or ""
-    summary = f"{alertname} in {case.get('namespace')} ({case.get('service_name')})"
+    # Target — сломанный workload из select_targets; сервис ближайшего
+    # инцидента — только если графу нечего сказать и инцидент не шумовой:
+    # GenerationMismatch от Rancher-churn указывает на здоровый сервис с
+    # ingress, и пустой target (масштаб namespace) честнее чужого.
+    service = case.get("target_workload") or ""
+    if not service and alertname not in _NOISE_ALERTS:
+        service = case.get("service_name") or ""
+    namespace = case.get("target_namespace") or case.get("namespace") or ""
+    summary = f"{alertname} in {namespace} ({service})"
     return Incident(
         incident_id=f"live-rca-{case['event_id']}",
         severity=case.get("severity") or "warning",
         status="firing",
         summary=summary,
         description=desc,
-        namespace=case.get("namespace"),
+        namespace=namespace,
         labels={
             "alertname": alertname,
-            "namespace": case.get("namespace") or "",
-            "service": case.get("service_name") or "",
+            "namespace": namespace,
+            "service": service,
         },
         annotations={"summary": summary, "description": desc},
         starts_at=str(case.get("opened_at") or case.get("started_at")),
@@ -947,6 +1241,18 @@ def score(cases: List[Dict[str, Any]], results: List[Dict[str, Any]]) -> Dict[st
         ctx: _score_block(cases, [r for r in results if r.get("context", "alert_only") == ctx])
         for ctx in contexts
     }
+    # root_cause у неподтверждённых — догадка медика по стенду, который так и
+    # остался больным; «попадание» в неё — слабый сигнал. Цифры раздельно.
+    confirmed_ids = {c["event_id"] for c in cases if c.get("outcome_confirmed")}
+    summary["by_outcome"] = {
+        label: {
+            ctx: _score_block(cases, [r for r in results
+                                      if r.get("context", "alert_only") == ctx
+                                      and (r["event_id"] in confirmed_ids) == want])
+            for ctx in contexts
+        }
+        for label, want in (("confirmed", True), ("unconfirmed", False))
+    }
     return summary
 
 
@@ -1005,13 +1311,20 @@ def cmd_score(args) -> int:
     results = [json.loads(ln) for ln in (out / "results.jsonl").read_text().splitlines() if ln]
     summary = score(cases, results)
     (out / "summary.json").write_text(json.dumps(summary, ensure_ascii=False, indent=2) + "\n")
+    def _print_blocks(title: str, blocks: Dict[str, Any]) -> None:
+        for ctx, block in blocks.items():
+            print(f"--- {title}{ctx}")
+            for bk, bv in block.items():
+                if bk != "note":
+                    print(f"  {bk:24} {bv}")
+
     for k, v in summary.items():
         if k == "by_context":
-            for ctx, block in v.items():
-                print(f"--- {ctx}")
-                for bk, bv in block.items():
-                    if bk != "note":
-                        print(f"  {bk:24} {bv}")
+            _print_blocks("", v)
+            continue
+        if k == "by_outcome":
+            for label, blocks in v.items():
+                _print_blocks(f"{label} / ", blocks)
             continue
         print(f"{k:26} {v}")
     return 0
