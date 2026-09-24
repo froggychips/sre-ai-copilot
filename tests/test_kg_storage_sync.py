@@ -1426,3 +1426,93 @@ def test_baseline_is_taken_before_the_run_marks_anything(db):
 
     assert seen_baselines == [("pvc", 4)]
     assert stats["cleanup"]["skipped"] == "delete_pct"
+
+
+# ── Непроверенный снимок не становится опорой ──────────────────────────────
+
+def _age_last_seen(db, hours):
+    from app.knowledge_graph.schema import StorageVolume
+
+    stamp = datetime.utcnow() - timedelta(hours=hours)
+    db.query(StorageVolume).update(
+        {"last_seen_at": stamp}, synchronize_session=False,
+    )
+    db.commit()
+
+
+def test_partial_after_downtime_does_not_become_baseline(db):
+    """Обрезанный снимок после простоя не становится опорой — повтор не сносит.
+
+    Синк вернулся после двух суток простоя: опоры за сутки нет, но тома,
+    виденные до простоя, остались последним известным живым набором. Лист
+    отдал четверть — чистка не идёт, и, главное, эта четверть не отмечается:
+    иначе следующий такой же обрезанный лист прошёл бы порог с усадкой 0% и
+    снёс живые узлы. Масштаб прода — 300 из 1214; здесь 2 из 8.
+    """
+    _seed_volume_edges(db, count=8)
+    _age_last_seen(db, hours=48)
+
+    partial = [_mk_pvc(f"data-{i}", "prod-shared") for i in range(2)]
+    with patch(
+        "app.knowledge_graph.k8s_storage_sync._get_all", return_value=partial,
+    ):
+        first = sync_pvcs(db)
+    assert first["cleanup"]["skipped"] == "no_baseline"
+    assert first["last_seen_touched"] == 0, "непроверенный снимок не отмечаем"
+    assert first["cleanup"]["baseline_candidate_rejected"] is True
+    assert first["cleanup"]["fallback_baseline"] == 8
+
+    with patch(
+        "app.knowledge_graph.k8s_storage_sync._get_all", return_value=partial,
+    ):
+        second = sync_pvcs(db)
+    assert second["cleanup"]["skipped"] == "no_baseline"
+    assert second["cleanup"]["volumes_deleted"] == 0
+    assert len(_pvc_names(db)) == 8, "повтор обрезанного листа не сносит живое"
+
+
+def test_full_snapshot_after_downtime_restores_cleanup(db):
+    """Полный снимок после простоя сверяется с живым набором и становится опорой.
+
+    Дальше чистка работает как обычно: настоящая пропажа тома сносится.
+    """
+    _seed_volume_edges(db, count=8)
+    _age_last_seen(db, hours=48)
+
+    full = [_mk_pvc(f"data-{i}", "prod-shared") for i in range(8)]
+    with patch(
+        "app.knowledge_graph.k8s_storage_sync._get_all", return_value=full[:2],
+    ):
+        sync_pvcs(db)
+    with patch(
+        "app.knowledge_graph.k8s_storage_sync._get_all", return_value=full,
+    ):
+        restored = sync_pvcs(db)
+    assert restored["last_seen_touched"] == 8
+    assert restored["cleanup"]["baseline_candidate_rejected"] is False
+
+    with patch(
+        "app.knowledge_graph.k8s_storage_sync._get_all", return_value=full[:7],
+    ):
+        after = sync_pvcs(db)
+    assert after["cleanup"]["skipped"] == ""
+    assert after["cleanup"]["volumes_deleted"] == 1
+    assert len(_pvc_names(db)) == 7
+
+
+def test_bootstrap_with_no_history_is_marked_unverified(db):
+    """Отметок нет и за неделю — снимок отмечается, но виден как непроверенный.
+
+    Иначе опора не появится никогда; сверять здесь не с чем, и это честно
+    видно в stats, а не прячется за «всё в порядке».
+    """
+    _seed_volume_edges(db, count=4)
+    _age_last_seen(db, hours=24 * 30)
+
+    with patch(
+        "app.knowledge_graph.k8s_storage_sync._get_all",
+        return_value=[_mk_pvc(f"data-{i}", "prod-shared") for i in range(4)],
+    ):
+        stats = sync_pvcs(db)
+    assert stats["last_seen_touched"] == 4
+    assert stats["cleanup"]["baseline_unverified"] is True
