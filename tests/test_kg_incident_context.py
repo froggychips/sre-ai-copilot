@@ -190,6 +190,17 @@ def test_jobs_snapshot_is_flagged_when_updated_after_as_of(db):
     assert jobs["bravo-db-migrate"]["failed"] == 2 and jobs["bravo-db-migrate"]["migrate"]
     assert not jobs["bravo-db-migrate"]["state_after_as_of"]
     assert jobs["chat-db-migrate"]["state_after_as_of"]
+    # Счётчики строки, обновлённой после инцидента, наружу не отдаются.
+    assert jobs["chat-db-migrate"]["failed"] is None and jobs["chat-db-migrate"]["exit_code"] is None
+
+
+def test_post_as_of_job_state_never_reaches_text_or_prompt():
+    kgc = {"schema": kgi.SCHEMA, "as_of": AS_OF.isoformat(), "sources": {},
+           "jobs": [{"namespace": "n", "name": "late-migrate", "failed": 3, "migrate": True,
+                     "state_after_as_of": True}]}
+    ctx = kgi.apply_kg_context({"service": "x", "source_status": {}}, kgc)
+    assert "late-migrate" not in (ctx.get("k8s_summary") or "")
+    assert "late-migrate" not in kgi.kg_context_prompt(kgc)
 
 
 def test_noise_alerts_are_marked(db):
@@ -222,16 +233,23 @@ def test_observations_fall_back_to_extractor_for_old_events(db):
 
 
 def test_failed_source_is_unknown_not_absent(db, monkeypatch):
-    def boom(*_a, **_k):
-        raise RuntimeError("down")
+    from sqlalchemy import text
+
+    def bad_sql(reader, *_a, **_k):
+        # Настоящая ошибка запроса: в PostgreSQL она оставила бы транзакцию
+        # aborted — источник обязан быть под savepoint.
+        reader.db.execute(text("SELECT * FROM no_such_table"))
 
     monkeypatch.setattr(kgi, "_SOURCES", tuple(
-        (n, boom if n == "kg_k8s_jobs" else f) for n, f in kgi._SOURCES))
+        (n, bad_sql if n in ("kg_k8s_jobs", "kg_log_observations") else f)
+        for n, f in kgi._SOURCES))
     kgc = _kgc(db)
     assert kgc["sources"]["kg_k8s_jobs"]["status"] == "failed"
-    assert kgc["pod_events"]          # остальные на месте
+    assert kgc["pod_events"] and kgc["remediation_history"]   # остальные на месте
+    db.commit()                                              # сессия цела
     ctx = kgi.apply_kg_context({"service": "bravo-service", "source_status": {}}, kgc)
     assert ctx["source_status"]["kg_jobs"].startswith("kg_k8s_jobs недоступен")
+    assert ctx["source_status"]["logs_summary"].startswith("kg_log_observations недоступен")
     assert "kg_k8s_jobs" in kgi.kg_context_prompt(kgc)
 
 

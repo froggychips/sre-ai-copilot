@@ -41,10 +41,11 @@ from __future__ import annotations
 
 import json
 import re
+from contextlib import nullcontext
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from typing import (Any, Callable, Dict, List, Optional, Protocol,
-                    Sequence, Set, Tuple)
+from typing import (Any, Callable, ContextManager, Dict, List, Optional,
+                    Protocol, Sequence, Set, Tuple)
 
 import structlog
 from sqlalchemy import func, literal_column, or_, select, text
@@ -127,6 +128,8 @@ class KGReader(Protocol):
 
     def has_column(self, table: str, column: str) -> bool: ...
 
+    def isolated(self) -> ContextManager[Any]: ...
+
 
 class SessionReader:
     """Прод: те же `Select` через SQLAlchemy-сессию пайплайна/enrichment-а."""
@@ -137,6 +140,12 @@ class SessionReader:
 
     def rows(self, stmt: Select) -> List[Dict[str, Any]]:
         return [dict(r._mapping) for r in self.db.execute(stmt)]
+
+    def isolated(self) -> ContextManager[Any]:
+        """Savepoint на источник: ошибка запроса (таймаут, нет колонки)
+        откатывает только его, а не оставляет транзакцию сессии aborted —
+        иначе падали бы все следующие источники и commit пайплайна."""
+        return self.db.begin_nested()
 
     def has_column(self, table: str, column: str) -> bool:
         if table not in self._columns:
@@ -184,6 +193,10 @@ class PsqlReader:
 
     def rows(self, stmt: Select) -> List[Dict[str, Any]]:
         return self._json_rows(render_sql(stmt))
+
+    def isolated(self) -> ContextManager[Any]:
+        # Каждый вызов psql — своя транзакция, изолировать нечего.
+        return nullcontext()
 
     def has_column(self, table: str, column: str) -> bool:
         if table not in self._columns:
@@ -518,14 +531,16 @@ def _job_snapshot(reader: KGReader, ns: List[str], scope: KGScope) -> List[Dict[
         # измениться уже после инцидента — это не наблюдение на as_of.
         after = bool((completed and completed > as_of)
                      or (seen and seen > as_of + timedelta(minutes=30)))
+        # Счётчики и exit code такой строки — уже после инцидента: наружу
+        # (правилам, тексту, модели) их не отдаём вовсе, только факт Job-а.
         out.append({
             "namespace": r.get("namespace"),
             "name": r.get("name"),
             "owner_service": r.get("owner_service_name"),
-            "succeeded": r.get("succeeded_count"),
-            "failed": r.get("failed_count"),
-            "active": r.get("active_count"),
-            "exit_code": r.get("last_pod_exit_code"),
+            "succeeded": None if after else r.get("succeeded_count"),
+            "failed": None if after else r.get("failed_count"),
+            "active": None if after else r.get("active_count"),
+            "exit_code": None if after else r.get("last_pod_exit_code"),
             "start_time": _iso(_aware(r.get("start_time"))),
             "completion_time": _iso(completed) if completed and completed <= as_of else None,
             "state_after_as_of": after,
@@ -754,7 +769,12 @@ def fetch_kg_incident_context(reader: KGReader, scope: KGScope) -> Dict[str, Any
     """Прочитать граф на момент `scope.as_of`. Упавший источник — запись в
     `sources` с причиной, остальные на месте; JSON-сериализуемо (метки времени
     — ISO), чтобы датасет хранил ровно то, что увидел бы прод."""
-    namespaces = _scope_namespaces(reader, scope.namespace)
+    try:
+        with reader.isolated():
+            namespaces = _scope_namespaces(reader, scope.namespace)
+    except Exception as e:  # без списка сквада — хотя бы сам namespace
+        log.warning("kg_context.scope_failed", error=type(e).__name__)
+        namespaces = [scope.namespace]
     kgc: Dict[str, Any] = {
         "schema": SCHEMA,
         "as_of": _iso(scope.as_of_utc),
@@ -772,7 +792,8 @@ def fetch_kg_incident_context(reader: KGReader, scope: KGScope) -> Dict[str, Any
     }
     for name, fn in _SOURCES:
         try:
-            data = fn(reader, namespaces, scope)
+            with reader.isolated():
+                data = fn(reader, namespaces, scope)
         except Exception as e:  # источник, а не сборка: остальные должны прийти
             log.warning("kg_context.source_failed", source=name, error=type(e).__name__,
                         message=str(e)[:200])
@@ -834,6 +855,7 @@ _SOURCE_FIELDS = {
     "kg_pod_events": ("k8s_events",),
     "kg_deployments": ("recent_deployments",),
     "kg_k8s_jobs": ("kg_jobs",),
+    "kg_log_observations": ("logs_summary",),
 }
 
 
@@ -859,8 +881,7 @@ def _job_line(j: Dict[str, Any]) -> str:
         state = f"status={j['status']} " + state
     if j.get("exit_code") is not None:
         state += f" exit_code={j['exit_code']}"
-    tail = " (состояние обновлено после инцидента)" if j.get("state_after_as_of") else ""
-    return f"Job {j.get('namespace')}/{j.get('name')}: {state}{tail}"
+    return f"Job {j.get('namespace')}/{j.get('name')}: {state}"
 
 
 def apply_kg_context(ctx: Dict[str, Any], kgc: Optional[Dict[str, Any]], *,
@@ -912,7 +933,8 @@ def apply_kg_context(ctx: Dict[str, Any], kgc: Optional[Dict[str, Any]], *,
     if jobs:
         ctx["kg_jobs"] = jobs
         _block(ctx, "k8s_summary", "kg_k8s_jobs",
-               [_job_line(j) for j in jobs if (j.get("failed") or 0) > 0])
+               [_job_line(j) for j in jobs
+                if (j.get("failed") or 0) > 0 and not j.get("state_after_as_of")])
     _block(ctx, "k8s_summary", MEDIC_PROVENANCE, medic_facts)
     _block(ctx, "logs_summary", "kg_log_observations",
            [f"{lg.get('level')} x{lg.get('count')} {lg.get('namespace')}/{lg.get('app')}: "
@@ -970,7 +992,8 @@ def kg_context_prompt(kgc: Optional[Dict[str, Any]], *, include_medic: bool = Tr
         lines.append("[kg_pod_events] bad pod events in window:")
         lines += [f"  {e.get('namespace')}/{e.get('pod')}: {_event_line(e)}"
                   for e in evs[:max_events]]
-    failed_jobs = [j for j in kgc.get("jobs") or [] if (j.get("failed") or 0) > 0]
+    failed_jobs = [j for j in kgc.get("jobs") or []
+                   if (j.get("failed") or 0) > 0 and not j.get("state_after_as_of")]
     if failed_jobs:
         lines.append("[kg_k8s_jobs] failed jobs:")
         lines += [f"  {_job_line(j)}" for j in failed_jobs[:10]]
