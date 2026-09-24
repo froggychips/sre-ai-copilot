@@ -13,6 +13,8 @@ LLM-цепочку, что и golden (`MultiHypothesisAgent` → `FactCriticAgen
 Подкоманды:
   export  SELECT из боевой БД copilot (через `kubectl exec psql`, транзакция
           read-only) → cases.jsonl. Только чтение.
+  kg-context  дописать в готовый cases.jsonl снимок контекста и реконструкцию
+          из графа на момент инцидента (`context=kg_reconstructed`). Только чтение.
   run     прогон N кейсов через модель → results.jsonl (дописывает, уже
           прогнанные пропускает — прогон можно дробить).
   score   метрики по results.jsonl → summary.json + таблица.
@@ -24,10 +26,11 @@ LLM-цепочку, что и golden (`MultiHypothesisAgent` → `FactCriticAgen
 Оценка — грубая и честная: причину медика и причину модели раскладываем по
 одним и тем же классам (`CAUSE_CLASSES`, регулярки RU+EN), попадание — это
 пересечение классов. Это нижняя оценка: модель могла назвать ту же причину
-словами, которых нет в регулярках. На входе у модели только алерт — снимка
-кластера на момент инцидента в БД нет (его начали сохранять с 1.0.19,
-`analysis.source_coverage`), поэтому цифры меряют «разбор по алерту», а не
-«разбор с полным контекстом».
+словами, которых нет в регулярках. Вход — алерт, плюс снимок контекста
+инцидента (`analysis.context_snapshot`), если пайплайн его записал: `export`
+подтягивает снимок, `run` накладывает его на ctx правил. У кейсов без снимка
+цифры меряют «разбор по алерту», а не «разбор с полным контекстом» — в
+results это видно по `had_snapshot`.
 """
 from __future__ import annotations
 
@@ -117,6 +120,251 @@ SELECT row_to_json(t) FROM (
 """
 
 
+# Снимок контекста инцидента (analysis.context_snapshot, с 1.0.20 —
+# app/context/incident_snapshot.py): связь событие медика → kg_incidents →
+# записи incidents по fingerprint-ам. Берётся последний снимок, записанный ДО
+# разбора медика: снимок после починки описывал бы уже здоровый стенд.
+_SNAPSHOT_SQL = """
+SET TRANSACTION READ ONLY;
+SELECT to_jsonb(t) FROM (
+  SELECT DISTINCT ON (e.id) e.id AS event_id,
+         to_jsonb(r.analysis) -> 'context_snapshot' AS context_snapshot
+  FROM kg_remediation_events e
+  JOIN kg_incidents i ON i.id = e.incident_id
+  JOIN incidents r ON r.incident_id IN (
+    SELECT jsonb_array_elements_text(coalesce(to_jsonb(i.fingerprints), '[]'::jsonb)))
+  -- Отсечка по времени САМОГО снимка: строка инцидента переиспользуется
+  -- при повторном срабатывании, и снимок после починки перезаписал бы
+  -- прежний при старом created_at.
+  WHERE e.id IN ({ids})
+    AND jsonb_typeof(to_jsonb(r.analysis) -> 'context_snapshot') = 'object'
+    AND (to_jsonb(r.analysis) #>> '{{context_snapshot,captured_at}}')::timestamptz <= e.started_at
+  ORDER BY e.id, (to_jsonb(r.analysis) #>> '{{context_snapshot,captured_at}}') DESC
+) t;
+"""
+
+
+def _psql_rows(args, sql: str) -> Optional[List[Dict[str, Any]]]:
+    """SELECT через `kubectl exec psql` в read-only транзакции → строки JSON."""
+    cmd = [
+        "kubectl", "--context", args.context, "-n", args.namespace, "exec", "postgres-0",
+        "--", "psql", "-U", args.db_user, "-d", args.db_name, "-At", "-v", "ON_ERROR_STOP=1",
+        "-c", "BEGIN;" + sql + "COMMIT;",
+    ]
+    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+    if proc.returncode != 0:
+        print(proc.stderr, file=sys.stderr)
+        return None
+    return [json.loads(ln) for ln in proc.stdout.splitlines() if ln.startswith("{")]
+
+
+def attach_context_snapshots(args, cases: List[Dict[str, Any]]) -> int:
+    """Дописать в кейсы `context_snapshot`, где он есть. Возвращает число
+    кейсов со снимком. Сбой запроса не роняет выгрузку: кейс без снимка —
+    прежний «разбор по алерту», а не ошибка."""
+    ids = [int(c["event_id"]) for c in cases if c.get("event_id") is not None]
+    if not ids:
+        return 0
+    rows = _psql_rows(args, _SNAPSHOT_SQL.format(ids=",".join(map(str, ids))))
+    by_id = {r["event_id"]: r.get("context_snapshot") for r in rows or []}
+    n = 0
+    for c in cases:
+        snap = by_id.get(c.get("event_id"))
+        if isinstance(snap, dict):
+            c["context_snapshot"] = snap
+            n += 1
+    return n
+
+
+def ctx_from_snapshot(ctx: Dict[str, Any], snap: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """Наложить сохранённый снимок на ctx правил: правила и модель видят то,
+    что видел пайплайн в момент инцидента, а не один алерт."""
+    if not isinstance(snap, dict) or snap.get("schema") != "incident_ctx/v1":
+        return ctx
+    # События/деплои/алерты в снимке — ссылки (kg_refs), их данные поднимает
+    # reconstruct_from_kg; здесь — только то, чего в графе нет.
+    for key in ("k8s_pod_state", "metrics_summary", "cluster_health",
+                "rollout_suppressed", "core_dump_node", "logs_summary"):
+        if snap.get(key) is not None:
+            ctx[key] = snap[key]
+    # Пробелы источников переносятся вместе с данными: иначе правило по
+    # непришедшему источнику снова скажет уверенное «не было».
+    status = dict(ctx.get("source_status") or {})
+    status.update(snap.get("source_status") or {})
+    for key in snap.get("truncated") or []:
+        field = str(key).split(":", 1)[0]
+        if snap.get(field) is None and field != "facts":
+            status.setdefault(field, "truncated: срезано лимитом снимка")
+    ctx["source_status"] = status
+    return ctx
+
+
+# Реконструкция контекста из графа point-in-time: у большинства старых
+# инцидентов снимка нет, но граф хранит историю событий подов, алертов и
+# деплоев. Замер 24.09.2026: у 92% событий медика fixed=true есть
+# kg_pod_events того же namespace в окне, деплои через kg_services — у 7%.
+# Верхняя граница окна — НАЧАЛО разбора медика, а не «+30 минут»: события
+# после него описывают уже его починку, и в кейсе протекал бы ответ.
+_KG_SQL = """
+SET TRANSACTION READ ONLY;
+SELECT to_jsonb(t) FROM (
+  SELECT e.id AS event_id, sc.scope AS ns_scope, sc.ns AS ns_list,
+    (SELECT coalesce(jsonb_agg(x), '[]'::jsonb) FROM (
+       -- Последнее событие на (под, reason): иначе 40 мест съедают сотни
+       -- одинаковых Unhealthy от readiness-пробы, а BackOff/OOMKilled не влезают.
+       -- kg_pod_events — изменяемый агрегат: count и last_seen дописываются
+       -- следующими синками. last_seen срезаем по отсечке, а count, если
+       -- строка обновлялась ПОСЛЕ неё, неизвестен на момент инцидента → NULL.
+       SELECT * FROM (
+         SELECT DISTINCT ON (pe.namespace, pe.pod_name, pe.reason)
+                pe.namespace, pe.pod_name AS pod, pe.type, pe.reason,
+                left(pe.message, 300) AS message,
+                CASE WHEN coalesce(pe.last_seen, pe.first_seen) <= e.started_at
+                     THEN pe.count END AS count,
+                pe.first_seen,
+                least(coalesce(pe.last_seen, pe.first_seen), e.started_at) AS last_seen
+         FROM kg_pod_events pe
+         -- first_seen не старше 7 суток: без нижней границы индекс по
+         -- first_seen бесполезен и запрос сканирует всю историю с апреля.
+         -- Строка, начавшаяся раньше и всё ещё обновлявшаяся, теряется —
+         -- цена приемлемая для датасета.
+         WHERE pe.namespace = ANY(sc.ns)
+           AND pe.first_seen BETWEEN e.started_at - interval '7 days' AND e.started_at
+           AND least(coalesce(pe.last_seen, pe.first_seen), e.started_at)
+               >= e.started_at - interval '2 hours'
+         ORDER BY pe.namespace, pe.pod_name, pe.reason,
+                  least(coalesce(pe.last_seen, pe.first_seen), e.started_at) DESC) d
+       ORDER BY (d.namespace = i.namespace) DESC, (d.type = 'Warning') DESC, d.last_seen DESC
+       LIMIT 40) x) AS pod_events,
+    (SELECT coalesce(jsonb_agg(x), '[]'::jsonb) FROM (
+       SELECT s.namespace, s.name AS service, a.alertname, a.severity, a.fired_at,
+              CASE WHEN a.resolved_at <= e.started_at THEN a.resolved_at END AS resolved_at
+       FROM kg_alerts a JOIN kg_services s ON s.id = a.service_id
+       WHERE s.namespace = ANY(sc.ns)
+         AND a.fired_at BETWEEN e.started_at - interval '2 hours' AND e.started_at
+       ORDER BY a.fired_at DESC LIMIT 20) x) AS alerts,
+    (SELECT coalesce(jsonb_agg(x), '[]'::jsonb) FROM (
+       -- Статика отдельно от кода: StaticsNewCluster раскатывается веером на
+       -- все сервисы сквада (сотни «деплоев» на сервис в месяц), и «недавний
+       -- деплой» по ней почти всегда true, хотя кода никто не менял.
+       SELECT s.namespace, s.name AS service, d.status, d.buildtype_id, d.started_at,
+              CASE WHEN d.finished_at <= e.started_at THEN d.finished_at END AS finished_at,
+              'code' AS kind
+       FROM kg_deployments d JOIN kg_services s ON s.id = d.service_id
+       WHERE s.namespace = ANY(sc.ns)
+         AND d.started_at BETWEEN e.started_at - interval '6 hours' AND e.started_at
+         AND d.buildtype_id NOT LIKE '%StaticsNewCluster%'
+       ORDER BY d.started_at DESC
+       LIMIT 10) x) AS deployments,
+    -- Статика — только счётчиком: её строки заняли бы весь лимит.
+    (SELECT count(*) FROM kg_deployments d JOIN kg_services s ON s.id = d.service_id
+     WHERE s.namespace = ANY(sc.ns) AND d.buildtype_id LIKE '%StaticsNewCluster%'
+       AND d.started_at BETWEEN e.started_at - interval '6 hours' AND e.started_at
+    ) AS statics_rollouts
+  FROM kg_remediation_events e
+  JOIN kg_incidents i ON i.id = e.incident_id
+  -- Сквад живёт в нескольких ns: медик пишет основной `squad-N-shared`, а
+  -- деплои и события сервисов ложатся в `squad-N-kingdomX`. Точный джойн по
+  -- namespace находил деплои у 7% кейсов, по префиксу сквада — у 76%.
+  -- Вне сквадов — точный namespace (в имени ns нет `_`/`%`, LIKE безопасен).
+  -- Список ns сквада — из kg_services (таблица маленькая), дальше точное
+  -- равенство по списку: LIKE с вычисляемым шаблоном по kg_pod_events
+  -- индекс не берёт и упирался в таймаут.
+  CROSS JOIN LATERAL (
+    SELECT p.scope, array_append(coalesce(
+             (SELECT array_agg(DISTINCT s2.namespace) FROM kg_services s2
+              WHERE s2.namespace LIKE p.scope), '{{}}'::text[]), i.namespace) AS ns
+    FROM (SELECT coalesce(substring(i.namespace from '^(squad-[^-]+-)') || '%',
+                          i.namespace) AS scope) p
+  ) sc
+  WHERE e.id IN ({ids})
+) t;
+"""
+
+
+def reconstruct_from_kg(args, cases: List[Dict[str, Any]]) -> int:
+    """Дописать в кейсы `kg_context` — строки графа на момент инцидента,
+    с меткой `context=kg_reconstructed`. Текст событий проходит redact_pii:
+    датасет лежит вне репо, но выводы модели по нему могут попасть в отчёт."""
+    from app.services.pii_redaction import redact_pii
+
+    ids = [int(c["event_id"]) for c in cases if c.get("event_id") is not None]
+    if not ids:
+        return 0
+    rows = _psql_rows(args, _KG_SQL.format(ids=",".join(map(str, ids)))) or []
+    by_id = {r["event_id"]: r for r in rows}
+    n = 0
+    for c in cases:
+        r = by_id.get(c.get("event_id"))
+        if not r or not (r.get("pod_events") or r.get("alerts") or r.get("deployments")
+                         or r.get("statics_rollouts")):
+            continue
+        for ev in r.get("pod_events") or []:
+            if ev.get("message"):
+                ev["message"] = redact_pii(ev["message"], max_len=300)
+        c["kg_context"] = {k: r.get(k) or [] for k in ("pod_events", "alerts", "deployments")}
+        c["kg_context"]["ns_scope"] = r.get("ns_scope")
+        c["kg_context"]["statics_rollouts"] = int(r.get("statics_rollouts") or 0)
+        c.setdefault("context", "kg_reconstructed")
+        n += 1
+    return n
+
+
+def ctx_from_kg(ctx: Dict[str, Any], kg: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """Наложить реконструкцию из графа на ctx правил в форме, которую правила
+    читают: k8s_events как у K8sFacts, recent_deployments как у TC-экстрактора
+    (скоуп namespace — деплой любого сервиса ns, не обязательно этого)."""
+    if not isinstance(kg, dict):
+        return ctx
+    if kg.get("pod_events"):
+        ctx["k8s_events"] = [
+            {"type": e.get("type"), "reason": e.get("reason"), "message": e.get("message"),
+             "count": e.get("count"), "pod": e.get("pod"), "namespace": e.get("namespace"),
+             "last_timestamp": e.get("last_seen") or e.get("first_seen")}
+            for e in kg["pod_events"]
+        ]
+    # В правило recent_deploy — только деплои кода (SQL статику в строки не
+    # берёт): веерная раскатка статики сделала бы «недавний деплой» истиной
+    # почти для любого кейса сквада. Статика — счётчиком в описание.
+    code = kg.get("deployments") or []
+    statics = int(kg.get("statics_rollouts") or 0)
+    if code:
+        ctx["recent_deployments"] = [
+            {"name": d.get("service") or d.get("buildtype_id") or "deploy",
+             "ts": d.get("finished_at") or d.get("started_at"), "status": d.get("status"),
+             "buildtype_id": d.get("buildtype_id"), "namespace": d.get("namespace"),
+             "attribution_scope": "namespace"}
+            for d in code
+        ]
+    if statics:
+        ctx["description"] = ((ctx.get("description") or "")
+                              + f"\nРаскатки статики на сквад за 6ч: {statics}").strip()
+    # Соседние алерты графа — не upstream по рёбрам зависимостей (правило
+    # UpstreamDegraded ждёт edge_kind), поэтому идут в описание, не в правило.
+    if kg.get("alerts"):
+        names = sorted({a.get("alertname") for a in kg["alerts"] if a.get("alertname")})
+        ctx["description"] = ((ctx.get("description") or "")
+                              + f"\nАлерты сквада за 2ч: {', '.join(names)}").strip()
+    return ctx
+
+
+def cmd_kg_context(args) -> int:
+    """Ретроактивно: дописать снимки и реконструкцию из графа в УЖЕ собранный
+    cases.jsonl, не пересобирая выборку (прогнанные results остаются валидны
+    по event_id; перепрогон кейса с новым входом — `run --ids`)."""
+    out = _guard_out_dir(Path(args.out))
+    path = out / "cases.jsonl"
+    cases = [json.loads(ln) for ln in path.read_text().splitlines() if ln]
+    with_snapshot = attach_context_snapshots(args, cases)
+    with_kg = reconstruct_from_kg(args, cases)
+    with path.open("w", encoding="utf-8") as f:
+        for c in cases:
+            f.write(json.dumps(c, ensure_ascii=False, default=str) + "\n")
+    print(f"кейсов: {len(cases)}, со снимком: {with_snapshot}, "
+          f"с реконструкцией из графа: {with_kg} → {path}")
+    return 0
+
+
 def cmd_export(args) -> int:
     out = _guard_out_dir(Path(args.out))
     sql = "BEGIN;" + _EXPORT_SQL.format(days=int(args.days)) + "COMMIT;"
@@ -151,11 +399,14 @@ def cmd_export(args) -> int:
         r["expected_classes"] = labels
         r["expected_primary"] = primary
         cases.append(r)
+    with_snapshot = attach_context_snapshots(args, cases)
+    with_kg = reconstruct_from_kg(args, cases)
     path = out / "cases.jsonl"
     with path.open("w", encoding="utf-8") as f:
         for c in cases:
             f.write(json.dumps(c, ensure_ascii=False, default=str) + "\n")
-    print(f"событий медика: {len(rows)}, после дедупа: {len(cases)} → {path}")
+    print(f"событий медика: {len(rows)}, после дедупа: {len(cases)}, "
+          f"со снимком: {with_snapshot}, с реконструкцией из графа: {with_kg} → {path}")
     return 0
 
 
@@ -195,6 +446,8 @@ async def _run_case(case: Dict[str, Any]) -> Dict[str, Any]:
     incident = _to_incident(case)
     ctx = build_diagnostics_ctx(incident, analyzer_summary="", kg_session=None)
     ctx.pop("collector_results", None)
+    ctx = ctx_from_kg(ctx, case.get("kg_context"))
+    ctx = ctx_from_snapshot(ctx, case.get("context_snapshot"))
     store = default_engine.run(ctx)
     t0 = time.monotonic()
     hypotheses = await MultiHypothesisAgent().generate(
@@ -220,6 +473,8 @@ async def _run_case(case: Dict[str, Any]) -> Dict[str, Any]:
         "best_confidence": float(getattr(best, "confidence", 0.0) or 0.0) if best else None,
         "ranked_causes": [_cause(h) for h in ranked[:5]],
         "observed_facts": sorted(store.observed_kinds()),
+        "had_snapshot": isinstance(case.get("context_snapshot"), dict),
+        "context": case.get("context") or ("snapshot" if case.get("context_snapshot") else "alert_only"),
     }
 
 
@@ -233,6 +488,13 @@ async def _run_async(args) -> int:
     if args.ids:
         wanted = {int(x) for x in args.ids.split(",")}
         cases = [c for c in cases if c["event_id"] in wanted]
+        # Явный --ids = перепрогон: после kg-context у кейса новый вход, и
+        # старый результат по одному алерту иначе остался бы в score.
+        if res_path.exists():
+            kept = [ln for ln in res_path.read_text().splitlines()
+                    if ln and json.loads(ln)["event_id"] not in wanted]
+            res_path.write_text("".join(ln + "\n" for ln in kept))
+        done -= wanted
     todo = [c for c in cases if c["event_id"] not in done][: args.limit]
     print(f"кейсов всего {len(cases)}, прогнано {len(done)}, в этом заходе {len(todo)}")
     for c in todo:
@@ -320,16 +582,19 @@ def main() -> int:
     sub = ap.add_subparsers(dest="cmd", required=True)
     ex = sub.add_parser("export")
     ex.add_argument("--days", type=int, default=30)
-    ex.add_argument("--context", default="lastoasisgame-local")
-    ex.add_argument("--namespace", default="sre-ai")
-    ex.add_argument("--db-user", default="sre_ai")
-    ex.add_argument("--db-name", default="sre_copilot")
+    kc = sub.add_parser("kg-context", help="дописать снимки/реконструкцию в готовый cases.jsonl")
+    for p in (ex, kc):
+        p.add_argument("--context", default="lastoasisgame-local")
+        p.add_argument("--namespace", default="sre-ai")
+        p.add_argument("--db-user", default="sre_ai")
+        p.add_argument("--db-name", default="sre_copilot")
     rn = sub.add_parser("run")
     rn.add_argument("--limit", type=int, default=3, help="кейсов за заход (каждый ≈ 15 вызовов LLM)")
     rn.add_argument("--ids", default="", help="event_id через запятую — прогнать только их")
     sub.add_parser("score")
     args = ap.parse_args()
-    return {"export": cmd_export, "run": cmd_run, "score": cmd_score}[args.cmd](args)
+    return {"export": cmd_export, "kg-context": cmd_kg_context, "run": cmd_run,
+            "score": cmd_score}[args.cmd](args)
 
 
 if __name__ == "__main__":
