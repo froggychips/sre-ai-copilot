@@ -458,7 +458,13 @@ class FactCriticAgent(BaseAgent):
             pending.sort(key=lambda p: p[0])
 
         if pending:
-            verdicts = await self._ask_batch(pending, facts)
+            # Весь критик идёт под стадийным cap-ом pipeline
+            # (PIPELINE_STAGE_TIMEOUT_SECONDS). Деление пакета после сбоя
+            # имеет смысл, только пока половинки успевают в этот cap: иначе
+            # стадия падает PipelineStageTimeout и инцидент уходит в FAILED
+            # целиком — хуже, чем честно непроверенные гипотезы.
+            deadline = time.monotonic() + float(settings.PIPELINE_STAGE_TIMEOUT_SECONDS)
+            verdicts = await self._ask_batch(pending, facts, deadline)
             for i, h in pending:
                 refs = verdicts.get(i)
                 if refs is None:
@@ -474,7 +480,10 @@ class FactCriticAgent(BaseAgent):
         return HypothesisSet(items=[h for h in out if h is not None])
 
     async def _ask_batch(
-        self, pending: List[Tuple[int, Hypothesis]], facts: FactStore
+        self,
+        pending: List[Tuple[int, Hypothesis]],
+        facts: FactStore,
+        deadline: float,
     ) -> Dict[int, Optional[List[str]]]:
         """index → refutations; None / отсутствие ключа — вердикта нет.
 
@@ -482,12 +491,19 @@ class FactCriticAgent(BaseAgent):
         по max_tokens — не повод ронять стадию: пакет делится пополам и
         переспрашивается, пока не останется одна гипотеза; обрезка на одной —
         тот же терминальный LLMTruncatedResponse, что и в per_hypothesis.
+
+        Деление после сбоя — только если до `deadline` осталось не меньше,
+        чем занял упавший вызов (половинки идут последовательно и обычно не
+        быстрее целого). Не успеваем: сбой — вердиктов нет (fail-closed,
+        гипотезы не проверены), обрезка — терминальный LLMTruncatedResponse.
         """
         size = max(1, settings.FACT_CRITIC_BATCH_MAX)
         if len(pending) > size:
             merged: Dict[int, Optional[List[str]]] = {}
             for start in range(0, len(pending), size):
-                merged.update(await self._ask_batch(pending[start:start + size], facts))
+                merged.update(
+                    await self._ask_batch(pending[start:start + size], facts, deadline)
+                )
             return merged
 
         ids = [f"h{n + 1}" for n in range(len(pending))]
@@ -500,13 +516,14 @@ class FactCriticAgent(BaseAgent):
                 user_context=user_context, instruction=instruction
             )
         except LLMTruncatedResponse:
-            track_stage_duration("llm_critic", time.monotonic() - _t0)
-            if len(pending) == 1:
+            took = time.monotonic() - _t0
+            track_stage_duration("llm_critic", took)
+            if len(pending) == 1 or deadline - time.monotonic() < took:
                 raise
             half = len(pending) // 2
             logger.warning("critic_batch_truncated_split", size=len(pending))
-            first = await self._ask_batch(pending[:half], facts)
-            first.update(await self._ask_batch(pending[half:], facts))
+            first = await self._ask_batch(pending[:half], facts, deadline)
+            first.update(await self._ask_batch(pending[half:], facts, deadline))
             return first
         except MissingRecording:
             # Replay golden-eval: записи пакетного вызова нет. Проглотить это
@@ -514,7 +531,15 @@ class FactCriticAgent(BaseAgent):
             # критики — и зелёный replay не проверял бы batch-режим вовсе.
             raise
         except Exception as e:
-            track_stage_duration("llm_critic", time.monotonic() - _t0)
+            took = time.monotonic() - _t0
+            track_stage_duration("llm_critic", took)
+            if len(pending) > 1 and deadline - time.monotonic() < took:
+                logger.warning(
+                    "critic_batch_failed_no_time_to_split",
+                    error=type(e).__name__, size=len(pending),
+                    took_s=round(took, 1),
+                )
+                return {i: None for i, _ in pending}
             if len(pending) > 1:
                 # Сбой пакета — чаще всего таймаут на длинном ответе (замер
                 # 24.09: claude_cli, пакет из 6 гипотез упирался в 180 с). В
@@ -525,8 +550,8 @@ class FactCriticAgent(BaseAgent):
                     "critic_batch_failed_split",
                     error=type(e).__name__, size=len(pending),
                 )
-                first = await self._ask_batch(pending[:half], facts)
-                first.update(await self._ask_batch(pending[half:], facts))
+                first = await self._ask_batch(pending[:half], facts, deadline)
+                first.update(await self._ask_batch(pending[half:], facts, deadline))
                 return first
             # Паритет с per_hypothesis: LLM недоступна — критик молчит, а не
             # опровергает всё подряд. Fail-closed относится к ОТВЕТУ модели

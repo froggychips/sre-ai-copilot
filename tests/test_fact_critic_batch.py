@@ -225,6 +225,29 @@ async def test_batch_failure_splits_before_giving_up(facts):
 
 
 @pytest.mark.asyncio
+async def test_no_split_when_stage_deadline_cannot_fit(facts, monkeypatch):
+    """Упавший вызов съел почти весь стадийный cap: делить некогда —
+    гипотезы помечаются непроверенными, а не ждут PipelineStageTimeout."""
+    import app.agents.fact_critic as fc
+
+    monkeypatch.setattr(settings, "PIPELINE_STAGE_TIMEOUT_SECONDS", 240.0)
+    clock = {"t": 1000.0}
+    monkeypatch.setattr(fc.time, "monotonic", lambda: clock["t"])
+    calls = []
+
+    async def slow_timeout(self, user_context, instruction=""):
+        calls.append(len(_ids_in(user_context)))
+        clock["t"] += 180.0  # как 180-с таймаут claude_cli
+        raise RuntimeError("claude CLI timed out after 180.0s")
+
+    hs = HypothesisSet(items=[_h("a"), _h("b"), _h("c")])
+    with patch("app.agents.base.BaseAgent.ask", new=slow_timeout):
+        out = await FactCriticAgent().critique_all(hs, facts)
+    assert calls == [3]
+    assert all(h.refutations == [BATCH_NO_VERDICT] for h in out.items)
+
+
+@pytest.mark.asyncio
 async def test_llm_failure_keeps_parity_with_per_hypothesis(facts):
     async def boom(self, *a, **kw):
         raise RuntimeError("LLM 500")
