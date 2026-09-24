@@ -380,6 +380,36 @@ def test_verification_falls_back_to_row_when_json_lost(Session, monkeypatch):
     assert row.verification["outcome"] == "unknown"
 
 
+def test_verification_checks_applied_intent_not_refired_plan(Session, monkeypatch):
+    """Re-fire перезаписал analysis.execution_intent новым планом — проверять
+    надо то, что реально применили: intent строки, а не свежий JSON."""
+    monkeypatch.setattr(v.settings, "REMEDIATION_VERIFY_DELAYS_SEC", "300,900", raising=False)
+    _seed(Session)
+    with patch.object(executor_apply.k8s_service, "execute_intent", _Exec()):
+        assert executor_apply.apply_intent(INCIDENT, "tester", SIG)["ok"] is True
+    db = Session()
+    rec = db.query(IncidentRecord).filter_by(incident_id=INCIDENT).one()
+    rec.analysis = {**rec.analysis,
+                    "execution_intent": {**INTENT, "resource_name": "other-service"}}
+    db.commit()
+    db.close()
+    seen_argv = []
+
+    class _Proc:
+        returncode = 0
+        stderr = ""
+        stdout = "{}"
+
+    def runner(argv, **kw):
+        seen_argv.append(list(argv))
+        return _Proc()
+
+    with patch("app.services.audit_logger.audit_service.log_event"):
+        v.verify_remediation(INCIDENT, 1, db_factory=Session, runner=runner)
+    flat = " ".join(" ".join(a) for a in seen_argv)
+    assert "town-service" in flat and "other-service" not in flat
+
+
 # ── миграция ──────────────────────────────────────────────────────────────
 
 _MIGRATION = (

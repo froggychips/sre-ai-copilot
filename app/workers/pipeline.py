@@ -1288,10 +1288,11 @@ class IncidentPipeline:
 
         if record:
             # МЕРЖ, а не замена: analysis-блоб хранит и данные ВНЕ этого прогона
-            # — в первую очередь executor_applied (единственный guard от
-            # повторного реального kubectl в executor_apply.py). Полная замена
-            # блоба при re-fire стирала маркер, и старая Discord-кнопка могла
-            # прогнать вторую реальную мутацию.
+            # — в первую очередь executor_applied. Полная замена блоба при
+            # re-fire стирала маркер, и старая Discord-кнопка могла прогнать
+            # вторую реальную мутацию. Для новых записей guard — строка
+            # kg_remediation_attempts, её мерж блоба не трогает; для записей
+            # до таблицы маркер в JSON по-прежнему единственный.
             fresh_analysis = {
                 "summary": self.analysis,
                 "hypotheses": self.hypotheses_text,

@@ -392,7 +392,7 @@ curl -s -H "Authorization: Bearer $JWT" "$API/kg/incidents/42/timeline" | jq '{c
 
 Как читать ответ:
 - `unknowns` перечисляет, что проверить **не удалось** (сервиса нет в графе → нет деплоев / событий подов / аномалий / логов; нет строк `incidents` → пайплайн разбора по этим алертам не запускался). Пустая лента с непустым `unknowns` — не «ничего не было».
-- `memory.outcome`: `action_verified` / `action_failed` / `action_pending` / `action_applied_unverified` / `resolved_without_action` / `resolved_without_analysis` / `open_without_*`.
+- `memory.outcome`: `action_verified` / `action_failed` / `action_pending` / `action_state_unknown` / `action_applied_unverified` / `resolved_without_action` / `resolved_without_analysis` / `open_without_*`.
 - `noise=true` — обогащение сочло **все** алерты инцидента шумом; настоящий алерт снимает флаг. Шумовые инциденты остаются в таблице и доступны по id.
 - Инцидент, который переоткрывается снова и снова (`reopened_count`), — флаппинг: один инцидент, а не N; смотреть на алерт, а не на число инцидентов.
 

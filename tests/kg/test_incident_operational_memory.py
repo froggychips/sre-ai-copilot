@@ -173,3 +173,71 @@ def test_diagnosis_not_made_uses_triage_note(db):
     db.commit()
     diag = next(e for e in build_timeline(db, inc, now=T0 + 30 * M)["events"] if e["kind"] == "diagnosis")
     assert diag["title"] == "Диагноз не поставлен: No hypothesis survived"
+
+
+# ── kg_remediation_attempts как источник истины ─────────────────────────────
+
+
+def _attempt_row(status, *, intent=None, result=None, verification=None):
+    from app.remediation.attempts import RemediationAttempt
+
+    applied = _analysis()["executor_applied"]
+    return RemediationAttempt(
+        incident_id=FP, signature=f"sig-{status}", status=status,
+        intent=intent or {"action": "restart_deployment", "resource_type": "deployment",
+                          "resource_name": "town-service", "namespace": "squad-1"},
+        applied_by="oncall", claimed_at=T0 + 11 * M,
+        applied_at=T0 + 12 * M if status != "unknown" else None,
+        result=result if result is not None else (applied if status != "unknown" else None),
+        verification=verification, error="stale_claim" if status == "unknown" else None,
+        created_at=T0 + 11 * M, updated_at=T0 + 21 * M,
+    )
+
+
+def test_attempt_row_wins_over_json_and_carries_applied_intent(db):
+    """Re-fire перезаписал analysis.execution_intent новым планом: действие в
+    хронологии — то, что реально применили (intent строки), а не новый план."""
+    inc = _incident(db)
+    a = _analysis(with_action=False, with_verification=False)
+    a["execution_intent"] = {"action": "scale_deployment", "resource_type": "deployment",
+                             "resource_name": "other-service", "namespace": "squad-1"}
+    db.add(IncidentRecord(incident_id=FP, status="COMPLETED", data={}, analysis=a,
+                          created_at=T0 + 3 * M))
+    db.add(_attempt_row("verified", verification={
+        "outcome": "verified", "attempt": 2, "checked_at": (T0 + 20 * M).isoformat(),
+        "checks": {}, "reasons": []}))
+    db.commit()
+    tl = build_timeline(db, inc, now=T0 + 30 * M)
+    by = {e["kind"]: e for e in tl["events"]}
+    assert by["action.applied"]["details"]["resource"] == "town-service"
+    assert by["action.applied"]["evidence"]["provenance"].startswith("kg_remediation_attempts#")
+    assert by["verification"]["details"]["attempt"] == 2
+    assert tl["memory"]["outcome"] == "action_verified"
+
+
+def test_row_present_json_leftovers_are_not_double_counted(db):
+    """Dual-write: строка и JSON про одно действие — событие одно."""
+    inc = _incident(db)
+    db.add(IncidentRecord(incident_id=FP, status="COMPLETED", data={},
+                          analysis=_analysis(), created_at=T0 + 3 * M))
+    db.add(_attempt_row("applied"))
+    db.commit()
+    tl = build_timeline(db, inc, now=T0 + 30 * M)
+    assert [e["kind"] for e in tl["events"]].count("action.applied") == 1
+    # верификации в строке ещё нет — JSON-хвост не подмешивается
+    assert tl["memory"]["outcome"] == "action_applied_unverified"
+
+
+def test_unknown_attempt_is_visible_and_not_counted_as_applied(db):
+    inc = _incident(db)
+    db.add(IncidentRecord(incident_id=FP, status="COMPLETED", data={},
+                          analysis=_analysis(with_action=False, with_verification=False),
+                          created_at=T0 + 3 * M))
+    db.add(_attempt_row("unknown"))
+    db.commit()
+    tl = build_timeline(db, inc, now=T0 + 30 * M)
+    ev = next(e for e in tl["events"] if e["kind"] == "action.state_unknown")
+    assert ev["evidence"]["epistemic"] == "unknown"
+    assert ev["details"]["error"] == "stale_claim"
+    assert tl["memory"]["actions"] == 0
+    assert tl["memory"]["outcome"] == "action_state_unknown"

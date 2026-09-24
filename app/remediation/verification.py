@@ -447,16 +447,20 @@ def verify_remediation(
         if record is None:
             return {"outcome": OUTCOME_UNKNOWN, "reason": "incident_not_found"}
         analysis: Dict[str, Any] = dict(record.analysis or {})
-        # Строка попытки — источник истины; JSON — хвост и носитель для
-        # записей, сделанных до kg_remediation_attempts. Берём то, что есть.
+        # Строка попытки — источник истины; JSON — фолбэк для записей,
+        # сделанных до kg_remediation_attempts. Порядок важен для intent-а:
+        # re-fire перезаписывает analysis.execution_intent НОВЫМ планом, а
+        # проверять надо то, что реально применили, — оно лежит в строке.
         # NB: не `attempt` — так называется номер проверки (аргумент).
         attempt_row = _applied_attempt(db, incident_id)
-        applied = analysis.get("executor_applied") or (
+        row_result = (
             attempt_row.result
-            if attempt_row is not None and isinstance(attempt_row.result, dict) else {}
+            if attempt_row is not None and isinstance(attempt_row.result, dict) else None
         )
-        intent_data = analysis.get("execution_intent") or (
-            attempt_row.intent if attempt_row is not None else None
+        applied = row_result or analysis.get("executor_applied") or {}
+        intent_data = (
+            (attempt_row.intent if attempt_row is not None else None)
+            or analysis.get("execution_intent")
         )
         if not applied or not intent_data:
             return {"outcome": OUTCOME_UNKNOWN, "reason": "nothing_applied"}

@@ -393,7 +393,7 @@ curl -s -H "Authorization: Bearer $JWT" "$API/kg/incidents/42/timeline" | jq '{c
 
 Reading the answer:
 - `unknowns` lists what could **not** be checked (service not in the graph → no deploys / pod events / anomalies / logs; no `incidents` rows → the analysis pipeline never ran for these alerts). An empty timeline with a non-empty `unknowns` is not «nothing happened».
-- `memory.outcome`: `action_verified` / `action_failed` / `action_pending` / `action_applied_unverified` / `resolved_without_action` / `resolved_without_analysis` / `open_without_*`.
+- `memory.outcome`: `action_verified` / `action_failed` / `action_pending` / `action_state_unknown` / `action_applied_unverified` / `resolved_without_action` / `resolved_without_analysis` / `open_without_*`.
 - `noise=true` means enrichment classified **every** alert of the incident as noise; a real alert clears the flag. Noise incidents stay in the table and are reachable by id.
 - An incident that keeps re-opening (`reopened_count`) is flapping — one incident, not N; look at the alert, not at the incident count.
 
