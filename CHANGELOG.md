@@ -4,6 +4,19 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+### Добавлено
+
+- **Live RCA-датасет на реальных инцидентах, без ключа.**
+  `scripts/live_rca_dataset.py`: `export` берёт из БД copilot (read-only
+  транзакция) инциденты, причину которых установил squad-medic
+  (`kg_remediation_events.root_cause`, `fixed=true`), и схлопывает повторы
+  одного стенда с той же причиной (201 событие → 31 кейс). `run` гонит их через
+  ту же цепочку, что golden (MultiHypothesis → FactCritic → best_candidate), на
+  `LLM_BACKEND=claude_cli`. `score` считает Top-1/Top-3 по первичному классу
+  причины медика, долю отказов, долю неклассифицируемых ответов, латентность.
+  Данные пишутся только вне репо (`~/.cache/sre-ai-copilot/live-rca/<дата>/`),
+  путь внутри репо скрипт отвергает: в кейсах живые namespace-ы и выводы медика.
+
 ## [1.0.19] — 2026-09-24 — Playbook v2, таблица попыток и исполнитель под своим SA
 
 ### Добавлено
