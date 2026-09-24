@@ -86,8 +86,9 @@ python scripts/eval_golden.py --mode replay --check-baseline
 # один кейс
 python scripts/eval_golden.py --case 013_facts_oom_false_positive_guard
 
-# реальная модель (стоит денег)
-ANTHROPIC_API_KEY=... python scripts/eval_golden.py --mode live
+# реальная модель без ключа — через залогиненный `claude` (подписка)
+LLM_BACKEND=claude_cli python scripts/eval_golden.py --mode live \
+  --check-baseline --baseline tests/golden/baseline_live.json
 
 # перезаписать эталонные ответы после осознанной смены промпта
 LLM_BACKEND=claude_cli python scripts/eval_golden.py --mode record
@@ -102,6 +103,14 @@ LLM_BACKEND=claude_cli python scripts/eval_golden.py --mode record
 Поднимать baseline — осознанное действие (`--update-baseline`, отдельным
 коммитом). Понижать — только вместе с объяснением, почему деградация
 допустима.
+
+`baseline_live.json` — отдельный эталон для `live` (`--baseline`). Сверять
+живую модель с replay-эталоном нельзя: тот меряет обвес на записанных
+ответах, и любая перефразировка модели читалась бы как регресс. В live-сводке
+есть ещё `latency_s` (всего, максимум, по кейсам) — только для информации, в
+сверку не входит. Расписание — `.github/workflows/eval-live.yml` на ARC-раннере,
+бэкенд `claude_cli` с секретом `CLAUDE_CODE_OAUTH_TOKEN` (`claude setup-token`).
+Пока `baseline_live.json` не зафиксирован, прогон меряет, но не сверяет.
 
 ## Когда кейс падает
 
