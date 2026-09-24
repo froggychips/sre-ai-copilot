@@ -1471,6 +1471,36 @@ def test_partial_after_downtime_does_not_become_baseline(db):
     assert len(_pvc_names(db)) == 8, "повтор обрезанного листа не сносит живое"
 
 
+def test_rejected_snapshot_with_new_volumes_does_not_become_baseline(db):
+    """Новые тома в отвергнутом снимке тоже не становятся опорой.
+
+    Находка ревью: строку, которой не было в графе, прогон вставляет, и
+    `last_seen_at` у неё стоит дефолтом колонки ещё до решения об опоре.
+    Не снять его — и повтор насчитает её в суточную опору: 8 старых томов,
+    снимок из одного старого и одного нового, второй прогон снёс бы семь.
+    """
+    _seed_volume_edges(db, count=8)
+    _age_last_seen(db, hours=48)
+
+    partial = [
+        _mk_pvc("data-0", "prod-shared"),
+        _mk_pvc("fresh-0", "prod-shared"),
+    ]
+    with patch(
+        "app.knowledge_graph.k8s_storage_sync._get_all", return_value=partial,
+    ):
+        first = sync_pvcs(db)
+    assert first["cleanup"]["baseline_candidate_rejected"] is True
+
+    with patch(
+        "app.knowledge_graph.k8s_storage_sync._get_all", return_value=partial,
+    ):
+        second = sync_pvcs(db)
+    assert second["cleanup"]["skipped"] == "no_baseline"
+    assert second["cleanup"]["volumes_deleted"] == 0
+    assert len(_pvc_names(db)) == 9
+
+
 def test_full_snapshot_after_downtime_restores_cleanup(db):
     """Полный снимок после простоя сверяется с живым набором и становится опорой.
 

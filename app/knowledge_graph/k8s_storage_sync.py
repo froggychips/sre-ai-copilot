@@ -1008,11 +1008,63 @@ def _seen_within_count(db: Session, *, kind: str, hours: int) -> int:
     )
 
 
-def _snapshot_trusted(
+def _fallback_baseline(db: Session, *, kind: str, baseline: int) -> int:
+    """Последний известный живой набор — только когда суточной опоры нет.
+
+    Считать, как и `baseline`, ДО апсертов: новые строки получают
+    `last_seen_at` дефолтом колонки при вставке и иначе попали бы в
+    знаменатель, которым проверяют их же снимок.
+    """
+    if baseline > 0:
+        return 0
+    return _seen_within_count(db, kind=kind, hours=_BASELINE_FALLBACK_HOURS)
+
+
+def _mark_snapshot(
     db: Session,
     *,
     kind: str,
     baseline: int,
+    fallback: int,
+    seen: Set[Tuple[str, str]],
+    seen_ids: Sequence[int],
+    run_started: datetime,
+) -> Tuple[int, Dict[str, Any]]:
+    """Отметить снимок как виденный — или, если он не доверен, не дать ему
+    стать опорой. Возвращает (сколько отмечено, решение _snapshot_trusted).
+
+    Недоверенному снимку мало не вызвать `_touch_last_seen`: строки, которых
+    не было в графе, этот прогон вставил, и `last_seen_at` у них уже стоит
+    дефолтом колонки. Не снять его — и следующий прогон насчитает их в
+    суточную опору, а такой же обрезанный лист пройдёт порог с усадкой 0%.
+    """
+    trust = _snapshot_trusted(
+        kind=kind, baseline=baseline, fallback=fallback, seen=seen,
+    )
+    if trust["trusted"]:
+        return _touch_last_seen(db, seen_ids), trust
+    for part in _chunked(list(seen_ids)):
+        db.query(StorageVolume).filter(
+            StorageVolume.id.in_(part),
+            StorageVolume.last_seen_at.isnot(None),
+            StorageVolume.last_seen_at >= run_started,
+        ).update(
+            {
+                StorageVolume.last_seen_at: None,
+                # Как и в _touch_last_seen: не дать `onupdate` сдвинуть
+                # `updated_at` — строку только что вставили, поля те же.
+                StorageVolume.updated_at: StorageVolume.updated_at,
+            },
+            synchronize_session=False,
+        )
+    return 0, trust
+
+
+def _snapshot_trusted(
+    *,
+    kind: str,
+    baseline: int,
+    fallback: int,
     seen: Set[Tuple[str, str]],
 ) -> Dict[str, Any]:
     """Можно ли отметить этот снимок `last_seen_at`, то есть сделать опорой.
@@ -1037,9 +1089,6 @@ def _snapshot_trusted(
     """
     if baseline > 0:
         return {"trusted": True}
-    fallback = _seen_within_count(
-        db, kind=kind, hours=_BASELINE_FALLBACK_HOURS,
-    )
     if fallback <= 0:
         return {"trusted": True, "unverified_bootstrap": True}
     shrink_pct = _live_set_shrink_pct(baseline=fallback, current=len(seen))
@@ -1221,6 +1270,8 @@ def sync_pvs(db: Session) -> Dict[str, Any]:
     # без учёта текущего снимка. Посчитать её после `_touch_last_seen`
     # значило бы сравнивать снимок с ним же самим.
     baseline = _recently_seen_count(db, kind=NODE_PV)
+    fallback = _fallback_baseline(db, kind=NODE_PV, baseline=baseline)
+    run_started = datetime.utcnow()
     pvs, fetch_ok = _fetch_items("persistentvolumes", stats)
     stats["pvs_fetched"] = len(pvs)
     seen: Set[Tuple[str, str]] = set()
@@ -1238,9 +1289,9 @@ def sync_pvs(db: Session) -> Dict[str, Any]:
     # видели недавно, и этот прогон обязан быть уже посчитан. Но отмечать
     # можно только снимок, которому есть основание верить, — иначе он сам
     # станет опорой для следующего прогона (см. _snapshot_trusted).
-    trust = _snapshot_trusted(db, kind=NODE_PV, baseline=baseline, seen=seen)
-    stats["last_seen_touched"] = (
-        _touch_last_seen(db, seen_ids) if trust["trusted"] else 0
+    stats["last_seen_touched"], trust = _mark_snapshot(
+        db, kind=NODE_PV, baseline=baseline, fallback=fallback,
+        seen=seen, seen_ids=seen_ids, run_started=run_started,
     )
     cleanup = _cleanup_absent_volumes(
         db, kind=NODE_PV, seen=seen, fetch_ok=fetch_ok, baseline=baseline,
@@ -1292,6 +1343,8 @@ def sync_pvcs(
         "fetch_failed": False,
     }
     baseline = _recently_seen_count(db, kind=NODE_PVC)
+    fallback = _fallback_baseline(db, kind=NODE_PVC, baseline=baseline)
+    run_started = datetime.utcnow()
     pvcs, fetch_ok = _fetch_items("persistentvolumeclaims", stats)
     stats["pvcs_fetched"] = len(pvcs)
     seen: Set[Tuple[str, str]] = set()
@@ -1329,9 +1382,9 @@ def sync_pvcs(
                 extras={"phase": fields.get("phase")},
             )
             stats["edges_bound_to"] += 1
-    trust = _snapshot_trusted(db, kind=NODE_PVC, baseline=baseline, seen=seen)
-    stats["last_seen_touched"] = (
-        _touch_last_seen(db, seen_ids) if trust["trusted"] else 0
+    stats["last_seen_touched"], trust = _mark_snapshot(
+        db, kind=NODE_PVC, baseline=baseline, fallback=fallback,
+        seen=seen, seen_ids=seen_ids, run_started=run_started,
     )
     cleanup = _cleanup_absent_volumes(
         db, kind=NODE_PVC, seen=seen, fetch_ok=fetch_ok, baseline=baseline,
