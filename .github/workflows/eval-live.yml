@@ -31,12 +31,12 @@ jobs:
   eval:
     name: Golden Eval
     runs-on: sre-copilot-k8s
-    # Без ключа прогон бессмысленен: секрет отсутствует → джоба не стартует
-    # вместо того, чтобы падать на середине набора.
+    # Форки расписание не гоняют. Наличие ключа проверяет шаг «Run golden
+    # eval» и без него валит джобу сразу, а не на середине набора.
     if: ${{ github.event_name == 'workflow_dispatch' || github.repository == 'froggychips/sre-ai-copilot' }}
     steps:
       - name: Checkout Code
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           clean: false
 
@@ -45,7 +45,7 @@ jobs:
       # macOS 26.1), ни в образе раннера ARC (там uv не предустановлен).
       # Action идемпотентен: где uv уже есть, он его и использует.
       - name: Setup uv
-        uses: astral-sh/setup-uv@v7
+        uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7.6.0
         with:
           version: "0.9.5"
 
@@ -66,9 +66,21 @@ jobs:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           LLM_BACKEND: anthropic
         run: |
+          # Без ключа — ПАДЕНИЕ, а не warning с exit 0. Прежний вариант давал
+          # зелёную галочку над прогоном, который не измерил ничего (20.09.2026
+          # «success» за 21 с): по списку прогонов нельзя было понять, что
+          # качество промптов не меряется вовсе. Красный раз в неделю —
+          # честная цена, пока ключа нет; причина — в summary джобы.
           if [ -z "$ANTHROPIC_API_KEY" ]; then
-            echo "::warning::ANTHROPIC_API_KEY не задан — live-прогон пропущен"
-            exit 0
+            msg="ANTHROPIC_API_KEY не задан — live-прогон НЕ выполнен, качество промптов не измерено"
+            echo "::error::${msg}"
+            {
+              echo "### Golden Eval (live): не выполнен"
+              echo
+              echo "${msg}. Добавьте секрет \`ANTHROPIC_API_KEY\` в настройки репозитория"
+              echo "или отключите расписание этого workflow."
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 1
           fi
           .venv/bin/python scripts/eval_golden.py \
             --mode "${{ inputs.mode || 'live' }}" \
@@ -76,7 +88,7 @@ jobs:
 
       - name: Upload summary
         if: always()
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         # Квота artifact storage на аккаунте переполнена — сводка есть и в
         # логе джобы, поэтому её загрузка не должна валить прогон.
         continue-on-error: true

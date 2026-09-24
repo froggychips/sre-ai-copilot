@@ -129,6 +129,18 @@ async def _main_async(args) -> int:
             json.dumps(summary, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
         )
 
+    # Все кейсы пропущены — не измерено ничего. Без этой проверки итог
+    # сводился к «0 из 0 прошло» → код 0, то есть к зелёной галочке над
+    # прогоном, который ни одного ответа модели не видел; а с
+    # --update-baseline пустая сводка молча стала бы новым эталоном.
+    if summary["cases_total"] == 0:
+        print(
+            f"\nни один кейс не прогнан (пропущено {skipped}) — "
+            "измерять нечего, итог не может быть успешным",
+            file=sys.stderr,
+        )
+        return 1
+
     if args.update_baseline:
         BASELINE_PATH.write_text(
             json.dumps(summary, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
