@@ -12,7 +12,8 @@
     → apply_in_flight, второго write нет;
   - протухший claim в таблице → unknown, write НЕ выполняется, повтор тем же
     одобрением тоже отказан;
-  - unknown + одобрение позже пометки → CAS unknown→claimed → applied;
+  - unknown конечен: ни одобрение позже пометки, ни другой intent после
+    re-fire его не снимают, write нет;
   - legacy: executor_applied в JSON без строки → already_applied, строка не
     создаётся;
   - kubectl вернул ошибку → failed, повтор запрещён;
