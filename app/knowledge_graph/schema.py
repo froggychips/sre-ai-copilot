@@ -737,6 +737,10 @@ class K8sJobRun(Base):
     condition_type = Column(String, nullable=True)
     condition_reason = Column(String, nullable=True)
     condition_message = Column(Text, nullable=True)
+    # Job пропал из кластера (удалён, TTL, снос namespace-а): tombstone-строка
+    # с последним известным состоянием. Без неё последний «running» жил бы в
+    # истории вечно — sync больше этот Job не видит и ничего не пишет.
+    disappeared = Column(Boolean, nullable=False, default=False, server_default="false")
     # Когда sync увидел это состояние: верхняя граница «с какого момента
     # известно», точность — период sync-а (15 мин).
     observed_at = Column(DateTime, nullable=False)

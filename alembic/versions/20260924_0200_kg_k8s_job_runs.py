@@ -45,6 +45,7 @@ def upgrade() -> None:
         sa.Column("condition_type", sa.String(), nullable=True),
         sa.Column("condition_reason", sa.String(), nullable=True),
         sa.Column("condition_message", sa.Text(), nullable=True),
+        sa.Column("disappeared", sa.Boolean(), nullable=False, server_default=sa.false()),
         sa.Column("observed_at", sa.DateTime(), nullable=False),
     )
     op.create_index("ix_kg_k8s_job_runs_ns_observed", _TABLE, ["namespace", "observed_at"])

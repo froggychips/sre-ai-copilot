@@ -129,3 +129,15 @@ def test_only_squads_all_unreachable_is_blind(db):
     with patch.object(seq_logs_sync.settings, "SEQ_SQUAD_DISCOVERY_ENABLED", True):
         stats = _run(db, [], _SQUADS, [RuntimeError("timeout")] * 3)
     assert "error" in stats
+
+
+def test_squad_only_success_marks_source_success():
+    """Прод не настроен, стенды ответили — источник успешен (heartbeat пишется)."""
+    from app.knowledge_graph.source_status import SOURCE_STATUS_KEY, SourceStatus
+    from app.workers.tasks import _src_seq
+    ok = _src_seq({"instances": 0, "reached": 0, "squads": {"instances": 3, "reached": 3}})
+    assert ok[SOURCE_STATUS_KEY] == SourceStatus.SUCCESS.value
+    part = _src_seq({"instances": 0, "reached": 0, "squads": {"instances": 3, "reached": 1}})
+    assert part[SOURCE_STATUS_KEY] == SourceStatus.PARTIAL.value
+    none = _src_seq({"instances": 0, "reached": 0})
+    assert none[SOURCE_STATUS_KEY] == SourceStatus.UNAVAILABLE.value

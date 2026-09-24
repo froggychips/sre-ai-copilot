@@ -24,7 +24,7 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 from sqlalchemy import func
 from sqlalchemy.orm import Session
 
-from app.knowledge_graph.schema import K8sJobRun
+from app.knowledge_graph.schema import K8sJobRun, Namespace
 
 logger = logging.getLogger(__name__)
 
@@ -45,6 +45,7 @@ _PRUNE_BATCH = 5000
 _STATE_FIELDS = (
     "uid", "succeeded_count", "failed_count", "active_count",
     "completion_time", "last_pod_exit_code", "condition_type", "condition_reason",
+    "disappeared",
 )
 
 StateKey = Tuple[Any, ...]
@@ -68,7 +69,12 @@ def terminal_condition(job: Dict[str, Any]) -> Tuple[Optional[str], Optional[str
 
 
 def state_key(fields: Dict[str, Any]) -> StateKey:
-    return tuple(fields.get(f) for f in _STATE_FIELDS)
+    # disappeared: None из свежего Job-а и False из БД — одно и то же
+    # состояние, иначе каждый тик писал бы «изменение».
+    return tuple(
+        bool(fields.get(f)) if f == "disappeared" else fields.get(f)
+        for f in _STATE_FIELDS
+    )
 
 
 def latest_run_states(db: Session) -> Dict[Tuple[str, str], StateKey]:
@@ -123,10 +129,41 @@ def record_job_run(
         condition_type=fields.get("condition_type"),
         condition_reason=fields.get("condition_reason"),
         condition_message=fields.get("condition_message"),
+        disappeared=bool(fields.get("disappeared")),
         observed_at=now or datetime.utcnow(),
     ))
     prev[(namespace, name)] = key
     return True
+
+
+def record_disappeared(
+    db: Session,
+    *,
+    seen: Iterable[Tuple[str, str]],
+    prev: Dict[Tuple[str, str], StateKey],
+    now: Optional[datetime] = None,
+) -> int:
+    """Tombstone для Job-ов, которые были в истории, а в этом тике пропали.
+
+    Вызывать только по полному листу (fetch вернул Job-ы): пустой ответ
+    kubectl неотличим от пустого кластера, и по нему «удалить» всё нельзя —
+    та же дисциплина, что у cleanup_stale_jobs. Tombstone несёт последнее
+    известное состояние (счётчики, условие) и `disappeared=True`: упавший, а
+    потом удалённый Job остаётся «упал», а незавершённый перестаёт быть
+    «running» навсегда.
+    """
+    seen_set = set(seen)
+    n = 0
+    for (ns, name), key in list(prev.items()):
+        if (ns, name) in seen_set:
+            continue
+        last = dict(zip(_STATE_FIELDS, key))
+        if last.get("disappeared"):
+            continue
+        last["disappeared"] = True
+        if record_job_run(db, namespace=ns, name=name, fields=last, prev=prev, now=now):
+            n += 1
+    return n
 
 
 def prune_job_runs(
@@ -187,11 +224,18 @@ def _row_dict(r: K8sJobRun) -> Dict[str, Any]:
         "condition_reason": r.condition_reason,
         "condition_message": r.condition_message,
         "observed_at": r.observed_at,
+        "disappeared": bool(r.disappeared),
         "status": _status(r),
     }
 
 
 def _status(r: K8sJobRun) -> str:
+    failed = r.condition_type in ("Failed", "FailureTarget") or (
+        r.condition_type is None and (r.active_count or 0) == 0 and (r.failed_count or 0) > 0
+    )
+    if r.disappeared:
+        # Удалён: «упал» остаётся фактом, всё остальное — уже не состояние.
+        return "failed" if failed else "gone"
     if r.condition_type in ("Failed", "FailureTarget"):
         return "failed"
     if r.condition_type in ("Complete", "SuccessCriteriaMet"):
@@ -205,6 +249,25 @@ def _status(r: K8sJobRun) -> str:
 
 
 _STATUS_ORDER = {"failed": 0, "retrying": 1, "running": 2, "unknown": 3, "succeeded": 4}
+
+
+def _incarnation_starts(db: Session, namespaces: List[str]) -> Dict[str, datetime]:
+    """Начало текущей инкарнации namespace-ов (kg_namespaces.k8s_created_at).
+
+    Снесённый и пересозданный под тем же именем стенд — другой стенд: его
+    прошлые Job-ы к инцидентам нового отношения не имеют. Нет строки или
+    k8s_created_at — граница неизвестна, фильтра нет (так было и до истории).
+    """
+    try:
+        rows = (
+            db.query(Namespace.namespace, Namespace.k8s_created_at)
+            .filter(Namespace.namespace.in_(namespaces))
+            .all()
+        )
+    except Exception as e:  # граф без kg_namespaces — история всё равно полезна
+        logger.debug("k8s_job_history.incarnation_lookup_failed err=%s", e)
+        return {}
+    return {str(ns): created for ns, created in rows if created is not None}
 
 
 def jobs_state_at(
@@ -237,6 +300,7 @@ def jobs_state_at(
         return []
     since = at - timedelta(hours=lookback_hours)
     failed_since = at - timedelta(hours=failed_lookback_hours)
+    incarnation = _incarnation_starts(db, ns_list)
     base = db.query(K8sJobRun).filter(
         K8sJobRun.namespace.in_(ns_list), K8sJobRun.observed_at <= at,
     )
@@ -252,7 +316,14 @@ def jobs_state_at(
     rows = db.query(K8sJobRun).join(last, K8sJobRun.id == last.c.mid).all()
     out = []
     for r in rows:
+        born = incarnation.get(str(r.namespace))
+        if born is not None and born <= at and r.observed_at is not None and r.observed_at < born:
+            # Строка из прошлой инкарнации namespace-а, а спрашивают про
+            # нынешнюю: этот Job в новом стенде ещё не запускался.
+            continue
         d = _row_dict(r)
+        if d["status"] == "gone":
+            continue
         seen = r.observed_at
         recent = seen is not None and seen >= since
         unfinished = d["status"] in ("running", "retrying")

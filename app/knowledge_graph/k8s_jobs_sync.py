@@ -48,8 +48,8 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.knowledge_graph.k8s_job_history import (StateKey, latest_run_states,
-                                                 prune_job_runs, record_job_run,
-                                                 terminal_condition)
+                                                 prune_job_runs, record_disappeared,
+                                                 record_job_run, terminal_condition)
 from app.knowledge_graph.kubectl_breaker import run_kubectl
 from app.knowledge_graph.schema import NODE_KIND_SERVICE, K8sJob, Service
 
@@ -636,6 +636,7 @@ def sync_all_jobs(db: Session) -> Dict[str, int]:
         "exit_codes_resolved": 0,
         "linked_via_name_pattern": 0,
         "job_runs_recorded": 0,
+        "job_runs_disappeared": 0,
         "errors": 0,
     }
 
@@ -675,6 +676,22 @@ def sync_all_jobs(db: Session) -> Dict[str, int]:
             # Короткая транзакция = локи отпускаются, соседние писатели и DDL
             # не ждут конца всего тика.
             db.commit()
+
+    # Tombstone пропавшим Job-ам — только по непустому листу: [] от kubectl
+    # неотличим от сбоя (та же дисциплина, что у cleanup_stale_jobs).
+    if run_states is not None and jobs:
+        seen: List[Tuple[str, str]] = [
+            (str((j.get("metadata") or {}).get("namespace") or "default"),
+             str((j.get("metadata") or {}).get("name") or ""))
+            for j in jobs
+        ]
+        try:
+            with db.begin_nested():
+                stats["job_runs_disappeared"] = record_disappeared(
+                    db, seen=seen, prev=run_states,
+                )
+        except Exception as e:
+            logger.warning("k8s_jobs_sync.job_runs_tombstone_failed err=%s", e)
 
     db.commit()
     logger.info(

@@ -184,3 +184,56 @@ def test_prune_keeps_last_row_per_job(db):
     assert prune_job_runs(db, retention_days=30, now=T0) == 1
     left = sorted((r.name, r.failed_count) for r in db.query(K8sJobRun).all())
     assert left == [("j", 1), ("k", None)]
+
+
+# ── ревью: пропавшие Job-ы и инкарнации namespace-а ─────────────────────────
+
+
+def test_deleted_running_job_is_not_running_forever(db):
+    _sync(db, [_job("mig", "ns", active=1), _job("keep", "ns", active=1)], T0)
+    stats = _sync(db, [_job("keep", "ns", active=1)], T0 + timedelta(minutes=15))
+    assert stats["job_runs_disappeared"] == 1
+    db.commit()
+    names = [j["name"] for j in jobs_state_at(db, ["ns"], T0 + timedelta(days=3))]
+    assert names == ["keep"], "удалённый running-Job не должен жить вечно"
+    before = {j["name"] for j in jobs_state_at(db, ["ns"], T0 + timedelta(minutes=5))}
+    assert before == {"mig", "keep"}
+
+
+def test_deleted_failed_job_stays_failed(db):
+    _sync(db, [_job("mig", "ns", failed=3, cond="Failed", reason="BackoffLimitExceeded"),
+               _job("keep", "ns", active=1)], T0)
+    _sync(db, [_job("keep", "ns", active=1)], T0 + timedelta(hours=1))
+    db.commit()
+    got = {j["name"]: j for j in jobs_state_at(db, ["ns"], T0 + timedelta(hours=2))}
+    assert got["mig"]["status"] == "failed" and got["mig"]["disappeared"]
+
+
+def test_empty_fetch_writes_no_tombstones(db):
+    _sync(db, [_job("mig", "ns", active=1)], T0)
+    stats = _sync(db, [], T0 + timedelta(minutes=15))
+    assert stats["job_runs_disappeared"] == 0
+    assert db.query(K8sJobRun).count() == 1
+
+
+def test_reappeared_job_after_tombstone_is_new_row(db):
+    _sync(db, [_job("mig", "ns", uid="a", active=1), _job("k", "ns", active=1)], T0)
+    _sync(db, [_job("k", "ns", active=1)], T0 + timedelta(minutes=15))
+    _sync(db, [_job("mig", "ns", uid="a", active=1), _job("k", "ns", active=1)],
+          T0 + timedelta(minutes=30))
+    db.commit()
+    rows = db.query(K8sJobRun).filter(K8sJobRun.name == "mig").order_by(K8sJobRun.id).all()
+    assert [r.disappeared for r in rows] == [False, True, False]
+
+
+def test_previous_namespace_incarnation_is_ignored(db):
+    from app.knowledge_graph.schema import Namespace
+    _sync(db, [_job("mig", "squad-5-shared", failed=2, cond="Failed")], T0)
+    # стенд снесли и подняли заново под тем же именем
+    db.add(Namespace(namespace="squad-5-shared", state="active",
+                     k8s_created_at=T0 + timedelta(hours=2)))
+    db.commit()
+    assert jobs_state_at(db, ["squad-5-shared"], T0 + timedelta(hours=5)) == []
+    # вопрос про момент прошлой инкарнации — история на месте
+    past = jobs_state_at(db, ["squad-5-shared"], T0 + timedelta(hours=1))
+    assert past[0]["status"] == "failed"

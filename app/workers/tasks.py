@@ -1966,6 +1966,13 @@ def _src_seq(result):
         return mark(result, SourceStatus.FAILED)
     instances = result.get("instances") or 0
     reached = result.get("reached") or 0
+    if not instances:
+        # Прода в конфиге нет, но опрошены Seq стендов (SEQ_SQUAD_DISCOVERY):
+        # статус — по ним, иначе успешный опрос стендов читался бы как
+        # «источник недоступен» и heartbeat не писался бы.
+        squads = result.get("squads") or {}
+        instances = squads.get("instances") or 0
+        reached = squads.get("reached") or 0
     if instances and not reached:
         return mark(result, SourceStatus.UNAVAILABLE)
     if instances and reached < instances:
