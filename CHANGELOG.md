@@ -38,6 +38,25 @@ All notable changes to this project are documented in this file.
 
 ### Добавлено
 
+- **История состояний Job-ов в графе (`kg_k8s_job_runs`).** `kg_k8s_jobs` —
+  снимок последнего состояния: упавший migrate-job к моменту разбора
+  перезаписан следующим запуском с тем же именем или удалён вместе с
+  namespace-ом (squad-19, 12–14.09: phantom-миграции, а в графе строки только
+  от 31.08). Теперь `k8s_jobs_sync` пишет строку на каждое изменение статуса
+  (uid, счётчики, exit-код, терминальное условие с reason/message), retention
+  30 дней (`KG_K8S_JOB_RUNS_RETENTION_DAYS`), и `k8s_job_history.jobs_state_at`
+  отвечает «какими были Job-ы namespace-ов на момент T» — упавшие первыми.
+  Миграция `20260924_0200`: новая пустая таблица, без блокировок; порядок
+  выката не важен (без таблицы sync пишет только снимок).
+- **Seq стендов в `kg_log_observations`.** Синк знал только девять
+  прод-инстансов из `SEQ_INSTANCES`, и логи сквадов в граф не попадали вовсе.
+  Список сквадовых Seq берётся из графа (сервис `seq` в активном squad-* ns →
+  `seq.<ns>.svc`, без ключа), только Error/Fatal, таймаут 5 с, до 8
+  параллельно, потолок `SEQ_SQUAD_MAX_INSTANCES`. Счёт отдельный (`squads` в
+  итоге задачи): недоступные стенды не превращают прогон прода в partial.
+  Включается `SEQ_SQUAD_DISCOVERY_ENABLED` (в k8s/worker.yaml — true) вместе с
+  новым egress-правилом copilot → поды Seq :80 в k8s/networkpolicy.yaml.
+
 - **Пакетный режим FactCritic (`FACT_CRITIC_MODE=batch`).** Раньше критик
   делал LLM-вызов на каждую гипотезу. Замер 24.09 на claude_cli: ~11 из ~16
   вызовов кейса и основная латентность. В batch-режиме все гипотезы,

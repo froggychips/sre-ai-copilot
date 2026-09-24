@@ -892,6 +892,9 @@ class Settings(BaseSettings):
     # (baseline детектора аномалий — 7 дней). Ниже 7 модуль откажется работать:
     # см. health_retention.MIN_RETENTION_DAYS.
     KG_HEALTH_RETENTION_DAYS: int = Field(30, description="Сколько суток хранить kg_service_health")
+    # История состояний Job-ов (kg_k8s_job_runs): столько же, сколько живут
+    # события подов, — разбор инцидента смотрит на оба источника вместе.
+    KG_K8S_JOB_RUNS_RETENTION_DAYS: int = Field(30, description="Сколько суток хранить kg_k8s_job_runs")
 
     # Daily stats digest — Celery beat task который собирает cluster-health
     # + KG-quality + stale-deployments и шлёт в DISCORD_WEBHOOK_STATS_URL.
@@ -1098,6 +1101,11 @@ class Settings(BaseSettings):
     SEQ_TOKEN_PREPROD: str = Field("", description="Seq preprod API key")
     SEQ_URL_PREUPDATE: str = Field("", description="Seq preupdate base URL")
     SEQ_TOKEN_PREUPDATE: str = Field("", description="Seq preupdate API key")
+    # Сквадовые Seq (seq.<squad-ns>.svc, без ключа) — список из графа, см.
+    # seq_logs_sync._discover_squad_instances. Off по умолчанию: без egress-правила
+    # copilot → seq:80 (k8s/networkpolicy.yaml) каждый запрос упрётся в таймаут.
+    SEQ_SQUAD_DISCOVERY_ENABLED: bool = Field(False, description="Синкать Error/Fatal из Seq стендов squad-*")
+    SEQ_SQUAD_MAX_INSTANCES: int = Field(150, description="Потолок числа сквадовых Seq за тик")
 
     # PodEvent runtime correlation — cheap OTEL-substitute. Beat task
     # `kg_runtime_correlation_sync` каждые 30 мин ищет пары (src, dst) для

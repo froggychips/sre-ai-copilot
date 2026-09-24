@@ -47,6 +47,9 @@ from typing import Any, Dict, List, Optional, Tuple, cast
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
+from app.knowledge_graph.k8s_job_history import (StateKey, latest_run_states,
+                                                 prune_job_runs, record_job_run,
+                                                 terminal_condition)
 from app.knowledge_graph.kubectl_breaker import run_kubectl
 from app.knowledge_graph.schema import NODE_KIND_SERVICE, K8sJob, Service
 
@@ -529,12 +532,17 @@ def _sync_one_job(
     job: Dict[str, Any],
     stats: Dict[str, int],
     exit_codes: Optional[Dict[Tuple[str, str], int]] = None,
+    run_states: Optional[Dict[Tuple[str, str], StateKey]] = None,
 ) -> None:
     """Обработать один Job. Вызывается под per-item SAVEPOINT-ом.
 
     `exit_codes` — карта из `_prefetch_failed_job_exit_codes`, собранная ДО
     транзакции. None (прямой вызов из CLI/тестов) → старое поведение с
     kubectl по месту.
+
+    `run_states` — последнее записанное состояние Job-ов из
+    `kg_k8s_job_runs` (`latest_run_states`); None → история не пишется
+    (таблицы нет / её чтение упало — снимок в kg_k8s_jobs при этом живёт).
     """
     meta = job.get("metadata") or {}
     ns = meta.get("namespace") or "default"
@@ -597,6 +605,18 @@ def _sync_one_job(
     )
     stats["nodes_upserted"] += 1
 
+    if run_states is not None:
+        cond_type, cond_reason, cond_message = terminal_condition(job)
+        run_fields = dict(fields)
+        run_fields.update(
+            uid=meta.get("uid"),
+            condition_type=cond_type,
+            condition_reason=cond_reason,
+            condition_message=cond_message,
+        )
+        if record_job_run(db, namespace=ns, name=name, fields=run_fields, prev=run_states):
+            stats["job_runs_recorded"] = stats.get("job_runs_recorded", 0) + 1
+
 
 def sync_all_jobs(db: Session) -> Dict[str, int]:
     """Sync все Job-ы cluster-wide.
@@ -615,6 +635,7 @@ def sync_all_jobs(db: Session) -> Dict[str, int]:
         "nodes_upserted": 0,
         "exit_codes_resolved": 0,
         "linked_via_name_pattern": 0,
+        "job_runs_recorded": 0,
         "errors": 0,
     }
 
@@ -622,13 +643,27 @@ def sync_all_jobs(db: Session) -> Dict[str, int]:
     # ждёт kubectl (см. _prefetch_failed_job_exit_codes).
     exit_codes = _prefetch_failed_job_exit_codes(jobs, stats)
 
+    # История состояний (kg_k8s_job_runs): одно чтение на тик. Сбой чтения —
+    # тик пишет только снимок, как до истории; history-строки не
+    # выдумываются из «не знаю, что было раньше».
+    run_states: Optional[Dict[Tuple[str, str], StateKey]]
+    try:
+        with db.begin_nested():
+            run_states = latest_run_states(db)
+    except Exception as e:
+        run_states = None
+        stats["job_runs_unavailable"] = 1
+        logger.warning("k8s_jobs_sync.job_runs_unavailable err=%s", e)
+
     for i, job in enumerate(jobs, 1):
         try:
             # SAVEPOINT на item: одна битая запись (DataError и т.п.) не
             # переводит Session в aborted-состояние и не роняет весь tick.
             # Зеркалит per-item SAVEPOINT из k8s_events_sync.
             with db.begin_nested():
-                _sync_one_job(db, job, stats, exit_codes=exit_codes)
+                _sync_one_job(
+                    db, job, stats, exit_codes=exit_codes, run_states=run_states,
+                )
         except Exception as e:
             stats["errors"] += 1
             logger.warning(
@@ -945,12 +980,19 @@ def sync_k8s_jobs(db: Session) -> Dict[str, Any]:
             db, kind="job", fetch_count=job_stats["jobs_fetched"],
         ),
     }
+    job_runs_pruned = 0
+    try:
+        with db.begin_nested():
+            job_runs_pruned = prune_job_runs(db)
+    except Exception as e:
+        logger.warning("k8s_jobs_sync.job_runs_prune_failed err=%s", e)
     db.commit()
     return {
         "cronjobs": cj_stats,
         "jobs": job_stats,
         "transitive_linked": transitive_linked,
         "stale_cleanup": stale_cleanup,
+        "job_runs_pruned": job_runs_pruned,
     }
 
 
