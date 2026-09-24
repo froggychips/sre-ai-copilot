@@ -370,3 +370,39 @@ def test_preview_ignores_v2(monkeypatch) -> None:
     cls = ClassificationResult(classification=Classification.STALE_FAILED_JOB, rule_id="t")
     assert _select_candidate_playbooks({"v2": v2}, cls, {}) == []
 
+
+
+@pytest.mark.asyncio
+async def test_fix_agent_prompt_says_none_when_binding_on_but_no_candidates() -> None:
+    from app.agents.fix import FixAgent
+    fake = AsyncMock(return_value="{}")
+    with patch("app.agents.base.BaseAgent.ask", new=fake):
+        await FixAgent().suggest("cause", playbooks=[])
+    ctx = fake.await_args.kwargs["user_context"]
+    assert "ALLOWED REMEDIATION PLAYBOOKS" in ctx and "(none" in ctx
+
+
+def test_pipeline_strips_playbook_not_selected_for_incident() -> None:
+    """Ревью #427 P1: gate не видит фактов и доверяет любой ссылке на
+    существующий playbook. Ссылку, которую matcher для ЭТОГО инцидента не
+    выбирал (OOM, свежий выкат, чужой алерт), pipeline снимает — и gate
+    блокирует intent как playbook_missing."""
+    from app.workers.pipeline import _enforce_candidate_binding
+    restart = load_registry()[_RESTART]
+    bound = _intent(playbook=_RESTART)
+    # Кандидатов нет (preconditions не выполнены) — привязка снимается.
+    stripped = _enforce_candidate_binding(bound, [], "inc-1")
+    assert stripped.playbook is None
+    # Выбран matcher-ом — остаётся как есть.
+    assert _enforce_candidate_binding(bound, [restart], "inc-1") is bound
+    # Флаг выключен (None) — поле не трогаем.
+    assert _enforce_candidate_binding(bound, None, "inc-1") is bound
+    assert _enforce_candidate_binding(None, [restart], "inc-1") is None
+
+
+def test_stripped_intent_is_blocked_by_gate(binding_on) -> None:
+    from app.workers.pipeline import _enforce_candidate_binding
+    stripped = _enforce_candidate_binding(_intent(playbook=_RESTART), [], "inc-1")
+    decision = evaluate_intent_gate(stripped)
+    assert decision.mode == PolicyMode.BLOCK
+    assert decision.reasons[0]["reason"] == "playbook_missing"

@@ -66,6 +66,8 @@ def _build_playbook_prefix(playbooks: Sequence["Playbook"]) -> str:
     не данные инцидента, так что в промпт оно попадает без экранирования.
     """
     lines = ["=== ALLOWED REMEDIATION PLAYBOOKS ==="]
+    if not playbooks:
+        lines.append("(none — no playbook matches this incident)")
     for pb in playbooks:
         actions = ", ".join(step.action for step in pb.plan.steps or ())
         desc = " ".join((pb.description or "").split())
@@ -102,8 +104,8 @@ class FixAgent(BaseAgent):
         показывается в Discord-embed, executor-стадия просто пропускается).
 
         `playbooks` — кандидаты от `matcher.match_playbooks`; передаются
-        только при REMEDIATION_PLAYBOOK_BINDING_ENABLED. None/пусто — промпт
-        прежний.
+        только при REMEDIATION_PLAYBOOK_BINDING_ENABLED. None — промпт
+        прежний; [] — в промпте явно «кандидатов нет, только чтение».
         """
         instruction = (
             _RECURRENCE_PREFIX + _BASE_INSTRUCTION if is_recurrence else _BASE_INSTRUCTION
@@ -111,7 +113,11 @@ class FixAgent(BaseAgent):
         context = finalized_cause
         if jira_context:
             context = _build_jira_prefix(jira_context) + "\n\n" + finalized_cause
-        if playbooks:
+        # None — привязка выключена, промпт прежний. [] — привязка включена,
+        # но под инцидент ничего не подошло: модель должна знать, что
+        # мутировать нечем, иначе она предложит restart, dry-run пройдёт, и
+        # в Discord появится кнопка Apply, которую gate всё равно отвергнет.
+        if playbooks is not None:
             context = _build_playbook_prefix(playbooks) + "\n\n" + context
         raw = await self.ask(user_context=context, instruction=instruction)
         intent = ExecutionIntent.from_llm_response(raw)
