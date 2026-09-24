@@ -1,0 +1,45 @@
+id: 025_real_migration_dirty_version
+title: migrate-джоба упала на dirty-версии — сервис крашлупит после выката
+source: real          # класс migration: 10 из 31 кейса live-RCA датасета 24.09
+llm: false
+incident:
+  incident_id: golden-025
+  severity: critical
+  status: firing
+  summary: Pod echo-service-7c9d-x2k4p crash-looping in squad-7-kingdom2
+  description: CrashLoopBackOff
+  namespace: squad-7-kingdom2
+  labels:
+    alertname: KubePodCrashLooping
+    severity: critical
+    namespace: squad-7-kingdom2
+    pod: echo-service-7c9d-x2k4p
+    service: echo-service
+  annotations:
+    description: CrashLoopBackOff
+  starts_at: "2026-09-15T12:20:00Z"
+  ends_at: null
+  generator_url: null
+  raw: {}
+context:
+  incident_starts_at: "2026-09-15T12:20:00Z"
+  k8s_pod_state:
+    echo-service-7c9d-x2k4p: {exit_code: 1, reason: Error, restart_count: 14}
+  logs_summary: |
+    Last state: terminated, exit code 1
+    Npgsql.PostgresException 42P01: relation "DynUsers" does not exist
+    migrate: Dirty database version 20260624125000. Fix and force version.
+  k8s_events:
+    - {type: Warning, reason: BackOff, count: 14,
+       message: "Back-off restarting failed container echo-service in pod echo-service-7c9d-x2k4p"}
+  recent_deployments:
+    - {name: echo-service, ts: "2026-09-15T12:03:00Z", repo: backend, sha: a1b2c3d}
+expect:
+  # Схема отстала от кода: рестарт упрётся в ту же dirty-версию. Выкат за
+  # 17 минут до алерта обязан дать recent_deploy FOUND, и restart-playbook
+  # по нему отсекается — лечится миграцией, а не перезапуском.
+  facts:
+    crashloop: true
+    oom_killed: false
+    recent_deploy: true
+  playbooks: []

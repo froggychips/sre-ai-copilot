@@ -1,0 +1,44 @@
+id: 027_real_db_grants_missing
+title: после пересборки сквада у роли сервиса нет GRANT-ов — permission denied на старте
+source: real          # класс db_grants: 3 из 31 кейса live-RCA датасета 24.09
+llm: false
+incident:
+  incident_id: golden-027
+  severity: critical
+  status: firing
+  summary: Pod golf-service-5d4c-m8n2t crash-looping in squad-11-kingdom5
+  description: CrashLoopBackOff
+  namespace: squad-11-kingdom5
+  labels:
+    alertname: KubePodCrashLooping
+    severity: critical
+    namespace: squad-11-kingdom5
+    pod: golf-service-5d4c-m8n2t
+    service: golf-service
+  annotations:
+    description: CrashLoopBackOff
+  starts_at: "2026-09-10T08:00:00Z"
+  ends_at: null
+  generator_url: null
+  raw: {}
+context:
+  incident_starts_at: "2026-09-10T08:00:00Z"
+  k8s_pod_state:
+    golf-service-5d4c-m8n2t: {exit_code: 1, reason: Error, restart_count: 31}
+  logs_summary: |
+    Last state: terminated, exit code 1
+    Npgsql.PostgresException 42501: permission denied for table PlayerProfiles
+  k8s_events:
+    - {type: Warning, reason: BackOff, count: 31,
+       message: "Back-off restarting failed container golf-service in pod golf-service-5d4c-m8n2t"}
+  recent_deployments: []
+expect:
+  # ИЗВЕСТНАЯ ДЫРА (24.09.2026): restart_crashloop_deployment сейчас матчит
+  # этот случай — crashloop FOUND, OOM и выкат ABSENT, exit 1 не сигнал. Но
+  # «permission denied» рестарт не лечит: GRANT-ов от него не прибавится.
+  # Фактов, отличающих отказ прав БД от транзиентного exit 1, у правил нет.
+  # Ожидание `playbooks: []` сюда не записано, чтобы не фиксировать в
+  # baseline заведомо красный кейс; оно появится вместе с precondition-ом.
+  facts:
+    crashloop: true
+    oom_killed: false
