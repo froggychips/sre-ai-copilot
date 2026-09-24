@@ -56,6 +56,9 @@ def mock_session(monkeypatch):
         lambda intent, **kw: TargetSnapshot.unavailable("test", intent),
     )
     monkeypatch.setattr(executor_apply, "expected_identity", lambda db, incident_id: None)
+    # Таблица попыток: в mock-сессии строк нет. Поведение с настоящей БД —
+    # в tests/remediation/test_attempts.py.
+    monkeypatch.setattr(executor_apply, "_load_attempt", lambda db, incident_id: None)
     monkeypatch.setattr(
         executor_apply, "schedule_verification",
         lambda incident_id, **kw: {"scheduled": False, "reason": "test"},

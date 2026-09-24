@@ -20,6 +20,19 @@ All notable changes to this project are documented in this file.
   VictoriaMetrics). LLM tool-calling не появился: контекст по-прежнему
   собирается кодом до промпта.
 
+- **Попытки исполнения — отдельная таблица `kg_remediation_attempts`.**
+  Claim, итог и верификация исполнителя жили ключами в `incidents.analysis`,
+  а защита от второй записи в кластер — на row-lock и на том, что каждый
+  писатель analysis мержит блоб, а не заменяет его. Теперь одна строка на
+  (incident_id, signature), как у одобрения: claim — вставка, гонку ловит
+  UNIQUE самой базы (на SQLite `FOR UPDATE` нет вовсе), жизненный цикл
+  `claimed → applied → verified | verification_failed`, `failed`, `unknown`
+  читается запросом. Протухший claim по-прежнему не даёт второй записи —
+  попытка уходит в `unknown → manual`. JSON-ключи пишутся как раньше
+  (embed, timeline, отчёты их читают); записи до таблицы распознаются по
+  `executor_applied`. Метрика `remediation_attempt_transitions_total`.
+  Миграция `20260924_0100` — новая пустая таблица, без блокировок.
+
 ### Исправлено
 
 - **Упавший k8s API больше не даёт правилам пайплайна уверенного ✗.**

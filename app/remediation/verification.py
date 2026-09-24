@@ -385,6 +385,43 @@ def assess(
     return {"outcome": OUTCOME_VERIFIED, "checks": checks, "reasons": reasons}
 
 
+def _applied_attempt(db: Any, incident_id: str) -> Any:
+    """Попытка, дошедшая до записи (kg_remediation_attempts), или None.
+
+    Сбой запроса — не повод ронять проверку: исход всё равно запишется в
+    analysis, как до появления таблицы.
+    """
+    from app.remediation.attempts import latest_applied
+    try:
+        return latest_applied(db, incident_id)
+    except Exception as e:
+        log.warning("verification.attempt_lookup_failed", incident_id=incident_id,
+                    error=type(e).__name__)
+        try:
+            db.rollback()
+        except Exception:
+            pass
+        return None
+
+
+def _record_on_attempt(attempt: Any, outcome: str, entry: Dict[str, Any]) -> None:
+    """Исход проверки — в строку попытки. Статус меняют только терминальные
+    исходы: pending ждёт следующей проверки, unknown — честное «не знаем»,
+    и запись в кластер от него не перестаёт быть состоявшейся."""
+    from app.remediation import attempts as attempts_store
+
+    if outcome == OUTCOME_VERIFIED:
+        attempts_store.set_status(attempt, attempts_store.STATUS_VERIFIED, verification=entry)
+    elif outcome == OUTCOME_FAILED:
+        attempts_store.set_status(
+            attempt, attempts_store.STATUS_VERIFICATION_FAILED,
+            verification=entry, error="; ".join(entry.get("reasons") or [])[:2000] or None,
+        )
+    else:
+        attempt.verification = entry
+        attempt.updated_at = datetime.now(timezone.utc).replace(tzinfo=None)
+
+
 def verify_remediation(
     incident_id: str,
     attempt: int = 1,
@@ -410,8 +447,17 @@ def verify_remediation(
         if record is None:
             return {"outcome": OUTCOME_UNKNOWN, "reason": "incident_not_found"}
         analysis: Dict[str, Any] = dict(record.analysis or {})
-        applied = analysis.get("executor_applied") or {}
-        intent_data = analysis.get("execution_intent")
+        # Строка попытки — источник истины; JSON — хвост и носитель для
+        # записей, сделанных до kg_remediation_attempts. Берём то, что есть.
+        # NB: не `attempt` — так называется номер проверки (аргумент).
+        attempt_row = _applied_attempt(db, incident_id)
+        applied = analysis.get("executor_applied") or (
+            attempt_row.result
+            if attempt_row is not None and isinstance(attempt_row.result, dict) else {}
+        )
+        intent_data = analysis.get("execution_intent") or (
+            attempt_row.intent if attempt_row is not None else None
+        )
         if not applied or not intent_data:
             return {"outcome": OUTCOME_UNKNOWN, "reason": "nothing_applied"}
         try:
@@ -449,6 +495,8 @@ def verify_remediation(
             set_executor_state(record, EXECUTOR_VERIFIED)
         elif result["outcome"] == OUTCOME_FAILED:
             set_executor_state(record, EXECUTOR_VERIFY_FAILED)
+        if attempt_row is not None:
+            _record_on_attempt(attempt_row, result["outcome"], entry)
         db.commit()
 
         audit_service.log_event(

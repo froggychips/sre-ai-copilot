@@ -233,9 +233,24 @@ REMEDIATION_VERIFICATION = Counter(
     ["outcome"],
 )
 
+# Переходы жизненного цикла kg_remediation_attempts (app/remediation/attempts.py).
+# from="none" — рождение строки (claim). Кардинальность ограничена набором
+# статусов: ~6×6 пар, и большинство из них невозможны.
+REMEDIATION_ATTEMPT_TRANSITIONS = Counter(
+    "remediation_attempt_transitions_total",
+    "Remediation attempt lifecycle transitions (kg_remediation_attempts.status)",
+    ["from_status", "to_status"],
+)
+
 
 def track_remediation_verification(outcome: str) -> None:
     REMEDIATION_VERIFICATION.labels(outcome=outcome).inc()
+
+
+def track_remediation_attempt_transition(from_status: str | None, to_status: str) -> None:
+    REMEDIATION_ATTEMPT_TRANSITIONS.labels(
+        from_status=from_status or "none", to_status=to_status,
+    ).inc()
 
 
 def track_grounded(perspective: str) -> None:
