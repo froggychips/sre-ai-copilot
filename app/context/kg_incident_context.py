@@ -26,9 +26,11 @@ kg_pod_events обрезается, `count` строки, обновлённой
   kg_alerts             алерты сквада в окне, шумовые помечены;
   kg_deployments        деплой кода отдельно от пересборки статики и от
                         k8s_rollout (веерные раскатки не «недавний деплой»);
-  kg_k8s_jobs           Job-ы сквада (migrate-job-ы: failed_count, exit code).
-                        Таблица — снимок, а не история: строка, обновлённая
-                        позже `as_of`, помечается `state_after_as_of`;
+  kg_k8s_job_runs       Job-ы сквада на момент `as_of` из истории состояний
+                        (`k8s_job_history`, упавшие впереди, инкарнация ns
+                        учтена); без неё — снимок kg_k8s_jobs, где строка,
+                        обновлённая позже `as_of`, помечается
+                        `state_after_as_of`;
   kg_incidents          история: прошлые инциденты того же сквада;
   kg_remediation_events что внешний исполнитель (squad-medic) делал раньше и
                         чем кончилось, плюс его НАБЛЮДЕНИЯ как отдельный
@@ -447,6 +449,46 @@ def _deployments(reader: KGReader, ns: List[str], scope: KGScope) -> Dict[str, A
 
 
 def _jobs(reader: KGReader, ns: List[str], scope: KGScope) -> List[Dict[str, Any]]:
+    """Job-ы сквада на момент as_of: из истории, если она есть, иначе из снимка."""
+    if reader.has_column("kg_k8s_job_runs", "observed_at"):
+        return _job_history(reader, ns, scope)
+    return _job_snapshot(reader, ns, scope)
+
+
+def _job_history(reader: KGReader, ns: List[str], scope: KGScope) -> List[Dict[str, Any]]:
+    """История kg_k8s_job_runs (#454): последнее состояние Job-а, увиденное не
+    позже as_of, упавшие впереди — те же запрос и отбор, что у
+    `k8s_job_history.jobs_state_at`, исполненные через reader (прод/psql)."""
+    from app.knowledge_graph import k8s_job_history as jh
+
+    as_of = scope.as_of_utc
+    try:
+        incarnation = jh.incarnation_from_rows(reader.rows(jh.incarnation_select(ns)))
+    except Exception:  # граф без kg_namespaces — история всё равно полезна
+        incarnation = {}
+    states = jh.states_at_from_rows(reader.rows(jh.last_runs_select(ns, as_of)),
+                                    incarnation, as_of, limit=_JOBS_KEEP)
+    return [{
+        "namespace": d["namespace"],
+        "name": d["name"],
+        "owner_service": d["owner_service_name"],
+        "succeeded": d["succeeded"],
+        "failed": d["failed"],
+        "active": d["active"],
+        "exit_code": d["exit_code"],
+        "status": d["status"],
+        "condition_reason": d["condition_reason"],
+        "start_time": _iso(_aware(d["start_time"])),
+        "completion_time": _iso(_aware(d["completion_time"])),
+        "observed_at": _iso(_aware(d["observed_at"])),
+        # История пишется на изменение: строка на as_of — наблюдение на as_of.
+        "state_after_as_of": False,
+        "migrate": _MIGRATE_TOKEN in str(d["name"] or "").lower(),
+        "source": "kg_k8s_job_runs",
+    } for d in states]
+
+
+def _job_snapshot(reader: KGReader, ns: List[str], scope: KGScope) -> List[Dict[str, Any]]:
     as_of = scope.as_of_utc
     started = func.coalesce(K8sJob.start_time, K8sJob.created_at)
     stmt = (
@@ -484,6 +526,7 @@ def _jobs(reader: KGReader, ns: List[str], scope: KGScope) -> List[Dict[str, Any
             "completion_time": _iso(completed) if completed and completed <= as_of else None,
             "state_after_as_of": after,
             "migrate": _MIGRATE_TOKEN in str(r.get("name") or "").lower(),
+            "source": "kg_k8s_jobs",
         })
     return out
 
@@ -808,6 +851,8 @@ def _event_line(e: Dict[str, Any]) -> str:
 
 def _job_line(j: Dict[str, Any]) -> str:
     state = f"failed={j.get('failed') or 0} succeeded={j.get('succeeded') or 0}"
+    if j.get("status"):
+        state = f"status={j['status']} " + state
     if j.get("exit_code") is not None:
         state += f" exit_code={j['exit_code']}"
     tail = " (состояние обновлено после инцидента)" if j.get("state_after_as_of") else ""

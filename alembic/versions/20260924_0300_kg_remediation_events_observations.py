@@ -1,7 +1,7 @@
 """kg_remediation_events.observations: наблюдения внешнего исполнителя в графе
 
 Revision ID: 20260924_0300
-Revises: 20260924_0100
+Revises: 20260924_0200
 Create Date: 2026-09-24 03:00:00.000000
 
 Медик видит на стенде то, чего граф не сохраняет (dirty/phantom-версия
@@ -21,7 +21,7 @@ import sqlalchemy as sa
 from alembic import op
 
 revision = "20260924_0300"
-down_revision = "20260924_0100"
+down_revision = "20260924_0200"
 branch_labels = None
 depends_on = None
 

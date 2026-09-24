@@ -23,8 +23,10 @@ All notable changes to this project are documented in this file.
   шумового/безсервисного алерта — «больной» workload графа. Датасет ходит в
   граф ТЕМИ ЖЕ запросами (Select → SQL для psql) и раскладывает тем же
   кодом; своей реконструкции у скрипта больше нет, режимы — `alert_only`,
-  `kg`, `kg_no_medic`. `migration_failed` видит упавший migrate-job из
-  `kg_k8s_jobs`.
+  `kg`, `kg_no_medic`. Job-ы — из истории состояний `kg_k8s_job_runs`
+  (#454, `k8s_job_history`: тот же запрос и отбор, что `jobs_state_at`, теперь
+  исполнимый и сессией, и через psql), без неё — из снимка `kg_k8s_jobs`;
+  `migration_failed` видит упавший на момент инцидента migrate-job.
 - **Наблюдения squad-medic — в граф, а не прозой в датасете.** Экстрактор
   наблюдений (состояния подов, коды выхода, dirty-миграция, отсутствующие
   ключи Secret; без root_cause/next_action) переехал из скрипта в

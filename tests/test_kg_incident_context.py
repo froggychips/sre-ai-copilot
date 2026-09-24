@@ -12,8 +12,9 @@ from sqlalchemy.orm import sessionmaker
 from app.context import kg_incident_context as kgi
 from app.database import Base
 from app.knowledge_graph.schema import (AlertEvent, Deployment, K8sJob,
-                                        KGIncident, KGRemediationEvent,
-                                        LogObservation, PodEvent, Service)
+                                        K8sJobRun, KGIncident,
+                                        KGRemediationEvent, LogObservation,
+                                        PodEvent, Service)
 from app.models.incident import Incident
 
 AS_OF = datetime(2026, 9, 20, 10, 0, tzinfo=timezone.utc)
@@ -84,6 +85,14 @@ def _seed(s):
         K8sJob(namespace="squad-9-shared", name="chat-db-migrate", kind="Job",
                failed_count=0, succeeded_count=1, start_time=N - 70 * M,
                completion_time=N - 69 * M, last_seen_at=N + 3 * 60 * M),
+        # История Job-ов (#454): упал до as_of; успех того же Job-а — после.
+        K8sJobRun(namespace="squad-9-kingdom2", name="bravo-db-migrate", failed_count=2,
+                  succeeded_count=0, active_count=0, last_pod_exit_code=1,
+                  condition_type="Failed", condition_reason="BackoffLimitExceeded",
+                  start_time=N - 70 * M, observed_at=N - 60 * M, disappeared=False),
+        K8sJobRun(namespace="squad-9-kingdom2", name="bravo-db-migrate", failed_count=2,
+                  succeeded_count=1, active_count=0, condition_type="Complete",
+                  start_time=N + 5 * M, observed_at=N + 20 * M, disappeared=False),
         KGIncident(incident_key="squad-9-shared/alpha-service@1", namespace="squad-9-shared",
                    service_name="alpha-service", status="resolved", severity="warning",
                    opened_at=N - 2 * 24 * 60 * M, last_alert_at=N - 2 * 24 * 60 * M,
@@ -162,8 +171,22 @@ def test_deploys_split_code_rollout_statics(db):
     assert d["statics_count"] == 2
 
 
-def test_jobs_snapshot_is_flagged_when_updated_after_as_of(db):
+def test_jobs_come_from_history_at_as_of(db):
     jobs = {j["name"]: j for j in _kgc(db)["jobs"]}
+    # Успех после as_of — будущее: на момент инцидента migrate-job упал.
+    assert jobs["bravo-db-migrate"]["status"] == "failed"
+    assert jobs["bravo-db-migrate"]["source"] == "kg_k8s_job_runs"
+    assert "chat-db-migrate" not in jobs      # в истории его нет — снимок не подмешан
+
+
+class _NoHistory(kgi.SessionReader):
+    def has_column(self, table, column):
+        return False if table == "kg_k8s_job_runs" else super().has_column(table, column)
+
+
+def test_jobs_snapshot_is_flagged_when_updated_after_as_of(db):
+    kgc = kgi.fetch_kg_incident_context(_NoHistory(db), _scope())
+    jobs = {j["name"]: j for j in kgc["jobs"]}
     assert jobs["bravo-db-migrate"]["failed"] == 2 and jobs["bravo-db-migrate"]["migrate"]
     assert not jobs["bravo-db-migrate"]["state_after_as_of"]
     assert jobs["chat-db-migrate"]["state_after_as_of"]

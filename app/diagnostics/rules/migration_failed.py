@@ -118,8 +118,11 @@ def _kg_migrate_job_signal(jobs: List[Dict[str, Any]]) -> Optional[Dict[str, Any
     for j in jobs:
         if not isinstance(j, dict) or not j.get("migrate") or j.get("state_after_as_of"):
             continue
-        if (j.get("failed") or 0) > 0 and not (j.get("succeeded") or 0):
-            reason = "Failed"
+        status = j.get("status")
+        failed = (status in ("failed", "retrying") if status
+                  else (j.get("failed") or 0) > 0 and not (j.get("succeeded") or 0))
+        if failed:
+            reason = "Failed" if status != "retrying" else "Retrying"
             if j.get("exit_code") is not None:
                 reason += f" exit_code={j['exit_code']}"
             return {"job": str(j.get("name") or ""), "reason": reason}
