@@ -1160,10 +1160,12 @@ class IncidentPipeline:
         """
         if not getattr(settings, "REMEDIATION_PLAYBOOK_BINDING_ENABLED", False):
             return None
-        from app.remediation.matcher import match_playbooks
+        from app.remediation.matcher import classify_alert, match_playbooks
+        classification = classify_alert(self.incident.labels)
         try:
             candidates = match_playbooks(
                 alertname=(self.incident.labels or {}).get("alertname"),
+                classification=classification,
                 facts=self.fact_store,
             )
         except Exception as e:
@@ -1180,7 +1182,7 @@ class IncidentPipeline:
                 facts=self.fact_store,
                 namespace=self.incident.namespace or "",
                 alertname=(self.incident.labels or {}).get("alertname"),
-                classification=None,
+                classification=classification,
             )
         except Exception as e:
             # Без снимка gate заблокирует мутирующий intent (binding_missing)

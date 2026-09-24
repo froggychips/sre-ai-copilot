@@ -1,0 +1,50 @@
+# Масштабирование Deployment-а, который упирается в CPU под нагрузкой.
+#
+# CPUThrottlingHigh — самый частый «ресурсный» алерт кластера (285 срабатываний
+# за 7 дней на 24.09.2026). Добавить реплику помогает, когда нагрузка выросла, а
+# сервис здоров. Не помогает — и потому исключено preconditions:
+#   * crashloop / OOM: реплика с тем же дефектом упадёт так же;
+#   * свежий выкат: регресс в новой версии лечится откатом, а не репликами;
+#   * UNKNOWN любого из них (источник упал) — не доказательство отсутствия.
+#
+# Чего playbook проверить не может (фактов нет) и что остаётся человеку при
+# одобрении: есть ли у Deployment-а HPA (он перезапишет ручной scale — тогда
+# verify action_took_effect покажет расхождение) и в какую сторону меняется
+# число реплик. Поэтому только approve, auto не бывает.
+#
+# NB: "no"/"yes"/"maybe" в кавычках — иначе PyYAML прочтёт no/yes как bool.
+schema_version: remediation.playbook/v2
+name: scale_out_cpu_throttled_deployment
+kind: remediation
+description: |
+  kubectl scale Deployment-а, который троттлится по CPU, при здоровом процессе:
+  без crashloop, без OOM и без свежего выката. Только dev/squad и только через
+  одобрение человека; prod/preprod/system/data-plane — block.
+match:
+  alertnames: ["CPUThrottlingHigh"]
+preconditions:
+  - {fact: resource_pressure, verdict: found}
+  - {fact: crashloop, verdict: absent}
+  - {fact: oom_killed, verdict: absent}
+  - {fact: recent_deploy, verdict: absent}
+policy:
+  approve:
+    namespace_tier: ["dev", "squad"]
+    data_plane: ["no", "maybe"]
+  block:
+    any:
+      namespace_tier: ["prod", "preprod", "system"]
+      data_plane: ["yes"]
+      reversibility: ["hard"]
+      confidence: ["weak"]
+plan:
+  steps:
+    - action: describe_resource
+    - action: scale_deployment
+      params:
+        replicas: "{replicas}"
+verify:
+  - same_identity
+  - action_took_effect
+  - converged
+  - healthy

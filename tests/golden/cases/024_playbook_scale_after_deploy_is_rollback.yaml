@@ -1,0 +1,22 @@
+id: 024_playbook_scale_after_deploy_is_rollback
+title: CPU-троттлинг сразу после выката — scale НЕ предлагается (это регресс, а не нагрузка)
+source: synthetic
+llm: false
+incident: {incident_id: golden-024, severity: warning, status: firing,
+           summary: "Processes experience elevated CPU throttling", description: "CPU throttling high",
+           namespace: squad-3,
+           labels: {alertname: CPUThrottlingHigh, pod: api-7c9d-xyz12, service: api, namespace: squad-3},
+           annotations: {description: "85% throttling of CPU in namespace squad-3 for container api"},
+           starts_at: "2026-09-20T10:00:00Z", ends_at: null, generator_url: null, raw: {}}
+context:
+  metrics_summary: {cpu_pressure: true, memory_pressure: false}
+  k8s_events: []
+  recent_deployments:
+    - {name: api, ts: "2026-09-20T09:52:00Z", repo: api, sha: abc1234}
+expect:
+  # Выкат за 8 минут до алерта: recent_deploy FOUND → preconditions не
+  # выполнены, кандидатов нет. Лечится откатом, реплики его не снимут.
+  facts:
+    resource_pressure: true
+    recent_deploy: true
+  playbooks: []

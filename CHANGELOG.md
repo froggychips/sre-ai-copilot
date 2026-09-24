@@ -39,6 +39,20 @@ All notable changes to this project are documented in this file.
   политика playbook-а складывается с gate по строжайшему. `playbook` входит
   в подпись intent-а только когда задан — подписи уже одобренных не сдвигаются.
 
+- **Playbook `scale_out_cpu_throttled_deployment`** — второй исполнимый
+  сценарий после рестарта: `kubectl scale` Deployment-а по
+  `CPUThrottlingHigh` (самый частый ресурсный алерт кластера) при
+  доказанно здоровом процессе — `resource_pressure` FOUND, crashloop / OOM /
+  свежий выкат ABSENT (UNKNOWN не проходит). Только dev/squad и только
+  через одобрение; prod/preprod/system/data-plane — block. Число реплик —
+  шаблон `{replicas}`, его видит человек при одобрении. Golden-кейсы 023
+  (кандидат) и 024 (выкат за 8 минут — нет кандидата, это откат).
+  Playbook под rollback не добавлен: действия отката нет в `ACTION_SPECS`.
+- **Classification доходит до matcher-а.** Pipeline и golden передают
+  `classify_alert(labels)` — тот же классификатор, что у preview, без KG и
+  enrichment-сигналов; UNKNOWN → None, и playbook с `match.classification`
+  такой инцидент не выбирает.
+
 ### Изменено
 
 - **Привязка intent → playbook держится на серверном снимке, а не на имени

@@ -331,3 +331,65 @@ def test_verify_remediation_applies_playbook_checks(monkeypatch) -> None:
         .analysis["executor_verification"]
     assert ver["playbook_verify"]["checks"]["same_identity"] is None
     engine.dispose()
+
+
+# ── scale-playbook и classification ──────────────────────────────────────
+
+_SCALE = "scale_out_cpu_throttled_deployment"
+_HEALTHY = {"resource_pressure": "found", "crashloop": "absent",
+            "oom_killed": "absent", "recent_deploy": "absent"}
+
+
+def _store(**verdicts):
+    from app.diagnostics.facts import Fact, FactStore
+    store = FactStore()
+    for kind, verdict in verdicts.items():
+        if verdict == "unknown":
+            store.add(Fact.unknown(kind, "source down"))
+        else:
+            store.add(Fact(kind=kind, observed=verdict == "found", confidence=0.9,
+                           verdict=verdict))
+    return store
+
+
+def _names(reg, alertname, facts):
+    return [pb.name for pb in matcher.match_playbooks(reg, alertname=alertname, facts=facts)]
+
+
+@pytest.mark.parametrize("kind, verdict", [
+    ("recent_deploy", "found"), ("oom_killed", "found"),
+    ("crashloop", "found"), ("recent_deploy", "unknown"),
+])
+def test_scale_playbook_needs_healthy_process(kind, verdict) -> None:
+    reg = load_registry()
+    assert _names(reg, "CPUThrottlingHigh", _store(**_HEALTHY)) == [_SCALE]
+    assert _names(reg, "CPUThrottlingHigh", _store(**{**_HEALTHY, kind: verdict})) == []
+
+
+def test_scale_playbook_only_for_its_alert() -> None:
+    assert _SCALE not in _names(load_registry(), "KubePodCrashLooping", _store(**_HEALTHY))
+
+
+def test_scale_playbook_gate_approves_squad_blocks_prod_and_data_plane(binding_on) -> None:
+    scale = load_registry()[_SCALE]
+    for ns, name, want in (("squad-1", "town-service", PolicyMode.APPROVE),
+                           ("prod-k1", "town-service", PolicyMode.BLOCK),
+                           ("squad-1", "town-postgres", PolicyMode.BLOCK)):
+        snap = _snapshot(scale, namespace=ns)
+        intent = _intent(namespace=ns, resource_name=name, playbook=_SCALE,
+                         playbook_match=snap["entries"][0]["binding"])
+        assert evaluate_intent_gate(intent, match_snapshot=snap).mode == want, (ns, name)
+
+
+def test_classify_alert_is_fail_closed() -> None:
+    # Лейблов для классов с сигналами нет — классификации нет, а не угаданная.
+    assert matcher.classify_alert({"alertname": "CPUThrottlingHigh", "namespace": "squad-1"}) is None
+    assert matcher.classify_alert(None) is None
+
+
+def test_classification_reaches_matcher() -> None:
+    pb = _pb(name="t_by_class", match={"classification": "memory_pressure"})
+    reg = {pb.name: pb}
+    facts = _store(crashloop="found")
+    assert matcher.match_playbooks(reg, classification="memory_pressure", facts=facts) == [pb]
+    assert matcher.match_playbooks(reg, classification=None, facts=facts) == []

@@ -1,0 +1,23 @@
+id: 023_playbook_scale_cpu_throttled
+title: CPU-троттлинг под нагрузкой при здоровом процессе — scale-playbook кандидат
+source: synthetic
+llm: false
+incident: {incident_id: golden-023, severity: warning, status: firing,
+           summary: "Processes experience elevated CPU throttling", description: "CPU throttling high",
+           namespace: squad-3,
+           labels: {alertname: CPUThrottlingHigh, pod: api-7c9d-xyz12, service: api, namespace: squad-3},
+           annotations: {description: "85% throttling of CPU in namespace squad-3 for container api"},
+           starts_at: "2026-09-20T10:00:00Z", ends_at: null, generator_url: null, raw: {}}
+context:
+  metrics_summary: {cpu_pressure: true, memory_pressure: false}
+  k8s_events: []
+  recent_deployments: []
+expect:
+  # Позитивный случай scale_out_cpu_throttled_deployment: resource_pressure
+  # FOUND, crashloop/OOM/выкат доказанно ABSENT.
+  facts:
+    resource_pressure: true
+    crashloop: false
+    oom_killed: false
+    recent_deploy: false
+  playbooks: [scale_out_cpu_throttled_deployment]
