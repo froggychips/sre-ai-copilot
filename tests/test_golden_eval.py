@@ -12,8 +12,10 @@ import json
 
 import pytest
 
+from app.agents.fact_critic import _BatchCritic
+from app.config import settings
 from app.evaluation.golden import BASELINE_PATH, load_cases, run_case, summarize
-from app.evaluation.llm_replay import Recordings, install_replay
+from app.evaluation.llm_replay import Recordings, _sha, install_replay
 
 CASES = load_cases()
 
@@ -31,6 +33,32 @@ def test_golden_case(case, monkeypatch):
             f"нет записанных ответов для {case.id}: "
             "снять через scripts/eval_golden.py --mode record"
         )
+    install_replay(monkeypatch, recordings)
+    result = asyncio.run(run_case(case))
+
+    assert result.error is None, f"{case.id}: {result.error}"
+    assert result.passed, (
+        f"{case.id} — провалено {result.failed_checks}\n"
+        + "\n".join(f"  · {n}" for n in result.notes)
+    )
+
+
+_BATCH_ROLE = _sha(_BatchCritic().role.strip())
+_LLM_CASES = [c for c in CASES if c.llm]
+
+
+@pytest.mark.parametrize("case", _LLM_CASES, ids=[c.id for c in _LLM_CASES])
+def test_golden_case_batch_critic(case, monkeypatch):
+    """Тот же кейс с FACT_CRITIC_MODE=batch: пакетный критик не должен
+    менять исход там, где его ответ записан (scripts/eval_golden.py
+    --mode record-missing). Гипотезы и fix — из тех же записей."""
+    recordings = Recordings.load(case.recording_path)
+    if not any(c.get("role") == _BATCH_ROLE for c in recordings.calls):
+        pytest.skip(
+            f"нет записи пакетного критика для {case.id}: FACT_CRITIC_MODE=batch "
+            "scripts/eval_golden.py --mode record-missing"
+        )
+    monkeypatch.setattr(settings, "FACT_CRITIC_MODE", "batch")
     install_replay(monkeypatch, recordings)
     result = asyncio.run(run_case(case))
 

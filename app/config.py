@@ -424,6 +424,27 @@ class Settings(BaseSettings):
         1024, description="Maximum number of tokens to generate in LLM responses"
     )
 
+    # Режим LLM-части FactCritic (app/agents/fact_critic.py). per_hypothesis —
+    # вызов на гипотезу: замер 24.09.2026 на claude_cli — ~11 из ~16 вызовов
+    # кейса и основная латентность. batch — один вызов на все гипотезы,
+    # пережившие algo-проверку; гипотеза без вердикта в ответе не выживает.
+    FACT_CRITIC_MODE: str = Field(
+        "per_hypothesis", description="per_hypothesis | batch"
+    )
+    # batch: сколько самых уверенных гипотез отдавать модели. 0 — все.
+    # Остальные помечаются «не проверена» и в survivors не попадают.
+    FACT_CRITIC_BATCH_TOP_N: int = Field(
+        0, ge=0, description="batch: critique only top-N hypotheses by confidence (0 = all)"
+    )
+    # batch: потолок гипотез в одном вызове. Ответ растёт с пакетом, а
+    # MAX_TOKENS общий: больше — чаще обрезка (пакет тогда делится пополам).
+    # 6, а не 12: замер 24.09 на claude_cli — пакет из 12 гипотез шёл
+    # 130–180 с и дважды упёрся в 180-секундный таймаут CLI, пакет из 6 —
+    # 40–85 с. Двенадцать гипотез кейса — два вызова вместо двенадцати.
+    FACT_CRITIC_BATCH_MAX: int = Field(
+        6, ge=1, description="batch: max hypotheses per LLM call"
+    )
+
     LOG_LEVEL: str = Field("INFO", description="Standard logging level")
 
     DISCORD_WEBHOOK_URL: Optional[str] = Field(None, description="Discord webhook — канал #error (инциденты)")
@@ -1124,6 +1145,13 @@ class Settings(BaseSettings):
         if self.EXECUTOR_DISPATCH not in ("inline", "queue"):
             raise ValueError(
                 f"EXECUTOR_DISPATCH must be 'inline' or 'queue', got {self.EXECUTOR_DISPATCH!r}"
+            )
+        # Опечатка («Batch», «batched») молча вернула бы per_hypothesis — и
+        # замер «batch против per_hypothesis» сравнил бы режим сам с собой.
+        if self.FACT_CRITIC_MODE not in ("per_hypothesis", "batch"):
+            raise ValueError(
+                "FACT_CRITIC_MODE must be 'per_hypothesis' or 'batch', "
+                f"got {self.FACT_CRITIC_MODE!r}"
             )
         # Условие включения пайплайна, записанное исполняемым правилом.
         # Раньше оно жило комментарием у LLM_PIPELINE_ENABLED («включать

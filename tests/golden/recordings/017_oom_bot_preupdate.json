@@ -71,6 +71,18 @@
       "ctx": "825c4b343d98c509",
       "task_type": "analysis",
       "text": "```json\n{\n    \"action\": \"scale_deployment\",\n    \"resource_type\": \"deployment\",\n    \"resource_name\": \"unknown\",\n    \"namespace\": \"default\",\n    \"params\": {\n        \"replicas\": 2,\n        \"memory_limit\": \"512Mi\",\n        \"memory_request\": \"256Mi\"\n    },\n    \"risk\": \"medium\"\n}\n```"
+    },
+    {
+      "role": "177236372fcc2908",
+      "ctx": "5bf57d11db87dd63",
+      "task_type": "critic",
+      "text": "```json\n{\"critiques\": [{\"id\": \"h1\", \"refutations\": []}, {\"id\": \"h2\", \"refutations\": []}, {\"id\": \"h3\", \"refutations\": []}, {\"id\": \"h4\", \"refutations\": []}, {\"id\": \"h5\", \"refutations\": []}, {\"id\": \"h6\", \"refutations\": []}]}\n```"
+    },
+    {
+      "role": "177236372fcc2908",
+      "ctx": "3c621685667e5446",
+      "task_type": "critic",
+      "text": "{\"critiques\": [{\"id\": \"h1\", \"refutations\": []}, {\"id\": \"h2\", \"refutations\": []}]}"
     }
   ]
 }

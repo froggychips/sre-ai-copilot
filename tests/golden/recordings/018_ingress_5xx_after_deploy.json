@@ -53,6 +53,12 @@
       "ctx": "0ff83b2db895a4b1",
       "task_type": "critic",
       "text": "{\"refutations\": [\"upstream_degraded is ✗ NOT observed (conf=0.30, reason=no_graph_data): the hypothesis requires the gateway to be exhausting connections to upstream services and causing cascades there, but no upstream degradation was detected — even accounting for no_graph_data, the absence of any positive upstream_degraded signal means the core causal mechanism (upstream exhaustion) has no supporting evidence in the observed facts\"]}"
+    },
+    {
+      "role": "177236372fcc2908",
+      "ctx": "cb37a45ccd3b3c44",
+      "task_type": "critic",
+      "text": "```json\n{\"critiques\": [{\"id\": \"h1\", \"refutations\": []}, {\"id\": \"h2\", \"refutations\": []}, {\"id\": \"h3\", \"refutations\": []}, {\"id\": \"h4\", \"refutations\": []}, {\"id\": \"h5\", \"refutations\": []}, {\"id\": \"h6\", \"refutations\": []}]}\n```"
     }
   ]
 }
