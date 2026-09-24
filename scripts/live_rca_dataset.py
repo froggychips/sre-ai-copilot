@@ -719,7 +719,9 @@ async def _run_case(case: Dict[str, Any], context: str) -> Dict[str, Any]:
         "ranked_causes": [_cause(h) for h in ranked[:5]],
         "observed_facts": sorted(store.observed_kinds()),
         "had_snapshot": isinstance(case.get("context_snapshot"), dict),
-        "context": case.get("context") or ("snapshot" if case.get("context_snapshot") else "alert_only"),
+        # Режим прогона — в "context" выше (по нему done и score by_context);
+        # метка входа самого кейса — отдельно, чтобы одна не затирала другую.
+        "case_context": case.get("context") or ("snapshot" if case.get("context_snapshot") else "alert_only"),
     }
 
 
