@@ -287,3 +287,27 @@ def test_mark_noise_without_incident_or_kinds_is_a_noop(db):
     inc = _attach(db, svc, "fp-1", T0)
     assert mark_incident_noise(db, fingerprint="fp-1", kinds=[]) is None
     assert inc.noise is False
+
+
+def test_unmark_removes_only_given_kind_and_restores_flag(db):
+    from app.knowledge_graph.incidents import unmark_incident_noise
+
+    svc = _svc(db)
+    inc = _attach(db, svc, "fp-1", T0, "KubeDeploymentGenerationMismatch")
+    mark_incident_noise(db, fingerprint="fp-1", kinds=["controller_lag_rancher_churn", "gen_mismatch"])
+    assert inc.noise is True
+    unmark_incident_noise(db, fingerprint="fp-1", kind="controller_lag_rancher_churn")
+    assert inc.extras["noise_fingerprints"]["fp-1"] == ["gen_mismatch"]
+    assert inc.noise is True                        # другой вид шума остался
+    unmark_incident_noise(db, fingerprint="fp-1", kind="gen_mismatch")
+    assert "fp-1" not in inc.extras["noise_fingerprints"]
+    assert inc.noise is False
+
+
+def test_unmark_noop_when_nothing_to_remove(db):
+    from app.knowledge_graph.incidents import unmark_incident_noise
+
+    svc = _svc(db)
+    _attach(db, svc, "fp-1", T0)
+    assert unmark_incident_noise(db, fingerprint="fp-1", kind="controller_lag_rancher_churn") is None
+    assert unmark_incident_noise(db, fingerprint="fp-none", kind="x") is None

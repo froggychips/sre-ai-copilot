@@ -86,7 +86,9 @@ def open_incident_for_namespaces(
         KGIncident.namespace.in_(namespaces),
         KGIncident.opened_at <= at_n,
     )
-    rows = q.order_by(KGIncident.opened_at.desc()).limit(20).all()
+    # Не-шумовые первыми уже в запросе: на стенде бывает больше 20 открытых
+    # churn-инцидентов, и лимит иначе отрезал бы реальный инцидент.
+    rows = q.order_by(KGIncident.noise.asc(), KGIncident.opened_at.desc()).limit(20).all()
     # Шумовой инцидент — только если другого нет: иначе действие медика
     # цеплялось к мигающему GenerationMismatch-у (Rancher churn, ~500 в сутки
     # в squad-*), а не к тому, что он на самом деле чинил.

@@ -681,13 +681,31 @@ async def alertmanager_webhook_store_only(
         try:
             stats = populate_from_incident(db, incident)
             stored.append({"incident_id": incident.incident_id, "result": "stored", **stats})
-            if (alert.labels.get("namespace"), alert.labels.get("deployment")) in churn:
+            # Только сам GenerationMismatch: ReplicasMismatch того же Deployment-а
+            # в том же batch-е — реальный сигнал, churn его не касается.
+            if alert.labels.get("alertname") == "KubeDeploymentGenerationMismatch":
+                from app.knowledge_graph.incidents import unmark_incident_noise
                 from app.services.alert_enrichment import GENERATION_CHURN_NOISE_KIND
-                ALERTS_SUPPRESSED.labels(
-                    reason=GENERATION_CHURN_NOISE_KIND,
-                    alertname=alert.labels.get("alertname", ""),
-                ).inc()
-                _mark_incidents_noise(db, [incident], [GENERATION_CHURN_NOISE_KIND])
+                key = (alert.labels.get("namespace"), alert.labels.get("deployment"))
+                if key in churn:
+                    ALERTS_SUPPRESSED.labels(
+                        reason=GENERATION_CHURN_NOISE_KIND,
+                        alertname=alert.labels.get("alertname", ""),
+                    ).inc()
+                    _mark_incidents_noise(db, [incident], [GENERATION_CHURN_NOISE_KIND])
+                else:
+                    # Тот же fingerprint раньше был churn-ом, теперь — нет (пошёл
+                    # накат, spec написал человек, снимка нет): снимаем старую
+                    # пометку, иначе инцидент так и останется спрятанным.
+                    try:
+                        unmark_incident_noise(
+                            db, fingerprint=incident.incident_id, kind=GENERATION_CHURN_NOISE_KIND,
+                        )
+                        db.commit()
+                    except Exception as e:
+                        db.rollback()
+                        log.warning("kg_store.noise_unmark_failed",
+                                    incident_id=incident.incident_id, error=type(e).__name__)
         except Exception as e:
             # Откатываем failed-транзакцию, иначе session остаётся в
             # сорванном состоянии и финальный db.commit() уронит весь batch.

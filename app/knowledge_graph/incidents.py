@@ -276,6 +276,44 @@ def mark_incident_noise(
     return inc
 
 
+def unmark_incident_noise(db: Session, *, fingerprint: str, kind: str) -> Optional[KGIncident]:
+    """Снять у алерта один вид шума и пересчитать флаг инцидента.
+
+    Нужен там, где решение о шуме пересматривается на каждом срабатывании
+    (churn GenerationMismatch-а): `mark_incident_noise` только добавляет виды,
+    и без снятия однажды помеченный fingerprint прятал бы инцидент и тогда,
+    когда Deployment уже в реальном накате. Нечего снимать — None, без записи.
+    """
+    if not fingerprint or not kind:
+        return None
+    key = (
+        db.query(AlertEvent.incident_id)
+        .filter(AlertEvent.fingerprint == fingerprint)
+        .scalar()
+    )
+    if not key:
+        return None
+    inc = db.query(KGIncident).filter(KGIncident.incident_key == key).one_or_none()
+    if inc is None or not isinstance(inc.extras, dict):
+        return None
+    extras: Dict[str, Any] = dict(inc.extras)
+    marked: Dict[str, List[str]] = dict(extras.get("noise_fingerprints") or {})
+    kinds = [k for k in (marked.get(fingerprint) or []) if k != kind]
+    if kinds == list(marked.get(fingerprint) or []):
+        return None
+    if kinds:
+        marked[fingerprint] = kinds
+    else:
+        marked.pop(fingerprint, None)
+    extras["noise_fingerprints"] = marked
+    row: Any = inc
+    row.extras = extras
+    row.noise = _all_noise(extras, list(inc.fingerprints or []))
+    db.flush()
+    log.info("kg.incident.noise_unmarked", incident=inc.incident_key, kind=kind, noise=inc.noise)
+    return inc
+
+
 def incident_to_dict(inc: KGIncident) -> Dict[str, Any]:
     extras: Dict[str, Any] = inc.extras if isinstance(inc.extras, dict) else {}
     noise_kinds = sorted({k for ks in (extras.get("noise_fingerprints") or {}).values() for k in (ks or [])})

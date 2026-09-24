@@ -293,3 +293,64 @@ def test_store_marks_generation_churn_incident_as_noise(app_client, churn, expec
             assert "controller_lag_rancher_churn" in (inc.extras or {})["noise_fingerprints"][fingerprint]
     finally:
         db.close()
+
+
+def test_store_churn_does_not_mark_other_alerts_of_same_deployment(app_client):
+    """ReplicasMismatch того же Deployment-а в том же batch-е — не шум."""
+    from app.database import SessionLocal
+    from app.knowledge_graph.schema import AlertEvent, KGIncident
+
+    deployment = f"svc-{uuid.uuid4().hex[:6]}"
+    fp_gen = f"store-gen-{uuid.uuid4().hex[:12]}"
+    fp_rep = f"store-rep-{uuid.uuid4().hex[:12]}"
+    payload = _gen_mismatch_payload(fp_gen, deployment)
+    rep = json.loads(json.dumps(payload["alerts"][0]))
+    rep["labels"]["alertname"] = "KubeDeploymentReplicasMismatch"
+    rep["fingerprint"] = fp_rep
+    payload["alerts"].append(rep)
+
+    async def fake_targets(_alerts):
+        return {("squad-18-shared", deployment)}
+
+    with patch("app.api.webhooks._generation_churn_targets", side_effect=fake_targets):
+        resp = _post_signed(app_client, "/webhooks/alertmanager/store", payload)
+    assert resp.status_code == 202, resp.text
+
+    db = SessionLocal()
+    try:
+        key = db.query(AlertEvent.incident_id).filter(AlertEvent.fingerprint == fp_rep).scalar()
+        inc = db.query(KGIncident).filter(KGIncident.incident_key == key).one()
+        marked = (inc.extras or {}).get("noise_fingerprints") or {}
+        assert fp_rep not in marked
+        assert inc.noise is False, "реальный ReplicasMismatch не должен прятать инцидент"
+    finally:
+        db.close()
+
+
+def test_store_unmarks_churn_when_deployment_starts_real_rollout(app_client):
+    """Тот же fingerprint: сначала churn → noise, потом накат → noise снимается."""
+    from app.database import SessionLocal
+    from app.knowledge_graph.schema import AlertEvent, KGIncident
+
+    deployment = f"svc-{uuid.uuid4().hex[:6]}"
+    fingerprint = f"store-gen-{uuid.uuid4().hex[:12]}"
+    targets = [{("squad-18-shared", deployment)}, set()]
+
+    async def fake_targets(_alerts):
+        return targets.pop(0)
+
+    with patch("app.api.webhooks._generation_churn_targets", side_effect=fake_targets):
+        for _ in range(2):
+            p = _gen_mismatch_payload(fingerprint, deployment)
+            p["groupKey"] += uuid.uuid4().hex[:4]  # другой batch — иначе anti-replay
+            resp = _post_signed(app_client, "/webhooks/alertmanager/store", p)
+            assert resp.status_code == 202, resp.text
+
+    db = SessionLocal()
+    try:
+        key = db.query(AlertEvent.incident_id).filter(AlertEvent.fingerprint == fingerprint).scalar()
+        inc = db.query(KGIncident).filter(KGIncident.incident_key == key).one()
+        assert inc.noise is False
+        assert fingerprint not in ((inc.extras or {}).get("noise_fingerprints") or {})
+    finally:
+        db.close()
