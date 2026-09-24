@@ -40,7 +40,8 @@ from sqlalchemy.orm import Session
 
 from app.config import settings
 from app.providers.factory import make_log_provider
-from app.knowledge_graph.schema import NODE_KIND_SERVICE, LogObservation, Service
+from app.knowledge_graph.schema import (NODE_KIND_SERVICE, LogObservation, Namespace,
+                                        Service)
 from app.services.pii_redaction import redact_pii
 
 log = logging.getLogger(__name__)
@@ -49,6 +50,17 @@ log = logging.getLogger(__name__)
 # Уровни Seq, которые льём в KG. Warning тоже учитываем (см. WO signal-m33302),
 # но при необходимости можно отрезать через env позже.
 _LEVELS = ("Error", "Fatal", "Warning")
+
+# Сквадовые Seq: только Error/Fatal. Warning у стендов — поток шума от ботов и
+# статики (см. память про флуд seq на dev-нодах), а разбору поломки стенда
+# нужны ошибки старта и миграций. Треть запросов на каждый из ~100 инстансов.
+_SQUAD_LEVELS = ("Error", "Fatal")
+
+# Таймаут одного запроса к сквадовому Seq. Прод держит 10 с; стендов около
+# сотни, и один зависший не должен растягивать тик: при 8 параллельных
+# запросах и 5 с потолок тика — ~2 мин даже если не ответит никто.
+_SQUAD_TIMEOUT_S = 5.0
+_SQUAD_CONCURRENCY = 8
 
 
 class LogSourceUnavailable(RuntimeError):
@@ -114,6 +126,52 @@ def _load_instances() -> List[Dict[str, Optional[str]]]:
         })
 
     return instances
+
+
+def _discover_squad_instances(db: Session) -> List[Dict[str, Optional[str]]]:
+    """Сквадовые Seq-инстансы из графа: сервис `seq` в активном squad-* ns.
+
+    До 24.09.2026 синк знал только прод (`SEQ_INSTANCES` — девять статичных
+    записей), и `kg_log_observations` по сквадам был пуст: ошибки мигратора и
+    «column does not exist» на стендах в граф не попадали вовсе, а модель при
+    разборе поломки стенда видела только «под крашится». У каждого стенда свой
+    Seq в своём namespace (`seq.<ns>.svc`, без ключа —
+    SEQ_FIRSTRUN_NOAUTHENTICATION), список меняется с каждым заездом/сносом
+    стенда — поэтому не конфиг, а граф.
+
+    Выключатель `SEQ_SQUAD_DISCOVERY_ENABLED` (по умолчанию off: без правила
+    egress в NetworkPolicy copilot все запросы упрутся в таймаут) и потолок
+    `SEQ_SQUAD_MAX_INSTANCES`.
+    """
+    if not getattr(settings, "SEQ_SQUAD_DISCOVERY_ENABLED", False):
+        return []
+    limit = int(getattr(settings, "SEQ_SQUAD_MAX_INSTANCES", 150) or 0)
+    if limit <= 0:
+        return []
+    rows = (
+        db.query(Service.namespace)
+        .join(Namespace, Namespace.namespace == Service.namespace)
+        .filter(
+            Service.name == "seq",
+            Service.node_kind == NODE_KIND_SERVICE,
+            Service.namespace.like("squad-%"),
+            Namespace.state == "active",
+        )
+        .distinct()
+        .order_by(Service.namespace)
+        .limit(limit)
+        .all()
+    )
+    return [
+        {
+            "name": f"squad:{ns}",
+            "url": f"http://seq.{ns}.svc.cluster.local",
+            "token": None,
+            "namespace": ns,
+            "kind": "squad",
+        }
+        for (ns,) in rows if ns
+    ]
 
 
 def _seq_app_candidates(app_name: str) -> List[str]:
@@ -277,11 +335,15 @@ async def _sync_instance(
     # Провайдер, а не SeqClient напрямую: синк не должен знать, откуда
     # берутся логи. Реализация выбирается конфигом (LOG_PROVIDER_BACKEND),
     # и смена источника не требует правок здесь.
-    provider = make_log_provider(name=name, url=url, token=token, timeout=10.0)
+    squad = instance.get("kind") == "squad"
+    levels = _SQUAD_LEVELS if squad else _LEVELS
+    provider = make_log_provider(
+        name=name, url=url, token=token, timeout=_SQUAD_TIMEOUT_S if squad else 10.0,
+    )
     stats = {"groups_total": 0, "matched": 0, "unmatched": 0, "rows": 0,
              "unmeasured": 0, "measured": 0}
 
-    for level in _LEVELS:
+    for level in levels:
         window = await provider.service_stats(
             level=level, since=since, until=until, limit=500,
         )
@@ -353,7 +415,7 @@ async def _sync_instance(
         # ничего. Вернуться нормально значило бы попасть в `reached` и
         # объявить прогон успешным при полной слепоте.
         raise LogSourceUnavailable(
-            f"{name}: ни один уровень из {len(_LEVELS)} не измерен"
+            f"{name}: ни один уровень из {len(levels)} не измерен"
         )
 
     return stats
@@ -364,7 +426,7 @@ async def _sync_seq_logs_async(
     window_minutes: int = 10,
 ) -> Dict[str, Any]:
     instances = _load_instances()
-    if not instances:
+    if not instances and not getattr(settings, "SEQ_SQUAD_DISCOVERY_ENABLED", False):
         log.info("seq_logs_sync.skipped reason=no_instances")
         return {"skipped": "no_instances"}
 
@@ -400,6 +462,49 @@ async def _sync_seq_logs_async(
         totals["matched"] += stats["matched"]
         totals["unmatched"] += stats["unmatched"]
 
+    # Сквады — отдельным счётом: их отказы не должны превращать прогон прода
+    # в «partial», а «все сквады недоступны» — отдельный сигнал (как правило,
+    # NetworkPolicy), а не «логи прода неизвестны». Параллельно с потолком:
+    # сессия БД одна, но это один поток event loop-а — upsert-ы между await-ами
+    # идут строго по очереди.
+    squads = _discover_squad_instances(db)
+    squad_totals = {"instances": len(squads), "reached": 0, "failed": 0, "rows": 0}
+    if squads:
+        sem = asyncio.Semaphore(_SQUAD_CONCURRENCY)
+
+        async def _one(inst: Dict[str, Optional[str]]) -> Optional[Dict[str, int]]:
+            async with sem:
+                try:
+                    return await _sync_instance(db, inst, since, until, ts_bucket)
+                except Exception as e:
+                    log.debug("seq_logs_sync.squad_failed name=%s err=%s", inst.get("name"), e)
+                    return None
+
+        for res in await asyncio.gather(*(_one(i) for i in squads)):
+            if res is None:
+                squad_totals["failed"] += 1
+                continue
+            squad_totals["reached"] += 1
+            squad_totals["rows"] += res["rows"]
+            totals["rows"] += res["rows"]
+            totals["matched"] += res["matched"]
+            totals["unmatched"] += res["unmatched"]
+        if squad_totals["reached"] == 0:
+            log.error(
+                "seq_logs_sync.squads_all_unreachable count=%d — логи стендов вне обзора "
+                "(NetworkPolicy copilot → seq:80?)", squad_totals["failed"],
+            )
+        elif squad_totals["failed"]:
+            log.warning(
+                "seq_logs_sync.squads_partial reached=%d failed=%d",
+                squad_totals["reached"], squad_totals["failed"],
+            )
+    totals["squads"] = squad_totals
+    if not instances and squads and squad_totals["reached"] == 0:
+        # Прода нет в конфиге, а стенды не ответили все — прогон слепой
+        # целиком, heartbeat писать нельзя (см. правило reached == 0 ниже).
+        totals["error"] = f"все {squad_totals['failed']} сквадовых Seq недоступны"
+
     db.commit()
     log.info(
         "seq_logs_sync.done instances=%d reached=%d failed=%d rows=%d "
@@ -408,7 +513,7 @@ async def _sync_seq_logs_async(
         totals["rows"], totals["matched"], totals["unmatched"],
         window_minutes, ts_bucket.isoformat(),
     )
-    if totals["reached"] == 0:
+    if instances and totals["reached"] == 0:
         # Ни один инстанс не ответил — состояние логов НЕИЗВЕСТНО, и
         # «ошибок за окно нет» утверждать нельзя. Возвращаем error-маркер:
         # `_record_beat_heartbeat` не пишет heartbeat для таких прогонов, и

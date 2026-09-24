@@ -86,6 +86,11 @@ spec:
         # write-право; исполняет его copilot-executor (k8s/executor.yaml).
         - name: EXECUTOR_DISPATCH
           value: "queue"
+        # Error/Fatal из Seq стендов → kg_log_observations (список Seq — из
+        # графа). Egress copilot → seq:80 — в k8s/networkpolicy.yaml; без него
+        # флаг бесполезен (таймауты), поэтому едут одним деплоем.
+        - name: SEQ_SQUAD_DISCOVERY_ENABLED
+          value: "true"
         # ── дальше: то, что жило ТОЛЬКО в кластере ────────────────────────
         #
         # 21.08.2026: манифест и работающий Deployment разошлись полностью. В

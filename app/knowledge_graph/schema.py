@@ -701,6 +701,56 @@ class K8sJob(Base):
     )
 
 
+class K8sJobRun(Base):
+    """История состояний Job-а: строка на каждое изменение статуса.
+
+    `kg_k8s_jobs` — снимок последнего состояния, и он теряет ровно то, что
+    нужно при разборе: упавший migrate-job к моменту разбора перезаписан
+    следующим запуском с тем же именем или удалён вместе с namespace-ом.
+    Замер 24.09.2026: у squad-19 на 12–14.09 (phantom-миграции после wipe) в
+    графе остались строки только от 31.08 — модель видела «под крашится», а
+    «migrate-job упал с BackoffLimitExceeded» уже не видел никто.
+
+    Пишет `k8s_jobs_sync` (см. `k8s_job_history.record_job_run`), только когда
+    состояние отличается от последней записи того же Job-а: Job с тем же
+    именем, но другим `uid` — новый запуск. Читает `jobs_state_at` —
+    состояние Job-ов namespace-ов на момент T. Retention —
+    `KG_K8S_JOB_RUNS_RETENTION_DAYS` (30 дней, как у событий подов).
+    """
+    __tablename__ = "kg_k8s_job_runs"
+
+    id = Column(Integer, primary_key=True)
+    namespace = Column(String, nullable=False)
+    name = Column(String, nullable=False)
+    # metadata.uid — отличает перезапуск с тем же именем от обновления статуса.
+    uid = Column(String, nullable=True)
+    owner_service_name = Column(String, nullable=True)
+    succeeded_count = Column(Integer, nullable=True)
+    failed_count = Column(Integer, nullable=True)
+    active_count = Column(Integer, nullable=True)
+    start_time = Column(DateTime, nullable=True)
+    completion_time = Column(DateTime, nullable=True)
+    last_pod_exit_code = Column(Integer, nullable=True)
+    # Терминальное условие Job-а: type (Complete / Failed / SuccessCriteriaMet
+    # / FailureTarget), reason (BackoffLimitExceeded / DeadlineExceeded) и
+    # обрезанное message. Для активного Job-а — NULL.
+    condition_type = Column(String, nullable=True)
+    condition_reason = Column(String, nullable=True)
+    condition_message = Column(Text, nullable=True)
+    # Job пропал из кластера (удалён, TTL, снос namespace-а): tombstone-строка
+    # с последним известным состоянием. Без неё последний «running» жил бы в
+    # истории вечно — sync больше этот Job не видит и ничего не пишет.
+    disappeared = Column(Boolean, nullable=False, default=False, server_default="false")
+    # Когда sync увидел это состояние: верхняя граница «с какого момента
+    # известно», точность — период sync-а (15 мин).
+    observed_at = Column(DateTime, nullable=False)
+
+    __table_args__ = (
+        Index("ix_kg_k8s_job_runs_ns_observed", "namespace", "observed_at"),
+        Index("ix_kg_k8s_job_runs_ns_name", "namespace", "name", "id"),
+    )
+
+
 class ServiceEdge(Base):
     """Ребро графа: src сервис вызывает / зависит от dst сервиса.
 

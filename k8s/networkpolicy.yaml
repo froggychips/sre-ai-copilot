@@ -135,6 +135,19 @@ spec:
       port: 8428
     - protocol: TCP
       port: 9093
+  # Seq стендов (seq.<squad-ns>.svc:80 → pod ui:80) — kg_seq_logs_sync,
+  # SEQ_SQUAD_DISCOVERY_ENABLED. У squad-* namespace-ов нет общего лейбла
+  # (kingdom-ns без лейблов вовсе), поэтому все ns, но только поды самого Seq
+  # и только порт UI/API: ingestion 5341 копайлоту не нужен.
+  - to:
+    - namespaceSelector: {}
+      podSelector:
+        matchLabels:
+          app: seq
+          release: seq
+    ports:
+    - protocol: TCP
+      port: 80
   # Внешний HTTPS (Anthropic API, Discord, Jira, ghcr) — только публичные IP.
   - to:
     - ipBlock:
