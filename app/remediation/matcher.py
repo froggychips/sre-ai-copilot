@@ -15,14 +15,13 @@ v1-playbook-и (preview-only) сюда не попадают: их матчит
 """
 from __future__ import annotations
 
-import re
 from functools import lru_cache
 from typing import Any, Mapping
 
 from app.core.execution_dsl import (ActionType, DSLTranslator, ExecutionIntent,
                                     action_spec)
 from app.diagnostics.facts import FactStore, Verdict
-from app.remediation.playbook import Playbook, load_registry
+from app.remediation.playbook import Playbook, load_registry, template_name
 
 __all__ = [
     "PlanRenderError",
@@ -32,8 +31,6 @@ __all__ = [
     "match_playbooks",
     "render_plan",
 ]
-
-_TEMPLATE_RE = re.compile(r"^\{([a-z_][a-z0-9_]*)\}$")
 
 
 class PlanRenderError(ValueError):
@@ -157,13 +154,11 @@ def match_playbooks(
 
 
 def _render_param(value: int | str, context: Mapping[str, Any]) -> Any:
-    if isinstance(value, str):
-        m = _TEMPLATE_RE.match(value)
-        if m:
-            key = m.group(1)
-            if key not in context or context[key] is None:
-                raise PlanRenderError(f"template '{{{key}}}' has no value")
-            return context[key]
+    key = template_name(value)
+    if key is not None:
+        if key not in context or context[key] is None:
+            raise PlanRenderError(f"template '{{{key}}}' has no value")
+        return context[key]
     return value
 
 

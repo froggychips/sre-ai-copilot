@@ -20,16 +20,24 @@ hash в поле `playbook_match`, и hash входит в подпись intent
                                │
       evaluate_intent_gate(intent, match_snapshot=analysis["playbook_match"])
                                └── check_intent_binding
+
+Серверные параметры (`playbook.SERVER_PARAMS`, сейчас `current_replicas`)
+модель не пишет: после выбора цели pipeline снимает их с живого объекта
+(`bind_server_params`), кладёт в запись снимка (`server_params`) и
+пересчитывает её hash. Gate требует, чтобы значение в intent-е совпало со
+снимком: одобрение покрывает и то, против какого состояния сверится
+`kubectl scale --current-replicas`.
 """
 from __future__ import annotations
 
 import hashlib
 import json
 from datetime import datetime, timezone
-from typing import TYPE_CHECKING, Any, Dict, Iterable, List, Mapping, Optional
+from typing import (TYPE_CHECKING, Any, Callable, Dict, Iterable, List, Mapping,
+                    Optional)
 
 from app.remediation.matcher import check_preconditions
-from app.remediation.playbook import Playbook
+from app.remediation.playbook import SERVER_PARAMS, Playbook, template_name
 
 if TYPE_CHECKING:
     from app.core.execution_dsl import ExecutionIntent
@@ -38,6 +46,8 @@ if TYPE_CHECKING:
 __all__ = [
     "SNAPSHOT_VERSION",
     "BindingViolation",
+    "bind_server_params",
+    "bound_entry_for",
     "build_match_snapshot",
     "check_intent_binding",
     "entry_binding",
@@ -46,8 +56,6 @@ __all__ = [
 ]
 
 SNAPSHOT_VERSION = "playbook-match/v1"
-
-_TEMPLATE_PREFIX = "{"
 
 
 class BindingViolation(ValueError):
@@ -142,14 +150,57 @@ def find_entry(
     return None
 
 
-def _is_template(value: Any) -> bool:
-    return isinstance(value, str) and value.startswith(_TEMPLATE_PREFIX)
+def verified_entry(
+    entry: Optional[Mapping[str, Any]], binding: Optional[str],
+) -> Optional[Mapping[str, Any]]:
+    """Запись, если её hash цел и равен `binding`; иначе None."""
+    if not isinstance(entry, Mapping) or not binding:
+        return None
+    if entry.get("binding") != binding or entry_binding(entry) != binding:
+        return None
+    return entry
+
+
+def bound_entry_for(
+    intent: "ExecutionIntent", snapshot: Optional[Mapping[str, Any]],
+) -> Optional[Dict[str, Any]]:
+    """Запись снимка, под которую одобрен intent (hash совпал), или None."""
+    entry = verified_entry(find_entry(snapshot, intent.playbook), intent.playbook_match)
+    return dict(entry) if entry is not None else None
+
+
+def _normalized_params(
+    intent: "ExecutionIntent", params: Mapping[str, Any],
+) -> Optional[Dict[str, Any]]:
+    """Литеральные параметры шага, прогнанные через валидаторы ExecutionIntent.
+
+    YAML допускает `replicas: "2"`; рендер плана отдаёт его через
+    ExecutionIntent, и там строка-цифра становится `2`. Сверка обязана
+    понимать литерал так же, иначе валидный шаг навсегда давал бы
+    `intent_not_in_plan`. Литерал, который валидатор не принимает, — не
+    совпадение (None), а не исключение наружу.
+    """
+    from pydantic import ValidationError
+
+    from app.core.execution_dsl import ExecutionIntent
+
+    if not params:
+        return {}
+    try:
+        return dict(ExecutionIntent.model_validate({
+            "action": intent.action, "resource_type": intent.resource_type,
+            "resource_name": intent.resource_name, "namespace": intent.namespace,
+            "params": dict(params),
+        }).params)
+    except (ValidationError, ValueError):
+        return None
 
 
 def _step_matches(step: Mapping[str, Any], intent: "ExecutionIntent") -> bool:
     """Intent — ровно этот шаг плана: действие, тип ресурса и параметры.
 
-    Литеральный параметр шага обязан совпасть; шаблон `{name}` принимает
+    Литеральный параметр шага обязан совпасть после нормализации; шаблон —
+    только строка целиком `{name}` (тот же паттерн, что у рендера) — принимает
     значение intent-а (его диапазон уже проверил ExecutionIntent). Лишний
     параметр в intent-е — не совпадение: план его не предусматривал.
     """
@@ -165,12 +216,63 @@ def _step_matches(step: Mapping[str, Any], intent: "ExecutionIntent") -> bool:
     intent_params = intent.params or {}
     if set(intent_params) != set(step_params):
         return False
-    for key, value in step_params.items():
-        if _is_template(value):
+    literals = {k: v for k, v in step_params.items() if template_name(v) is None}
+    normalized = _normalized_params(intent, literals)
+    if normalized is None:
+        return False
+    return all(intent_params.get(k) == v for k, v in normalized.items())
+
+
+def _server_param_keys(entry: Mapping[str, Any], action: str) -> List[str]:
+    """Серверные параметры, которые план этой записи ждёт для `action`."""
+    keys: set = set()
+    for step in entry.get("plan") or ():
+        if not isinstance(step, Mapping) or step.get("action") != action:
             continue
-        if intent_params.get(key) != value:
-            return False
-    return True
+        for key, value in (step.get("params") or {}).items():
+            if key in SERVER_PARAMS and template_name(value) == key:
+                keys.add(key)
+    return sorted(keys)
+
+
+def bind_server_params(
+    intent: "ExecutionIntent",
+    snapshot: Optional[Dict[str, Any]],
+    probe: Callable[["ExecutionIntent"], Optional[int]],
+) -> "ExecutionIntent":
+    """Заполнить серверные параметры intent-а и зафиксировать их в снимке.
+
+    Вызывается pipeline-ом после привязки intent-а к записи снимка (цель —
+    resource_name — к этому моменту известна). Значения из intent-а, если
+    модель их вписала, выбрасываются всегда. `probe` снимает живое число
+    реплик; не снял (None / исключение) — параметр не ставится, запись
+    снимка остаётся без `server_params`, и gate откажет по
+    `server_param_missing`: scale без precondition не исполняется.
+
+    Запись снимка меняется на месте и получает новый hash — intent несёт уже
+    его, так что подпись и одобрение покрывают и снятое значение.
+    """
+    params = {k: v for k, v in (intent.params or {}).items() if k not in SERVER_PARAMS}
+    entry = find_entry(snapshot, intent.playbook)
+    if not isinstance(entry, dict) or not intent.playbook_match:
+        if params != (intent.params or {}):
+            intent = intent.model_copy(update={"params": params})
+        return intent
+    keys = _server_param_keys(entry, intent.action.value)
+    entry.pop("server_params", None)
+    if keys:
+        try:
+            current = probe(intent)
+        except Exception:
+            current = None
+        if isinstance(current, int) and not isinstance(current, bool) and current >= 0:
+            entry["server_params"] = {
+                "resource_name": intent.resource_name,
+                **{k: current for k in keys},
+            }
+            params.update({k: current for k in keys})
+    entry["binding"] = entry_binding(entry)
+    return intent.model_copy(update={"params": params, "playbook_match": entry["binding"]})
 
 
 def check_intent_binding(
@@ -219,6 +321,15 @@ def check_intent_binding(
         raise BindingViolation("playbook_not_executable", playbook=pb.name)
     if playbook_digest(pb) != entry.get("playbook_digest"):
         raise BindingViolation("playbook_changed_since_match", playbook=pb.name)
+    keys = _server_param_keys(entry, intent.action.value)
+    if keys:
+        server = entry.get("server_params")
+        if not isinstance(server, Mapping):
+            raise BindingViolation("server_param_missing", playbook=pb.name, params=keys)
+        if server.get("resource_name") != intent.resource_name or any(
+            (intent.params or {}).get(k) != server.get(k) for k in keys
+        ):
+            raise BindingViolation("server_param_mismatch", playbook=pb.name, params=keys)
     if not any(
         isinstance(step, Mapping) and _step_matches(step, intent)
         for step in entry.get("plan") or ()

@@ -386,15 +386,23 @@ def assess(
 
 
 def playbook_verify_names(
-    intent: ExecutionIntent, analysis: Dict[str, Any],
+    intent: ExecutionIntent,
+    analysis: Dict[str, Any],
+    bound_entry: Optional[Dict[str, Any]] = None,
 ) -> Optional[Dict[str, Any]]:
-    """Какие проверки требует playbook, по которому исполнен intent.
+    """Какие проверки требует playbook, под который ОДОБРЕН intent.
 
-    Источник — серверный снимок отбора (`analysis["playbook_match"]`):
-    список verify зафиксирован там на момент одобрения, и правка YAML после
-    исполнения не меняет требований задним числом. Снимок потерян (analysis
-    перезаписан) — берём playbook из реестра по имени: здесь это не граница
-    доверия, а лишь выбор, какие проверки считать обязательными.
+    Источник — запись серверного снимка с тем же hash, что `playbook_match`
+    intent-а (hash входит в подпись одобрения):
+      1. запись, сохранённая вместе с попыткой (`bound_playbook_entry` в
+         строке kg_remediation_attempts) — её re-fire не перепишет;
+      2. запись из `analysis["playbook_match"]`, если её hash всё ещё равен
+         hash-у intent-а (попытки до этого поля).
+    Ни одна не сошлась — `binding_lost`: re-fire заменил снимок, и чужая
+    запись (или текущая редакция реестра) могла бы выкинуть обязательную
+    проверку и засчитать старое действие как verified. Такой исход не
+    бывает VERIFIED — см. apply_playbook_verify.
+
     Привязанным считается intent с `playbook_match` — его ставит только
     pipeline по серверному снимку. Имя playbook-а без hash-а могла вписать
     модель при выключенном флаге; ужесточать по нему проверку незачем.
@@ -402,21 +410,17 @@ def playbook_verify_names(
     """
     if not intent.playbook or not intent.playbook_match:
         return None
-    from app.remediation.binding import find_entry
-    entry = find_entry(analysis.get("playbook_match"), intent.playbook)
-    if entry is not None:
-        names = [str(n) for n in entry.get("verify") or ()]
-        return {"playbook": intent.playbook, "source": "match_snapshot", "names": names}
-    try:
-        from app.remediation.matcher import default_registry
-        pb = default_registry().get(intent.playbook)
-    except Exception as e:
-        log.warning("verification.playbook_registry_failed",
-                    playbook=intent.playbook, error=type(e).__name__)
-        pb = None
-    if pb is None:
-        return None
-    return {"playbook": pb.name, "source": "registry", "names": list(pb.verify or ())}
+    from app.remediation.binding import find_entry, verified_entry
+    for source, entry in (
+        ("attempt", bound_entry),
+        ("match_snapshot", find_entry(analysis.get("playbook_match"), intent.playbook)),
+    ):
+        ok = verified_entry(entry, intent.playbook_match)
+        if ok is not None:
+            names = [str(n) for n in ok.get("verify") or ()]
+            return {"playbook": intent.playbook, "source": source, "names": names}
+    return {"playbook": intent.playbook, "source": "binding_lost", "names": [],
+            "binding_lost": True}
 
 
 def apply_playbook_verify(
@@ -437,7 +441,7 @@ def apply_playbook_verify(
         пробел (например, uid до действия неизвестен) остаётся лишь
         пометкой в reasons.
     """
-    if not verify or not verify.get("names"):
+    if not verify or not (verify.get("names") or verify.get("binding_lost")):
         return result
     from app.remediation.verify_checks import VERIFY_CHECKS, evaluate_verify
     names = [n for n in verify["names"] if n in VERIFY_CHECKS]
@@ -453,6 +457,13 @@ def apply_playbook_verify(
     if out["outcome"] not in (OUTCOME_VERIFIED, OUTCOME_PENDING):
         return out
     last = attempt >= max_attempts
+    if verify.get("binding_lost"):
+        out["reasons"].append(
+            f"playbook {verify.get('playbook')}: снимок привязки, под который "
+            "одобрено действие, не найден — обязательные проверки неизвестны"
+        )
+        out["outcome"] = OUTCOME_UNKNOWN if last else OUTCOME_PENDING
+        return out
     failed = [n for n, v in evaluated.items() if v is False]
     gaps = [n for n, v in evaluated.items() if v is None] + unknown_names
     if failed:
@@ -559,8 +570,13 @@ def verify_remediation(
             attempt=attempt,
             max_attempts=max_attempts,
         )
+        from app.remediation.attempts import BOUND_ENTRY_KEY
+        bound_entry = (
+            intent_data.get(BOUND_ENTRY_KEY)
+            if attempt_row is not None and isinstance(intent_data, dict) else None
+        )
         result = apply_playbook_verify(
-            result, playbook_verify_names(intent, analysis),
+            result, playbook_verify_names(intent, analysis, bound_entry),
             attempt=attempt, max_attempts=max_attempts,
         )
         entry = {

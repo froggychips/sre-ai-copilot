@@ -563,9 +563,15 @@ def apply_intent(
         # с JSON-claim-ом ниже; конфликт уникальности на commit = параллельный
         # apply того же intent-а успел первым. Переклейма нет: unknown
         # конечен и отсечён выше.
+        # Запись снимка playbook-а, под которую одобрен intent, едет вместе с
+        # попыткой: re-fire перепишет analysis.playbook_match новым отбором,
+        # а отложенная проверка обязана судить по тем verify, что были
+        # одобрены (см. verification.playbook_verify_names).
+        from app.remediation.binding import bound_entry_for
         attempt_row = attempts_store.new_claim(
             incident_id, expected_signature,
             intent.model_dump(mode="json"), applied_by,
+            bound_playbook_entry=bound_entry_for(intent, analysis.get("playbook_match")),
         )
         db.add(attempt_row)
         analysis["executor_in_flight"] = {
