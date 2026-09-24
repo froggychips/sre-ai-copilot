@@ -43,6 +43,7 @@ from app.agents.base import BaseAgent
 from app.agents.models.hypothesis import Hypothesis, HypothesisSet
 from app.config import settings
 from app.diagnostics.facts import FactStore
+from app.evaluation.llm_replay import MissingRecording
 from app.observability.ai_metrics import track_refuted, track_stage_duration
 from app.services.llm_service import LLMTruncatedResponse
 from app.services.telemetry_utils import trace_agent
@@ -507,6 +508,11 @@ class FactCriticAgent(BaseAgent):
             first = await self._ask_batch(pending[:half], facts)
             first.update(await self._ask_batch(pending[half:], facts))
             return first
+        except MissingRecording:
+            # Replay golden-eval: записи пакетного вызова нет. Проглотить это
+            # как «LLM недоступна» значило бы молча пропустить гипотезы без
+            # критики — и зелёный replay не проверял бы batch-режим вовсе.
+            raise
         except Exception as e:
             track_stage_duration("llm_critic", time.monotonic() - _t0)
             if len(pending) > 1:
