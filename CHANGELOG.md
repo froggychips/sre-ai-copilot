@@ -6,6 +6,22 @@ All notable changes to this project are documented in this file.
 
 ### Изменено
 
+- **Target кейса live RCA — сломанный workload, а не сервис ближайшего
+  инцидента.** Стендовые разборы медика привязывались к ближайшему
+  `kg_incidents`, а это в 22 из 31 кейса шумовой
+  KubeDeploymentGenerationMismatch от Rancher-churn на analytics/admin —
+  доля событий окна, принадлежащих target-у, была 0,7%. Теперь `export`
+  выбирает target по плохим событиям подов всего сквада (вес по count и
+  близости к разбору; провал пробы у раскатывавшегося workload-а не
+  считается — иначе target-ом становились рестарты grainhost от самого
+  медика), шумовой GenerationMismatch без rollout-а в выборе не участвует,
+  имена из applied медика только усиливают уже найденных кандидатов.
+  Замер v4: target сменился у 24 из 31, доля target-событий 0,7% → 16%,
+  кейсов с наблюдённым фактом в `kg_reconstructed` 8 → 20, в `kg+medic`
+  14 → 22. Плюс `outcome_confirmed`: медик видел стенд здоровым или граф
+  через 1–2 ч после разбора затих при покрытии графом (4 из 31); при дедупе
+  серии разборов побеждает подтверждённый, `score` — отдельно по исходу.
+
 - **Контекст кейса live RCA доходит до правил тем же путём, что в бою.**
   `scripts/live_rca_dataset.py`: `build_case_ctx(case, mode)` собирает ctx
   правил по режиму входа — `alert_only`, `medic_observed`, `kg_reconstructed`,
