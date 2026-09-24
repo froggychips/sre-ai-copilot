@@ -501,7 +501,10 @@ def ctx_from_kg(ctx: Dict[str, Any], kg: Optional[Dict[str, Any]]) -> Dict[str, 
     if kg.get("pod_events"):
         ctx["k8s_events"] = [
             {"type": e.get("type"), "reason": e.get("reason"), "message": e.get("message"),
-             "count": e.get("count"), "pod": e.get("pod"), "namespace": e.get("namespace"),
+             # pod_name — ключ, по которому PodEventsRule привязывает событие
+             # к target-у: с `pod` каждое шло как unverified, и чужой OOM
+             # становился наблюдённым фактом вместо «чужого workload-а».
+             "count": e.get("count"), "pod_name": e.get("pod"), "namespace": e.get("namespace"),
              "last_timestamp": e.get("last_seen") or e.get("first_seen")}
             for e in kg["pod_events"]
         ]
@@ -661,13 +664,168 @@ _MEDIC_PARTIAL = "partial: восстановлено из наблюдений 
 
 
 def apply_medic_observations(ctx: Dict[str, Any], facts: List[str]) -> Dict[str, Any]:
-    ctx["k8s_summary"] = "\n".join(facts)
-    ctx["k8s_events"] = observation_events(facts)
+    # Дописываем, а не заменяем: в режиме kg+medic k8s_events уже наполнены
+    # из графа, и наблюдения медика — добавка к ним, а не их подмена.
+    _append_text(ctx, "k8s_summary", "squad-medic", facts)
+    ctx["k8s_events"] = list(ctx.get("k8s_events") or []) + observation_events(facts)
     status = dict(ctx.get("source_status") or {})
     for field in ("k8s_summary", "k8s_events", "k8s_pod_state"):
+        if str(status.get(field, "")).startswith(NOT_RECONSTRUCTED):
+            status.pop(field)
         status.setdefault(field, _MEDIC_PARTIAL)
     ctx["source_status"] = status
     return ctx
+
+
+# --- ctx кейса: те же поля, что наполняет боевой enrichment -------------------
+
+# Режимы входа: какой источник кейса подаётся в ctx правил. Один инцидент
+# меряется во всех режимах, для которых у него есть данные, — иначе by_context
+# сравнивал бы разные популяции, а не эффект источника.
+MODES = ("alert_only", "medic_observed", "kg_reconstructed", "kg+medic")
+
+# Поля ctx, на которые правила объявляют `sources`. Поле, которого в кейсе нет,
+# помечается в source_status: без пометки пустое поле читается как «опрошено,
+# пусто», и OOMKilledRule по кейсу без логов уверенно отвечает «OOM не было».
+RULE_SOURCE_FIELDS = ("k8s_events", "k8s_summary", "logs_summary", "k8s_pod_state",
+                      "metrics_summary", "recent_deployments", "upstream_alerts")
+NOT_RECONSTRUCTED = "not_reconstructed"
+_NOT_RECONSTRUCTED_REASON = f"{NOT_RECONSTRUCTED}: в кейсе датасета этого источника нет"
+_KG_PARTIAL = "partial: восстановлено из графа point-in-time (окно до начала разбора)"
+
+
+def uses_kg(mode: str) -> bool:
+    return mode in ("kg_reconstructed", "kg+medic")
+
+
+def uses_medic(mode: str) -> bool:
+    return mode in ("medic_observed", "kg+medic")
+
+
+def available_modes(case: Dict[str, Any]) -> List[str]:
+    """Режимы, для которых у кейса есть вход. alert_only — всегда.
+
+    Снимок контекста считается входом «графового» режима наравне с
+    реконструкцией: кейс со снимком, но без строк графа в окне, иначе терял
+    бы как раз то живое состояние подов, ради которого снимок пишется.
+    """
+    has_kg = (isinstance(case.get("kg_context"), dict)
+              or isinstance(case.get("context_snapshot"), dict))
+    has_medic = bool(case.get("observed_medic"))
+    return [m for m, ok in (("alert_only", True), ("medic_observed", has_medic),
+                            ("kg_reconstructed", has_kg), ("kg+medic", has_kg and has_medic))
+            if ok]
+
+
+def _append_text(ctx: Dict[str, Any], field: str, source: str, lines: List[str]) -> None:
+    """Наблюдаемый текст с маркером источника. Не в analyzer_summary: тот —
+    проза модели и в text_haystack правил не входит намеренно."""
+    if not lines:
+        return
+    block = f"[{source}]\n" + "\n".join(lines)
+    prev = ctx.get(field)
+    ctx[field] = f"{prev}\n{block}" if prev else block
+
+
+def kg_event_lines(kg: Optional[Dict[str, Any]], target: Optional[str]) -> List[str]:
+    """События подов из графа — строками, как их видит k8s_summary боевого
+    K8sFacts: текстовые правила (crashloop, oom, process_crash) ищут сигнал
+    в тексте, а не в структурированном k8s_events.
+
+    Только события target-workload-а: текстовые правила под события не
+    перепроверяют, и BackOff соседнего сервиса сквада стал бы уверенным
+    фактом этого инцидента. Нет target-а — текста нет вовсе (structured
+    k8s_events остаются, там привязку делает PodEventsRule).
+    """
+    from app.diagnostics.rules.base import same_workload
+
+    if not target:
+        return []
+    out: List[str] = []
+    for e in (kg or {}).get("pod_events") or []:
+        if not same_workload(e.get("pod") or "", target):
+            continue
+        reason, msg = e.get("reason") or "", (e.get("message") or "").strip()
+        if not reason and not msg:
+            continue
+        cnt = f" x{e['count']}" if e.get("count") else ""
+        out.append(f"{e.get('type') or 'Event'} {reason}{cnt}: {msg}".rstrip(": "))
+    return out
+
+
+def build_case_ctx(case: Dict[str, Any], mode: str) -> Dict[str, Any]:
+    """ctx правил для кейса в заданном режиме входа.
+
+    Источник кейса кладётся в те же поля, что наполняет боевой enrichment
+    (граф → k8s_events/recent_deployments, текст событий target-а →
+    k8s_summary), и только если режим его включает: alert_only не должен тихо
+    получать граф, иначе сравнение режимов теряет смысл. Всё, что не
+    восстановлено, — в source_status, и правило отвечает «?», а не ✗.
+    """
+    from app.diagnostics.incident_ctx import build_diagnostics_ctx
+
+    if mode not in MODES:
+        raise ValueError(f"неизвестный режим входа: {mode}")
+    ctx = build_diagnostics_ctx(_to_incident(case), analyzer_summary="", kg_session=None)
+    ctx.pop("collector_results", None)
+    status = dict(ctx.get("source_status") or {})
+    for field in RULE_SOURCE_FIELDS:
+        if not ctx.get(field):
+            status.setdefault(field, _NOT_RECONSTRUCTED_REASON)
+    ctx["source_status"] = status
+
+    if uses_kg(mode):
+        kg = case.get("kg_context")
+        ctx = ctx_from_kg(ctx, kg)
+        _append_text(ctx, "k8s_summary", "kg_pod_events",
+                     kg_event_lines(kg, ctx.get("pod") or ctx.get("service")))
+        status = ctx["source_status"]
+        for field in ("k8s_events", "recent_deployments", "k8s_summary"):
+            if ctx.get(field) and str(status.get(field, "")).startswith(NOT_RECONSTRUCTED):
+                # Окно графа — выборка (40 событий, 10 деплоев), не полный снимок.
+                status[field] = _KG_PARTIAL
+        ctx = ctx_from_snapshot(ctx, case.get("context_snapshot"))
+    if uses_medic(mode):
+        apply_medic_observations(ctx, case.get("observed_medic") or [])
+    return ctx
+
+
+def rule_facts(case: Dict[str, Any], mode: str) -> Dict[str, Any]:
+    """Что правила извлекают из кейса в режиме — без LLM, бесплатно."""
+    from app.diagnostics import default_engine
+
+    store = default_engine.run(build_case_ctx(case, mode))
+    by_verdict: Dict[str, List[str]] = {}
+    for f in store.facts:
+        v = getattr(f.verdict, "value", f.verdict) or "?"
+        by_verdict.setdefault(str(v), []).append(f.kind)
+    return {"observed": sorted(store.observed_kinds()),
+            "by_verdict": {k: sorted(set(v)) for k, v in by_verdict.items()}}
+
+
+def cmd_facts(args) -> int:
+    """Покрытие правил по режимам входа: сколько кейсов дают хоть один
+    наблюдённый факт и какие kind-ы. Меряет вход до того, как тратить LLM."""
+    # Settings валидируется при импорте app.*; LLM здесь не зовётся.
+    os.environ.setdefault("LLM_BACKEND", "claude_cli")
+    out = _guard_out_dir(Path(args.out))
+    cases = [json.loads(ln) for ln in (out / "cases.jsonl").read_text().splitlines() if ln]
+    report: Dict[str, Any] = {}
+    for mode in MODES:
+        rows = [rule_facts(c, mode) for c in cases if mode in available_modes(c)]
+        kinds: Dict[str, int] = {}
+        for r in rows:
+            for k in r["observed"]:
+                kinds[k] = kinds.get(k, 0) + 1
+        report[mode] = {
+            "cases": len(rows),
+            "with_observed_fact": sum(1 for r in rows if r["observed"]),
+            "observed_kinds": dict(sorted(kinds.items(), key=lambda kv: -kv[1])),
+        }
+    (out / "facts_coverage.json").write_text(json.dumps(report, ensure_ascii=False, indent=2) + "\n")
+    for mode, r in report.items():
+        print(f"{mode:17} кейсов {r['cases']:3}  с фактом {r['with_observed_fact']:3}  {r['observed_kinds']}")
+    return 0
 
 
 def case_summary(incident_summary: str, facts: List[str]) -> str:
@@ -682,17 +840,10 @@ async def _run_case(case: Dict[str, Any], context: str) -> Dict[str, Any]:
                                          survivors)
     from app.agents.multi_hypothesis import MultiHypothesisAgent
     from app.diagnostics import default_engine
-    from app.diagnostics.incident_ctx import build_diagnostics_ctx
 
     incident = _to_incident(case)
-    facts = (case.get("observed_medic") or []) if context == "medic_observed" else []
-    ctx = build_diagnostics_ctx(incident, analyzer_summary="", kg_session=None)
-    ctx.pop("collector_results", None)
-    ctx = ctx_from_kg(ctx, case.get("kg_context"))
-    ctx = ctx_from_snapshot(ctx, case.get("context_snapshot"))
-    if facts:
-        apply_medic_observations(ctx, facts)
-    store = default_engine.run(ctx)
+    facts = (case.get("observed_medic") or []) if uses_medic(context) else []
+    store = default_engine.run(build_case_ctx(case, context))
     t0 = time.monotonic()
     hypotheses = await MultiHypothesisAgent().generate(
         incident_summary=case_summary(incident.summary, facts), facts=store
@@ -749,18 +900,17 @@ async def _run_async(args) -> int:
             res_path.write_text("".join(ln + "\n" for ln in kept))
         done = {d for d in done if d[0] not in wanted}
 
-    # auto = оба режима на ОДНИХ И ТЕХ ЖЕ кейсах: alert_only для всех,
-    # medic_observed — где наблюдения есть. Иначе by_context сравнивал бы
-    # разные популяции инцидентов, а не эффект наблюдений.
+    # auto = все режимы на ОДНИХ И ТЕХ ЖЕ кейсах: alert_only для всех,
+    # остальные — где у кейса есть соответствующий вход. Иначе by_context
+    # сравнивал бы разные популяции инцидентов, а не эффект источника.
     # getattr: вызывающие код программно (тесты) могут собрать args без --context.
     context_mode = getattr(args, "context", "auto")
 
     def modes(c: Dict[str, Any]) -> List[str]:
+        avail = available_modes(c)
         if context_mode == "auto":
-            return ["alert_only"] + (["medic_observed"] if c.get("observed_medic") else [])
-        if context_mode == "medic_observed" and not c.get("observed_medic"):
-            return []
-        return [context_mode]
+            return avail
+        return [context_mode] if context_mode in avail else []
 
     work = [(c, m) for c in cases for m in modes(c) if (c["event_id"], m) not in done]
     todo = work[: args.limit]
@@ -883,13 +1033,14 @@ def main() -> int:
         p.add_argument("--db-name", default="sre_copilot")
     rn = sub.add_parser("run")
     rn.add_argument("--limit", type=int, default=3, help="кейсов за заход (каждый ≈ 15 вызовов LLM)")
-    rn.add_argument("--context", choices=("auto", "alert_only", "medic_observed"), default="auto",
-                    help="вход модели: auto — по метке кейса")
+    rn.add_argument("--context", choices=("auto",) + MODES, default="auto",
+                    help="вход модели: auto — все режимы, для которых у кейса есть данные")
     rn.add_argument("--ids", default="", help="event_id через запятую — прогнать только их")
     sub.add_parser("score")
+    sub.add_parser("facts", help="покрытие правил по режимам входа, без LLM")
     args = ap.parse_args()
     return {"export": cmd_export, "kg-context": cmd_kg_context, "run": cmd_run,
-            "score": cmd_score}[args.cmd](args)
+            "score": cmd_score, "facts": cmd_facts}[args.cmd](args)
 
 
 if __name__ == "__main__":
