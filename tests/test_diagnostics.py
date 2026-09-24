@@ -364,9 +364,11 @@ def test_engine_runs_all_rules():
     # Каждое правило выдаёт >= 1 Fact (✓ или ✗), кроме тех, что молчат без
     # наблюдаемого материала: PodEventsRule при пустом k8s_events,
     # MigrationFailedRule и DbPermissionRule без логов/снимка/событий
-    # («не проверяли» не должно читаться как ✗).
+    # («не проверяли» не должно читаться как ✗), OrleansMembershipRule без
+    # упоминания Orleans в тексте.
     from app.diagnostics.rules import DEFAULT_RULES
-    silent_without_material = {"PodEventsRule", "MigrationFailedRule", "DbPermissionRule"}
+    silent_without_material = {"PodEventsRule", "MigrationFailedRule", "DbPermissionRule",
+                               "OrleansMembershipRule"}
     assert len(store.facts) >= len(DEFAULT_RULES) - len(silent_without_material)
 
 

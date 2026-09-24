@@ -144,11 +144,16 @@ class FactKind:
     MIGRATION_FAILED = "migration_failed"
     # База отказала по правам (гранты/роль) или по аутентификации.
     DB_PERMISSION = "db_permission"
+    # Деградация Orleans membership СЕЙЧАС: свежие признаки в окне
+    # инцидента. Мёртвые записи силосов без них — хронический фон (ABSENT с
+    # evidence.chronic), см. rules/orleans_membership.py.
+    ORLEANS_MEMBERSHIP_DEGRADED = "orleans_membership_degraded"
 
     ALL = frozenset({
         OOM_KILLED, CRASHLOOP, FAILED_SCHEDULING,
         RECENT_DEPLOY, RESOURCE_PRESSURE, UPSTREAM_DEGRADED,
         PROCESS_CRASH, MIGRATION_FAILED, DB_PERMISSION,
+        ORLEANS_MEMBERSHIP_DEGRADED,
     })
 
 
@@ -244,6 +249,7 @@ class FactStore:
             return "<facts>no deterministic facts collected</facts>"
         lines = ["<facts>"]
         has_unknown = False
+        has_chronic = False
         for f in self._facts:
             if f.is_unknown:
                 has_unknown = True
@@ -260,6 +266,12 @@ class FactStore:
                 if f.is_unknown
                 else f"  {marker} {f.kind} (conf={f.confidence:.2f}){epi}{subj}"
             )
+            # Хронический фон помечается прямо в строке факта: модель читает
+            # строку, а не разбирает evidence, и без пометки «записи мёртвых
+            # силосов есть» выглядит как находка.
+            if f.evidence.get("chronic") and not f.is_unknown:
+                has_chronic = True
+                head += " [фон, наблюдается постоянно]"
             lines.append(head + (f" — {ev_preview}" if ev_preview else ""))
 
         if has_unknown:
@@ -267,6 +279,14 @@ class FactStore:
                 "  NOTE: '?' means the check could not be performed (source "
                 "unavailable) — it is NOT evidence of absence and MUST NOT be "
                 "used to refute a hypothesis."
+            )
+
+        if has_chronic:
+            lines.append(
+                "  NOTE: '[фон, наблюдается постоянно]' marks a chronic "
+                "background signal present in most incidents — it is NOT a "
+                "root cause by itself and MUST NOT be the basis of a hypothesis "
+                "without fresh evidence in the incident window."
             )
 
         conflict_pairs = self.conflicts()
