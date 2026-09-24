@@ -133,6 +133,69 @@ def fetch_live_replicas(
         return None
 
 
+def fetch_deployment_rollout_state(
+    namespace: str,
+    name: str,
+    *,
+    timeout_sec: float = 3.0,
+) -> Optional[Dict[str, Any]]:
+    """Снимок «идёт ли накат» у Deployment: реплики, условие Progressing, писатели.
+
+    Нужен, чтобы отличить зависший накат от churn-а generation внешним
+    контроллером (см. alert_enrichment.classify_generation_churn). Один GET:
+    `managedFields` API отдаёт в обычном ответе (прячет их только kubectl).
+
+    Возвращает dict или None при любой ошибке/таймауте — caller трактует None
+    как «не знаю» и оставляет алерт громким. Никогда не бросает.
+    """
+    if not _load_k8s_once():
+        return None
+    try:
+        dep = client.AppsV1Api().read_namespaced_deployment(
+            name, namespace, _request_timeout=timeout_sec
+        )
+    except Exception as e:
+        logger.warning(
+            "rollout_state_fetch_failed",
+            namespace=namespace, name=name, error=type(e).__name__,
+        )
+        return None
+    try:
+        status = dep.status
+        progressing = next(
+            (c for c in (status.conditions or []) if c.type == "Progressing"), None
+        )
+        writers = [
+            {
+                "manager": m.manager or "",
+                "operation": m.operation or "",
+                "subresource": getattr(m, "subresource", None) or "",
+                "time": m.time,
+            }
+            for m in (dep.metadata.managed_fields or [])
+        ]
+        return {
+            "desired": int(dep.spec.replicas or 0),
+            "ready": int(status.ready_replicas or 0),
+            "updated": int(status.updated_replicas or 0),
+            "unavailable": int(status.unavailable_replicas or 0),
+            "progressing_reason": progressing.reason if progressing else None,
+            "progressing_updated_at": (
+                progressing.last_update_time if progressing else None
+            ),
+            "revision": (dep.metadata.annotations or {}).get(
+                "deployment.kubernetes.io/revision"
+            ),
+            "writers": writers,
+        }
+    except Exception as e:
+        logger.warning(
+            "rollout_state_parse_failed",
+            namespace=namespace, name=name, error=type(e).__name__,
+        )
+        return None
+
+
 # Namespace'ы DaemonSet'ов и агентов: их поды стоят на КАЖДОЙ ноде, поэтому на
 # вопрос «чьи стенды на этой ноде» они не отвечают и только вытесняют ответ.
 # Рендер сворачивает их в один счётчик. Сверено с `kubectl get ds -A`

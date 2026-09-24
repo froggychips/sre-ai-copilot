@@ -165,6 +165,40 @@ def test_open_incident_lookup_respects_time(db):
     assert open_incident_for_namespaces(db, ["other-ns"], at=NOW) is None
 
 
+def test_open_incident_lookup_prefers_non_noise(db):
+    """Свежий шумовой GenerationMismatch не перехватывает действие медика."""
+    real = _incident(svc="town-service", opened=NOW - timedelta(hours=3))
+    noisy = _incident(svc="analytics-service", opened=NOW - timedelta(minutes=10))
+    noisy.noise = True
+    db.add_all([real, noisy])
+    db.commit()
+    found = open_incident_for_namespaces(db, ["squad-39-kingdom2"], at=NOW)
+    assert found is not None and found.service_name == "town-service"
+
+
+def test_open_incident_lookup_finds_real_incident_behind_many_noisy(db):
+    """Больше 20 свежих шумовых — реальный старый инцидент всё равно находится."""
+    real = _incident(svc="town-service", opened=NOW - timedelta(hours=6))
+    noisy = []
+    for i in range(25):
+        n = _incident(svc=f"svc-{i}", opened=NOW - timedelta(minutes=i + 1))
+        n.noise = True
+        noisy.append(n)
+    db.add_all([real, *noisy])
+    db.commit()
+    found = open_incident_for_namespaces(db, ["squad-39-kingdom2"], at=NOW)
+    assert found is not None and found.service_name == "town-service"
+
+
+def test_open_incident_lookup_falls_back_to_noise_when_alone(db):
+    noisy = _incident(svc="analytics-service", opened=NOW - timedelta(minutes=10))
+    noisy.noise = True
+    db.add(noisy)
+    db.commit()
+    found = open_incident_for_namespaces(db, ["squad-39-kingdom2"], at=NOW)
+    assert found is not None and found.service_name == "analytics-service"
+
+
 # --- timeline ----------------------------------------------------------------------
 
 

@@ -163,6 +163,24 @@ All notable changes to this project are documented in this file.
 
 ### Исправлено
 
+- **GenerationMismatch от Rancher на пути /store — noise, а не инцидент.**
+  Rancher раз в минуту переписывает Deployment с публичным ingress (generation
+  23 тыс. при revision 4), deployment-контроллер отстаёт, и
+  KubeDeploymentGenerationMismatch мигает: за сутки 535 инцидентов в squad-*,
+  ни один не помечен — health-gate `gen_mismatch_noise` жил только на
+  enrich-пути, а ресиверы сквадов ходят в `/store`. Теперь `/store` читает живой
+  Deployment (`fetch_deployment_rollout_state`, один GET, параллельно до записи
+  в БД) и помечает инцидент noise с видом `controller_lag_rancher_churn`, если
+  наката нет (Progressing=NewReplicaSetAvailable старше 30 мин, все реплики
+  обновлены и готовы) и spec последним писал менеджер из
+  `GEN_MISMATCH_BACKGROUND_MANAGERS` (`rancher`). Нет снимка, накат идёт или
+  упал — инцидент остаётся. Замер по живому кластеру: 532 из 535 за сутки.
+  Метрика — `ALERTS_SUPPRESSED{reason="controller_lag_rancher_churn"}`, выключатель
+  `GEN_MISMATCH_STORE_NOISE_ENABLED`.
+- **Действие медика не цепляется к шумовому инциденту.**
+  `open_incident_for_namespaces` берёт шумовой инцидент, только если другого
+  открытого на стенде нет: раньше событие squad-medic привязывалось к
+  ближайшему мигающему GenerationMismatch-у, а не к тому, что он чинил.
 - **Мёртвые записи Orleans membership — фон, а не причина.** Фраза «есть записи
   мёртвых силосов (status=6)» стояла в 28 из 31 реального инцидента, а причиной
   была в 2, и модель уходила в гипотезу «сломан кластер Orleans». Новое правило

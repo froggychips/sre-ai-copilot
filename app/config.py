@@ -392,6 +392,19 @@ class Settings(BaseSettings):
     # 🚨/@mention), тег честный — 🔇 GENERATION-CHURN. kill-switch.
     GEN_MISMATCH_NOISE_ENABLED: bool = True
 
+    # Тот же шум на пути /store (ресиверы squad/preupdate): там нет enrichment-а,
+    # и за сутки 533 GenerationMismatch-инцидента в squad-* шли без флага noise
+    # (замер 24.09.2026: Rancher пишет Deployment с публичным ingress раз в
+    # минуту, generation 23 тыс. при revision 4). Критерий — по живому
+    # Deployment-у: наката нет, spec последним писал фоновый менеджер
+    # (см. alert_enrichment.classify_generation_churn). Помеченный инцидент
+    # остаётся в kg_incidents с noise=true, kind controller_lag_rancher_churn.
+    GEN_MISMATCH_STORE_NOISE_ENABLED: bool = True
+    # managedFields.manager, чья запись spec — фон, а не накат.
+    GEN_MISMATCH_BACKGROUND_MANAGERS: List[str] = Field(default_factory=lambda: ["rancher"])
+    # Сколько минут без прогресса наката считать «наката нет».
+    GEN_MISMATCH_QUIET_MINUTES: float = 30.0
+
     # A3: Explicit alertname allowlist — pure-noise alerts которые AM шлёт
     # либо для self-monitoring (Watchdog ping), либо как technical helper
     # (InfoInhibitor — workaround для AM inhibition rules без matchers).
