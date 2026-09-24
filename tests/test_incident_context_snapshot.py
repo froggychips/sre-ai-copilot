@@ -112,8 +112,17 @@ def test_size_limit_trims_by_priority_and_marks_it():
 
 
 def test_tiny_budget_drops_fact_evidence_last():
-    snap = build_context_snapshot(_ctx(), _facts(), max_bytes=600)
-    assert "facts:evidence" in snap["truncated"]
+    # Бюджет — ровно под снимок без режущихся секций и без evidence фактов:
+    # срезаться должно всё режущееся, потом evidence, но не сами вердикты.
+    lean = build_context_snapshot(_ctx(logs_summary=None, k8s_pod_state={}), _facts())
+    for f in lean["facts"]:
+        f["evidence"] = None
+    lean["truncated"] = ["logs_summary", "k8s_pod_state", "facts:evidence"]
+    budget = len(json.dumps({k: v for k, v in lean.items() if k != "bytes"},
+                            ensure_ascii=False, default=str).encode("utf-8")) + 5
+    snap = build_context_snapshot(_ctx(), _facts(), max_bytes=budget)
+    assert snap["bytes"] <= budget
+    assert "facts:evidence" in snap["truncated"] and "facts" not in snap["truncated"]
     assert all(f["evidence"] is None for f in snap["facts"])
     assert [f["verdict"] for f in snap["facts"]] == ["found", "absent"]
 
@@ -276,3 +285,56 @@ def test_ctx_from_kg_feeds_rules_in_their_shape():
     store = default_engine.run(ctx)
     assert "recent_deploy" in store.observed_kinds()
     assert lrd.ctx_from_kg({"a": 1}, None) == {"a": 1}
+
+
+# ── ревью #446: отсечка по времени снимка, агрегаты, перепрогон, метаданные ──
+
+
+def test_snapshot_is_dated_and_dataset_cuts_on_that_date():
+    snap = build_context_snapshot(_ctx(), _facts())
+    assert datetime.fromisoformat(snap["captured_at"]).tzinfo is not None
+    assert "captured_at}}')::timestamptz <= e.started_at" in lrd._SNAPSHOT_SQL
+    assert "r.created_at" not in lrd._SNAPSHOT_SQL
+
+
+def test_pod_event_aggregates_are_clamped_to_cutoff():
+    sql = lrd._KG_SQL
+    assert "least(coalesce(pe.last_seen, pe.first_seen), e.started_at) AS last_seen" in sql
+    assert "THEN pe.count END AS count" in sql
+    assert "ORDER BY (d.type = 'Warning') DESC, d.last_seen DESC" in sql
+
+
+def test_fact_metadata_is_redacted_and_bounded():
+    leak = "password=hunter2 " + "z" * 50_000
+    store = FactStore([Fact(kind="upstream_degraded", observed=False, confidence=0.0,
+                            verdict="unknown", unknown_reason=leak)])
+    snap = build_context_snapshot(_ctx(), store)
+    reason = snap["facts"][0]["unknown_reason"]
+    assert "hunter2" not in reason and len(reason) <= 300
+    many = FactStore([Fact(kind=f"k{i}", observed=False, confidence=0.0, verdict="unknown",
+                           unknown_reason="r" * 290) for i in range(400)])
+    tight = build_context_snapshot(_ctx(), many, max_bytes=8000)
+    assert tight["bytes"] <= 8000 and "facts" in tight["truncated"]
+
+
+def test_run_with_ids_reruns_and_replaces_prior_result(tmp_path, monkeypatch):
+    import asyncio
+    import types
+
+    out = tmp_path / "ds"
+    out.mkdir()
+    (out / "cases.jsonl").write_text(json.dumps({"event_id": 1}) + "\n" + json.dumps({"event_id": 2}) + "\n")
+    (out / "results.jsonl").write_text(
+        json.dumps({"event_id": 1, "best_cause": "old"}) + "\n"
+        + json.dumps({"event_id": 2, "best_cause": "keep"}) + "\n")
+    monkeypatch.setattr(lrd, "REPO_ROOT", Path("/nonexistent-repo-root"))
+
+    async def fake_run(case):
+        return {"event_id": case["event_id"], "best_cause": "new"}
+
+    monkeypatch.setattr(lrd, "_run_case", fake_run)
+    args = types.SimpleNamespace(out=str(out), ids="1", limit=5)
+    asyncio.run(lrd._run_async(args))
+    rows = [json.loads(ln) for ln in (out / "results.jsonl").read_text().splitlines() if ln]
+    by = {r["event_id"]: r["best_cause"] for r in rows}
+    assert by == {1: "new", 2: "keep"} and len(rows) == 2

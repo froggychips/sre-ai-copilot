@@ -133,9 +133,13 @@ SELECT to_jsonb(t) FROM (
   JOIN kg_incidents i ON i.id = e.incident_id
   JOIN incidents r ON r.incident_id IN (
     SELECT jsonb_array_elements_text(coalesce(to_jsonb(i.fingerprints), '[]'::jsonb)))
-  WHERE e.id IN ({ids}) AND r.created_at <= e.started_at
+  -- Отсечка по времени САМОГО снимка: строка инцидента переиспользуется
+  -- при повторном срабатывании, и снимок после починки перезаписал бы
+  -- прежний при старом created_at.
+  WHERE e.id IN ({ids})
     AND jsonb_typeof(to_jsonb(r.analysis) -> 'context_snapshot') = 'object'
-  ORDER BY e.id, r.created_at DESC
+    AND (to_jsonb(r.analysis) #>> '{{context_snapshot,captured_at}}')::timestamptz <= e.started_at
+  ORDER BY e.id, (to_jsonb(r.analysis) #>> '{{context_snapshot,captured_at}}') DESC
 ) t;
 """
 
@@ -208,16 +212,24 @@ SELECT to_jsonb(t) FROM (
     (SELECT coalesce(jsonb_agg(x), '[]'::jsonb) FROM (
        -- Последнее событие на (под, reason): иначе 40 мест съедают сотни
        -- одинаковых Unhealthy от readiness-пробы, а BackOff/OOMKilled не влезают.
+       -- kg_pod_events — изменяемый агрегат: count и last_seen дописываются
+       -- следующими синками. last_seen срезаем по отсечке, а count, если
+       -- строка обновлялась ПОСЛЕ неё, неизвестен на момент инцидента → NULL.
        SELECT * FROM (
          SELECT DISTINCT ON (pe.pod_name, pe.reason)
                 pe.pod_name AS pod, pe.type, pe.reason, left(pe.message, 300) AS message,
-                pe.count, pe.first_seen, pe.last_seen
+                CASE WHEN coalesce(pe.last_seen, pe.first_seen) <= e.started_at
+                     THEN pe.count END AS count,
+                pe.first_seen,
+                least(coalesce(pe.last_seen, pe.first_seen), e.started_at) AS last_seen
          FROM kg_pod_events pe
          WHERE pe.namespace = i.namespace
-           AND coalesce(pe.last_seen, pe.first_seen) >= e.started_at - interval '2 hours'
+           AND least(coalesce(pe.last_seen, pe.first_seen), e.started_at)
+               >= e.started_at - interval '2 hours'
            AND pe.first_seen <= e.started_at
-         ORDER BY pe.pod_name, pe.reason, coalesce(pe.last_seen, pe.first_seen) DESC) d
-       ORDER BY (d.type = 'Warning') DESC, coalesce(d.last_seen, d.first_seen) DESC
+         ORDER BY pe.pod_name, pe.reason,
+                  least(coalesce(pe.last_seen, pe.first_seen), e.started_at) DESC) d
+       ORDER BY (d.type = 'Warning') DESC, d.last_seen DESC
        LIMIT 40) x) AS pod_events,
     (SELECT coalesce(jsonb_agg(x), '[]'::jsonb) FROM (
        SELECT s.name AS service, a.alertname, a.severity, a.fired_at, a.resolved_at
@@ -432,6 +444,13 @@ async def _run_async(args) -> int:
     if args.ids:
         wanted = {int(x) for x in args.ids.split(",")}
         cases = [c for c in cases if c["event_id"] in wanted]
+        # Явный --ids = перепрогон: после kg-context у кейса новый вход, и
+        # старый результат по одному алерту иначе остался бы в score.
+        if res_path.exists():
+            kept = [ln for ln in res_path.read_text().splitlines()
+                    if ln and json.loads(ln)["event_id"] not in wanted]
+            res_path.write_text("".join(ln + "\n" for ln in kept))
+        done -= wanted
     todo = [c for c in cases if c["event_id"] not in done][: args.limit]
     print(f"кейсов всего {len(cases)}, прогнано {len(done)}, в этом заходе {len(todo)}")
     for c in todo:

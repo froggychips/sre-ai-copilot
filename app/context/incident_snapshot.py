@@ -44,7 +44,7 @@ LLM-вывод (`analyzer_summary`) сюда намеренно НЕ входи�
 from __future__ import annotations
 
 import json
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 from typing import Any, Dict, List, Optional
 
 from app.services.pii_redaction import redact_pii
@@ -150,13 +150,15 @@ def _facts_section(facts: Any) -> List[Dict[str, Any]]:
     items = items() if callable(items) else items
     out: List[Dict[str, Any]] = []
     for f in items or []:
+        # Все строковые поля — через _compact: unknown_reason несёт текст
+        # ответа упавшего источника (там бывают креды и простыни на килобайты).
         out.append({
-            "kind": getattr(f, "kind", None),
-            "verdict": getattr(f, "verdict", None),
+            "kind": _compact(getattr(f, "kind", None)),
+            "verdict": _compact(getattr(f, "verdict", None)),
             "confidence": getattr(f, "confidence", None),
-            "subject": getattr(f, "subject", None),
-            "source_rule": getattr(f, "source_rule", None),
-            "unknown_reason": getattr(f, "unknown_reason", None),
+            "subject": _compact(getattr(f, "subject", None)),
+            "source_rule": _compact(getattr(f, "source_rule", None)),
+            "unknown_reason": _compact(getattr(f, "unknown_reason", None)),
             "evidence": _compact(getattr(f, "evidence", None) or {}, depth=2),
         })
     return out
@@ -205,6 +207,9 @@ def build_context_snapshot(
     alert = _alert_section(ctx)
     snap: Dict[str, Any] = {
         "schema": SNAPSHOT_SCHEMA,
+        # Время снимка, а не время строки инцидента: запись переиспользуется
+        # при повторном срабатывании, и её created_at снимок не датирует.
+        "captured_at": datetime.now(timezone.utc).isoformat(),
         "alert": alert,
         "facts": _facts_section(facts),
         "source_status": _compact(ctx.get("source_status") or {}),
@@ -246,5 +251,11 @@ def build_context_snapshot(
         for f in snap["facts"]:
             f["evidence"] = None
         snap["truncated"].append("facts:evidence")
+    if _size(snap) > max_bytes:
+        # И только потом — сами факты: лимит обещан жёстким.
+        keep = snap["facts"]
+        while keep and _size(snap) > max_bytes:
+            keep.pop()
+        snap["truncated"].append("facts")
     snap["bytes"] = _size(snap)
     return snap
