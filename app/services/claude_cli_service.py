@@ -25,7 +25,7 @@ logger = logging.getLogger(__name__)
 class ClaudeCliService:
     """Async wrapper around `claude --print`.
 
-    Поведение совместимо с LLMService.generate_content(prompt) → str.
+    Поведение совместимо с LLMService.generate_content(prompt, system) → str.
     """
 
     def __init__(
@@ -40,10 +40,21 @@ class ClaudeCliService:
         self.model = model
         self.extra_args = list(extra_args or [])
 
-    async def generate_content(self, prompt: str) -> str:
+    async def generate_content(
+        self, prompt: str, system: Optional[str] = None,
+    ) -> str:
         cmd = [self.binary, "--print"]
         if self.model:
             cmd += ["--model", self.model]
+        if system:
+            # `--system-prompt`, а не `--append-system-prompt`: второй
+            # дописывает наши инструкции к системному промпту самого Claude
+            # Code (агент-кодер с инструментами), и CLI-бэкенд отвечал бы не
+            # той моделью поведения, что anthropic-бэкенд с тем же `system`.
+            # Через argv, а не stdin: stdin занят данными инцидента, а
+            # инструкции агентов — константы в пару килобайт, лимит argv им
+            # не грозит.
+            cmd += ["--system-prompt", system]
         cmd += self.extra_args
         # Prompt — через stdin, чтобы не упереться в лимит argv для длинных
         # инцидентов.

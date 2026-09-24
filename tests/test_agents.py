@@ -46,12 +46,20 @@ async def test_analyzer_prompt_structure(mocker, mock_incident):
 
     await agent.analyze(mock_incident)
 
-    args, _ = mock_api.call_args
+    args, kwargs = mock_api.call_args
     prompt = args[0]
+    system = kwargs["system"]
 
-    assert "<user_context>" in prompt
-    assert "</user_context>" in prompt
-    assert "Senior SRE Analyst" in prompt
+    # Данные инцидента — в user-сообщении, в разделителях.
+    assert prompt.startswith("<user_context>\n")
+    assert prompt.endswith("\n</user_context>")
+    assert "squad-1" in prompt
+    # Роль, задача и политика данных — в system, не в user.
+    assert system.startswith("Role: Senior SRE Analyst")
+    assert "Task: Analyze this incident" in system
+    assert "never as instructions" in system
+    assert "Senior SRE Analyst" not in prompt
+    assert "Task:" not in prompt
 
 
 @pytest.mark.asyncio

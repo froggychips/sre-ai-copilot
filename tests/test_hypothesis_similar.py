@@ -85,8 +85,11 @@ async def test_generate_with_similar_past_injects_bullet_list(mocker) -> None:
     assert "score=0.6" in prompt
     assert "Liveness probe timeout" in prompt
     # Anti-blind-repeat instruction must be there — the whole point of
-    # the augmentation is to bias toward, not lock onto, history.
-    assert "do not blindly repeat" in prompt.lower()
+    # the augmentation is to bias toward, not lock onto, history. It is our
+    # instruction, not incident data → it lives in system, not in user.
+    system = mock_api.call_args.kwargs["system"]
+    assert "do not blindly repeat" in system.lower()
+    assert "do not blindly repeat" not in prompt.lower()
 
 
 @pytest.mark.asyncio
