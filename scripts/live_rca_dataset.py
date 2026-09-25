@@ -12,12 +12,13 @@ LLM-цепочку, что и golden (`MultiHypothesisAgent` → `FactCriticAgen
 
 Подкоманды:
   export  SELECT из боевой БД copilot (через `kubectl exec psql`, транзакция
-          read-only) → cases.jsonl. Только чтение.
-  kg-context  дописать в готовый cases.jsonl снимок контекста и реконструкцию
-          из графа на момент инцидента (`context=kg_reconstructed`). Только чтение.
+          read-only) → cases.jsonl, у каждого кейса — контекст графа на начало
+          разбора медика. Только чтение.
+  kg-context  перечитать контекст графа для готового cases.jsonl. Только чтение.
   run     прогон N кейсов через модель → results.jsonl (дописывает, уже
           прогнанные пропускает — прогон можно дробить).
   score   метрики по results.jsonl → summary.json + таблица.
+  facts   покрытие правил по режимам входа, без LLM.
 
 ДАННЫЕ — ТОЛЬКО ВНЕ РЕПО. Репозиторий публичный, а в кейсах живые namespace-ы,
 имена сервисов, текст алертов и выводы медика. По умолчанию всё пишется в
@@ -26,22 +27,19 @@ LLM-цепочку, что и golden (`MultiHypothesisAgent` → `FactCriticAgen
 Оценка — грубая и честная: причину медика и причину модели раскладываем по
 одним и тем же классам (`CAUSE_CLASSES`, регулярки RU+EN), попадание — это
 пересечение классов. Это нижняя оценка: модель могла назвать ту же причину
-словами, которых нет в регулярках. У кейса несколько источников входа
-(`context` — метка режима, `had_snapshot`/`kg_context` — что подмешано):
+словами, которых нет в регулярках.
 
-  alert_only      только алерт;
-  medic_observed  алерт + наблюдения медика (`extract_medic_observations`):
-                  состояния подов, коды выхода, dirty-миграция, отсутствующие
-                  ключи секрета — шаблонами из белого списка, без его выводов.
-
-Поверх режима `run` накладывает снимок контекста инцидента
-(`analysis.context_snapshot`, если пайплайн его записал) и реконструкцию из
-графа (`kg-context`). Метрики считаются по режимам раздельно. medic_observed —
-нижняя граница «разбора с контекстом», а не он сам: медик записал не всё, что
-видел.
+Вход кейса собирается ТЕМ ЖЕ кодом, что у прода: контекст графа —
+app/context/kg_incident_context.fetch_kg_incident_context (те же запросы,
+отрендеренные для psql), раскладка в ctx правил — build_diagnostics_ctx,
+текст для модели — kg_context_prompt. Своей реконструкции в скрипте нет:
+датасет меряет ровно то, что увидел бы пайплайн. Медик — не отдельный вход, а
+источник squad-medic внутри контекста графа (его наблюдения из
+kg_remediation_events, без выводов). Режимы (`MODES`): alert_only, kg,
+kg_no_medic — метрики по ним раздельно.
 
 Target кейса — не сервис ближайшего инцидента, а сломанный workload: тот, у
-кого в окне больше всего «плохих» событий подов (`select_targets`). Ближайший
+кого в окне больше всего «плохих» событий подов (`select_targets` сборщика). Ближайший
 инцидент стендового разбора медика — чаще всего шумовой
 KubeDeploymentGenerationMismatch от Rancher-churn на сервисе с ingress
 (analytics/admin), и привязка к нему уводила правила в «чужой workload».
@@ -66,7 +64,7 @@ import sys
 import time
 from datetime import date, datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, Callable, Dict, List, Optional, Set
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT))
@@ -110,176 +108,11 @@ def primary_class(text: Optional[str]) -> Optional[str]:
 
 # --- наблюдения медика ----------------------------------------------------
 #
-# Снимка кластера на момент инцидента в БД нет, а медик его видел: в summary,
-# applied, manual и gaps события лежит то, что он наблюдал (состояния подов,
-# коды выхода, dirty-миграция, отсутствующие ключи секрета). Но там же лежат
-# и его ВЫВОДЫ («теги ушли из реестра из-за retention») — а вывод и есть
-# ответ, с которым сверяется модель. Поэтому текст медика в вход модели не
-# копируется НИКОГДА: экстрактор ищет белый список наблюдаемых сигналов и
-# рендерит каждый своим шаблоном. Из исходного текста в вход попадают только
-# захваченные токены — reason из словаря k8s, числа, имена ключей и таблиц.
-# root_cause и next_action экстрактор не читает вовсе.
-
-_POD_REASONS = (
-    "ImagePullBackOff", "ErrImagePull", "CreateContainerConfigError",
-    "CreateContainerError", "RunContainerError", "CrashLoopBackOff",
-    "OOMKilled", "Evicted", "ContainerCreating", "Init:CrashLoopBackOff",
-    "Init:Error", "FailedScheduling", "FailedMount", "Pending",
-)
-_REASON_RE = re.compile(
-    r"(?<![\w:])(" + "|".join(re.escape(r) for r in _POD_REASONS) + r")(?![\w])", re.I
-)
-_EXIT_RE = re.compile(r"(?:exit(?:\s*code)?|exitcode|код(?:ом)?\s+выхода)\s*[=:]?\s*(\d{1,3})\b", re.I)
-_SIGNAL_RE = re.compile(r"\bSIG(SEGV|ABRT|KILL|TERM|BUS|ILL|FPE)\b")
-_RESTARTS_RE = re.compile(r"(\d{1,6})\s*(?:рестарт\w*|restarts?)\b|restarts?\s*[=:]\s*(\d{1,6})", re.I)
-_FAILED_PODS_RE = re.compile(r"(?:(\d{1,4})\s*)?(failed|evicted)[\s-]*(?:под\w*|pods?)\b", re.I)
-_DIRTY_RE = re.compile(r"\bdirty\b", re.I)
-_MIGRATION_VERSION_RE = re.compile(r"(?:верси\w+|version|v)\s*[=:]?\s*(\d{8,14})\b", re.I)
-_RELATION_RE = re.compile(r'(relation|column)\s+"?([\w.]{1,80})"?\s+does not exist', re.I)
-_PERMISSION_RE = re.compile(r"permission denied for (table|schema|relation|database|sequence)\s+\"?([\w.]{1,80})", re.I)
-_SECRET_CTX_RE = re.compile(r"secret|секрет", re.I)
-_MISSING_RE = re.compile(r"нет|отсутств|не хвата|недолит|missing|couldn't find|not found", re.I)
-_ENV_KEY_RE = re.compile(r"\b([A-Z][A-Z0-9]*_[A-Z0-9_]*\*?|[A-Z]{3,}_\*)")
-_COULDNT_FIND_KEY_RE = re.compile(r"couldn't find key\s+([A-Za-z0-9_.-]{1,80})", re.I)
-_ORLEANS_RE = re.compile(r"orleans|membership|силос|silo", re.I)
-_ZOMBIE_RE = re.compile(r"zombie|status\s*=\s*6|мёртв\w* (?:силос|запис)|dead silo", re.I)
-_PROBE_RE = re.compile(r"\b(readiness|liveness|startup)[\s-]*probe\b", re.I)
-_CONN_REFUSED_RE = re.compile(r"connection refused", re.I)
-
-# Каналы k8s-событий, которые понимает PodEventsRule: так наблюдение станет
-# фактом FactStore (OOM, evicted, crashloop, scheduling), а не только строкой.
-_REASON_TO_EVENT = {
-    "crashloopbackoff": "BackOff", "init:crashloopbackoff": "BackOff",
-    "oomkilled": "OOMKilled", "evicted": "Evicted",
-    "failedscheduling": "FailedScheduling",
-}
-
-
-def _medic_texts(event: Dict[str, Any]) -> List[str]:
-    """Тексты медика, из которых МОЖНО извлекать наблюдения.
-
-    root_cause и next_action сюда не входят намеренно: это вывод и план,
-    то есть ответ. summary/applied/manual/gaps тоже содержат выводы, но из
-    них берутся только совпадения белого списка, а не фразы.
-    """
-    out: List[str] = []
-    if event.get("summary"):
-        out.append(str(event["summary"]))
-    for key in ("applied", "manual", "gaps"):
-        val = event.get(key)
-        if isinstance(val, str):
-            try:
-                val = json.loads(val)
-            except ValueError:
-                val = [val]
-        if isinstance(val, list):
-            out.extend(str(x) for x in val if x)
-    extras = event.get("extras")
-    if isinstance(extras, dict):
-        out.extend(str(v) for v in extras.values() if isinstance(v, (str, int, float)))
-    return out
-
-
-def _sentences(text: str) -> List[str]:
-    return [s for s in re.split(r"(?<=[.;!?])\s+|\n+", text) if s.strip()]
-
-
-def extract_medic_observations(event: Dict[str, Any]) -> List[str]:
-    """Наблюдаемые факты из события медика — строки фиксированных шаблонов."""
-    texts = _medic_texts(event)
-    reasons: Dict[str, str] = {}
-    exits: Set[int] = set()
-    signals: Set[str] = set()
-    restarts = 0
-    failed_pods = False
-    dirty_versions: Set[str] = set()
-    dirty = False
-    db_errors: Set[str] = set()
-    secret_keys: Set[str] = set()
-    orleans_zombie = False
-    probes: Set[str] = set()
-    conn_refused = False
-    for text in texts:
-        for m in _REASON_RE.finditer(text):
-            canon = next(r for r in _POD_REASONS if r.lower() == m.group(1).lower())
-            reasons[canon.lower()] = canon
-        exits |= {int(x) for x in _EXIT_RE.findall(text) if int(x) <= 255}
-        signals |= {f"SIG{s}" for s in _SIGNAL_RE.findall(text)}
-        for a, b in _RESTARTS_RE.findall(text):
-            restarts = max(restarts, int(a or b or 0))
-        failed_pods = failed_pods or bool(_FAILED_PODS_RE.search(text))
-        for m in _RELATION_RE.finditer(text):
-            db_errors.add(f'{m.group(1).lower()} "{m.group(2)}" does not exist')
-        for m in _PERMISSION_RE.finditer(text):
-            db_errors.add(f'permission denied for {m.group(1).lower()} "{m.group(2)}"')
-        secret_keys |= set(_COULDNT_FIND_KEY_RE.findall(text))
-        for sent in _sentences(text):
-            if _DIRTY_RE.search(sent):
-                dirty = True
-                dirty_versions |= set(_MIGRATION_VERSION_RE.findall(sent))
-            if _SECRET_CTX_RE.search(sent) and _MISSING_RE.search(sent):
-                secret_keys |= set(_ENV_KEY_RE.findall(sent))
-            if _ORLEANS_RE.search(sent) and _ZOMBIE_RE.search(sent):
-                orleans_zombie = True
-        probes |= {p.lower() for p in _PROBE_RE.findall(text)}
-        conn_refused = conn_refused or bool(_CONN_REFUSED_RE.search(text))
-
-    facts: List[str] = []
-    if reasons:
-        facts.append("состояние подов: " + ", ".join(sorted(reasons.values())))
-    if exits:
-        facts.append("код выхода контейнера: " + ", ".join(str(x) for x in sorted(exits)))
-    if signals:
-        facts.append("сигнал завершения процесса: " + ", ".join(sorted(signals)))
-    if restarts:
-        facts.append(f"рестартов контейнера: до {restarts}")
-    if failed_pods:
-        facts.append("в namespace есть поды в фазе Failed/Evicted")
-    if dirty:
-        v = f" (версия {', '.join(sorted(dirty_versions))})" if dirty_versions else ""
-        facts.append(f"schema_migrations: dirty=true{v}")
-    for err in sorted(db_errors):
-        facts.append(f"ошибка БД: {err}")
-    if secret_keys:
-        facts.append("в Secret нет ключей: " + ", ".join(sorted(secret_keys)))
-    if orleans_zombie:
-        facts.append("Orleans membership: есть записи мёртвых силосов (status=6)")
-    if probes:
-        facts.append("проба не проходит: " + ", ".join(sorted(probes)))
-    if conn_refused:
-        facts.append("в логах: connection refused")
-    return facts
-
-
-def observation_events(facts: List[str]) -> List[Dict[str, Any]]:
-    """k8s-события для PodEventsRule из строки «состояние подов: …»."""
-    events: List[Dict[str, Any]] = []
-    for f in facts:
-        if not f.startswith("состояние подов: "):
-            continue
-        for r in f.split(": ", 1)[1].split(", "):
-            reason = _REASON_TO_EVENT.get(r.lower())
-            if reason:
-                events.append({"type": "Warning", "reason": reason,
-                               "message": f"observed by squad-medic: {r}", "count": 1})
-    return events
-
-
-def answer_leak(facts: List[str], root_cause: Optional[str], n: int = 4) -> List[str]:
-    """n-граммы слов root_cause, которые нашлись в фактах (пусто = утечки нет).
-
-    Страховка поверх белого списка: шаблоны сами фраз медика не содержат,
-    но если когда-нибудь захваченный токен окажется куском вывода — кейс
-    не должен тихо уехать в датасет с подсказкой.
-    """
-    def words(s: str) -> List[str]:
-        return re.findall(r"[\w*]+", s.lower())
-
-    rc = words(root_cause or "")
-    grams = {" ".join(rc[i:i + n]) for i in range(len(rc) - n + 1)}
-    text = " ".join(" ".join(words(f)) for f in facts)
-    return sorted(g for g in grams if g and g in text)
-
+# Наблюдения squad-medic (что он ВИДЕЛ, без выводов) извлекаются в app и
+# живут в графе (kg_remediation_events.observations) как источник squad-medic
+# контекста инцидента — датасет читает их через тот же сборщик, что и прод.
+# Здесь — только страховка оценки от утечки ответа (answer_leak).
+from app.context.medic_observations import answer_leak  # noqa: E402
 
 def _guard_out_dir(out: Path) -> Path:
     out = out.expanduser().resolve()
@@ -382,8 +215,8 @@ def ctx_from_snapshot(ctx: Dict[str, Any], snap: Optional[Dict[str, Any]]) -> Di
     что видел пайплайн в момент инцидента, а не один алерт."""
     if not isinstance(snap, dict) or snap.get("schema") != "incident_ctx/v1":
         return ctx
-    # События/деплои/алерты в снимке — ссылки (kg_refs), их данные поднимает
-    # reconstruct_from_kg; здесь — только то, чего в графе нет.
+    # События/деплои/алерты в снимке — ссылки (kg_refs), их данные несёт
+    # kg_context кейса; здесь — только то, чего в графе нет.
     for key in ("k8s_pod_state", "metrics_summary", "cluster_health",
                 "rollout_suppressed", "core_dump_node", "logs_summary"):
         if snap.get(key) is not None:
@@ -400,311 +233,100 @@ def ctx_from_snapshot(ctx: Dict[str, Any], snap: Optional[Dict[str, Any]]) -> Di
     return ctx
 
 
-# Реконструкция контекста из графа point-in-time: у большинства старых
-# инцидентов снимка нет, но граф хранит историю событий подов, алертов и
-# деплоев. Замер 24.09.2026: у 92% событий медика fixed=true есть
-# kg_pod_events того же namespace в окне, деплои через kg_services — у 7%.
-# Верхняя граница окна — НАЧАЛО разбора медика, а не «+30 минут»: события
-# после него описывают уже его починку, и в кейсе протекал бы ответ.
-_KG_SQL = """
-SET TRANSACTION READ ONLY;
-SELECT to_jsonb(t) FROM (
-  SELECT e.id AS event_id, sc.scope AS ns_scope, sc.ns AS ns_list,
-    (SELECT coalesce(jsonb_agg(x), '[]'::jsonb) FROM (
-       -- Последнее событие на (под, reason): иначе 40 мест съедают сотни
-       -- одинаковых Unhealthy от readiness-пробы, а BackOff/OOMKilled не влезают.
-       -- kg_pod_events — изменяемый агрегат: count и last_seen дописываются
-       -- следующими синками. last_seen срезаем по отсечке, а count, если
-       -- строка обновлялась ПОСЛЕ неё, неизвестен на момент инцидента → NULL.
-       SELECT * FROM (
-         SELECT DISTINCT ON (pe.namespace, pe.pod_name, pe.reason)
-                pe.namespace, pe.pod_name AS pod, pe.type, pe.reason,
-                left(pe.message, 300) AS message,
-                CASE WHEN coalesce(pe.last_seen, pe.first_seen) <= e.started_at
-                     THEN pe.count END AS count,
-                pe.first_seen,
-                least(coalesce(pe.last_seen, pe.first_seen), e.started_at) AS last_seen
-         FROM kg_pod_events pe
-         -- first_seen не старше 7 суток: без нижней границы индекс по
-         -- first_seen бесполезен и запрос сканирует всю историю с апреля.
-         -- Строка, начавшаяся раньше и всё ещё обновлявшаяся, теряется —
-         -- цена приемлемая для датасета.
-         WHERE pe.namespace = ANY(sc.ns)
-           AND pe.first_seen BETWEEN e.started_at - interval '7 days' AND e.started_at
-           AND least(coalesce(pe.last_seen, pe.first_seen), e.started_at)
-               >= e.started_at - interval '2 hours'
-         ORDER BY pe.namespace, pe.pod_name, pe.reason,
-                  least(coalesce(pe.last_seen, pe.first_seen), e.started_at) DESC) d
-       ORDER BY (d.namespace = i.namespace) DESC, (d.type = 'Warning') DESC, d.last_seen DESC
-       LIMIT 40) x) AS pod_events,
-    (SELECT coalesce(jsonb_agg(x), '[]'::jsonb) FROM (
-       SELECT s.namespace, s.name AS service, a.alertname, a.severity, a.fired_at,
-              CASE WHEN a.resolved_at <= e.started_at THEN a.resolved_at END AS resolved_at
-       FROM kg_alerts a JOIN kg_services s ON s.id = a.service_id
-       WHERE s.namespace = ANY(sc.ns)
-         AND a.fired_at BETWEEN e.started_at - interval '2 hours' AND e.started_at
-       ORDER BY a.fired_at DESC LIMIT 20) x) AS alerts,
-    (SELECT coalesce(jsonb_agg(x), '[]'::jsonb) FROM (
-       -- Статика отдельно от кода: StaticsNewCluster раскатывается веером на
-       -- все сервисы сквада (сотни «деплоев» на сервис в месяц), и «недавний
-       -- деплой» по ней почти всегда true, хотя кода никто не менял.
-       SELECT s.namespace, s.name AS service, d.status, d.buildtype_id, d.started_at,
-              CASE WHEN d.finished_at <= e.started_at THEN d.finished_at END AS finished_at,
-              'code' AS kind
-       FROM kg_deployments d JOIN kg_services s ON s.id = d.service_id
-       WHERE s.namespace = ANY(sc.ns)
-         AND d.started_at BETWEEN e.started_at - interval '6 hours' AND e.started_at
-         AND d.buildtype_id NOT LIKE '%StaticsNewCluster%'
-       ORDER BY d.started_at DESC
-       LIMIT 10) x) AS deployments,
-    -- Статика — только счётчиком: её строки заняли бы весь лимит.
-    (SELECT count(*) FROM kg_deployments d JOIN kg_services s ON s.id = d.service_id
-     WHERE s.namespace = ANY(sc.ns) AND d.buildtype_id LIKE '%StaticsNewCluster%'
-       AND d.started_at BETWEEN e.started_at - interval '6 hours' AND e.started_at
-    ) AS statics_rollouts
-  FROM kg_remediation_events e
-  JOIN kg_incidents i ON i.id = e.incident_id
-  -- Сквад живёт в нескольких ns: медик пишет основной `squad-N-shared`, а
-  -- деплои и события сервисов ложатся в `squad-N-kingdomX`. Точный джойн по
-  -- namespace находил деплои у 7% кейсов, по префиксу сквада — у 76%.
-  -- Вне сквадов — точный namespace (в имени ns нет `_`/`%`, LIKE безопасен).
-  -- Список ns сквада — из kg_services (таблица маленькая), дальше точное
-  -- равенство по списку: LIKE с вычисляемым шаблоном по kg_pod_events
-  -- индекс не берёт и упирался в таймаут.
-  CROSS JOIN LATERAL (
-    SELECT p.scope, array_append(coalesce(
-             (SELECT array_agg(DISTINCT s2.namespace) FROM kg_services s2
-              WHERE s2.namespace LIKE p.scope), '{{}}'::text[]), i.namespace) AS ns
-    FROM (SELECT coalesce(substring(i.namespace from '^(squad-[^-]+-)') || '%',
-                          i.namespace) AS scope) p
-  ) sc
-  WHERE e.id IN ({ids})
-) t;
-"""
+# --- контекст графа: тот же сборщик, что у прода ----------------------------
+#
+# Своей реконструкции здесь больше нет: кейс получает контекст графа от
+# app/context/kg_incident_context.fetch_kg_incident_context — те же запросы
+# (объекты Select, отрендеренные в SQL для psql), тот же point-in-time на
+# начало разбора медика, тот же выбор target-а. Наблюдения squad-medic
+# приходят как источник внутри этого контекста, из графа.
 
 
-def reconstruct_from_kg(args, cases: List[Dict[str, Any]]) -> int:
-    """Дописать в кейсы `kg_context` — строки графа на момент инцидента,
-    с меткой `context=kg_reconstructed`. Текст событий проходит redact_pii:
-    датасет лежит вне репо, но выводы модели по нему могут попасть в отчёт."""
-    from app.services.pii_redaction import redact_pii
+def _run_psql(args) -> Callable[[str], Optional[str]]:
+    """Транспорт для PsqlReader: `kubectl exec psql` в под postgres-0.
 
-    ids = [int(c["event_id"]) for c in cases if c.get("event_id") is not None]
-    if not ids:
-        return 0
-    # Порциями: 31 кейс одним запросом упирался в 120-секундный таймаут
-    # (у каждого — свой lateral-скан kg_pod_events по скваду).
-    rows: List[Dict[str, Any]] = []
-    for i in range(0, len(ids), 8):
-        part = ids[i:i + 8]
-        rows += _psql_rows(args, _KG_SQL.format(ids=",".join(map(str, part)))) or []
-    by_id = {r["event_id"]: r for r in rows}
-    n = 0
-    for c in cases:
-        r = by_id.get(c.get("event_id"))
-        if not r or not (r.get("pod_events") or r.get("alerts") or r.get("deployments")
-                         or r.get("statics_rollouts")):
-            continue
-        for ev in r.get("pod_events") or []:
-            if ev.get("message"):
-                ev["message"] = redact_pii(ev["message"], max_len=300)
-        c["kg_context"] = {k: r.get(k) or [] for k in ("pod_events", "alerts", "deployments")}
-        c["kg_context"]["ns_scope"] = r.get("ns_scope")
-        c["kg_context"]["statics_rollouts"] = int(r.get("statics_rollouts") or 0)
-        c.setdefault("context", "kg_reconstructed")
-        n += 1
-    return n
-
-
-def ctx_from_kg(ctx: Dict[str, Any], kg: Optional[Dict[str, Any]]) -> Dict[str, Any]:
-    """Наложить реконструкцию из графа на ctx правил в форме, которую правила
-    читают: k8s_events как у K8sFacts, recent_deployments как у TC-экстрактора
-    (скоуп namespace — деплой любого сервиса ns, не обязательно этого)."""
-    if not isinstance(kg, dict):
-        return ctx
-    if kg.get("pod_events"):
-        ctx["k8s_events"] = [
-            {"type": e.get("type"), "reason": e.get("reason"), "message": e.get("message"),
-             # pod_name — ключ, по которому PodEventsRule привязывает событие
-             # к target-у: с `pod` каждое шло как unverified, и чужой OOM
-             # становился наблюдённым фактом вместо «чужого workload-а».
-             "count": e.get("count"), "pod_name": e.get("pod"), "namespace": e.get("namespace"),
-             "last_timestamp": e.get("last_seen") or e.get("first_seen")}
-            for e in kg["pod_events"]
-        ]
-    # В правило recent_deploy — только деплои кода (SQL статику в строки не
-    # берёт): веерная раскатка статики сделала бы «недавний деплой» истиной
-    # почти для любого кейса сквада. Статика — счётчиком в описание.
-    code = kg.get("deployments") or []
-    statics = int(kg.get("statics_rollouts") or 0)
-    if code:
-        ctx["recent_deployments"] = [
-            {"name": d.get("service") or d.get("buildtype_id") or "deploy",
-             "ts": d.get("finished_at") or d.get("started_at"), "status": d.get("status"),
-             "buildtype_id": d.get("buildtype_id"), "namespace": d.get("namespace"),
-             "attribution_scope": "namespace"}
-            for d in code
-        ]
-    if statics:
-        ctx["description"] = ((ctx.get("description") or "")
-                              + f"\nРаскатки статики на сквад за 6ч: {statics}").strip()
-    # Соседние алерты графа — не upstream по рёбрам зависимостей (правило
-    # UpstreamDegraded ждёт edge_kind), поэтому идут в описание, не в правило.
-    if kg.get("alerts"):
-        names = sorted({a.get("alertname") for a in kg["alerts"] if a.get("alertname")})
-        ctx["description"] = ((ctx.get("description") or "")
-                              + f"\nАлерты сквада за 2ч: {', '.join(names)}").strip()
-    return ctx
-
-
-# --- target кейса: сломанный workload, а не ближайший инцидент --------------
-
-# Причины событий подов, которые означают поломку, а не штатную жизнь пода.
-_BAD_POD_REASONS = frozenset({
-    "BackOff", "CrashLoopBackOff", "Failed", "FailedCreate", "FailedMount",
-    "FailedAttachVolume", "FailedScheduling", "ErrImagePull", "ImagePullBackOff",
-    "ErrImageNeverPull", "InspectFailed", "CreateContainerConfigError",
-    "CreateContainerError", "Unhealthy", "OOMKilling", "OOMKilled", "Evicted",
-    "BackoffLimitExceeded", "DeadlineExceeded",
-})
-# Алерты, которые target не выбирают: GenerationMismatch в сквадах мигает от
-# Rancher-churn (он переписывает Deployment раз в минуту, controller отстаёт) —
-# на сервисах с ingress, где ничего не сломано. Признак настоящего rollout-а —
-# деплой кода этого сервиса в окне; без него алерт в выбор не идёт.
-_NOISE_ALERTS = frozenset({"KubeDeploymentGenerationMismatch"})
-# Провал пробы — симптом, а не поломка: его даёт любой rollout, пока новый под
-# не прогрелся. Замер v4 (24.09.2026): без поправки target-ом в 24 из 31 кейса
-# становился town-grainhost — его Unhealthy от рестартов, которые медик сам
-# делал каждые 2 часа (цикл orleans-zombie, external/mcp!115).
-_SOFT_REASONS = frozenset({"Unhealthy"})
-_SOFT_WEIGHT = 0.2
-# Метрика-источник, а не workload: алерты kube-state-metrics с неразобранной
-# атрибуцией несут его имя в service.
-_NOT_TARGETS = frozenset({"vm-kube-state-metrics", "kube-state-metrics"})
-
-# Алфавит суффиксов k8s (без гласных и 0/1/3) — чтобы `town-db-0` не резался
-# как job-под, а `map-service` не терял «service».
-_K8S_SFX = "[bcdfghjklmnpqrstvwxz2456789]"
-_RS_POD_RE = re.compile(rf"^(?P<w>.+)-{_K8S_SFX}{{6,10}}-{_K8S_SFX}{{5}}$")
-_CRONJOB_POD_RE = re.compile(rf"^(?P<w>.+)-\d{{8,10}}-{_K8S_SFX}{{5}}$")
-_STS_POD_RE = re.compile(r"^(?P<w>.+)-\d{1,3}$")
-_JOB_POD_RE = re.compile(rf"^(?P<w>.+)-{_K8S_SFX}{{5}}$")
-
-
-def workload_of(pod: str) -> str:
-    """Имя workload-а по имени пода: Deployment (`x-<rs>-<pod>`), CronJob
-    (`x-<ts>-<pod>`), StatefulSet (`x-0`), Job (`x-<pod>`)."""
-    for rx in (_RS_POD_RE, _CRONJOB_POD_RE, _STS_POD_RE, _JOB_POD_RE):
-        m = rx.match(pod or "")
-        if m:
-            return m.group("w")
-    return pod or ""
-
-
-def _parse_ts(v: Any) -> Optional[datetime]:
-    if not v:
-        return None
-    try:
-        dt = datetime.fromisoformat(str(v).replace("Z", "+00:00"))
-    except ValueError:
-        return None
-    return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
-
-
-def _proximity(ts: Any, started: Optional[datetime]) -> float:
-    """Вес по близости к началу разбора: событие за 5 минут до разбора важнее
-    события двухчасовой давности (1.0 → ~0.2 к краю окна)."""
-    t = _parse_ts(ts)
-    if not t or not started:
-        return 0.5
-    age_min = max((started - t).total_seconds() / 60.0, 0.0)
-    return 1.0 / (1.0 + age_min / 30.0)
-
-
-def select_targets(case: Dict[str, Any], medic_action_text: str = "",
-                   limit: int = 5) -> List[Dict[str, Any]]:
-    """Кандидаты в target кейса, самый «больной» первым.
-
-    Вес workload-а — сумма по его плохим событиям подов (count, обрезанный до
-    20, × близость к началу разбора) плюс не-шумовые алерты его сервиса.
-    Провал пробы у workload-а, который в окне раскатывался, не считается вовсе
-    (прогрев нового пода), в остальных случаях — с весом 0.2.
-    Имена, которые медик назвал в applied/manual, только УСИЛИВАЮТ уже
-    известных кандидатов с «жёсткой» причиной (×1.5): нового имени из текста
-    медика не рождается, собственные рестарты медика не усиливают сами себя,
-    а выводы (root_cause/summary) не читаются вовсе.
+    Прямой kubectl — только здесь, в скрипте: app/ ходит в кластер через
+    kubectl_breaker, а в боевую БД — сессией.
     """
-    kg = case.get("kg_context") or {}
-    started = _parse_ts(case.get("started_at"))
-    rolled = {(d.get("namespace"), d.get("service")) for d in kg.get("deployments") or []}
-    acc: Dict[tuple, Dict[str, Any]] = {}
-
-    def slot(ns: Optional[str], wl: str) -> Dict[str, Any]:
-        return acc.setdefault((ns, wl), {"namespace": ns, "workload": wl, "score": 0.0,
-                                         "reasons": set(), "sources": set()})
-
-    for e in kg.get("pod_events") or []:
-        reason = e.get("reason")
-        if reason not in _BAD_POD_REASONS:
-            continue
-        wl = workload_of(e.get("pod") or "")
-        if not wl or wl in _NOT_TARGETS:
-            continue
-        weight = 1.0
-        if reason in _SOFT_REASONS:
-            if (e.get("namespace"), wl) in rolled:
-                continue
-            weight = _SOFT_WEIGHT
-        t = slot(e.get("namespace"), wl)
-        t["score"] += (weight * min(int(e.get("count") or 1), 20)
-                       * _proximity(e.get("last_seen"), started))
-        t["reasons"].add(reason)
-        t["sources"].add("kg_pod_events")
-    for a in kg.get("alerts") or []:
-        svc, ns = a.get("service"), a.get("namespace")
-        if not svc or svc in _NOT_TARGETS:
-            continue
-        # Резолвнувшийся до разбора алерт — уже выздоровевший сервис, не target.
-        if a.get("resolved_at"):
-            continue
-        if a.get("alertname") in _NOISE_ALERTS and (ns, svc) not in rolled:
-            continue
-        t = slot(ns, svc)
-        t["score"] += 5.0 * _proximity(a.get("fired_at"), started)
-        t["reasons"].add(a.get("alertname") or "alert")
-        t["sources"].add("kg_alerts")
-    if medic_action_text:
-        for t in acc.values():
-            if not (t["reasons"] - _SOFT_REASONS):
-                continue
-            if re.search(rf"(?<![\w-]){re.escape(t['workload'])}(?![\w-])", medic_action_text):
-                t["score"] *= 1.5
-                t["sources"].add("medic_applied")
-    ranked = sorted(acc.values(), key=lambda t: -t["score"])[:limit]
-    return [{**t, "score": round(t["score"], 2), "reasons": sorted(t["reasons"]),
-             "sources": sorted(t["sources"])} for t in ranked if t["score"] > 0]
+    def run(sql: str) -> Optional[str]:
+        cmd = ["kubectl", "--context", args.context, "-n", args.namespace, "exec",
+               "postgres-0", "--", "psql", "-U", args.db_user, "-d", args.db_name,
+               "-At", "-v", "ON_ERROR_STOP=1", "-c", sql]
+        try:
+            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=180)
+        except subprocess.TimeoutExpired:
+            print("psql: таймаут 180 с", file=sys.stderr)
+            return None
+        if proc.returncode != 0:
+            print(proc.stderr[-800:], file=sys.stderr)
+            return None
+        return proc.stdout
+    return run
 
 
-def assign_targets(cases: List[Dict[str, Any]],
-                   medic_texts: Optional[Dict[Any, str]] = None) -> int:
-    """Проставить `targets`/`target_workload`; сервис инцидента сохраняется
-    как `incident_service`. Возвращает число кейсов, сменивших target."""
+def case_scope(case: Dict[str, Any]):
+    """Скоуп кейса: граф на НАЧАЛО разбора медика. Сам разбор из истории
+    исключён (его итог — ответ кейса), выводы прошлых разборов — тоже
+    (в проде это законное «так уже было», в оценке — подсказка)."""
+    from app.context.kg_incident_context import KGScope
+
+    return KGScope(
+        namespace=case.get("namespace") or "",
+        service=case.get("service_name") or None,
+        alertname=case.get("alert_name") or None,
+        as_of=_parse_ts(case.get("started_at")) or datetime.now(timezone.utc),
+        with_conclusions=False,
+        exclude_remediation_ids=(int(case["event_id"]),) if case.get("event_id") else (),
+    )
+
+
+def fetch_kg_contexts(args, cases: List[Dict[str, Any]]) -> Dict[str, int]:
+    """Дописать в кейсы `kg_context` (граф на момент разбора) и target.
+
+    Наблюдения squad-medic внутри контекста проходят страховку answer_leak
+    против root_cause кейса: наблюдение, процитированное и в выводе медика,
+    из входа выбрасывается (в проде того же фильтра нет — там это не ответ).
+    """
+    from app.context.kg_incident_context import (PsqlReader,
+                                                 fetch_kg_incident_context)
+
+    reader = PsqlReader(_run_psql(args))
+    stats = {"with_kg": 0, "retargeted": 0, "leaks": 0, "with_medic": 0}
+    for c in cases:
+        try:
+            kgc = fetch_kg_incident_context(reader, case_scope(c))
+        except Exception as e:  # кейс, а не выгрузка: остальные должны пройти
+            print(f"  #{c.get('event_id')}: граф не ответил: {type(e).__name__}", file=sys.stderr)
+            continue
+        for o in kgc.get("medic_observations") or []:
+            facts = o.get("facts") or []
+            clean = [f for f in facts if not answer_leak([f], c.get("root_cause"))]
+            stats["leaks"] += len(facts) - len(clean)
+            o["facts"] = clean
+        c["kg_context"] = kgc
+        stats["with_kg"] += 1
+        if any(o.get("facts") for o in kgc.get("medic_observations") or []):
+            stats["with_medic"] += 1
+        if set_case_target(c):
+            stats["retargeted"] += 1
+    return stats
+
+
+def set_case_target(case: Dict[str, Any]) -> bool:
+    """`targets`/`target_workload` кейса из контекста графа; сервис инцидента
+    — `incident_service`. True — target сменился."""
     from app.diagnostics.rules.base import same_workload
 
-    changed = 0
-    for c in cases:
-        c.setdefault("incident_service", c.get("service_name"))
-        targets = select_targets(c, (medic_texts or {}).get(c.get("event_id"), ""))
-        c["targets"] = targets
-        if not targets:
-            c.pop("target_workload", None)
-            c.pop("target_namespace", None)
-            continue
-        c["target_workload"] = targets[0]["workload"]
-        c["target_namespace"] = targets[0]["namespace"]
-        if not same_workload(c["target_workload"], c.get("incident_service") or ""):
-            changed += 1
-    return changed
+    case.setdefault("incident_service", case.get("service_name"))
+    targets = (case.get("kg_context") or {}).get("targets") or []
+    case["targets"] = targets
+    if not targets:
+        case.pop("target_workload", None)
+        case.pop("target_namespace", None)
+        return False
+    case["target_workload"] = targets[0]["workload"]
+    case["target_namespace"] = targets[0]["namespace"]
+    return not same_workload(case["target_workload"], case.get("incident_service") or "")
 
 
 def target_event_share(case: Dict[str, Any], target: Optional[str]) -> Optional[float]:
@@ -718,8 +340,19 @@ def target_event_share(case: Dict[str, Any], target: Optional[str]) -> Optional[
     return sum(1 for e in evs if same_workload(e.get("pod") or "", target)) / len(evs)
 
 
+def _parse_ts(v: Any) -> Optional[datetime]:
+    if not v:
+        return None
+    try:
+        dt = datetime.fromisoformat(str(v).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+
+
 # Отсечка семантики `fixed` у медика (external/mcp!115 раскатан 24.09.2026 08:56
-# UTC): после неё fixed=true = «стенд здоров», до — «что-то применил».
+# UTC): после неё fixed=true = «стенд здоров», до — «что-то применил». Та же
+# константа, что в app/context/kg_incident_context (история для модели).
 MEDIC_FIXED_SEMANTICS_CUTOVER = datetime(2026, 9, 24, 8, 56, tzinfo=timezone.utc)
 
 # Затих ли сквад через 1–2 ч после разбора. Только метка исхода — во вход
@@ -768,12 +401,14 @@ SELECT to_jsonb(t) FROM (
 
 def fetch_kg_outcomes(args, ids: List[int], chunk: int = 60) -> Dict[int, Dict[str, Any]]:
     """Исход по графу для событий медика; сбой запроса = исход неизвестен."""
+    from app.context.kg_incident_context import BAD_POD_REASONS, NOISE_ALERTS
+
     out: Dict[int, Dict[str, Any]] = {}
     for i in range(0, len(ids), chunk):
         part = ids[i:i + chunk]
         sql = _OUTCOME_SQL.format(ids=",".join(map(str, part)),
-                                  reasons=",".join(sorted(_BAD_POD_REASONS)),
-                                  noise=",".join(sorted(_NOISE_ALERTS)))
+                                  reasons=",".join(sorted(BAD_POD_REASONS)),
+                                  noise=",".join(sorted(NOISE_ALERTS)))
         for r in _psql_rows(args, sql) or []:
             out[int(r["event_id"])] = r
     return out
@@ -802,30 +437,22 @@ def outcome_evidence(row: Dict[str, Any], kg: Optional[Dict[str, Any]]) -> Dict[
             "confirmed": bool(medic_healthy or kg_quiet)}
 
 
-def _medic_action_text(row: Dict[str, Any]) -> str:
-    """applied/manual медика одной строкой — только для сверки имён workload-ов
-    в select_targets. root_cause/summary/next_action сюда не входят."""
-    return json.dumps([row.get("applied") or [], row.get("manual") or []],
-                      ensure_ascii=False, default=str)
-
-
 def cmd_kg_context(args) -> int:
-    """Ретроактивно: дописать снимки и реконструкцию из графа в УЖЕ собранный
-    cases.jsonl, не пересобирая выборку (прогнанные results остаются валидны
-    по event_id; перепрогон кейса с новым входом — `run --ids`)."""
+    """Ретроактивно: перечитать контекст графа для УЖЕ собранного cases.jsonl,
+    не пересобирая выборку (прогнанные results остаются валидны по event_id;
+    перепрогон кейса с новым входом — `run --ids`)."""
     out = _guard_out_dir(Path(args.out))
     path = out / "cases.jsonl"
     cases = [json.loads(ln) for ln in path.read_text().splitlines() if ln]
     with_snapshot = attach_context_snapshots(args, cases)
-    with_kg = reconstruct_from_kg(args, cases)
-    # Текста applied/manual здесь уже нет (export его выбрасывает) — target
-    # только по графу.
-    retargeted = assign_targets(cases)
+    st = fetch_kg_contexts(args, cases)
     with path.open("w", encoding="utf-8") as f:
         for c in cases:
             f.write(json.dumps(c, ensure_ascii=False, default=str) + "\n")
-    print(f"кейсов: {len(cases)}, со снимком: {with_snapshot}, "
-          f"с реконструкцией из графа: {with_kg}, сменили target: {retargeted} → {path}")
+    print(f"кейсов: {len(cases)}, со снимком: {with_snapshot}, с контекстом графа: "
+          f"{st['with_kg']} (из них с наблюдениями squad-medic: {st['with_medic']}), "
+          f"сменили target: {st['retargeted']}, наблюдений отброшено страховкой: "
+          f"{st['leaks']} → {path}")
     return 0
 
 
@@ -875,8 +502,6 @@ def cmd_export(args) -> int:
     # теги». Без дедупа датасет меряет один случай сотню раз.
     seen: Set[tuple] = set()
     cases = []
-    medic_texts: Dict[Any, str] = {}
-    leaks = 0
     for r in rows:
         alertnames = r.get("alertnames") or []
         labels = sorted(classify(r.get("root_cause")))
@@ -887,23 +512,10 @@ def cmd_export(args) -> int:
         seen.add(key)
         r["expected_classes"] = labels
         r["expected_primary"] = primary
-        observed = extract_medic_observations(r)
-        # Строка факта, у которой есть общая n-грамма с выводом медика,
-        # выбрасывается, даже если это наблюдение: медик цитирует текст
-        # ошибки («relation X does not exist») и в root_cause, и граница
-        # «наблюдение / подсказка» тут не проверяема. Остальные факты кейса
-        # остаются.
-        clean = [f for f in observed if not answer_leak([f], r.get("root_cause"))]
-        leaks += len(observed) - len(clean)
-        observed = clean
-        r["observed_medic"] = observed
-        r["context"] = "medic_observed" if observed else "alert_only"
-        # Имена из applied/manual — только для сверки с кандидатами в target,
-        # в кейс текст не пишется.
-        medic_texts[r["event_id"]] = _medic_action_text(r)
-        # Сырые поля медика дальше не нужны: наблюдения уже извлечены, а
-        # выводы в applied/manual/gaps — лишний шанс протечь в вход.
-        for k in ("applied", "manual", "gaps", "extras"):
+        # Сырые поля медика в кейс не идут: его наблюдения приходят из графа
+        # (источник squad-medic контекста), а выводы в applied/manual/gaps —
+        # лишний шанс протечь во вход. root_cause остаётся — это ответ кейса.
+        for k in ("applied", "manual", "gaps", "extras", "summary"):
             r.pop(k, None)
         cases.append(r)
     if keep is not None:
@@ -914,18 +526,16 @@ def cmd_export(args) -> int:
             raise SystemExit(f"--keep-ids: не вернулись event_id {sorted(missing)} "
                              f"(окно --days {args.days}?) — cases.jsonl не перезаписан")
     with_snapshot = attach_context_snapshots(args, cases)
-    with_kg = reconstruct_from_kg(args, cases)
-    retargeted = assign_targets(cases, medic_texts)
+    st = fetch_kg_contexts(args, cases)
     path = out / "cases.jsonl"
     with path.open("w", encoding="utf-8") as f:
         for c in cases:
             f.write(json.dumps(c, ensure_ascii=False, default=str) + "\n")
-    with_obs = sum(1 for c in cases if c["context"] == "medic_observed")
     confirmed = sum(1 for c in cases if c.get("outcome_confirmed"))
-    print(f"событий медика: {len(rows)}, кейсов: {len(cases)}, с наблюдениями: {with_obs}, "
-          f"со снимком: {with_snapshot}, с реконструкцией из графа: {with_kg}, "
-          f"сменили target: {retargeted}, исход подтверждён: {confirmed}, "
-          f"фактов отброшено из-за совпадения с выводом медика: {leaks} → {path}")
+    print(f"событий медика: {len(rows)}, кейсов: {len(cases)}, со снимком: {with_snapshot}, "
+          f"с контекстом графа: {st['with_kg']} (с наблюдениями squad-medic: "
+          f"{st['with_medic']}), сменили target: {st['retargeted']}, исход подтверждён: "
+          f"{confirmed}, наблюдений отброшено страховкой answer_leak: {st['leaks']} → {path}")
     return 0
 
 
@@ -933,6 +543,7 @@ def cmd_export(args) -> int:
 
 
 def _to_incident(case: Dict[str, Any]):
+    from app.context.kg_incident_context import NOISE_ALERTS
     from app.models.incident import Incident
 
     alertname = case.get("alert_name") or (case.get("alertnames") or ["unknown"])[0]
@@ -942,7 +553,7 @@ def _to_incident(case: Dict[str, Any]):
     # GenerationMismatch от Rancher-churn указывает на здоровый сервис с
     # ingress, и пустой target (масштаб namespace) честнее чужого.
     service = case.get("target_workload") or ""
-    if not service and alertname not in _NOISE_ALERTS:
+    if not service and alertname not in NOISE_ALERTS:
         service = case.get("service_name") or ""
     namespace = case.get("target_namespace") or case.get("namespace") or ""
     summary = f"{alertname} in {namespace} ({service})"
@@ -963,136 +574,72 @@ def _to_incident(case: Dict[str, Any]):
     )
 
 
-# Снимок медика — частичный: он записывал то, что счёл важным, а не весь
-# namespace. Поля, которые он наполняет, помечаются partial, и правило,
-# не нашедшее своего сигнала, отвечает «?», а не «не было».
-_MEDIC_PARTIAL = "partial: восстановлено из наблюдений squad-medic, не полный снимок"
+# --- ctx кейса: тот же build_diagnostics_ctx, что у прода --------------------
 
-
-def apply_medic_observations(ctx: Dict[str, Any], facts: List[str]) -> Dict[str, Any]:
-    # Дописываем, а не заменяем: в режиме kg+medic k8s_events уже наполнены
-    # из графа, и наблюдения медика — добавка к ним, а не их подмена.
-    _append_text(ctx, "k8s_summary", "squad-medic", facts)
-    ctx["k8s_events"] = list(ctx.get("k8s_events") or []) + observation_events(facts)
-    status = dict(ctx.get("source_status") or {})
-    for field in ("k8s_summary", "k8s_events", "k8s_pod_state"):
-        if str(status.get(field, "")).startswith(NOT_RECONSTRUCTED):
-            status.pop(field)
-        status.setdefault(field, _MEDIC_PARTIAL)
-    ctx["source_status"] = status
-    return ctx
-
-
-# --- ctx кейса: те же поля, что наполняет боевой enrichment -------------------
-
-# Режимы входа: какой источник кейса подаётся в ctx правил. Один инцидент
-# меряется во всех режимах, для которых у него есть данные, — иначе by_context
+# Режимы входа: какой источник кейса подаётся модели. Один инцидент меряется
+# во всех режимах, для которых у него есть данные, — иначе by_context
 # сравнивал бы разные популяции, а не эффект источника.
-MODES = ("alert_only", "medic_observed", "kg_reconstructed", "kg+medic")
+#   alert_only   только алерт;
+#   kg           контекст графа на начало разбора, как у прода: события подов
+#                и Job-ы сквада, деплои, история, наблюдения squad-medic;
+#   kg_no_medic  то же без источника squad-medic — сколько даёт медик.
+MODES = ("alert_only", "kg", "kg_no_medic")
 
-# Поля ctx, на которые правила объявляют `sources`. Поле, которого в кейсе нет,
-# помечается в source_status: без пометки пустое поле читается как «опрошено,
-# пусто», и OOMKilledRule по кейсу без логов уверенно отвечает «OOM не было».
+# Поля ctx, которые в проде наполняют ЖИВЫЕ источники (снимок K8sFacts,
+# VictoriaMetrics, TeamCity) — у кейса датасета их нет. Пустое поле без
+# пометки читалось бы как «опрошено, пусто», и OOMKilledRule по кейсу без
+# логов уверенно отвечал бы «OOM не было».
 RULE_SOURCE_FIELDS = ("k8s_events", "k8s_summary", "logs_summary", "k8s_pod_state",
                       "metrics_summary", "recent_deployments", "upstream_alerts")
 NOT_RECONSTRUCTED = "not_reconstructed"
 _NOT_RECONSTRUCTED_REASON = f"{NOT_RECONSTRUCTED}: в кейсе датасета этого источника нет"
-_KG_PARTIAL = "partial: восстановлено из графа point-in-time (окно до начала разбора)"
 
 
-def uses_kg(mode: str) -> bool:
-    return mode in ("kg_reconstructed", "kg+medic")
-
-
-def uses_medic(mode: str) -> bool:
-    return mode in ("medic_observed", "kg+medic")
+def _has_medic(case: Dict[str, Any]) -> bool:
+    kgc = case.get("kg_context") or {}
+    return any(o.get("facts") for o in kgc.get("medic_observations") or [])
 
 
 def available_modes(case: Dict[str, Any]) -> List[str]:
     """Режимы, для которых у кейса есть вход. alert_only — всегда.
 
     Снимок контекста считается входом «графового» режима наравне с
-    реконструкцией: кейс со снимком, но без строк графа в окне, иначе терял
+    контекстом графа: кейс со снимком, но без строк графа в окне, иначе терял
     бы как раз то живое состояние подов, ради которого снимок пишется.
     """
     has_kg = (isinstance(case.get("kg_context"), dict)
               or isinstance(case.get("context_snapshot"), dict))
-    has_medic = bool(case.get("observed_medic"))
-    return [m for m, ok in (("alert_only", True), ("medic_observed", has_medic),
-                            ("kg_reconstructed", has_kg), ("kg+medic", has_kg and has_medic))
-            if ok]
-
-
-def _append_text(ctx: Dict[str, Any], field: str, source: str, lines: List[str]) -> None:
-    """Наблюдаемый текст с маркером источника. Не в analyzer_summary: тот —
-    проза модели и в text_haystack правил не входит намеренно."""
-    if not lines:
-        return
-    block = f"[{source}]\n" + "\n".join(lines)
-    prev = ctx.get(field)
-    ctx[field] = f"{prev}\n{block}" if prev else block
-
-
-def kg_event_lines(kg: Optional[Dict[str, Any]], target: Optional[str]) -> List[str]:
-    """События подов из графа — строками, как их видит k8s_summary боевого
-    K8sFacts: текстовые правила (crashloop, oom, process_crash) ищут сигнал
-    в тексте, а не в структурированном k8s_events.
-
-    Только события target-workload-а: текстовые правила под события не
-    перепроверяют, и BackOff соседнего сервиса сквада стал бы уверенным
-    фактом этого инцидента. Нет target-а — текста нет вовсе (structured
-    k8s_events остаются, там привязку делает PodEventsRule).
-    """
-    from app.diagnostics.rules.base import same_workload
-
-    if not target:
-        return []
-    out: List[str] = []
-    for e in (kg or {}).get("pod_events") or []:
-        if not same_workload(e.get("pod") or "", target):
-            continue
-        reason, msg = e.get("reason") or "", (e.get("message") or "").strip()
-        if not reason and not msg:
-            continue
-        cnt = f" x{e['count']}" if e.get("count") else ""
-        out.append(f"{e.get('type') or 'Event'} {reason}{cnt}: {msg}".rstrip(": "))
-    return out
+    modes = ["alert_only"]
+    if has_kg:
+        modes.append("kg")
+        if _has_medic(case):
+            modes.append("kg_no_medic")
+    return modes
 
 
 def build_case_ctx(case: Dict[str, Any], mode: str) -> Dict[str, Any]:
-    """ctx правил для кейса в заданном режиме входа.
+    """ctx правил для кейса в режиме входа — ТЕМ ЖЕ кодом, что у прода.
 
-    Источник кейса кладётся в те же поля, что наполняет боевой enrichment
-    (граф → k8s_events/recent_deployments, текст событий target-а →
-    k8s_summary), и только если режим его включает: alert_only не должен тихо
-    получать граф, иначе сравнение режимов теряет смысл. Всё, что не
-    восстановлено, — в source_status, и правило отвечает «?», а не ✗.
+    `build_diagnostics_ctx(kg_context=...)` раскладывает сохранённый в кейсе
+    контекст графа той же `apply_kg_context`, что раскладывает собранный в
+    проде. alert_only граф не получает вовсе. Всё, что в проде даёт живой
+    источник, а у кейса отсутствует, — в source_status: правило ответит «?».
     """
     from app.diagnostics.incident_ctx import build_diagnostics_ctx
 
     if mode not in MODES:
         raise ValueError(f"неизвестный режим входа: {mode}")
-    ctx = build_diagnostics_ctx(_to_incident(case), analyzer_summary="", kg_session=None)
+    kgc = case.get("kg_context") if mode != "alert_only" else None
+    ctx = build_diagnostics_ctx(_to_incident(case), analyzer_summary="", kg_session=None,
+                                kg_context=kgc, include_medic=(mode == "kg"))
     ctx.pop("collector_results", None)
     status = dict(ctx.get("source_status") or {})
     for field in RULE_SOURCE_FIELDS:
         if not ctx.get(field):
             status.setdefault(field, _NOT_RECONSTRUCTED_REASON)
     ctx["source_status"] = status
-
-    if uses_kg(mode):
-        kg = case.get("kg_context")
-        ctx = ctx_from_kg(ctx, kg)
-        _append_text(ctx, "k8s_summary", "kg_pod_events",
-                     kg_event_lines(kg, ctx.get("pod") or ctx.get("service")))
-        status = ctx["source_status"]
-        for field in ("k8s_events", "recent_deployments", "k8s_summary"):
-            if ctx.get(field) and str(status.get(field, "")).startswith(NOT_RECONSTRUCTED):
-                # Окно графа — выборка (40 событий, 10 деплоев), не полный снимок.
-                status[field] = _KG_PARTIAL
+    if mode != "alert_only":
         ctx = ctx_from_snapshot(ctx, case.get("context_snapshot"))
-    if uses_medic(mode):
-        apply_medic_observations(ctx, case.get("observed_medic") or [])
     return ctx
 
 
@@ -1134,11 +681,16 @@ def cmd_facts(args) -> int:
     return 0
 
 
-def case_summary(incident_summary: str, facts: List[str]) -> str:
-    if not facts:
-        return incident_summary
-    return (incident_summary + "\n\nНаблюдения на момент разбора (только наблюдаемое "
-            "состояние, без выводов):\n" + "\n".join(f"- {f}" for f in facts))
+def case_prompt(case: Dict[str, Any], mode: str) -> str:
+    """Текст инцидента для модели — как в пайплайне: сводка алерта плюс блок
+    контекста графа (`kg_context_prompt`), а не своя сборка скрипта."""
+    from app.context.kg_incident_context import kg_context_prompt
+
+    summary = _to_incident(case).summary
+    if mode == "alert_only":
+        return summary
+    block = kg_context_prompt(case.get("kg_context"), include_medic=(mode == "kg"))
+    return f"{summary}\n\n{block}" if block else summary
 
 
 async def _run_case(case: Dict[str, Any], context: str) -> Dict[str, Any]:
@@ -1147,12 +699,10 @@ async def _run_case(case: Dict[str, Any], context: str) -> Dict[str, Any]:
     from app.agents.multi_hypothesis import MultiHypothesisAgent
     from app.diagnostics import default_engine
 
-    incident = _to_incident(case)
-    facts = (case.get("observed_medic") or []) if uses_medic(context) else []
     store = default_engine.run(build_case_ctx(case, context))
     t0 = time.monotonic()
     hypotheses = await MultiHypothesisAgent().generate(
-        incident_summary=case_summary(incident.summary, facts), facts=store
+        incident_summary=case_prompt(case, context), facts=store
     )
     critiqued = await FactCriticAgent().critique_all(hypotheses, store)
     best = best_candidate(critiqued)
@@ -1313,7 +863,8 @@ def _score_block(cases: List[Dict[str, Any]], results: List[Dict[str, Any]]) -> 
         "latency_max_s": lat[-1] if lat else None,
         "note": ("попадание = первичный класс причины медика среди классов ответа "
                  "модели (регулярки CAUSE_CLASSES); alert_only — только алерт, "
-                 "medic_observed — алерт + наблюдения медика без выводов"),
+                 "kg — контекст графа на начало разбора (с наблюдениями squad-medic), "
+                 "kg_no_medic — то же без squad-medic"),
     }
 
 

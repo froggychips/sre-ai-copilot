@@ -73,8 +73,11 @@ def test_diagnostics_ctx_hands_upstream_run_to_pipeline(monkeypatch):
     )
     ctx = incident_ctx.build_diagnostics_ctx(inc, "", kg_session=object())
     runs = ctx[incident_ctx.COLLECTOR_RESULTS_KEY]
-    assert [r.name for r in runs] == ["upstream_alerts"]
+    # Второй прогон — контекст инцидента из графа: у заглушки-сессии он падает,
+    # и это видно в покрытии, а не теряется.
+    assert [r.name for r in runs] == ["upstream_alerts", "kg_incident_context"]
     assert runs[0].status is SourceStatus.EMPTY
+    assert runs[1].status is SourceStatus.FAILED
 
 
 def test_pipeline_coverage_survives_checkpoint_resume():

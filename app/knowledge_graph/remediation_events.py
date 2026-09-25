@@ -21,6 +21,7 @@ from typing import Any, Dict, List, Mapping, Optional, cast
 import structlog
 from sqlalchemy.orm import Session
 
+from app.context.medic_observations import build_observations
 from app.core.timeutil import ensure_naive
 from app.knowledge_graph.schema import KGIncident, KGRemediationEvent
 from app.models.remediation_event import RemediationEventIn
@@ -152,6 +153,16 @@ def record_external_remediation(db: Session, payload: RemediationEventIn) -> Dic
         incident_id=incident.id if incident is not None else None,
         extras=payload.extras,
     )
+    # Наблюдения — при приёме, один раз: граф хранит, что робот ВИДЕЛ, а не
+    # только его доклад прозой. Выводы (root_cause/next_action) экстрактор
+    # не читает.
+    row_any: Any = row
+    row_any.observations = build_observations(
+        {"summary": payload.summary, "applied": list(payload.applied),
+         "manual": list(payload.manual), "gaps": list(payload.gaps),
+         "extras": payload.extras, "namespace": payload.namespace, "namespaces": all_ns},
+        observed_at=payload.started_at,
+    )
     db.add(row)
     db.commit()
     log.info(
@@ -199,4 +210,5 @@ def event_to_dict(row: KGRemediationEvent) -> Dict[str, Any]:
         "summary": row.summary, "root_cause": row.root_cause, "next_action": row.next_action,
         "escalated": bool(row.escalated), "owner_login": row.owner_login,
         "incident_id": row.incident_id, "created_at": row.created_at,
+        "observations": row.observations,
     }

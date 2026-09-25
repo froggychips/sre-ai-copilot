@@ -39,6 +39,8 @@ from app.context.collector import (Collector, CollectorResult, Outcome,
                                    merge_source_status, summarize_coverage)
 from app.context.incident_snapshot import build_context_snapshot
 from app.context.k8s_facts import K8sFacts, K8sSnapshot
+from app.context.kg_incident_context import CTX_KEY as KG_CTX_KEY
+from app.context.kg_incident_context import kg_context_prompt
 from app.context.vm_client import (ClusterHealth, VMClient,
                                    valid_promql_label)
 from app.core.execution_dsl import ExecutionIntent
@@ -367,6 +369,12 @@ def _serialize_hypotheses(critiqued, facts: FactStore) -> str:
     return "\n".join(lines)
 
 
+def _join_text(live: Optional[str], graph: Optional[str]) -> Optional[str]:
+    """Живой текст снимка первым, блоки графа следом; пустое — отбросить."""
+    parts = [p for p in (live, graph) if p]
+    return "\n".join(parts) if parts else live
+
+
 class IncidentPipeline:
     """Stateful pipeline for a single incident. Call `await pipeline.run()`."""
 
@@ -417,6 +425,9 @@ class IncidentPipeline:
         self.gitlab_context: Optional[Dict[str, Any]] = None
         self.blast_radius_context: Optional[str] = None
         self.statics_check_context: Optional[str] = None
+        # Контекст графа на момент инцидента текстом для модели
+        # (app/context/kg_incident_context.kg_context_prompt).
+        self.kg_context_prompt: Optional[str] = None
         # Wave 3 #2: deploy correlation для проброса в Discord embed.
         # Заполняется в stage_diagnose._enrich_deploy_correlation.
         self.deploy_correlation: Optional[Dict[str, Any]] = None
@@ -478,6 +489,7 @@ class IncidentPipeline:
                 "gitlab_context": self.gitlab_context,
                 "blast_radius_context": self.blast_radius_context,
                 "statics_check_context": self.statics_check_context,
+                "kg_context_prompt": self.kg_context_prompt,
                 "deploy_correlation": self.deploy_correlation,
                 "team_owner": self.team_owner,
                 "context_snapshot": self.context_snapshot,
@@ -551,6 +563,7 @@ class IncidentPipeline:
                 self.gitlab_context = cp.get("gitlab_context")
                 self.blast_radius_context = cp.get("blast_radius_context")
                 self.statics_check_context = cp.get("statics_check_context")
+                self.kg_context_prompt = cp.get("kg_context_prompt")
                 self.deploy_correlation = cp.get("deploy_correlation")
                 self.team_owner = cp.get("team_owner")
                 self.context_snapshot = cp.get("context_snapshot")
@@ -667,6 +680,8 @@ class IncidentPipeline:
             self._filter_rollout_noise(diag_ctx)
             self.fact_store = diag_engine.run(diag_ctx)
             self._capture_context_snapshot(diag_ctx)
+            # Модель видит тот же граф, что и правила, — блоком в промпт.
+            self.kg_context_prompt = kg_context_prompt(diag_ctx.get(KG_CTX_KEY))
         snap = t.snapshot().to_dict()
         self._safe_transition(IncidentState.FACTS_COLLECTED, snap)
         self.traces.append(snap)
@@ -945,9 +960,16 @@ class IncidentPipeline:
         if isinstance(snap, K8sSnapshot):
             # Заглушку упавшего снапшота кладём как раньше (её видит LLM), но
             # поля уже помечены в source_status: ✗ по ней правила не скажут.
-            diag_ctx["logs_summary"] = snap.text
+            # Живой снимок ДОПОЛНЯЕТ граф (build_diagnostics_ctx уже положил
+            # события и текст из kg_incident_context), а не стирает его: граф
+            # знает то, чего уже нет в живом API (упавший и снесённый
+            # migrate-job, BackOff пересозданного пода).
+            diag_ctx["logs_summary"] = _join_text(snap.text, diag_ctx.get("logs_summary"))
             diag_ctx["k8s_pod_state"] = snap.container_terminated
-            diag_ctx["k8s_events"] = snap.pod_events
+            diag_ctx["k8s_events"] = list(snap.pod_events or []) + [
+                e for e in (diag_ctx.get("k8s_events") or []) if isinstance(e, dict)
+                and e.get("source")
+            ]
             if snap.core_dump_node:
                 diag_ctx["core_dump_node"] = snap.core_dump_node
         if res.error:
@@ -1081,6 +1103,9 @@ class IncidentPipeline:
 
         if self.statics_check_context:
             summary = f"{summary}\n\n{self.statics_check_context}"
+
+        if self.kg_context_prompt:
+            summary = f"{summary}\n\n{self.kg_context_prompt}"
 
         if self.similar_past:
             bullets = []

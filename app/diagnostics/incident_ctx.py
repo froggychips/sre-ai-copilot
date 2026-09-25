@@ -20,6 +20,8 @@ from typing import Any, Dict, List, Optional
 from sqlalchemy.orm import Session
 
 from app.context.collector import Collector, merge_source_status
+from app.context.kg_incident_context import (apply_kg_context, as_of_for,
+                                             build_kg_context)
 
 from app.knowledge_graph.queries import nearby_alerts
 from app.models.incident import Incident
@@ -81,6 +83,8 @@ def build_diagnostics_ctx(
     incident: Incident,
     analyzer_summary: str,
     kg_session: Optional[Session] = None,
+    kg_context: Optional[Dict[str, Any]] = None,
+    include_medic: bool = True,
 ) -> Dict[str, Any]:
     """Собрать enriched ctx для DiagnosticEngine.
 
@@ -90,9 +94,13 @@ def build_diagnostics_ctx(
             `analyzer_summary` (вне Rule.text_haystack): LLM-проза не должна
             фабриковать «наблюдаемые» факты через regex-сканы правил.
         kg_session: опциональная сессия БД. Если передана, попытаемся
-            подтянуть nearby_alerts из knowledge_graph для UpstreamDegradedRule.
-            Без неё `upstream_alerts` остаётся None и правило сигналит
-            «no_graph_data» (это сейчас норма — populator ещё не работает).
+            подтянуть nearby_alerts из knowledge_graph для UpstreamDegradedRule
+            и контекст инцидента из графа на момент его начала
+            (app/context/kg_incident_context.py): события подов и Job-ы
+            сквада, деплои, история, наблюдения squad-medic.
+        kg_context: уже собранный контекст графа (датасет live-RCA хранит его
+            в кейсе) — раскладывается ТЕМ ЖЕ кодом, что и собранный здесь.
+        include_medic: подавать ли источник squad-medic (сравнение в датасете).
 
     Returns:
         dict с полями: incident, namespace, service, pod, alertname,
@@ -128,7 +136,7 @@ def build_diagnostics_ctx(
             upstream_alerts = res.data if res.ok else None
             collector_results.append(res)
 
-    return {
+    ctx: Dict[str, Any] = {
         "incident": incident.model_dump(),
         "namespace": incident.namespace,
         "service": labels.get("service"),
@@ -148,3 +156,17 @@ def build_diagnostics_ctx(
         "source_status": source_status,
         COLLECTOR_RESULTS_KEY: collector_results,
     }
+    # Граф на момент начала инцидента — основной источник наблюдений; живой
+    # снимок K8sFacts пайплайн накладывает поверх (дополняет, не стирает).
+    if kg_context is None and kg_session is not None and incident.namespace:
+        kg_res = build_kg_context(
+            kg_session, namespace=incident.namespace, service=labels.get("service"),
+            alertname=labels.get("alertname"), as_of=as_of_for(incident_starts_at),
+        )
+        if kg_res is not None:
+            merge_source_status(source_status, kg_res)
+            collector_results.append(kg_res)
+            kg_context = kg_res.data
+    if kg_context is not None:
+        apply_kg_context(ctx, kg_context, include_medic=include_medic)
+    return ctx

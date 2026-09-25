@@ -240,3 +240,20 @@ def test_payload_validation_caps_lists():
     assert len(p.applied) == 100 and p.namespaces == ["a", "b"]
     with pytest.raises(ValueError):
         RemediationEventIn(**{**json.loads(_payload().model_dump_json()), "outcome": "weird"})
+
+
+def test_ingest_stores_observations_without_conclusions(db):
+    """Наблюдения медика — в граф при приёме; выводы — нет."""
+    res = record_external_remediation(db, _payload(
+        summary="Поды в ImagePullBackOff, schema_migrations dirty version 20260801120000",
+        root_cause="тег снесён retention Nexus — CrashLoopBackOff тут ни при чём",
+    ))
+    row = db.get(KGRemediationEvent, res["id"])
+    obs = row.observations
+    assert obs["schema"] == "medic_obs/v1" and obs["provenance"] == "squad-medic"
+    assert obs["namespace"] == "squad-39-shared"
+    assert obs["observed_at"].startswith(NOW.isoformat()[:16])
+    assert "состояние подов: ImagePullBackOff" in obs["facts"]
+    assert "schema_migrations: dirty=true (версия 20260801120000)" in obs["facts"]
+    text = json.dumps(obs, ensure_ascii=False)
+    assert "retention" not in text and "CrashLoopBackOff" not in text

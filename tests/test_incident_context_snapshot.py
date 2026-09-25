@@ -242,49 +242,10 @@ def test_kg_rows_are_referenced_not_copied():
 
 
 # ── датасет: реконструкция из графа ─────────────────────────────────────────
+# Своей реконструкции у датасета больше нет: контекст графа собирает общий
+# сборщик app/context/kg_incident_context.py (point-in-time, скоуп сквада,
+# статика отдельно, redact) — его тесты в tests/test_kg_incident_context.py.
 
-
-def test_reconstruct_from_kg_labels_and_redacts(monkeypatch):
-    rows = [{"event_id": 1,
-             "pod_events": [{"pod": "p-1", "type": "Warning", "reason": "BackOff",
-                             "message": "token=abc123 for ops@example.com", "count": 5,
-                             "first_seen": "2026-09-24T09:00:00", "last_seen": "2026-09-24T09:50:00"}],
-             "alerts": [{"service": "s", "alertname": "KubePodCrashLooping"}],
-             "deployments": [{"service": "s", "status": "SUCCESS",
-                              "started_at": "2026-09-24T09:40:00", "finished_at": "2026-09-24T09:45:00"}]},
-            {"event_id": 2, "pod_events": [], "alerts": [], "deployments": []}]
-    monkeypatch.setattr(lrd, "_psql_rows", lambda args, sql: rows)
-    cases = [{"event_id": 1}, {"event_id": 2}, {"event_id": 3, "context": "medic_observed"}]
-    assert lrd.reconstruct_from_kg(object(), cases) == 1
-    assert cases[0]["context"] == "kg_reconstructed"
-    assert "ops@example.com" not in json.dumps(cases[0])
-    assert "kg_context" not in cases[1]
-    assert cases[2]["context"] == "medic_observed"   # чужую метку не перетираем
-
-
-def test_reconstruct_sql_window_stops_at_medic_start():
-    # Верхняя граница — начало разбора медика: события починки — это ответ.
-    assert "pe.first_seen BETWEEN e.started_at - interval '7 days' AND e.started_at" in lrd._KG_SQL
-    assert "+ interval" not in lrd._KG_SQL
-
-
-def test_ctx_from_kg_feeds_rules_in_their_shape():
-    from app.diagnostics import default_engine
-
-    kg = {"pod_events": [{"pod": "p-1", "type": "Warning", "reason": "BackOff",
-                          "message": "Back-off restarting failed container", "count": 9,
-                          "last_seen": "2026-09-24T09:58:00"}],
-          "deployments": [{"service": "town-service", "status": "SUCCESS",
-                           "started_at": "2026-09-24T09:40:00", "finished_at": "2026-09-24T09:45:00"}],
-          "alerts": [{"alertname": "KubePodCrashLooping"}]}
-    ctx = _ctx(k8s_events=None, recent_deployments=None, k8s_pod_state={})
-    ctx = lrd.ctx_from_kg(ctx, kg)
-    assert ctx["k8s_events"][0]["reason"] == "BackOff"
-    assert ctx["recent_deployments"][0]["attribution_scope"] == "namespace"
-    assert "KubePodCrashLooping" in ctx["description"]
-    store = default_engine.run(ctx)
-    assert "recent_deploy" in store.observed_kinds()
-    assert lrd.ctx_from_kg({"a": 1}, None) == {"a": 1}
 
 
 # ── ревью #446: отсечка по времени снимка, агрегаты, перепрогон, метаданные ──
@@ -295,26 +256,6 @@ def test_snapshot_is_dated_and_dataset_cuts_on_that_date():
     assert datetime.fromisoformat(snap["captured_at"]).tzinfo is not None
     assert "captured_at}}')::timestamptz <= e.started_at" in lrd._SNAPSHOT_SQL
     assert "r.created_at" not in lrd._SNAPSHOT_SQL
-
-
-def test_pod_event_aggregates_are_clamped_to_cutoff():
-    sql = lrd._KG_SQL
-    assert "least(coalesce(pe.last_seen, pe.first_seen), e.started_at) AS last_seen" in sql
-    assert "THEN pe.count END AS count" in sql
-    assert "(d.type = 'Warning') DESC, d.last_seen DESC" in sql
-
-
-def test_reconstruction_scopes_by_squad_and_splits_statics():
-    sql = lrd._KG_SQL
-    # Сквад — все его ns через kg_services; вне сквадов — точный namespace.
-    assert "substring(i.namespace from '^(squad-[^-]+-)') || '%'" in sql
-    assert sql.count("= ANY(sc.ns)") == 4
-    # Статика — не строками деплоя, а счётчиком.
-    assert "NOT LIKE '%StaticsNewCluster%'" in sql and "AS statics_rollouts" in sql
-    ctx = lrd.ctx_from_kg({"description": "d"}, {"pod_events": [], "deployments": [],
-                                                 "alerts": [], "statics_rollouts": 7})
-    assert "recent_deployments" not in ctx
-    assert "статики на сквад за 6ч: 7" in ctx["description"]
 
 
 def test_fact_metadata_is_redacted_and_bounded():

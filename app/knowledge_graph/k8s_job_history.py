@@ -18,11 +18,12 @@ KG-контекста инцидента.
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
-from sqlalchemy import func
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
+from sqlalchemy.sql import Select
 
 from app.knowledge_graph.schema import K8sJobRun, Namespace
 
@@ -208,47 +209,86 @@ def prune_job_runs(
     return deleted
 
 
-def _row_dict(r: K8sJobRun) -> Dict[str, Any]:
+def _get(r: Any, key: str) -> Any:
+    """Поле строки истории: ORM-объект или словарь (строка `Select`)."""
+    return r.get(key) if isinstance(r, dict) else getattr(r, key, None)
+
+
+def _naive_ts(v: Any) -> Optional[datetime]:
+    """Метка времени строки: naive UTC из сессии или ISO-строка из psql."""
+    if v is None or v == "":
+        return None
+    if isinstance(v, datetime):
+        dt = v
+    else:
+        try:
+            dt = datetime.fromisoformat(str(v).replace("Z", "+00:00"))
+        except ValueError:
+            return None
+    if dt.tzinfo is not None:
+        dt = dt.astimezone(timezone.utc).replace(tzinfo=None)
+    return dt
+
+
+def _row_dict(r: Any) -> Dict[str, Any]:
     return {
-        "namespace": r.namespace,
-        "name": r.name,
-        "uid": r.uid,
-        "owner_service_name": r.owner_service_name,
-        "succeeded": r.succeeded_count,
-        "failed": r.failed_count,
-        "active": r.active_count,
-        "start_time": r.start_time,
-        "completion_time": r.completion_time,
-        "exit_code": r.last_pod_exit_code,
-        "condition_type": r.condition_type,
-        "condition_reason": r.condition_reason,
-        "condition_message": r.condition_message,
-        "observed_at": r.observed_at,
-        "disappeared": bool(r.disappeared),
+        "namespace": _get(r, "namespace"),
+        "name": _get(r, "name"),
+        "uid": _get(r, "uid"),
+        "owner_service_name": _get(r, "owner_service_name"),
+        "succeeded": _get(r, "succeeded_count"),
+        "failed": _get(r, "failed_count"),
+        "active": _get(r, "active_count"),
+        "start_time": _naive_ts(_get(r, "start_time")),
+        "completion_time": _naive_ts(_get(r, "completion_time")),
+        "exit_code": _get(r, "last_pod_exit_code"),
+        "condition_type": _get(r, "condition_type"),
+        "condition_reason": _get(r, "condition_reason"),
+        "condition_message": _get(r, "condition_message"),
+        "observed_at": _naive_ts(_get(r, "observed_at")),
+        "disappeared": bool(_get(r, "disappeared")),
         "status": _status(r),
     }
 
 
-def _status(r: K8sJobRun) -> str:
-    failed = r.condition_type in ("Failed", "FailureTarget") or (
-        r.condition_type is None and (r.active_count or 0) == 0 and (r.failed_count or 0) > 0
+def _status(r: Any) -> str:
+    cond = _get(r, "condition_type")
+    active = _get(r, "active_count") or 0
+    failed_n = _get(r, "failed_count") or 0
+    failed = cond in ("Failed", "FailureTarget") or (
+        cond is None and active == 0 and failed_n > 0
     )
-    if r.disappeared:
+    if _get(r, "disappeared"):
         # Удалён: «упал» остаётся фактом, всё остальное — уже не состояние.
         return "failed" if failed else "gone"
-    if r.condition_type in ("Failed", "FailureTarget"):
+    if cond in ("Failed", "FailureTarget"):
         return "failed"
-    if r.condition_type in ("Complete", "SuccessCriteriaMet"):
+    if cond in ("Complete", "SuccessCriteriaMet"):
         return "succeeded"
-    if (r.active_count or 0) > 0:
+    if active > 0:
         # Активный, но уже с упавшими попытками: backoff в процессе.
-        return "retrying" if (r.failed_count or 0) > 0 else "running"
-    if (r.failed_count or 0) > 0:
+        return "retrying" if failed_n > 0 else "running"
+    if failed_n > 0:
         return "failed"
     return "unknown"
 
 
 _STATUS_ORDER = {"failed": 0, "retrying": 1, "running": 2, "unknown": 3, "succeeded": 4}
+
+
+def incarnation_select(namespaces: List[str]) -> Select:
+    """Начало текущей инкарнации namespace-ов (kg_namespaces.k8s_created_at)."""
+    return (select(Namespace.namespace, Namespace.k8s_created_at)
+            .where(Namespace.namespace.in_(namespaces)))
+
+
+def incarnation_from_rows(rows: Iterable[Any]) -> Dict[str, datetime]:
+    out: Dict[str, datetime] = {}
+    for r in rows:
+        created = _naive_ts(_get(r, "k8s_created_at"))
+        if created is not None:
+            out[str(_get(r, "namespace"))] = created
+    return out
 
 
 def _incarnation_starts(db: Session, namespaces: List[str]) -> Dict[str, datetime]:
@@ -259,15 +299,68 @@ def _incarnation_starts(db: Session, namespaces: List[str]) -> Dict[str, datetim
     k8s_created_at — граница неизвестна, фильтра нет (так было и до истории).
     """
     try:
-        rows = (
-            db.query(Namespace.namespace, Namespace.k8s_created_at)
-            .filter(Namespace.namespace.in_(namespaces))
-            .all()
-        )
+        return incarnation_from_rows(
+            dict(m) for m in db.execute(incarnation_select(namespaces)).mappings())
     except Exception as e:  # граф без kg_namespaces — история всё равно полезна
         logger.debug("k8s_job_history.incarnation_lookup_failed err=%s", e)
         return {}
-    return {str(ns): created for ns, created in rows if created is not None}
+
+
+def last_runs_select(namespaces: List[str], at: datetime,
+                     name_contains: Optional[str] = None) -> Select:
+    """Последняя строка истории каждого (namespace, name) с observed_at <= at.
+
+    `Select`, а не запрос сессии: тот же запрос исполняет и сборщик контекста
+    инцидента через psql (датасет live-RCA), см. app/context/kg_incident_context.
+    """
+    at_n = _naive_ts(at) or at
+    conds = [K8sJobRun.namespace.in_(namespaces), K8sJobRun.observed_at <= at_n]
+    if name_contains:
+        conds.append(K8sJobRun.name.ilike(f"%{name_contains}%"))
+    last = (
+        select(K8sJobRun.namespace, K8sJobRun.name, func.max(K8sJobRun.id).label("mid"))
+        .where(*conds)
+        .group_by(K8sJobRun.namespace, K8sJobRun.name)
+        .subquery()
+    )
+    cols = [c for c in K8sJobRun.__table__.columns]
+    return select(*cols).join(last, K8sJobRun.id == last.c.mid)
+
+
+def states_at_from_rows(
+    rows: Iterable[Any],
+    incarnation: Dict[str, datetime],
+    at: datetime,
+    *,
+    lookback_hours: int = 24,
+    failed_lookback_hours: int = 168,
+    limit: int = 50,
+) -> List[Dict[str, Any]]:
+    """Отбор и порядок `jobs_state_at` поверх уже прочитанных строк."""
+    at_n = _naive_ts(at) or at
+    since = at_n - timedelta(hours=lookback_hours)
+    failed_since = at_n - timedelta(hours=failed_lookback_hours)
+    out = []
+    for r in rows:
+        d = _row_dict(r)
+        born = incarnation.get(str(d["namespace"]))
+        seen = d["observed_at"]
+        if born is not None and born <= at_n and seen is not None and seen < born:
+            # Строка из прошлой инкарнации namespace-а, а спрашивают про
+            # нынешнюю: этот Job в новом стенде ещё не запускался.
+            continue
+        if d["status"] == "gone":
+            continue
+        recent = seen is not None and seen >= since
+        unfinished = d["status"] in ("running", "retrying")
+        failed_recently = d["status"] == "failed" and seen is not None and seen >= failed_since
+        if recent or unfinished or failed_recently:
+            out.append(d)
+    out.sort(key=lambda d: (
+        _STATUS_ORDER.get(d["status"], 9),
+        -(d["observed_at"].timestamp() if d["observed_at"] else 0),
+    ))
+    return out[:limit]
 
 
 def jobs_state_at(
@@ -298,40 +391,7 @@ def jobs_state_at(
     ns_list = [n for n in namespaces if n]
     if not ns_list:
         return []
-    since = at - timedelta(hours=lookback_hours)
-    failed_since = at - timedelta(hours=failed_lookback_hours)
     incarnation = _incarnation_starts(db, ns_list)
-    base = db.query(K8sJobRun).filter(
-        K8sJobRun.namespace.in_(ns_list), K8sJobRun.observed_at <= at,
-    )
-    if name_contains:
-        base = base.filter(K8sJobRun.name.ilike(f"%{name_contains}%"))
-    last = (
-        base.with_entities(
-            K8sJobRun.namespace, K8sJobRun.name, func.max(K8sJobRun.id).label("mid"),
-        )
-        .group_by(K8sJobRun.namespace, K8sJobRun.name)
-        .subquery()
-    )
-    rows = db.query(K8sJobRun).join(last, K8sJobRun.id == last.c.mid).all()
-    out = []
-    for r in rows:
-        born = incarnation.get(str(r.namespace))
-        if born is not None and born <= at and r.observed_at is not None and r.observed_at < born:
-            # Строка из прошлой инкарнации namespace-а, а спрашивают про
-            # нынешнюю: этот Job в новом стенде ещё не запускался.
-            continue
-        d = _row_dict(r)
-        if d["status"] == "gone":
-            continue
-        seen = r.observed_at
-        recent = seen is not None and seen >= since
-        unfinished = d["status"] in ("running", "retrying")
-        failed_recently = d["status"] == "failed" and seen is not None and seen >= failed_since
-        if recent or unfinished or failed_recently:
-            out.append(d)
-    out.sort(key=lambda d: (
-        _STATUS_ORDER.get(d["status"], 9),
-        -(d["observed_at"].timestamp() if d["observed_at"] else 0),
-    ))
-    return out[:limit]
+    rows = [dict(m) for m in db.execute(last_runs_select(ns_list, at, name_contains)).mappings()]
+    return states_at_from_rows(rows, incarnation, at, lookback_hours=lookback_hours,
+                               failed_lookback_hours=failed_lookback_hours, limit=limit)
