@@ -1243,21 +1243,49 @@ def enrich_alert(db: Session, incident: Incident) -> EnrichedContext:
         ctx.collector_results.append(kg_res)
         ctx.kg_context = kg_res.data if isinstance(kg_res.data, dict) else None
 
+    # Метка `pod` в алерте — это под, с которого пришла серия. События ниже
+    # собраны по СЕРВИСУ, а у DaemonSet (vm-node-exporter, ~60 подов на разных
+    # нодах) «последнее событие сервиса» — случайный под с чужой ноды: карточка
+    # NodeSystemSaturation по dev-6 показывала под с dev-4 и его Unhealthy
+    # месячной давности, прод-алерт — под dev-6. Если метка есть, оставляем
+    # только события этого пода.
+    alert_pod = (labels.get("pod") or "").strip() or None
+    # У алертов по kube-state-metrics без собственной метки pod (Deployment/
+    # StatefulSet/Node-условия) `pod` — это под самого KSM, откуда пришла
+    # серия, а не проблемный: его нельзя ставить в карточку и фильтровать им
+    # события сервиса. У KubePodCrashLooping и т.п. KSM отдаёт настоящий pod
+    # (не начинается с имени сервиса экспортёра) — он остаётся.
+    if (
+        alert_pod
+        and labels.get("job") == "kube-state-metrics"
+        and alert_pod.startswith((labels.get("service") or "kube-state-metrics") + "-")
+    ):
+        alert_pod = None
+    # С названным подом фильтруем ДО лимита: иначе у DaemonSet на ~60 подов
+    # пять свежих событий чужих подов вытесняют событие нужного, а пустой
+    # после фильтра список ещё и не доходит до недельного fallback.
+    fetch_limit = 200 if alert_pod else 5
+
+    def _only_alert_pod(events: Any) -> Any:
+        if not alert_pod or events is None:
+            return events
+        return [e for e in events if (e.get("pod_name") or "") == alert_pod][:5]
+
     def _collect_pod_events() -> Any:
-        events = service_pod_events(
+        events = _only_alert_pod(service_pod_events(
             ctx.kg_context, namespace, service, around=effective_at,
-            window_minutes=60, limit=5,
-        )
+            window_minutes=60, limit=fetch_limit,
+        ))
         if events is None:
-            events = recent_pod_events_for(
+            events = _only_alert_pod(recent_pod_events_for(
                 db, namespace, service, around=effective_at,
-                window_minutes=60, limit=5,
-            )
+                window_minutes=60, limit=fetch_limit,
+            ))
         if not events:
-            events = recent_pod_events_for(
+            events = _only_alert_pod(recent_pod_events_for(
                 db, namespace, service, around=effective_at,
-                window_minutes=7 * 24 * 60, limit=5,
-            )
+                window_minutes=7 * 24 * 60, limit=fetch_limit,
+            ))
         return events
 
     res = _POD_EVENTS.run_sync(_collect_pod_events)
@@ -1309,9 +1337,14 @@ def enrich_alert(db: Session, incident: Incident) -> EnrichedContext:
         if ctx.pod_events:
             # head(pod_events) уже отсортирован по first_seen DESC
             latest_ev = ctx.pod_events[0]
-        else:
+        elif not alert_pod:
+            # Fallback «последнее событие сервиса» — только когда алерт сам не
+            # назвал под: иначе он подменил бы верный под чужим.
             latest_ev = latest_pod_event_for(db, namespace, service)
-        if latest_ev:
+        if alert_pod:
+            ctx.pod_name = alert_pod
+            ctx.container_reason = (latest_ev or {}).get("reason") or None
+        elif latest_ev:
             ctx.pod_name = latest_ev.get("pod_name") or None
             ctx.container_reason = latest_ev.get("reason") or None
     except Exception as e:
