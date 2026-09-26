@@ -393,3 +393,60 @@ def test_enrich_alert_ignores_ksm_exporter_pod_label(
 
     assert ctx.pod_name == "clickhouse-keeper-0"
     assert ctx.container_reason == "BackOff"
+
+
+@patch("app.services.alert_enrichment.current_replicas_from_kg")
+@patch("app.services.alert_enrichment.latest_pod_event_for")
+@patch("app.services.alert_enrichment.recent_pod_events_for")
+@patch("app.services.alert_enrichment.recent_deploys_for")
+@patch("app.services.alert_enrichment.nearby_alerts")
+@patch("app.services.alert_enrichment.incidents_on")
+@patch("app.services.alert_enrichment._downstream_count_by_kind")
+def test_enrich_alert_pod_filter_applies_before_limit_and_reaches_fallback(
+    mock_downstream, mock_incidents, mock_nearby, mock_recent,
+    mock_pod_events, mock_latest_event, mock_replicas,
+):
+    """Часовое окно DaemonSet забито событиями чужих подов — после фильтра
+    пусто, и недельный fallback должен найти событие пода из алерта."""
+    inc = Incident(
+        incident_id="fp-3", severity="warning", status="firing", summary="x",
+        description="load", namespace="monitoring",
+        labels={"alertname": "NodeSystemSaturation", "severity": "warning",
+                "namespace": "monitoring", "service": "vm-node-exporter",
+                "pod": "vm-node-exporter-tgj76"},
+        annotations={}, starts_at="2026-09-21T03:27:00Z",
+    )
+    mock_recent.return_value = []
+    mock_nearby.return_value = []
+    mock_incidents.return_value = []
+    mock_downstream.return_value = {}
+    def ev(pod, reason):
+        return {
+            "reason": reason, "pod_name": pod,
+            "first_seen": datetime(2026, 9, 20, 8, 0, tzinfo=timezone.utc),
+            "last_seen": datetime(2026, 9, 20, 9, 0, tzinfo=timezone.utc),
+            "count": 1, "minutes_before": 60, "message": "m",
+        }
+    others = [ev(f"vm-node-exporter-x{i}", "Unhealthy") for i in range(6)]
+    week = others + [ev("vm-node-exporter-tgj76", "OOMKilling")]
+    def by_window(*_a, **kw):
+        return others if kw.get("window_minutes") == 60 else week
+
+    mock_pod_events.side_effect = by_window
+    mock_latest_event.return_value = None
+    mock_replicas.return_value = None
+
+    db = MagicMock()
+    svc_row = MagicMock()
+    svc_row.team_owner = "platform"
+    svc_row.synthetic = False
+    svc_row.updated_at = datetime(2026, 9, 21, 3, 0, tzinfo=timezone.utc)
+    db.query.return_value.filter.return_value.one_or_none.return_value = svc_row
+    db.query.return_value.filter.return_value.filter.return_value.first.return_value = svc_row
+
+    ctx = enrich_alert(db, inc)
+
+    assert [e["pod_name"] for e in ctx.pod_events] == ["vm-node-exporter-tgj76"]
+    assert ctx.container_reason == "OOMKilling"
+    # запрос шёл с расширенным лимитом, а не с 5
+    assert all(c.kwargs.get("limit") == 200 for c in mock_pod_events.call_args_list)

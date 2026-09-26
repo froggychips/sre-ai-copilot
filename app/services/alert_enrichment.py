@@ -1243,27 +1243,7 @@ def enrich_alert(db: Session, incident: Incident) -> EnrichedContext:
         ctx.collector_results.append(kg_res)
         ctx.kg_context = kg_res.data if isinstance(kg_res.data, dict) else None
 
-    def _collect_pod_events() -> Any:
-        events = service_pod_events(
-            ctx.kg_context, namespace, service, around=effective_at,
-            window_minutes=60, limit=5,
-        )
-        if events is None:
-            events = recent_pod_events_for(
-                db, namespace, service, around=effective_at,
-                window_minutes=60, limit=5,
-            )
-        if not events:
-            events = recent_pod_events_for(
-                db, namespace, service, around=effective_at,
-                window_minutes=7 * 24 * 60, limit=5,
-            )
-        return events
-
-    res = _POD_EVENTS.run_sync(_collect_pod_events)
-    _record(ctx, res)
-    ctx.pod_events = res.data or []
-    # Метка `pod` в алерте — это под, с которого пришла серия. События выше
+    # Метка `pod` в алерте — это под, с которого пришла серия. События ниже
     # собраны по СЕРВИСУ, а у DaemonSet (vm-node-exporter, ~60 подов на разных
     # нодах) «последнее событие сервиса» — случайный под с чужой ноды: карточка
     # NodeSystemSaturation по dev-6 показывала под с dev-4 и его Unhealthy
@@ -1281,10 +1261,36 @@ def enrich_alert(db: Session, incident: Incident) -> EnrichedContext:
         and alert_pod.startswith((labels.get("service") or "kube-state-metrics") + "-")
     ):
         alert_pod = None
-    if alert_pod:
-        ctx.pod_events = [
-            e for e in ctx.pod_events if (e.get("pod_name") or "") == alert_pod
-        ]
+    # С названным подом фильтруем ДО лимита: иначе у DaemonSet на ~60 подов
+    # пять свежих событий чужих подов вытесняют событие нужного, а пустой
+    # после фильтра список ещё и не доходит до недельного fallback.
+    fetch_limit = 200 if alert_pod else 5
+
+    def _only_alert_pod(events: Any) -> Any:
+        if not alert_pod or events is None:
+            return events
+        return [e for e in events if (e.get("pod_name") or "") == alert_pod][:5]
+
+    def _collect_pod_events() -> Any:
+        events = _only_alert_pod(service_pod_events(
+            ctx.kg_context, namespace, service, around=effective_at,
+            window_minutes=60, limit=fetch_limit,
+        ))
+        if events is None:
+            events = _only_alert_pod(recent_pod_events_for(
+                db, namespace, service, around=effective_at,
+                window_minutes=60, limit=fetch_limit,
+            ))
+        if not events:
+            events = _only_alert_pod(recent_pod_events_for(
+                db, namespace, service, around=effective_at,
+                window_minutes=7 * 24 * 60, limit=fetch_limit,
+            ))
+        return events
+
+    res = _POD_EVENTS.run_sync(_collect_pod_events)
+    _record(ctx, res)
+    ctx.pod_events = res.data or []
 
     # 4e. Wave 7 enrichment: blast radius / NATS impact / pod trail.
     # Все три — best-effort, silent fail. Render в embed только при
