@@ -349,3 +349,47 @@ def test_enrich_alert_prefers_alert_pod_label_over_service_events(
     assert ctx.pod_events == []
     # fallback «последнее событие сервиса» при названном поде не зовётся
     mock_latest_event.assert_not_called()
+
+
+@patch("app.services.alert_enrichment.current_replicas_from_kg")
+@patch("app.services.alert_enrichment.latest_pod_event_for")
+@patch("app.services.alert_enrichment.recent_pod_events_for")
+@patch("app.services.alert_enrichment.recent_deploys_for")
+@patch("app.services.alert_enrichment.nearby_alerts")
+@patch("app.services.alert_enrichment.incidents_on")
+@patch("app.services.alert_enrichment._downstream_count_by_kind")
+def test_enrich_alert_ignores_ksm_exporter_pod_label(
+    mock_downstream, mock_incidents, mock_nearby, mock_recent,
+    mock_pod_events, mock_latest_event, mock_replicas,
+):
+    """Алерт по Deployment из kube-state-metrics: `pod` = под KSM. Карточка
+    должна остаться на событиях сервиса, а не подставить KSM."""
+    inc = _make_incident()
+    inc.labels = dict(inc.labels, job="kube-state-metrics",
+                      service="vm-kube-state-metrics",
+                      pod="vm-kube-state-metrics-59b86ff96-qwhmz")
+    mock_recent.return_value = []
+    mock_nearby.return_value = []
+    mock_incidents.return_value = []
+    mock_downstream.return_value = {}
+    mock_pod_events.return_value = [{
+        "reason": "BackOff", "pod_name": "clickhouse-keeper-0",
+        "first_seen": datetime(2026, 5, 24, 8, 0, tzinfo=timezone.utc),
+        "last_seen": datetime(2026, 5, 24, 10, 0, tzinfo=timezone.utc),
+        "count": 3, "minutes_before": 60, "message": "Back-off",
+    }]
+    mock_latest_event.return_value = None
+    mock_replicas.return_value = {"ready": 1, "desired": 3}
+
+    db = MagicMock()
+    svc_row = MagicMock()
+    svc_row.team_owner = "infra"
+    svc_row.synthetic = False
+    svc_row.updated_at = datetime(2026, 5, 24, 9, 0, tzinfo=timezone.utc)
+    db.query.return_value.filter.return_value.one_or_none.return_value = svc_row
+    db.query.return_value.filter.return_value.filter.return_value.first.return_value = svc_row
+
+    ctx = enrich_alert(db, inc)
+
+    assert ctx.pod_name == "clickhouse-keeper-0"
+    assert ctx.container_reason == "BackOff"

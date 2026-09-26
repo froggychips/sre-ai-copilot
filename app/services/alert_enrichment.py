@@ -1270,6 +1270,17 @@ def enrich_alert(db: Session, incident: Incident) -> EnrichedContext:
     # месячной давности, прод-алерт — под dev-6. Если метка есть, оставляем
     # только события этого пода.
     alert_pod = (labels.get("pod") or "").strip() or None
+    # У алертов по kube-state-metrics без собственной метки pod (Deployment/
+    # StatefulSet/Node-условия) `pod` — это под самого KSM, откуда пришла
+    # серия, а не проблемный: его нельзя ставить в карточку и фильтровать им
+    # события сервиса. У KubePodCrashLooping и т.п. KSM отдаёт настоящий pod
+    # (не начинается с имени сервиса экспортёра) — он остаётся.
+    if (
+        alert_pod
+        and labels.get("job") == "kube-state-metrics"
+        and alert_pod.startswith((labels.get("service") or "kube-state-metrics") + "-")
+    ):
+        alert_pod = None
     if alert_pod:
         ctx.pod_events = [
             e for e in ctx.pod_events if (e.get("pod_name") or "") == alert_pod
