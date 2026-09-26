@@ -4,6 +4,12 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+### Исправлено
+
+- **`imagePullSecrets` на обоих ServiceAccount (#458).** У `sre-ai-executor` не было
+  `registry-secret`: executor 1.0.19 жил на образе из кэша ноды, а раскатка 1.0.20
+  получила `ImagePullBackOff 401`. У `sre-ai` секрет стоял только руками в кластере.
+
 ## [1.0.20] — 2026-09-25 — Модель видит граф: единый контекст инцидента, новые правила, история Job-ов
 
 ### Добавлено
