@@ -1263,6 +1263,17 @@ def enrich_alert(db: Session, incident: Incident) -> EnrichedContext:
     res = _POD_EVENTS.run_sync(_collect_pod_events)
     _record(ctx, res)
     ctx.pod_events = res.data or []
+    # Метка `pod` в алерте — это под, с которого пришла серия. События выше
+    # собраны по СЕРВИСУ, а у DaemonSet (vm-node-exporter, ~60 подов на разных
+    # нодах) «последнее событие сервиса» — случайный под с чужой ноды: карточка
+    # NodeSystemSaturation по dev-6 показывала под с dev-4 и его Unhealthy
+    # месячной давности, прод-алерт — под dev-6. Если метка есть, оставляем
+    # только события этого пода.
+    alert_pod = (labels.get("pod") or "").strip() or None
+    if alert_pod:
+        ctx.pod_events = [
+            e for e in ctx.pod_events if (e.get("pod_name") or "") == alert_pod
+        ]
 
     # 4e. Wave 7 enrichment: blast radius / NATS impact / pod trail.
     # Все три — best-effort, silent fail. Render в embed только при
@@ -1309,9 +1320,14 @@ def enrich_alert(db: Session, incident: Incident) -> EnrichedContext:
         if ctx.pod_events:
             # head(pod_events) уже отсортирован по first_seen DESC
             latest_ev = ctx.pod_events[0]
-        else:
+        elif not alert_pod:
+            # Fallback «последнее событие сервиса» — только когда алерт сам не
+            # назвал под: иначе он подменил бы верный под чужим.
             latest_ev = latest_pod_event_for(db, namespace, service)
-        if latest_ev:
+        if alert_pod:
+            ctx.pod_name = alert_pod
+            ctx.container_reason = (latest_ev or {}).get("reason") or None
+        elif latest_ev:
             ctx.pod_name = latest_ev.get("pod_name") or None
             ctx.container_reason = latest_ev.get("reason") or None
     except Exception as e:
