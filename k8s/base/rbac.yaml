@@ -27,6 +27,11 @@
 #   kubectl -n squad-foo apply -f rbac.yaml
 # и RoleBinding на sre-ai-executor — осознанно, по одному (пример ниже).
 
+# imagePullSecrets на ОБОИХ SA: образ лежит во внутреннем реестре
+# docker.lastoasisgame.com, анонимный pull там — 401. До 26.09.2026 секрет стоял
+# только на sre-ai, и то руками в кластере; у sre-ai-executor его не было, и
+# релиз 1.0.20 встал: executor 1.0.19 жил на образе из кэша ноды (IfNotPresent),
+# а новый тег получил ImagePullBackOff 401.
 apiVersion: v1
 kind: ServiceAccount
 metadata:
@@ -34,6 +39,8 @@ metadata:
   labels:
     app.kubernetes.io/part-of: sre-ai-copilot
 automountServiceAccountToken: true
+imagePullSecrets:
+  - name: registry-secret
 
 ---
 # SA исполнителя. Только его токен может менять кластер (через RoleBinding
@@ -46,6 +53,8 @@ metadata:
   labels:
     app.kubernetes.io/part-of: sre-ai-copilot
 automountServiceAccountToken: true
+imagePullSecrets:
+  - name: registry-secret
 
 ---
 # Read-only Role на текущий namespace — применяется в любом ns, куда
