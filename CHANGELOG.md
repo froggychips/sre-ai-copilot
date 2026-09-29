@@ -4,6 +4,8 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+## [1.0.21] — 2026-09-29 — Пинг critical только дежурному
+
 ### Добавлено
 
 - **Пинг critical — дежурному, а не всей роли.** `DISCORD_ALERT_MENTION_USER_ID`
