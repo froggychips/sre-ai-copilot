@@ -48,6 +48,24 @@ maxRunners: 3
 containerMode:
   type: dind
 
+# Listener (под, который держит long-poll к GitHub и заказывает раннеры)
+# контроллер создаёт по ОТДЕЛЬНОМУ шаблону — affinity из `template` на него не
+# действует, без этого блока он садился на prod-ноду. Контейнер обязан
+# называться `listener`: только так контроллер сливает его со своим, любое
+# другое имя станет sidecar'ом.
+listenerTemplate:
+  spec:
+    affinity:
+      nodeAffinity:
+        requiredDuringSchedulingIgnoredDuringExecution:
+          nodeSelectorTerms:
+          - matchExpressions:
+            - key: env
+              operator: In
+              values: ["dev"]
+    containers:
+    - name: listener
+
 template:
   spec:
     # ServiceAccount без каких-либо RoleBinding: раннеру не нужны права в
