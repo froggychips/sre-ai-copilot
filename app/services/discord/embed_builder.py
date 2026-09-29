@@ -1035,11 +1035,34 @@ def _severity_to_color(severity: str, *, resurfaced: bool = False, resolved: boo
     return SEVERITY_COLOR_UNKNOWN
 
 
+def _primary_oncall_away(today: Optional[datetime] = None) -> bool:
+    """Дежурный в отпуске: сегодня (UTC) <= DISCORD_ALERT_MENTION_USER_AWAY_UNTIL.
+
+    Дата включительная и сама истекает — после неё пинг возвращается к
+    дежурному без правки конфига. Нечитаемая дата = «в отпуске»: лучше
+    лишний раз пингнуть всех, чем молча не пингнуть никого.
+    """
+    raw = (getattr(settings, "DISCORD_ALERT_MENTION_USER_AWAY_UNTIL", "") or "").strip()
+    if not raw:
+        return False
+    try:
+        until = datetime.strptime(raw, "%Y-%m-%d").date()
+    except ValueError:
+        _log.warning("discord.mention_away_until_invalid", value=raw)
+        return True
+    now = today or datetime.now(timezone.utc)
+    return now.date() <= until
+
+
 def _mention_block(severity: str, env: Optional[str] = None) -> str:
     """B-блок #11 — mention-префикс для critical (только critical).
 
-    DISCORD_ALERT_MENTION_ROLE_ID задан → пинг роли `<@&ID>`, иначе
-    `@here`. Возвращает строку с trailing newline или пустую строку.
+    Кого пингуем, по убыванию приоритета:
+    - DISCORD_ALERT_MENTION_USER_ID задан и дежурный не в отпуске
+      (`_primary_oncall_away`) → только он, `<@ID>`;
+    - DISCORD_ALERT_MENTION_ROLE_ID задан → роль `<@&ID>`;
+    - иначе `@here`.
+    Возвращает строку с trailing newline или пустую строку.
     Используется как content-префикс embed-payload (не внутри embed-text —
     Discord не рендерит mentions в embed.title/description).
 
@@ -1047,23 +1070,32 @@ def _mention_block(severity: str, env: Optional[str] = None) -> str:
     """
     if (severity or "").lower() != "critical":
         return ""
+    user_id = (getattr(settings, "DISCORD_ALERT_MENTION_USER_ID", "") or "").strip()
+    if user_id and not _primary_oncall_away():
+        return f"<@{user_id}>\n"
     role_id = (getattr(settings, "DISCORD_ALERT_MENTION_ROLE_ID", "") or "").strip()
     if role_id:
         return f"<@&{role_id}>\n"
     return "@here\n"
 
 
+_MENTION_RE = re.compile(r"^<@(&?)(\d+)>")
+
+
 def _allowed_mentions(mention_prefix: str) -> Dict[str, Any]:
     """allowed_mentions под mention-префикс из `_mention_block`.
 
-    Роль → разрешаем только её id; `@here` → ["everyone"] (Discord
-    трактует @here через everyone в parse-list); нет префикса — пусто.
+    Разбираем сам префикс, а не настройки: кого упомянули, того и
+    разрешаем. Роль → только её id, пользователь → только его id,
+    `@here` → ["everyone"] (Discord трактует @here через everyone в
+    parse-list); нет префикса — пусто.
     """
     if not mention_prefix:
         return {"parse": []}
-    role_id = (getattr(settings, "DISCORD_ALERT_MENTION_ROLE_ID", "") or "").strip()
-    if role_id:
-        return {"parse": [], "roles": [role_id]}
+    m = _MENTION_RE.match(mention_prefix.strip())
+    if m:
+        key = "roles" if m.group(1) else "users"
+        return {"parse": [], key: [m.group(2)]}
     return {"parse": ["everyone"]}
 
 
