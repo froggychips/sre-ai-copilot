@@ -10,6 +10,14 @@ githubConfigSecret: github-runner-app
 # Имя набора = значение `runs-on` в workflow.
 runnerScaleSetName: sre-copilot-k8s
 
+# ServiceAccount контроллера ARC (релиз `arc` в этом же namespace). Без явного
+# значения чарт при каждом рендере ищет его lookup'ом по ВСЕМ Deployment'ам
+# кластера — на медленном канале до API этот запрос не укладывается в таймаут
+# и `helm upgrade` падает ещё до применения.
+controllerServiceAccount:
+  namespace: sre-ai-ci
+  name: arc-gha-rs-controller
+
 # ── Сколько раннеров держать ────────────────────────────────────────────────
 #
 # minRunners: 1 — один тёплый раннер всегда онлайн. Ноль тоже работает
