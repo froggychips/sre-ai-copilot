@@ -46,6 +46,14 @@ template:
     # кластере вообще. Токен API монтировать тоже незачем — в CI он
     # используется только для эскалации, если под скомпрометируют.
     automountServiceAccountToken: false
+    affinity:
+      nodeAffinity:
+        requiredDuringSchedulingIgnoredDuringExecution:
+          nodeSelectorTerms:
+          - matchExpressions:
+            - key: env
+              operator: In
+              values: ["dev"]
     containers:
     - name: runner
       image: ghcr.io/actions/actions-runner:latest
@@ -85,8 +93,9 @@ template:
 
 # ── Где размещать ───────────────────────────────────────────────────────────
 #
-# dev-ноды заняты squad-окружениями, и CI не должен с ними конкурировать за
-# память в пик. Явного nodeSelector нет намеренно: на момент написания
-# выделенной ноды под CI не существует, а прибивать раннеры к конкретной
-# ноде без неё — значит получить Pending при первой же эвакуации.
-# Появится выделенная нода — добавить сюда nodeSelector и toleration.
+# Только ноды с env=dev. Без ограничения раннер садился куда угодно, в том
+# числе на prod-ноду выделенного королевства: CI публичного репозитория
+# (privileged dind) рядом с боевыми базами. Squad-ноды закрыты taint'ом
+# squad-pin, поэтому раннер попадает на общие dev-ноды без taint'а — их
+# много, Pending при эвакуации одной ноды не грозит. Появится выделенная
+# нода под CI — заменить это на nodeSelector и toleration.
