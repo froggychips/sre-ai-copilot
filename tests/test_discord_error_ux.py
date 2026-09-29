@@ -86,6 +86,45 @@ def test_allowed_mentions_for_role_and_here(monkeypatch):
     }
 
 
+def test_mention_block_user_id_pings_only_user(monkeypatch):
+    from app.config import settings
+    monkeypatch.setattr(settings, "DISCORD_ALERT_MENTION_ROLE_ID", "111")
+    monkeypatch.setattr(settings, "DISCORD_ALERT_MENTION_USER_ID", "222")
+    monkeypatch.setattr(settings, "DISCORD_ALERT_MENTION_USER_AWAY_UNTIL", "")
+    assert _mention_block("critical") == "<@222>\n"
+    assert _mention_block("warning") == ""
+    assert _allowed_mentions("<@222>\n") == {"parse": [], "users": ["222"]}
+
+
+def test_mention_block_user_away_falls_back_to_role(monkeypatch):
+    from app.config import settings
+    monkeypatch.setattr(settings, "DISCORD_ALERT_MENTION_ROLE_ID", "111")
+    monkeypatch.setattr(settings, "DISCORD_ALERT_MENTION_USER_ID", "222")
+    monkeypatch.setattr(settings, "DISCORD_ALERT_MENTION_USER_AWAY_UNTIL", "2999-01-01")
+    assert _mention_block("critical") == "<@&111>\n"
+    # отпуск прошёл — снова только дежурный
+    monkeypatch.setattr(settings, "DISCORD_ALERT_MENTION_USER_AWAY_UNTIL", "2000-01-01")
+    assert _mention_block("critical") == "<@222>\n"
+
+
+def test_primary_oncall_away_until_is_inclusive(monkeypatch):
+    from datetime import datetime, timezone
+    from app.config import settings
+    from app.services.discord.embed_builder import _primary_oncall_away
+    monkeypatch.setattr(settings, "DISCORD_ALERT_MENTION_USER_AWAY_UNTIL", "2026-10-05")
+    last_day = datetime(2026, 10, 5, 23, 59, tzinfo=timezone.utc)
+    next_day = datetime(2026, 10, 6, 0, 0, tzinfo=timezone.utc)
+    assert _primary_oncall_away(last_day) is True
+    assert _primary_oncall_away(next_day) is False
+
+
+def test_primary_oncall_away_invalid_date_is_loud(monkeypatch):
+    from app.config import settings
+    from app.services.discord.embed_builder import _primary_oncall_away
+    monkeypatch.setattr(settings, "DISCORD_ALERT_MENTION_USER_AWAY_UNTIL", "5 октября")
+    assert _primary_oncall_away() is True
+
+
 # ── runbook link ────────────────────────────────────────────────────────
 
 

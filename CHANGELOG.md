@@ -4,6 +4,14 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+### Добавлено
+
+- **Пинг critical — дежурному, а не всей роли.** `DISCORD_ALERT_MENTION_USER_ID`
+  задан → critical в #infra-error упоминает только этого пользователя
+  (`allowed_mentions.users`). `DISCORD_ALERT_MENTION_USER_AWAY_UNTIL=YYYY-MM-DD`
+  (UTC, включительно) — дежурный в отпуске: пинг уходит роли/`@here`, как раньше,
+  а после даты сам возвращается к дежурному. Нечитаемая дата считается отпуском.
+
 ### Исправлено
 
 - **`imagePullSecrets` на обоих ServiceAccount (#458).** У `sre-ai-executor` не было

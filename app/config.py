@@ -233,6 +233,13 @@ class Settings(BaseSettings):
     # allowed_mentions при этом сужается до этой роли вместо everyone.
     DISCORD_ALERT_MENTION_ROLE_ID: str = ""
 
+    # Дежурный: задан Discord user ID → critical пингует только его, а не
+    # роль/@here (запрос 29.09.2026: «зачем тегать всех»). Пока сегодня
+    # (UTC) <= AWAY_UNTIL (YYYY-MM-DD, включительно) — дежурный в отпуске,
+    # пинг уходит роли/@here как раньше; после даты возвращается сам.
+    DISCORD_ALERT_MENTION_USER_ID: str = ""
+    DISCORD_ALERT_MENTION_USER_AWAY_UNTIL: str = ""
+
     # Deploy-related алерты постим без mention (запрос 2026-06-11,
     # прецедент PreprodRestartsSpike: деплой статики → штатная волна
     # self-restart'ов всех statics-зависимых сервисов → critical с @here).
