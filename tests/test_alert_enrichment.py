@@ -1,7 +1,8 @@
 """Unit-тесты на service-resolver в app.services.alert_enrichment.
 
 Root cause #1 fix: target service резолвится из labels в priority order
-(deployment > statefulset > daemonset > job_name > pod-hash-strip > container),
+(deployment > statefulset > daemonset > pdb > hpa > job_name > pod-hash-strip >
+container),
 а не из устаревшего `service || deployment` chain. Это убирает 330
 alerts/week misattribute на vm-kube-state-metrics.
 """
@@ -68,6 +69,33 @@ def test_resolver_picks_daemonset():
     labels = {"namespace": "kube-system", "daemonset": "kube-proxy"}
     assert _resolve_target_service_from_labels(labels) == (
         "kube-system", "kube-proxy"
+    )
+
+
+def test_resolver_picks_pdb_over_ksm_pod():
+    """KubePdbNotEnoughHealthyPods: `pod` — под kube-state-metrics, strip его
+    давал фантомный vm-kube-state-metrics; цель — PDB (= имя workload'а)."""
+    labels = {
+        "namespace": "prod-kingdom8",
+        "poddisruptionbudget": "town-grainhost",
+        "job": "kube-state-metrics",
+        "service": "vm-kube-state-metrics",
+        "pod": "vm-kube-state-metrics-6d9c7b8f5d-q2x7k",
+        "container": "kube-state-metrics",
+    }
+    assert _resolve_target_service_from_labels(labels) == (
+        "prod-kingdom8", "town-grainhost"
+    )
+
+
+def test_resolver_picks_hpa_over_ksm_pod():
+    labels = {
+        "namespace": "prod-kingdom7",
+        "horizontalpodautoscaler": "town-service",
+        "pod": "vm-kube-state-metrics-6d9c7b8f5d-q2x7k",
+    }
+    assert _resolve_target_service_from_labels(labels) == (
+        "prod-kingdom7", "town-service"
     )
 
 
@@ -150,6 +178,28 @@ def test_store_service_daemonset_prefers_target():
     assert resolve_store_service(
         labels, legacy_default=labels.get("service")
     ) == "node-exporter"
+
+
+def test_store_service_pdb_prefers_target():
+    labels = {
+        "namespace": "prod-kingdom8",
+        "poddisruptionbudget": "town-db-postgresql",
+        "service": "vm-kube-state-metrics",
+    }
+    assert resolve_store_service(
+        labels, legacy_default=labels.get("service")
+    ) == "town-db-postgresql"
+
+
+def test_store_service_hpa_prefers_target():
+    labels = {
+        "namespace": "prod-kingdom7",
+        "horizontalpodautoscaler": "town-service",
+        "service": "vm-kube-state-metrics",
+    }
+    assert resolve_store_service(
+        labels, legacy_default=labels.get("service")
+    ) == "town-service"
 
 
 def test_store_service_app_alert_keeps_legacy_default():
