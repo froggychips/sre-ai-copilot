@@ -78,7 +78,7 @@ def _edge_verdict(edge: ServiceEdge) -> EpistemicVerdict:
     extras: Dict[str, Any] = edge.extras if isinstance(edge.extras, dict) else {}
     return classify_edge(
         _edge_sources(edge),
-        cast(Any, edge.last_seen_at),
+        edge.last_seen_at,
         contradictions=find_edge_contradictions(
             kind=cast(str, edge.kind), src_metadata=extras,
         ),

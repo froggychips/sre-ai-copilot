@@ -46,7 +46,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional
 
-from sqlalchemy.orm import mapped_column
+from sqlalchemy.orm import Mapped, mapped_column
 from sqlalchemy import (JSON, DateTime, Index, Integer, String, Text,
                         UniqueConstraint)
 
@@ -93,24 +93,24 @@ class RemediationAttempt(Base):
     """
     __tablename__ = "kg_remediation_attempts"
 
-    id = mapped_column(Integer, primary_key=True)
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
     # Без index=True: uq_kg_remediation_attempts_incident_signature покрывает
     # incident_id как префикс.
-    incident_id = mapped_column(String, nullable=False)
-    signature = mapped_column(String, nullable=False)
-    action = mapped_column(String, nullable=True)
-    namespace = mapped_column(String, nullable=True)
-    resource_name = mapped_column(String, nullable=True)
-    intent = mapped_column(JSON, nullable=True)
-    status = mapped_column(String, nullable=False)
-    applied_by = mapped_column(String, nullable=True)
-    claimed_at = mapped_column(DateTime, nullable=True)
-    applied_at = mapped_column(DateTime, nullable=True)
-    result = mapped_column(JSON, nullable=True)
-    verification = mapped_column(JSON, nullable=True)
-    error = mapped_column(Text, nullable=True)
-    created_at = mapped_column(DateTime, default=_utcnow_naive, nullable=False)
-    updated_at = mapped_column(DateTime, default=_utcnow_naive, nullable=False)
+    incident_id: Mapped[str] = mapped_column(String, nullable=False)
+    signature: Mapped[str] = mapped_column(String, nullable=False)
+    action: Mapped[Optional[str]] = mapped_column(String, nullable=True)
+    namespace: Mapped[Optional[str]] = mapped_column(String, nullable=True)
+    resource_name: Mapped[Optional[str]] = mapped_column(String, nullable=True)
+    intent: Mapped[Optional[Any]] = mapped_column(JSON, nullable=True)
+    status: Mapped[str] = mapped_column(String, nullable=False)
+    applied_by: Mapped[Optional[str]] = mapped_column(String, nullable=True)
+    claimed_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    applied_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    result: Mapped[Optional[Any]] = mapped_column(JSON, nullable=True)
+    verification: Mapped[Optional[Any]] = mapped_column(JSON, nullable=True)
+    error: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow_naive, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow_naive, nullable=False)
 
     __table_args__ = (
         UniqueConstraint(

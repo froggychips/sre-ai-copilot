@@ -11,7 +11,8 @@ from __future__ import annotations
 
 from datetime import datetime
 
-from sqlalchemy.orm import mapped_column
+from typing import Any, Optional
+from sqlalchemy.orm import Mapped, mapped_column
 from sqlalchemy import (JSON, DateTime, Integer, String, Text,
                         UniqueConstraint)
 
@@ -42,23 +43,23 @@ class RemediationDecision(Base):
     """
     __tablename__ = "kg_remediation_decisions"
 
-    id = mapped_column(Integer, primary_key=True)
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
     # Без `index=True`: uq_kg_remediation_decisions_incident_idem
     # (incident_id, idempotency_key) покрывает эту колонку как префикс.
-    incident_id = mapped_column(String, nullable=True)
-    alert_fingerprint = mapped_column(String, nullable=True, index=True)
-    target_ref = mapped_column(JSON, nullable=True)
-    classification = mapped_column(String, nullable=True, index=True)
-    classification_provenance = mapped_column(JSON, nullable=True)
-    risk_axes = mapped_column(JSON, nullable=True)
-    candidate_playbooks = mapped_column(JSON, nullable=True)
-    selected_playbook = mapped_column(String, nullable=True, index=True)
+    incident_id: Mapped[Optional[str]] = mapped_column(String, nullable=True)
+    alert_fingerprint: Mapped[Optional[str]] = mapped_column(String, nullable=True, index=True)
+    target_ref: Mapped[Optional[Any]] = mapped_column(JSON, nullable=True)
+    classification: Mapped[Optional[str]] = mapped_column(String, nullable=True, index=True)
+    classification_provenance: Mapped[Optional[Any]] = mapped_column(JSON, nullable=True)
+    risk_axes: Mapped[Optional[Any]] = mapped_column(JSON, nullable=True)
+    candidate_playbooks: Mapped[Optional[Any]] = mapped_column(JSON, nullable=True)
+    selected_playbook: Mapped[Optional[str]] = mapped_column(String, nullable=True, index=True)
     # Enum по значению: 'auto' | 'approve' | 'block'.
-    decision = mapped_column(String, nullable=True, index=True)
-    decision_reasons = mapped_column(JSON, nullable=True)
-    command_preview = mapped_column(Text, nullable=True)
-    idempotency_key = mapped_column(String, nullable=False, index=True)
-    created_at = mapped_column(DateTime, default=datetime.utcnow, nullable=False)
+    decision: Mapped[Optional[str]] = mapped_column(String, nullable=True, index=True)
+    decision_reasons: Mapped[Optional[Any]] = mapped_column(JSON, nullable=True)
+    command_preview: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    idempotency_key: Mapped[str] = mapped_column(String, nullable=False, index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, nullable=False)
 
     __table_args__ = (
         UniqueConstraint(

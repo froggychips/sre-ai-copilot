@@ -4,6 +4,21 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+### Изменено
+
+- **Модели типизированы через `Mapped[...]`.** 319 полей в 5 модулях получили
+  `Mapped[T]` / `Mapped[Optional[T]]`; `Optional` — ровно там, где NULL разрешён
+  сейчас, поэтому DDL 24 таблиц и 67 индексов не меняется. Сняты обходы, которые
+  жили только из-за нетипизированных колонок: 38 `# type: ignore`, 25
+  `cast(Any, …)`.
+
+### Исправлено
+
+- **`populator`: ребро с NULL-весом больше не падает на сравнении.**
+  `weight > edge.weight` при `edge.weight is None` давал `TypeError`; нашёл mypy
+  после типизации колонок. Ещё пять мест получили явную проверку NULL (JSON
+  `extras`, `resolved_at`, `service_id`).
+
 ## [1.0.23] — 2026-09-30 — SQLAlchemy 2.1
 
 ### Зависимости

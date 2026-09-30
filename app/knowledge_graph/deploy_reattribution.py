@@ -141,6 +141,8 @@ def reattribute_deployments(
         .group_by(Deployment.buildtype_id, Deployment.build_number)
         .order_by(func.max(Deployment.started_at).desc())
         .all()
+        # NULL уже отсечён фильтром запроса; условие — чтобы это видел mypy.
+        if bt is not None and num is not None
     ]
     if limit_builds:
         build_keys = build_keys[:limit_builds]
@@ -204,14 +206,14 @@ def reattribute_deployments(
                 # что-то каталось». Пока маркер висит, `stale_classifier`
                 # обязан считать запись broadcast'ом и не может выдать
                 # `active`.
-                if service_name and r.extras.get("namespace_scope"):
+                if service_name and (r.extras or {}).get("namespace_scope"):
                     stats["rows_unmarked"] += 1
                     if apply:
                         # JSON-колонку переприсваиваем целиком: мутацию dict
                         # на месте SQLAlchemy не увидит и UPDATE не сделает.
-                        updated: Dict[str, Any] = dict(r.extras)
+                        updated: Dict[str, Any] = dict(r.extras or {})
                         updated["namespace_scope"] = False
-                        r.extras = updated  # type: ignore[assignment]
+                        r.extras = updated
             else:
                 wrong.append(r)
 

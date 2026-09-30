@@ -402,11 +402,11 @@ def _clear_owner_of_dead_namespaces(db: Session, scope: Any) -> int:
         log.info("namespace_owner.cleared_on_missing", namespace=name,
                  was_owner=row.owner_login, was_source=row.owner_source,
                  state=row.state)
-        row.owner_login = None  # type: ignore[assignment]
-        row.owner_source = None  # type: ignore[assignment]
-        row.owner_jira_key = None  # type: ignore[assignment]
-        row.owner_discord_id = None  # type: ignore[assignment]
-        row.owner_resolved_at = datetime.utcnow()  # type: ignore[assignment]
+        row.owner_login = None
+        row.owner_source = None
+        row.owner_jira_key = None
+        row.owner_discord_id = None
+        row.owner_resolved_at = datetime.utcnow()
         cleared += 1
     return cleared
 
@@ -556,11 +556,11 @@ def sync_namespace_owners(
             stats["changed"] += 1
             log.info("namespace_owner.changed", namespace=name,
                      owner=res.login, source=res.source, jira_key=res.jira_key)
-        row.owner_login = res.login  # type: ignore[assignment]
-        row.owner_source = res.source  # type: ignore[assignment]
-        row.owner_jira_key = res.jira_key  # type: ignore[assignment]
-        row.owner_discord_id = res.discord_id  # type: ignore[assignment]
-        row.owner_resolved_at = now  # type: ignore[assignment]
+        row.owner_login = res.login
+        row.owner_source = res.source
+        row.owner_jira_key = res.jira_key
+        row.owner_discord_id = res.discord_id
+        row.owner_resolved_at = now
         if res.login:
             stats["resolved"] += 1
             stats["by_source"][res.source] = stats["by_source"].get(res.source, 0) + 1
@@ -571,7 +571,7 @@ def sync_namespace_owners(
             squad = name.rsplit("-shared", 1)[0] if name.endswith("-shared") else name
             last = activity_lookup(squad)
             if last is not None:
-                row.last_activity_at = last  # type: ignore[assignment]
+                row.last_activity_at = last
                 stats["activity_updated"] += 1
 
         # Коммитим батчами, а не одной транзакцией на прогон. Прогон идёт

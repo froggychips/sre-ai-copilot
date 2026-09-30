@@ -219,7 +219,7 @@ def _process_batch(
         meta: Dict[str, Any] = dict(node.metadata_json or {})
         meta["endpoints_ready"] = ready
         meta["endpoints_checked_at"] = stamp
-        node.metadata_json = meta  # type: ignore[assignment]
+        node.metadata_json = meta
         # JSON-колонка: SQLAlchemy не видит мутацию словаря по значению, и без
         # явного флага UPDATE не уйдёт. Тот же приём в external_probe_sync.
         flag_modified(node, "metadata_json")

@@ -33,7 +33,7 @@ from __future__ import annotations
 
 import logging
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, List, Optional, Set, cast
+from typing import Any, Dict, List, Optional, Set
 
 import httpx
 from sqlalchemy.orm import Session
@@ -159,7 +159,7 @@ def _mark_resolved(
         if ev.fingerprint and ev.fingerprint in active_set_for_fallback:
             continue  # ещё firing в AM — не трогаем
         try:
-            ev.resolved_at = cast(Any, now)
+            ev.resolved_at = now
             # Маркер для отладки / отчётности. raw — JSON, может быть None
             # или string у легаси-записей.
             raw_existing: Dict[str, Any] = ev.raw if isinstance(ev.raw, dict) else {}

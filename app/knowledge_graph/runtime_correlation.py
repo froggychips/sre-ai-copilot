@@ -23,7 +23,7 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from typing import Any, Dict, List, Optional, Tuple, cast
+from typing import Dict, List, Optional, Tuple, cast
 
 from sqlalchemy.orm import Session, joinedload
 
@@ -340,8 +340,8 @@ def _apply_confirmation(edge: ServiceEdge, co: CoOccurrence, now: datetime) -> b
         "confirmed_at": now.isoformat(),
         "reasons": co.reasons,
     }
-    # cast(Any, ...) — SQLAlchemy Column[T] vs T долг, см. PR #66 паттерн.
-    edge.extras = cast(Any, extras)
+    # ... — SQLAlchemy Column[T] vs T долг, см. PR #66 паттерн.
+    edge.extras = extras
     return newly_added
 
 

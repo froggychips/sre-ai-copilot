@@ -477,8 +477,8 @@ def _upsert_k8s_job(
         if hasattr(existing, k):
             setattr(existing, k, v)
     if metadata is not None:
-        existing.metadata_json = cast(Any, metadata)
-    existing.last_seen_at = cast(Any, now)
+        existing.metadata_json = metadata
+    existing.last_seen_at = now
     db.flush()
     return existing
 
@@ -767,7 +767,7 @@ def _sync_one_cronjob(db: Session, cj: Dict[str, Any], stats: Dict[str, int]) ->
     # Service _имеет_ CronJob как побочный workflow.
     meta_with_link: Dict[str, Any] = dict(cj_node.metadata_json or {})
     meta_with_link["owner_service_id"] = owner_svc_id
-    cj_node.metadata_json = cast(Any, meta_with_link)
+    cj_node.metadata_json = meta_with_link
     db.flush()
     stats["edges_runs_as_job"] += 1
     if resolved_via == _RESOLVED_VIA_NAME_PATTERN:
@@ -888,7 +888,7 @@ def _link_jobs_to_cronjob_owners(db: Session) -> int:
             continue
         meta_updated = dict(meta)
         meta_updated["owner_service_id"] = owner_id
-        j.metadata_json = cast(Any, meta_updated)
+        j.metadata_json = meta_updated
         linked += 1
     if linked:
         db.commit()

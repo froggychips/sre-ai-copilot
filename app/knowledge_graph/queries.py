@@ -350,7 +350,7 @@ def cluster_deploy_activity(
         if bkey in seen_ns_builds:
             continue
         seen_ns_builds.add(bkey)
-        per_ns[str(svc.namespace)] = per_ns.get(str(svc.namespace), 0) + 1
+        per_ns[svc.namespace] = per_ns.get(svc.namespace, 0) + 1
         distinct_builds.add((d.buildtype_id, d.build_number))
         delta_min = int(
             (before_aware - d.started_at.replace(tzinfo=timezone.utc)).total_seconds() // 60

@@ -238,7 +238,7 @@ def _apply_owner_plan(db: Session, plan: OwnerPlan) -> None:
     svc = db.query(Service).filter(Service.id == plan.service_id).first()
     if svc is None:
         return
-    svc.team_owner = plan.suggested_owner  # type: ignore[assignment]
+    svc.team_owner = plan.suggested_owner
     md_existing: Dict[str, Any] = (
         svc.metadata_json if isinstance(svc.metadata_json, dict) else {}
     )
@@ -247,14 +247,14 @@ def _apply_owner_plan(db: Session, plan: OwnerPlan) -> None:
     md_new["owner_confidence"] = round(plan.confidence, 3)
     if plan.manual:
         md_new["owner_manual"] = True
-    svc.metadata_json = md_new  # type: ignore[assignment]
+    svc.metadata_json = md_new
 
 
 def _apply_stale_plan(db: Session, plan: StalePlan) -> None:
     svc = db.query(Service).filter(Service.id == plan.service_id).first()
     if svc is None:
         return
-    svc.stale_class = plan.new_class  # type: ignore[assignment]
+    svc.stale_class = plan.new_class
 
 
 # ── Markdown rendering ──────────────────────────────────────────────────

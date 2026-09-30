@@ -259,7 +259,7 @@ def _rehome_batch(
             # Вес не понижаем (тот же приём в phantom_db_cleanup), устаревший
             # дубль удаляем.
             merged_weight = max(int(existing.weight or 1), int(edge.weight or 1))
-            existing.weight = merged_weight  # type: ignore[assignment]
+            existing.weight = merged_weight
             db.delete(edge)
             stats["merged"] += 1
         else:
@@ -269,9 +269,9 @@ def _rehome_batch(
             # (name, namespace) остаётся читаемым и без него.
             extras["rehomed_from"] = dst.namespace
             extras["rehomed_at"] = _stamp()
-            edge.extras = extras  # type: ignore[assignment]
+            edge.extras = extras
             flag_modified(edge, "extras")
-            edge.dst_id = target.id  # type: ignore[assignment]
+            edge.dst_id = target.id
             stats["repointed"] += 1
         db.flush()   # чтобы следующий lookup existing видел изменение
 
@@ -341,9 +341,9 @@ def undo_rehome(db: Session, apply: bool = False) -> Dict[str, Any]:
             continue
         extras.pop("rehomed_from", None)
         extras.pop("rehomed_at", None)
-        edge.extras = extras  # type: ignore[assignment]
+        edge.extras = extras
         flag_modified(edge, "extras")
-        edge.dst_id = origin.id  # type: ignore[assignment]
+        edge.dst_id = origin.id
         stats["restored"] += 1
         db.flush()
 
