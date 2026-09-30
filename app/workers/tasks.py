@@ -274,6 +274,17 @@ celery_app.conf.beat_schedule = {
         "schedule": crontab(minute=37),  # ежечасно в 37 мин (offset от других)
         "options": {"expires": 3240},
     },
+    # Ноды (зона/регион из topology-меток) и точки входа трафика: какой
+    # публичный host входит через какую ноду (MetalLB L2, IP балансировщика =
+    # адрес ноды). Раз в 30 минут: ноды и LB-IP меняются редко, а вот после
+    # переезда IP на другую ноду связь должна обновиться до следующего
+    # инцидента. Минуты 15/45 — в стороне от kubectl-тяжёлых
+    # topology-resources (12/42) и ingress-observations (16/46).
+    "kg-nodes-sync": {
+        "task": "kg_nodes_sync",
+        "schedule": crontab(minute="15,45"),
+        "options": {"expires": 1620},
+    },
     # ChatGPT review #4.3: service health composite (open alerts × severity
     # + chronic pod events + recurrence). Раз в 20 мин — health моментальный
     # сигнал, но recompute дорого над всеми ~370 real services. Используется
@@ -721,6 +732,24 @@ def kg_ingress_sync_task():
     except Exception as e:
         logger.warning("kg_ingress_sync.failed: %s", e)
         return _src_status({"error": str(e)}, observed=('ingresses_fetched',), unavailable=('skipped',))
+    finally:
+        db.close()
+
+
+@celery_app.task(name="kg_nodes_sync")
+@single_instance(ttl_seconds=1800)
+def kg_nodes_sync_task():
+    """Ноды (зона/регион) и точки входа трафика → kg_nodes / kg_entrypoints."""
+    from app.knowledge_graph.k8s_nodes_sync import sync_nodes_and_entrypoints
+
+    db = SessionLocal()
+    try:
+        return _src_status(sync_nodes_and_entrypoints(db),
+                           observed=('nodes_fetched', 'hosts_seen'), unavailable=('skipped',))
+    except Exception as e:
+        logger.warning("kg_nodes_sync.failed: %s", e)
+        return _src_status({"error": str(e)}, observed=('nodes_fetched', 'hosts_seen'),
+                           unavailable=('skipped',))
     finally:
         db.close()
 
@@ -2011,6 +2040,8 @@ _BEAT_HEARTBEAT_TASKS = frozenset({
     "kg_nats_subjects_sync",
     "kg_topology_resources_sync",
     "kg_ingress_sync",
+    # Ноды и точки входа трафика (kg_nodes / kg_entrypoints).
+    "kg_nodes_sync",
     # Остальные источники данных, добавлены 23.08.2026 после ревизии
     # проверок. До неё все восемь были в расписании, но ни в sync_lag, ни
     # здесь: смерть любого из них не замечал никто.

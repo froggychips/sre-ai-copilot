@@ -162,6 +162,7 @@ def build_diagnostics_ctx(
         kg_res = build_kg_context(
             kg_session, namespace=incident.namespace, service=labels.get("service"),
             alertname=labels.get("alertname"), as_of=as_of_for(incident_starts_at),
+            node=labels.get("node"),
         )
         if kg_res is not None:
             merge_source_status(source_status, kg_res)

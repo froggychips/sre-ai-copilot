@@ -209,6 +209,11 @@ _SYNC_LAG_TARGETS: Dict[str, Dict[str, Any]] = {
         "heartbeat_task": "kg_ingress_sync",
         "interval_minutes": 60,
     },
+    # Ноды и точки входа трафика: kg_nodes / kg_entrypoints (15/45 мин).
+    "kg_nodes_sync": {
+        "heartbeat_task": "kg_nodes_sync",
+        "interval_minutes": 30,
+    },
     # ── источники, добавленные ревизией 23.08.2026 ─────────────────────
     #
     # До неё все восемь были в расписании, но ни здесь, ни в
