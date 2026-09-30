@@ -175,3 +175,35 @@ def test_dataset_case_scope_takes_alert_node():
                             "alert_node": "node-a"})
     assert scope.node == "node-a"
     assert mod.case_scope({"namespace": "app-1", "started_at": AS_OF.isoformat()}).node is None
+
+
+def test_node_alert_without_namespace_collects_only_nodes(db):
+    """Нодовый алерт без стенда (NodeDiskIOSaturation и т.п.): namespace нет,
+    а зона ноды и host-ы входа нужны — опрашивается только kg_nodes."""
+    out = kgi.build_kg_context(db, namespace=None, service=None, alertname="NodeDown",
+                               as_of=AS_OF, node="node-a")
+    assert out is not None and out.status.value == "success"
+    kgc = out.data
+    assert set(kgc["sources"]) == {"kg_nodes"}
+    assert kgc["namespaces"] == [] and kgc["ns_scope"] is None
+    assert kgc["node_topology"]["zone"] == "dc-1"
+    assert "[kg_nodes]" in kgi.kg_context_prompt(kgc)
+
+
+def test_build_kg_context_needs_namespace_or_node(db):
+    assert kgi.build_kg_context(db, namespace=None, service=None, alertname="X",
+                                as_of=AS_OF) is None
+    assert kgi.build_kg_context(db, namespace="Bad NS!", service=None, alertname="X",
+                                as_of=AS_OF, node=" ") is None
+
+
+def test_diagnostics_ctx_node_alert_without_namespace(db, monkeypatch):
+    from app.diagnostics import incident_ctx
+
+    monkeypatch.setattr(incident_ctx, "nearby_alerts", lambda *_a, **_k: [])
+    inc = Incident(incident_id="i2", severity="warning", status="firing", summary="s",
+                   namespace=None, labels={"alertname": "NodeDown", "node": "node-a"},
+                   annotations={}, starts_at=AS_OF.isoformat())
+    ctx = incident_ctx.build_diagnostics_ctx(inc, "", kg_session=db)
+    assert ctx["kg_node_topology"]["zone"] == "dc-1"
+    assert "[kg_nodes]" in ctx["k8s_summary"]

@@ -267,10 +267,11 @@ class KGScope:
     подсказка.
 
     `node` — нода нодового алерта (метка `node`): без неё источник kg_nodes
-    не опрашивается вовсе и в `sources` не появляется.
+    не опрашивается вовсе и в `sources` не появляется. `namespace=None` —
+    нодовый алерт без стенда: собирается только kg_nodes.
     """
 
-    namespace: str
+    namespace: Optional[str]
     as_of: datetime
     service: Optional[str] = None
     alertname: Optional[str] = None
@@ -857,20 +858,22 @@ def fetch_kg_incident_context(reader: KGReader, scope: KGScope) -> Dict[str, Any
     """Прочитать граф на момент `scope.as_of`. Упавший источник — запись в
     `sources` с причиной, остальные на месте; JSON-сериализуемо (метки времени
     — ISO), чтобы датасет хранил ровно то, что увидел бы прод."""
-    try:
-        with reader.isolated():
-            namespaces = _scope_namespaces(reader, scope.namespace)
-    except Exception as e:  # без списка сквада — хотя бы сам namespace
-        log.warning("kg_context.scope_failed", error=type(e).__name__)
-        namespaces = [scope.namespace]
+    namespaces: List[str] = []
+    if scope.namespace:
+        try:
+            with reader.isolated():
+                namespaces = _scope_namespaces(reader, scope.namespace)
+        except Exception as e:  # без списка сквада — хотя бы сам namespace
+            log.warning("kg_context.scope_failed", error=type(e).__name__)
+            namespaces = [scope.namespace]
     kgc: Dict[str, Any] = {
         "schema": SCHEMA,
         "as_of": _iso(scope.as_of_utc),
         "namespace": scope.namespace,
         "service": scope.service,
         "alertname": scope.alertname,
-        "ns_scope": (squad_prefix(scope.namespace) or scope.namespace) + (
-            "%" if squad_prefix(scope.namespace) else ""),
+        "ns_scope": ((squad_prefix(scope.namespace) or scope.namespace) + (
+            "%" if squad_prefix(scope.namespace) else "")) if scope.namespace else None,
         "namespaces": namespaces,
         "pod_events": [], "alerts": [],
         "deployments": {"code": [], "rollouts": [], "statics_count": 0},
@@ -884,6 +887,8 @@ def fetch_kg_incident_context(reader: KGReader, scope: KGScope) -> Dict[str, Any
     for name, fn in _SOURCES:
         needs = _SCOPED_SOURCES.get(name)
         if needs and not getattr(scope, needs, None):
+            continue
+        if not scope.namespace and not needs:  # нодовый алерт без стенда
             continue
         try:
             with reader.isolated():
@@ -1227,13 +1232,17 @@ def as_of_for(starts_at: Any, now: Optional[datetime] = None) -> datetime:
 def build_kg_context(db: Any, *, namespace: Optional[str], service: Optional[str],
                      alertname: Optional[str], as_of: datetime,
                      node: Optional[str] = None) -> Optional[Any]:
-    """Прод: собрать через сессию. None — нечего собирать (нет namespace).
+    """Прод: собрать через сессию. None — нечего собирать (нет ни namespace, ни ноды).
 
-    `node` — метка `node` алерта: включает источник kg_nodes."""
-    if not namespace or not _NS_RE.match(namespace):
+    `node` — метка `node` алерта: включает источник kg_nodes; у нодового
+    алерта без namespace собирается только он."""
+    node = (node or "").strip() or None
+    if namespace and not _NS_RE.match(namespace):
+        namespace = None
+    if not namespace and not node:
         return None
     scope = KGScope(namespace=namespace, service=service, alertname=alertname, as_of=as_of,
-                    node=(node or "").strip() or None)
+                    node=node)
     return KG_CONTEXT.run_sync(collect_kg_incident_context, SessionReader(db), scope)
 
 
