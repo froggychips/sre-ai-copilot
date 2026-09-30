@@ -202,7 +202,7 @@ def _deploy_history_top(
     """
     cutoff = datetime.utcnow() - timedelta(days=lookback_days)
     try:
-        rows = db.execute(text("""
+        rows: Any = db.execute(text("""
             SELECT d.triggered_by, COUNT(*) AS cnt
             FROM kg_deployments d
             JOIN kg_services s ON s.id = d.service_id
@@ -637,7 +637,7 @@ def suggest_owners_bulk(
         return result
 
     try:
-        rows = db.execute(text("""
+        rows: Any = db.execute(text("""
             SELECT namespace, team_owner
             FROM (
                 SELECT namespace, team_owner,

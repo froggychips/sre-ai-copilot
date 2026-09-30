@@ -4,6 +4,19 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+### Зависимости
+
+- **`sqlalchemy` 2.0.54 → 2.1.0** (вместо #464). В 2.1 `Column` стал
+  дескриптором, и на ORM-классе `Model.col` для mypy — `Never`: 168 ложных
+  ошибок в 39 файлах. Поля 5 модулей моделей (319 штук) переведены с
+  `Column(...)` на `mapped_column(...)` — те же аргументы, DDL всех 24 таблиц и
+  67 индексов совпадает бит в бит. Строки сырого SQL (`text(...).fetchall()`) в 2.1
+  типизированы как `object` — результаты аннотированы `Any`, как фактически было
+  на 2.0. `greenlet` больше не тянется (async-API не используется). В 2.1 драйвер по
+  умолчанию для `postgresql://` — psycopg (v3), которого в образе нет: URL
+  приводится к `postgresql+psycopg2://` (`app.database.sqlalchemy_url`, и в alembic). Полная
+  типизация моделей через `Mapped[...]` — отдельный долг.
+
 ## [1.0.22] — 2026-09-30 — Алерты PDB/HPA на своём workload'е
 
 ### Исправлено

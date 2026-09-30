@@ -161,3 +161,25 @@ def test_datetime_columns_are_without_timezone():
         if isinstance(column.type, DateTime) and column.type.timezone
     ]
     assert not aware, f"колонки с timezone=True при naive-UTC контракте: {aware}"
+
+
+# ── sqlalchemy_url: явный драйвер psycopg2 ───────────────────────────────
+# SQLAlchemy 2.1 сделал psycopg (v3) драйвером по умолчанию для postgresql://,
+# а в образе только psycopg2 — без явного драйвера приложение не стартует.
+
+
+def test_sqlalchemy_url_pins_psycopg2_for_bare_postgres_schemes():
+    assert db_mod.sqlalchemy_url("postgresql://u:p@h:5432/d") == "postgresql+psycopg2://u:p@h:5432/d"
+    assert db_mod.sqlalchemy_url("postgres://u:p@h/d") == "postgresql+psycopg2://u:p@h/d"
+
+
+def test_sqlalchemy_url_keeps_explicit_driver_and_sqlite():
+    assert db_mod.sqlalchemy_url("postgresql+psycopg2://u@h/d") == "postgresql+psycopg2://u@h/d"
+    assert db_mod.sqlalchemy_url("postgresql+asyncpg://u@h/d") == "postgresql+asyncpg://u@h/d"
+    assert db_mod.sqlalchemy_url("sqlite:///x.db") == "sqlite:///x.db"
+
+
+def test_engine_uses_psycopg2_driver_for_postgres():
+    from sqlalchemy.engine import make_url
+    url = make_url(db_mod.sqlalchemy_url("postgresql://u:p@h:5432/d"))
+    assert url.get_driver_name() == "psycopg2"

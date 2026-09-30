@@ -250,7 +250,7 @@ def _get_ns_to_team_map(db: Session) -> Dict[str, str]:
     пустая карта — все namespace-ы просто отрисуются как `(unowned)`.
     """
     try:
-        rows = db.execute(text("""
+        rows: Any = db.execute(text("""
             SELECT namespace,
                    COALESCE(
                        MIN(team_owner) FILTER (WHERE team_owner != 'platform'),
@@ -600,7 +600,7 @@ def _alert_type_metadata(
         """)).scalar()
 
         # 1) yesterday: за окно 24-48h назад, count(*) по alertname.
-        yest_rows = db.execute(text("""
+        yest_rows: Any = db.execute(text("""
             SELECT alertname, count(*) AS cnt
             FROM kg_alerts
             WHERE alertname = ANY(:names)
@@ -614,7 +614,7 @@ def _alert_type_metadata(
         # yesterday-event-count (обе из kg_alerts, окна одинаковой длины).
         # Раньше вычитали yesterday-count из мгновенного firing-series `cnt`
         # (VM-снимок за 5 минут) — несопоставимые популяции → мусорная дельта.
-        today_rows = db.execute(text("""
+        today_rows: Any = db.execute(text("""
             SELECT alertname, count(*) AS cnt
             FROM kg_alerts
             WHERE alertname = ANY(:names)
@@ -627,7 +627,7 @@ def _alert_type_metadata(
         # ≥CHRONIC_REPEAT_MIN_FIRES fires за окно. Порог именованный и
         # проговаривается в заголовке секции — иначе три разных «chronic» в
         # дайджесте не сверить между собой.
-        chronic_rows = db.execute(text("""
+        chronic_rows: Any = db.execute(text("""
             SELECT alertname, count(*) AS chronic_svc
             FROM (
                 SELECT alertname, service_id, count(*) AS fires
@@ -645,7 +645,7 @@ def _alert_type_metadata(
 
         # 3) resurfaced — service-alertname пары где есть resolved + позднее fired.
         # Heuristic: max(resolved_at) < max(fired_at) при ≥2 fires.
-        resurf_rows = db.execute(text("""
+        resurf_rows: Any = db.execute(text("""
             SELECT alertname, count(*) AS resurf_svc
             FROM (
                 SELECT alertname, service_id,
@@ -814,7 +814,7 @@ def fragile_services_section(db: Session, ns_to_team: Dict[str, str]) -> str:
     # Pull all candidate services с inbound-callers count + health_score.
     # SELECT в один проход; дальше классифицируем в Python.
     try:
-        rows = db.execute(text("""
+        rows: Any = db.execute(text("""
             SELECT s.name, s.namespace, s.health_score,
                    count(e.id) AS callers
             FROM kg_services s
@@ -937,11 +937,10 @@ def stale_deployments_section(
     # ловят свои исключения сами). Без списка namespace-ов делать нечего —
     # честно скрываемся и отмечаемся в трекере сбоев.
     try:
-        wo_namespaces = sorted({
-            ns for (ns,) in db.execute(
-                text("SELECT DISTINCT namespace FROM kg_services")
-            ).fetchall()
-        })
+        ns_rows: Any = db.execute(
+            text("SELECT DISTINCT namespace FROM kg_services")
+        ).fetchall()
+        wo_namespaces = sorted({ns for (ns,) in ns_rows})
     # `as exc`, а не `as e`: ниже в этой же функции `e` — переменная цикла по
     # entries, а Python удаляет имя исключения на выходе из except-блока.
     except Exception as exc:  # noqa: BLE001 — одна секция выпадает, дайджест живёт
@@ -1329,7 +1328,7 @@ def anomaly_summary_section(db: Session) -> str:
         top_services = []
 
     try:
-        by_metric = db.execute(text("""
+        by_metric: Any = db.execute(text("""
             SELECT metric, count(*)
             FROM kg_anomaly_observations
             WHERE ts > NOW() - INTERVAL '24 hours'
@@ -1371,7 +1370,7 @@ def anomaly_top_section(db: Session, ns_to_team: Dict[str, str]) -> str:
     persistent-кейсов — возвращаем "" (секция скрыта).
     """
     try:
-        rows = db.execute(text("""
+        rows: Any = db.execute(text("""
             WITH ranked AS (
                 SELECT
                     a.service_id,
@@ -1422,7 +1421,7 @@ def log_errors_section(db: Session, ns_to_team: Dict[str, str]) -> str:
     обрезаем до 60 chars чтобы строка не уехала за ширину embed-а.
     """
     try:
-        rows = db.execute(text("""
+        rows: Any = db.execute(text("""
             SELECT s.name, s.namespace,
                    SUM(l.count)::int AS total,
                    MAX(l.sample_message) AS sample
@@ -1482,11 +1481,10 @@ def kg_quality_section(db: Session) -> str:
         edges_total = db.execute(
             text("SELECT count(*) FROM kg_service_edges")
         ).scalar() or 0
-        edges_by_kind: Dict[str, int] = {
-            k: v for k, v in db.execute(
-                text("SELECT kind, count(*) FROM kg_service_edges GROUP BY kind")
-            ).fetchall()
-        }
+        kind_rows: Any = db.execute(
+            text("SELECT kind, count(*) FROM kg_service_edges GROUP BY kind")
+        ).fetchall()
+        edges_by_kind: Dict[str, int] = {k: v for k, v in kind_rows}
         synthetic = db.execute(
             text("SELECT count(*) FROM kg_services "
                  "WHERE synthetic = true AND node_kind = 'service'")
@@ -2397,7 +2395,7 @@ def deploy_incident_correlation_section(db: Session, hours: int = 24) -> str:
     builds = int(overall[4] or 0) if len(overall) > 4 else 0
 
     try:
-        worst = db.execute(text("""
+        worst: Any = db.execute(text("""
             SELECT
                 d.build_number,
                 d.triggered_by,

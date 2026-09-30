@@ -21,6 +21,7 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')
 # Поэтому явно импортируем ВСЕ модули с ORM-моделями (side-effect-импорты):
 from app.models import Base as ModelsBase
 from app.database import Base as DatabaseBase
+from app.database import sqlalchemy_url
 import app.knowledge_graph.schema  # noqa: F401 — kg_services, kg_alerts, ... (14 таблиц)
 import app.remediation.attempts  # noqa: F401 — kg_remediation_attempts
 import app.remediation.models  # noqa: F401 — kg_remediation_decisions
@@ -58,7 +59,7 @@ target_metadata = [ModelsBase.metadata, DatabaseBase.metadata]
 
 def run_migrations_offline() -> None:
     """Run migrations in 'offline' mode."""
-    url = settings.DATABASE_URL
+    url = sqlalchemy_url(settings.DATABASE_URL)
     context.configure(
         url=url,
         target_metadata=target_metadata,
@@ -73,7 +74,7 @@ def run_migrations_online() -> None:
     """Run migrations in 'online' mode."""
     # Override sqlalchemy.url with value from settings
     configuration = config.get_section(config.config_ini_section, {})
-    configuration["sqlalchemy.url"] = settings.DATABASE_URL
+    configuration["sqlalchemy.url"] = sqlalchemy_url(settings.DATABASE_URL)
     
     connectable = engine_from_config(
         configuration,
