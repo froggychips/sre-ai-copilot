@@ -207,3 +207,10 @@ def test_diagnostics_ctx_node_alert_without_namespace(db, monkeypatch):
     ctx = incident_ctx.build_diagnostics_ctx(inc, "", kg_session=db)
     assert ctx["kg_node_topology"]["zone"] == "dc-1"
     assert "[kg_nodes]" in ctx["k8s_summary"]
+
+
+def test_late_observation_flag_without_entry_hosts():
+    line = kgi._node_line({"node": "n1", "zone": "z", "same_zone_nodes": [],
+                           "entry_hosts": [], "observed_after_as_of": True})
+    assert "traffic entry" not in line
+    assert line.endswith("[node topology observed after incident start]")

@@ -1005,8 +1005,8 @@ def _node_line(nt: Dict[str, Any]) -> str:
     hosts = list(nt.get("entry_hosts") or [])
     if hosts:
         line += f"; traffic entry for hosts ({len(hosts)}): {_few(hosts)}"
-        if nt.get("observed_after_as_of"):
-            line += " [entry mapping observed after incident start]"
+    if nt.get("observed_after_as_of"):
+        line += " [node topology observed after incident start]"
     return line
 
 

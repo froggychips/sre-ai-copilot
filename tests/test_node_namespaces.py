@@ -350,6 +350,17 @@ class TestEnrichment:
         assert build.call_args.kwargs["node"] == "dev-26"
         assert ctx.kg_context == {"node_topology": {"zone": "z"}}
 
+    def test_node_alert_with_scrape_namespace_but_no_service(self):
+        """namespace=monitoring (метка скрейпа), service нет: топология ноды
+        всё равно собирается, но без контекста namespace."""
+        labels = {k: v for k, v in _NODE_LABELS.items() if k != "service"}
+        with patch("app.context.deployments.fetch_node_namespaces", return_value=[]), \
+                patch("app.services.alert_enrichment.build_kg_context") as build:
+            build.return_value = SimpleNamespace(data={"node_topology": {"zone": "z"}})
+            enrich_alert(_db(), _incident({**labels, "node": "dev-26"}))
+        assert build.call_args.kwargs["namespace"] is None
+        assert build.call_args.kwargs["node"] == "dev-26"
+
 
 class TestPrefetch:
     @pytest.mark.asyncio
