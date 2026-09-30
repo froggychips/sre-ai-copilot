@@ -4,6 +4,8 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+## [1.0.22] — 2026-09-30 — Алерты PDB/HPA на своём workload'е
+
 ### Исправлено
 
 - **Алерты PDB/HPA привязываются к workload'у, а не к kube-state-metrics.** У
@@ -15,6 +17,16 @@ All notable changes to this project are documented in this file.
 - **`oauthlib` 4.0.0 — CVE-2026-49265 (#471).** `pip-audit --strict` валил CI
   любого PR; `oauthlib` приходит транзитивно через `kubernetes` →
   `requests-oauthlib`.
+- **Раннер CI и его listener — только на dev-нодах (#466, #469).** Без affinity
+  раннер (privileged dind) садился и на prod-ноды. Явный
+  `controllerServiceAccount`: чарт ARC больше не ищет его lookup'ом по всем
+  Deployment'ам кластера.
+
+### Зависимости
+
+- `anthropic` 1.7.0 → 1.8.0 (#459), `pyjwt` 2.14.0 → 2.15.0 (#460),
+  `uvicorn` 0.52.4 → 0.53.0 (#461); в CI `astral-sh/setup-uv` 7.6.0 → 10.2.0
+  (#463), `github/codeql-action` 4.38.1 → 4.38.2 (#462, #465).
 
 ## [1.0.21] — 2026-09-29 — Пинг critical только дежурному
 
