@@ -4,6 +4,8 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+## [1.0.23] — 2026-09-30 — SQLAlchemy 2.1
+
 ### Зависимости
 
 - **`sqlalchemy` 2.0.54 → 2.1.0** (вместо #464). В 2.1 `Column` стал
