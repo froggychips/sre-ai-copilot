@@ -1143,9 +1143,10 @@ def enrich_alert(db: Session, incident: Incident) -> EnrichedContext:
                 log.warning("enrich.ns_deploy_fallback_failed", error=str(e))
         else:
             log.debug("enrich.skip_no_service", namespace=namespace, service=service)
-        if not namespace and ctx.node:
-            # Нодовый алерт без стенда: из графа — только топология ноды
-            # (зона, соседи, host-ы входа).
+        if ctx.node:
+            # Нодовый алерт без сервиса: из графа — только топология ноды
+            # (зона, соседи, host-ы входа). namespace такого алерта — метка
+            # скрейпа (monitoring), а не стенд: контекст ns не собираем.
             _attach_kg_context(ctx, db, incident, namespace=None, service=None,
                                as_of=datetime.now(timezone.utc))
         return ctx
