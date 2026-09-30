@@ -112,10 +112,26 @@ def _build_pool_kwargs(database_url: str, cfg=settings) -> dict:
     }
 
 
+def sqlalchemy_url(url: str) -> str:
+    """URL с явным драйвером psycopg2 для Postgres-схем без драйвера.
+
+    SQLAlchemy 2.1 сменил драйвер по умолчанию для `postgresql://` с psycopg2
+    на psycopg (v3), которого в образе нет: без явного `+psycopg2` приложение
+    падало бы на импорте с `No module named 'psycopg'`. DATABASE_URL в секретах
+    и CI задан как `postgresql://…`, поэтому драйвер фиксируется здесь, а не в
+    каждом окружении. Явно указанный драйвер (`postgresql+…`) и не-Postgres URL
+    (sqlite) не трогаются.
+    """
+    for scheme in ("postgresql://", "postgres://"):
+        if url.startswith(scheme):
+            return "postgresql+psycopg2://" + url[len(scheme):]
+    return url
+
+
 _pool_kwargs: dict = _build_pool_kwargs(settings.DATABASE_URL)
 
 engine = create_engine(
-    settings.DATABASE_URL,
+    sqlalchemy_url(settings.DATABASE_URL),
     echo=False,
     # pool_pre_ping вытаскивает stale connections при возврате из пула —
     # обязателен в k8s, где DB pod может рестартиться без уведомления.
