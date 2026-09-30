@@ -612,6 +612,8 @@ def detect_anomalies(
     svc_by_id = {s.id: s for s in services}
     stats["log_error_services"] = len(log_svc_ids)
     for sid in log_svc_ids:
+        if sid is None:  # отсечён фильтром запроса; условие — для mypy
+            continue
         svc_opt = svc_by_id.get(sid)
         if svc_opt is None:
             continue

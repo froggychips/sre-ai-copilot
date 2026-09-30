@@ -397,8 +397,8 @@ def sync_namespace_lifecycle(db: Session) -> Dict[str, Any]:
         # row.k8s_uid is None — строка из backfill: инкарнацию не знали,
         # поэтому просто запоминаем текущий UID, не считая это пересозданием.
         if row.k8s_uid and info["uid"] and row.k8s_uid != info["uid"]:
-            row.incarnation = (row.incarnation or 1) + 1  # type: ignore[assignment]
-            row.first_seen_at = now  # type: ignore[assignment]
+            row.incarnation = (row.incarnation or 1) + 1
+            row.first_seen_at = now
             stats["reincarnated"] += 1
             audit_service.log_event("KG_NAMESPACE_REINCARNATED", {
                 "namespace": name,
@@ -416,25 +416,25 @@ def sync_namespace_lifecycle(db: Session) -> Dict[str, Any]:
             returned_names.append(name)
             log.info("kg_namespace.returned", namespace=name)
 
-        row.k8s_uid = info["uid"] or row.k8s_uid  # type: ignore[assignment]
-        row.k8s_created_at = info["created_at"] or row.k8s_created_at  # type: ignore[assignment]
-        row.state = NS_STATE_ACTIVE  # type: ignore[assignment]
-        row.last_seen_at = now  # type: ignore[assignment]
-        row.missing_since = None  # type: ignore[assignment]
+        row.k8s_uid = info["uid"] or row.k8s_uid
+        row.k8s_created_at = info["created_at"] or row.k8s_created_at
+        row.state = NS_STATE_ACTIVE
+        row.last_seen_at = now
+        row.missing_since = None
         # Лейблы — как есть, включая None: перераскатка стенда без лейбла
         # должна стирать прежнего деплойера, а не наследовать его.
         if "deployed_by" in info:
-            row.deployed_by = info.get("deployed_by")  # type: ignore[assignment]
-            row.deployed_branch = info.get("deployed_branch")  # type: ignore[assignment]
-            row.claim_owner = info.get("claim_owner")  # type: ignore[assignment]
+            row.deployed_by = info.get("deployed_by")
+            row.deployed_branch = info.get("deployed_branch")
+            row.claim_owner = info.get("claim_owner")
 
     for name, row in known.items():
         if name in live or row.state != NS_STATE_ACTIVE:
             continue
-        row.state = NS_STATE_MISSING  # type: ignore[assignment]
+        row.state = NS_STATE_MISSING
         # Ставится ОДИН раз: по нему считается срок до забвения, и повторная
         # запись обнуляла бы отсчёт на каждом тике.
-        row.missing_since = now  # type: ignore[assignment]
+        row.missing_since = now
         stats["marked_missing"] += 1
         log.info("kg_namespace.marked_missing", namespace=name)
 

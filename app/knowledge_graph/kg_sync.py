@@ -1012,7 +1012,7 @@ def _refresh_stale_class_for_namespace(db: Session, namespace: str) -> int:
             team_owner=cast(Optional[str], svc.team_owner),
         )
         if svc.stale_class != new_class:
-            svc.stale_class = new_class  # type: ignore[assignment]
+            svc.stale_class = new_class
             updated += 1
     if updated:
         db.flush()
@@ -1302,7 +1302,7 @@ def _decay_stale_edges(
             continue  # уже помечен в предыдущем decay-проходе
         ex["inactive"] = True
         ex["inactivated_at"] = now.isoformat()
-        edge.extras = cast(Any, ex)
+        edge.extras = ex
         stats["marked_inactive"] += 1
         marked_any = True
     if marked_any:
@@ -1358,7 +1358,7 @@ def _revive_active_edges(db: Session) -> int:
             new_ex = dict(ex)
             new_ex.pop("inactive", None)
             new_ex.pop("inactivated_at", None)
-            edge.extras = cast(Any, new_ex or None)
+            edge.extras = new_ex or None
             revived += 1
     if revived:
         db.flush()

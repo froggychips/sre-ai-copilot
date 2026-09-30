@@ -31,9 +31,9 @@ embed и debug-метки алерта.
 import logging
 import time
 from datetime import datetime, timezone
-from typing import Any, Dict, Optional, cast
+from typing import Any, cast, Dict, Optional
 
-from sqlalchemy.orm import mapped_column
+from sqlalchemy.orm import Mapped, mapped_column
 from sqlalchemy import DateTime, Integer, String, JSON
 from sqlalchemy.exc import IntegrityError
 
@@ -73,19 +73,19 @@ class DiscordDedupEntry(Base):
 
     __tablename__ = "discord_dedup"
 
-    key = mapped_column(String(40), primary_key=True)  # sha1 hex от _compute_enriched_key
-    msg_id = mapped_column(String(32), nullable=False)
+    key: Mapped[str] = mapped_column(String(40), primary_key=True)  # sha1 hex от _compute_enriched_key
+    msg_id: Mapped[str] = mapped_column(String(32), nullable=False)
     # webhook_url тут БЫЛ и снесён миграцией 20260808_0200 — см. докстринг
     # модуля. Не возвращать: PATCH-URL резолвится из настроек в рантайме.
-    embed = mapped_column(JSON, nullable=True)
-    first_ts = mapped_column(DateTime, nullable=False, index=True)
-    last_ts = mapped_column(DateTime, nullable=False)
-    count = mapped_column(Integer, nullable=False, default=1)
+    embed: Mapped[Optional[Any]] = mapped_column(JSON, nullable=True)
+    first_ts: Mapped[datetime] = mapped_column(DateTime, nullable=False, index=True)
+    last_ts: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+    count: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
     # Debug-видимость: что за алерт скрывается за sha1-ключом.
-    alertname = mapped_column(String(255), nullable=True)
-    namespace = mapped_column(String(255), nullable=True)
-    service = mapped_column(String(255), nullable=True)
-    severity = mapped_column(String(32), nullable=True)
+    alertname: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    namespace: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    service: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    severity: Mapped[Optional[str]] = mapped_column(String(32), nullable=True)
 
 
 def _to_dt(ts: float) -> datetime:

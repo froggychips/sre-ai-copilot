@@ -149,9 +149,7 @@ def attach_alert(
         db.add(inc)
         action = "opened"
 
-    # SQLAlchemy Column[...] без Mapped[]: присваиваем через Any-вид, как в
-    # alerts_resolve_sync (cast(Any, ...)) — иначе mypy спорит с каждой строкой.
-    row: Any = inc
+    row = inc
     # JSON-колонки: присваиваем НОВЫЙ список — мутация in-place SQLAlchemy
     # без MutableList не заметит.
     fps: List[str] = list(inc.fingerprints or [])
@@ -214,7 +212,7 @@ def reconcile_incidents(db: Session, *, now: Optional[datetime] = None) -> Dict[
             missing = set(fps) - seen
             if not still_firing and not missing:
                 row.status = STATUS_RESOLVED
-                row.resolved_at = max(r for _, r in rows)
+                row.resolved_at = max(r for _, r in rows if r is not None)
                 row.resolve_reason = RESOLVE_ALL_ALERTS
                 stats["resolved"] += 1
                 continue

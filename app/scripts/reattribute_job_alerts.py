@@ -112,7 +112,7 @@ def reattribute(db: Session, *, apply: bool = False) -> Dict[str, Any]:
         db.flush()
         attach_alert(
             db, namespace=job["ns"], service_name=target, service_id=cast(int, svc.id),
-            fired_at=cast(Any, alert.fired_at), alertname=cast(str, alert.alertname),
+            fired_at=alert.fired_at, alertname=cast(str, alert.alertname),
             severity=cast(Optional[str], alert.severity), fingerprint=cast(Optional[str], alert.fingerprint),
         )
         stats["moved"] += 1

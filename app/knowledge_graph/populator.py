@@ -587,7 +587,8 @@ def _upsert_edge_fallback(
         # KG H5: weight монотонно растёт — env-sync (weight=1) не понижает
         # «жирность», проставленную runtime/traffic-источником. Зеркалит
         # GREATEST(existing, excluded) из PG-пути.
-        if weight > edge.weight:
+        # NULL в weight (строка до H5) раньше давал TypeError на сравнении.
+        if edge.weight is None or weight > edge.weight:
             edge.weight = weight
         merged = dict(edge.extras or {})
         if extras:

@@ -165,8 +165,8 @@ def _collapse_phantom_db_nodes_historical(
                                 cast(Optional[Dict[str, Any]], existing.extras),
                                 cast(Optional[Dict[str, Any]], e.extras),
                             )
-                            existing.weight = merged_weight  # type: ignore[assignment]
-                            existing.extras = merged_extras  # type: ignore[assignment]
+                            existing.weight = merged_weight
+                            existing.extras = merged_extras
                             db.delete(e)
                             stats["edges_merged"] += 1
                         else:

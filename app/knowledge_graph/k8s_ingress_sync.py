@@ -204,7 +204,7 @@ def _adopt_legacy_ingress_node(db: Session, namespace: str, name: str) -> None:
     if legacy is None:
         return
 
-    legacy.node_kind = NODE_KIND_INGRESS  # type: ignore[assignment]
+    legacy.node_kind = NODE_KIND_INGRESS
     db.flush()
     log.info("ingress_sync.node_kind_adopted namespace=%s name=%s", namespace, name)
 

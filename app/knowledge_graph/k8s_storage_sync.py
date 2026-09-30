@@ -591,14 +591,14 @@ def _upsert_volume(
     # Update mutable fields. Не трогаем disk_pct если на этом тике нет
     # данных (None) — чтобы предыдущее значение не стиралось при
     # STORAGE_METRICS_ENABLED=False.
-    vol.capacity_bytes = cast(Any, fields.get("capacity_bytes"))
-    vol.storage_class = cast(Any, fields.get("storage_class"))
-    vol.phase = cast(Any, fields.get("phase"))
-    vol.access_modes = cast(Any, fields.get("access_modes"))
-    vol.volume_name = cast(Any, fields.get("volume_name"))
-    vol.metadata_json = cast(Any, fields.get("metadata_json"))
+    vol.capacity_bytes = fields.get("capacity_bytes")
+    vol.storage_class = fields.get("storage_class")
+    vol.phase = fields.get("phase")
+    vol.access_modes = fields.get("access_modes")
+    vol.volume_name = fields.get("volume_name")
+    vol.metadata_json = fields.get("metadata_json")
     if disk_pct is not None:
-        vol.disk_pct = cast(Any, disk_pct)
+        vol.disk_pct = disk_pct
     db.flush()
     return vol
 
@@ -658,12 +658,12 @@ def _upsert_volume_edge(
             )
             # проваливаемся в update-путь ниже.
 
-    edge.last_seen_at = cast(Any, now)
+    edge.last_seen_at = now
     if extras:
         merged = dict(edge.extras or {})
         merged.update(extras)
         if merged != (edge.extras or {}):
-            edge.extras = cast(Any, merged)
+            edge.extras = merged
     db.flush()
     return edge
 

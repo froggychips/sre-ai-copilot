@@ -371,14 +371,14 @@ async def _run_probe_cycle(db: Session) -> Dict[str, Any]:
                     .one_or_none()
                 )
                 if ae is not None:
-                    ae.resolved_at = cast(Any, datetime.utcnow())
+                    ae.resolved_at = datetime.utcnow()
                 notifications.append(
                     {"host": host, "status": "up", "snapshot": snapshot, "resolved": True},
                 )
                 stats["alerts_resolved"] += 1
 
             meta["external_probe"] = snapshot
-            svc.metadata_json = cast(Any, meta)
+            svc.metadata_json = meta
             flag_modified(svc, "metadata_json")
 
         db.commit()

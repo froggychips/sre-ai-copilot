@@ -7,10 +7,11 @@ from __future__ import annotations
 
 from datetime import datetime
 
+from typing import Any, Optional
 from sqlalchemy import (JSON, BigInteger, Boolean, DateTime, Float,
                         ForeignKey, Index, Integer, String, Text,
                         UniqueConstraint, text)
-from sqlalchemy.orm import mapped_column, relationship
+from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.database import Base
 from app.knowledge_graph.contract import UQ_KG_SERVICE_NS_NAME_KIND
@@ -67,52 +68,52 @@ class Namespace(Base):
 
     __tablename__ = "kg_namespaces"
 
-    namespace = mapped_column(String, primary_key=True)
+    namespace: Mapped[str] = mapped_column(String, primary_key=True)
     #: metadata.uid namespace в кластере. NULL у строк, заведённых до того,
     #: как синк начал его читать — для них инкарнация неизвестна.
-    k8s_uid = mapped_column(String, nullable=True, index=True)
+    k8s_uid: Mapped[Optional[str]] = mapped_column(String, nullable=True, index=True)
     #: metadata.creationTimestamp — возраст САМОГО namespace, в отличие от
     #: created_at узлов, который у пересозданного стенда врёт.
-    k8s_created_at = mapped_column(DateTime, nullable=True)
+    k8s_created_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
     #: Счётчик пересозданий: 1 у первой известной инкарнации.
-    incarnation = mapped_column(Integer, nullable=False, default=1, server_default="1")
-    state = mapped_column(
+    incarnation: Mapped[int] = mapped_column(Integer, nullable=False, default=1, server_default="1")
+    state: Mapped[str] = mapped_column(
         String, nullable=False, index=True,
         default=NS_STATE_ACTIVE, server_default=NS_STATE_ACTIVE,
     )
     #: Когда граф впервые увидел ЭТУ инкарнацию (не namespace вообще).
-    first_seen_at = mapped_column(DateTime, default=datetime.utcnow)
+    first_seen_at: Mapped[Optional[datetime]] = mapped_column(DateTime, default=datetime.utcnow)
     #: Последний тик, в котором namespace был жив в кластере.
-    last_seen_at = mapped_column(DateTime, default=datetime.utcnow, index=True)
+    last_seen_at: Mapped[Optional[datetime]] = mapped_column(DateTime, default=datetime.utcnow, index=True)
     #: Когда впервые не увидели. NULL у active — по нему считается TTL до
     #: retired, то есть время, а не доля, решает судьбу узлов.
-    missing_since = mapped_column(DateTime, nullable=True, index=True)
+    missing_since: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True, index=True)
     #: Сырые лейблы namespace (`deployed-by` / `deployed-branch`) — что
     #: поставил TeamCity при раскатке. Пишет lifecycle каждым тиком. Это ещё
     #: не владелец: кнопку мог нажать сервисный аккаунт (ai-agent, cicd), а
     #: ветку — раскатать коллега для проверки чужой задачи.
-    deployed_by = mapped_column(String, nullable=True)
-    deployed_branch = mapped_column(String, nullable=True)
+    deployed_by: Mapped[Optional[str]] = mapped_column(String, nullable=True)
+    deployed_branch: Mapped[Optional[str]] = mapped_column(String, nullable=True)
     # Лейбл `squad-owner`: кто занял стенд кнопкой ГД. Отличается от
     # deployed_by, который остаётся от прежнего деплойера стенда.
-    claim_owner = mapped_column(String, nullable=True)
+    claim_owner: Mapped[Optional[str]] = mapped_column(String, nullable=True)
     #: Владелец стенда — человек, к которому идти с вопросом «твой стенд
     #: болеет». Резолв (`kg_namespace_owner_sync`): ручной override →
     #: assignee Jira-задачи из ветки → deployed-by, если это не сервисный
     #: аккаунт → кто триггерил последний деплой в TC. `owner_source` хранит,
     #: какой из путей сработал (contract.NAMESPACE_OWNER_SOURCES).
-    owner_login = mapped_column(String, nullable=True, index=True)
-    owner_source = mapped_column(String, nullable=True)
-    owner_jira_key = mapped_column(String, nullable=True)
+    owner_login: Mapped[Optional[str]] = mapped_column(String, nullable=True, index=True)
+    owner_source: Mapped[Optional[str]] = mapped_column(String, nullable=True)
+    owner_jira_key: Mapped[Optional[str]] = mapped_column(String, nullable=True)
     #: Discord snowflake для @mention — из манифеста людей
     #: (PEOPLE_MANIFEST_PATH), в код не попадает.
-    owner_discord_id = mapped_column(String, nullable=True)
-    owner_resolved_at = mapped_column(DateTime, nullable=True)
+    owner_discord_id: Mapped[Optional[str]] = mapped_column(String, nullable=True)
+    owner_resolved_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
     #: Последняя игровая сессия по ClickHouse сквада (опционально). Критерий
     #: «стенд простаивает» для медика — вместо stale_class, который для
     #: сквадов не работает (их деплои — ns-broadcast, active недостижим).
-    last_activity_at = mapped_column(DateTime, nullable=True)
-    updated_at = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    last_activity_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    updated_at: Mapped[Optional[datetime]] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
 
 class Service(Base):
@@ -124,19 +125,19 @@ class Service(Base):
     """
     __tablename__ = "kg_services"
 
-    id = mapped_column(Integer, primary_key=True)
-    name = mapped_column(String, nullable=False, index=True)
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    name: Mapped[str] = mapped_column(String, nullable=False, index=True)
     # Без `index=True`: uq_kg_service_ns_name_kind (namespace, name,
     # node_kind) покрывает эту колонку как префикс.
-    namespace = mapped_column(String, nullable=False)
+    namespace: Mapped[str] = mapped_column(String, nullable=False)
     # Тип узла. Существующие строки мигрированы в 'service' — то есть смысл
     # старых данных не меняется, а k8s-workload'ы теперь заводятся отдельными
     # узлами и перестают конфликтовать с одноимённым Service.
-    node_kind = mapped_column(
+    node_kind: Mapped[str] = mapped_column(
         String, nullable=False, index=True,
         default=NODE_KIND_SERVICE, server_default=NODE_KIND_SERVICE,
     )
-    team_owner = mapped_column(String, nullable=True)   # squad, например `squad-gd`
+    team_owner: Mapped[Optional[str]] = mapped_column(String, nullable=True)   # squad, например `squad-gd`
     # Откуда взялся team_owner. Значения — contract.OWNER_SOURCES.
     # NULL = провенанс неизвестен (строки до 14.08.2026 и любой источник,
     # который его ещё не проставляет). Смысл: префиксная эвристика ошибается
@@ -146,29 +147,29 @@ class Service(Base):
     # сценарий чтения — агрегат «сколько узлов по каждому источнику». На такой
     # селективности PostgreSQL всё равно выберет seq scan, а лишний индекс на
     # kg_services — это ещё одна структура, которую ALTER TABLE будет блокировать.
-    owner_source = mapped_column(String, nullable=True)
-    metadata_json = mapped_column(JSON, nullable=True)  # labels, репо, runbook URL...
+    owner_source: Mapped[Optional[str]] = mapped_column(String, nullable=True)
+    metadata_json: Mapped[Optional[Any]] = mapped_column(JSON, nullable=True)  # labels, репо, runbook URL...
     # Synthetic = по дизайну никогда не имеет edges (cron-backups, nats-tools,
     # observability-exporters). Исключается из Orphan %-метрики в kg_quality.
-    synthetic = mapped_column(Boolean, nullable=False, default=False, server_default="false")
+    synthetic: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default="false")
 
-    created_at = mapped_column(DateTime, default=datetime.utcnow)
-    updated_at = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    created_at: Mapped[Optional[datetime]] = mapped_column(DateTime, default=datetime.utcnow)
+    updated_at: Mapped[Optional[datetime]] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
     # Service health score [0, 1] — composite (alerts × severity + crashloop +
     # recurrence). Recomputed периодически через `kg_health_recompute` beat task.
     # None = ещё не считалось. 1.0 = perfect health, 0.0 = down/broken.
     # Используется в kg_fragile_top для «истинного» ранжирования (не только
     # inbound count). Per ChatGPT review #4.3.
-    health_score = mapped_column(Float, nullable=True, index=True)
-    health_computed_at = mapped_column(DateTime, nullable=True)
+    health_score: Mapped[Optional[float]] = mapped_column(Float, nullable=True, index=True)
+    health_computed_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
 
     # KG Coverage #4 (2026-05-24): first-class stale классификация.
     # Значения: 'active' | 'expected_stale' | 'suspicious_stale'.
     # Заполняется в `kg_sync.sync_namespace` на каждом ран-е (idempotent) и
     # читается из `stats_digest.stale_deployments_section` / dashboards.
     # Реализация эвристики — `app/knowledge_graph/stale_classifier.py`.
-    stale_class = mapped_column(String, nullable=True, index=True)
+    stale_class: Mapped[Optional[str]] = mapped_column(String, nullable=True, index=True)
 
     # ── Идентичность объекта, а не его имени ─────────────────────────────
     #
@@ -185,14 +186,14 @@ class Service(Base):
     #
     # NULL здесь — «источник не сообщил uid», а не «объект без uid»: узлы из
     # алертов и ingress-синтетики заводятся без обхода k8s API.
-    k8s_uid = mapped_column(String, nullable=True)
+    k8s_uid: Mapped[Optional[str]] = mapped_column(String, nullable=True)
     # Порядковый номер воплощения. Растёт, когда под тем же именем появился
     # объект с другим `k8s_uid`. Смысл тот же, что у `kg_namespaces`.
-    incarnation = mapped_column(Integer, nullable=False, default=1, server_default="1")
+    incarnation: Mapped[int] = mapped_column(Integer, nullable=False, default=1, server_default="1")
     # Когда инкарнация сменилась в последний раз. Без метки факт пересоздания
     # виден только как «число стало 2» — без ответа, когда именно, а значит
     # и без возможности связать его с инцидентом.
-    incarnation_changed_at = mapped_column(DateTime, nullable=True)
+    incarnation_changed_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
 
     __table_args__ = (
         # node_kind в ключе: Service и workload с одинаковым именем — это
@@ -214,19 +215,19 @@ class Deployment(Base):
     """
     __tablename__ = "kg_deployments"
 
-    id = mapped_column(Integer, primary_key=True)
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
     # Без `index=True`: (service_id, started_at) ниже покрывает его как
     # префикс — отдельный индекс делал бы ту же работу второй раз.
-    service_id = mapped_column(Integer, ForeignKey("kg_services.id"), nullable=False)
-    sha = mapped_column(String, nullable=True)
-    repo = mapped_column(String, nullable=True)
-    buildtype_id = mapped_column(String, nullable=True)  # TeamCity build type
-    build_number = mapped_column(String, nullable=True)
-    started_at = mapped_column(DateTime, nullable=False, index=True)
-    finished_at = mapped_column(DateTime, nullable=True)
-    status = mapped_column(String, nullable=True)        # SUCCESS / FAILURE / RUNNING
-    triggered_by = mapped_column(String, nullable=True)
-    extras = mapped_column(JSON, nullable=True)
+    service_id: Mapped[int] = mapped_column(Integer, ForeignKey("kg_services.id"), nullable=False)
+    sha: Mapped[Optional[str]] = mapped_column(String, nullable=True)
+    repo: Mapped[Optional[str]] = mapped_column(String, nullable=True)
+    buildtype_id: Mapped[Optional[str]] = mapped_column(String, nullable=True)  # TeamCity build type
+    build_number: Mapped[Optional[str]] = mapped_column(String, nullable=True)
+    started_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, index=True)
+    finished_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    status: Mapped[Optional[str]] = mapped_column(String, nullable=True)        # SUCCESS / FAILURE / RUNNING
+    triggered_by: Mapped[Optional[str]] = mapped_column(String, nullable=True)
+    extras: Mapped[Optional[Any]] = mapped_column(JSON, nullable=True)
 
     service = relationship("Service")
 
@@ -253,20 +254,20 @@ class AlertEvent(Base):
     """
     __tablename__ = "kg_alerts"
 
-    id = mapped_column(Integer, primary_key=True)
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
     # Без `index=True`: ix_kg_alert_service_time (service_id, fired_at) покрывает эту колонку как префикс.
-    service_id = mapped_column(Integer, ForeignKey("kg_services.id"), nullable=True)
-    alertname = mapped_column(String, nullable=False, index=True)
-    severity = mapped_column(String, nullable=True)
-    fingerprint = mapped_column(String, nullable=True, unique=True, index=True)
-    fired_at = mapped_column(DateTime, nullable=False, index=True)
+    service_id: Mapped[Optional[int]] = mapped_column(Integer, ForeignKey("kg_services.id"), nullable=True)
+    alertname: Mapped[str] = mapped_column(String, nullable=False, index=True)
+    severity: Mapped[Optional[str]] = mapped_column(String, nullable=True)
+    fingerprint: Mapped[Optional[str]] = mapped_column(String, nullable=True, unique=True, index=True)
+    fired_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, index=True)
     # Последний раз, когда AM прислал webhook по этому alert-у (repeat_interval).
     # Для хронических алертов (fired_at недели назад) именно это поле попадает
     # в окно деплоя и используется в deploy_incident_correlation_section.
-    last_notified_at = mapped_column(DateTime, nullable=True, index=True)
-    resolved_at = mapped_column(DateTime, nullable=True)
-    incident_id = mapped_column(String, nullable=True, index=True)  # связь с IncidentRecord
-    raw = mapped_column(JSON, nullable=True)
+    last_notified_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True, index=True)
+    resolved_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    incident_id: Mapped[Optional[str]] = mapped_column(String, nullable=True, index=True)  # связь с IncidentRecord
+    raw: Mapped[Optional[Any]] = mapped_column(JSON, nullable=True)
 
     service = relationship("Service")
 
@@ -289,21 +290,21 @@ class PodEvent(Base):
     """
     __tablename__ = "kg_pod_events"
 
-    id = mapped_column(Integer, primary_key=True)
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
     # Без `index=True`: ix_kg_pod_event_service_time (service_id, first_seen) покрывает эту колонку как префикс.
-    service_id = mapped_column(Integer, ForeignKey("kg_services.id"), nullable=True)
+    service_id: Mapped[Optional[int]] = mapped_column(Integer, ForeignKey("kg_services.id"), nullable=True)
     # Без `index=True`: ix_kg_pod_event_ns_reason_time (namespace, reason,
     # first_seen) покрывает эту колонку как префикс.
-    namespace = mapped_column(String, nullable=False)
-    pod_name = mapped_column(String, nullable=False, index=True)
-    reason = mapped_column(String, nullable=False, index=True)   # OOMKilled / FailedScheduling / ...
-    message = mapped_column(String, nullable=True)
-    type = mapped_column(String, nullable=True)                  # Warning / Normal
-    event_uid = mapped_column(String, nullable=False, unique=True, index=True)
-    first_seen = mapped_column(DateTime, nullable=False, index=True)
-    last_seen = mapped_column(DateTime, nullable=True)
-    count = mapped_column(Integer, nullable=True)                # сколько раз k8s видел event
-    extras = mapped_column(JSON, nullable=True)
+    namespace: Mapped[str] = mapped_column(String, nullable=False)
+    pod_name: Mapped[str] = mapped_column(String, nullable=False, index=True)
+    reason: Mapped[str] = mapped_column(String, nullable=False, index=True)   # OOMKilled / FailedScheduling / ...
+    message: Mapped[Optional[str]] = mapped_column(String, nullable=True)
+    type: Mapped[Optional[str]] = mapped_column(String, nullable=True)                  # Warning / Normal
+    event_uid: Mapped[str] = mapped_column(String, nullable=False, unique=True, index=True)
+    first_seen: Mapped[datetime] = mapped_column(DateTime, nullable=False, index=True)
+    last_seen: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    count: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)                # сколько раз k8s видел event
+    extras: Mapped[Optional[Any]] = mapped_column(JSON, nullable=True)
 
     service = relationship("Service")
 
@@ -323,17 +324,17 @@ class ServiceHealth(Base):
     """
     __tablename__ = "kg_service_health"
 
-    id = mapped_column(Integer, primary_key=True)
-    service_id = mapped_column(
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    service_id: Mapped[int] = mapped_column(
     # Без `index=True`: uq_kg_service_health_service_ts (service_id, ts) покрывает эту колонку как префикс.
         Integer, ForeignKey("kg_services.id"), nullable=False,
     )
-    ts = mapped_column(DateTime, nullable=False)
-    cpu_pct = mapped_column(Float, nullable=True)
-    mem_pct = mapped_column(Float, nullable=True)
-    restarts_rate = mapped_column(Float, nullable=True)
-    http_5xx_rate = mapped_column(Float, nullable=True)
-    p95_latency_ms = mapped_column(Float, nullable=True)
+    ts: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+    cpu_pct: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    mem_pct: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    restarts_rate: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    http_5xx_rate: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    p95_latency_ms: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
     # Здоровье Orleans-силоса (v1.0.9). Источник — pull-скрейп `/metrics`
     # town-grainhost'а (VMPodScrape в чарте, метер Microsoft.Orleans через
     # prometheus-net). Отдельная семья колонок, а не подмена http_*/p95:
@@ -341,13 +342,13 @@ class ServiceHealth(Base):
     # здесь средняя (count+sum), гистограммы в скрейпе нет. NULL — у сервиса
     # нет Orleans-метрик вовсе; 0.0 у счётчиков сбоев — «есть силос, сбоев
     # не было» (prometheus-net не отдаёт счётчик до первого инкремента).
-    orleans_latency_avg_ms = mapped_column(Float, nullable=True)
-    orleans_timedout_rate = mapped_column(Float, nullable=True)        # /мин
-    orleans_messaging_fault_rate = mapped_column(Float, nullable=True)  # rejected+expired+sent_failed+sent_dropped, /мин (rerouted — не сбой, см. metrics_sync)
-    orleans_pings_missed_rate = mapped_column(Float, nullable=True)     # pings_reply_missed, /мин — прокси death-vote
-    orleans_rerouted_rate = mapped_column(Float, nullable=True)         # messaging_rerouted, /мин — пересылка на другой силос: не сбой, но растёт раньше сбоев (1.0.11)
-    orleans_activation_churn = mapped_column(Float, nullable=True)      # created+destroyed+shutdown, /мин
-    source = mapped_column(String, nullable=True)
+    orleans_latency_avg_ms: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    orleans_timedout_rate: Mapped[Optional[float]] = mapped_column(Float, nullable=True)        # /мин
+    orleans_messaging_fault_rate: Mapped[Optional[float]] = mapped_column(Float, nullable=True)  # rejected+expired+sent_failed+sent_dropped, /мин (rerouted — не сбой, см. metrics_sync)
+    orleans_pings_missed_rate: Mapped[Optional[float]] = mapped_column(Float, nullable=True)     # pings_reply_missed, /мин — прокси death-vote
+    orleans_rerouted_rate: Mapped[Optional[float]] = mapped_column(Float, nullable=True)         # messaging_rerouted, /мин — пересылка на другой силос: не сбой, но растёт раньше сбоев (1.0.11)
+    orleans_activation_churn: Mapped[Optional[float]] = mapped_column(Float, nullable=True)      # created+destroyed+shutdown, /мин
+    source: Mapped[Optional[str]] = mapped_column(String, nullable=True)
 
     service = relationship("Service")
 
@@ -373,22 +374,22 @@ class ClusterObservation(Base):
     """
     __tablename__ = "kg_cluster_observations"
 
-    id = mapped_column(Integer, primary_key=True)
-    ts = mapped_column(DateTime, nullable=False)
-    cpu_pct = mapped_column(Float, nullable=True)
-    mem_pct = mapped_column(Float, nullable=True)
-    disk_peak_pct = mapped_column(Float, nullable=True)
-    pods_running = mapped_column(Integer, nullable=True)
-    pods_pending = mapped_column(Integer, nullable=True)
-    pods_failed = mapped_column(Integer, nullable=True)
-    crashloops = mapped_column(Integer, nullable=True)
-    deploy_mismatch = mapped_column(Integer, nullable=True)
-    alerts_critical = mapped_column(Integer, nullable=True)
-    alerts_warning = mapped_column(Integer, nullable=True)
-    alerts_prod = mapped_column(Integer, nullable=True)
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    ts: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+    cpu_pct: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    mem_pct: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    disk_peak_pct: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    pods_running: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    pods_pending: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    pods_failed: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    crashloops: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    deploy_mismatch: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    alerts_critical: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    alerts_warning: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    alerts_prod: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
     # Сырые поля из ClusterHealth — для forward-compat если VMClient добавит
     # новые сигналы, мы не теряем их даже без миграции.
-    raw = mapped_column(JSON, nullable=True)
+    raw: Mapped[Optional[Any]] = mapped_column(JSON, nullable=True)
 
     __table_args__ = (
         UniqueConstraint("ts", name="uq_kg_cluster_obs_ts"),
@@ -406,19 +407,19 @@ class IngressObservation(Base):
     """
     __tablename__ = "kg_ingress_observations"
 
-    id = mapped_column(Integer, primary_key=True)
-    ts = mapped_column(DateTime, nullable=False)
-    ingress_name = mapped_column(String, nullable=False)
-    host = mapped_column(String, nullable=False)
-    path = mapped_column(String, nullable=True)
-    service_id = mapped_column(
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    ts: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+    ingress_name: Mapped[str] = mapped_column(String, nullable=False)
+    host: Mapped[str] = mapped_column(String, nullable=False)
+    path: Mapped[Optional[str]] = mapped_column(String, nullable=True)
+    service_id: Mapped[Optional[int]] = mapped_column(
         Integer, ForeignKey("kg_services.id"), nullable=True, index=True,
     )
-    p95_latency_ms = mapped_column(Float, nullable=True)
-    p99_latency_ms = mapped_column(Float, nullable=True)
-    rps = mapped_column(Float, nullable=True)
-    error_5xx_rate = mapped_column(Float, nullable=True)
-    error_4xx_rate = mapped_column(Float, nullable=True)
+    p95_latency_ms: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    p99_latency_ms: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    rps: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    error_5xx_rate: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    error_4xx_rate: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
 
     service = relationship("Service")
 
@@ -441,20 +442,20 @@ class SignalAggregate(Base):
     """
     __tablename__ = "kg_signal_aggregates"
 
-    id = mapped_column(Integer, primary_key=True)
-    service_id = mapped_column(
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    service_id: Mapped[int] = mapped_column(
     # Без `index=True`: uq_kg_signal_aggregates_service_window (service_id, window_end) покрывает эту колонку как префикс.
         Integer, ForeignKey("kg_services.id"), nullable=False,
     )
-    window_end = mapped_column(DateTime, nullable=False)
-    window_hours = mapped_column(Integer, nullable=True)
-    deploy_count = mapped_column(Integer, nullable=True)
-    deploy_failure_pct = mapped_column(Float, nullable=True)
-    alert_open_count = mapped_column(Integer, nullable=True)
-    alert_ttr_p50_min = mapped_column(Float, nullable=True)
-    pod_event_count = mapped_column(Integer, nullable=True)
-    top_event_reason = mapped_column(String, nullable=True)
-    slo_burn_pct = mapped_column(Float, nullable=True)
+    window_end: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+    window_hours: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    deploy_count: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    deploy_failure_pct: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    alert_open_count: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    alert_ttr_p50_min: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    pod_event_count: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    top_event_reason: Mapped[Optional[str]] = mapped_column(String, nullable=True)
+    slo_burn_pct: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
 
     service = relationship("Service")
 
@@ -480,26 +481,26 @@ class AnomalyObservation(Base):
     """
     __tablename__ = "kg_anomaly_observations"
 
-    id = mapped_column(Integer, primary_key=True)
-    service_id = mapped_column(
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    service_id: Mapped[int] = mapped_column(
     # Без `index=True`: uq_kg_anomaly_obs_service_ts_metric (service_id, ts, metric) покрывает эту колонку как префикс.
         Integer, ForeignKey("kg_services.id"), nullable=False,
     )
-    ts = mapped_column(DateTime, nullable=False)
-    metric = mapped_column(String, nullable=False)
-    value = mapped_column(Float, nullable=True)
-    baseline_mean = mapped_column(Float, nullable=True)
-    baseline_stddev = mapped_column(Float, nullable=True)
-    z_score = mapped_column(Float, nullable=True)
-    severity = mapped_column(String, nullable=True)  # 'warning' | 'critical'
-    notified = mapped_column(
+    ts: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+    metric: Mapped[str] = mapped_column(String, nullable=False)
+    value: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    baseline_mean: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    baseline_stddev: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    z_score: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    severity: Mapped[Optional[str]] = mapped_column(String, nullable=True)  # 'warning' | 'critical'
+    notified: Mapped[bool] = mapped_column(
         Boolean, nullable=False, default=False, server_default="false",
     )
-    created_at = mapped_column(DateTime, default=datetime.utcnow)
+    created_at: Mapped[Optional[datetime]] = mapped_column(DateTime, default=datetime.utcnow)
     # JSON-debug: какой method использован (robust_z_flat/robust_z_seasonal),
     # сколько baseline-точек, MAD, threshold-config. Не используется для
     # фильтрации — только для post-mortem'ов и tuning'а.
-    extras = mapped_column(JSON, nullable=True)
+    extras: Mapped[Optional[Any]] = mapped_column(JSON, nullable=True)
 
     service = relationship("Service")
 
@@ -546,28 +547,28 @@ class LogObservation(Base):
     """
     __tablename__ = "kg_log_observations"
 
-    id = mapped_column(Integer, primary_key=True)
-    service_id = mapped_column(
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    service_id: Mapped[Optional[int]] = mapped_column(
     # Без `index=True`: ix_kg_log_obs_service_ts (service_id, ts) покрывает эту колонку как префикс.
         Integer, ForeignKey("kg_services.id"), nullable=True,
     )
-    ts = mapped_column(DateTime, nullable=False)
+    ts: Mapped[datetime] = mapped_column(DateTime, nullable=False)
     # Error / Fatal / Warning — Seq использует эти строковые уровни.
-    level = mapped_column(String, nullable=False)
-    count = mapped_column(Integer, nullable=False)
-    top_message_hash = mapped_column(String, nullable=True)
-    sample_message = mapped_column(String, nullable=True)
+    level: Mapped[str] = mapped_column(String, nullable=False)
+    count: Mapped[int] = mapped_column(Integer, nullable=False)
+    top_message_hash: Mapped[Optional[str]] = mapped_column(String, nullable=True)
+    sample_message: Mapped[Optional[str]] = mapped_column(String, nullable=True)
     # Имя Seq-инстанса: prod / preprod / preupdate / wo-api3-prod / ...
-    source = mapped_column(String, nullable=True)
-    namespace = mapped_column(String, nullable=True)
+    source: Mapped[Optional[str]] = mapped_column(String, nullable=True)
+    namespace: Mapped[Optional[str]] = mapped_column(String, nullable=True)
     # Сырой `App`-тэг из Seq — детерминированная NOT NULL часть UNIQUE-ключа
     # (вместо NULLABLE service_id, см. docstring). Legacy-строки бэкфиллятся
     # суррогатами `legacy-svc:<service_id>` / `legacy:<id>` в миграции
     # 20260807_0400 (kg_idempotency_constraints, пункт 2) — без потери данных.
     # Ссылка была на 20260807_0200 (add_node_kind) — та к app_name отношения
     # не имеет; при инцидентном откате это направляло оператора не туда.
-    app_name = mapped_column(String, nullable=False, default="", server_default="")
-    created_at = mapped_column(DateTime, default=datetime.utcnow)
+    app_name: Mapped[str] = mapped_column(String, nullable=False, default="", server_default="")
+    created_at: Mapped[Optional[datetime]] = mapped_column(DateTime, default=datetime.utcnow)
 
     service = relationship("Service")
 
@@ -600,16 +601,16 @@ class ActionApproval(Base):
     """
     __tablename__ = "kg_action_approvals"
 
-    id = mapped_column(Integer, primary_key=True)
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
     # Без `index=True`: uq_kg_action_approvals_incident_intent
     # (incident_id, intent_signature) покрывает эту колонку как префикс.
-    incident_id = mapped_column(String, nullable=False)
-    action = mapped_column(String, nullable=True)            # ActionType value, для quick-filter
-    intent_signature = mapped_column(String, nullable=False)
-    status = mapped_column(String, nullable=False)           # "approved" | "declined"
-    approved_by = mapped_column(String, nullable=True)
-    decided_at = mapped_column(DateTime, nullable=True)
-    created_at = mapped_column(DateTime, default=datetime.utcnow)
+    incident_id: Mapped[str] = mapped_column(String, nullable=False)
+    action: Mapped[Optional[str]] = mapped_column(String, nullable=True)            # ActionType value, для quick-filter
+    intent_signature: Mapped[str] = mapped_column(String, nullable=False)
+    status: Mapped[str] = mapped_column(String, nullable=False)           # "approved" | "declined"
+    approved_by: Mapped[Optional[str]] = mapped_column(String, nullable=True)
+    decided_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    created_at: Mapped[Optional[datetime]] = mapped_column(DateTime, default=datetime.utcnow)
 
     __table_args__ = (
         UniqueConstraint(
@@ -652,48 +653,48 @@ class K8sJob(Base):
     """
     __tablename__ = "kg_k8s_jobs"
 
-    id = mapped_column(Integer, primary_key=True)
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
     # Без `index=True`: uq_kg_k8s_job_ns_name_kind (namespace, name, kind)
     # покрывает эту колонку как префикс.
-    namespace = mapped_column(String, nullable=False)
-    name = mapped_column(String, nullable=False, index=True)
+    namespace: Mapped[str] = mapped_column(String, nullable=False)
+    name: Mapped[str] = mapped_column(String, nullable=False, index=True)
     # 'job' | 'cronjob'. Hard-coded enum как и в discovery_sources —
     # валидация на app-уровне, сейчас плоская string.
     # Без `index=True`: ix_kg_k8s_job_kind_ns (kind, namespace) покрывает
     # эту колонку как префикс.
-    kind = mapped_column(String, nullable=False)
+    kind: Mapped[str] = mapped_column(String, nullable=False)
 
     # Owner-label attribution. `owner_service_name` — name из k8s label
     # (`app.kubernetes.io/part-of` или `app`); `owner_service_id` живёт в
     # metadata_json — это сматченный id из kg_services. Опционально.
-    owner_service_name = mapped_column(String, nullable=True, index=True)
+    owner_service_name: Mapped[Optional[str]] = mapped_column(String, nullable=True, index=True)
 
     # CronJob-only поля. На Job-узлах остаются None.
-    schedule = mapped_column(String, nullable=True)              # cron expression
-    suspended = mapped_column(Boolean, nullable=False, default=False, server_default="false")
-    last_schedule_time = mapped_column(DateTime, nullable=True)
-    last_successful_time = mapped_column(DateTime, nullable=True)
+    schedule: Mapped[Optional[str]] = mapped_column(String, nullable=True)              # cron expression
+    suspended: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default="false")
+    last_schedule_time: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    last_successful_time: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
 
     # Job-counters. На CronJob: active_count = len(status.active), succeeded/
     # failed остаются 0 (это для одного Job-а). UX-ясности это не вредит:
     # фильтрация по kind отделяет одно от другого.
-    succeeded_count = mapped_column(Integer, nullable=True)
-    failed_count = mapped_column(Integer, nullable=True)
-    active_count = mapped_column(Integer, nullable=True)
-    start_time = mapped_column(DateTime, nullable=True)
-    completion_time = mapped_column(DateTime, nullable=True)
+    succeeded_count: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    failed_count: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    active_count: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    start_time: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    completion_time: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
 
     # Job-only: exit-code из последнего terminated container первого pod-а.
     # NULL если pod ещё running или failed_count=0 (мы не дёргаем exit-code
     # на success — implied 0). Используется для post-mortem: «alembic
     # migration упала с exit 1 за час до alert KubeDeploymentReplicasMismatch».
-    last_pod_exit_code = mapped_column(Integer, nullable=True)
+    last_pod_exit_code: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
 
-    metadata_json = mapped_column(JSON, nullable=True)
-    created_at = mapped_column(DateTime, default=datetime.utcnow)
+    metadata_json: Mapped[Optional[Any]] = mapped_column(JSON, nullable=True)
+    created_at: Mapped[Optional[datetime]] = mapped_column(DateTime, default=datetime.utcnow)
     # Refresh timestamp на каждом upsert. Stale rows (не sync N часов) —
     # кандидаты на drift_cleanup. Не индексируем — выборка raredата-аналитики.
-    last_seen_at = mapped_column(DateTime, nullable=True)
+    last_seen_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
 
     __table_args__ = (
         UniqueConstraint("namespace", "name", "kind", name="uq_kg_k8s_job_ns_name_kind"),
@@ -719,31 +720,31 @@ class K8sJobRun(Base):
     """
     __tablename__ = "kg_k8s_job_runs"
 
-    id = mapped_column(Integer, primary_key=True)
-    namespace = mapped_column(String, nullable=False)
-    name = mapped_column(String, nullable=False)
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    namespace: Mapped[str] = mapped_column(String, nullable=False)
+    name: Mapped[str] = mapped_column(String, nullable=False)
     # metadata.uid — отличает перезапуск с тем же именем от обновления статуса.
-    uid = mapped_column(String, nullable=True)
-    owner_service_name = mapped_column(String, nullable=True)
-    succeeded_count = mapped_column(Integer, nullable=True)
-    failed_count = mapped_column(Integer, nullable=True)
-    active_count = mapped_column(Integer, nullable=True)
-    start_time = mapped_column(DateTime, nullable=True)
-    completion_time = mapped_column(DateTime, nullable=True)
-    last_pod_exit_code = mapped_column(Integer, nullable=True)
+    uid: Mapped[Optional[str]] = mapped_column(String, nullable=True)
+    owner_service_name: Mapped[Optional[str]] = mapped_column(String, nullable=True)
+    succeeded_count: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    failed_count: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    active_count: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    start_time: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    completion_time: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    last_pod_exit_code: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
     # Терминальное условие Job-а: type (Complete / Failed / SuccessCriteriaMet
     # / FailureTarget), reason (BackoffLimitExceeded / DeadlineExceeded) и
     # обрезанное message. Для активного Job-а — NULL.
-    condition_type = mapped_column(String, nullable=True)
-    condition_reason = mapped_column(String, nullable=True)
-    condition_message = mapped_column(Text, nullable=True)
+    condition_type: Mapped[Optional[str]] = mapped_column(String, nullable=True)
+    condition_reason: Mapped[Optional[str]] = mapped_column(String, nullable=True)
+    condition_message: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     # Job пропал из кластера (удалён, TTL, снос namespace-а): tombstone-строка
     # с последним известным состоянием. Без неё последний «running» жил бы в
     # истории вечно — sync больше этот Job не видит и ничего не пишет.
-    disappeared = mapped_column(Boolean, nullable=False, default=False, server_default="false")
+    disappeared: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default="false")
     # Когда sync увидел это состояние: верхняя граница «с какого момента
     # известно», точность — период sync-а (15 мин).
-    observed_at = mapped_column(DateTime, nullable=False)
+    observed_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
 
     __table_args__ = (
         Index("ix_kg_k8s_job_runs_ns_observed", "namespace", "observed_at"),
@@ -764,25 +765,25 @@ class ServiceEdge(Base):
     """
     __tablename__ = "kg_service_edges"
 
-    id = mapped_column(Integer, primary_key=True)
-    src_id = mapped_column(Integer, ForeignKey("kg_services.id"), nullable=False, index=True)
-    dst_id = mapped_column(Integer, ForeignKey("kg_services.id"), nullable=False, index=True)
-    kind = mapped_column(String, nullable=False)
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    src_id: Mapped[int] = mapped_column(Integer, ForeignKey("kg_services.id"), nullable=False, index=True)
+    dst_id: Mapped[int] = mapped_column(Integer, ForeignKey("kg_services.id"), nullable=False, index=True)
+    kind: Mapped[str] = mapped_column(String, nullable=False)
     # Направление для kind'ов где оно различает РАЗНЫЕ рёбра (uses_nats:
     # `pub` / `sub`). Для остальных kinds — пустая строка (NOT NULL, чтобы
     # UNIQUE-конфликт срабатывал: NULL-ы в PG различны). Раньше direction
     # жил только в extras и pub+sub схлопывались в одно ребро с
     # flip-flop'ом направления между тиками.
-    direction = mapped_column(String, nullable=False, default="", server_default="")
-    weight = mapped_column(Integer, default=1)          # «жирность» edge: % трафика, важность
-    discovered_by = mapped_column(String, nullable=True)  # populator/method, для отладки
-    extras = mapped_column(JSON, nullable=True)
-    created_at = mapped_column(DateTime, default=datetime.utcnow)
+    direction: Mapped[str] = mapped_column(String, nullable=False, default="", server_default="")
+    weight: Mapped[Optional[int]] = mapped_column(Integer, default=1)          # «жирность» edge: % трафика, важность
+    discovered_by: Mapped[Optional[str]] = mapped_column(String, nullable=True)  # populator/method, для отладки
+    extras: Mapped[Optional[Any]] = mapped_column(JSON, nullable=True)
+    created_at: Mapped[Optional[datetime]] = mapped_column(DateTime, default=datetime.utcnow)
     # C1: refresh timestamp. Каждый upsert_edge → last_seen_at = now().
     # Edges, не подтверждённые за N дней — кандидаты на soft-cleanup
     # (см. queries.upstream_of(..., fresh_only=True) и beat-task
     # kg_edges_decay в будущем).
-    last_seen_at = mapped_column(DateTime, nullable=True, index=True)
+    last_seen_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True, index=True)
 
     src = relationship("Service", foreign_keys=[src_id])
     dst = relationship("Service", foreign_keys=[dst_id])
@@ -822,24 +823,24 @@ class StorageVolume(Base):
     """
     __tablename__ = "kg_storage_volumes"
 
-    id = mapped_column(Integer, primary_key=True)
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
     # Без `index=True`: ix_kg_storage_volumes_kind_ns (kind, namespace)
     # покрывает эту колонку как префикс.
-    kind = mapped_column(String, nullable=False)
-    namespace = mapped_column(
+    kind: Mapped[str] = mapped_column(String, nullable=False)
+    namespace: Mapped[str] = mapped_column(
         String, nullable=False, server_default="", index=True,
     )
-    name = mapped_column(String, nullable=False, index=True)
-    capacity_bytes = mapped_column(BigInteger, nullable=True)
-    storage_class = mapped_column(String, nullable=True, index=True)
-    phase = mapped_column(String, nullable=True, index=True)
-    access_modes = mapped_column(JSON, nullable=True)
-    volume_name = mapped_column(String, nullable=True)
-    disk_pct = mapped_column(Float, nullable=True)
-    metadata_json = mapped_column(JSON, nullable=True)
+    name: Mapped[str] = mapped_column(String, nullable=False, index=True)
+    capacity_bytes: Mapped[Optional[int]] = mapped_column(BigInteger, nullable=True)
+    storage_class: Mapped[Optional[str]] = mapped_column(String, nullable=True, index=True)
+    phase: Mapped[Optional[str]] = mapped_column(String, nullable=True, index=True)
+    access_modes: Mapped[Optional[Any]] = mapped_column(JSON, nullable=True)
+    volume_name: Mapped[Optional[str]] = mapped_column(String, nullable=True)
+    disk_pct: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    metadata_json: Mapped[Optional[Any]] = mapped_column(JSON, nullable=True)
 
-    created_at = mapped_column(DateTime, default=datetime.utcnow)
-    updated_at = mapped_column(
+    created_at: Mapped[Optional[datetime]] = mapped_column(DateTime, default=datetime.utcnow)
+    updated_at: Mapped[Optional[datetime]] = mapped_column(
         DateTime, default=datetime.utcnow, onupdate=datetime.utcnow,
     )
     # «Синк видел этот том», в отличие от updated_at = «строка менялась».
@@ -848,7 +849,7 @@ class StorageVolume(Base):
     # моложе суток была 61 при живом снимке в 1214. Порог усадки, который
     # считает по «недавно виденным», на таком знаменателе не работает.
     # Обновляется явным batch-UPDATE в конце среза, см. _touch_last_seen.
-    last_seen_at = mapped_column(DateTime, nullable=True, default=datetime.utcnow)
+    last_seen_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True, default=datetime.utcnow)
 
     __table_args__ = (
         UniqueConstraint(
@@ -878,20 +879,20 @@ class VolumeEdge(Base):
     """
     __tablename__ = "kg_volume_edges"
 
-    id = mapped_column(Integer, primary_key=True)
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
     # `src_kind` ∈ {'service', 'pvc', 'pv'}. Без FK — это namespacing,
     # не reference. Проверка валидности — на app-уровне (populator).
     # Без `index=True` у *_kind: ix_kg_volume_edges_src (src_kind, src_id)
     # и ix_kg_volume_edges_dst (dst_kind, dst_id) покрывают их как префикс.
-    src_kind = mapped_column(String, nullable=False)
-    src_id = mapped_column(Integer, nullable=False, index=True)
-    dst_kind = mapped_column(String, nullable=False)
-    dst_id = mapped_column(Integer, nullable=False, index=True)
-    kind = mapped_column(String, nullable=False, index=True)
-    discovered_by = mapped_column(String, nullable=True)
-    extras = mapped_column(JSON, nullable=True)
-    created_at = mapped_column(DateTime, default=datetime.utcnow)
-    last_seen_at = mapped_column(DateTime, nullable=True, index=True)
+    src_kind: Mapped[str] = mapped_column(String, nullable=False)
+    src_id: Mapped[int] = mapped_column(Integer, nullable=False, index=True)
+    dst_kind: Mapped[str] = mapped_column(String, nullable=False)
+    dst_id: Mapped[int] = mapped_column(Integer, nullable=False, index=True)
+    kind: Mapped[str] = mapped_column(String, nullable=False, index=True)
+    discovered_by: Mapped[Optional[str]] = mapped_column(String, nullable=True)
+    extras: Mapped[Optional[Any]] = mapped_column(JSON, nullable=True)
+    created_at: Mapped[Optional[datetime]] = mapped_column(DateTime, default=datetime.utcnow)
+    last_seen_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True, index=True)
 
     __table_args__ = (
         UniqueConstraint(
@@ -932,34 +933,34 @@ class KGIncident(Base):
 
     __tablename__ = "kg_incidents"
 
-    id = mapped_column(Integer, primary_key=True)
-    incident_key = mapped_column(String, nullable=False, unique=True)
-    namespace = mapped_column(String, nullable=False)
-    service_name = mapped_column(String, nullable=False)
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    incident_key: Mapped[str] = mapped_column(String, nullable=False, unique=True)
+    namespace: Mapped[str] = mapped_column(String, nullable=False)
+    service_name: Mapped[str] = mapped_column(String, nullable=False)
     # NULL = сервис в момент первого алерта в графе не нашёлся (см.
     # Known Unknowns в timeline: без service_id деплои/поды/аномалии не
     # опросить).
-    service_id = mapped_column(Integer, ForeignKey("kg_services.id"), nullable=True, index=True)
-    status = mapped_column(String, nullable=False, default="open")   # open | resolved
-    severity = mapped_column(String, nullable=True)                   # максимум по алертам
-    opened_at = mapped_column(DateTime, nullable=False, index=True)   # fired_at первого алерта
-    last_alert_at = mapped_column(DateTime, nullable=False)
-    resolved_at = mapped_column(DateTime, nullable=True)
-    resolve_reason = mapped_column(String, nullable=True)   # all_alerts_resolved | aged_out
-    alert_count = mapped_column(Integer, nullable=False, default=0)
-    alertnames = mapped_column(JSON, nullable=True)
-    fingerprints = mapped_column(JSON, nullable=True)
-    reopened_count = mapped_column(Integer, nullable=False, default=0)
+    service_id: Mapped[Optional[int]] = mapped_column(Integer, ForeignKey("kg_services.id"), nullable=True, index=True)
+    status: Mapped[str] = mapped_column(String, nullable=False, default="open")   # open | resolved
+    severity: Mapped[Optional[str]] = mapped_column(String, nullable=True)                   # максимум по алертам
+    opened_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, index=True)   # fired_at первого алерта
+    last_alert_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+    resolved_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    resolve_reason: Mapped[Optional[str]] = mapped_column(String, nullable=True)   # all_alerts_resolved | aged_out
+    alert_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    alertnames: Mapped[Optional[Any]] = mapped_column(JSON, nullable=True)
+    fingerprints: Mapped[Optional[Any]] = mapped_column(JSON, nullable=True)
+    reopened_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     # Все алерты инцидента классифицированы обогащением как шум
     # (gen-mismatch при здоровых репликах, meta-агрегаты, rollout-в-процессе).
     # Инцидент остаётся — он честно случился, — но списки по умолчанию его
     # скрывают. Замер 07.09.2026 в первые минуты после релиза: 7 из 13
     # инцидентов — KubeDeploymentGenerationMismatch, 327 из ~390 алертов за
     # неделю. Виды шума — в extras["noise_fingerprints"] по каждому алерту.
-    noise = mapped_column(Boolean, nullable=False, default=False, server_default="false", index=True)
-    extras = mapped_column(JSON, nullable=True)
-    created_at = mapped_column(DateTime, default=datetime.utcnow)
-    updated_at = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    noise: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default="false", index=True)
+    extras: Mapped[Optional[Any]] = mapped_column(JSON, nullable=True)
+    created_at: Mapped[Optional[datetime]] = mapped_column(DateTime, default=datetime.utcnow)
+    updated_at: Mapped[Optional[datetime]] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
     __table_args__ = (
         Index("ix_kg_incidents_ns_service_status", "namespace", "service_name", "status"),
@@ -996,47 +997,47 @@ class KGRemediationEvent(Base):
 
     __tablename__ = "kg_remediation_events"
 
-    id = mapped_column(Integer, primary_key=True)
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
     #: Кто действовал: `squad-medic`, позже — другие роботы/скиллы.
     #: Без index=True: uq_kg_remediation_events_run (actor, run_id, namespace)
     #: покрывает колонку как префикс.
-    actor = mapped_column(String, nullable=False)
+    actor: Mapped[str] = mapped_column(String, nullable=False)
     #: Идентификатор прогона у исполнителя (имя пода CronJob, iso-время) —
     #: для дедупа повторной отправки.
-    run_id = mapped_column(String, nullable=True)
+    run_id: Mapped[Optional[str]] = mapped_column(String, nullable=True)
     #: Основной namespace (для сквада — `squad-N-shared`), по нему идёт timeline.
-    namespace = mapped_column(String, nullable=False, index=True)
+    namespace: Mapped[str] = mapped_column(String, nullable=False, index=True)
     #: Все namespace стенда, которые исполнитель трогал.
-    namespaces = mapped_column(JSON, nullable=True)
-    squad = mapped_column(String, nullable=True, index=True)
-    service_name = mapped_column(String, nullable=True)
-    started_at = mapped_column(DateTime, nullable=False, index=True)
-    finished_at = mapped_column(DateTime, nullable=True)
-    duration_min = mapped_column(Integer, nullable=True)
+    namespaces: Mapped[Optional[Any]] = mapped_column(JSON, nullable=True)
+    squad: Mapped[Optional[str]] = mapped_column(String, nullable=True, index=True)
+    service_name: Mapped[Optional[str]] = mapped_column(String, nullable=True)
+    started_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, index=True)
+    finished_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    duration_min: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
     #: fixed | partial | unresolved | failed | noop
-    outcome = mapped_column(String, nullable=False)
-    severity = mapped_column(String, nullable=True)
-    fixed = mapped_column(Boolean, nullable=False, default=False)
-    still_unhealthy = mapped_column(Boolean, nullable=False, default=False)
-    applied = mapped_column(JSON, nullable=True)
-    manual = mapped_column(JSON, nullable=True)
-    gaps = mapped_column(JSON, nullable=True)
-    summary = mapped_column(Text, nullable=True)
-    root_cause = mapped_column(Text, nullable=True)
-    next_action = mapped_column(Text, nullable=True)
+    outcome: Mapped[str] = mapped_column(String, nullable=False)
+    severity: Mapped[Optional[str]] = mapped_column(String, nullable=True)
+    fixed: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    still_unhealthy: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    applied: Mapped[Optional[Any]] = mapped_column(JSON, nullable=True)
+    manual: Mapped[Optional[Any]] = mapped_column(JSON, nullable=True)
+    gaps: Mapped[Optional[Any]] = mapped_column(JSON, nullable=True)
+    summary: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    root_cause: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    next_action: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     #: Владельца дёргали в Discord.
-    escalated = mapped_column(Boolean, nullable=False, default=False)
-    owner_login = mapped_column(String, nullable=True)
-    incident_id = mapped_column(Integer, ForeignKey("kg_incidents.id"), nullable=True, index=True)
-    extras = mapped_column(JSON, nullable=True)
+    escalated: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    owner_login: Mapped[Optional[str]] = mapped_column(String, nullable=True)
+    incident_id: Mapped[Optional[int]] = mapped_column(Integer, ForeignKey("kg_incidents.id"), nullable=True, index=True)
+    extras: Mapped[Optional[Any]] = mapped_column(JSON, nullable=True)
     #: Наблюдения прогона (что робот ВИДЕЛ на стенде: состояния подов, коды
     #: выхода, dirty-миграция, отсутствующие ключи Secret) — без его выводов.
     #: Схема `medic_obs/v1`, пишет POST /webhooks/remediation через
     #: app/context/medic_observations.build_observations; читает сборщик
     #: контекста инцидента из графа как источник `squad-medic`. NULL у событий,
     #: принятых до поля: их наблюдения извлекаются тем же экстрактором на чтении.
-    observations = mapped_column(JSON, nullable=True)
-    created_at = mapped_column(DateTime, default=datetime.utcnow)
+    observations: Mapped[Optional[Any]] = mapped_column(JSON, nullable=True)
+    created_at: Mapped[Optional[datetime]] = mapped_column(DateTime, default=datetime.utcnow)
 
     __table_args__ = (
         # Повторная отправка одного прогона (retry исполнителя) — не второе
