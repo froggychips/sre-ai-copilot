@@ -35,7 +35,10 @@ kg_pod_events обрезается, `count` строки, обновлённой
   kg_remediation_events что внешний исполнитель (squad-medic) делал раньше и
                         чем кончилось, плюс его НАБЛЮДЕНИЯ как отдельный
                         источник `squad-medic` (без его выводов);
-  kg_log_observations   ошибки из логов (Seq), если граф их знает.
+  kg_log_observations   ошибки из логов (Seq), если граф их знает;
+  kg_nodes              только при известной ноде алерта (`KGScope.node`):
+                        её зона/регион, соседи по зоне и host-ы, чей трафик
+                        входит через неё (kg_entrypoints).
 """
 from __future__ import annotations
 
@@ -57,8 +60,9 @@ from app.context.medic_observations import PROVENANCE as MEDIC_PROVENANCE
 from app.context.medic_observations import (observation_events,
                                             observations_of)
 from app.knowledge_graph.schema import (AlertEvent, Deployment, K8sJob,
-                                        KGIncident, KGRemediationEvent,
-                                        LogObservation, PodEvent, Service)
+                                        K8sNode, KGIncident,
+                                        KGRemediationEvent, LogObservation,
+                                        PodEvent, Service, TrafficEntrypoint)
 
 log = structlog.get_logger()
 
@@ -114,6 +118,8 @@ _INCIDENTS_SCAN = 200
 _REMEDIATION_KEEP = 30
 _LOGS_KEEP = 10
 _MSG_LEN = 300
+# Сколько соседей по зоне и host-ов входа показывать в тексте.
+_NODE_LIST_KEEP = 10
 
 PARTIAL_REASON = "partial: граф point-in-time, выборка окна, не полный снимок"
 
@@ -259,6 +265,9 @@ class KGScope:
     `as_of`. `with_conclusions=False` убирает из истории выводы исполнителя
     (root_cause) — в проде это законное знание «так уже было», в оценке —
     подсказка.
+
+    `node` — нода нодового алерта (метка `node`): без неё источник kg_nodes
+    не опрашивается вовсе и в `sources` не появляется.
     """
 
     namespace: str
@@ -270,6 +279,7 @@ class KGScope:
     history_days: int = 14
     with_conclusions: bool = True
     exclude_remediation_ids: Tuple[int, ...] = ()
+    node: Optional[str] = None
 
     @property
     def as_of_utc(self) -> datetime:
@@ -752,6 +762,79 @@ def select_targets(kgc: Dict[str, Any], medic_action_text: str = "",
              "sources": sorted(t["sources"])} for t in ranked if t["score"] > 0]
 
 
+def _alive_at(model: Any, as_of: datetime) -> Any:
+    """Строка kg_nodes / kg_entrypoints существовала на момент as_of."""
+    return (model.first_seen_at <= _naive(as_of)) & or_(
+        model.deleted_at.is_(None), model.deleted_at > _naive(as_of))
+
+
+def _node_topology(reader: KGReader, ns: List[str], scope: KGScope) -> Optional[Dict[str, Any]]:
+    """Нода алерта: зона, соседи по зоне, host-ы, входящие через неё.
+
+    Таблицы маленькие (десятки нод, сотни host-ов): читаем живые на as_of
+    строки целиком и фильтруем здесь — JSON-массивы entry_nodes в PG и SQLite
+    ищутся по-разному, а запрос должен быть один для прода и датасета.
+    Атрибуты — последнее известное состояние: строка, подтверждённая
+    синком заметно позже as_of, помечается `observed_after_as_of`.
+    None — ноды на as_of граф не знает.
+    """
+    as_of = scope.as_of_utc
+    want = (scope.node or "").strip()
+    if not want:
+        return None
+    nodes = reader.rows(
+        select(K8sNode.name, K8sNode.zone, K8sNode.region, K8sNode.unschedulable,
+               K8sNode.roles, K8sNode.internal_ip, K8sNode.external_ip,
+               K8sNode.addresses, K8sNode.last_seen_at)
+        .where(_alive_at(K8sNode, as_of))
+        .order_by(K8sNode.name))
+    # Метка `node` обычно имя ноды, но у части экспортёров — адрес
+    # (`ip:port`): тогда ищем по адресам.
+    host_part = want.rsplit(":", 1)[0] if want.count(":") == 1 else want
+    me = next((n for n in nodes if n.get("name") == want), None)
+    if me is None:
+        for n in nodes:
+            addrs = {a.get("address") for a in _jsonish(n.get("addresses")) or []
+                     if isinstance(a, dict)}
+            if host_part in addrs | {n.get("internal_ip"), n.get("external_ip")}:
+                me = n
+                break
+    if me is None:
+        return None
+    name = me["name"]
+    zone = me.get("zone")
+    same_zone = sorted(n["name"] for n in nodes
+                       if zone and n.get("zone") == zone and n["name"] != name)
+    entries = reader.rows(
+        select(TrafficEntrypoint.host, TrafficEntrypoint.entry_nodes,
+               TrafficEntrypoint.lb_services, TrafficEntrypoint.last_seen_at)
+        .where(_alive_at(TrafficEntrypoint, as_of))
+        .order_by(TrafficEntrypoint.host))
+    hosts: List[str] = []
+    lb: Set[str] = set()
+    late = False
+    for e in entries:
+        if name not in (_jsonish(e.get("entry_nodes")) or []):
+            continue
+        hosts.append(str(e.get("host")))
+        lb.update(str(x) for x in _jsonish(e.get("lb_services")) or [])
+        seen = _aware(e.get("last_seen_at"))
+        late = late or bool(seen and seen > as_of + timedelta(minutes=30))
+    seen_me = _aware(me.get("last_seen_at"))
+    return {
+        "node": name,
+        "zone": zone,
+        "region": me.get("region"),
+        "unschedulable": bool(me.get("unschedulable")),
+        "roles": _jsonish(me.get("roles")) or [],
+        "same_zone_nodes": same_zone,
+        "same_zone_count": len(same_zone),
+        "entry_hosts": hosts,
+        "entry_lb_services": sorted(lb),
+        "observed_after_as_of": late or bool(seen_me and seen_me > as_of + timedelta(minutes=30)),
+    }
+
+
 # --- сборка -------------------------------------------------------------------
 
 _SOURCES: Sequence[Tuple[str, Callable[..., Any]]] = (
@@ -762,7 +845,12 @@ _SOURCES: Sequence[Tuple[str, Callable[..., Any]]] = (
     ("kg_incidents", _incident_history),
     ("kg_remediation_events", _remediation),
     ("kg_log_observations", _logs),
+    ("kg_nodes", _node_topology),
 )
+#: Источники, которые опрашиваются только при заданном поле скоупа: без него
+#: источника нет вовсе (ни данных, ни записи в `sources`), и контекст стенда
+#: без ноды остаётся ровно прежним.
+_SCOPED_SOURCES = {"kg_nodes": "node"}
 
 
 def fetch_kg_incident_context(reader: KGReader, scope: KGScope) -> Dict[str, Any]:
@@ -790,7 +878,13 @@ def fetch_kg_incident_context(reader: KGReader, scope: KGScope) -> Dict[str, Any
         "medic_observations": [], "logs": [],
         "sources": {},
     }
+    if scope.node:
+        kgc["node"] = scope.node
+        kgc["node_topology"] = None
     for name, fn in _SOURCES:
+        needs = _SCOPED_SOURCES.get(name)
+        if needs and not getattr(scope, needs, None):
+            continue
         try:
             with reader.isolated():
                 data = fn(reader, namespaces, scope)
@@ -814,9 +908,11 @@ def fetch_kg_incident_context(reader: KGReader, scope: KGScope) -> Dict[str, Any
             kgc["remediation_history"], kgc["medic_observations"] = data
         elif name == "kg_log_observations":
             kgc["logs"] = data
+        elif name == "kg_nodes":
+            kgc["node_topology"] = data
         empty = not data or (isinstance(data, tuple) and not any(data)) or (
-            isinstance(data, dict) and not (data.get("code") or data.get("rollouts")
-                                            or data.get("statics_count")))
+            name == "kg_deployments" and isinstance(data, dict)
+            and not (data.get("code") or data.get("rollouts") or data.get("statics_count")))
         kgc["sources"][name] = {"status": (SourceStatus.EMPTY if empty
                                            else SourceStatus.SUCCESS).value}
     kgc["targets"] = select_targets(kgc, _medic_action_text(kgc))
@@ -832,7 +928,7 @@ KG_CONTEXT = Collector(
     name="kg_incident_context",
     ctx_fields=("k8s_events", "recent_deployments", "kg_jobs"),
     provenance="kg_pod_events+kg_alerts+kg_deployments+kg_k8s_jobs+kg_incidents+"
-               "kg_remediation_events+kg_log_observations",
+               "kg_remediation_events+kg_log_observations+kg_nodes",
     failure_label="граф недоступен",
     log_event="kg_context.failed",
 )
@@ -842,7 +938,7 @@ def collect_kg_incident_context(reader: KGReader, scope: KGScope) -> Any:
     """Для `KG_CONTEXT.run_sync`: частичный отказ источников — PARTIAL."""
     kgc = fetch_kg_incident_context(reader, scope)
     failed = [n for n, s in kgc["sources"].items() if s["status"] == SourceStatus.FAILED.value]
-    if failed and len(failed) == len(_SOURCES):
+    if failed and len(failed) == len(kgc["sources"]):
         return Outcome(SourceStatus.FAILED, kgc, reason="граф недоступен: все источники упали")
     return Outcome(SourceStatus.PARTIAL if failed else SourceStatus.SUCCESS, kgc)
 
@@ -856,6 +952,7 @@ _SOURCE_FIELDS = {
     "kg_deployments": ("recent_deployments",),
     "kg_k8s_jobs": ("kg_jobs",),
     "kg_log_observations": ("logs_summary",),
+    "kg_nodes": ("kg_node_topology",),
 }
 
 
@@ -882,6 +979,30 @@ def _job_line(j: Dict[str, Any]) -> str:
     if j.get("exit_code") is not None:
         state += f" exit_code={j['exit_code']}"
     return f"Job {j.get('namespace')}/{j.get('name')}: {state}"
+
+
+def _node_line(nt: Dict[str, Any]) -> str:
+    """Одна строка о ноде алерта: зона, соседи по зоне, host-ы входа."""
+    def _few(items: List[str]) -> str:
+        head = ", ".join(items[:_NODE_LIST_KEEP])
+        more = len(items) - _NODE_LIST_KEEP
+        return head + (f" (+{more} more)" if more > 0 else "")
+
+    line = f"Node {nt.get('node')}: zone {nt.get('zone') or 'unknown'}"
+    if nt.get("region"):
+        line += f" (region {nt['region']})"
+    if nt.get("unschedulable"):
+        line += ", unschedulable (cordoned)"
+    same = list(nt.get("same_zone_nodes") or [])
+    if nt.get("zone"):
+        line += (f"; same-zone nodes ({len(same)}): {_few(same)}" if same
+                 else "; no other nodes in this zone")
+    hosts = list(nt.get("entry_hosts") or [])
+    if hosts:
+        line += f"; traffic entry for hosts ({len(hosts)}): {_few(hosts)}"
+        if nt.get("observed_after_as_of"):
+            line += " [entry mapping observed after incident start]"
+    return line
 
 
 def apply_kg_context(ctx: Dict[str, Any], kgc: Optional[Dict[str, Any]], *,
@@ -936,6 +1057,10 @@ def apply_kg_context(ctx: Dict[str, Any], kgc: Optional[Dict[str, Any]], *,
                [_job_line(j) for j in jobs
                 if (j.get("failed") or 0) > 0 and not j.get("state_after_as_of")])
     _block(ctx, "k8s_summary", MEDIC_PROVENANCE, medic_facts)
+    node_topo = kgc.get("node_topology")
+    if isinstance(node_topo, dict):
+        ctx["kg_node_topology"] = node_topo
+        _block(ctx, "k8s_summary", "kg_nodes", [_node_line(node_topo)])
     _block(ctx, "logs_summary", "kg_log_observations",
            [f"{lg.get('level')} x{lg.get('count')} {lg.get('namespace')}/{lg.get('app')}: "
             f"{lg.get('message')}" for lg in kgc.get("logs") or []])
@@ -1022,6 +1147,9 @@ def kg_context_prompt(kgc: Optional[Dict[str, Any]], *, include_medic: bool = Tr
         lines.append("[kg_log_observations] errors:")
         lines += [f"  {lg.get('level')} x{lg.get('count')} {lg.get('app')}: {lg.get('message')}"
                   for lg in kgc["logs"][:5]]
+    node_topo = kgc.get("node_topology")
+    if isinstance(node_topo, dict):
+        lines.append(f"[kg_nodes] {_node_line(node_topo)}")
     hist = kgc.get("incident_history") or []
     if hist:
         lines.append("[kg_incidents] history (same squad, prior days): " + "; ".join(
@@ -1097,11 +1225,15 @@ def as_of_for(starts_at: Any, now: Optional[datetime] = None) -> datetime:
 
 
 def build_kg_context(db: Any, *, namespace: Optional[str], service: Optional[str],
-                     alertname: Optional[str], as_of: datetime) -> Optional[Any]:
-    """Прод: собрать через сессию. None — нечего собирать (нет namespace)."""
+                     alertname: Optional[str], as_of: datetime,
+                     node: Optional[str] = None) -> Optional[Any]:
+    """Прод: собрать через сессию. None — нечего собирать (нет namespace).
+
+    `node` — метка `node` алерта: включает источник kg_nodes."""
     if not namespace or not _NS_RE.match(namespace):
         return None
-    scope = KGScope(namespace=namespace, service=service, alertname=alertname, as_of=as_of)
+    scope = KGScope(namespace=namespace, service=service, alertname=alertname, as_of=as_of,
+                    node=(node or "").strip() or None)
     return KG_CONTEXT.run_sync(collect_kg_incident_context, SessionReader(db), scope)
 
 

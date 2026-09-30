@@ -131,14 +131,16 @@ SELECT row_to_json(t) FROM (
          e.root_cause, e.summary, e.applied, e.manual, e.gaps, e.extras,
          i.incident_key, i.namespace, i.service_name, i.severity,
          i.alertnames, i.opened_at,
-         al.alertname AS alert_name, al.description AS alert_description
+         al.alertname AS alert_name, al.description AS alert_description,
+         al.node AS alert_node
   FROM kg_remediation_events e
   JOIN kg_incidents i ON i.id = e.incident_id
   -- Алерт, который горел К МОМЕНТУ разбора медика, и его имя вместе с его же
   -- описанием: самый свежий алерт инцидента мог прийти после разбора, а имя
   -- из incident-wide alertnames — от другого алерта той же группы.
   LEFT JOIN LATERAL (
-    SELECT a.alertname, a.raw->>'description' AS description FROM kg_alerts a
+    SELECT a.alertname, a.raw->>'description' AS description,
+           a.raw->>'node' AS node FROM kg_alerts a
     WHERE a.incident_id = i.incident_key AND a.fired_at <= e.started_at
     ORDER BY a.fired_at DESC LIMIT 1
   ) al ON true
@@ -277,6 +279,9 @@ def case_scope(case: Dict[str, Any]):
         as_of=_parse_ts(case.get("started_at")) or datetime.now(timezone.utc),
         with_conclusions=False,
         exclude_remediation_ids=(int(case["event_id"]),) if case.get("event_id") else (),
+        # Нода алерта, если она была (raw.node пишется с 30.09.2026): включает
+        # источник kg_nodes — зону и точки входа трафика на as_of.
+        node=case.get("alert_node") or None,
     )
 
 
@@ -568,6 +573,7 @@ def _to_incident(case: Dict[str, Any]):
             "alertname": alertname,
             "namespace": namespace,
             "service": service,
+            **({"node": case["alert_node"]} if case.get("alert_node") else {}),
         },
         annotations={"summary": summary, "description": desc},
         starts_at=str(case.get("opened_at") or case.get("started_at")),

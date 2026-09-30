@@ -1251,6 +1251,7 @@ def enrich_alert(db: Session, incident: Incident) -> EnrichedContext:
     kg_res = build_kg_context(
         db, namespace=namespace, service=service,
         alertname=(incident.labels or {}).get("alertname"), as_of=now,
+        node=ctx.node,
     )
     if kg_res is not None:
         ctx.collector_results.append(kg_res)
