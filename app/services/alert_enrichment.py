@@ -562,9 +562,18 @@ def _resolve_target_service_from_labels(
         1. labels["deployment"]    — KubeDeployment*
         2. labels["statefulset"]   — KubeStatefulSet*
         3. labels["daemonset"]     — KubeDaemonSet*
-        4. labels["job_name"]      — KubeJobFailed
-        5. labels["pod"] → strip hash → deployment-derive
-        6. labels["container"]     — last-resort fallback
+        4. labels["poddisruptionbudget"]     — KubePdb*
+        5. labels["horizontalpodautoscaler"] — KubeHpa*
+        6. labels["job_name"]      — KubeJobFailed
+        7. labels["pod"] → strip hash → deployment-derive
+        8. labels["container"]     — last-resort fallback
+
+    PDB/HPA: у этих алертов нет ни deployment, ни statefulset, а `pod` — под
+    самого kube-state-metrics, и strip давал фантомный `vm-kube-state-metrics`
+    («сервис не в graph» у KubePdbNotEnoughHealthyPods). Имя PDB/HPA берём как
+    имя цели: замер 30.09.2026 — совпадает с workload'ом у 1310 из 1330 PDB и
+    у всех 70 HPA; расходятся только PDB CloudNativePG (`<cluster>-primary`),
+    у которых workload'а нет вовсе.
 
     namespace ВСЕГДА из labels["namespace"] (если есть). Это namespace
     target'а, не источника метрики. Если ничего не нашли — (None, None).
@@ -573,7 +582,8 @@ def _resolve_target_service_from_labels(
         return (None, None)
     namespace = labels.get("namespace") or None
     # Priority chain: первое непустое поле выигрывает.
-    for key in ("deployment", "statefulset", "daemonset", "job_name"):
+    for key in ("deployment", "statefulset", "daemonset",
+                "poddisruptionbudget", "horizontalpodautoscaler", "job_name"):
         value = labels.get(key)
         if value:
             return (namespace, value)
@@ -609,7 +619,8 @@ def resolve_store_service(
     лейбла `service` → все такие алерты схлопывались на один фантомный сервис.
 
     Правило (совпадает с enrichment-путём, root cause #1):
-        * есть deployment / statefulset / daemonset  →  target workload
+        * есть deployment / statefulset / daemonset / poddisruptionbudget /
+          horizontalpodautoscaler  →  target workload
           через `_resolve_target_service_from_labels` (лейбл `service` игнор);
         * иначе (обычные app-алерты, где `service`-лейбл валиден и нет
           kube-resource-лейблов)  →  `legacy_default` (прежнее поведение).
@@ -627,6 +638,8 @@ def resolve_store_service(
         labels.get("deployment")
         or labels.get("statefulset")
         or labels.get("daemonset")
+        or labels.get("poddisruptionbudget")
+        or labels.get("horizontalpodautoscaler")
     ):
         _, target = _resolve_target_service_from_labels(labels)
         if target:

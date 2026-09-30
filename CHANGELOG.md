@@ -4,6 +4,18 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+### Исправлено
+
+- **Алерты PDB/HPA привязываются к workload'у, а не к kube-state-metrics.** У
+  `KubePdb*` и `KubeHpa*` нет меток `deployment`/`statefulset`, а `pod` — под
+  самого экспортёра: из него выходил фантомный сервис `vm-kube-state-metrics`, и
+  карточка писала «сервис не в graph». Цель теперь берётся из
+  `poddisruptionbudget` / `horizontalpodautoscaler` — и в карточке, и в
+  `kg_alerts`. Имя совпадает с workload'ом у 1310 из 1330 PDB и у всех 70 HPA.
+- **`oauthlib` 4.0.0 — CVE-2026-49265 (#471).** `pip-audit --strict` валил CI
+  любого PR; `oauthlib` приходит транзитивно через `kubernetes` →
+  `requests-oauthlib`.
+
 ## [1.0.21] — 2026-09-29 — Пинг critical только дежурному
 
 ### Добавлено
