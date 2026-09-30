@@ -337,6 +337,20 @@ class TestEnrichment:
         assert "node_namespaces" not in ctx.source_status
 
 
+    def test_node_alert_without_namespace_gets_node_topology(self):
+        """Метка node без namespace/service: ранний выход enrichment всё равно
+        собирает из графа топологию ноды (источник kg_nodes)."""
+        inc = _incident({"alertname": "NodeDown", "node": "dev-26"})
+        inc.namespace = None
+        with patch("app.context.deployments.fetch_node_namespaces", return_value=[]), \
+                patch("app.services.alert_enrichment.build_kg_context") as build:
+            build.return_value = SimpleNamespace(data={"node_topology": {"zone": "z"}})
+            ctx = enrich_alert(_db(), inc)
+        assert build.call_args.kwargs["namespace"] is None
+        assert build.call_args.kwargs["node"] == "dev-26"
+        assert ctx.kg_context == {"node_topology": {"zone": "z"}}
+
+
 class TestPrefetch:
     @pytest.mark.asyncio
     async def test_group_nodes_fetched_in_parallel(self, monkeypatch):

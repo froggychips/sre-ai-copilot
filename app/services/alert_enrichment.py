@@ -224,6 +224,22 @@ def _record(ctx: "EnrichedContext", result: CollectorResult, *, overwrite: bool 
     merge_source_status(ctx.source_status, result, overwrite=overwrite)
 
 
+def _attach_kg_context(ctx: "EnrichedContext", db: Any, incident: Incident, *,
+                       namespace: Optional[str], service: Optional[str],
+                       as_of: datetime) -> None:
+    """Контекст графа на `as_of`. Сбой сборки не роняет enrichment и не пишет
+    source_status полей эмбеда (у них свои сборщики): результат только в
+    покрытии источников."""
+    kg_res = build_kg_context(
+        db, namespace=namespace, service=service,
+        alertname=(incident.labels or {}).get("alertname"), as_of=as_of,
+        node=ctx.node,
+    )
+    if kg_res is not None:
+        ctx.collector_results.append(kg_res)
+        ctx.kg_context = kg_res.data if isinstance(kg_res.data, dict) else None
+
+
 def _fetch_node_namespaces(node: str, timeout_sec: float) -> Optional[List[Dict[str, Any]]]:
     # Локальный импорт — модуль тянет kubernetes-client (см. fetch_live_replicas).
     from app.context.deployments import fetch_node_namespaces
@@ -1127,6 +1143,11 @@ def enrich_alert(db: Session, incident: Incident) -> EnrichedContext:
                 log.warning("enrich.ns_deploy_fallback_failed", error=str(e))
         else:
             log.debug("enrich.skip_no_service", namespace=namespace, service=service)
+        if not namespace and ctx.node:
+            # Нодовый алерт без стенда: из графа — только топология ноды
+            # (зона, соседи, host-ы входа).
+            _attach_kg_context(ctx, db, incident, namespace=None, service=None,
+                               as_of=datetime.now(timezone.utc))
         return ctx
 
     incident_at = _parse_starts_at(incident.starts_at)
@@ -1248,14 +1269,7 @@ def enrich_alert(db: Session, incident: Incident) -> EnrichedContext:
     # Контекст графа на СЕЙЧАС: эмбед — живой вид стенда, а не реконструкция.
     # Сбой сборки не роняет enrichment и не пишет source_status полей эмбеда
     # (у них свои сборщики): результат только в покрытии источников.
-    kg_res = build_kg_context(
-        db, namespace=namespace, service=service,
-        alertname=(incident.labels or {}).get("alertname"), as_of=now,
-        node=ctx.node,
-    )
-    if kg_res is not None:
-        ctx.collector_results.append(kg_res)
-        ctx.kg_context = kg_res.data if isinstance(kg_res.data, dict) else None
+    _attach_kg_context(ctx, db, incident, namespace=namespace, service=service, as_of=now)
 
     # Метка `pod` в алерте — это под, с которого пришла серия. События ниже
     # собраны по СЕРВИСУ, а у DaemonSet (vm-node-exporter, ~60 подов на разных
