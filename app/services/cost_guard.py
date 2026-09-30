@@ -246,7 +246,7 @@ def _apply_delta(day: dt.date, delta_micro: int) -> int:
     """)
     db = SessionLocal()
     try:
-        value = db.execute(sql, {"day": day, "delta": delta_micro}).scalar_one()
+        value: Any = db.execute(sql, {"day": day, "delta": delta_micro}).scalar_one()
         db.commit()
         return int(value)
     finally:

@@ -32,9 +32,9 @@ tests/test_idle_transaction_guard.py.
 """
 from datetime import datetime
 
-from sqlalchemy import (JSON, BigInteger, Column, Date, DateTime, Integer,
+from sqlalchemy import (JSON, BigInteger, Date, DateTime, Integer,
                         String, create_engine, func)
-from sqlalchemy.orm import declarative_base, sessionmaker
+from sqlalchemy.orm import declarative_base, mapped_column, sessionmaker
 
 from app.config import settings
 
@@ -180,19 +180,19 @@ class IncidentRecord(Base):
     """
 
     __tablename__ = "incidents"
-    id = Column(Integer, primary_key=True)
-    incident_id = Column(String, unique=True, index=True)
-    status = Column(String)
-    data = Column(JSON)
-    analysis = Column(JSON, nullable=True)
+    id = mapped_column(Integer, primary_key=True)
+    incident_id = mapped_column(String, unique=True, index=True)
+    status = mapped_column(String)
+    data = mapped_column(JSON)
+    analysis = mapped_column(JSON, nullable=True)
     # Per-stage execution trace populated by app.core.tracing.StageTimer in
     # the Celery worker pipeline. Shape:
     #   [{stage: str, duration_ms: int, llm_calls: [{backend, duration_ms, error?}]}]
     # Self-contained inside the incident row so post-mortem doesn't need
     # a separate trip into OTel/Prometheus.
-    trace = Column(JSON, nullable=True)
-    user_feedback = Column(JSON, nullable=True)  # {score: 1-5, comment: str}
-    is_accepted = Column(String, nullable=True)  # "ACCEPTED", "REJECTED"
+    trace = mapped_column(JSON, nullable=True)
+    user_feedback = mapped_column(JSON, nullable=True)  # {score: 1-5, comment: str}
+    is_accepted = mapped_column(String, nullable=True)  # "ACCEPTED", "REJECTED"
 
     # --- состояние обработки (миграция 20260819_0200) --------------------
     #
@@ -207,12 +207,12 @@ class IncidentRecord(Base):
     #
     # NULL значит «стадии не было», и это не то же самое, что «была и
     # завершилась». В JSON различение давало наличие ключа.
-    report_state = Column(String, nullable=True, index=True)      # pending|sent|failed
-    report_attempts = Column(Integer, nullable=True)
-    report_updated_at = Column(DateTime, nullable=True)
-    executor_state = Column(String, nullable=True, index=True)    # in_flight|applied|…
-    executor_claimed_at = Column(DateTime, nullable=True)
-    created_at = Column(DateTime, default=datetime.utcnow)
+    report_state = mapped_column(String, nullable=True, index=True)      # pending|sent|failed
+    report_attempts = mapped_column(Integer, nullable=True)
+    report_updated_at = mapped_column(DateTime, nullable=True)
+    executor_state = mapped_column(String, nullable=True, index=True)    # in_flight|applied|…
+    executor_claimed_at = mapped_column(DateTime, nullable=True)
+    created_at = mapped_column(DateTime, default=datetime.utcnow)
 
 
 class LLMSpendLedger(Base):
@@ -230,12 +230,12 @@ class LLMSpendLedger(Base):
     """
 
     __tablename__ = "llm_spend_ledger"
-    day = Column(Date, primary_key=True)
-    spent_micro_usd = Column(BigInteger, nullable=False, server_default="0")
+    day = mapped_column(Date, primary_key=True)
+    spent_micro_usd = mapped_column(BigInteger, nullable=False, server_default="0")
     # naive-UTC, как вся остальная схема: смешивать timestamptz и timestamp
     # в одной базе значит считать окна по разным зонам (см.
     # test_datetime_columns_are_without_timezone).
-    updated_at = Column(DateTime, nullable=False, server_default=func.now())
+    updated_at = mapped_column(DateTime, nullable=False, server_default=func.now())
 
 
 def get_db():

@@ -21,7 +21,7 @@ from __future__ import annotations
 
 import logging
 import re
-from typing import TYPE_CHECKING, Dict, Iterable, Optional, Set, TypedDict
+from typing import TYPE_CHECKING, Any, Dict, Iterable, Optional, Set, TypedDict
 
 if TYPE_CHECKING:  # pragma: no cover - only for typing
     from sqlalchemy.orm import Session
@@ -617,7 +617,7 @@ def compute_orphan_stats_by_env(db: "Session") -> Dict[str, OrphanStats]:
         "svc_kind": NODE_KIND_SERVICE,
         "st": EDGE_SERVES_TRAFFIC,
     }
-    rows = db.execute(text(
+    rows: Any = db.execute(text(
         "SELECT s.namespace, "
         "       (s.id NOT IN ("
         "           SELECT src_id FROM kg_service_edges "

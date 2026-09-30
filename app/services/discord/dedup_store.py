@@ -33,7 +33,8 @@ import time
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional, cast
 
-from sqlalchemy import Column, DateTime, Integer, String, JSON
+from sqlalchemy.orm import mapped_column
+from sqlalchemy import DateTime, Integer, String, JSON
 from sqlalchemy.exc import IntegrityError
 
 from app.database import Base
@@ -72,19 +73,19 @@ class DiscordDedupEntry(Base):
 
     __tablename__ = "discord_dedup"
 
-    key = Column(String(40), primary_key=True)  # sha1 hex от _compute_enriched_key
-    msg_id = Column(String(32), nullable=False)
+    key = mapped_column(String(40), primary_key=True)  # sha1 hex от _compute_enriched_key
+    msg_id = mapped_column(String(32), nullable=False)
     # webhook_url тут БЫЛ и снесён миграцией 20260808_0200 — см. докстринг
     # модуля. Не возвращать: PATCH-URL резолвится из настроек в рантайме.
-    embed = Column(JSON, nullable=True)
-    first_ts = Column(DateTime, nullable=False, index=True)
-    last_ts = Column(DateTime, nullable=False)
-    count = Column(Integer, nullable=False, default=1)
+    embed = mapped_column(JSON, nullable=True)
+    first_ts = mapped_column(DateTime, nullable=False, index=True)
+    last_ts = mapped_column(DateTime, nullable=False)
+    count = mapped_column(Integer, nullable=False, default=1)
     # Debug-видимость: что за алерт скрывается за sha1-ключом.
-    alertname = Column(String(255), nullable=True)
-    namespace = Column(String(255), nullable=True)
-    service = Column(String(255), nullable=True)
-    severity = Column(String(32), nullable=True)
+    alertname = mapped_column(String(255), nullable=True)
+    namespace = mapped_column(String(255), nullable=True)
+    service = mapped_column(String(255), nullable=True)
+    severity = mapped_column(String(32), nullable=True)
 
 
 def _to_dt(ts: float) -> datetime:
