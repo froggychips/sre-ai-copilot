@@ -43,6 +43,7 @@ _DATA_SOURCES = frozenset({
     "kg_jobs_sync",
     "kg_metrics_sync",
     "kg_nats_subjects_sync",
+    "kg_nodes_sync",
     "kg_runtime_correlation_sync",
     "kg_seq_logs_sync",
     "kg_statics_versions_sync",

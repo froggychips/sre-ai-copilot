@@ -4,6 +4,19 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+### Добавлено
+
+- **Граф знает зону ноды и точки входа трафика.** Новые таблицы `kg_nodes`
+  (зона/регион из меток `topology.kubernetes.io/*`, адреса, роли, cordon) и
+  `kg_entrypoints` (host из Ingress → во что резолвится, какие
+  LoadBalancer-сервисы и какие ноды стоят на этом IP), миграция
+  `20260930_0100`. Пишет beat-задача `kg_nodes_sync` (15/45 мин), пропавшие
+  объекты получают `deleted_at`, сбой kubectl ничего не удаляет. Сборщик
+  контекста инцидента получил источник `kg_nodes`: при метке `node` у алерта
+  правила и модель видят зону ноды, соседей по зоне и host-ы, чей вход идёт
+  через эту ноду (point-in-time по `as_of`). Без метки `node` контекст прежний.
+  RBAC: чтение core `nodes` в ClusterRole (helm и k8s/base).
+
 ### Изменено
 
 - **Модели типизированы через `Mapped[...]`.** 319 полей в 5 модулях получили
