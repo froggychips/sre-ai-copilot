@@ -76,13 +76,16 @@ spec:
             # PGDATA должна быть подпапкой, иначе init падает на lost+found.
             - name: PGDATA
               value: /var/lib/postgresql/data/pgdata
+          # 16.10.2026: при limit 1 CPU postgres троттлился 78–93% периодов всю
+          # неделю — ~25 мс на простой запрос, kg_topology_sync 611–756 с (93%
+          # времени внутри SQL по замеру #503). Нода dev-4: 48 ядер, занято ~72%.
           resources:
             limits:
-              cpu: 1000m
-              memory: 1Gi
+              cpu: "4"
+              memory: 2Gi
             requests:
-              cpu: 200m
-              memory: 512Mi
+              cpu: "1"
+              memory: 1Gi
           livenessProbe:
             exec:
               command: ["/bin/sh", "-c", "pg_isready -U \"$POSTGRES_USER\" -d \"$POSTGRES_DB\""]
