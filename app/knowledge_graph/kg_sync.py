@@ -19,13 +19,14 @@ from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Set, Tuple, cast
 
 from sqlalchemy import cast as sa_cast
+from sqlalchemy import or_
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Session
 
 from app.knowledge_graph.kubectl_breaker import run_kubectl
 from app.knowledge_graph.contract import (
     OWNER_SOURCE_NAMESPACE_PREFIX, OWNER_SOURCE_PLATFORM_STATIC,
-    shared_namespace_of,
+    STALE_CLASS_GONE, shared_namespace_of,
 )
 from app.knowledge_graph.edge_decay_guard import (
     REASON_UNMAPPED_KIND, SOURCE_KG_SYNC, edge_block_reason, record_source_run,
@@ -772,9 +773,145 @@ _EXISTING_NS_CACHE: Optional[Set[str]] = None
 
 
 def _reset_existing_ns_cache() -> None:
-    """Сбросить кэш существующих namespace (вызывается в начале прохода)."""
-    global _EXISTING_NS_CACHE
+    """Сбросить кэши прохода: существующие namespace и k8s Service баз.
+
+    Зовётся в начале `sync_topology`. До 16.10.2026 не звался нигде, и кэш
+    namespace жил всё время жизни воркера: стенд, поднятый после старта
+    воркера, для `_db_namespace_for_client` не существовал до рестарта.
+    """
+    global _EXISTING_NS_CACHE, _DB_SERVICE_CACHE
     _EXISTING_NS_CACHE = None
+    _DB_SERVICE_CACHE = None
+
+
+#: Host hint из ключа секрета → базовое имя k8s Service, где они расходятся.
+#: Выведено из шаблона wo-k8s `k8s-install/master/secrets/*/database.yaml`
+#: (сверены только ключи и хосты): `CHAT_STRUCTURE_DB_CONNECTION` и
+#: `CHAT_CONFIG_DB_URI` ходят в `chat-db-postgresql`, а
+#: `CHAT_MESSAGE_ADDITIONAL_DB_CONNECTION` теряет `ADDITIONAL` как шумовой
+#: токен и даёт hint `chat-message`, хотя база — `chat-messages-additional`.
+_DB_HINT_SERVICE_BASE: Dict[str, str] = {
+    "chat-structure": "chat",
+    "chat-config": "chat",
+    "chat-message": "chat-messages-additional",
+    "chat-message-global": "chat-messages-global",
+}
+
+#: Имена k8s Service, под которыми база видна клиентам, в порядке
+#: предпочтения. `-db-postgresql` первым: этот хост стоит в DSN всех
+#: окружений, и после переезда на CNPG его Service переключают на primary
+#: кластера (prod-shared/config-db-postgresql → `cnpg.io/cluster`), а не
+#: переписывают DSN. `-db-cnpg-rw` — для баз, у которых bitnami-Service уже нет.
+_DB_SERVICE_NAME_TEMPLATES: Dict[str, Tuple[str, ...]] = {
+    "postgres": ("{base}-db-postgresql", "{base}-db-cnpg-rw"),
+    # ClickHouse один на realm и называется по продукту, не по базе:
+    # `ANALYTICS_DB_CLICKHOUSE_CONNECTION` → `clickhouse.<realm>-shared`.
+    "clickhouse": ("clickhouse",),
+}
+
+#: (namespace, name) → id узла-k8s Service, к которому можно вести uses_db.
+#: Строится раз за проход, как `_EXISTING_NS_CACHE`.
+_DB_SERVICE_CACHE: Optional[Dict[Tuple[str, str], int]] = None
+
+
+def _load_db_service_cache(db: Session) -> Dict[Tuple[str, str], int]:
+    """Индекс реальных k8s Service, похожих на базы.
+
+    Признак «реальный» — `metadata_json.k8s_service` (его пишет
+    k8s_topology_resources_sync из живого объекта), а НЕ `synthetic=false`:
+    флаг synthetic у части Service баз залип от старой логики (замер
+    16.10.2026 — `prod-shared/config-db-postgresql` и `prod-kingdom5/
+    town-db-postgresql` живые, но synthetic=true). Узлы снесённых namespace
+    (`stale_class='gone'`) не берём: ребро в них было бы ложью.
+    """
+    names = {
+        tpl.format(base="%") for tpls in _DB_SERVICE_NAME_TEMPLATES.values()
+        for tpl in tpls
+    }
+    rows = (
+        db.query(Service.id, Service.namespace, Service.name, Service.metadata_json)
+        .filter(Service.node_kind == NODE_KIND_SERVICE)
+        .filter(or_(*(Service.name.like(n) for n in sorted(names))))
+        .filter(or_(Service.stale_class.is_(None), Service.stale_class != STALE_CLASS_GONE))
+        .all()
+    )
+    index: Dict[Tuple[str, str], int] = {}
+    for svc_id, ns, name, meta in rows:
+        if isinstance(meta, dict) and meta.get("k8s_service"):
+            index[(ns, name)] = svc_id
+    return index
+
+
+def _resolve_db_service(
+    db: Session,
+    driver: str,
+    host_hint: str,
+    client_namespace: str,
+) -> Optional[Service]:
+    """Настоящий k8s Service базы для `db:<driver>:<host_hint>`, или None.
+
+    Ищем только среди существующих узлов — ничего не создаём и не угадываем
+    сверх шаблона имён. Сначала namespace клиента (town/map/message/
+    chat-messages-* живут в королевстве), потом `<realm>-shared` (config, mv,
+    security и прочие общие). None — вызывающий оставит ребро на
+    синтетическом `db:`-узле, как было до этого резолва.
+    """
+    global _DB_SERVICE_CACHE
+    templates = _DB_SERVICE_NAME_TEMPLATES.get(driver)
+    if not templates:
+        return None
+    if _DB_SERVICE_CACHE is None:
+        _DB_SERVICE_CACHE = _load_db_service_cache(db)
+    base = _DB_HINT_SERVICE_BASE.get(host_hint, host_hint)
+    namespaces = [client_namespace]
+    shared = shared_namespace_of(client_namespace)
+    if shared and shared != client_namespace:
+        namespaces.append(shared)
+    for ns in namespaces:
+        for tpl in templates:
+            found = _lookup_db_service(db, ns, tpl.format(base=base))
+            if found is not None:
+                return found
+    return None
+
+
+def _drop_superseded_db_edge(db: Session, src: Service, db_node: str, db_ns: str) -> int:
+    """Удалить ребро `src → db:`-узел, которое заменило ребро в k8s Service.
+
+    Оставить его доживать до edge_decay нельзя: при первом проходе так
+    заменяется ~7,7 тыс. рёбер (27% графа, замер 16.10.2026), через 30 дней
+    они разом стали бы кандидатами на удаление, и deadman
+    (`EDGE_DECAY_MAX_DELETE_PCT` = 25%) заблокировал бы decay целиком — для
+    всех kind'ов. Удаляем только ребро этого же клиента в этот же `db:`-узел:
+    тот же факт, новый адрес. Сам `db:`-узел не трогаем — у него могут быть
+    клиенты, для которых Service не нашёлся.
+    """
+    old_dst = (
+        db.query(Service.id)
+        .filter_by(namespace=db_ns, name=db_node, node_kind=NODE_KIND_SERVICE)
+        .scalar()
+    )
+    if old_dst is None:
+        return 0
+    return (
+        db.query(ServiceEdge)
+        .filter_by(src_id=src.id, dst_id=old_dst, kind="uses_db")
+        .delete(synchronize_session=False)
+    )
+
+
+def _lookup_db_service(db: Session, namespace: str, name: str) -> Optional[Service]:
+    """k8s Service базы по точному имени — для DSN, где host известен.
+
+    Ищет в том же индексе, что и `_resolve_db_service`, поэтому видит только
+    имена по шаблонам `_DB_SERVICE_NAME_TEMPLATES`; DSN на хост другой формы
+    останется на синтетическом узле.
+    """
+    global _DB_SERVICE_CACHE
+    if _DB_SERVICE_CACHE is None:
+        _DB_SERVICE_CACHE = _load_db_service_cache(db)
+    svc_id = _DB_SERVICE_CACHE.get((namespace, name))
+    return db.get(Service, svc_id) if svc_id is not None else None
 
 
 def _db_namespace_for_client(db: Session, client_namespace: str) -> Optional[str]:
@@ -931,14 +1068,39 @@ def sync_namespace(
                     # консьюмеры (blast-radius) могли отфильтровать.
                     edge_extras["confidence"] = "unverified_host"
                     edge_extras["unverified_host"] = True
-            dst = _upsert_service_pg(
-                db,
-                namespace=db_ns,
-                name=db_node,
-                team_owner="data",
-                owner_source=OWNER_SOURCE_PLATFORM_STATIC,
-                synthetic=True,
-            )
+
+            # Ребро ведём в настоящий k8s Service базы, если он есть в графе.
+            # Синтетический `db:`-узел был концом пути: у k8s Service базы не
+            # оказывалось ни одного ребра (замер 16.10.2026 — 0 на проде), и
+            # 62 из 85 прод-орфанов были именно базами, а blast radius от
+            # StatefulSet базы не доходил до клиентов. Не нашли Service —
+            # остаёмся на синтетическом узле, как раньше: сигнал не теряем.
+            # Старые рёбра в `db:`-узлы уйдут сами через edge_decay.
+            host = db_node.split(":", 2)[-1]
+            if source == "dsn_env":
+                real_db = _lookup_db_service(db, db_ns, host)
+            else:
+                real_db = _resolve_db_service(db, driver, host, namespace)
+            if real_db is not None:
+                _drop_superseded_db_edge(db, src, db_node, db_ns)
+                edge_extras["db_node"] = db_node
+                edge_extras["db_target"] = "k8s_service"
+                if source != "dsn_env":
+                    # Namespace подтверждён существующим Service, а не
+                    # правилом realm: town живёт в королевстве, не в shared.
+                    edge_extras["confidence"] = "inferred_secret_name"
+                    edge_extras["db_namespace_source"] = "k8s_service"
+                    edge_extras.pop("unverified_host", None)
+                dst = real_db
+            else:
+                dst = _upsert_service_pg(
+                    db,
+                    namespace=db_ns,
+                    name=db_node,
+                    team_owner="data",
+                    owner_source=OWNER_SOURCE_PLATFORM_STATIC,
+                    synthetic=True,
+                )
             upsert_edge(
                 db, src=src, dst=dst,
                 kind="uses_db",
@@ -1400,6 +1562,8 @@ def sync_topology(
         # децаить наши kind'ы в этом цикле.
         record_source_run(SOURCE_KG_SYNC, empty)
         return empty
+
+    _reset_existing_ns_cache()
 
     total: Dict[str, Any] = {
         "services": 0, "edges": 0, "edges_extended": 0,
