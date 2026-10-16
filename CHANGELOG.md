@@ -4,6 +4,24 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+## [1.0.26] — 2026-10-16 — kg_topology_sync без выгрузки деплоев
+
+### Производительность
+
+- **stale_class: max(started_at) считается в PostgreSQL** (#500). Пересчёт
+  класса каждого namespace выгружал в Python все строки `kg_deployments` его
+  сервисов с JSON `extras`: таблица — 784 тыс. строк (+166 тыс. в неделю, 99% —
+  ns-broadcast), `preprod-shared` — 138 тыс., до 31 с на namespace; из 611 с
+  `kg_topology_sync` ~510 с уходило сюда. Теперь один `GROUP BY` с `FILTER`;
+  признак ns-broadcast — точная копия Python truthiness по типу JSON.
+
+### Исправлено
+
+- **`reattribute_exporter_alerts` распознаёт workload в описании** (#499):
+  `Deployment|StatefulSet|DaemonSet|HPA <ns>/<имя>`, `Rollout of deployment …`,
+  `rollout status deploy/…`. Dry-run на проде оставлял без владельца 955
+  строк, 927 из них — такие; после фикса — около 28.
+
 ## [1.0.25] — 2026-10-16 — алерты на своём k8s-объекте, orphan до нуля
 
 ### Исправлено
