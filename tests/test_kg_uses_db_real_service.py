@@ -247,3 +247,130 @@ def test_reset_clears_db_service_cache(db):
     assert _resolve_db_service(db, "postgres", "town", "prod-kingdom1") is None
     kg_sync._reset_existing_ns_cache()
     assert _resolve_db_service(db, "postgres", "town", "prod-kingdom1") is not None
+
+
+# ── стоимость прохода: без per-edge запросов на резолв и drop ───────────────
+
+
+def _count_sql(db, fn):
+    """Выполнить fn и вернуть список SQL-операторов, ушедших в БД."""
+    from sqlalchemy import event
+
+    statements = []
+
+    def _capture(conn, cursor, statement, params, context, executemany):
+        statements.append(" ".join(statement.split()))
+
+    engine = db.get_bind()
+    event.listen(engine, "before_cursor_execute", _capture)
+    try:
+        fn()
+    finally:
+        event.remove(engine, "before_cursor_execute", _capture)
+    return statements
+
+
+def _sync_clients(db, monkeypatch, n):
+    deploys = [_deploy(f"svc-{i}", "CONFIG_DB_CONNECTION", "TOWN_DB_CONNECTION")
+               for i in range(n)]
+    monkeypatch.setattr(kg_sync, "_refresh_stale_class_for_namespace", lambda *_: 0)
+    sync_namespace(db, "prod-kingdom1", deploys=deploys)
+    db.commit()  # как sync_topology: commit per-namespace, объекты протухают
+
+
+def test_steady_state_pass_has_no_per_edge_resolve_or_drop_queries(db, monkeypatch):
+    """Повторный проход: резолв без db.get, drop без SELECT/DELETE.
+
+    16.10.2026 kg_topology_sync вырос с ~2 мин до 817 с: на каждое ребро
+    uses_db уходили refresh-SELECT протухшего Service (db.get после commit) и
+    SELECT + DELETE на удаление старого ребра в `db:`-узел, которого у
+    резолвленного клиента уже нет.
+    """
+    _k8s_svc(db, "prod-shared", "config-db-postgresql")
+    _k8s_svc(db, "prod-kingdom1", "town-db-postgresql")
+    # Как на проде: `db:`-узел живёт дальше ради клиентов, для которых
+    # Service не нашёлся, — старый код ходил в него SELECT + DELETE на ребро.
+    old_db = upsert_service(db, "prod-shared", "db:postgres:config", synthetic=True)
+    upsert_edge(db, upsert_service(db, "prod-kingdom2", "unresolved"), old_db, kind="uses_db")
+    db.commit()
+    _sync_clients(db, monkeypatch, 20)
+    kg_sync._reset_existing_ns_cache()  # новый проход sync_topology
+
+    sql = _count_sql(db, lambda: _sync_clients(db, monkeypatch, 20))
+
+    deletes = [s for s in sql if s.startswith("DELETE FROM kg_service_edges")]
+    assert deletes == []
+    # Поиск id `db:`-узла по имени (старый drop): SELECT только id.
+    synth_lookups = [s for s in sql if s.startswith(
+        "SELECT kg_services.id AS kg_services_id FROM kg_services WHERE")]
+    assert synth_lookups == [], synth_lookups[:3]
+    by_id = [s for s in sql if s.startswith("SELECT")
+             and "FROM kg_services" in s and "WHERE kg_services.id = ?" in s]
+    assert by_id == [], by_id[:3]
+    # Узлы `db:%` и рёбра в них — по одному запросу на проход, не на ребро.
+    synth = [s for s in sql if "LIKE" in s and "kg_service_edges" in s]
+    assert len(synth) <= 1
+
+
+def test_first_pass_still_drops_old_synthetic_edges(db, monkeypatch):
+    """Кэш не должен потерять перенос: старые рёбра клиентов в `db:`-узел
+    удаляются на первом проходе с резолвом, чужие — остаются."""
+    old_db = upsert_service(db, "prod-shared", "db:postgres:config", synthetic=True)
+    clients = [upsert_service(db, "prod-kingdom1", f"svc-{i}") for i in range(5)]
+    foreign = upsert_service(db, "prod-kingdom2", "svc-x")
+    for c in clients + [foreign]:
+        upsert_edge(db, c, old_db, kind="uses_db")
+    _k8s_svc(db, "prod-shared", "config-db-postgresql")
+    db.commit()
+
+    deploys = [_deploy(f"svc-{i}", "CONFIG_DB_CONNECTION") for i in range(5)]
+    monkeypatch.setattr(kg_sync, "_refresh_stale_class_for_namespace", lambda *_: 0)
+    sync_namespace(db, "prod-kingdom1", deploys=deploys)
+    db.commit()
+
+    left = db.query(ServiceEdge).filter_by(dst_id=old_db.id, kind="uses_db").all()
+    assert [e.src_id for e in left] == [foreign.id]
+
+
+def test_cache_not_stale_between_separate_sync_namespace_calls(db, monkeypatch):
+    """Кэш рёбер в `db:`-узлы живёт один вызов: ребро, появившееся между
+    вызовами (или возвращённое откатом savepoint-а), следующий вызов удалит
+    (ревью Codex)."""
+    _k8s_svc(db, "prod-shared", "config-db-postgresql")
+    old_db = upsert_service(db, "prod-shared", "db:postgres:config", synthetic=True)
+    db.commit()
+    deploy = _deploy("svc-0", "CONFIG_DB_CONNECTION")
+    monkeypatch.setattr(kg_sync, "_refresh_stale_class_for_namespace", lambda *_: 0)
+    sync_namespace(db, "prod-kingdom1", deploys=[deploy])
+    db.commit()
+
+    # Между вызовами старое ребро снова появилось (откат, ручная запись).
+    client = db.query(Service).filter_by(namespace="prod-kingdom1", name="svc-0",
+                                         node_kind="service").one()
+    upsert_edge(db, client, old_db, kind="uses_db")
+    db.commit()
+
+    sync_namespace(db, "prod-kingdom1", deploys=[deploy])
+    db.commit()
+    assert db.query(ServiceEdge).filter_by(dst_id=old_db.id, kind="uses_db").count() == 0
+
+
+def test_rolled_back_drop_is_redone_on_next_call(db, monkeypatch):
+    """Savepoint namespace откатился — удалённое ребро вернулось; следующий
+    вызов обязан удалить его снова, а не считать уже удалённым."""
+    _k8s_svc(db, "prod-shared", "config-db-postgresql")
+    old_db = upsert_service(db, "prod-shared", "db:postgres:config", synthetic=True)
+    client = upsert_service(db, "prod-kingdom1", "svc-0")
+    upsert_edge(db, client, old_db, kind="uses_db")
+    db.commit()
+    deploy = _deploy("svc-0", "CONFIG_DB_CONNECTION")
+    monkeypatch.setattr(kg_sync, "_refresh_stale_class_for_namespace", lambda *_: 0)
+
+    nested = db.begin_nested()
+    sync_namespace(db, "prod-kingdom1", deploys=[deploy])
+    nested.rollback()
+    assert db.query(ServiceEdge).filter_by(dst_id=old_db.id, kind="uses_db").count() == 1
+
+    sync_namespace(db, "prod-kingdom1", deploys=[deploy])
+    db.commit()
+    assert db.query(ServiceEdge).filter_by(dst_id=old_db.id, kind="uses_db").count() == 0
