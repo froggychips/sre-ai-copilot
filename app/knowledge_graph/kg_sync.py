@@ -15,10 +15,12 @@ from __future__ import annotations
 import logging
 import re
 import json
+import time
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, NamedTuple, Optional, Set, Tuple, cast
 
 from sqlalchemy import cast as sa_cast
+from sqlalchemy import event
 from sqlalchemy import or_
 from sqlalchemy import text as sa_text
 from sqlalchemy.dialects.postgresql import JSONB
@@ -1062,6 +1064,92 @@ def _db_namespace_for_client(db: Session, client_namespace: str) -> Optional[str
 # глобально. Замена — `_db_namespace_for_client` (realm → `<realm>-shared`).
 
 
+#: Namespace дольше этого порога (с) получают строку kg_sync.ns_timing.
+_NS_TIMING_LOG_SEC = 1.0
+
+_SQL_KEY_RE = re.compile(
+    r"^\s*(select|insert\s+into|update|delete\s+from)\b.*?\b(kg_\w+)",
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+def _sql_key(statement: str) -> str:
+    """«insert into kg_service_edges» — вид запроса и первая таблица kg_*."""
+    m = _SQL_KEY_RE.match(statement or "")
+    if not m:
+        return (statement or "").strip().split(" ", 1)[0].lower() or "?"
+    return f"{' '.join(m.group(1).lower().split())} {m.group(2).lower()}"
+
+
+class _SqlMeter:
+    """Время и число SQL-запросов на движке, пока открыт контекст.
+
+    Зачем (16.10.2026): kg_topology_sync вырос до 611–756 с, и две гипотезы
+    подряд (#495 per-edge запросы, #500 выгрузка kg_deployments) не
+    подтвердились — время уходило в хвост sync_namespace, а без замера не
+    видно, база это (блокировки, медленный запрос) или Python. Слушатели
+    вешаются на engine на время одного namespace и снимаются в __exit__;
+    воркер Celery — prefork, один таск на процесс, чужие запросы не
+    подмешиваются.
+    """
+
+    def __init__(self, db: Session) -> None:
+        self.engine: Any = None
+        try:
+            bind: Any = db.get_bind()
+            self.engine = getattr(bind, "engine", bind)
+        except Exception:  # noqa: BLE001 — замер не должен ронять синк
+            self.engine = None
+        self.count = 0
+        self.total = 0.0
+        self.by_key: Dict[str, List[float]] = {}
+        self.slowest: Tuple[float, str] = (0.0, "")
+
+    def _before(self, conn: Any, cursor: Any, statement: str, *a: Any) -> None:
+        conn.info.setdefault("_kg_sql_t0", []).append(time.perf_counter())
+
+    def _after(self, conn: Any, cursor: Any, statement: str, *a: Any) -> None:
+        stack = conn.info.get("_kg_sql_t0") or []
+        if not stack:
+            return
+        dt = time.perf_counter() - stack.pop()
+        self.count += 1
+        self.total += dt
+        slot = self.by_key.setdefault(_sql_key(statement), [0.0, 0.0])
+        slot[0] += 1
+        slot[1] += dt
+        if dt > self.slowest[0]:
+            self.slowest = (dt, " ".join((statement or "").split())[:160])
+
+    def __enter__(self) -> "_SqlMeter":
+        # Замер не должен ронять синк: не подписались — работаем без него.
+        if self.engine is not None:
+            try:
+                event.listen(self.engine, "before_cursor_execute", self._before)
+                event.listen(self.engine, "after_cursor_execute", self._after)
+            except Exception:  # noqa: BLE001
+                self._detach()
+                self.engine = None
+        return self
+
+    def __exit__(self, *exc: Any) -> None:
+        if self.engine is not None:
+            self._detach()
+
+    def _detach(self) -> None:
+        for name, fn in (("before_cursor_execute", self._before),
+                         ("after_cursor_execute", self._after)):
+            try:
+                if event.contains(self.engine, name, fn):
+                    event.remove(self.engine, name, fn)
+            except Exception:  # noqa: BLE001
+                pass
+
+    def top(self, n: int = 4) -> List[str]:
+        items = sorted(self.by_key.items(), key=lambda kv: -kv[1][1])[:n]
+        return [f"{k}×{int(v[0])}={v[1]:.2f}s" for k, v in items]
+
+
 def sync_namespace(
     db: Session,
     namespace: str,
@@ -1226,7 +1314,9 @@ def sync_namespace(
     # KG Coverage #4: пересчитать stale_class для всех сервисов в этом ns.
     # Делаем здесь (а не в _upsert_service_pg), чтобы один SQL-проход по
     # kg_deployments вместо N×запросов.
+    t_refresh = time.perf_counter()
     _refresh_stale_class_for_namespace(db, namespace)
+    stats["refresh_s"] = round(time.perf_counter() - t_refresh, 3)  # type: ignore[assignment]
 
     return stats
 
@@ -1785,8 +1875,18 @@ def sync_topology(
             # последующие ns + per-ns db.commit() падают с
             # PendingRollbackError, теряя весь pass. Зеркалит per-item
             # SAVEPOINT из k8s_events_sync.sync_namespace_events.
-            with db.begin_nested():
+            t_ns = time.perf_counter()
+            with _SqlMeter(db) as meter, db.begin_nested():
                 stats = sync_namespace(db, ns, deploys=deploys)
+            ns_wall = time.perf_counter() - t_ns
+            if ns_wall >= _NS_TIMING_LOG_SEC:
+                logger.info(
+                    "kg_sync.ns_timing ns=%s wall=%.2fs sql_n=%d sql_s=%.2f "
+                    "refresh_s=%.2f top=%s slowest=%.2fs %s",
+                    ns, ns_wall, meter.count, meter.total,
+                    stats.get("refresh_s", 0.0), meter.top(),
+                    meter.slowest[0], meter.slowest[1],
+                )
             total["services"] += stats["services"]
             total["edges"] += stats["edges"]
             total["namespaces"] += 1
@@ -1803,7 +1903,11 @@ def sync_topology(
         # дописывает недописанное — образец k8s_topology_resources_sync
         # (_COMMIT_BATCH). После упавшего ns commit тоже безопасен:
         # savepoint уже откатил его работу, pending-изменений нет.
+        t_commit = time.perf_counter()
         db.commit()
+        commit_s = time.perf_counter() - t_commit
+        if commit_s >= _NS_TIMING_LOG_SEC:
+            logger.info("kg_sync.ns_commit_slow ns=%s commit_s=%.2f", ns, commit_s)
 
     # ── Pass 2: extended env-scan ──────────────────────────────────────
     known_index = _build_known_index(db)

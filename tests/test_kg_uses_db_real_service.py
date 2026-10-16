@@ -465,3 +465,48 @@ def test_last_deploys_sql_path_matches_python_path(pg_session):
     with patch.object(type(pg_session.get_bind().dialect), "name", "sqlite"):
         py_svc, py_ns = kg_sync._last_deploys_by_service(pg_session, ids)
     assert (sql_svc, sql_ns) == (py_svc, py_ns)
+
+
+# ── замер фаз kg_sync ──────────────────────────────────────────────────────
+
+
+def test_sql_meter_counts_by_kind_and_detaches(db):
+    from sqlalchemy import event as sa_event
+
+    upsert_service(db, "m-ns", "svc")
+    db.flush()
+    with kg_sync._SqlMeter(db) as meter:
+        db.query(Service).filter_by(namespace="m-ns").all()
+        upsert_service(db, "m-ns", "svc2")
+        db.flush()
+    assert meter.count >= 2 and meter.total > 0
+    assert any(k.startswith("select kg_services") for k in meter.by_key)
+    assert meter.slowest[1]
+    engine = db.get_bind()
+    assert not sa_event.contains(engine, "before_cursor_execute", meter._before)
+    assert not sa_event.contains(engine, "after_cursor_execute", meter._after)
+
+
+@pytest.mark.parametrize("stmt, key", [
+    ("SELECT x FROM kg_services WHERE a=1", "select kg_services"),
+    ("INSERT INTO kg_service_edges (a) VALUES (1)", "insert into kg_service_edges"),
+    ("delete from  kg_service_edges where id=1", "delete from kg_service_edges"),
+    ("SAVEPOINT sa_savepoint_1", "savepoint"),
+])
+def test_sql_key(stmt, key):
+    assert kg_sync._sql_key(stmt) == key
+
+
+def test_sync_namespace_reports_refresh_time(db, monkeypatch):
+    _run_sync(db, monkeypatch, "prod-kingdom1", _deploy("town-service", "TOWN_DB_CONNECTION"))
+    # _run_sync глушит _refresh_stale_class_for_namespace, но время фазы пишется.
+    stats = kg_sync.sync_namespace(db, "prod-kingdom1", deploys=[_deploy("town-service")])
+    assert "refresh_s" in stats
+
+
+def test_sql_meter_never_breaks_sync_when_listen_fails():
+    """Замер на чём-то, куда нельзя подписаться (мок, чужой bind), — no-op."""
+    from unittest.mock import MagicMock
+    with kg_sync._SqlMeter(MagicMock()) as meter:
+        pass
+    assert meter.engine is None and meter.count == 0
