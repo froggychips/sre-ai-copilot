@@ -73,8 +73,9 @@ _POD_PATTERNS = (
 _PDB_RE = re.compile(r"\bPDB /?(?P<ns>[a-z0-9-]+)/(?P<pdb>[a-z0-9.-]+)\b")
 # Workload прямо в описании — история до KSM-target фикса (май–авг. 2026):
 # KubeDeployment{Generation,Replicas}Mismatch, *RolloutStuck,
-# KubeStatefulSet*/KubeDaemonSet*, KubeHpaReplicasMismatch (HPA и его
-# Deployment в WO называются одинаково — проверяется по графу), наши
+# KubeStatefulSet*/KubeDaemonSet*, KubeHpaReplicasMismatch (HPA → workload
+# по имени: связь scaleTargetRef в графе не хранится, но 16.10.2026 у всех
+# 55 HPA кластера имя == scaleTargetRef.name; иначе — проверять target), наши
 # PreprodDeploymentNotProgressing. Без этих шаблонов dry-run 16.10.2026 на
 # проде оставлял без владельца ~920 строк при известном target.
 _WORKLOAD_PATTERNS = (
