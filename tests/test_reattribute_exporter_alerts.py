@@ -152,3 +152,78 @@ def test_undo_restores_previous_service(db):
         # Опустевшие инциденты экспортеров удалены при переносе — ссылку на
         # мёртвый key не восстанавливаем.
         assert a.incident_id is None
+
+
+# ── инциденты, на которые ссылаются починки squad-medic ─────────────────────
+
+
+def _medic_event(db, incident_key):
+    from app.knowledge_graph.schema import KGRemediationEvent
+
+    inc = db.query(KGIncident).filter_by(incident_key=incident_key).one()
+    db.add(KGRemediationEvent(
+        actor="squad-medic", run_id=f"run-{inc.id}", namespace=inc.namespace,
+        started_at=T0 + timedelta(minutes=5), outcome="fixed", fixed=True,
+        incident_id=inc.id,
+    ))
+    db.commit()
+    return inc
+
+
+def test_medic_linked_incident_is_kept_and_alert_stays_its_member(db):
+    """Прод 16.10.2026: удаление опустевшего инцидента падало на FK
+    kg_remediation_events, а отвязка алерта лишала датасет live-RCA имени и
+    описания алерта починки. Теперь: сервис меняется, членство — нет."""
+    _seed(db)
+    crash = db.query(AlertEvent).filter_by(fingerprint="fp-crash").one()
+    inc = _medic_event(db, crash.incident_id)
+
+    st = reattribute(db, apply=True)
+    assert st["failed"] == 0 and st["kept_medic_incident"] == 1
+    crash = db.query(AlertEvent).filter_by(fingerprint="fp-crash").one()
+    assert db.get(Service, crash.service_id).name == "moderation-service"
+    assert crash.incident_id == inc.incident_key
+    assert db.get(KGIncident, inc.id) is not None
+
+
+def test_counters_count_only_committed_moves(db, monkeypatch):
+    """Откатившийся перенос не считается удалением/сжатием инцидента."""
+    import app.scripts.reattribute_exporter_alerts as m
+
+    _seed(db)
+    real_move = m._move
+
+    def flaky(db_, alert, *a, **k):
+        res = real_move(db_, alert, *a, **k)
+        if alert.fingerprint == "fp-crash":
+            raise RuntimeError("deadlock")
+        return res
+    monkeypatch.setattr(m, "_move", flaky)
+    st = reattribute(db, apply=True)
+    assert st["failed"] == 1 and st["moved"] == 2
+    assert st["incidents_deleted"] == 2  # только у двух успешных
+
+
+def test_relink_returns_alerts_detached_from_medic_incidents(db):
+    """Починка последствий прежнего --apply: алерт, отвязанный от инцидента
+    медика, возвращается в него по журналу raw.reattributed_from."""
+    from app.scripts.reattribute_exporter_alerts import relink_medic_alerts
+
+    _seed(db)
+    crash = db.query(AlertEvent).filter_by(fingerprint="fp-crash").one()
+    key = crash.incident_id
+    inc = _medic_event(db, key)
+    # Состояние после старого скрипта: incident_id снят, журнал есть.
+    crash.raw = {**crash.raw, "reattributed_from": {"service_id": crash.service_id,
+                                                    "incident_id": key}}
+    crash.incident_id = None
+    inc.fingerprints = []
+    db.commit()
+
+    assert relink_medic_alerts(db, apply=False) == {"medic_relink_candidates": 1, "medic_relinked": 0}
+    st = relink_medic_alerts(db, apply=True)
+    assert st["medic_relinked"] == 1
+    crash = db.query(AlertEvent).filter_by(fingerprint="fp-crash").one()
+    assert crash.incident_id == key
+    assert db.get(KGIncident, inc.id).fingerprints == ["fp-crash"]
+    assert relink_medic_alerts(db, apply=True)["medic_relinked"] == 0  # идемпотентно

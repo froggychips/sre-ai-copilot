@@ -52,7 +52,8 @@ from app.core.timeutil import utcnow
 from app.database import SessionLocal
 from app.knowledge_graph.populator import upsert_service
 from app.knowledge_graph.schema import (NODE_KIND_SERVICE, NODE_KIND_WORKLOAD,
-                                        AlertEvent, Service)
+                                        AlertEvent, KGIncident,
+                                        KGRemediationEvent, Service)
 from app.scripts.reattribute_job_alerts import _detach_from_incident
 from app.services.alert_enrichment import (_NODE_ALERT_PREFIXES,
                                            _NODE_EXPORTER_SOURCES,
@@ -177,7 +178,8 @@ def reattribute(db: Session, *, apply: bool = False) -> Dict[str, Any]:
     stats: Dict[str, Any] = {
         "applied": apply, "candidates": 0, "to_service": 0, "to_node": 0,
         "unresolved": 0, "moved": 0, "failed": 0, "incidents_deleted": 0,
-        "incidents_shrunk": 0, "by_how": {}, "by_exporter": {}, "top_targets": {},
+        "incidents_shrunk": 0, "kept_medic_incident": 0,
+        "by_how": {}, "by_exporter": {}, "top_targets": {},
         "sample": [],
     }
     rows = _candidates(db)
@@ -208,8 +210,16 @@ def reattribute(db: Session, *, apply: bool = False) -> Dict[str, Any]:
             continue
         try:
             with db.begin_nested():
-                _move(db, alert, exporter, target, how, node, stats)
+                fate, kept = _move(db, alert, exporter, target, how, node, stats)
+            # Счётчики — только после успешного SAVEPOINT: откатившийся
+            # перенос не удалял и не сжимал инцидент.
             stats["moved"] += 1
+            if fate == "deleted":
+                stats["incidents_deleted"] += 1
+            elif fate == "shrunk":
+                stats["incidents_shrunk"] += 1
+            if kept:
+                stats["kept_medic_incident"] += 1
         except Exception as e:  # noqa: BLE001 — одна строка не валит батч
             stats["failed"] += 1
             print(f"[skip] alert {alert.id}: {type(e).__name__}: {e}", file=sys.stderr)
@@ -217,6 +227,7 @@ def reattribute(db: Session, *, apply: bool = False) -> Dict[str, Any]:
             db.commit()
     if apply:
         db.commit()
+    stats.update(relink_medic_alerts(db, apply=apply))
     stats["top_targets"] = dict(
         sorted(stats["top_targets"].items(), key=lambda kv: -kv[1])[:15]
     )
@@ -227,12 +238,16 @@ def _move(
     db: Session, alert: AlertEvent, exporter: str,
     target: Optional[Tuple[str, str]], how: str, node: Optional[str],
     stats: Dict[str, Any],
-) -> None:
-    fate = _detach_from_incident(db, alert)
-    if fate == "deleted":
-        stats["incidents_deleted"] += 1
-    elif fate == "shrunk":
-        stats["incidents_shrunk"] += 1
+) -> Tuple[Optional[str], bool]:
+    # Инцидент, на который ссылаются починки squad-medic, НЕ трогаем: алерт
+    # остаётся его членом (меняется только service_id). Датасет live-RCA
+    # берёт имя и описание алерта починки через kg_alerts.incident_id, а сами
+    # такие инциденты — уровня namespace («после роллаута все сервисы сквада
+    # в CrashLoop»), их нельзя ни удалить (FK kg_remediation_events), ни
+    # честно приписать одному workload. Прод 16.10.2026: 14 инцидентов,
+    # 227 починок.
+    keep_incident = _medic_linked(db, alert.incident_id)
+    fate = None if keep_incident else _detach_from_incident(db, alert)
     raw = dict(alert.raw) if isinstance(alert.raw, dict) else {}
     raw["reattributed_from"] = {
         "service_id": alert.service_id, "incident_id": alert.incident_id,
@@ -248,15 +263,65 @@ def _move(
     # старый эпизод с текущим открытым инцидентом сервиса или открыл бы новый
     # из закрытого алерта — длительности и MTTR исказились бы. Дайджест
     # (chronic, MTTR) считает по kg_alerts, ему хватает service_id.
-    row.incident_id = None
+    if not keep_incident:
+        row.incident_id = None
     if target is None:
         row.service_id = None
         db.flush()
-        return
+        return fate, keep_incident
     svc = upsert_service(db, namespace=target[0], name=target[1], node_kind=NODE_KIND_SERVICE)
     db.flush()
     row.service_id = svc.id
     db.flush()
+    return fate, keep_incident
+
+
+def _medic_linked(db: Session, incident_key: Optional[str]) -> bool:
+    """На инцидент ссылается хоть одна починка (kg_remediation_events)?"""
+    if not incident_key:
+        return False
+    return (
+        db.query(KGRemediationEvent.id)
+        .join(KGIncident, KGIncident.id == KGRemediationEvent.incident_id)
+        .filter(KGIncident.incident_key == incident_key)
+        .first()
+    ) is not None
+
+
+def relink_medic_alerts(db: Session, *, apply: bool = False) -> Dict[str, int]:
+    """Вернуть в инцидент медика алерты, отвязанные прежним --apply.
+
+    До этой правки перенос снимал алерт со всех инцидентов, в том числе с
+    тех, на которые ссылаются починки: 16.10.2026 так отвязались 7 алертов
+    4 инцидентов (75 починок), и датасет live-RCA потерял их имя и описание.
+    Адрес — журнал `raw.reattributed_from.incident_id`. Идемпотентно.
+    """
+    stats = {"medic_relink_candidates": 0, "medic_relinked": 0}
+    rows = (
+        db.query(AlertEvent, KGIncident)
+        .join(KGIncident, KGIncident.incident_key
+              == AlertEvent.raw["reattributed_from"]["incident_id"].as_string())
+        .filter(AlertEvent.incident_id.is_(None))
+        .all()
+    )
+    for alert, inc in rows:
+        if not _medic_linked(db, cast(str, inc.incident_key)):
+            continue
+        stats["medic_relink_candidates"] += 1
+        if not apply:
+            continue
+        a: Any = alert
+        a.incident_id = inc.incident_key
+        row: Any = inc
+        fps = list(row.fingerprints or [])
+        if alert.fingerprint not in fps:
+            fps.append(alert.fingerprint)
+            row.fingerprints = fps
+            row.alert_count = len(fps)
+        stats["medic_relinked"] += 1
+    if apply:
+        db.commit()
+    return stats
 
 
 def undo(db: Session, *, apply: bool = False) -> Dict[str, Any]:
