@@ -1122,15 +1122,28 @@ class _SqlMeter:
             self.slowest = (dt, " ".join((statement or "").split())[:160])
 
     def __enter__(self) -> "_SqlMeter":
+        # Замер не должен ронять синк: не подписались — работаем без него.
         if self.engine is not None:
-            event.listen(self.engine, "before_cursor_execute", self._before)
-            event.listen(self.engine, "after_cursor_execute", self._after)
+            try:
+                event.listen(self.engine, "before_cursor_execute", self._before)
+                event.listen(self.engine, "after_cursor_execute", self._after)
+            except Exception:  # noqa: BLE001
+                self._detach()
+                self.engine = None
         return self
 
     def __exit__(self, *exc: Any) -> None:
         if self.engine is not None:
-            event.remove(self.engine, "before_cursor_execute", self._before)
-            event.remove(self.engine, "after_cursor_execute", self._after)
+            self._detach()
+
+    def _detach(self) -> None:
+        for name, fn in (("before_cursor_execute", self._before),
+                         ("after_cursor_execute", self._after)):
+            try:
+                if event.contains(self.engine, name, fn):
+                    event.remove(self.engine, name, fn)
+            except Exception:  # noqa: BLE001
+                pass
 
     def top(self, n: int = 4) -> List[str]:
         items = sorted(self.by_key.items(), key=lambda kv: -kv[1][1])[:n]

@@ -502,3 +502,11 @@ def test_sync_namespace_reports_refresh_time(db, monkeypatch):
     # _run_sync глушит _refresh_stale_class_for_namespace, но время фазы пишется.
     stats = kg_sync.sync_namespace(db, "prod-kingdom1", deploys=[_deploy("town-service")])
     assert "refresh_s" in stats
+
+
+def test_sql_meter_never_breaks_sync_when_listen_fails():
+    """Замер на чём-то, куда нельзя подписаться (мок, чужой bind), — no-op."""
+    from unittest.mock import MagicMock
+    with kg_sync._SqlMeter(MagicMock()) as meter:
+        pass
+    assert meter.engine is None and meter.count == 0
