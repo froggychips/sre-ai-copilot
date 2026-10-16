@@ -456,3 +456,129 @@ def test_populate_bad_alert_does_not_poison_session(db, monkeypatch):
     # Session пригодна — service закоммитился.
     db.commit()
     assert db.query(Service).filter(Service.name == "town-service").count() == 1
+
+
+# ── Атрибуция к k8s-target вместо экспортера ───────────────────────────────
+
+
+def _exporter_incident(incident_id, labels, namespace="squad-48-kingdom2"):
+    return Incident(
+        incident_id=incident_id, severity="warning", status="firing",
+        summary="x", description="y", namespace=namespace,
+        labels={"severity": "warning", **labels},
+        annotations={}, starts_at="2026-10-16T10:00:00Z",
+    )
+
+
+def _seed_workload(db, namespace, name):
+    from app.knowledge_graph.populator import upsert_service
+    upsert_service(db, namespace=namespace, name=name, node_kind="workload")
+    db.commit()
+
+
+def test_pod_alert_via_ksm_lands_on_owning_workload(db):
+    """KubePodCrashLooping: `service` = KSM, цель — workload пода. Замер
+    16.10.2026: 91 такой алерт за 30 дней лежал на vm-kube-state-metrics."""
+    _seed_workload(db, "squad-48-kingdom2", "town-service")
+    stats = populate_from_incident(db, _exporter_incident("fp-crash", {
+        "alertname": "KubePodCrashLooping",
+        "namespace": "squad-48-kingdom2",
+        "pod": "town-service-7f8c4b6cdf-h2x9k",
+        "container": "town-service",
+        "service": "vm-kube-state-metrics",
+    }))
+    alert = db.query(AlertEvent).filter_by(fingerprint="fp-crash").one()
+    svc = db.get(Service, alert.service_id)
+    assert svc.name == "town-service" and svc.namespace == "squad-48-kingdom2"
+    assert alert.raw["source"] == "vm-kube-state-metrics"
+    assert alert.raw["attribution"] == "pod"
+    assert db.query(Service).filter_by(name="vm-kube-state-metrics").count() == 0
+    assert "attribution_unresolved" not in stats
+    assert stats.get("kg_incident_id") is not None
+
+
+def test_deleted_pod_alert_is_not_attributed_to_exporter(db):
+    """Workload'а пода в графе нет (под удалён) — алерт без сервиса, а не на
+    KSM: guardrail против того же бага для удалённых подов."""
+    stats = populate_from_incident(db, _exporter_incident("fp-gone", {
+        "alertname": "KubeContainerWaiting",
+        "namespace": "squad-48-kingdom2",
+        "pod": "old-worker-5d9c7b8f6d-zz9kq",
+        "container": "old-worker",
+        "service": "vm-kube-state-metrics",
+    }))
+    alert = db.query(AlertEvent).filter_by(fingerprint="fp-gone").one()
+    assert alert.service_id is None
+    assert alert.raw["source"] == "vm-kube-state-metrics"
+    assert alert.raw["attribution"] == "no_target"
+    assert stats["attribution_unresolved"] == 1
+    assert db.query(Service).count() == 0
+    assert db.query(KGIncident).count() == 0
+
+
+def test_node_alert_via_node_exporter_has_no_service(db):
+    """Node* от node-exporter: объект — нода; namespace=monitoring и
+    service=vm-node-exporter — метки скрейпа."""
+    populate_from_incident(db, _exporter_incident("fp-node", {
+        "alertname": "NodeDiskIOSaturation",
+        "namespace": "monitoring",
+        "pod": "vm-node-exporter-gbn9k",
+        "service": "vm-node-exporter",
+        "node": "prod-k7",
+    }, namespace="monitoring"))
+    alert = db.query(AlertEvent).filter_by(fingerprint="fp-node").one()
+    assert alert.service_id is None
+    assert alert.raw["node"] == "prod-k7"
+    assert alert.raw["source"] == "vm-node-exporter"
+    assert alert.raw["attribution"] == "node"
+    assert db.query(Service).count() == 0
+
+
+def test_kube_node_alert_via_ksm_has_no_service(db):
+    """KubeNodePressure приходит от KSM с меткой node — тоже нода, не KSM."""
+    populate_from_incident(db, _exporter_incident("fp-knode", {
+        "alertname": "KubeNodePressure",
+        "namespace": "monitoring",
+        "node": "dev-32",
+        "service": "vm-kube-state-metrics",
+    }, namespace="monitoring"))
+    alert = db.query(AlertEvent).filter_by(fingerprint="fp-knode").one()
+    assert alert.service_id is None and alert.raw["attribution"] == "node"
+
+
+def test_ksm_own_pod_is_not_a_target(db):
+    """Алерт про под самого KSM — не повод заводить экспортер владельцем."""
+    _seed_workload(db, "monitoring", "vm-kube-state-metrics")
+    populate_from_incident(db, _exporter_incident("fp-ksm-self", {
+        "alertname": "KubePodNotReady",
+        "namespace": "monitoring",
+        "pod": "vm-kube-state-metrics-7f8c4b6cdf-h2x9k",
+        "service": "vm-kube-state-metrics",
+    }, namespace="monitoring"))
+    alert = db.query(AlertEvent).filter_by(fingerprint="fp-ksm-self").one()
+    assert alert.service_id is None
+
+
+def test_app_alert_without_exporter_keeps_legacy_service(db):
+    """Обычный app-алерт: `service` валиден, raw.source не пишется."""
+    populate_from_incident(db, _incident(incident_id="fp-app"))
+    alert = db.query(AlertEvent).filter_by(fingerprint="fp-app").one()
+    assert db.get(Service, alert.service_id).name == "town-service"
+    assert "source" not in alert.raw
+
+
+def test_kill_switch_keeps_exporter_attribution_for_pod_alerts(db):
+    """Флаг выключен — полностью прежнее поведение, включая pod-алерты."""
+    with patch(
+        "app.services.alert_enrichment.settings.ATTRIBUTION_RESOLVE_KUBE_TARGET_ENABLED",
+        False,
+    ):
+        populate_from_incident(db, _exporter_incident("fp-ks", {
+            "alertname": "KubePodCrashLooping",
+            "namespace": "squad-48-kingdom2",
+            "pod": "town-service-7f8c4b6cdf-h2x9k",
+            "service": "vm-kube-state-metrics",
+        }))
+    alert = db.query(AlertEvent).filter_by(fingerprint="fp-ks").one()
+    assert db.get(Service, alert.service_id).name == "vm-kube-state-metrics"
+    assert "source" not in alert.raw

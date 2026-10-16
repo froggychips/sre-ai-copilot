@@ -41,19 +41,23 @@ def populate_from_incident(db: Session, incident: Incident) -> Dict[str, int]:
     stats = {"services_touched": 0, "deploys_added": 0, "alerts_added": 0}
 
     labels = incident.labels or {}
-    # STORE-путь синхронизирован с enrichment-путём: у kube-resource-алертов
-    # (KubeDeployment*/StatefulSet*/DaemonSet*) лейбл `service` = метрика-источник
-    # kube-state-metrics (`vm-kube-state-metrics`), не target. resolve_store_service
-    # берёт target workload при наличии deployment/statefulset/daemonset, иначе —
-    # прежнюю fallback-цепочку `service→app→deployment` (app-алерты не трогаем).
-    from app.services.alert_enrichment import resolve_store_service
-    service_name = resolve_store_service(
+    # Алерт пишется на свой k8s-target, а не на экспортер метрики: у
+    # kube-resource-алертов лейбл `service` = источник (`vm-kube-state-metrics`,
+    # `vm-node-exporter`). Под → workload, нода → без сервиса, цель не нашлась →
+    # без сервиса; экспортер остаётся только в raw.source. Обычные app-алерты —
+    # прежняя fallback-цепочка `service→app→deployment`.
+    from app.services.alert_enrichment import (STORE_SCOPE_UNRESOLVED,
+                                               resolve_store_target)
+    target = resolve_store_target(
         labels,
         legacy_default=(
             labels.get("service") or labels.get("app") or labels.get("deployment")
         ),
-        db=db,   # владелец Job/CronJob — из kg_k8s_jobs
+        db=db,   # владелец Job/CronJob — из kg_k8s_jobs; workload пода — из графа
     )
+    service_name = target.service
+    if target.scope == STORE_SCOPE_UNRESOLVED:
+        stats["attribution_unresolved"] = 1
     namespace = incident.namespace
 
     # Сначала Service — если его можно определить. Без него граф обогащать
@@ -150,6 +154,12 @@ def populate_from_incident(db: Session, incident: Incident) -> Dict[str, int]:
     # источника kg_nodes (зона, точки входа) — labels целиком в raw не лежат.
     if labels.get("node"):
         alert_raw["node"] = labels["node"]
+    # Экспортер, через который пришёл алерт: источник метрики, не владелец.
+    # По `attribution` видно, как определён объект (pod/node/no_target/…) —
+    # без этого «без сервиса» нодового алерта и неразрешённого не различить.
+    if target.source:
+        alert_raw["source"] = target.source
+        alert_raw["attribution"] = target.how
     if fired_at is not None:
         try:
             with db.begin_nested():
