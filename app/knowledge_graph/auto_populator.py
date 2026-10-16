@@ -134,6 +134,10 @@ def populate_from_incident(db: Session, incident: Incident) -> Dict[str, int]:
     # каждым уведомлением, и следующий полный batch честно снимает пометку.
     if incident.batch_truncated_alerts:
         alert_raw["batch_truncated_alerts"] = incident.batch_truncated_alerts
+    # Нода нодового алерта: по ней датасет live-RCA восстанавливает скоуп
+    # источника kg_nodes (зона, точки входа) — labels целиком в raw не лежат.
+    if labels.get("node"):
+        alert_raw["node"] = labels["node"]
     if fired_at is not None:
         try:
             with db.begin_nested():

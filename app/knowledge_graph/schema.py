@@ -1044,3 +1044,77 @@ class KGRemediationEvent(Base):
         # событие. run_id NULL уникальностью не ограничен (SQL-семантика NULL).
         UniqueConstraint("actor", "run_id", "namespace", name="uq_kg_remediation_events_run"),
     )
+
+
+class K8sNode(Base):
+    """Нода кластера: в какой зоне/датацентре она живёт.
+
+    До этой таблицы граф про ноды не знал ничего — ни одного вызова
+    `kubectl get nodes` в синках. Вопрос «что ещё стоит в той же зоне» при
+    нодовом алерте оставался без ответа, хотя метки
+    `topology.kubernetes.io/zone` / `region` на нодах есть.
+
+    Пишет `k8s_nodes_sync.sync_nodes` (строка на имя ноды). Нода, пропавшая
+    из API, не удаляется: `deleted_at` ставится, строка остаётся для истории.
+    Point-in-time чтение: `first_seen_at <= T` и (`deleted_at` IS NULL или
+    `deleted_at > T`). Атрибуты (zone, адреса) — последнее известное
+    состояние, а не история.
+    """
+    __tablename__ = "kg_nodes"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    name: Mapped[str] = mapped_column(String, nullable=False)
+    zone: Mapped[Optional[str]] = mapped_column(String, nullable=True)
+    region: Mapped[Optional[str]] = mapped_column(String, nullable=True)
+    internal_ip: Mapped[Optional[str]] = mapped_column(String, nullable=True)
+    external_ip: Mapped[Optional[str]] = mapped_column(String, nullable=True)
+    #: status.addresses целиком: [{"type": "InternalIP", "address": ...}, ...].
+    addresses: Mapped[Optional[Any]] = mapped_column(JSON, nullable=True)
+    #: Роли из меток node-role.kubernetes.io/<role> (control-plane, ...).
+    roles: Mapped[Optional[Any]] = mapped_column(JSON, nullable=True)
+    unschedulable: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default="false")
+    #: Только отобранные метки: zone, region и env/kingdom-метки. Все метки
+    #: ноды — это сотни ключей служебного шума, и в граф они не нужны.
+    labels_json: Mapped[Optional[Any]] = mapped_column(JSON, nullable=True)
+    first_seen_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=datetime.utcnow)
+    last_seen_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=datetime.utcnow)
+    deleted_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+
+    __table_args__ = (
+        UniqueConstraint("name", name="uq_kg_nodes_name"),
+    )
+
+
+class TrafficEntrypoint(Base):
+    """Точка входа трафика: через какую ноду публичный host попадает в кластер.
+
+    LoadBalancer-сервисы здесь — MetalLB L2 с `externalTrafficPolicy: Local`,
+    и публичный IP балансировщика обычно совпадает с адресом самой ноды.
+    Значит отказ ноды роняет вход для всех host-ов, что на неё резолвятся,
+    — в том числе чужих стендов, чьих подов на этой ноде нет вовсе. Без этой
+    таблицы такая связь не видна ни из графа сервисов, ни из алерта.
+
+    Строка на host из Ingress (`spec.rules[].host`, без wildcard). Пишет
+    `k8s_nodes_sync.sync_entrypoints`: DNS-резолв host-а (IPv4) сверяется с
+    адресами нод (`entry_nodes`) и с IP LoadBalancer-сервисов
+    (`lb_services`). Point-in-time — как у `kg_nodes`.
+    """
+    __tablename__ = "kg_entrypoints"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    host: Mapped[str] = mapped_column(String, nullable=False)
+    #: Во что host резолвится (IPv4). Пусто — резолв не удался на этом тике.
+    resolved_ips: Mapped[Optional[Any]] = mapped_column(JSON, nullable=True)
+    #: "namespace/name" LoadBalancer-сервисов с совпавшим IP.
+    lb_services: Mapped[Optional[Any]] = mapped_column(JSON, nullable=True)
+    #: Имена нод, чей адрес совпал с резолвом host-а.
+    entry_nodes: Mapped[Optional[Any]] = mapped_column(JSON, nullable=True)
+    #: Классы Ingress-ов, которые обслуживают host.
+    ingress_classes: Mapped[Optional[Any]] = mapped_column(JSON, nullable=True)
+    first_seen_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=datetime.utcnow)
+    last_seen_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=datetime.utcnow)
+    deleted_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+
+    __table_args__ = (
+        UniqueConstraint("host", name="uq_kg_entrypoints_host"),
+    )
