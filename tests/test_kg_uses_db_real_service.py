@@ -413,17 +413,30 @@ def _seed_deploys(db):
         (a, t0 - timedelta(days=1), None),                          # без extras — свой
         (b, t0 + timedelta(hours=2), {"namespace_scope": True}),    # только broadcast
     ]
+    # Небулевые значения — truthiness как в Python (ревью Codex).
+    odd = [
+        ("false", True), ("0", True), ("", False), (0, False), (0.0, False),
+        (2, True), ([], False), ([1], True), ({}, False), ({"x": 1}, True), (None, False),
+    ]
+    for i, (val, _) in enumerate(odd):
+        c = upsert_service(db, "agg-ns", f"svc-odd-{i}")
+        rows.append((c, t0, {"namespace_scope": val}))
+    rows += [
+    ]
     for svc, started, extras in rows:
         db.add(Deployment(service_id=svc.id, started_at=started, extras=extras))
     db.flush()
-    return [a.id, b.id]
+    return [a.id, b.id] + [
+        sid for (sid,) in db.query(Service.id).filter(Service.name.like("svc-odd-%")).all()
+    ]
 
 
 def test_last_deploys_python_path_splits_broadcast(db):
     ids = _seed_deploys(db)
     svc, ns = kg_sync._last_deploys_by_service(db, ids)
-    assert svc == {ids[0]: datetime(2026, 10, 1, 12, 0)}
-    assert ns == {ids[0]: datetime(2026, 10, 1, 13, 0), ids[1]: datetime(2026, 10, 1, 14, 0)}
+    assert svc[ids[0]] == datetime(2026, 10, 1, 12, 0)
+    assert ns[ids[0]] == datetime(2026, 10, 1, 13, 0)
+    assert ns[ids[1]] == datetime(2026, 10, 1, 14, 0) and ids[1] not in svc
 
 
 @pytest.fixture

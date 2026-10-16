@@ -1243,9 +1243,9 @@ def _last_deploys_by_service(
     kg_topology_sync ~510 с уходило сюда.
 
     Признак ns-broadcast — тот же, что в `is_ns_broadcast_deploy`
-    (truthiness `extras.namespace_scope`): пишется булевым (`tc_deploys_to_kg`),
-    поэтому в SQL — текст `->>` не из ('', 'false', '0'). На других СУБД
-    (sqlite в тестах) — прежний Python-путь.
+    (Python truthiness `extras.namespace_scope`), в SQL повторён по типу JSON.
+    Пишется булевым (`tc_deploys_to_kg`), но эквивалентность держится и на
+    прочих значениях. На других СУБД (sqlite в тестах) — прежний Python-путь.
     """
     last_service: Dict[int, datetime] = {}
     last_ns: Dict[int, datetime] = {}
@@ -1258,7 +1258,15 @@ def _last_deploys_by_service(
             "  max(started_at) FILTER (WHERE b) AS ns_max "
             "FROM ("
             "  SELECT service_id, started_at, "
-            "    coalesce(extras::json->>:key, '') NOT IN ('', 'false', '0') AS b "
+            # Точная копия Python truthiness `extras.get(key)` по типу JSON
+            # (ревью Codex): строка "false" истинна, 0.0 и [] — ложны.
+            "    CASE json_typeof(extras::json->:key) "
+            "      WHEN 'boolean' THEN (extras::json->>:key)::boolean "
+            "      WHEN 'number'  THEN (extras::json->>:key)::numeric <> 0 "
+            "      WHEN 'string'  THEN (extras::json->>:key) <> '' "
+            "      WHEN 'array'   THEN json_array_length(extras::json->:key) > 0 "
+            "      WHEN 'object'  THEN (extras::json->:key)::jsonb <> '{}'::jsonb "
+            "      ELSE false END AS b "
             "  FROM kg_deployments "
             "  WHERE service_id = ANY(:ids) AND started_at IS NOT NULL"
             ") t GROUP BY service_id"
