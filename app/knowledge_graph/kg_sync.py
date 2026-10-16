@@ -20,6 +20,7 @@ from typing import Any, Dict, List, NamedTuple, Optional, Set, Tuple, cast
 
 from sqlalchemy import cast as sa_cast
 from sqlalchemy import or_
+from sqlalchemy import text as sa_text
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Session, aliased
 
@@ -35,6 +36,7 @@ from app.knowledge_graph.edge_decay_guard import (
 from app.knowledge_graph.populator import upsert_edge, upsert_service
 from app.knowledge_graph.schema import NODE_KIND_SERVICE, Deployment, Service, ServiceEdge
 from app.knowledge_graph.stale_classifier import (
+    NS_BROADCAST_EXTRAS_KEY,
     classify_stale_with_deploys,
     is_ns_broadcast_deploy,
 )
@@ -1229,6 +1231,60 @@ def sync_namespace(
     return stats
 
 
+def _last_deploys_by_service(
+    db: Session, svc_ids: List[int],
+) -> Tuple[Dict[int, datetime], Dict[int, datetime]]:
+    """max(started_at) по сервису — отдельно свой деплой и ns-broadcast.
+
+    На PostgreSQL — один GROUP BY в базе. Раньше строки `kg_deployments`
+    выгружались в Python целиком вместе с JSON `extras`: 16.10.2026 таблица —
+    784 тыс. строк (+166 тыс. в неделю), на `preprod-shared` 138 тыс., и
+    пересчёт класса одного namespace шёл до 31 с — из 611 с прохода
+    kg_topology_sync ~510 с уходило сюда.
+
+    Признак ns-broadcast — тот же, что в `is_ns_broadcast_deploy`
+    (truthiness `extras.namespace_scope`): пишется булевым (`tc_deploys_to_kg`),
+    поэтому в SQL — текст `->>` не из ('', 'false', '0'). На других СУБД
+    (sqlite в тестах) — прежний Python-путь.
+    """
+    last_service: Dict[int, datetime] = {}
+    last_ns: Dict[int, datetime] = {}
+    if not svc_ids:
+        return last_service, last_ns
+    if db.get_bind().dialect.name == "postgresql":
+        rows: Any = db.execute(sa_text(
+            "SELECT service_id, "
+            "  max(started_at) FILTER (WHERE NOT b) AS svc_max, "
+            "  max(started_at) FILTER (WHERE b) AS ns_max "
+            "FROM ("
+            "  SELECT service_id, started_at, "
+            "    coalesce(extras::json->>:key, '') NOT IN ('', 'false', '0') AS b "
+            "  FROM kg_deployments "
+            "  WHERE service_id = ANY(:ids) AND started_at IS NOT NULL"
+            ") t GROUP BY service_id"
+        ), {"ids": list(svc_ids), "key": NS_BROADCAST_EXTRAS_KEY}).fetchall()
+        for sid, svc_max, ns_max in rows:
+            if svc_max is not None:
+                last_service[sid] = svc_max
+            if ns_max is not None:
+                last_ns[sid] = ns_max
+        return last_service, last_ns
+
+    deploy_rows = (
+        db.query(Deployment.service_id, Deployment.started_at, Deployment.extras)
+        .filter(Deployment.service_id.in_(svc_ids))
+        .all()
+    )
+    for sid, started_at, extras in deploy_rows:
+        if started_at is None:
+            continue
+        bucket = last_ns if is_ns_broadcast_deploy(extras) else last_service
+        known = bucket.get(sid)
+        if known is None or started_at > known:
+            bucket[sid] = started_at
+    return last_service, last_ns
+
+
 def _refresh_stale_class_for_namespace(db: Session, namespace: str) -> int:
     """Пересчитать ``kg_services.stale_class`` для всех сервисов в namespace.
 
@@ -1253,23 +1309,7 @@ def _refresh_stale_class_for_namespace(db: Session, namespace: str) -> int:
         return 0
 
     svc_ids = [s.id for s in services]
-    # extras — JSON-колонка, и маркер приходится разбирать в Python: предикат
-    # по JSON различается между PG и sqlite (тесты гоняются на sqlite), а
-    # выборка ограничена сервисами одного namespace, так что это дёшево.
-    deploy_rows = (
-        db.query(Deployment.service_id, Deployment.started_at, Deployment.extras)
-        .filter(Deployment.service_id.in_(svc_ids))
-        .all()
-    )
-    last_service_deploy: Dict[int, datetime] = {}
-    last_ns_deploy: Dict[int, datetime] = {}
-    for sid, started_at, extras in deploy_rows:
-        if started_at is None:
-            continue
-        bucket = last_ns_deploy if is_ns_broadcast_deploy(extras) else last_service_deploy
-        known = bucket.get(sid)
-        if known is None or started_at > known:
-            bucket[sid] = started_at
+    last_service_deploy, last_ns_deploy = _last_deploys_by_service(db, svc_ids)
 
     # Живые k8s Service namespace — для правила «-cnpg-rw без клиентов» (#493):
     # он инфра, только если рядом жив алиас `<база>-db-postgresql`. Живость —
