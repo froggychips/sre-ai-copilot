@@ -26,7 +26,7 @@ from sqlalchemy.orm import Session
 from app.knowledge_graph.kubectl_breaker import run_kubectl
 from app.knowledge_graph.contract import (
     OWNER_SOURCE_NAMESPACE_PREFIX, OWNER_SOURCE_PLATFORM_STATIC,
-    STALE_CLASS_GONE, shared_namespace_of,
+    EDGE_SERVES_TRAFFIC, STALE_CLASS_GONE, shared_namespace_of,
 )
 from app.knowledge_graph.edge_decay_guard import (
     REASON_UNMAPPED_KIND, SOURCE_KG_SYNC, edge_block_reason, record_source_run,
@@ -809,6 +809,10 @@ _DB_SERVICE_NAME_TEMPLATES: Dict[str, Tuple[str, ...]] = {
     "clickhouse": ("clickhouse",),
 }
 
+#: Сколько Service базы может не подтверждаться синком топологии и всё ещё
+#: считаться живым. См. `_load_db_service_cache`.
+_DB_SERVICE_SEEN_WINDOW = timedelta(hours=24)
+
 #: (namespace, name) → id узла-k8s Service, к которому можно вести uses_db.
 #: Строится раз за проход, как `_EXISTING_NS_CACHE`.
 _DB_SERVICE_CACHE: Optional[Dict[Tuple[str, str], int]] = None
@@ -823,7 +827,28 @@ def _load_db_service_cache(db: Session) -> Dict[Tuple[str, str], int]:
     16.10.2026 — `prod-shared/config-db-postgresql` и `prod-kingdom5/
     town-db-postgresql` живые, но synthetic=true). Узлы снесённых namespace
     (`stale_class='gone'`) не берём: ребро в них было бы ложью.
+
+    `k8s_service` говорит лишь, что Service КОГДА-ТО был: при удалении Service
+    внутри живого namespace узел остаётся с теми же metadata. Без проверки
+    присутствия удалённый `config-db-postgresql` выигрывал бы у живого
+    `config-db-cnpg-rw` вечно (ревью Codex, PR #488). Присутствие —
+    `last_seen_at` ребра serves_traffic Service → backing workload: его
+    освежает k8s_topology_resources_sync, только пока Service есть в кластере
+    (замер 16.10.2026: у всех 821 живого Service баз — свежее 2 ч). Окно
+    `_DB_SERVICE_SEEN_WINDOW` с запасом на сбой синка: короче — и простой
+    синка перекидывал бы рёбра на синтетику и обратно.
     """
+    seen_cutoff = datetime.utcnow() - _DB_SERVICE_SEEN_WINDOW
+    seen_ids = {
+        sid for (sid,) in (
+            db.query(ServiceEdge.src_id)
+            .filter(ServiceEdge.kind == EDGE_SERVES_TRAFFIC,
+                    ServiceEdge.src_id != ServiceEdge.dst_id,
+                    ServiceEdge.last_seen_at >= seen_cutoff)
+            .distinct()
+            .all()
+        )
+    }
     names = {
         tpl.format(base="%") for tpls in _DB_SERVICE_NAME_TEMPLATES.values()
         for tpl in tpls
@@ -837,7 +862,7 @@ def _load_db_service_cache(db: Session) -> Dict[Tuple[str, str], int]:
     )
     index: Dict[Tuple[str, str], int] = {}
     for svc_id, ns, name, meta in rows:
-        if isinstance(meta, dict) and meta.get("k8s_service"):
+        if isinstance(meta, dict) and meta.get("k8s_service") and svc_id in seen_ids:
             index[(ns, name)] = svc_id
     return index
 

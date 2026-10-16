@@ -5,6 +5,8 @@
 85 орфанов были базами, а blast radius от StatefulSet базы до клиентов не
 доходил. Здесь — резолв hint → Service и замена старого ребра.
 """
+from datetime import datetime, timedelta
+
 import pytest
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
@@ -35,8 +37,10 @@ def db():
         engine.dispose()
 
 
-def _k8s_svc(db, ns, name, *, synthetic=False, stale_class=None):
-    """Узел так, как его пишет k8s_topology_resources_sync из живого Service."""
+def _k8s_svc(db, ns, name, *, synthetic=False, stale_class=None, seen_hours_ago=0):
+    """Узел так, как его пишет k8s_topology_resources_sync из живого Service:
+    metadata.k8s_service + ребро serves_traffic в backing workload, которое
+    синк освежает, пока Service есть в кластере."""
     svc = upsert_service(
         db, ns, name,
         metadata={"k8s_service": {"service_type": "ClusterIP"}},
@@ -44,6 +48,9 @@ def _k8s_svc(db, ns, name, *, synthetic=False, stale_class=None):
     )
     if stale_class is not None:
         svc.stale_class = stale_class
+    workload = upsert_service(db, ns, name, node_kind="workload")
+    edge = upsert_edge(db, svc, workload, kind="serves_traffic")
+    edge.last_seen_at = datetime.utcnow() - timedelta(hours=seen_hours_ago)
     db.flush()
     return svc
 
@@ -120,6 +127,24 @@ def test_cnpg_rw_used_when_no_postgresql_service(db):
     _k8s_svc(db, "preprod-shared", "mv-db-cnpg-rw")
     found = _resolve_db_service(db, "postgres", "mv", "preprod-kingdom2")
     assert found.name == "mv-db-cnpg-rw"
+
+
+def test_deleted_service_loses_to_live_cnpg_rw(db):
+    """Удалённый внутри живого namespace Service не должен выигрывать вечно.
+
+    Узел и его metadata.k8s_service остаются после удаления Service; живость
+    видна только по свежести serves_traffic (ревью Codex, PR #488).
+    """
+    _k8s_svc(db, "prod-shared", "config-db-postgresql", seen_hours_ago=60 * 24)
+    _k8s_svc(db, "prod-shared", "config-db-cnpg-rw")
+    found = _resolve_db_service(db, "postgres", "config", "prod-kingdom1")
+    assert found.name == "config-db-cnpg-rw"
+
+
+def test_short_sync_outage_keeps_service(db):
+    """Сбой синка на пару часов не должен перекидывать рёбра на синтетику."""
+    _k8s_svc(db, "prod-shared", "config-db-postgresql", seen_hours_ago=3)
+    assert _resolve_db_service(db, "postgres", "config", "prod-kingdom1") is not None
 
 
 def test_clickhouse_resolves_by_product_name(db):
