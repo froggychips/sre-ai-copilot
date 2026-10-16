@@ -88,6 +88,38 @@ def test_classify_stale_backup_infix_is_expected():
     assert _classify_stale("chat-backup-restore", "prod-kingdom2") == "expected"
 
 
+def test_classify_stale_cnpg_unused_services_are_expected():
+    # Реплики и DR-кластер CNPG: приложения к ним не подключаются.
+    for name in ("town-db-cnpg-r", "town-db-cnpg-ro", "mv-db-cnpg-dr-r",
+                 "mv-db-cnpg-dr-ro", "mv-db-cnpg-dr-rw", "mv-db-cnpg-dr-primary"):
+        assert _classify_stale(name, "prod-shared") == "expected", name
+
+
+def test_classify_stale_cnpg_rw_and_bitnami_stay_app_scope():
+    # Точку записи и bitnami-базу связывает ребро uses_db — не прятать.
+    assert _classify_stale("town-db-cnpg-rw", "prod-kingdom5") == "suspicious"
+    assert _classify_stale("town-db-postgresql", "prod-kingdom1") == "suspicious"
+    assert _classify_stale("town-db-cnpg-rw-proxy", "prod-kingdom5") == "suspicious"
+
+
+def test_classify_stale_new_infra_namespaces_are_expected():
+    for ns in ("cnpg-system", "sre-ai-ci", "ai-reviewer-net", "asset-lock"):
+        assert _classify_stale("anything", ns) == "expected", ns
+
+
+def test_classify_3class_infra_namespace_wins_over_recent_deploy():
+    """copilot-worker в sre-ai катится постоянно, но остаётся вне app-scope."""
+    now = datetime(2026, 10, 16, 12, 0, 0)
+    yesterday = now - timedelta(days=1)
+    assert (
+        classify_stale_with_deploys(
+            "copilot-worker", "sre-ai", None,
+            last_service_deploy_at=yesterday, now=now,
+        )
+        == STALE_CLASS_EXPECTED
+    )
+
+
 # ── classify_stale_with_deploys (3-class) ───────────────────────────────────
 
 

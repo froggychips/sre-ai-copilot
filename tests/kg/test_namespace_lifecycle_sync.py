@@ -284,6 +284,52 @@ def test_returned_namespace_services_are_reclassified(db, cluster):
     assert stats["services_reclassified"] == 1
 
 
+def test_never_seen_namespace_is_adopted_as_missing_and_swept(db, cluster):
+    """Узлы есть, строки kg_namespaces нет, в кластере namespace нет.
+
+    Кейс squad-52-kingdom5/7 (16.10.2026): стенд жил между тиками lifecycle,
+    узлы завёл синк топологии, и 52 узла месяц держали stale_class=NULL —
+    sweep искал только по известным строкам kg_namespaces.
+    """
+    db.add(Service(name="town-db-postgresql", namespace="squad-52-kingdom5",
+                   synthetic=False, stale_class=None))
+    db.add(_svc("prod-kingdom1"))
+    db.commit()
+    cluster({"prod-kingdom1": ("uid-p", NOW)})
+
+    stats = sync_namespace_lifecycle(db)
+
+    svc = db.query(Service).filter_by(namespace="squad-52-kingdom5").one()
+    assert svc.stale_class == STALE_CLASS_GONE
+    row = db.query(Namespace).filter_by(namespace="squad-52-kingdom5").one()
+    assert row.state == NS_STATE_MISSING
+    assert row.missing_since is not None
+    assert stats["adopted_missing"] == 1
+    assert "squad-52-kingdom5" in nl.missing_namespace_names(db)
+
+    # Второй тик: строка уже есть — не плодим, missing_since не сбрасываем.
+    first_missing = row.missing_since
+    stats2 = sync_namespace_lifecycle(db)
+    assert stats2.get("adopted_missing", 0) == 0
+    assert db.query(Namespace).filter_by(namespace="squad-52-kingdom5").one().missing_since == first_missing
+
+
+def test_live_namespace_with_unclassified_services_is_classified(db, cluster):
+    """Системные namespace ns-sync не обходит, и узлы, заведённые туда
+    другими синками, оставались NULL (cattle-system, kube-system, monitoring)."""
+    db.add(Namespace(namespace="cattle-system", k8s_uid="uid-c", state=NS_STATE_ACTIVE))
+    db.add(Service(name="ingress-prod-controller", namespace="cattle-system",
+                   synthetic=False, stale_class=None))
+    db.commit()
+    cluster({"cattle-system": ("uid-c", NOW)})
+
+    stats = sync_namespace_lifecycle(db)
+
+    svc = db.query(Service).one()
+    assert svc.stale_class == "expected_stale"
+    assert stats["services_reclassified"] == 1
+
+
 def test_missing_namespace_names_lists_every_non_active_state(db):
     db.add_all([
         Namespace(namespace="a-live", state=NS_STATE_ACTIVE),

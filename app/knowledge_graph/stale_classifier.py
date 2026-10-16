@@ -7,8 +7,10 @@
   namespace, разосланный всем — см. ``is_ns_broadcast_deploy``) таким
   доказательством НЕ является.
 * ``expected_stale`` — давно не катился, но это норма: backup/cron/system
-  (`*-backup`, `*-cron`, ns `kube-system`, `monitoring`, …) либо infra/platform
-  owner вне ``ACTIVE_WINDOW_DAYS``.
+  (`*-backup`, `*-cron`, CNPG-реплики `*-cnpg-ro`, …) либо infra/platform
+  owner вне ``ACTIVE_WINDOW_DAYS``. Сервис инфра-namespace (`kube-system`,
+  `monitoring`, `sre-ai`, …) — ``expected_stale`` всегда, даже со свежим
+  деплоем: класс решает, входит ли узел в app-scope метрик графа.
 * ``suspicious_stale`` — нет доказанных deploys сервиса за 30d, не
   expected_stale.
 
@@ -36,6 +38,7 @@
 """
 from __future__ import annotations
 
+import re
 from datetime import datetime, timedelta
 from app.core.timeutil import ensure_naive
 from typing import Any, Mapping, Optional
@@ -53,6 +56,13 @@ _EXPECTED_STALE_NAME_SUFFIXES = (
 
 # Infix-эвристика: backup-postgresql, postgres-backup-restore, …
 _EXPECTED_STALE_NAME_INFIXES = ("backup-", "-backup-", "-cron-")
+
+# k8s Service-ы CNPG, к которым приложения НЕ подключаются: реплики (`-r`,
+# `-ro`) и всё DR-кластера. Оператор создаёт их на каждый Cluster сам, рёбер
+# к ним не бывает по дизайну. Замер 15.10.2026: после переезда 9 баз на CNPG
+# они дали 41 из 85 orphan прода. `-cnpg-rw` сюда НЕ входит — это точка записи
+# приложений, её связывает ребро uses_db.
+_EXPECTED_STALE_NAME_RE = re.compile(r"-cnpg-(?:dr-(?:r|ro|rw|primary)|r|ro)$")
 
 # Системные namespace — deployments в них «не катились» по design'у.
 # Расширено 2026-06-06: инфра/система/AI-ML namespaces (infra*/statics/sre-ai/
@@ -80,6 +90,13 @@ _EXPECTED_STALE_NAMESPACES = frozenset({
     "jupyter",
     "ambassador",
     "tools",
+    # Добавлено 16.10.2026 — infra/other orphan в дайджесте 15.10: оператор
+    # CNPG и его плагин, раннеры GitHub Actions копилота, сеть AI-ревьюера,
+    # БД сервиса блокировок ассетов.
+    "cnpg-system",
+    "sre-ai-ci",
+    "ai-reviewer-net",
+    "asset-lock",
 })
 
 # Infra/platform owner: для них допускается «не катился 60d» если запас
@@ -108,6 +125,11 @@ from app.knowledge_graph.contract import STALE_CLASS_VALUES as _CONTRACT_STALE_C
 STALE_CLASS_VALUES = tuple(sorted(_CONTRACT_STALE_CLASS_VALUES))
 
 
+def _is_infra_namespace(namespace: str) -> bool:
+    """Системный/инфра namespace: его сервисы вне app-scope при любых деплоях."""
+    return namespace in _EXPECTED_STALE_NAMESPACES or namespace.startswith("cattle-")
+
+
 def _classify_stale(name: str, namespace: str) -> str:
     """Legacy 2-value эвристика: ``'expected' | 'suspicious'``.
 
@@ -116,14 +138,14 @@ def _classify_stale(name: str, namespace: str) -> str:
     ``stats_digest.stale_deployments_section`` как fallback и в
     ``classify_stale_with_deploys`` как builder.
     """
-    if namespace in _EXPECTED_STALE_NAMESPACES:
-        return "expected"
-    if namespace.startswith("cattle-"):
+    if _is_infra_namespace(namespace):
         return "expected"
     name_lower = name.lower()
     if any(name_lower.endswith(suf) for suf in _EXPECTED_STALE_NAME_SUFFIXES):
         return "expected"
     if any(inf in name_lower for inf in _EXPECTED_STALE_NAME_INFIXES):
+        return "expected"
+    if _EXPECTED_STALE_NAME_RE.search(name_lower):
         return "expected"
     return "suspicious"
 
@@ -187,6 +209,8 @@ def classify_stale_with_deploys(
 
     Решение:
 
+    0. namespace инфраструктурный (``_is_infra_namespace``) → ``expected_stale``
+       при любых деплоях: такие сервисы не входят в app-scope.
     1. ``last_service_deploy_at`` свежее ``active_window_days`` → ``active``.
        Это ЕДИНСТВЕННОЕ доказательство «сервис катился».
     2. name/ns матчат legacy ``_classify_stale`` == ``expected`` → ``expected_stale``.
@@ -235,6 +259,14 @@ def classify_stale_with_deploys(
     # Caller разделил атрибуцию → сырому `last_deploy_at` больше не верим
     # как доказательству «катился сервис».
     attribution_known = svc_naive is not None or ns_naive is not None
+
+    # Инфра-namespace — раньше любых деплоев. `expected_stale` вырезает узел
+    # из app-scope orphan-метрики, а сервисы sre-ai/infra-2/ai-platform
+    # катятся регулярно: по правилу 1 они получали `active` и считались
+    # прикладными сервисами без рёбер (дайджест 15.10.2026: copilot-worker,
+    # teamcity-agent, dm-forward-bot и т.п. в infra/other orphan).
+    if _is_infra_namespace(namespace):
+        return STALE_CLASS_EXPECTED
 
     if svc_naive is not None and svc_naive >= active_cutoff:
         return STALE_CLASS_ACTIVE

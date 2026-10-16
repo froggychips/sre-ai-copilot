@@ -446,10 +446,45 @@ def sync_namespace_lifecycle(db: Session) -> Dict[str, Any]:
     # не перепишет.
     gone_names = [name for name, row in known.items()
                   if name not in live and row.state != NS_STATE_ACTIVE]
+
+    # Namespace, которые есть у узлов графа, но lifecycle не видел живыми
+    # НИ РАЗУ: стенд подняли и снесли между тиками, а узлы успел завести
+    # синк топологии. Строки в kg_namespaces у них нет, поэтому sweep выше
+    # их не находил, и класс узлов оставался NULL навсегда — в app-scope
+    # orphan-метрики. Замер 16.10.2026: squad-52-kingdom5/7, 52 узла с
+    # 11.09. Заводим строку сразу в missing — дальше обычный путь (TTL,
+    # missing_namespace_names для metrics_sync и детектора).
+    graph_namespaces = {
+        str(ns) for (ns,) in db.query(Service.namespace).distinct().all() if ns
+    }
+    for name in sorted(graph_namespaces - set(live) - set(known)):
+        db.add(Namespace(
+            namespace=name, incarnation=1, state=NS_STATE_MISSING,
+            first_seen_at=None, last_seen_at=None, missing_since=now,
+        ))
+        gone_names.append(name)
+        stats["adopted_missing"] = stats.get("adopted_missing", 0) + 1
+        log.info("kg_namespace.adopted_missing", namespace=name)
+
     stats["services_gone"] = mark_services_gone(db, gone_names)
+
+    # Живые namespace с неклассифицированными узлами. ns-sync обходит не всё:
+    # `_discover_namespaces` намеренно пропускает системные (kube-*, cattle-*,
+    # monitoring), и узлы, заведённые там другими синками (Service-топология,
+    # ingress), классификатор не видел никогда — NULL вместо expected_stale.
+    # Пересчёт тем же классификатором, что и у вернувшихся.
+    unclassified = {
+        str(ns) for (ns,) in (
+            db.query(Service.namespace)
+            .filter(Service.stale_class.is_(None), Service.namespace.in_(list(live)))
+            .distinct().all()
+        ) if ns
+    }
     # Вернувшийся namespace: класс пересчитать сразу, не дожидаясь очередного
     # ns-sync — иначе живой стенд до часа читался бы как снесённый.
-    stats["services_reclassified"] = _reclassify_returned(db, returned_names)
+    stats["services_reclassified"] = _reclassify_returned(
+        db, sorted(set(returned_names) | unclassified),
+    )
 
     db.commit()
     log.info("kg_namespace.lifecycle_synced", **stats)
