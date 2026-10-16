@@ -1175,7 +1175,9 @@ def check_graph_integrity(db: Session) -> CheckResult:
         .join(src_s, ServiceEdge.src_id == src_s.id)
         .join(ns_dst, ns_dst.namespace == dst_s.namespace)
         .join(ns_src, ns_src.namespace == src_s.namespace)
-        .filter(dst_s.name.like("db:%"),
+        # С #488 uses_db ведёт и в настоящий k8s Service базы, не только в
+        # синтетический `db:`-узел — по имени такие рёбра не находились.
+        .filter(or_(dst_s.name.like("db:%"), ServiceEdge.kind == "uses_db"),
                 ns_dst.state == "missing",
                 ns_src.state == "active")
         .scalar()
@@ -1204,7 +1206,7 @@ def check_graph_integrity(db: Session) -> CheckResult:
                  dst_s.name, dst_s.node_kind)
         .join(dst_s, ServiceEdge.dst_id == dst_s.id)
         .join(src_s, ServiceEdge.src_id == src_s.id)
-        .filter(dst_s.name.like("db:%"), ServiceEdge.kind == "uses_db")
+        .filter(ServiceEdge.kind == "uses_db")  # и `db:`-узлы, и k8s Service баз (#488)
         .all()
     ):
         src_realm = shared_namespace_of(src_ns)
@@ -1213,8 +1215,11 @@ def check_graph_integrity(db: Session) -> CheckResult:
             continue
         has_own = (
             db.query(own_db.id)
+            # Свой узел ищем и в shared, и в namespace клиента: с #488 базы
+            # королевства (town/map/message) — это k8s Service в самом
+            # `prod-kingdomN`, а не `db:`-узел в shared (ревью Codex).
             .filter(own_db.name == db_name,
-                    own_db.namespace == src_realm,
+                    own_db.namespace.in_([src_realm, src_ns]),
                     own_db.node_kind == db_kind)
             .first()
         )

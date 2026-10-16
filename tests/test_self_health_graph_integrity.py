@@ -113,6 +113,39 @@ def test_live_service_pointing_at_db_in_missing_namespace(db):
     assert r.detail["live_edges_into_missing_ns_db"] == 150
 
 
+def test_uses_db_into_real_service_in_missing_namespace_is_counted(db):
+    """С #488 uses_db ведёт и в k8s Service базы — имя уже не `db:%`.
+
+    Фильтр по имени делал такие рёбра невидимыми: снесли namespace базы —
+    рёбра живых клиентов в него проверка не замечала (ревью Codex).
+    """
+    _ns(db, "prod-kingdom1", "active")
+    _ns(db, "preprod-kingdom1", "missing")
+    dead_db = _svc(db, "town-db-postgresql", "preprod-kingdom1")
+    live = _svc(db, "town-service", "prod-kingdom1")
+    _edge(db, live.id, dead_db.id, kind="uses_db")
+    # serves_traffic в тот же namespace — не база, не считается.
+    other = _svc(db, "ingress-thing", "preprod-kingdom1")
+    _edge(db, live.id, other.id, kind="calls")
+    db.commit()
+    r = check_graph_integrity(db)
+    assert r.detail["live_edges_into_missing_ns_db"] == 1
+
+
+def test_cross_realm_edge_into_kingdom_db_with_own_copy_is_counted(db):
+    """Клиент prod-kingdom1 смотрит в town-db препрода, а своя town-db — в его
+    же namespace (база королевства). Свой узел искался только в shared."""
+    _ns(db, "prod-kingdom1", "active")
+    _ns(db, "preprod-kingdom1", "active")
+    wrong = _svc(db, "town-db-postgresql", "preprod-kingdom1")
+    _svc(db, "town-db-postgresql", "prod-kingdom1")
+    client = _svc(db, "town-service", "prod-kingdom1")
+    _edge(db, client.id, wrong.id, kind="uses_db")
+    db.commit()
+    r = check_graph_integrity(db)
+    assert r.detail["cross_realm_db_edges"] == 1
+
+
 def test_dead_to_dead_db_edges_are_not_counted(db):
     """Снесённый сквад ссылается на свою же базу — это мусор, а не ложь.
 
