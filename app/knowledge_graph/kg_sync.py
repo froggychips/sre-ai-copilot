@@ -1271,6 +1271,30 @@ def _refresh_stale_class_for_namespace(db: Session, namespace: str) -> int:
         if known is None or started_at > known:
             bucket[sid] = started_at
 
+    # Живые k8s Service namespace — для правила «-cnpg-rw без клиентов» (#493):
+    # он инфра, только если рядом жив алиас `<база>-db-postgresql`. Живость —
+    # тот же признак, что у резолвера uses_db: metadata.k8s_service и
+    # serves_traffic, освежённый синком топологии за `_DB_SERVICE_SEEN_WINDOW`.
+    # Все имена узлов брать нельзя: workload с тем же именем или узел
+    # удалённого Service ложно совпали бы с алиасом.
+    seen_cutoff = datetime.utcnow() - _DB_SERVICE_SEEN_WINDOW
+    seen_src = {
+        sid for (sid,) in (
+            db.query(ServiceEdge.src_id)
+            .filter(ServiceEdge.src_id.in_(svc_ids),
+                    ServiceEdge.kind == EDGE_SERVES_TRAFFIC,
+                    ServiceEdge.src_id != ServiceEdge.dst_id,
+                    ServiceEdge.last_seen_at >= seen_cutoff)
+            .distinct()
+            .all()
+        )
+    }
+    live_service_names = {
+        cast(str, s.name) for s in services
+        if s.node_kind == NODE_KIND_SERVICE and s.id in seen_src
+        and isinstance(s.metadata_json, dict) and s.metadata_json.get("k8s_service")
+    }
+
     updated = 0
     for svc in services:
         svc_id_int: int = cast(int, svc.id)
@@ -1284,6 +1308,7 @@ def _refresh_stale_class_for_namespace(db: Session, namespace: str) -> int:
             last_service_deploy_at=last_service_deploy.get(svc_id_int),
             last_ns_deploy_at=last_ns_deploy.get(svc_id_int),
             team_owner=cast(Optional[str], svc.team_owner),
+            live_service_names=live_service_names,
         )
         if svc.stale_class != new_class:
             svc.stale_class = new_class

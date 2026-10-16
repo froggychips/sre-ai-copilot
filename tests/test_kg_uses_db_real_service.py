@@ -374,3 +374,24 @@ def test_rolled_back_drop_is_redone_on_next_call(db, monkeypatch):
     sync_namespace(db, "prod-kingdom1", deploys=[deploy])
     db.commit()
     assert db.query(ServiceEdge).filter_by(dst_id=old_db.id, kind="uses_db").count() == 0
+
+
+# ── stale_class: -cnpg-rw рядом с живым -db-postgresql (#493) ───────────────
+
+
+def test_unused_cnpg_rw_is_expected_when_postgresql_alias_is_live(db):
+    """kg_sync передаёт классификатору живые Service namespace: `-cnpg-rw`
+    без клиентов при живом `-db-postgresql` (переключён на primary) — инфра."""
+    _k8s_svc(db, "prod-shared", "config-db-postgresql")
+    rw = _k8s_svc(db, "prod-shared", "config-db-cnpg-rw")
+    kg_sync._refresh_stale_class_for_namespace(db, "prod-shared")
+    assert rw.stale_class == "expected_stale"
+
+
+def test_cnpg_rw_stays_in_scope_when_postgresql_alias_is_gone(db):
+    """Удалённый `-db-postgresql` (serves_traffic не освежается) — алиаса нет,
+    `-cnpg-rw` может быть реальной целью uses_db и из app-scope не уходит."""
+    _k8s_svc(db, "prod-shared", "config-db-postgresql", seen_hours_ago=60 * 24)
+    rw = _k8s_svc(db, "prod-shared", "config-db-cnpg-rw")
+    kg_sync._refresh_stale_class_for_namespace(db, "prod-shared")
+    assert rw.stale_class != "expected_stale"
