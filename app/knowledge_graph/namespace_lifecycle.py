@@ -33,6 +33,7 @@ from sqlalchemy.orm import Session
 from app.core.timeutil import parse_ts
 from app.knowledge_graph.contract import STALE_CLASS_GONE
 from app.knowledge_graph.kubectl_breaker import run_kubectl
+from app.knowledge_graph.nats_subjects_sync import NATS_SUBJECTS_NAMESPACE
 from app.knowledge_graph.schema import (NS_STATE_ACTIVE, NS_STATE_MISSING,
                                         Namespace, Service,
                                         ServiceEdge, ServiceHealth)
@@ -50,6 +51,19 @@ class K8sNamespaceFetchError(RuntimeError):
     помечается missing. Пустой ответ трактуется так же, потому что кластер без
     namespace физически невозможен — это признак сбоя, а не факт.
     """
+
+
+def _namespace_absent(name: str) -> bool:
+    """True только при явном NotFound от `kubectl get ns <name>`.
+
+    Сбой, таймаут, открытый брейкер, любой другой ответ — False: отсутствие
+    не подтверждено, и namespace не трогаем до следующего тика.
+    """
+    try:
+        out = run_kubectl(["kubectl", "get", "ns", name, "-o", "name"], timeout=15)
+    except Exception:  # noqa: BLE001
+        return False
+    return out.returncode != 0 and "NotFound" in (out.stderr or "")
 
 
 def _fetch_namespaces() -> Dict[str, Dict[str, Any]]:
@@ -103,6 +117,9 @@ def _fetch_namespaces() -> Dict[str, Dict[str, Any]]:
 #: Два часа = два прогона самого редкого синка. Одного мало: тик может
 #: совпасть с окном пересоздания и пройти по полупустому namespace.
 _REINCARNATION_GRACE = timedelta(hours=2)
+
+#: Namespace, которых в кластере нет по построению: их узлы — синтетика.
+_SYNTHETIC_NAMESPACES = frozenset({NATS_SUBJECTS_NAMESPACE})
 
 #: Доля рёбер namespace, выше которой чистка НЕ выполняется. Если после
 #: grace-периода неподтверждённым оказалось почти всё, объяснение скорее в
@@ -446,10 +463,58 @@ def sync_namespace_lifecycle(db: Session) -> Dict[str, Any]:
     # не перепишет.
     gone_names = [name for name, row in known.items()
                   if name not in live and row.state != NS_STATE_ACTIVE]
+
+    # Namespace, которые есть у узлов графа, но lifecycle не видел живыми
+    # НИ РАЗУ: стенд подняли и снесли между тиками, а узлы успел завести
+    # синк топологии. Строки в kg_namespaces у них нет, поэтому sweep выше
+    # их не находил, и класс узлов оставался NULL навсегда — в app-scope
+    # orphan-метрики. Замер 16.10.2026: squad-52-kingdom5/7, 52 узла с
+    # 11.09. Заводим строку сразу в missing — дальше обычный путь (TTL,
+    # missing_namespace_names для metrics_sync и детектора).
+    #
+    # Отсутствие подтверждаем точечным `kubectl get ns <имя>` (ревью Codex,
+    # PR #487). Список `live` снят раньше запроса к узлам: namespace,
+    # созданный между ними, и неполный ответ API здесь выглядят одинаково —
+    # как «нет в кластере». Свежесть узлов как признак не годится: их
+    # updated_at двигает и пересчёт health раз в 20 мин, тогда реально
+    # снесённый namespace не усыновлялся бы никогда. Ответ «есть» или
+    # неясный — пропускаем: missing ставим только по явному NotFound.
+    # Синтетические namespace (`nats-subjects`) в кластере не бывают по
+    # построению — объявить их missing значит вечно гасить живые узлы.
+    graph_namespaces = {
+        str(ns) for (ns,) in db.query(Service.namespace).distinct().all() if ns
+    } - _SYNTHETIC_NAMESPACES
+    candidates = sorted(graph_namespaces - set(live) - set(known))
+    confirmed_absent = [n for n in candidates if _namespace_absent(n)]
+    stats["adopt_skipped_unconfirmed"] = len(candidates) - len(confirmed_absent)
+    for name in confirmed_absent:
+        db.add(Namespace(
+            namespace=name, incarnation=1, state=NS_STATE_MISSING,
+            first_seen_at=None, last_seen_at=None, missing_since=now,
+        ))
+        gone_names.append(name)
+        stats["adopted_missing"] = stats.get("adopted_missing", 0) + 1
+        log.info("kg_namespace.adopted_missing", namespace=name)
+
     stats["services_gone"] = mark_services_gone(db, gone_names)
+
+    # Живые namespace с неклассифицированными узлами. ns-sync обходит не всё:
+    # `_discover_namespaces` намеренно пропускает системные (kube-*, cattle-*,
+    # monitoring), и узлы, заведённые там другими синками (Service-топология,
+    # ingress), классификатор не видел никогда — NULL вместо expected_stale.
+    # Пересчёт тем же классификатором, что и у вернувшихся.
+    unclassified = {
+        str(ns) for (ns,) in (
+            db.query(Service.namespace)
+            .filter(Service.stale_class.is_(None), Service.namespace.in_(list(live)))
+            .distinct().all()
+        ) if ns
+    }
     # Вернувшийся namespace: класс пересчитать сразу, не дожидаясь очередного
     # ns-sync — иначе живой стенд до часа читался бы как снесённый.
-    stats["services_reclassified"] = _reclassify_returned(db, returned_names)
+    stats["services_reclassified"] = _reclassify_returned(
+        db, sorted(set(returned_names) | unclassified),
+    )
 
     db.commit()
     log.info("kg_namespace.lifecycle_synced", **stats)
