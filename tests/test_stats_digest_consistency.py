@@ -385,6 +385,16 @@ def test_deploy_correlation_match_agrees_with_its_diagnostics():
     assert "a.last_notified_at BETWEEN" not in corr_sql
 
 
+def test_linkage_diagnostics_skip_node_alerts_without_service():
+    """Нодовый алерт без сервиса — штатно ничей (#491), а не дыра привязки:
+    иначе доля таких алертов сама по себе давала «Likely linkage gap»."""
+    diag_db = MagicMock()
+    diag_db.execute.return_value.fetchone.return_value = (1, 1, 1, 1, 1, 1, 1)
+    stats_digest._deploy_correlation_diagnostics(diag_db, hours=24)
+    diag_sql = " ".join(str(c.args[0]) for c in diag_db.execute.call_args_list)
+    assert "NOT (service_id IS NULL AND raw->>'node' IS NOT NULL)" in diag_sql
+
+
 # ── C5. noisemakers: окно, namespace, имена подов ──────────────────────────
 
 
