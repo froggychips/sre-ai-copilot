@@ -17,13 +17,14 @@ pipeline не должен падать, если populator упал.
 from __future__ import annotations
 
 from app.core.timeutil import parse_ts
-from typing import Any, Dict, cast
+from typing import Any, Dict, Optional, cast
 
 import structlog
 from sqlalchemy.orm import Session
 
 from app.knowledge_graph.populator import (record_alert_event,
                                            record_deployment, upsert_service)
+from app.knowledge_graph.schema import Service
 from app.models.incident import Incident
 
 logger = structlog.get_logger()
@@ -54,76 +55,87 @@ def populate_from_incident(db: Session, incident: Incident) -> Dict[str, int]:
         db=db,   # владелец Job/CronJob — из kg_k8s_jobs
     )
     namespace = incident.namespace
-    if not (namespace and service_name):
-        # Без identifiable service в графе хранить нечего.
-        logger.debug(
-            "kg.populate.skipped_no_service",
-            incident_id=incident.incident_id,
-            namespace=namespace,
-        )
-        return stats
 
-    try:
-        team = labels.get("team") or labels.get("squad")
-        with db.begin_nested():
-            svc = upsert_service(
-                db, namespace=namespace, name=service_name,
-                team_owner=team,
-                metadata={k: v for k, v in labels.items() if k in {"app", "component", "version"}},
-            )
-        stats["services_touched"] += 1
-    except Exception as e:
-        # begin_nested() уже откатил SAVEPOINT при выходе по исключению —
-        # Session очищена от aborted-состояния, внешняя транзакция цела.
-        # Тут можно выйти: без service остальные записи бессмысленны.
-        logger.warning(
-            "kg.populate.service_failed",
-            error=type(e).__name__, message=str(e),
-        )
-        return stats
-
-    # Deployments из TeamCity context (если был enrichment).
-    tc = incident.teamcity_context or {}
-    for b in tc.get("recent_builds") or []:
-        started_at = parse_ts(b.get("started_at") or b.get("finished_at"))
-        if started_at is None:
-            continue
-        # SHA живёт в changes[0]["version"] — TC context не имеет поля "sha" напрямую
-        changes = b.get("changes") or []
-        sha = (changes[0].get("version") or None) if changes else None
-        # KG H1: _parse_ts может вернуть None даже на непустой строке (мусорный
-        # finished_at у running-билдов) — тогда `.replace()` бросал AttributeError
-        # и весь build молча терялся (ловился внешним except). Считаем через
-        # промежуточную переменную и .replace() только если распарсилось.
-        _fin = parse_ts(b.get("finished_at"))
+    # Сначала Service — если его можно определить. Без него граф обогащать
+    # нечем (деплои, инцидент сервиса), но сам факт алерта хранить есть что:
+    # нодовый алерт без namespace — прямой пример (#477). До 16.10.2026 здесь
+    # стоял ранний return, и такой алерт не попадал в kg_alerts вовсе — вместе
+    # с raw.node, ради которого #477 его и пишет.
+    svc: Optional[Service] = None
+    if namespace and service_name:
         try:
+            team = labels.get("team") or labels.get("squad")
             with db.begin_nested():
-                record_deployment(
-                    db,
-                    service=svc,
-                    # parse_ts уже вернул naive UTC (app/core/timeutil.py):
-                    # обрезать tzinfo второй раз не нужно, а голый
-                    # .replace() здесь был бы неверен для источника
-                    # со смещением.
-                    started_at=started_at,
-                    finished_at=_fin.replace(tzinfo=None) if _fin else None,
-                    sha=sha,
-                    repo=b.get("repo"),
-                    buildtype_id=b.get("buildtype_id"),
-                    build_number=str(b.get("number") or ""),
-                    status=b.get("status"),
-                    triggered_by=b.get("triggered_by"),
-                    extras={"branch": b.get("branch")} if b.get("branch") else None,
+                svc = upsert_service(
+                    db, namespace=namespace, name=service_name,
+                    team_owner=team,
+                    metadata={k: v for k, v in labels.items() if k in {"app", "component", "version"}},
                 )
-            stats["deploys_added"] += 1
+            stats["services_touched"] += 1
         except Exception as e:
-            # Битый build не должен валить остальные builds/alert этого
-            # инцидента. begin_nested() откатил SAVEPOINT только этого item,
-            # прежде записанные узлы и внешняя транзакция остаются целы.
+            # begin_nested() уже откатил SAVEPOINT при выходе по исключению —
+            # Session очищена от aborted-состояния, внешняя транзакция цела.
+            # Алерт НЕ пишем без сервиса: у него сервис есть, просто запись
+            # не удалась, а record_alert_event при повторных уведомлениях
+            # service_id не трогает — строка осталась бы ничьей навсегда.
             logger.warning(
-                "kg.populate.deployment_failed",
+                "kg.populate.service_failed",
                 error=type(e).__name__, message=str(e),
             )
+            return stats
+    else:
+        # namespace без сервиса не превращаем в Service: у нодовых алертов это
+        # часто метка скрейпа (monitoring), а не прикладной scope.
+        logger.debug(
+            "kg.populate.alert_without_service",
+            incident_id=incident.incident_id,
+            namespace=namespace,
+            node=labels.get("node"),
+        )
+
+    # Deployments из TeamCity context (если был enrichment) — только к сервису.
+    tc = incident.teamcity_context or {}
+    if svc is not None:
+        for b in tc.get("recent_builds") or []:
+            started_at = parse_ts(b.get("started_at") or b.get("finished_at"))
+            if started_at is None:
+                continue
+            # SHA живёт в changes[0]["version"] — TC context не имеет поля "sha" напрямую
+            changes = b.get("changes") or []
+            sha = (changes[0].get("version") or None) if changes else None
+            # KG H1: _parse_ts может вернуть None даже на непустой строке (мусорный
+            # finished_at у running-билдов) — тогда `.replace()` бросал AttributeError
+            # и весь build молча терялся (ловился внешним except). Считаем через
+            # промежуточную переменную и .replace() только если распарсилось.
+            _fin = parse_ts(b.get("finished_at"))
+            try:
+                with db.begin_nested():
+                    record_deployment(
+                        db,
+                        service=svc,
+                        # parse_ts уже вернул naive UTC (app/core/timeutil.py):
+                        # обрезать tzinfo второй раз не нужно, а голый
+                        # .replace() здесь был бы неверен для источника
+                        # со смещением.
+                        started_at=started_at,
+                        finished_at=_fin.replace(tzinfo=None) if _fin else None,
+                        sha=sha,
+                        repo=b.get("repo"),
+                        buildtype_id=b.get("buildtype_id"),
+                        build_number=str(b.get("number") or ""),
+                        status=b.get("status"),
+                        triggered_by=b.get("triggered_by"),
+                        extras={"branch": b.get("branch")} if b.get("branch") else None,
+                    )
+                stats["deploys_added"] += 1
+            except Exception as e:
+                # Битый build не должен валить остальные builds/alert этого
+                # инцидента. begin_nested() откатил SAVEPOINT только этого item,
+                # прежде записанные узлы и внешняя транзакция остаются целы.
+                logger.warning(
+                    "kg.populate.deployment_failed",
+                    error=type(e).__name__, message=str(e),
+                )
 
     # AlertEvent — идемпотентен по fingerprint.
     fired_at = parse_ts(incident.starts_at)
@@ -150,7 +162,8 @@ def populate_from_incident(db: Session, incident: Incident) -> Dict[str, int]:
                     fired_at=fired_at.replace(tzinfo=None),
                     # Временное значение: attach_alert ниже заменит его на
                     # incident_key инцидента сервиса. Оставлено, чтобы строка
-                    # без инцидента (attach упал) не осталась с NULL.
+                    # без инцидента (нет сервиса или attach упал) не осталась
+                    # с NULL.
                     incident_id=incident.incident_id,
                     raw=alert_raw,
                 )
@@ -162,28 +175,35 @@ def populate_from_incident(db: Session, incident: Incident) -> Dict[str, int]:
                 error=type(e).__name__, message=str(e),
             )
         else:
-            # Incident как объект графа: алерт → открытый инцидент сервиса
-            # (или новый). Отдельный SAVEPOINT: сбой здесь не должен отменять
-            # уже записанный алерт.
-            try:
-                from app.knowledge_graph.incidents import attach_alert
-                with db.begin_nested():
-                    inc = attach_alert(
-                        db,
-                        namespace=namespace,
-                        service_name=service_name,
-                        service_id=cast(int, svc.id),
-                        fired_at=fired_at.replace(tzinfo=None),
-                        alertname=labels.get("alertname") or "unknown",
-                        severity=labels.get("severity") or incident.severity,
-                        fingerprint=incident.incident_id,
+            if svc is None:
+                # Без сервиса инцидента нет: KGIncident — «один открытый
+                # инцидент на сервис», и нодовый алерт не притворяется
+                # сервисом (синтетический `node/<имя>` — семантический долг).
+                stats["alerts_without_service"] = 1
+            else:
+                # Incident как объект графа: алерт → открытый инцидент сервиса
+                # (или новый). Отдельный SAVEPOINT: сбой здесь не должен
+                # отменять уже записанный алерт.
+                try:
+                    from app.knowledge_graph.incidents import attach_alert
+                    with db.begin_nested():
+                        inc = attach_alert(
+                            db,
+                            # svc есть только при namespace и service_name.
+                            namespace=cast(str, namespace),
+                            service_name=cast(str, service_name),
+                            service_id=cast(int, svc.id),
+                            fired_at=fired_at.replace(tzinfo=None),
+                            alertname=labels.get("alertname") or "unknown",
+                            severity=labels.get("severity") or incident.severity,
+                            fingerprint=incident.incident_id,
+                        )
+                    stats["kg_incident_id"] = cast(int, inc.id)
+                except Exception as e:
+                    logger.warning(
+                        "kg.populate.incident_attach_failed",
+                        error=type(e).__name__, message=str(e),
                     )
-                stats["kg_incident_id"] = cast(int, inc.id)
-            except Exception as e:
-                logger.warning(
-                    "kg.populate.incident_attach_failed",
-                    error=type(e).__name__, message=str(e),
-                )
 
     logger.info(
         "kg.populate.done",
