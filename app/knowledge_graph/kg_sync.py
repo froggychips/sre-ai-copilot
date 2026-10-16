@@ -16,12 +16,12 @@ import logging
 import re
 import json
 from datetime import datetime, timedelta
-from typing import Any, Dict, List, Optional, Set, Tuple, cast
+from typing import Any, Dict, List, NamedTuple, Optional, Set, Tuple, cast
 
 from sqlalchemy import cast as sa_cast
 from sqlalchemy import or_
 from sqlalchemy.dialects.postgresql import JSONB
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, aliased
 
 from app.knowledge_graph.kubectl_breaker import run_kubectl
 from app.knowledge_graph.contract import (
@@ -782,6 +782,14 @@ def _reset_existing_ns_cache() -> None:
     global _EXISTING_NS_CACHE, _DB_SERVICE_CACHE
     _EXISTING_NS_CACHE = None
     _DB_SERVICE_CACHE = None
+    _reset_synth_db_edges()
+
+
+def _reset_synth_db_edges() -> None:
+    """Сбросить кэш рёбер в `db:`-узлы — в начале каждого sync_namespace."""
+    global _SYNTH_DB_EDGES, _SYNTH_DB_EDGES_NS
+    _SYNTH_DB_EDGES = None
+    _SYNTH_DB_EDGES_NS = None
 
 
 #: Host hint из ключа секрета → базовое имя k8s Service, где они расходятся.
@@ -813,9 +821,74 @@ _DB_SERVICE_NAME_TEMPLATES: Dict[str, Tuple[str, ...]] = {
 #: считаться живым. См. `_load_db_service_cache`.
 _DB_SERVICE_SEEN_WINDOW = timedelta(hours=24)
 
+class _DbServiceRef(NamedTuple):
+    """Найденный k8s Service базы: ровно то, что нужно ребру.
+
+    Не ORM-объект намеренно. sync_namespace коммитит per-namespace, а
+    expire_on_commit делает загруженный Service протухшим: `db.get` на каждое
+    ребро uses_db превращался в refresh-SELECT, ~7,7 тыс. лишних запросов за
+    проход (вместе с drop-запросами ниже проход вырос с ~2 мин до 817 с,
+    16.10.2026). `upsert_edge` от `dst` читает только `.id`.
+    """
+    id: int
+    namespace: str
+    name: str
+
+
 #: (namespace, name) → id узла-k8s Service, к которому можно вести uses_db.
 #: Строится раз за проход, как `_EXISTING_NS_CACHE`.
 _DB_SERVICE_CACHE: Optional[Dict[Tuple[str, str], int]] = None
+
+
+class _SynthDbEdges(NamedTuple):
+    """Рёбра uses_db клиентов ОДНОГО namespace в синтетические `db:`-узлы.
+
+    `nodes` — (namespace, name) → id `db:`-узла; `pairs` — (src_id, dst_id)
+    существующих рёбер в них от клиентов этого namespace. По ним
+    `_drop_superseded_db_edge` решает без запросов к БД, есть ли что удалять:
+    после первого прохода с резолвом таких пар у резолвленных клиентов не
+    остаётся, и удаление не стоит ничего.
+
+    Живёт ровно один вызов sync_namespace (`_SYNTH_DB_EDGES_NS`), а не весь
+    проход: откат savepoint-а namespace возвращает удалённое ребро, а
+    отдельный вызов sync_namespace видит то, что успели записать между
+    вызовами. Кэш на весь проход разошёлся бы с БД в обоих случаях (ревью
+    Codex). Два запроса на namespace вместо двух-трёх на каждое ребро.
+    """
+    nodes: Dict[Tuple[str, str], int]
+    pairs: Set[Tuple[int, int]]
+
+
+_SYNTH_DB_EDGES: Optional[_SynthDbEdges] = None
+#: Namespace клиентов, для которого загружен `_SYNTH_DB_EDGES`.
+_SYNTH_DB_EDGES_NS: Optional[str] = None
+
+
+def _load_synth_db_edges(db: Session, client_namespace: str) -> _SynthDbEdges:
+    """Один запрос на узлы `db:%` и один — на рёбра в них из namespace клиента."""
+    nodes = {
+        (str(ns), str(name)): int(sid) for (sid, ns, name) in (
+            db.query(Service.id, Service.namespace, Service.name)
+            .filter(Service.node_kind == NODE_KIND_SERVICE,
+                    Service.name.like("db:%"))
+            .all()
+        )
+    }
+    pairs: Set[Tuple[int, int]] = set()
+    if nodes:
+        src_s = aliased(Service)
+        dst_s = aliased(Service)
+        for (src_id, dst_id) in (
+            db.query(ServiceEdge.src_id, ServiceEdge.dst_id)
+            .join(src_s, src_s.id == ServiceEdge.src_id)
+            .join(dst_s, dst_s.id == ServiceEdge.dst_id)
+            .filter(ServiceEdge.kind == "uses_db",
+                    src_s.namespace == client_namespace,
+                    dst_s.name.like("db:%"))
+            .all()
+        ):
+            pairs.add((int(src_id), int(dst_id)))
+    return _SynthDbEdges(nodes=nodes, pairs=pairs)
 
 
 def _load_db_service_cache(db: Session) -> Dict[Tuple[str, str], int]:
@@ -872,7 +945,7 @@ def _resolve_db_service(
     driver: str,
     host_hint: str,
     client_namespace: str,
-) -> Optional[Service]:
+) -> Optional[_DbServiceRef]:
     """Настоящий k8s Service базы для `db:<driver>:<host_hint>`, или None.
 
     Ищем только среди существующих узлов — ничего не создаём и не угадываем
@@ -910,14 +983,23 @@ def _drop_superseded_db_edge(db: Session, src: Service, db_node: str, db_ns: str
     всех kind'ов. Удаляем только ребро этого же клиента в этот же `db:`-узел:
     тот же факт, новый адрес. Сам `db:`-узел не трогаем — у него могут быть
     клиенты, для которых Service не нашёлся.
+
+    Есть ли что удалять — по `_SYNTH_DB_EDGES`, без запроса: в установившемся
+    режиме таких рёбер у резолвленных клиентов нет, и раньше на каждое ребро
+    uses_db здесь уходили впустую SELECT + DELETE.
     """
-    old_dst = (
-        db.query(Service.id)
-        .filter_by(namespace=db_ns, name=db_node, node_kind=NODE_KIND_SERVICE)
-        .scalar()
-    )
+    global _SYNTH_DB_EDGES, _SYNTH_DB_EDGES_NS
+    client_ns = str(src.namespace)
+    if _SYNTH_DB_EDGES is None or _SYNTH_DB_EDGES_NS != client_ns:
+        _SYNTH_DB_EDGES = _load_synth_db_edges(db, client_ns)
+        _SYNTH_DB_EDGES_NS = client_ns
+    old_dst = _SYNTH_DB_EDGES.nodes.get((db_ns, db_node))
     if old_dst is None:
         return 0
+    pair = (int(src.id), old_dst)
+    if pair not in _SYNTH_DB_EDGES.pairs:
+        return 0
+    _SYNTH_DB_EDGES.pairs.discard(pair)
     return (
         db.query(ServiceEdge)
         .filter_by(src_id=src.id, dst_id=old_dst, kind="uses_db")
@@ -925,7 +1007,7 @@ def _drop_superseded_db_edge(db: Session, src: Service, db_node: str, db_ns: str
     )
 
 
-def _lookup_db_service(db: Session, namespace: str, name: str) -> Optional[Service]:
+def _lookup_db_service(db: Session, namespace: str, name: str) -> Optional[_DbServiceRef]:
     """k8s Service базы по точному имени — для DSN, где host известен.
 
     Ищет в том же индексе, что и `_resolve_db_service`, поэтому видит только
@@ -936,7 +1018,7 @@ def _lookup_db_service(db: Session, namespace: str, name: str) -> Optional[Servi
     if _DB_SERVICE_CACHE is None:
         _DB_SERVICE_CACHE = _load_db_service_cache(db)
     svc_id = _DB_SERVICE_CACHE.get((namespace, name))
-    return db.get(Service, svc_id) if svc_id is not None else None
+    return _DbServiceRef(svc_id, namespace, name) if svc_id is not None else None
 
 
 def _db_namespace_for_client(db: Session, client_namespace: str) -> Optional[str]:
@@ -991,6 +1073,8 @@ def sync_namespace(
     stats = {"services": 0, "edges": 0, "skipped": 0}
     if deploys is None:
         deploys = _kubectl_get_deployments(namespace)
+    # Кэш рёбер в `db:`-узлы — только на этот вызов (см. _SynthDbEdges).
+    _reset_synth_db_edges()
 
     src_team = _derive_team_owner(namespace)
 
@@ -1100,7 +1184,8 @@ def sync_namespace(
             # 62 из 85 прод-орфанов были именно базами, а blast radius от
             # StatefulSet базы не доходил до клиентов. Не нашли Service —
             # остаёмся на синтетическом узле, как раньше: сигнал не теряем.
-            # Старые рёбра в `db:`-узлы уйдут сами через edge_decay.
+            # Старое ребро клиента в `db:`-узел удаляется сразу
+            # (_drop_superseded_db_edge), а не через edge_decay.
             host = db_node.split(":", 2)[-1]
             if source == "dsn_env":
                 real_db = _lookup_db_service(db, db_ns, host)
@@ -1116,7 +1201,9 @@ def sync_namespace(
                     edge_extras["confidence"] = "inferred_secret_name"
                     edge_extras["db_namespace_source"] = "k8s_service"
                     edge_extras.pop("unverified_host", None)
-                dst = real_db
+                # upsert_edge читает от dst только `.id` — ORM-объект не
+                # подгружаем (см. _DbServiceRef: refresh-SELECT на каждое ребро).
+                dst = cast(Service, real_db)
             else:
                 dst = _upsert_service_pg(
                     db,
