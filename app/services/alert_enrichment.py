@@ -40,7 +40,8 @@ from app.knowledge_graph.queries import (cluster_deploy_activity,
                                          recent_deploys_for,
                                          recent_deploys_for_namespaces,
                                          recent_pod_events_for, upstream_of)
-from app.knowledge_graph.schema import NODE_KIND_SERVICE, Service, ServiceEdge
+from app.knowledge_graph.schema import (NODE_KIND_SERVICE, NODE_KIND_WORKLOAD,
+                                        Service, ServiceEdge)
 from app.models.incident import Incident
 from app.services.node_resolver import is_node_exporter_pod
 from app.services.statics_service import (observe_statics_version,
@@ -626,31 +627,126 @@ def resolve_store_service(
     legacy_default: Optional[str],
     db: Optional[Session] = None,
 ) -> Optional[str]:
-    """Резолв service-name для STORE-пути (kg_alerts) единообразно с enrichment.
+    """Имя target-сервиса алерта — обёртка над `resolve_store_target`.
 
-    Баг «vm-kube-state-metrics noisemaker»: у kube-resource-алертов
-    (KubeDeployment*/KubeStatefulSet*/KubeDaemonSet*) лейбл `service` равен
-    job/service метрики-ИСТОЧНИКА kube-state-metrics (`vm-kube-state-metrics`),
-    а не target-workload'у. STORE-путь исторически брал service по приоритету
-    лейбла `service` → все такие алерты схлопывались на один фантомный сервис.
+    Баг «vm-kube-state-metrics noisemaker»: у kube-resource-алертов лейбл
+    `service` равен метрике-ИСТОЧНИКУ (`vm-kube-state-metrics`), а не
+    target-workload'у. `legacy_default` вычисляет вызывающий по своей прежней
+    fallback-цепочке (в webhooks `service→deployment`).
 
-    Правило (совпадает с enrichment-путём, root cause #1):
-        * есть deployment / statefulset / daemonset / poddisruptionbudget /
-          horizontalpodautoscaler  →  target workload
-          через `_resolve_target_service_from_labels` (лейбл `service` игнор);
-        * иначе (обычные app-алерты, где `service`-лейбл валиден и нет
-          kube-resource-лейблов)  →  `legacy_default` (прежнее поведение).
+    Для дедупа и текстов уведомлений webhook-пути: если цель не нашлась (нода,
+    удалённый под), возвращается `legacy_default` — ключ дедупа и
+    resolve-уведомление в Discord остаются прежними. В граф такой алерт
+    пишется без сервиса: auto_populator зовёт `resolve_store_target`.
+    """
+    target = resolve_store_target(labels, legacy_default=legacy_default, db=db)
+    return target.service or legacy_default
 
-    `legacy_default` вычисляет вызывающий по своей прежней fallback-цепочке
-    (в auto_populator это `service→app→deployment`, в webhooks `service→
-    deployment`) — так поведение app-алертов не меняется ни на одном callsite.
+
+#: Экспортеры метрик: их `service`/`job`/`app` — ИСТОЧНИК метрики, а не объект
+#: алерта. Замер 16.10.2026 (30 дней): 168 из 592 алертов в kg_alerts лежали на
+#: `vm-kube-state-metrics` и `vm-node-exporter`, на них же — 49 KGIncident;
+#: больше всех KubePodCrashLooping (91 алерт в 25 namespace).
+METRIC_EXPORTER_SOURCES = frozenset({
+    "vm-kube-state-metrics", "kube-state-metrics",
+    "vm-node-exporter", "node-exporter", "prometheus-node-exporter",
+})
+_NODE_EXPORTER_SOURCES = frozenset({
+    "vm-node-exporter", "node-exporter", "prometheus-node-exporter",
+})
+_NODE_ALERT_PREFIXES = ("Node", "KubeNode", "KubeletDown", "KubeletTooMany")
+
+#: scope в StoreTarget.
+STORE_SCOPE_SERVICE = "service"        # объект — workload/сервис
+STORE_SCOPE_NODE = "node"              # объект — нода, сервиса нет
+STORE_SCOPE_UNRESOLVED = "unresolved"  # пришёл через экспортер, цель не нашлась
+STORE_SCOPE_LEGACY = "legacy"          # обычный app-алерт или kill-switch
+
+
+@dataclass(frozen=True)
+class StoreTarget:
+    """Куда записать алерт в графе.
+
+    `service` — имя target-сервиса или None (алерт пишется без сервиса, #491).
+    `source` — экспортер, через который алерт пришёл (`raw.source`), если был.
+    """
+    service: Optional[str]
+    scope: str
+    source: Optional[str] = None
+    how: str = ""
+
+
+def _exporter_source(labels: Dict[str, str]) -> Optional[str]:
+    """Имя экспортера-источника метрики или None, если алерт не от экспортера."""
+    for key in ("service", "job", "app"):
+        value = (labels.get(key) or "").strip()
+        if value in METRIC_EXPORTER_SOURCES:
+            return value
+    if is_node_exporter_pod(labels.get("pod")):
+        return "vm-node-exporter"
+    return None
+
+
+def _is_node_scoped(labels: Dict[str, str], source: str) -> bool:
+    """Объект алерта — нода: node-exporter, Node*/KubeNode* или `node` без пода."""
+    if source in _NODE_EXPORTER_SOURCES:
+        return True
+    alertname = labels.get("alertname") or ""
+    if alertname.startswith(_NODE_ALERT_PREFIXES):
+        return True
+    return bool(labels.get("node")) and not labels.get("pod")
+
+
+def _workload_exists(db: Optional[Session], namespace: Optional[str], name: str) -> bool:
+    """Есть ли такой workload/сервис в графе. Без БД — верим выводу из имени пода."""
+    if db is None:
+        return True
+    if not namespace:
+        return False
+    try:
+        # SAVEPOINT: ошибка запроса не должна оставить транзакцию store-пути
+        # в aborted-состоянии — там же дальше пишутся алерт и инцидент.
+        with db.begin_nested():
+            # Существование: годится и Service, и workload — ищем оба вида явно.
+            return db.query(Service.id).filter(
+                Service.namespace == namespace, Service.name == name,
+                Service.node_kind.in_((NODE_KIND_SERVICE, NODE_KIND_WORKLOAD)),
+            ).first() is not None
+    except Exception:  # noqa: BLE001 — граф недоступен: не хуже прежнего
+        return True
+
+
+def resolve_store_target(
+    labels: Dict[str, str],
+    *,
+    legacy_default: Optional[str],
+    db: Optional[Session] = None,
+) -> StoreTarget:
+    """Объект алерта для записи в граф — k8s-target, а не экспортер метрики.
+
+    Тот же резолв, что у enrichment-пути (`_resolve_target_service_from_labels`:
+    deployment/statefulset/…/pod → workload), плюс правила для алертов, которые
+    пришли через экспортер (kube-state-metrics, node-exporter):
+
+      * нодовый алерт (node-exporter, Node*/KubeNode*, `node` без пода) —
+        без сервиса, scope=node: нода не притворяется сервисом (#491);
+      * под → workload, если такой workload есть в графе;
+      * цель не нашлась (под удалён, имя не разбирается) — без сервиса,
+        scope=unresolved. Метка экспортера НЕ становится владельцем: иначе та
+        же ошибка осталась бы для каждого удалённого пода. Экспортер уходит в
+        `source` — в `raw.source` строки алерта.
+
+    Обычные app-алерты (не через экспортер) — `legacy_default`, как раньше:
+    вызывающий считает его своей fallback-цепочкой (`service→app→deployment`).
 
     kill-switch `ATTRIBUTION_RESOLVE_KUBE_TARGET_ENABLED=False` → всегда
     `legacy_default` (полностью прежнее поведение store-пути).
     """
     if not settings.ATTRIBUTION_RESOLVE_KUBE_TARGET_ENABLED:
-        return legacy_default
-    if labels and (
+        return StoreTarget(legacy_default, STORE_SCOPE_LEGACY, how="kill_switch")
+    labels = labels or {}
+    source = _exporter_source(labels)
+    if (
         labels.get("deployment")
         or labels.get("statefulset")
         or labels.get("daemonset")
@@ -659,17 +755,31 @@ def resolve_store_service(
     ):
         _, target = _resolve_target_service_from_labels(labels)
         if target:
-            return target
+            return StoreTarget(target, STORE_SCOPE_SERVICE, source, "workload_label")
     # Job/CronJob-алерты (KubeJobFailed): лейбл `service` — KSM, цель — в
     # `job_name`. Владельца знает граф (kg_k8s_jobs.owner_service_name); без
     # графа — имя CronJob из имени Job. Замер 07.09.2026: 66 алертов за 30
     # дней все лежали на vm-kube-state-metrics.
-    if labels and labels.get("job_name"):
+    if labels.get("job_name"):
         from app.knowledge_graph.job_attribution import resolve_job_target
         target, _how = resolve_job_target(db, labels.get("namespace"), labels["job_name"])
         if target:
-            return target
-    return legacy_default
+            return StoreTarget(target, STORE_SCOPE_SERVICE, source, "job")
+    if source is None:
+        return StoreTarget(legacy_default, STORE_SCOPE_LEGACY, how="app_label")
+
+    # Дальше — алерт пришёл через экспортер, и его метка владельцем не будет.
+    if _is_node_scoped(labels, source):
+        return StoreTarget(None, STORE_SCOPE_NODE, source, "node")
+    pod = labels.get("pod")
+    if pod and not is_node_exporter_pod(pod):
+        derived = _strip_pod_hash(pod)
+        # Под самого экспортера (KSM мониторит себя) — не цель.
+        if derived and derived not in METRIC_EXPORTER_SOURCES and _workload_exists(
+            db, labels.get("namespace"), derived,
+        ):
+            return StoreTarget(derived, STORE_SCOPE_SERVICE, source, "pod")
+    return StoreTarget(None, STORE_SCOPE_UNRESOLVED, source, "no_target")
 
 
 # Blackbox-проба (ProdEndpointDown / PreprodEndpointDown) несёт СТАТИЧЕСКИЙ
