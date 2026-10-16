@@ -15,6 +15,13 @@ KubeContainerWaiting, KubePdb*, KubeNodePressure…) и `vm-node-exporter`
     `raw.node`, если имя ноды есть в описании;
   * остальное → без сервиса (unresolved). Экспортер владельцем не остаётся.
 
+Что НЕ делает (ревью Codex):
+  * не трогает горящие алерты — повтор уведомления перезаписывает raw и
+    стёр бы журнал отката; их запишет правильно уже новый store-путь;
+  * не заводит инциденты для истории — attach склеил бы старый эпизод с
+    текущим открытым инцидентом сервиса. Опустевшие инциденты экспортеров
+    удаляются. Дайджест (chronic, MTTR) считает по kg_alerts.
+
 Безопасность:
   * dry-run по умолчанию; `--apply` — запись;
   * журнал отката в строке: `raw.reattributed_from` (прежний service_id,
@@ -40,10 +47,9 @@ from sqlalchemy.orm import Session
 
 from app.core.timeutil import utcnow
 from app.database import SessionLocal
-from app.knowledge_graph.incidents import attach_alert
 from app.knowledge_graph.populator import upsert_service
 from app.knowledge_graph.schema import (NODE_KIND_SERVICE, NODE_KIND_WORKLOAD,
-                                        AlertEvent, Service)
+                                        AlertEvent, KGIncident, Service)
 from app.scripts.reattribute_job_alerts import _detach_from_incident
 from app.services.alert_enrichment import (_NODE_ALERT_PREFIXES,
                                            _NODE_EXPORTER_SOURCES,
@@ -121,11 +127,24 @@ def resolve_target(
     return None, "no_target", None
 
 
-def _candidates(db: Session) -> List[Tuple[AlertEvent, Service]]:
-    return cast(List[Tuple[AlertEvent, Service]], (
+def _on_exporters(db: Session) -> Any:
+    return (
         db.query(AlertEvent, Service)
         .join(Service, Service.id == AlertEvent.service_id)
         .filter(Service.name.in_(sorted(METRIC_EXPORTER_SOURCES)))
+    )
+
+
+def _candidates(db: Session) -> List[Tuple[AlertEvent, Service]]:
+    """Только ЗАКРЫТЫЕ алерты на экспортерах.
+
+    Горящий алерт не трогаем (ревью Codex): повторное уведомление того же
+    fingerprint целиком перезаписывает raw и стёрло бы журнал отката. Его
+    запишет правильно уже новый store-путь.
+    """
+    return cast(List[Tuple[AlertEvent, Service]], (
+        _on_exporters(db)
+        .filter(AlertEvent.resolved_at.isnot(None))
         .order_by(AlertEvent.fired_at)
         .all()
     ))
@@ -140,6 +159,7 @@ def reattribute(db: Session, *, apply: bool = False) -> Dict[str, Any]:
     }
     rows = _candidates(db)
     stats["candidates"] = len(rows)
+    stats["skipped_firing"] = _on_exporters(db).filter(AlertEvent.resolved_at.is_(None)).count()
     for i, (alert, exporter_svc) in enumerate(rows, 1):
         exporter = cast(str, exporter_svc.name)
         alertname = cast(str, alert.alertname)
@@ -199,6 +219,10 @@ def _move(
         raw["node"] = node
     row: Any = alert
     row.raw = raw  # новый dict: JSON-колонка не отслеживает мутации на месте
+    # Инцидент для истории НЕ заводим (ревью Codex): attach_alert склеил бы
+    # старый эпизод с текущим открытым инцидентом сервиса или открыл бы новый
+    # из закрытого алерта — длительности и MTTR исказились бы. Дайджест
+    # (chronic, MTTR) считает по kg_alerts, ему хватает service_id.
     row.incident_id = None
     if target is None:
         row.service_id = None
@@ -208,12 +232,6 @@ def _move(
     db.flush()
     row.service_id = svc.id
     db.flush()
-    attach_alert(
-        db, namespace=target[0], service_name=target[1], service_id=cast(int, svc.id),
-        fired_at=alert.fired_at, alertname=cast(str, alert.alertname),
-        severity=cast(Optional[str], alert.severity),
-        fingerprint=cast(Optional[str], alert.fingerprint),
-    )
 
 
 def undo(db: Session, *, apply: bool = False) -> Dict[str, Any]:
@@ -231,23 +249,17 @@ def undo(db: Session, *, apply: bool = False) -> Dict[str, Any]:
                 prev = raw.pop("reattributed_from")
                 for key in ("source", "attribution"):
                     raw.pop(key, None)
-                _detach_from_incident(db, alert)
                 row: Any = alert
                 row.raw = raw
                 row.service_id = prev.get("service_id")
-                row.incident_id = None
+                # Прежний инцидент — только если он ещё жив; удалённый при
+                # переносе (опустевший инцидент экспортера) не воскрешаем:
+                # ссылка на мёртвый key хуже, чем её отсутствие.
+                prev_key = prev.get("incident_id")
+                alive = prev_key and db.query(KGIncident.id).filter(
+                    KGIncident.incident_key == prev_key).first() is not None
+                row.incident_id = prev_key if alive else None
                 db.flush()
-                # Инцидент экспортера мог быть удалён при переносе — заводим
-                # заново тем же путём, что populate, а не ссылкой на мёртвый key.
-                svc = db.get(Service, row.service_id) if row.service_id else None
-                if svc is not None:
-                    attach_alert(
-                        db, namespace=cast(str, svc.namespace), service_name=cast(str, svc.name),
-                        service_id=cast(int, svc.id), fired_at=alert.fired_at,
-                        alertname=cast(str, alert.alertname),
-                        severity=cast(Optional[str], alert.severity),
-                        fingerprint=cast(Optional[str], alert.fingerprint),
-                    )
             stats["restored"] += 1
         except Exception as e:  # noqa: BLE001
             stats["failed"] += 1

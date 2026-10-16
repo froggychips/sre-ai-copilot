@@ -559,6 +559,25 @@ def test_ksm_own_pod_is_not_a_target(db):
     assert alert.service_id is None
 
 
+def test_workload_lookup_error_does_not_poison_store_session(db, monkeypatch):
+    """Ошибка проверки workload'а — под SAVEPOINT: алерт всё равно пишется,
+    транзакция store-пути не остаётся aborted (ревью Codex)."""
+    import app.services.alert_enrichment as ae
+
+    real_query = db.query
+
+    def flaky_query(*args, **kwargs):
+        if args and args[0] is Service.id:
+            raise RuntimeError("db hiccup")
+        return real_query(*args, **kwargs)
+    monkeypatch.setattr(db, "query", flaky_query)
+    assert ae._workload_exists(db, "squad-48-kingdom2", "town-service") is True
+    monkeypatch.setattr(db, "query", real_query)
+    populate_from_incident(db, _incident(incident_id="fp-after-hiccup"))
+    db.commit()
+    assert db.query(AlertEvent).filter_by(fingerprint="fp-after-hiccup").count() == 1
+
+
 def test_app_alert_without_exporter_keeps_legacy_service(db):
     """Обычный app-алерт: `service` валиден, raw.source не пишется."""
     populate_from_incident(db, _incident(incident_id="fp-app"))

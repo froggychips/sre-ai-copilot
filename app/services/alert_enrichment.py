@@ -704,11 +704,14 @@ def _workload_exists(db: Optional[Session], namespace: Optional[str], name: str)
     if not namespace:
         return False
     try:
-        # Существование: годится и Service, и workload — ищем оба вида явно.
-        return db.query(Service.id).filter(
-            Service.namespace == namespace, Service.name == name,
-            Service.node_kind.in_((NODE_KIND_SERVICE, NODE_KIND_WORKLOAD)),
-        ).first() is not None
+        # SAVEPOINT: ошибка запроса не должна оставить транзакцию store-пути
+        # в aborted-состоянии — там же дальше пишутся алерт и инцидент.
+        with db.begin_nested():
+            # Существование: годится и Service, и workload — ищем оба вида явно.
+            return db.query(Service.id).filter(
+                Service.namespace == namespace, Service.name == name,
+                Service.node_kind.in_((NODE_KIND_SERVICE, NODE_KIND_WORKLOAD)),
+            ).first() is not None
     except Exception:  # noqa: BLE001 — граф недоступен: не хуже прежнего
         return True
 

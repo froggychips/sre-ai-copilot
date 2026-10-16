@@ -1,5 +1,5 @@
 """Перенос истории алертов с экспортеров на k8s-target (reattribute_exporter_alerts)."""
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import pytest
 from sqlalchemy import create_engine
@@ -27,7 +27,7 @@ def db():
 T0 = datetime(2026, 10, 1, 10, 0)
 
 
-def _alert_on(db, exporter_ns, exporter, fp, alertname, description):
+def _alert_on(db, exporter_ns, exporter, fp, alertname, description, resolved=True):
     svc = upsert_service(db, namespace=exporter_ns, name=exporter)
     db.flush()
     record_alert_event(
@@ -36,6 +36,8 @@ def _alert_on(db, exporter_ns, exporter, fp, alertname, description):
     )
     attach_alert(db, namespace=exporter_ns, service_name=exporter, service_id=svc.id,
                  fired_at=T0, alertname=alertname, severity="warning", fingerprint=fp)
+    if resolved:
+        db.query(AlertEvent).filter_by(fingerprint=fp).one().resolved_at = T0 + timedelta(minutes=30)
     db.commit()
 
 
@@ -92,11 +94,24 @@ def test_apply_moves_alerts_and_incidents_off_exporters(db):
     assert node.service_id is None and node.raw["node"] == "dev-6"
     gone = db.query(AlertEvent).filter_by(fingerprint="fp-gone").one()
     assert gone.service_id is None and gone.raw["attribution"] == "pod_not_in_graph"
-    # Инциденты экспортеров опустели и удалены; у workload'а — свой.
-    names = {i.service_name for i in db.query(KGIncident).all()}
-    assert names == {"moderation-service"}
+    # Инциденты экспортеров опустели и удалены. Для истории новый инцидент не
+    # заводится: attach склеил бы старый эпизод с текущим открытым (ревью Codex).
+    assert db.query(KGIncident).count() == 0
+    assert crash.incident_id is None
     # Идемпотентность: повторно кандидатов нет.
     assert reattribute(db, apply=False)["candidates"] == 0
+
+
+def test_firing_alert_is_left_for_the_store_path(db):
+    """Горящий алерт не трогаем: повтор уведомления перезапишет raw и сотрёт
+    журнал отката. Его правильно запишет уже новый store-путь."""
+    _alert_on(db, "squad-16-shared", "vm-kube-state-metrics", "fp-firing", "KubePodCrashLooping",
+              "Pod squad-16-shared/moderation-service-5c5fbf559c-58chx (m) is in waiting state",
+              resolved=False)
+    st = reattribute(db, apply=True)
+    assert st["candidates"] == 0 and st["skipped_firing"] == 1
+    alert = db.query(AlertEvent).filter_by(fingerprint="fp-firing").one()
+    assert db.get(Service, alert.service_id).name == "vm-kube-state-metrics"
 
 
 def test_undo_restores_previous_service(db):
@@ -108,5 +123,6 @@ def test_undo_restores_previous_service(db):
     for a in db.query(AlertEvent).all():
         assert a.service_id == ksm_ids[a.fingerprint]
         assert "reattributed_from" not in a.raw and "source" not in a.raw
-        # Инцидент заведён заново, ссылка не висячая.
-        assert db.query(KGIncident).filter_by(incident_key=a.incident_id).one() is not None
+        # Опустевшие инциденты экспортеров удалены при переносе — ссылку на
+        # мёртвый key не восстанавливаем.
+        assert a.incident_id is None
