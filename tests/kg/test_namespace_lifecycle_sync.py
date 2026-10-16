@@ -284,7 +284,7 @@ def test_returned_namespace_services_are_reclassified(db, cluster):
     assert stats["services_reclassified"] == 1
 
 
-def test_never_seen_namespace_is_adopted_as_missing_and_swept(db, cluster):
+def test_never_seen_namespace_is_adopted_as_missing_and_swept(db, cluster, monkeypatch):
     """Узлы есть, строки kg_namespaces нет, в кластере namespace нет.
 
     Кейс squad-52-kingdom5/7 (16.10.2026): стенд жил между тиками lifecycle,
@@ -296,6 +296,7 @@ def test_never_seen_namespace_is_adopted_as_missing_and_swept(db, cluster):
     db.add(_svc("prod-kingdom1"))
     db.commit()
     cluster({"prod-kingdom1": ("uid-p", NOW)})
+    monkeypatch.setattr(nl, "_namespace_absent", lambda name: True)
 
     stats = sync_namespace_lifecycle(db)
 
@@ -385,3 +386,59 @@ def test_lifecycle_stores_claim_owner_label(db, monkeypatch):
     fresh = db.query(Namespace).filter_by(namespace="squad-33-shared").one()
     assert (taken.claim_owner, taken.deployed_by) == ("akomkov", "romeo")
     assert fresh.claim_owner is None
+
+
+def test_unconfirmed_absence_is_not_adopted_as_missing(db, cluster, monkeypatch):
+    """Нет в списке live — ещё не значит нет в кластере: namespace создан после
+    снятия списка или ответ API неполный. Без явного NotFound не трогаем
+    (ревью Codex, PR #487)."""
+    db.add(Service(name="town-service", namespace="squad-70-kingdom2",
+                   synthetic=False, stale_class=None))
+    db.add(_svc("prod-kingdom1"))
+    db.commit()
+    cluster({"prod-kingdom1": ("uid-p", NOW)})
+    monkeypatch.setattr(nl, "_namespace_absent", lambda name: False)
+
+    stats = sync_namespace_lifecycle(db)
+
+    assert stats.get("adopted_missing", 0) == 0
+    assert stats["adopt_skipped_unconfirmed"] == 1
+    assert db.query(Namespace).filter_by(namespace="squad-70-kingdom2").first() is None
+    svc = db.query(Service).filter_by(namespace="squad-70-kingdom2").one()
+    assert svc.stale_class != STALE_CLASS_GONE
+
+
+def test_synthetic_namespace_is_never_adopted_as_missing(db, cluster, monkeypatch):
+    """`nats-subjects` в кластере не бывает по построению — его узлы живые."""
+    db.add(Service(name="subject:town.events", namespace="nats-subjects",
+                   synthetic=True, stale_class=None))
+    db.add(_svc("prod-kingdom1"))
+    db.commit()
+    cluster({"prod-kingdom1": ("uid-p", NOW)})
+    monkeypatch.setattr(nl, "_namespace_absent", lambda name: True)
+
+    stats = sync_namespace_lifecycle(db)
+
+    assert stats.get("adopted_missing", 0) == 0
+    assert db.query(Namespace).filter_by(namespace="nats-subjects").first() is None
+
+
+@pytest.mark.parametrize("rc, stderr, expected", [
+    (1, 'Error from server (NotFound): namespaces "squad-52-kingdom5" not found', True),
+    (0, "", False),                                   # есть в кластере
+    (1, "Unable to connect to the server: timeout", False),  # неясно
+])
+def test_namespace_absent_requires_explicit_not_found(monkeypatch, rc, stderr, expected):
+    class R:
+        returncode = rc
+        stdout = ""
+    R.stderr = stderr
+    monkeypatch.setattr(nl, "run_kubectl", lambda *a, **k: R())
+    assert nl._namespace_absent("squad-52-kingdom5") is expected
+
+
+def test_namespace_absent_on_exception_is_false(monkeypatch):
+    def boom(*a, **k):
+        raise RuntimeError("breaker open")
+    monkeypatch.setattr(nl, "run_kubectl", boom)
+    assert nl._namespace_absent("x") is False
