@@ -4,6 +4,8 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+## [1.0.24] — 2026-10-16 — базы как узлы графа, алерты без сервиса
+
 ### Добавлено
 
 - **Граф знает зону ноды и точки входа трафика.** Новые таблицы `kg_nodes`
@@ -15,7 +17,18 @@ All notable changes to this project are documented in this file.
   контекста инцидента получил источник `kg_nodes`: при метке `node` у алерта
   правила и модель видят зону ноды, соседей по зоне и host-ы, чей вход идёт
   через эту ноду (point-in-time по `as_of`). Без метки `node` контекст прежний.
-  RBAC: чтение core `nodes` в ClusterRole (helm и k8s/base).
+  RBAC: чтение core `nodes` в ClusterRole (helm и k8s/base). Временный сбой
+  DNS не стирает прежние связи host → нода (`dns_failed` в статистике синка).
+- **`uses_db` ведёт в настоящий k8s Service базы** (#488), а не только в
+  синтетический `db:<driver>:<hint>`. Резолв по шаблону имени
+  (`<база>-db-postgresql`, затем `-db-cnpg-rw`; ClickHouse — `clickhouse`):
+  сначала namespace клиента (town/map/message живут в королевстве), потом
+  `<realm>-shared`. Берутся только Service, которые синк топологии видел за
+  24 ч (`serves_traffic`). Не нашли — ребро как раньше в `db:`-узел. Старое
+  ребро клиента в `db:`-узел удаляется сразу, чтобы не сработал deadman
+  edge_decay. Проверки целостности графа видят и новые цели. На проде
+  резолвится 104 из 114 пар клиент → база; у Service баз появляются рёбра,
+  blast radius доходит от базы до клиентов.
 
 ### Изменено
 
@@ -27,10 +40,34 @@ All notable changes to this project are documented in this file.
 
 ### Исправлено
 
+- **Алерт без сервиса больше не теряется** (#491). `populate_from_incident`
+  выходил до записи `AlertEvent`, если не определились namespace+service:
+  нодовый алерт без namespace не попадал в `kg_alerts` вместе с `raw.node`.
+  Теперь факт алерта пишется всегда (`service_id=NULL`), деплои и инцидент
+  сервиса — только при известном сервисе; Service по одному namespace не
+  придумывается. Дайджест не считает такие алерты дырой привязки.
+- **Orphan-метрика больше не считает инфраструктуру** (#487). `expected_stale`
+  получают инфра-namespace (раньше, чем свежие деплои делали их `active`),
+  `cnpg-system`/`sre-ai-ci`/`ai-reviewer-net`/`asset-lock` и неиспользуемые
+  CNPG-сервисы (`-cnpg-r`, `-ro`, `-dr-*`). Namespace, которых lifecycle не
+  видел ни разу (стенд жил меньше тика), заводятся как `missing` — только по
+  явному NotFound от `kubectl get ns <имя>`; узлы получают `gone` вместо
+  вечного NULL. Узлы живых системных namespace классифицируются.
+- **Кэш namespace в kg_sync сбрасывается каждый проход** — раньше не
+  сбрасывался никогда, и стенд, поднятый после старта воркера, не находил
+  свой `<realm>-shared` до рестарта.
 - **`populator`: ребро с NULL-весом больше не падает на сравнении.**
   `weight > edge.weight` при `edge.weight is None` давал `TypeError`; нашёл mypy
   после типизации колонок. Ещё пять мест получили явную проверку NULL (JSON
   `extras`, `resolved_at`, `service_id`).
+
+### Зависимости
+
+- `multidict` 6.9.1, `urllib3` 2.8.0 (#489) — PYSEC-2026-4244/4175-4177;
+  `mako` 1.4.2 — Dependabot alert #30; пачка dependabot (#490): `anthropic`
+  1.11.0, `pyjwt` 2.15.1, `cryptography` 50.0.2, `sqlalchemy` 2.1.2, `uvicorn`
+  0.54.0, actions `upload-artifact` 7.0.2, `download-syft` 0.24.3,
+  `cosign-installer` 4.1.2.
 
 ## [1.0.23] — 2026-09-30 — SQLAlchemy 2.1
 
