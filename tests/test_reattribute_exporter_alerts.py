@@ -64,6 +64,30 @@ def _seed(db):
      "CPU usage at 192.168.148.16:9100 has been above 90%", (None, "node", None)),
     ("NodeDiskBelow20pctFree", "vm-node-exporter",
      "На узле infra-2 (192.168.14.66:9100) осталось < 20%", (None, "node", "infra-2")),
+    # История до KSM-target фикса: workload назван прямо в описании.
+    ("KubeDeploymentGenerationMismatch", "vm-kube-state-metrics",
+     "Deployment generation for squad-30-kingdom5/chat-tasks-service does not match, …",
+     (("squad-30-kingdom5", "chat-tasks-service"), "workload", None)),
+    ("KubeDeploymentReplicasMismatch", "vm-kube-state-metrics",
+     "Deployment squad-30-kingdom5/chat-tasks-service has not matched the expected number of replicas",
+     (("squad-30-kingdom5", "chat-tasks-service"), "workload", None)),
+    ("KubeHpaReplicasMismatch", "vm-kube-state-metrics",
+     "HPA squad-30-kingdom5/chat-tasks-service has not matched the desired number of replicas",
+     (("squad-30-kingdom5", "chat-tasks-service"), "workload", None)),
+    ("KubeDeploymentRolloutStuck", "vm-kube-state-metrics",
+     "Rollout of deployment squad-30-kingdom5/chat-tasks-service is not progressing",
+     (("squad-30-kingdom5", "chat-tasks-service"), "workload", None)),
+    ("PreprodDeploymentNotProgressing", "vm-kube-state-metrics",
+     "накат не встал. kubectl -n squad-30-kingdom5 rollout status deploy/chat-tasks-service\n",
+     (("squad-30-kingdom5", "chat-tasks-service"), "workload", None)),
+    # Workload, которого уже нет в графе (снесённый сквад) — честно без владельца.
+    ("KubeStatefulSetReplicasMismatch", "vm-kube-state-metrics",
+     "StatefulSet squad-30-shared/clickhouse-shard0 has not matched the expected number",
+     (None, "workload_not_in_graph", None)),
+    # Сам экспортер владельцем не становится и здесь.
+    ("KubeDeploymentReplicasMismatch", "vm-kube-state-metrics",
+     "Deployment monitoring/vm-kube-state-metrics has not matched the expected number",
+     (None, "workload_not_in_graph", None)),
 ])
 def test_resolve_target_from_description(db, alertname, exporter, desc, expected):
     upsert_service(db, namespace="squad-30-kingdom5", name="chat-tasks-service", node_kind="workload")

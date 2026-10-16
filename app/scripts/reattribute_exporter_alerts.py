@@ -71,6 +71,21 @@ _POD_PATTERNS = (
     re.compile(r"-n (?P<ns>[a-z0-9-]+) describe pod (?P<pod>[a-z0-9.-]+)"),
 )
 _PDB_RE = re.compile(r"\bPDB /?(?P<ns>[a-z0-9-]+)/(?P<pdb>[a-z0-9.-]+)\b")
+# Workload прямо в описании — история до KSM-target фикса (май–авг. 2026):
+# KubeDeployment{Generation,Replicas}Mismatch, *RolloutStuck,
+# KubeStatefulSet*/KubeDaemonSet*, KubeHpaReplicasMismatch (HPA → workload
+# по имени: связь scaleTargetRef в графе не хранится, но 16.10.2026 у всех
+# 55 HPA кластера имя == scaleTargetRef.name; иначе — проверять target), наши
+# PreprodDeploymentNotProgressing. Без этих шаблонов dry-run 16.10.2026 на
+# проде оставлял без владельца ~920 строк при известном target.
+_WORKLOAD_PATTERNS = (
+    re.compile(
+        r"\b(?:Deployment|StatefulSet|DaemonSet|HPA)(?: generation for)? "
+        r"(?P<ns>[a-z0-9-]+)/(?P<name>[a-z0-9.-]+)\b"
+    ),
+    re.compile(r"\b[Rr]ollout of deployment (?P<ns>[a-z0-9-]+)/(?P<name>[a-z0-9.-]+)\b"),
+    re.compile(r"-n (?P<ns>[a-z0-9-]+) rollout status deploy/(?P<name>[a-z0-9.-]+)"),
+)
 # Имя ноды, если описание его называет («node dev-6 (», «узле infra-2 (»,
 # «dev-ноде dev-28», «dev-28 on cluster»). IP:9100 — адрес пода экспортера,
 # не ноды: по нему ноду не восстановить.
@@ -127,6 +142,14 @@ def resolve_target(
     m = _PDB_RE.search(desc)
     if m and _graph_has(db, m.group("ns"), m.group("pdb")):
         return (m.group("ns"), m.group("pdb")), "pdb", None
+    for rx in _WORKLOAD_PATTERNS:
+        m = rx.search(desc)
+        if not m:
+            continue
+        ns, name = m.group("ns"), m.group("name")
+        if name not in METRIC_EXPORTER_SOURCES and _graph_has(db, ns, name):
+            return (ns, name), "workload", None
+        return None, "workload_not_in_graph", None
     return None, "no_target", None
 
 
