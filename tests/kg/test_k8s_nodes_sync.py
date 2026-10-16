@@ -192,13 +192,51 @@ def test_entrypoints_missing_host_marked_deleted_and_fetch_failure_skips(db):
 def test_resolve_host_failure_is_empty_not_crash():
     import socket
 
-    with patch.object(m.socket, "getaddrinfo", side_effect=socket.gaierror("no such host")):
+    # NXDOMAIN — у имени точно нет адреса.
+    with patch.object(m.socket, "getaddrinfo",
+                      side_effect=socket.gaierror(socket.EAI_NONAME, "no such host")):
         assert m._resolve_host("nowhere.example.test") == []
+    # Временный сбой резолвера — «не знаем», а не «адресов нет».
+    with patch.object(m.socket, "getaddrinfo",
+                      side_effect=socket.gaierror(socket.EAI_AGAIN, "temporary failure")):
+        assert m._resolve_host("app.example.test") is None
+    with patch.object(m.socket, "getaddrinfo", side_effect=OSError("network unreachable")):
+        assert m._resolve_host("app.example.test") is None
     with patch.object(m.socket, "getaddrinfo", return_value=[
         (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("198.51.100.1", 0)),
         (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("198.51.100.1", 0)),
     ]):
         assert m._resolve_hosts(["x.example.test"]) == {"x.example.test": ["198.51.100.1"]}
+
+
+def test_dns_failure_keeps_previous_entry_links(db):
+    """Сбой DNS во время инцидента не должен обнулять связи host → нода —
+    они нужны RCA именно тогда (ревью Codex, PR #477)."""
+    _seed_nodes(db)
+    _run_entrypoints(db, [_ingress("n", "i", ["app.example.test"])],
+                     [_lb("ingress", "controller", "203.0.113.10")],
+                     {"app.example.test": ["203.0.113.10"]})
+    t1 = T0 + timedelta(minutes=30)
+    with patch.object(m, "_kubectl_get_ingresses", return_value=[_ingress("n", "i", ["app.example.test"])]), \
+         patch.object(m, "_kubectl_get_services", return_value=[_lb("ingress", "controller", "203.0.113.10")]), \
+         patch.object(m, "_resolve_host", return_value=None):
+        st = m.sync_entrypoints(db, now=t1)
+    row = db.query(TrafficEntrypoint).filter_by(host="app.example.test").one()
+    assert row.entry_nodes == ["node-a"] and row.resolved_ips == ["203.0.113.10"]
+    assert row.lb_services == ["ingress/controller"]
+    assert row.last_seen_at == t1 and row.deleted_at is None
+    assert st["dns_failed"] == 1 and st["unresolved"] == 0
+
+
+def test_dns_failure_on_new_host_stores_empty_not_null(db):
+    _seed_nodes(db)
+    with patch.object(m, "_kubectl_get_ingresses", return_value=[_ingress("n", "i", ["new.example.test"])]), \
+         patch.object(m, "_kubectl_get_services", return_value=[]), \
+         patch.object(m, "_resolve_host", return_value=None):
+        st = m.sync_entrypoints(db, now=T0)
+    row = db.query(TrafficEntrypoint).filter_by(host="new.example.test").one()
+    assert row.resolved_ips == [] and row.entry_nodes == []
+    assert st["dns_failed"] == 1 and st["created"] == 1
 
 
 def test_combined_sync_reports_skipped_only_when_both_fail(db):

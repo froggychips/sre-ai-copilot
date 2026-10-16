@@ -60,5 +60,8 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
+    # DROP TABLE берёт ACCESS EXCLUSIVE: без lock_timeout откат, ждущий
+    # транзакцию RCA, выстроил бы за собой очередь всех читателей таблиц.
+    op.execute("SET LOCAL lock_timeout = '5s'")
     op.drop_table("kg_entrypoints")
     op.drop_table("kg_nodes")

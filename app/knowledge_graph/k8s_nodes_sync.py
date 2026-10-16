@@ -260,17 +260,36 @@ def lb_service_ips(services: Iterable[Dict[str, Any]]) -> Dict[str, Set[str]]:
     return out
 
 
-def _resolve_host(host: str) -> List[str]:
-    """IPv4-адреса host-а стандартным резолвером. Сбой — пустой список."""
+#: Ответы резолвера, которые означают «у имени нет адреса», а не «спросить не
+#: удалось». Только они дают право записать пустой список адресов.
+_DNS_DEFINITIVE_ERRNOS = frozenset(
+    e for e in (getattr(socket, "EAI_NONAME", None), getattr(socket, "EAI_NODATA", None))
+    if e is not None
+)
+
+
+def _resolve_host(host: str) -> Optional[List[str]]:
+    """IPv4-адреса host-а стандартным резолвером.
+
+    `[]` — имя точно без адреса (NXDOMAIN/NODATA); None — резолв не удался
+    (EAI_AGAIN, сеть, таймаут) и о host-е мы ничего нового не знаем.
+    """
     try:
         infos = socket.getaddrinfo(host, None, socket.AF_INET, socket.SOCK_STREAM)
-    except (socket.gaierror, OSError, UnicodeError):
-        return []
+    except socket.gaierror as e:
+        return [] if e.errno in _DNS_DEFINITIVE_ERRNOS else None
+    except UnicodeError:
+        return []  # имя невалидно — адреса у него не будет никогда
+    except OSError:
+        return None
     return sorted({str(info[4][0]) for info in infos})
 
 
-def _resolve_hosts(hosts: Iterable[str]) -> Dict[str, List[str]]:
-    """Резолв пачкой с общим дедлайном: зависший резолвер не держит тик."""
+def _resolve_hosts(hosts: Iterable[str]) -> Dict[str, Optional[List[str]]]:
+    """Резолв пачкой с общим дедлайном: зависший резолвер не держит тик.
+
+    Не уложился в дедлайн или упал — None, как у `_resolve_host`.
+    """
     hosts = list(hosts)
     if not hosts:
         return {}
@@ -278,12 +297,12 @@ def _resolve_hosts(hosts: Iterable[str]) -> Dict[str, List[str]]:
     try:
         futures = {h: pool.submit(_resolve_host, h) for h in hosts}
         wait(list(futures.values()), timeout=_DNS_DEADLINE_S)
-        out: Dict[str, List[str]] = {}
+        out: Dict[str, Optional[List[str]]] = {}
         for h, f in futures.items():
             if f.done() and not f.cancelled() and f.exception() is None:
                 out[h] = f.result()
             else:
-                out[h] = []
+                out[h] = None
         return out
     finally:
         pool.shutdown(wait=False, cancel_futures=True)
@@ -299,6 +318,7 @@ def sync_entrypoints(db: Session, *, now: Optional[datetime] = None) -> Dict[str
     """
     now = now or datetime.utcnow()
     stats: Dict[str, Any] = {"hosts_seen": 0, "resolved": 0, "unresolved": 0,
+                             "dns_failed": 0,
                              "with_entry_nodes": 0, "created": 0, "marked_deleted": 0,
                              "errors": 0}
     try:
@@ -321,22 +341,32 @@ def sync_entrypoints(db: Session, *, now: Optional[datetime] = None) -> Dict[str
     stats["hosts_seen"] = len(hosts)
     existing = {r.host: r for r in db.query(TrafficEntrypoint).all()}
     for host, classes in sorted(hosts.items()):
-        ips = resolved.get(host) or []
-        entry_nodes = sorted({n for ip in ips for n in node_by_ip.get(ip, ())})
-        lb_refs = sorted({s for ip in ips for s in lb_by_ip.get(ip, ())})
-        stats["resolved" if ips else "unresolved"] += 1
-        if entry_nodes:
-            stats["with_entry_nodes"] += 1
+        ips = resolved.get(host)
         row = existing.get(host)
         if row is None:
             row = TrafficEntrypoint(host=host, first_seen_at=now)
             db.add(row)
             existing[host] = row
             stats["created"] += 1
+        row.ingress_classes = sorted(classes)
+        if ips is None:
+            # Резолв не удался (сбой DNS, дедлайн) — прежние связи host → нода
+            # не трогаем. Иначе во время сетевого инцидента, ровно когда они
+            # нужны RCA, они бы молча обнулились (ревью Codex, PR #477).
+            stats["dns_failed"] += 1
+            if row.resolved_ips is None:
+                row.resolved_ips, row.entry_nodes, row.lb_services = [], [], []
+            row.last_seen_at = now
+            row.deleted_at = None
+            continue
+        entry_nodes = sorted({n for ip in ips for n in node_by_ip.get(ip, ())})
+        lb_refs = sorted({s for ip in ips for s in lb_by_ip.get(ip, ())})
+        stats["resolved" if ips else "unresolved"] += 1
+        if entry_nodes:
+            stats["with_entry_nodes"] += 1
         row.resolved_ips = ips
         row.entry_nodes = entry_nodes
         row.lb_services = lb_refs
-        row.ingress_classes = sorted(classes)
         row.last_seen_at = now
         row.deleted_at = None
 
@@ -348,6 +378,9 @@ def sync_entrypoints(db: Session, *, now: Optional[datetime] = None) -> Dict[str
                 row.deleted_at = now
                 stats["marked_deleted"] += 1
     db.commit()
+    if stats["dns_failed"]:
+        log.warning("entrypoints_sync.dns_failed hosts=%d — прежние связи сохранены",
+                    stats["dns_failed"])
     log.info("entrypoints_sync.done hosts=%d resolved=%d via_nodes=%d deleted=%d",
              stats["hosts_seen"], stats["resolved"], stats["with_entry_nodes"],
              stats["marked_deleted"])
