@@ -20,6 +20,7 @@ from app.knowledge_graph.kg_sync import (
 )
 from app.knowledge_graph.populator import upsert_edge, upsert_service
 from app.knowledge_graph.schema import Service, ServiceEdge
+from tests.conftest import requires_postgres
 
 
 @pytest.fixture
@@ -395,3 +396,72 @@ def test_cnpg_rw_stays_in_scope_when_postgresql_alias_is_gone(db):
     rw = _k8s_svc(db, "prod-shared", "config-db-cnpg-rw")
     kg_sync._refresh_stale_class_for_namespace(db, "prod-shared")
     assert rw.stale_class != "expected_stale"
+
+
+# ── max(started_at) для stale_class: SQL-агрегат на PG == Python-путь ────────
+
+
+def _seed_deploys(db):
+    from app.knowledge_graph.schema import Deployment
+
+    a = upsert_service(db, "agg-ns", "svc-a")
+    b = upsert_service(db, "agg-ns", "svc-b")
+    t0 = datetime(2026, 10, 1, 12, 0)
+    rows = [
+        (a, t0, {"namespace_scope": False}),
+        (a, t0 + timedelta(hours=1), {"namespace_scope": True}),   # broadcast новее
+        (a, t0 - timedelta(days=1), None),                          # без extras — свой
+        (b, t0 + timedelta(hours=2), {"namespace_scope": True}),    # только broadcast
+    ]
+    # Небулевые значения — truthiness как в Python (ревью Codex).
+    odd = [
+        ("false", True), ("0", True), ("", False), (0, False), (0.0, False),
+        (2, True), ([], False), ([1], True), ({}, False), ({"x": 1}, True), (None, False),
+    ]
+    for i, (val, _) in enumerate(odd):
+        c = upsert_service(db, "agg-ns", f"svc-odd-{i}")
+        rows.append((c, t0, {"namespace_scope": val}))
+    rows += [
+    ]
+    for svc, started, extras in rows:
+        db.add(Deployment(service_id=svc.id, started_at=started, extras=extras))
+    db.flush()
+    return [a.id, b.id] + [
+        sid for (sid,) in db.query(Service.id).filter(Service.name.like("svc-odd-%")).all()
+    ]
+
+
+def test_last_deploys_python_path_splits_broadcast(db):
+    ids = _seed_deploys(db)
+    svc, ns = kg_sync._last_deploys_by_service(db, ids)
+    assert svc[ids[0]] == datetime(2026, 10, 1, 12, 0)
+    assert ns[ids[0]] == datetime(2026, 10, 1, 13, 0)
+    assert ns[ids[1]] == datetime(2026, 10, 1, 14, 0) and ids[1] not in svc
+
+
+@pytest.fixture
+def pg_session():
+    """Живой PG (CI/локально с DATABASE_URL); всё откатывается в конце."""
+    import app.knowledge_graph.schema  # noqa: F401
+    from app.database import Base, SessionLocal, engine
+
+    Base.metadata.create_all(engine)
+    session = SessionLocal()
+    try:
+        yield session
+    finally:
+        session.rollback()
+        session.close()
+
+
+@requires_postgres
+def test_last_deploys_sql_path_matches_python_path(pg_session):
+    """На PG считается GROUP BY в базе — результат обязан совпасть с прежним
+    Python-разбором `is_ns_broadcast_deploy`."""
+    ids = _seed_deploys(pg_session)
+    sql_svc, sql_ns = kg_sync._last_deploys_by_service(pg_session, ids)
+
+    from unittest.mock import patch
+    with patch.object(type(pg_session.get_bind().dialect), "name", "sqlite"):
+        py_svc, py_ns = kg_sync._last_deploys_by_service(pg_session, ids)
+    assert (sql_svc, sql_ns) == (py_svc, py_ns)
