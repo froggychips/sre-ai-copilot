@@ -41,7 +41,7 @@ from __future__ import annotations
 import re
 from datetime import datetime, timedelta
 from app.core.timeutil import ensure_naive
-from typing import Any, Mapping, Optional
+from typing import AbstractSet, Any, Mapping, Optional
 
 # ── Константы (вынесены из stats_digest.py) ──────────────────────────────────
 
@@ -63,6 +63,41 @@ _EXPECTED_STALE_NAME_INFIXES = ("backup-", "-backup-", "-cron-")
 # они дали 41 из 85 orphan прода. `-cnpg-rw` сюда НЕ входит — это точка записи
 # приложений, её связывает ребро uses_db.
 _EXPECTED_STALE_NAME_RE = re.compile(r"-cnpg-(?:dr-(?:r|ro|rw|primary)|r|ro)$")
+
+# Инфраструктурные компоненты по имени — вне app-scope при ЛЮБЫХ деплоях, как
+# инфра-namespace. Часть из них катится через TC отдельной кнопкой (NATS,
+# nats-exporter: замер 16.10.2026 — свои деплои у 20/30/44 узлов), и по правилу
+# «свой деплой за 30d → active» они считались прикладными сервисами без рёбер.
+# После 1.0.24 это 28 из 28 оставшихся orphan прода. Проверено на живом графе:
+# ни один узел под этими правилами не является источником calls/uses_db/
+# uses_nats — то есть ни один не прикладной клиент.
+#   * `*-exporter` — экспортеры метрик (nats-client-, town-db-stats-, blackbox-…);
+#   * `nats`, `nats-client` — сервер NATS (uses_nats ведёт в синтетический
+#     узел кластера, к самому Service рёбер не бывает);
+#   * ingress-контроллеры (`nginx-ingress-*`, `ingress-nginx-*`);
+#   * `prometheus-*` — стек kube-prometheus;
+#   * `*-db-migrate` — Service раннеров миграций, `clickhouse-keeper`,
+#     `*-pgbouncer` (пулер; uses_db в него не резолвится).
+_INFRA_COMPONENT_NAME_RE = re.compile(
+    r"(?:-exporter$"
+    r"|^nats(?:-client)?$"
+    r"|^(?:nginx-ingress|ingress-nginx)"
+    r"|^prometheus-"
+    r"|-db-migrate$"
+    r"|^clickhouse-keeper$"
+    r"|-pgbouncer$)"
+)
+
+# `-cnpg-rw` — точка записи CNPG. Безусловно в инфру её НЕ отправляем: если у
+# базы нет bitnami-алиаса, клиенты ходят именно сюда, и ребро uses_db (#488)
+# ведёт в неё. Но при переезде на CNPG в WO `<база>-db-postgresql` переключают
+# на primary кластера, а DSN не трогают (замер 16.10.2026: у 20 из 21
+# `-cnpg-rw` алиас есть, ни в один `-cnpg-rw` нет ни одного uses_db) — тогда
+# `-cnpg-rw` не использует никто, и это инфра. Решение требует знать соседей
+# по namespace: параметр `live_service_names` (только живые Service) в
+# classify_stale_with_deploys.
+_CNPG_RW_SUFFIX = "-cnpg-rw"
+_CNPG_RW_ALIAS_SUFFIX = "-postgresql"
 
 # Системные namespace — deployments в них «не катились» по design'у.
 # Расширено 2026-06-06: инфра/система/AI-ML namespaces (infra*/statics/sre-ai/
@@ -130,6 +165,30 @@ def _is_infra_namespace(namespace: str) -> bool:
     return namespace in _EXPECTED_STALE_NAMESPACES or namespace.startswith("cattle-")
 
 
+def _is_infra_component(name: str) -> bool:
+    """Инфра-компонент по имени: вне app-scope при любых деплоях."""
+    return bool(_INFRA_COMPONENT_NAME_RE.search(name.lower()))
+
+
+def _is_unused_cnpg_rw(name: str, live_service_names: Optional[AbstractSet[str]]) -> bool:
+    """`-cnpg-rw`, у которого в том же namespace есть bitnami-алиас базы.
+
+    `live_service_names` — имена ЖИВЫХ k8s Service namespace: node_kind=
+    'service', metadata.k8s_service и serves_traffic, освежённый синком
+    (тот же признак, что у `kg_sync._load_db_service_cache`). Не все имена
+    узлов: workload с тем же именем или узел удалённого Service совпали бы с
+    алиасом, и используемый `-cnpg-rw` ушёл бы из app-scope (ревью Codex).
+    Без списка (None) — False: не знаем, не угадываем.
+    """
+    if live_service_names is None:
+        return False
+    lower = name.lower()
+    if not lower.endswith(_CNPG_RW_SUFFIX):
+        return False
+    alias = lower[: -len(_CNPG_RW_SUFFIX)] + _CNPG_RW_ALIAS_SUFFIX
+    return alias in live_service_names
+
+
 def _classify_stale(name: str, namespace: str) -> str:
     """Legacy 2-value эвристика: ``'expected' | 'suspicious'``.
 
@@ -146,6 +205,8 @@ def _classify_stale(name: str, namespace: str) -> str:
     if any(inf in name_lower for inf in _EXPECTED_STALE_NAME_INFIXES):
         return "expected"
     if _EXPECTED_STALE_NAME_RE.search(name_lower):
+        return "expected"
+    if _is_infra_component(name_lower):
         return "expected"
     return "suspicious"
 
@@ -192,6 +253,7 @@ def classify_stale_with_deploys(
     infra_expected_days: int = INFRA_EXPECTED_DAYS,
     last_service_deploy_at: Optional[datetime] = None,
     last_ns_deploy_at: Optional[datetime] = None,
+    live_service_names: Optional[AbstractSet[str]] = None,
 ) -> str:
     """3-классная классификация.
 
@@ -209,8 +271,14 @@ def classify_stale_with_deploys(
 
     Решение:
 
-    0. namespace инфраструктурный (``_is_infra_namespace``) → ``expected_stale``
-       при любых деплоях: такие сервисы не входят в app-scope.
+    0. namespace инфраструктурный (``_is_infra_namespace``), имя — инфра-
+       компонент (``_is_infra_component``: экспортеры, NATS, ingress,
+       prometheus, раннеры миграций, пулеры) или неиспользуемый ``-cnpg-rw``
+       (есть bitnami-алиас среди ``live_service_names``) →
+       ``expected_stale`` при любых деплоях: такие сервисы не входят в
+       app-scope. ``live_service_names`` — имена живых k8s Service того же
+       namespace (см. ``_is_unused_cnpg_rw``); None — правило ``-cnpg-rw`` не
+       применяется.
     1. ``last_service_deploy_at`` свежее ``active_window_days`` → ``active``.
        Это ЕДИНСТВЕННОЕ доказательство «сервис катился».
     2. name/ns матчат legacy ``_classify_stale`` == ``expected`` → ``expected_stale``.
@@ -266,6 +334,10 @@ def classify_stale_with_deploys(
     # прикладными сервисами без рёбер (дайджест 15.10.2026: copilot-worker,
     # teamcity-agent, dm-forward-bot и т.п. в infra/other orphan).
     if _is_infra_namespace(namespace):
+        return STALE_CLASS_EXPECTED
+    # Инфра по имени — раньше деплоев по той же причине: NATS и экспортеры
+    # катятся через TC своими кнопками и получали `active`.
+    if _is_infra_component(name) or _is_unused_cnpg_rw(name, live_service_names):
         return STALE_CLASS_EXPECTED
 
     if svc_naive is not None and svc_naive >= active_cutoff:
