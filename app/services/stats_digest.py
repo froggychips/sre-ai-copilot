@@ -2522,6 +2522,9 @@ def _deploy_correlation_diagnostics(
                        count(DISTINCT service_id) FILTER (WHERE service_id IS NOT NULL) AS svc
                 FROM kg_alerts
                 WHERE COALESCE(last_notified_at, fired_at) > NOW() - (:hours || ' hours')::interval
+                  -- Нодовые алерты без сервиса — штатно ничьи (#491): в знаменателе
+                  -- «привязанности» они дали бы ложный linkage gap.
+                  AND NOT (service_id IS NULL AND raw->>'node' IS NOT NULL)
             ),
             o AS (
                 SELECT count(*) AS overlap FROM (

@@ -10,7 +10,7 @@ from app.database import Base
 from app.knowledge_graph.auto_populator import populate_from_incident
 from app.knowledge_graph.queries import (incidents_on, nearby_alerts,
                                          recent_deploys_for)
-from app.knowledge_graph.schema import (AlertEvent, Service,
+from app.knowledge_graph.schema import (AlertEvent, KGIncident, Service,
                                         ServiceEdge)  # noqa: F401
 from app.models.incident import Incident
 
@@ -143,20 +143,59 @@ def test_populate_deploy_not_lost_on_unparseable_finished_at(db):
     assert "deadc0de" in {d["sha"] for d in deploys}
 
 
-def test_populate_skips_when_no_service_label(db):
-    incident = Incident(
-        incident_id="inc-noservice",
-        severity="warning",
-        status="firing",
-        summary="x",
-        description="y",
-        namespace="squad-1",
-        labels={"alertname": "GenericAlert"},  # ни service, ни app, ни deployment
-        annotations={},
-        starts_at="2026-05-12T10:00:00Z",
+def _serviceless(incident_id, namespace, labels):
+    return Incident(
+        incident_id=incident_id, severity="warning", status="firing",
+        summary="x", description="y", namespace=namespace, labels=labels,
+        annotations={}, starts_at="2026-05-12T10:00:00Z",
     )
-    stats = populate_from_incident(db, incident)
-    assert stats == {"services_touched": 0, "deploys_added": 0, "alerts_added": 0}
+
+
+def test_populate_records_alert_without_service_label(db):
+    """Алерт без сервиса — всё равно факт алерта. До 16.10.2026 ранний return
+    терял его целиком; Service при этом не придумываем."""
+    stats = populate_from_incident(db, _serviceless(
+        "inc-noservice", "squad-1", {"alertname": "GenericAlert"}))
+    assert stats["services_touched"] == 0 and stats["alerts_added"] == 1
+    alert = db.query(AlertEvent).filter_by(fingerprint="inc-noservice").one()
+    assert alert.service_id is None
+    assert db.query(Service).count() == 0
+
+
+def test_node_only_alert_is_persisted_without_service(db):
+    """Нодовый алерт без namespace: raw.node нужен #477 (скоуп kg_nodes),
+    инцидента сервиса нет — нода не притворяется сервисом."""
+    stats = populate_from_incident(db, _serviceless(
+        "fp-node-1", None,
+        {"alertname": "NodeNotReady", "node": "worker-17", "severity": "critical"}))
+    alert = db.query(AlertEvent).filter_by(fingerprint="fp-node-1").one()
+    assert alert.service_id is None
+    assert alert.raw["node"] == "worker-17"
+    assert alert.severity == "critical"
+    assert stats["alerts_added"] == 1 and stats["alerts_without_service"] == 1
+    assert "kg_incident_id" not in stats
+    assert db.query(KGIncident).count() == 0
+
+
+def test_scrape_namespace_without_service_builds_no_phantom_service(db):
+    """namespace=monitoring у нодового алерта — метка скрейпа, а не scope."""
+    populate_from_incident(db, _serviceless(
+        "fp-node-2", "monitoring", {"alertname": "NodeDiskPressure", "node": "worker-17"}))
+    assert db.query(Service).count() == 0
+    assert db.query(AlertEvent).filter_by(fingerprint="fp-node-2").one().raw["node"] == "worker-17"
+
+
+def test_service_upsert_failure_does_not_write_orphan_alert(db, monkeypatch):
+    """Сервис у алерта есть, запись не удалась — алерт без сервиса не пишем:
+    повторные уведомления service_id не обновляют, строка осталась бы ничьей."""
+    import app.knowledge_graph.auto_populator as ap
+
+    def boom(*a, **k):
+        raise RuntimeError("db hiccup")
+    monkeypatch.setattr(ap, "upsert_service", boom)
+    stats = populate_from_incident(db, _incident(incident_id="fp-svc-fail"))
+    assert stats["alerts_added"] == 0
+    assert db.query(AlertEvent).count() == 0
 
 
 def test_populate_idempotent_on_second_call(db):
