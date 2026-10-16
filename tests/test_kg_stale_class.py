@@ -120,6 +120,66 @@ def test_classify_3class_infra_namespace_wins_over_recent_deploy():
     )
 
 
+@pytest.mark.parametrize("name", [
+    # Остаток прод-orphan после 1.0.24 (16.10.2026) и их родня по стенду.
+    "nats-client-exporter", "town-db-stats-exporter",
+    "nats-exporter-prometheus-nats-exporter", "blackbox-exporter",
+    "nats", "nats-client",
+    "nginx-ingress-service", "nginx-ingress-controller",
+    "ingress-nginx-controller-lb-208-51",
+    "prometheus-kube-prometheus-kubelet", "prometheus-grafana",
+    "town-db-migrate", "clickhouse-db-migrate", "clickhouse-keeper",
+    "town-db-pgbouncer",
+])
+def test_infra_component_is_expected_even_with_own_recent_deploy(name):
+    """NATS и экспортеры катятся через TC своими кнопками — правило «свой
+    деплой за 30d → active» делало их прикладными сервисами без рёбер."""
+    now = datetime(2026, 10, 16, 12, 0, 0)
+    assert classify_stale_with_deploys(
+        name, "prod-kingdom1", None,
+        last_service_deploy_at=now - timedelta(days=1), now=now,
+    ) == STALE_CLASS_EXPECTED
+    assert _classify_stale(name, "prod-kingdom1") == "expected"
+
+
+@pytest.mark.parametrize("name", [
+    # Прикладные сервисы и базы не должны попасть под инфра-правила.
+    "town-service", "nats-gateway-service", "natsume", "exporter-service",
+    "prometheus", "ingress-router", "town-db-postgresql", "clickhouse",
+    "town-db-cnpg-rw", "map-migrate-worker", "pgbouncer-admin",
+])
+def test_app_like_names_are_not_infra_components(name):
+    now = datetime(2026, 10, 16, 12, 0, 0)
+    assert classify_stale_with_deploys(
+        name, "prod-kingdom1", None,
+        last_service_deploy_at=now - timedelta(days=1), now=now,
+    ) == STALE_CLASS_ACTIVE
+
+
+def test_cnpg_rw_with_bitnami_alias_is_expected():
+    """Алиас `-db-postgresql` переключён на primary CNPG, DSN ходят через него —
+    `-cnpg-rw` не использует никто."""
+    names = {"config-db-postgresql", "config-db-cnpg-rw", "config-db-cnpg-ro"}
+    assert classify_stale_with_deploys(
+        "config-db-cnpg-rw", "prod-shared", None, live_service_names=names,
+    ) == STALE_CLASS_EXPECTED
+
+
+def test_cnpg_rw_without_alias_stays_app_scope():
+    """Нет алиаса — клиенты ходят в `-cnpg-rw`, ребро uses_db (#488) ведёт в него."""
+    assert classify_stale_with_deploys(
+        "cw-db-cnpg-rw", "preprod-shared", None,
+        live_service_names={"cw-db-cnpg-rw", "cw-db-cnpg-ro"},
+    ) == STALE_CLASS_SUSPICIOUS
+
+
+def test_cnpg_rw_without_neighbour_list_is_not_guessed():
+    """Без списка соседей правило не применяется — прежнее поведение."""
+    assert classify_stale_with_deploys(
+        "config-db-cnpg-rw", "prod-shared", None,
+    ) == STALE_CLASS_SUSPICIOUS
+
+
 # ── classify_stale_with_deploys (3-class) ───────────────────────────────────
 
 

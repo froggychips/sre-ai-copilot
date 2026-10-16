@@ -28,6 +28,8 @@ class FakeRedis:
         self.store = {}
         self.fail = fail
         self.deleted = []
+        self.expired = []
+        self.set_ex = []
 
     def set(self, key, value, nx=False, ex=None):
         if self.fail:
@@ -35,6 +37,7 @@ class FakeRedis:
         if nx and key in self.store:
             return None
         self.store[key] = value
+        self.set_ex.append(ex)
         return True
 
     def get(self, key):
@@ -45,6 +48,12 @@ class FakeRedis:
     def delete(self, key):
         self.deleted.append(key)
         self.store.pop(key, None)
+
+    def expire(self, key, seconds):
+        if self.fail:
+            raise ConnectionError("redis недоступен")
+        self.expired.append((key, seconds))
+        return key in self.store
 
 
 @pytest.fixture
@@ -222,3 +231,124 @@ def test_heartbeat_written_for_real_run(monkeypatch):
         retval={"services": 42},
     )
     assert written == ["kg_metrics_sync"]
+
+
+# --- аренда: смерть воркера не съедает следующий запуск ----------------------
+
+
+def test_lock_is_set_with_short_lease_not_full_ttl(redis):
+    """16.10.2026: лок на 3600 с пережил убитый деплоем прогон и съел запуск
+    09:00. В Redis теперь лежит аренда — столько лок живёт после смерти."""
+    client = redis()
+
+    @single_instance(ttl_seconds=3600)
+    def kg_hourly():
+        return "ok"
+
+    kg_hourly()
+    assert client.set_ex == [task_lock.LEASE_SECONDS]
+    assert task_lock.LEASE_SECONDS < 300, "аренда должна быть короче самого частого интервала"
+
+
+def test_lease_is_not_longer_than_ttl(redis):
+    client = redis()
+
+    @single_instance(ttl_seconds=30)
+    def kg_short():
+        return "ok"
+
+    kg_short()
+    assert client.set_ex == [30]
+    assert kg_short.lock_lease_seconds == 30
+
+
+def test_renew_extends_own_lock():
+    client = FakeRedis()
+    client.store["k"] = "tok"
+    r = task_lock._LeaseRenewer(client, "k", "tok", 90, 3600, "t")
+    assert r.renew_once() is True
+    assert client.expired == [("k", 90)]
+
+
+def test_renew_stops_when_lock_is_foreign():
+    """Лок истёк и перехвачен — чужой не продлеваем."""
+    client = FakeRedis()
+    client.store["k"] = "someone-else"
+    r = task_lock._LeaseRenewer(client, "k", "tok", 90, 3600, "t")
+    assert r.renew_once() is False
+    assert client.expired == []
+
+
+def test_renew_stops_after_max_hold(monkeypatch):
+    """Потолок удержания: зависший (не умерший) прогон не держит лок вечно."""
+    client = FakeRedis()
+    client.store["k"] = "tok"
+    now = [1000.0]
+    monkeypatch.setattr(task_lock.time, "monotonic", lambda: now[0])
+    r = task_lock._LeaseRenewer(client, "k", "tok", 90, 600, "t")
+    now[0] += 601
+    assert r.renew_once() is False
+    assert client.expired == []
+
+
+def test_renew_redis_error_does_not_raise():
+    client = FakeRedis(fail=True)
+    r = task_lock._LeaseRenewer(client, "k", "tok", 90, 3600, "t")
+    assert r.renew_once() is True  # попробуем ещё раз на следующем тике
+
+
+def test_renewer_thread_stops_with_task(redis, monkeypatch):
+    """Поток продления завершается вместе с прогоном, лок снят."""
+    client = redis()
+    monkeypatch.setattr(task_lock, "_RENEW_EVERY_SECONDS", 0.01)
+    import threading
+    import time as _t
+
+    @single_instance(ttl_seconds=3600)
+    def kg_slowish():
+        _t.sleep(0.05)
+        return "ok"
+
+    assert kg_slowish() == "ok"
+    assert client.expired, "живой прогон должен продлевать аренду"
+    assert not [t for t in threading.enumerate() if t.name == "task-lock-kg_slowish"]
+    assert f"{LOCK_KEY_PREFIX}kg_slowish" not in client.store
+
+
+def test_renew_never_extends_past_max_hold(monkeypatch):
+    """На краю потолка продлеваем только на остаток (ревью Codex): у
+    kg_incidents_lifecycle ttl=240 при интервале 300 полная аренда на 210-й
+    секунде держала бы лок до ~300-й."""
+    client = FakeRedis()
+    client.store["k"] = "tok"
+    now = [0.0]
+    monkeypatch.setattr(task_lock.time, "monotonic", lambda: now[0])
+    r = task_lock._LeaseRenewer(client, "k", "tok", 90, 240, "t")
+    now[0] = 210.0
+    assert r.renew_once() is True
+    assert client.expired == [("k", 30)]
+
+
+class EvalRedis(FakeRedis):
+    """Redis с серверным compare-and-expire (как настоящий)."""
+
+    def __init__(self):
+        super().__init__()
+        self.evals = []
+
+    def eval(self, script, numkeys, key, token, seconds):
+        self.evals.append((key, token, seconds))
+        if self.store.get(key) == token:
+            self.expired.append((key, seconds))
+            return 1
+        return 0
+
+
+def test_renew_uses_atomic_compare_and_expire():
+    client = EvalRedis()
+    client.store["k"] = "tok"
+    r = task_lock._LeaseRenewer(client, "k", "tok", 90, 3600, "t")
+    assert r.renew_once() is True
+    assert client.evals == [("k", "tok", 90)]
+    client.store["k"] = "other"
+    assert r.renew_once() is False
