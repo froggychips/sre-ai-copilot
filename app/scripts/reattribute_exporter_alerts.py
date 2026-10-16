@@ -16,11 +16,14 @@ KubeContainerWaiting, KubePdb*, KubeNodePressure…) и `vm-node-exporter`
   * остальное → без сервиса (unresolved). Экспортер владельцем не остаётся.
 
 Что НЕ делает (ревью Codex):
-  * не трогает горящие алерты — повтор уведомления перезаписывает raw и
-    стёр бы журнал отката; их запишет правильно уже новый store-путь;
   * не заводит инциденты для истории — attach склеил бы старый эпизод с
     текущим открытым инцидентом сервиса. Опустевшие инциденты экспортеров
     удаляются. Дайджест (chronic, MTTR) считает по kg_alerts.
+
+Ограничение отката: журнал лежит в `raw`, а повторное уведомление того же
+fingerprint (горящий или вновь загоревшийся алерт) перезаписывает `raw`
+целиком. Такие строки `--undo` не увидит — `service_id` у них останется
+перенесённым. Откат — best-effort; перед `--apply` снять dry-run.
 
 Безопасность:
   * dry-run по умолчанию; `--apply` — запись;
@@ -49,7 +52,7 @@ from app.core.timeutil import utcnow
 from app.database import SessionLocal
 from app.knowledge_graph.populator import upsert_service
 from app.knowledge_graph.schema import (NODE_KIND_SERVICE, NODE_KIND_WORKLOAD,
-                                        AlertEvent, KGIncident, Service)
+                                        AlertEvent, Service)
 from app.scripts.reattribute_job_alerts import _detach_from_incident
 from app.services.alert_enrichment import (_NODE_ALERT_PREFIXES,
                                            _NODE_EXPORTER_SOURCES,
@@ -136,17 +139,14 @@ def _on_exporters(db: Session) -> Any:
 
 
 def _candidates(db: Session) -> List[Tuple[AlertEvent, Service]]:
-    """Только ЗАКРЫТЫЕ алерты на экспортерах.
+    """Все алерты на экспортерах — и закрытые, и горящие.
 
-    Горящий алерт не трогаем (ревью Codex): повторное уведомление того же
-    fingerprint целиком перезаписывает raw и стёрло бы журнал отката. Его
-    запишет правильно уже новый store-путь.
+    Горящие тоже (ревью Codex): `record_alert_event` при повторе того же
+    fingerprint `service_id` не меняет, и пропущенная строка осталась бы на
+    экспортере навсегда — новый store-путь её не перепишет.
     """
     return cast(List[Tuple[AlertEvent, Service]], (
-        _on_exporters(db)
-        .filter(AlertEvent.resolved_at.isnot(None))
-        .order_by(AlertEvent.fired_at)
-        .all()
+        _on_exporters(db).order_by(AlertEvent.fired_at).all()
     ))
 
 
@@ -159,7 +159,9 @@ def reattribute(db: Session, *, apply: bool = False) -> Dict[str, Any]:
     }
     rows = _candidates(db)
     stats["candidates"] = len(rows)
-    stats["skipped_firing"] = _on_exporters(db).filter(AlertEvent.resolved_at.is_(None)).count()
+    # Горящие: их raw перезапишет следующее уведомление — журнал отката для
+    # них best-effort (см. шапку).
+    stats["firing"] = sum(1 for a, _ in rows if a.resolved_at is None)
     for i, (alert, exporter_svc) in enumerate(rows, 1):
         exporter = cast(str, exporter_svc.name)
         alertname = cast(str, alert.alertname)
@@ -252,13 +254,11 @@ def undo(db: Session, *, apply: bool = False) -> Dict[str, Any]:
                 row: Any = alert
                 row.raw = raw
                 row.service_id = prev.get("service_id")
-                # Прежний инцидент — только если он ещё жив; удалённый при
-                # переносе (опустевший инцидент экспортера) не воскрешаем:
-                # ссылка на мёртвый key хуже, чем её отсутствие.
-                prev_key = prev.get("incident_id")
-                alive = prev_key and db.query(KGIncident.id).filter(
-                    KGIncident.incident_key == prev_key).first() is not None
-                row.incident_id = prev_key if alive else None
+                # Откат возвращает атрибуцию, но не членство в инциденте:
+                # перенос уже убрал fingerprint из инцидента (или удалил его),
+                # и голая ссылка без fingerprints/alert_count рассогласовала
+                # бы инцидент (ревью Codex).
+                row.incident_id = None
                 db.flush()
             stats["restored"] += 1
         except Exception as e:  # noqa: BLE001

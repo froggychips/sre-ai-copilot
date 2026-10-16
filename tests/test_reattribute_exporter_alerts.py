@@ -102,16 +102,18 @@ def test_apply_moves_alerts_and_incidents_off_exporters(db):
     assert reattribute(db, apply=False)["candidates"] == 0
 
 
-def test_firing_alert_is_left_for_the_store_path(db):
-    """Горящий алерт не трогаем: повтор уведомления перезапишет raw и сотрёт
-    журнал отката. Его правильно запишет уже новый store-путь."""
+def test_firing_alert_is_moved_too(db):
+    """Горящий алерт тоже переносится: store-upsert при повторе service_id не
+    меняет, и без переноса строка осталась бы на экспортере навсегда."""
+    upsert_service(db, namespace="squad-16-shared", name="moderation-service", node_kind="workload")
+    db.commit()
     _alert_on(db, "squad-16-shared", "vm-kube-state-metrics", "fp-firing", "KubePodCrashLooping",
               "Pod squad-16-shared/moderation-service-5c5fbf559c-58chx (m) is in waiting state",
               resolved=False)
     st = reattribute(db, apply=True)
-    assert st["candidates"] == 0 and st["skipped_firing"] == 1
+    assert st["candidates"] == 1 and st["firing"] == 1 and st["moved"] == 1
     alert = db.query(AlertEvent).filter_by(fingerprint="fp-firing").one()
-    assert db.get(Service, alert.service_id).name == "vm-kube-state-metrics"
+    assert db.get(Service, alert.service_id).name == "moderation-service"
 
 
 def test_undo_restores_previous_service(db):
