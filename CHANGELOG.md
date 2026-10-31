@@ -107,8 +107,6 @@ All notable changes to this project are documented in this file.
 
 ### Зависимости
 
-### Зависимости
-
 - **pip-audit снова зелёный** (#520): `certifi` 2026.4.22 → 2026.10.23
   (PYSEC-2026-4320), стек OpenTelemetry 1.41.1/0.62b1 → 1.45.2/0.66b2
   (CVE-2026-114603 в `opentelemetry-api`; с 1.45 появились
