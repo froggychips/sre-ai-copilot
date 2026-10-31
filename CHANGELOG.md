@@ -13,6 +13,7 @@ All notable changes to this project are documented in this file.
   видны отдельно в `long_firing_alerts`. `source_coverage` считал молчащим
   `nats_subjects_sync`, выключенный флагом `NATS_SUBJECTS_PARSER_ENABLED`;
   выключенные источники идут в `disabled` и статус не поднимают.
+
 - **`alertmanager.webhook_unauthenticated` раз в час на процесс, а не на
   каждый батч** (#523): 359 строк в сутки при трёх настоящих событиях.
 
@@ -28,15 +29,18 @@ All notable changes to this project are documented in this file.
   `max_alerts: 0` на store-ресиверах и 50 на enrich-and-forward. Манифест
   `k8s/vmalertmanagerconfig.yaml` синхронизирован с живым объектом (squad- и
   blackhole-receiver-ов в репо не было, preupdate шёл не туда).
+
 - **`CopilotSelfHealthWarnStuck` → severity warning** (#517): с info его не
   постил ни один путь — три проверки висели в warn 28 часов, API писал
   `send_not_delivered` каждые 5–10 минут.
+
 - **Postgres: `shared_buffers=512MB`, `work_mem=16MB`,
   `effective_cache_size=1536MB`, `pg_stat_statements`** (#517,
   `k8s/postgres.yaml`): образ работал на дефолтах 128 МБ/4 МБ при БД 5,3 ГБ
   и лимите 2Gi. `k8s/postgres-backup.yaml` синхронизирован с живым CronJob
   (дамп на PVC с retention, S3 опционален; подсказка называла не те ключи
   секрета).
+
 - **CI: один прогон pytest вместо двух** (#516). Джоба `test` гоняла весь
   набор на sqlite с coverage-гейтом, затем поднимала Postgres и гоняла тот же
   набор ещё раз — вдвое дольше на единственном self-hosted раннере ради
@@ -47,6 +51,7 @@ All notable changes to this project are documented in this file.
   У `kg-contract-check` снят cron раз в 6 часов: без секрета
   `KG_READER_DATABASE_URL` шаги молча скипались; вернуть, когда секрет
   появится.
+
 - Dockerfile (#519): базовый образ `python:3.11-slim` закреплён по digest
   (manifest list; обновляет dependabot `docker`), `psycopg2-binary` в слое
   тяжёлых пакетов поднят до 2.9.13 — версии из `requirements.txt`, иначе слой
@@ -75,6 +80,7 @@ All notable changes to this project are documented in this file.
   `recent_deploys_for_namespaces` видит без правок, stale-класс берёт
   `last_ns_deploy_at` по всему namespace. Историю схлопывает
   `app/scripts/collapse_statics_broadcast.py` (`--apply`, затем VACUUM).
+
 - **Мёртвый код снят** (#519). Модули без единого импортёра: `app/topology/`,
   `app/ingestion/kubernetes_events.py`, `app/agents/critic.py` (его место
   давно занял `fact_critic`), `app/core/intelligence/next_steps.py`,
@@ -85,6 +91,7 @@ All notable changes to this project are documented in this file.
   `cleanup_false_rollouts`, `backfill_team_owner`. Настройки, которые никто
   не читал: `LOG_LEVEL` (и его env в helm-чарте), `KG_SELF_HEALTH_INTERVAL_MINUTES`,
   `OIDC_WELL_KNOWN_URL`, `REPLAY_MODE`, `CHRONIC_DIGEST_INTERVAL_HOURS`.
+
 - **Ретеншен таблиц событий** (#522) — отдельный реестр
   `EVENT_RETENTION_TARGETS` с полом `MIN_EVENT_RETENTION_DAYS=90`, не 7 дней
   метрик: `kg_deployments` 180 дней, `kg_alerts` 180 и `kg_incidents` 365 по
@@ -100,6 +107,7 @@ All notable changes to this project are documented in this file.
   helm-части `test_ops_manifests.py` и `test_worker_metrics.py`,
   `test_version_consistency.py::test_helm_chart_appversion_matches`; версия
   живёт в трёх местах (`app/__init__.py`, бейдж README, CHANGELOG).
+
 - **Доки сверены с кодом** (#524). README: секции про Helm заменены
   абзацем про `deploy.sh` + `k8s/`, добавлен боевой путь алертов (три
   endpoint-а и кто куда маршрутизируется; сквады пишутся только в KG через
@@ -117,6 +125,33 @@ All notable changes to this project are documented in this file.
   ownership-ConfigMap создаётся руками из `config/ownership.yaml`, релизный
   чек-лист считает три места вместо четырёх.
 
+- **Очередь `sync` для тяжёлых синков, `single_instance` на всех beat-задачах**
+  (#525). Четыре слота `copilot-worker` (2 × `--concurrency=2`) делили
+  35 beat-записей (~95 запусков в час) и инцидентный пайплайн: часовой
+  `kg_topology_sync` (4–10 мин) и 15-минутный `tc_deploys_to_kg` занимали
+  слоты, минутная `kg_external_probe` с `expires=50` и инцидент ждали за
+  ними. Теперь 11 тяжёлых (`SYNC_QUEUE_TASKS`: topology, tc_deploys, storage,
+  metrics, endpoints, signal_aggregates, health_retention,
+  topology_resources, anomaly_detection, runtime_correlation,
+  nats_subjects) уходят через `task_routes` в очередь `sync`
+  (`SYNC_QUEUE_NAME`), её слушает новый Deployment `copilot-worker-sync`
+  (1 × `--concurrency=2`, `-Q sync -n sync@%h`, те же env/SA/пробы/3Gi);
+  `copilot-worker` получил явный `-Q celery`. Лок `single_instance` стоял
+  на 17 задачах из 35 — теперь на всех (ttl ≈ интервал, у probe 50 с); у
+  восьми тяжёлых свои `soft_time_limit`/`time_limit` (tc_deploys 600/720,
+  metrics и anomaly 420/540, endpoints 300/420, storage и
+  runtime_correlation 900/1080, signal_aggregates 900/1200,
+  topology_resources 600/720; topology/retention/nats — глобальные
+  1500/1800). `celery_queue_length` был Gauge, который никто не выставлял
+  (вечный ноль под `CopilotCeleryBacklog`) — теперь Collector читает `LLEN`
+  по очередям на скрейпе api, с лейблом `queue`; правило — `max by (queue)`.
+  Новый воркер добавлен в NetworkPolicy, VMPodScrape, `deploy.sh` (rollout
+  status, подсказки scale) и получил `CopilotWorkerSyncDown`; тест «у каждого
+  celery-воркера есть правило Down» заодно нашёл, что его нет у
+  `copilot-executor` — добавлен `CopilotExecutorDown` (warning). Первый
+  раскат — только `deploy.sh`: TC-деплой делает `set image` по известным
+  deployment-ам и новый не создаст.
+
 ### Зависимости
 
 - **pip-audit снова зелёный** (#520): `certifi` 2026.4.22 → 2026.10.23
@@ -124,6 +159,7 @@ All notable changes to this project are documented in this file.
   (CVE-2026-114603 в `opentelemetry-api`; с 1.45 появились
   `opentelemetry-exporter-otlp-common` и `opentelemetry-exporter-http-transport`).
   Остальные пины не тронуты.
+
 - `tenacity` убран из `requirements.in`/`requirements.txt` (#519): не
   импортируется и никому из установленных пакетов не нужен.
   `httpx2`/`httpcore2` остаются — их требует `anthropic` 1.11.0.
