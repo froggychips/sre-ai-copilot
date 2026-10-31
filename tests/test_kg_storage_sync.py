@@ -25,7 +25,6 @@
   `kg_storage_volumes`, которых нет в снимке кластера. Обе — только при
   здоровом источнике: иначе повторили бы «тихую эрозию рёбер».
 """
-import inspect
 import json
 import subprocess
 from datetime import datetime, timedelta
@@ -1042,44 +1041,113 @@ def test_project_replicaset_feeds_owner_index():
     assert "spec" not in projected and "status" not in projected
 
 
-def test_get_all_pods_pages_through_continue_tokens():
-    """Две страницы → один список; второй запрос несёт continue-токен."""
+class _FakeApiserver:
+    """Подмена urllib3 — ниже всего kubernetes-client.
+
+    Мок стоит на `urllib3.PoolManager.request`, а не на `ApiClient.call_api`:
+    весь путь клиента (сгенерированный метод → `call_api` → `rest_client`)
+    выполняется настоящий, и дрейф его сигнатур между мажорами (36 → 37
+    выкинул `query_params`/`auth_settings`/`_preload_content` из `call_api`)
+    валит тест, а не прод. Работает на обоих мажорах: 36 кладёт query в
+    `fields`, 37 — в URL.
+    """
+
+    def __init__(self, pages, status=200):
+        self.pages = list(pages)
+        self.status = status
+        self.calls = []
+
+    def __call__(self, method, url, **kwargs):
+        from urllib.parse import parse_qsl, urlsplit
+
+        import urllib3
+
+        parts = urlsplit(url)
+        query = dict(parse_qsl(parts.query))
+        fields = kwargs.get("fields") or {}
+        pairs = fields.items() if isinstance(fields, dict) else fields
+        query.update({k: str(v) for k, v in pairs})
+        self.calls.append({
+            "method": method,
+            "path": parts.path,
+            "query": query,
+            "headers": dict(kwargs.get("headers") or {}),
+            "timeout": kwargs.get("timeout"),
+        })
+        body = self.pages.pop(0) if self.pages else {"items": [], "metadata": {}}
+        return urllib3.HTTPResponse(
+            body=json.dumps(body).encode(), status=self.status,
+            headers={"Content-Type": "application/json"}, preload_content=True,
+        )
+
+
+@pytest.fixture
+def kube_api(monkeypatch):
+    """Настоящий ApiClient над фейковым apiserver-ом, с Bearer-токеном —
+    чтобы проверить, что авторизация по-прежнему доезжает до запроса."""
+    from kubernetes import client as k8s_client
+
+    cfg = k8s_client.Configuration()
+    cfg.host = "https://apiserver.test"
+    # Так кладут токен сами load_kube_config/load_incluster_config (36 и 37).
+    cfg.api_key = {"BearerToken": "Bearer tok-secret"}
+    monkeypatch.setattr(k8s_client.Configuration, "_default", cfg)
+
+    def install(fake):
+        monkeypatch.setattr("urllib3.PoolManager.request", fake)
+        monkeypatch.setattr(
+            "app.context.deployments._load_k8s_once", lambda: True,
+        )
+        return fake
+
+    return install
+
+
+@pytest.mark.parametrize("resource,path", [
+    ("pods", "/api/v1/pods"),
+    ("replicasets", "/apis/apps/v1/replicasets"),
+])
+def test_get_all_paged_pages_through_continue_tokens(kube_api, resource, path):
+    """Две страницы → один список; второй запрос несёт continue-токен.
+    Тот же endpoint, limit, Accept и Bearer, что и до 37-го клиента."""
     from app.knowledge_graph.k8s_storage_sync import _get_all
 
-    calls = []
+    raw = _raw_pod_with_bulk() if resource == "pods" else {
+        "metadata": {"namespace": "ns", "name": "rs-1", "ownerReferences": []},
+        "spec": {"replicas": 1},
+        "status": {"replicas": 1},
+    }
+    fake = kube_api(_FakeApiserver([
+        {"items": [raw], "metadata": {"continue": "tok-2"}},
+        {"items": [raw], "metadata": {}},
+    ]))
 
-    class _Resp:
-        def __init__(self, payload):
-            self.data = json.dumps(payload)
-
-    def fake_call_api(path, method, **kwargs):
-        # Мок не должен прятать дрейф сигнатуры клиента: то, чем мы зовём
-        # call_api, обязано биндиться на РЕАЛЬНУЮ сигнатуру установленного
-        # kubernetes-client (ловит переименования вида
-        # response_type → response_types_map при апгрейде пакета).
-        from kubernetes.client import ApiClient
-        inspect.signature(ApiClient.call_api).bind(
-            None, path, method, **kwargs,
-        )
-        calls.append((path, dict(kwargs.get("query_params") or [])))
-        if len(calls) == 1:
-            return _Resp({
-                "items": [_raw_pod_with_bulk()],
-                "metadata": {"continue": "tok-2"},
-            })
-        return _Resp({"items": [_raw_pod_with_bulk()], "metadata": {}})
-
-    with patch("app.context.deployments._load_k8s_once", return_value=True), patch(
-        "kubernetes.client.ApiClient.call_api", side_effect=fake_call_api,
-    ):
-        items = _get_all("pods")
+    items = _get_all(resource)
 
     assert len(items) == 2
-    assert [c[0] for c in calls] == ["/api/v1/pods", "/api/v1/pods"]
-    assert calls[0][1].get("limit") == 500 and "continue" not in calls[0][1]
-    assert calls[1][1].get("continue") == "tok-2"
+    assert [c["method"] for c in fake.calls] == ["GET", "GET"]
+    assert [c["path"] for c in fake.calls] == [path, path]
+    assert fake.calls[0]["query"] == {"limit": "500"}
+    assert fake.calls[1]["query"] == {"limit": "500", "continue": "tok-2"}
+    for c in fake.calls:
+        assert c["headers"].get("Accept") == "application/json"
+        assert c["headers"].get("authorization") == "Bearer tok-secret"
+        assert c["timeout"] is not None
     # Вернулись проекции, а не сырые объекты.
     assert "status" not in items[0]
+
+
+def test_get_all_paged_non_2xx_raises_fetch_error(kube_api):
+    """410 на протухшем continue-токене (или 403/500) — отказ фетча, а не
+    «страница без items» и молча обрезанный лист. Сырой `call_api` 37-го
+    клиента сам статус не проверяет — проверяет слой сгенерированного метода."""
+    from app.knowledge_graph.k8s_storage_sync import _get_all
+
+    kube_api(_FakeApiserver(
+        [{"kind": "Status", "reason": "Expired", "code": 410}], status=410,
+    ))
+    with pytest.raises(KubectlFetchError):
+        _get_all("pods")
 
 
 def test_get_all_pvcs_still_goes_through_kubectl():
@@ -1101,7 +1169,7 @@ def test_get_all_paged_failure_raises_fetch_error(boom):
     from app.knowledge_graph.k8s_storage_sync import _get_all
 
     with patch("app.context.deployments._load_k8s_once", return_value=True), patch(
-        "kubernetes.client.ApiClient.call_api", side_effect=boom,
+        "urllib3.PoolManager.request", side_effect=boom,
     ), pytest.raises(KubectlFetchError):
         _get_all("pods")
 

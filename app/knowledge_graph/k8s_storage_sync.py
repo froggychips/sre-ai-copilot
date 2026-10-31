@@ -255,10 +255,19 @@ def _project_replicaset(item: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
-# resource → (путь листа в kube API, проекция страницы)
-_PAGED: Dict[str, Tuple[str, Any]] = {
-    "pods": ("/api/v1/pods", _project_pod),
-    "replicasets": ("/apis/apps/v1/replicasets", _project_replicaset),
+# resource → (путь листа в kube API, (api-группа клиента, метод листа), проекция).
+# Путь — для логов/ошибок и как документация: метод клиента ходит ровно в него.
+_PAGED: Dict[str, Tuple[str, Tuple[str, str], Any]] = {
+    "pods": (
+        "/api/v1/pods",
+        ("CoreV1Api", "list_pod_for_all_namespaces"),
+        _project_pod,
+    ),
+    "replicasets": (
+        "/apis/apps/v1/replicasets",
+        ("AppsV1Api", "list_replica_set_for_all_namespaces"),
+        _project_replicaset,
+    ),
 }
 
 
@@ -269,12 +278,19 @@ def _list_paged_projected(resource: str) -> List[Dict[str, Any]]:
     трактует его так же, как отказ kubectl: beat-loop не валим, но и молчать
     об отказе нельзя.
 
-    Идёт напрямую по REST-пути с `_preload_content=False`: так страница
-    парсится из сырого JSON apiserver-а (тот же camelCase, что у `kubectl -o
-    json`), без построения V1Pod/V1ReplicaSet-моделей — они на 500 объектов
-    стоят дороже, чем сам dict.
+    Идёт сгенерированным методом листа (`list_*_for_all_namespaces`) с
+    `_preload_content=False`: так страница парсится из сырого JSON
+    apiserver-а (тот же camelCase, что у `kubectl -o json`), без построения
+    V1Pod/V1ReplicaSet-моделей — они на 500 объектов стоят дороже, чем сам
+    dict. Раньше здесь был сырой `ApiClient.call_api(path, "GET",
+    query_params=…, auth_settings=…, _preload_content=False)`, но в
+    kubernetes-client 37 сигнатура `call_api` стала `(method, url, …)` без
+    этих аргументов — вызов падал в рантайме. Сгенерированные методы с
+    `_preload_content` есть и в 36, и в 37, и в обеих версиях бросают
+    `ApiException` на не-2xx (сырой `call_api` 37 этого уже не делает: 410
+    на протухшем continue-токене молча дал бы обрезанный лист).
     """
-    path, project = _PAGED[resource]
+    path, (api_cls, method_name), project = _PAGED[resource]
     # Локальный импорт — kubernetes-client не нужен на путях, где этот модуль
     # только парсит уже готовые dict-ы (тесты, CLI над фикстурами).
     try:
@@ -287,27 +303,28 @@ def _list_paged_projected(resource: str) -> List[Dict[str, Any]]:
     if not _load_k8s_once():
         raise KubectlFetchError("kube-config unavailable")
 
-    api = k8s_client.ApiClient()
+    api = getattr(k8s_client, api_cls)(k8s_client.ApiClient())
+    # Any: с `_preload_content=False` метод отдаёт сырой urllib3-ответ, а не
+    # V1PodList из аннотации 37 — типы клиента тут не помогают.
+    list_page: Any = getattr(api, method_name)
     items: List[Dict[str, Any]] = []
     token: Optional[str] = None
     pages = 0
     while True:
-        params: List[Tuple[str, Any]] = [("limit", _PAGE_LIMIT)]
+        kwargs: Dict[str, Any] = {"limit": _PAGE_LIMIT}
         if token:
-            params.append(("continue", token))
+            kwargs["_continue"] = token
         try:
-            resp = api.call_api(
-                path, "GET",
-                query_params=params,
-                header_params={"Accept": "application/json"},
-                auth_settings=["BearerToken"],
+            resp = list_page(
                 _preload_content=False,
                 _request_timeout=_KUBECTL_TIMEOUT_S,
+                **kwargs,
             )
-            raw = resp[0].data if isinstance(resp, tuple) else resp.data
-            page = json.loads(raw)
+            page = json.loads(resp.data)
         except Exception as e:
-            raise KubectlFetchError(f"list {resource} page={pages} failed: {e}") from e
+            raise KubectlFetchError(
+                f"list {resource} ({path}) page={pages} failed: {e}"
+            ) from e
 
         for item in page.get("items") or []:
             items.append(project(item))

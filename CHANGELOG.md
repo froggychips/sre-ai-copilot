@@ -3,6 +3,23 @@
 All notable changes to this project are documented in this file.
 
 ## [Unreleased]
+### Зависимости
+
+- **`kubernetes` 36.0.3 → 37.0.1** (закрывает #507). Клиент 37 перегенерирован
+  с полными типами и новой сигнатурой `ApiClient.call_api(method, url, …)` —
+  без `query_params`/`auth_settings`/`_preload_content`. Постраничный лист
+  подов/ReplicaSet-ов в `k8s_storage_sync` звал именно так и в 37 падал бы на
+  каждом тике; теперь он идёт сгенерированными
+  `list_pod_for_all_namespaces`/`list_replica_set_for_all_namespaces` с
+  `_preload_content=False` — тот же endpoint, `limit`/`continue`, Bearer и
+  разбор сырого JSON; работает и на 36. Плюс: не-2xx (410 на протухшем
+  continue-токене) снова отказ фетча — сырой `call_api` 37 статус не
+  проверяет и отдал бы обрезанный лист. Тест гоняет настоящий `ApiClient`
+  над подменённым `urllib3`, так что дрейф сигнатур клиента ловится в CI.
+  Optional-поля моделей (`metadata`/`status`/`spec`) в `app/context/*`
+  проверяются явно, без `type: ignore`. Транзитивно: `typing-extensions`
+  4.16.0, `pydantic` 2.13.5 / `pydantic-core` 2.46.5, `durationpy` 0.11,
+  новый `aiohttp-retry` 2.9.1; остальные пины не тронуты.
 
 ## [1.0.29] — 2026-10-31 — probe-фильтр access-лога реально ставится
 ### Исправлено
