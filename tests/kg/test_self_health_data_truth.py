@@ -126,7 +126,11 @@ def test_silent_source_raises_status(db):
 
     r = check_source_coverage(db)
     assert r.detail["sources_reported"] == 1
-    assert len(r.detail["silent"]) == len(ALL_EDGE_SOURCES) - 1
+    # Источник, выключенный флагом (nats_subjects_sync при дефолтном
+    # NATS_SUBJECTS_PARSER_ENABLED=False), не молчит — он в `disabled`.
+    assert len(r.detail["silent"]) == (
+        len(ALL_EDGE_SOURCES) - 1 - len(r.detail["disabled"])
+    )
     assert r.status == "warn"
 
 
