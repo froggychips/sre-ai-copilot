@@ -738,6 +738,23 @@ async def alertmanager_webhook_store_only(
             stored.append({"incident_id": incident.incident_id, "result": "failed"})
 
     db.commit()
+
+    # Детерминированный мост (REMEDIATION_BRIDGE_ENABLED). Сквадовые алерты
+    # в канал не идут — исключение одно: playbook с policy approve даёт
+    # карточку с кнопками (дедуп 6 ч на цель). Обогащение + K8sFacts +
+    # dry-run — секунды, поэтому фоном после ответа AlertManager-у.
+    from app.remediation.bridge import schedule_bridge_for_incident, wants_bridge
+    for alert in payload_alerts:
+        if alert.status == "resolved" or not wants_bridge(alert.labels):
+            continue
+        try:
+            bridge_incident = Incident.from_alertmanager(
+                alert, batch_truncated_alerts=truncated,
+            )
+        except HTTPException:
+            continue
+        schedule_bridge_for_incident(bridge_incident)
+
     return {
         "status": "stored",
         "alerts": stored,
@@ -959,6 +976,13 @@ async def alertmanager_webhook_enrich_and_forward(
                     ]
                     if kinds:
                         _mark_incidents_noise(db, [inc], kinds)
+                # Детерминированный мост правила → playbook (флаг
+                # REMEDIATION_BRIDGE_ENABLED): block → строка в этой же
+                # карточке, approve → отдельная карточка с кнопками.
+                from app.remediation.bridge import bridge_enabled, run_bridge
+                if bridge_enabled():
+                    for c in ctxs:
+                        await run_bridge(db, c)
                 env_hint = _env_hint(incs[0].namespace)
                 resurfaced = (decision == Decision.SEND_RESURFACED)
                 delivered = await discord_service.send_enriched_alert(
@@ -1005,7 +1029,7 @@ async def alertmanager_webhook_enrich_and_forward(
         notice_service = DiscordService()
         for inc in resolved_criticals:
             try:
-                await notice_service.send_resolved_notice(
+                posted = await notice_service.send_resolved_notice(
                     alertname=inc.labels.get("alertname", "unknown"),
                     namespace=inc.namespace,
                     # Тот же target-резолв, что в firing-notice/kg_alerts —
@@ -1019,7 +1043,8 @@ async def alertmanager_webhook_enrich_and_forward(
                     ),
                     duration_min=_resolved_duration_minutes(inc.starts_at, inc.ends_at),
                 )
-                resolved_posted += 1
+                if posted is not False:
+                    resolved_posted += 1
             except Exception as e:
                 log.warning(
                     "enrich_forward.resolved_notice_failed",

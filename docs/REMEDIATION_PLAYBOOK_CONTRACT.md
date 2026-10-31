@@ -98,3 +98,22 @@ intent-а. Порядок поиска: сначала запись из поп�
 - Playbook только ужесточает исход `assess()`: failed и unknown остаются как есть.
 - Проверка вернула False: на промежуточной попытке pending, на последней failed.
 - Проверку не удалось выполнить (None): pending, на последней unknown.
+
+## 7. Детерминированный мост (без LLM)
+
+`app/remediation/bridge.py`, флаг `REMEDIATION_BRIDGE_ENABLED`. Второй, кроме
+FixAgent, вход в этот контракт — прямо с прод-пути алертов (`/store`,
+`/enrich-and-forward`):
+
+- preconditions считаются по фактам правил `enrich_alert` и по фактам
+  состояния пода (K8sFacts → `OOMKilledRule`, `ProcessCrashRule`,
+  `PodEventsRule`); снимок не снят — `absent` понижается до `unknown`;
+- intent — первый мутирующий шаг `plan.steps`, собранный `render_plan`; снимок
+  и привязка — `build_match_snapshot` + `bind_server_params`, как у pipeline;
+- gate зовётся с `require_binding=True` и при отборе, и на apply-пути
+  (`analysis.source == "remediation_bridge"`), независимо от
+  `REMEDIATION_PLAYBOOK_BINDING_ENABLED`;
+- `approve` → карточка с кнопками в канал (сквадам — узкое исключение из
+  «в канал не постим»), не чаще раза в 6 ч на (playbook, uid, incarnation);
+  `block` → строка в обычной карточке, без кнопок.
+

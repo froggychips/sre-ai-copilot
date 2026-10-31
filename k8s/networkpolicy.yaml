@@ -35,7 +35,11 @@ spec:
   #   monitoring — vmalertmanager постит /webhooks/alertmanager/* напрямую в
   #                Service (HMAC у него нет, см. ALERTMANAGER_ALLOW_UNAUTHENTICATED:
   #                граница доверия — именно это правило);
-  #   mcp        — squad-medic постит /webhooks/remediation (HMAC).
+  #   mcp        — squad-medic постит /webhooks/remediation (HMAC);
+  #   ai-reviewer-net — пересылает клики по кнопкам «Применить/Отклонить»
+  #                (/discord/interactions, подпись Ed25519 Discord): копилот
+  #                шлёт карточки тем же приложением AI Bot, и его Interactions
+  #                Endpoint — ai-reviewer (wo/ai-reviewer!11).
   # До 23.09.2026 здесь стоял `namespaceSelector: {}` — любой namespace
   # кластера, включая сквады с кодом из произвольных веток, то есть изоляции,
   # на которую опирается отказ от HMAC, не было вовсе. Клиенты сверены по
@@ -49,6 +53,9 @@ spec:
     - namespaceSelector:
         matchLabels:
           kubernetes.io/metadata.name: mcp
+    - namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: ai-reviewer-net
     ports:
     - protocol: TCP
       port: 8000

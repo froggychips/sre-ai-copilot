@@ -284,6 +284,31 @@ def _parse_retry_after(resp: Any, default: float = _RATELIMIT_DEFAULT_WAIT) -> f
     return default
 
 
+# Порог длительности эпизода для зелёной resolved-карточки (минуты). Оверрайд
+# — settings.DISCORD_RESOLVED_NOTICE_MIN_MINUTES (0 — без фильтра).
+RESOLVED_NOTICE_MIN_MINUTES = 30
+
+
+def resolved_notice_wanted(duration_min: Optional[int]) -> bool:
+    """Постить ли «✅ resolved» за эпизод длиной `duration_min` минут.
+
+    В канал резолвы приходят только по critical (фильтр вызывающего), и
+    за неделю они дали 154 из 411 сообщений — в основном флапы на минуты.
+    Конец короткого эпизода видно и так: карточка firing была минуты назад.
+    Длительность неизвестна (нет endsAt) — постим: потерять конец долгого
+    инцидента хуже одной лишней строки.
+    """
+    threshold = getattr(settings, "DISCORD_RESOLVED_NOTICE_MIN_MINUTES",
+                        RESOLVED_NOTICE_MIN_MINUTES)
+    try:
+        threshold = int(threshold)
+    except (TypeError, ValueError):
+        threshold = RESOLVED_NOTICE_MIN_MINUTES
+    if threshold <= 0 or duration_min is None:
+        return True
+    return duration_min >= threshold
+
+
 def _redact_webhook_url(url: str) -> str:
     """Webhook-URL для логов — БЕЗ токена.
 
@@ -1366,10 +1391,19 @@ class DiscordService:
         В отличие от webhook, bot API поддерживает interactive components
         (buttons). Используется для embed-ов с approve/decline кнопками.
         """
+        return await self._post_via_bot(payload) is not None
+
+    async def _post_via_bot(self, payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """То же, что _send_via_bot, но отдаёт созданное сообщение.
+
+        None — не отправлено. Иначе dict с `id`/`channel_id` (что смогли
+        прочитать из ответа; пустой dict, если тело не JSON): по ним
+        карточку моста потом дописывают итогом verify.
+        """
         token = settings.DISCORD_BOT_TOKEN
         channel_id = settings.DISCORD_INCIDENT_CHANNEL_ID
         if not token or not channel_id:
-            return False
+            return None
         url = f"https://discord.com/api/v10/channels/{channel_id}/messages"
         headers = {
             "Authorization": f"Bot {token}",
@@ -1383,11 +1417,39 @@ class DiscordService:
                         "discord_bot_send_failed",
                         extra={"status": r.status_code, "body": r.text[:300]},
                     )
-                    return False
-                return True
+                    return None
+                try:
+                    body = r.json()
+                except Exception:
+                    body = None
+                msg: Dict[str, Any] = {"channel_id": str(channel_id)}
+                if isinstance(body, dict) and body.get("id"):
+                    msg["id"] = str(body["id"])
+                    msg["channel_id"] = str(body.get("channel_id") or channel_id)
+                return msg
         except Exception as e:
             logging.error("discord_bot_send_exception", extra={"error": str(e)})
-            return False
+            return None
+
+    async def send_remediation_proposal(
+        self, payload: Dict[str, Any],
+    ) -> Optional[Dict[str, Any]]:
+        """Карточка моста с кнопками «Применить/Отклонить» (bot API).
+
+        Только bot API: webhook не рендерит custom_id-кнопки, а карточка без
+        кнопок здесь бессмысленна (и для сквада — прямое нарушение «в канал
+        не постим»). Нет бота — None, карточки нет.
+        """
+        if settings.DISCORD_DRY_RUN:
+            _dry_run_log.info(
+                "discord.dry_run.send_remediation_proposal",
+                title=(payload.get("embeds") or [{}])[0].get("title"),
+            )
+            return {"channel_id": "dry-run"}
+        if not self._can_send_via_bot():
+            _log.warning("discord.remediation_proposal_no_bot")
+            return None
+        return await self._post_via_bot(payload)
 
     async def send_enriched_alert(
         self,
@@ -2067,6 +2129,21 @@ class DiscordService:
             if orleans_field:
                 fields.append(orleans_field)
 
+        # Детерминированный мост (REMEDIATION_BRIDGE_ENABLED): playbook
+        # сматчился, но policy его заблокировала — одна строка, без кнопок.
+        # Флаг выключен — extras пусты, поле не появляется.
+        remediation_lines: List[str] = []
+        for c in contexts:
+            for line in (getattr(c, "extras", None) or {}).get("remediation_lines") or ():
+                if line not in remediation_lines:
+                    remediation_lines.append(str(line))
+        if remediation_lines:
+            fields.append({
+                "name": "Remediation",
+                "value": "\n".join(remediation_lines)[:1024],
+                "inline": False,
+            })
+
         # Generator link (Grafana) — если есть
         if incident.generator_url:
             fields.append({
@@ -2392,16 +2469,24 @@ class DiscordService:
         namespace: Optional[str] = None,
         service: Optional[str] = None,
         duration_min: Optional[int] = None,
-    ) -> None:
+    ) -> bool:
         """Короткий зелёный embed «critical-алерт разрезолвился».
 
         Инварианты: без mention (хорошими новостями никого не пингуем),
         без dedup-кэша (резолв одноразовый), только из enrich-and-forward
-        и только для critical — фильтр на стороне вызывающего.
+        и только для critical — фильтр на стороне вызывающего. Короткий
+        эпизод (< DISCORD_RESOLVED_NOTICE_MIN_MINUTES) не постится вовсе —
+        см. resolved_notice_wanted. Возвращает False, если карточки нет.
         """
+        if not resolved_notice_wanted(duration_min):
+            _log.info(
+                "discord.resolved_notice_skipped_short",
+                alertname=alertname, namespace=namespace, duration_min=duration_min,
+            )
+            return False
         url = settings.DISCORD_WEBHOOK_URL
         if not url:
-            return
+            return False
         target = "/".join(p for p in (namespace, service) if p)
         duration_label = ""
         if duration_min is not None and duration_min >= 0:
@@ -2420,8 +2505,8 @@ class DiscordService:
                 alertname=alertname, namespace=namespace, service=service,
                 duration_min=duration_min,
             )
-            return
-        await self._post_enriched_raw(url, payload)
+            return True
+        return await self._post_enriched_raw(url, payload)
 
     async def _post_enriched_raw(self, url: str, payload: Dict[str, Any]) -> bool:
         """Fallback-POST когда _compute_enriched_key вернул None.
