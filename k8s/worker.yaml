@@ -134,6 +134,9 @@ spec:
         # Дефолт False — без явного true ежедневный дайджест выключится.
         - name: STATS_DIGEST_ENABLED
           value: "true"
+        # Сводка хронических алертов (#stats, раз в 6 ч), секция «горят непрерывно».
+        - name: CHRONIC_DIGEST_ENABLED
+          value: "true"
         # Тоже дефолт False: periodic backfill team_owner через
         # multi-signal inference.
         - name: OWNERSHIP_BACKFILL_ENABLED
@@ -428,6 +431,9 @@ spec:
         - name: BUILD_VERSION
           value: "BUILD_VERSION_PLACEHOLDER"
         - name: STATS_DIGEST_ENABLED
+          value: "true"
+        # Сводка хронических алертов (#stats, раз в 6 ч), секция «горят непрерывно».
+        - name: CHRONIC_DIGEST_ENABLED
           value: "true"
         - name: OWNERSHIP_BACKFILL_ENABLED
           value: "true"
