@@ -45,8 +45,6 @@ spec:
         env:
         - name: LLM_BACKEND
           value: {{ .Values.env.llmBackend | quote }}
-        - name: LOG_LEVEL
-          value: {{ .Values.env.logLevel | quote }}
         - name: SAFE_MODE
           value: {{ .Values.env.safeMode | quote }}
         - name: ENV

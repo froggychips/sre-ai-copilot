@@ -49,7 +49,6 @@
 - `app/context/logs.py`, `metrics.py`, `deployments.py`: адаптеры k8s-логов, VM-метрик, истории деплоев.
 - `app/context/jira_client.py`: `JiraClient` (Atlassian REST API v3, Basic Auth); `build_jira_context()` → `{open, resolved, has_open, has_resolved, total}` или `None`.
 - `app/core/intelligence/similar_incidents.py`: `SimilarIncidentEngine` — поиск по KG с фильтром `_is_quality_cause()`, `RECURRENCE_WINDOW_DAYS=7`, флаг `recurrence` в каждом результате.
-- `app/core/intelligence/blast_radius.py`, `temporal_diff.py`, `next_steps.py`: вспомогательные аналитические функции.
 
 ## Knowledge Graph
 
@@ -108,10 +107,8 @@
 - `primary_hypothesis()` — top-1 observed Fact; `why_this_matters()` — derived priorization (shared dep, chronic, recurrence, infra-critical team).
 
 ### CLI tools (`app/scripts/`)
-- `backfill_team_owner.py` — one-shot UPDATE `team_owner` для legacy строк.
 - `backfill_tc_deploys.py` — расширенный TC history backfill (default 30 дней).
 - `cleanup_drift.py` — thin wrapper над `drift_cleanup.py` для ручного dry-run / apply.
-- `cleanup_false_rollouts.py` — удаляет записи `k8s_rollout`, которые watcher 1.0.4 писал по росту `metadata.generation` (образы не менялись); dry-run по умолчанию.
 - `reattribute_deploys.py` — переатрибутирует ns-broadcast записи `kg_deployments` на точные цели по build properties TeamCity (`--apply --limit-builds N`).
 - `reattribute_job_alerts.py` — переносит `KubeJobFailed` / `KubeJobNotCompleted` с `vm-kube-state-metrics` на владельца Job/CronJob (`job_attribution`), ужимает или удаляет опустевшие KSM-инциденты и присоединяет алерты к инциденту владельца; dry-run по умолчанию, `--apply` для переноса.
 
