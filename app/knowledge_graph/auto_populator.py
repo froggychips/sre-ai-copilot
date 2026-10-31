@@ -154,6 +154,11 @@ def populate_from_incident(db: Session, incident: Incident) -> Dict[str, int]:
     # источника kg_nodes (зона, точки входа) — labels целиком в raw не лежат.
     if labels.get("node"):
         alert_raw["node"] = labels["node"]
+    # Namespace алерта без сервиса: у строки нет kg_services, и иначе он
+    # теряется — еженедельная сверка покрытия (weekly_reconciliation) ключует
+    # алерты парой (alertname, namespace), как ALERTS в VictoriaMetrics.
+    if svc is None and namespace:
+        alert_raw["namespace"] = namespace
     # Экспортер, через который пришёл алерт: источник метрики, не владелец.
     # По `attribution` видно, как определён объект (pod/node/no_target/…) —
     # без этого «без сервиса» нодового алерта и неразрешённого не различить.

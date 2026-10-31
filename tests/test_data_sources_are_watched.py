@@ -80,6 +80,9 @@ _MAINTENANCE = frozenset({
     "chronic_alerts_digest",
     "daily_stats_digest",
     "team_daily_digest",
+    # Отчёт-сверка: сам ничего в граф не пишет, а каждая его строка уже
+    # говорит «не измерено», если её источник молчит.
+    "weekly_reconciliation",
     "discord_dedup_purge",
     "kg_external_probe",
 })

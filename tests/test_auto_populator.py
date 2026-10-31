@@ -160,6 +160,9 @@ def test_populate_records_alert_without_service_label(db):
     alert = db.query(AlertEvent).filter_by(fingerprint="inc-noservice").one()
     assert alert.service_id is None
     assert db.query(Service).count() == 0
+    # Namespace без сервиса иначе теряется — по нему сверка покрытия
+    # (weekly_reconciliation) ключует алерт парой (alertname, namespace).
+    assert alert.raw["namespace"] == "squad-1"
 
 
 def test_node_only_alert_is_persisted_without_service(db):
