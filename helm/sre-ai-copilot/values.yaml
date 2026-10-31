@@ -82,7 +82,6 @@ resources:
 
 env:
   llmBackend: anthropic
-  logLevel: info
 
   # appEnv=production включает fail-closed-валидаторы в app/config.py:
   # обязательные ALERTMANAGER_WEBHOOK_SECRET / JWT_PUBLIC_KEY / непустой

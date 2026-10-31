@@ -1,5 +1,7 @@
-# Base-образ можно (и нужно) пиннить по digest в CI:
-#   FROM python:3.11-slim@sha256:<digest>
+# Base-образ закреплён по digest (manifest list, все архитектуры), чтобы
+# «тот же тег» не подменял рантайм между сборками. Обновляет dependabot
+# (ecosystem docker в .github/dependabot.yml); руками — без демона:
+#   skopeo inspect --raw docker://docker.io/library/python:3.11-slim | sha256sum
 # Текущая закреплённая версия пакета: 3.11-slim (Debian 12 trixie line).
 #
 # ЭТА СТРОКА — ЕДИНСТВЕННЫЙ ИСТОЧНИК ИСТИНЫ ПО ВЕРСИИ PYTHON. Меняешь минор —
@@ -14,7 +16,7 @@
 # бинарных пинов — проверено для grpcio/psycopg2-binary/pydantic-core/uvloop),
 # но это смена рантайма прода и делается отдельно, с прогоном сборки образа и
 # полного сьюта, а не заодно с правкой конфигов линтера.
-FROM python:3.11-slim
+FROM python:3.11-slim@sha256:673719e071ecf27434fd2635bbd8d00f49f4fdd81f243143438a42ced8bedf60
 
 # kubectl-версия пиннится явно. Обновлять — осознанно, вместе с KUBECTL_SHA256.
 # Получить актуальный sha256:
@@ -47,7 +49,7 @@ RUN set -eux; \
 # против 50.0.0 в lock-е — слой только путал и раздувал образ).
 RUN pip install --no-cache-dir \
     grpcio==1.80.0 \
-    psycopg2-binary==2.9.12 \
+    psycopg2-binary==2.9.13 \
     pydantic-core==2.46.4
 
 COPY requirements.txt .

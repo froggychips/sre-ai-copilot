@@ -4,6 +4,32 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+### Изменено
+
+- **Мёртвый код снят.** Модули без единого импортёра: `app/topology/`,
+  `app/ingestion/kubernetes_events.py`, `app/agents/critic.py` (его место
+  давно занял `fact_critic`), `app/core/intelligence/next_steps.py`,
+  `temporal_diff.py`, `blast_radius.py`. Модули, которых касались только
+  их собственные тесты: `app/rca/explainer.py`, `app/agents/hypothesis.py`
+  (пайплайн работает на `MultiHypothesisAgent`) — вместе с тестами.
+  Одноразовые скрипты, чья работа выполнена: `backfill_existing_sha`,
+  `cleanup_false_rollouts`, `backfill_team_owner`. Настройки, которые никто
+  не читал: `LOG_LEVEL` (и его env в helm-чарте), `KG_SELF_HEALTH_INTERVAL_MINUTES`,
+  `OIDC_WELL_KNOWN_URL`, `REPLAY_MODE`, `CHRONIC_DIGEST_INTERVAL_HOURS`.
+
+### Зависимости
+
+- `tenacity` убран из `requirements.in`/`requirements.txt`: не импортируется
+  и никому из установленных пакетов не нужен. `httpx2`/`httpcore2` остаются —
+  их требует `anthropic` 1.11.0.
+
+### Инфраструктура
+
+- Dockerfile: базовый образ `python:3.11-slim` закреплён по digest
+  (manifest list; обновляет dependabot `docker`), `psycopg2-binary` в слое
+  тяжёлых пакетов поднят до 2.9.13 — версии из `requirements.txt`, иначе слой
+  переустанавливался следующим `pip install`.
+
 ## [1.0.27] — 2026-10-16 — история медика при переносе алертов, замер синка
 
 ### Исправлено
