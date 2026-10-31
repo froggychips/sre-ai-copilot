@@ -132,8 +132,107 @@ async def test_sends_to_stats_channel_with_data():
         ms.CHRONIC_DIGEST_WINDOW_HOURS = 24
         ms.CHRONIC_DIGEST_MIN_FIRES = 5
         result = await send_chronic_digest(db)
-    assert result == {"status": "sent", "rows": 1}
+    assert result == {"status": "sent", "rows": 1, "continuous": 0}
     assert mock_send.await_count == 1
     sent_content = mock_send.await_args.args[0]
     assert "bot-service" in sent_content
     assert "42 fires" in sent_content
+
+
+# ── «горят непрерывно» ─────────────────────────────────────────────────────
+#
+# Непрерывно горящий алерт — одна строка kg_alerts, в счёт fires он не
+# попадает, а его AM-повторы в #infra-error больше не постятся
+# (SUPPRESS_REPEAT). Секция держит его в поле зрения.
+
+
+@pytest.fixture
+def sqlite_db():
+    from sqlalchemy import create_engine
+    from sqlalchemy.orm import sessionmaker
+
+    from app.database import Base
+
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    session = sessionmaker(bind=engine)()
+    try:
+        yield session
+    finally:
+        session.close()
+        engine.dispose()
+
+
+def _alert(db, fp, fired_h, notified_h=1.0, resolved=False, raw=None, svc=None):
+    from app.knowledge_graph.schema import AlertEvent
+
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    db.add(AlertEvent(
+        alertname=f"A-{fp}",
+        severity="warning",
+        fingerprint=fp,
+        service_id=svc,
+        fired_at=now - timedelta(hours=fired_h),
+        last_notified_at=now - timedelta(hours=notified_h),
+        resolved_at=now if resolved else None,
+        raw=raw,
+    ))
+    db.commit()
+
+
+def test_continuous_picks_open_long_firing_alerts(sqlite_db):
+    from app.knowledge_graph.schema import Service
+    from app.services.chronic_digest import _continuous
+
+    svc = Service(name="cnpg", namespace="prod-shared")
+    sqlite_db.add(svc)
+    sqlite_db.commit()
+    _alert(sqlite_db, "days", fired_h=72, svc=svc.id)               # горит 3 суток
+    _alert(sqlite_db, "node", fired_h=30, raw={"node": "dev-32"})   # без сервиса
+    _alert(sqlite_db, "fresh", fired_h=3)                           # меньше порога
+    _alert(sqlite_db, "gone", fired_h=72, resolved=True)            # резолвнут
+    _alert(sqlite_db, "phantom", fired_h=72, notified_h=48)         # AM молчит
+
+    rows = _continuous(sqlite_db, 24)
+
+    assert [r["alertname"] for r in rows] == ["A-days", "A-node"]
+    assert rows[0]["where"] == "prod-shared/cnpg"
+    assert rows[1]["where"] == "dev-32"
+
+
+def test_format_continuous_section():
+    from app.services.chronic_digest import _format_continuous
+
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    out = _format_continuous([{
+        "alertname": "KubeVersionMismatch", "severity": "warning",
+        "where": "—", "fired_at": now - timedelta(hours=50),
+    }], 24)
+    assert "Горят непрерывно > 24 ч" in out
+    assert "`KubeVersionMismatch`" in out
+    assert "горит 50 ч" in out
+    assert _format_continuous([], 24) == ""
+
+
+@pytest.mark.asyncio
+async def test_sends_continuous_even_without_chronic_rows():
+    """Хроники нет, но алерт горит сутками — дайджест всё равно уходит."""
+    cont = [{
+        "alertname": "CnpgDrReplicaMissing", "severity": "warning",
+        "where": "prod-shared/cnpg",
+        "fired_at": (datetime.now(timezone.utc) - timedelta(hours=40)).replace(tzinfo=None),
+    }]
+    with patch("app.services.chronic_digest.settings") as ms, \
+         patch("app.services.chronic_digest._aggregate", return_value=[]), \
+         patch("app.services.chronic_digest._continuous", return_value=cont), \
+         patch("app.services.discord_service.DiscordService.send_stats_report",
+               new_callable=AsyncMock) as mock_send:
+        ms.CHRONIC_DIGEST_ENABLED = True
+        ms.CHRONIC_DIGEST_WINDOW_HOURS = 24
+        ms.CHRONIC_DIGEST_MIN_FIRES = 5
+        ms.STUCK_ALERTS_MIN_DURATION_HOURS = 24
+        result = await send_chronic_digest(MagicMock())
+    assert result == {"status": "sent", "rows": 0, "continuous": 1}
+    content = mock_send.await_args.args[0]
+    assert "CnpgDrReplicaMissing" in content
+    assert "Chronic alerts" not in content

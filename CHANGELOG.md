@@ -3,6 +3,9 @@
 All notable changes to this project are documented in this file.
 
 ## [Unreleased]
+### Исправлено
+
+- **Повтор горящего алерта от Alertmanager больше не постит карточку «🌀 RESURFACED».** 31.10 в 11:52 UTC в #infra-error пачкой пришли 7 таких карточек (NodeDiskIOSaturation dev-32, TooManyScrapeErrors, TooManyLogs, ScrapePoolHasNoTargets, CnpgDrReplicaMissing, KubeVersionMismatch, DevNodeDiskPressureImminent dev-4) — все горели непрерывно днями, AM просто повторил группу через `repeat_interval` (4 ч), а L2 принимал «4 ч без fire» за затишье > 2 ч. Теперь в ветке затишья `decide_send` сначала смотрит эпизод: если по каждому fingerprint группы строка `kg_alerts` открыта (`resolved_at IS NULL`), а эпизод — `fired_at` в KG и `startsAt` из AM — начался до прошлого раза, когда ключ видели, это повтор: решение `SUPPRESS_REPEAT`, карточки нет, `last_notified_at` обновлён `populate_from_incident` как в /store, «последний раз видели» в Redis сдвинут, метрика `alerts_suppressed_total{reason="repeat"}`, лог `alert_dedup.suppress_repeat` с alertname/fingerprints. Возврат после resolve (populate сдвигает `fired_at` резолвнутой строки на новый эпизод, AM даёт новый `startsAt`) по-прежнему `SEND_RESURFACED`; нет строки в KG, новый fingerprint в группе или сбой SQL — тоже карточка. Critical-повтор остаётся напоминанием каждые 4 ч, но обычной карточкой без ложной 🌀. Флаг `ALERT_SUPPRESS_AM_REPEATS` (по умолчанию включён), `false` — поведение 1.0.30. Чтобы такие алерты не пропали из виду, chronic-дайджест (#stats, раз в 6 ч) получил секцию «🔥 Горят непрерывно > N ч» — открытые строки `kg_alerts` старше `STUCK_ALERTS_MIN_DURATION_HOURS` (24), по которым AM присылал что-то за 12 ч; раньше дайджест считал только число fires, а непрерывный алерт — одна строка, и в него не попадал.
 
 ## [1.0.30] — 2026-10-31 — еженедельная сверка против кластера, kubernetes 37
 ### Зависимости

@@ -258,6 +258,11 @@ class Settings(BaseSettings):
     # Default False — включается отдельно после канареечного прогона,
     # чтобы `/store`-route не получил Discord-побочку случайно.
     DISCORD_ENRICH_ENABLED: bool = False
+    # Повтор ГОРЯЩЕГО алерта от Alertmanager (repeat_interval, 4h) не постит
+    # карточку: L2 видел в нём «quiet >2h» и слал 🌀 RESURFACED, хотя алерт
+    # не гас. Видимость таких — секция «горят непрерывно» chronic-дайджеста.
+    # False — поведение 1.0.30 (повтор = resurface).
+    ALERT_SUPPRESS_AM_REPEATS: bool = True
     # Окно поиска recent_deploys/incidents_on (минуты).
     ENRICH_DEPLOY_LOOKBACK_MIN: int = 60
     ENRICH_RECURRENCE_LOOKBACK_MIN: int = 1440  # 24 ч

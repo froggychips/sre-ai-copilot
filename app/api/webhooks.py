@@ -836,6 +836,7 @@ async def alertmanager_webhook_enrich_and_forward(
     suppressed_chronic = 0
     suppressed_rollout = 0
     suppressed_inhibited = 0
+    suppressed_repeat = 0
     if settings.DISCORD_ENRICH_ENABLED and firing_incidents:
         from app.services.alert_dedup import (Decision, decide_send,
                                               rollback_undelivered)
@@ -910,7 +911,11 @@ async def alertmanager_webhook_enrich_and_forward(
                     service=head_service,
                     severity=sev,
                     db=db,
+                    episodes=[(i.incident_id, i.starts_at) for i in incs],
                 )
+                if decision == Decision.SUPPRESS_REPEAT:
+                    suppressed_repeat += 1
+                    continue
                 if decision == Decision.SUPPRESS_CHRONIC:
                     suppressed_chronic += 1
                     log.info(
@@ -1031,6 +1036,7 @@ async def alertmanager_webhook_enrich_and_forward(
         "suppressed_chronic": suppressed_chronic,
         "suppressed_rollout": suppressed_rollout,
         "suppressed_inhibited": suppressed_inhibited,
+        "suppressed_repeat": suppressed_repeat,
         "suppressed_allowlist": suppressed_allowlist,
         "enrich_enabled": settings.DISCORD_ENRICH_ENABLED,
         "truncated_alerts": truncated,
