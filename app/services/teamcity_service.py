@@ -75,6 +75,20 @@ def is_prod_buildtype(buildtype_id: Optional[str]) -> bool:
     return "_Prod_" in bt or bt.endswith("_Prod")
 
 
+STATICS_BUILDTYPE_PREFIX = "Wo_StaticsNewCluster"
+
+
+def is_statics_buildtype(buildtype_id: Optional[str]) -> bool:
+    """Сборка статики (проект TC `Wo_StaticsNewCluster_*`).
+
+    Статика — не сервис: билд перезаливает данные для всего окружения
+    (preprod/prod/squad-N), и привязывать его к каждому сервису namespace
+    бессмысленно. `tc_deploys_to_kg` пишет такой билд одной строкой на
+    синтетический узел `statics` namespace (см. schema.STATICS_NODE_NAME).
+    """
+    return (buildtype_id or "").startswith(STATICS_BUILDTYPE_PREFIX)
+
+
 def branch_for_namespace(namespace: Optional[str]) -> Optional[str]:
     if not namespace:
         return None

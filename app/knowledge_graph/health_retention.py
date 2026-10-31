@@ -49,10 +49,16 @@ ACCESS EXCLUSIVE-подобную нагрузку на автовакуум и 
 копеечная по объёму, а поквартальный тренд по кластеру — единственное, из
 чего его вообще можно восстановить.
 
-**Чего эта политика НЕ касается.** `kg_deployments`, `kg_alerts`,
-`kg_pod_events`, `kg_k8s_jobs` — это события со смыслом, а не сэмплы:
-деплой полугодовой давности отвечает на вопрос «когда это сломалось», и
-срок его жизни — отдельное решение, не побочный эффект уборки метрик.
+**События — отдельный реестр.** `kg_deployments`, `kg_alerts`,
+`kg_pod_events`, `kg_incidents`, `kg_remediation_events` — это события со
+смыслом, а не сэмплы: деплой полугодовой давности отвечает на вопрос «когда
+это сломалось». Поэтому у них свой список `EVENT_RETENTION_TARGETS` со
+сроками от полугода и свой пол `MIN_EVENT_RETENTION_DAYS`, а не 30 дней
+метрик. Срок у них всё же есть: до 31.10.2026 его не было вовсе, и
+`kg_deployments` дорос до 1,24 млн строк (1,96 ГБ) — больше, чем все
+наблюдательные таблицы вместе. У алертов и инцидентов время — `resolved_at`:
+открытые (NULL) не трогаются никогда. `kg_k8s_jobs`, `kg_services`,
+`kg_service_edges` — не история, а текущее состояние, их чистят синки.
 """
 from __future__ import annotations
 
@@ -66,8 +72,9 @@ from sqlalchemy.orm import Session
 logger = logging.getLogger(__name__)
 
 __all__ = [
-    "purge_old_health", "purge_observations", "RETENTION_TARGETS",
-    "DEFAULT_RETENTION_DAYS", "MIN_RETENTION_DAYS",
+    "purge_old_health", "purge_observations", "purge_events",
+    "RETENTION_TARGETS", "EVENT_RETENTION_TARGETS",
+    "DEFAULT_RETENTION_DAYS", "MIN_RETENTION_DAYS", "MIN_EVENT_RETENTION_DAYS",
 ]
 
 #: Сколько истории храним. 30 дней = 4× самое глубокое окно потребителя (7д).
@@ -86,6 +93,11 @@ DEFAULT_BATCH_SIZE = 50_000
 #: накопленное за несколько суток, дальше уборка станет копеечной.
 DEFAULT_MAX_BATCHES = 40
 
+#: Пол ретеншена СОБЫТИЙ. Квартал — минимум, на который таймлайн инцидента и
+#: вопрос «когда это сломалось» должны отвечать без оговорок; короче —
+#: почти наверняка ошибка в настройке.
+MIN_EVENT_RETENTION_DAYS = 90
+
 
 #: Наблюдательные таблицы: (таблица, колонка времени, срок хранения).
 #: Срок — свойство данных, а не текущего размера таблицы: см. рассуждение
@@ -103,6 +115,23 @@ RETENTION_TARGETS: tuple[tuple[str, str, int], ...] = (
     ("kg_log_observations", "ts", DEFAULT_RETENTION_DAYS),
     # 15 МБ на три месяца: дешевле хранить, чем потом не иметь тренда.
     ("kg_cluster_observations", "ts", 90),
+)
+
+#: Таблицы событий: (таблица, колонка времени, срок хранения). Сроки длиннее
+#: метрик на порядок — см. «События — отдельный реестр» в докстринге модуля.
+EVENT_RETENTION_TARGETS: tuple[tuple[str, str, int], ...] = (
+    # «Когда это сломалось» — полгода. Самый глубокий читатель: stale-класс
+    # (ACTIVE_WINDOW_DAYS) и deploy-correlator (часы).
+    ("kg_deployments", "started_at", 180),
+    # По resolved_at: открытый алерт (NULL) не удаляется никогда.
+    ("kg_alerts", "resolved_at", 180),
+    # По last_seen: событие, которое k8s ещё видит, остаётся.
+    ("kg_pod_events", "last_seen", 90),
+    # Починки медика — год: это датасет live-RCA и история стендов.
+    ("kg_remediation_events", "created_at", 365),
+    # После kg_remediation_events: у тех FK на kg_incidents.id. По resolved_at —
+    # открытые остаются.
+    ("kg_incidents", "resolved_at", 365),
 )
 
 
@@ -143,6 +172,41 @@ def purge_observations(
     return {"deleted": deleted, "per_table": per_table}
 
 
+def purge_events(
+    db: Session,
+    *,
+    overrides: Dict[str, int] | None = None,
+    batch_size: int = DEFAULT_BATCH_SIZE,
+    max_batches: int = DEFAULT_MAX_BATCHES,
+    now: datetime | None = None,
+) -> Dict[str, Any]:
+    """Прогнать ретеншен по таблицам событий из `EVENT_RETENTION_TARGETS`.
+
+    Тот же контракт, что у `purge_observations`: таблицы независимы, пол —
+    `MIN_EVENT_RETENTION_DAYS`, порядок списка значим (FK
+    kg_remediation_events → kg_incidents).
+    """
+    per_table: Dict[str, Any] = {}
+    deleted = 0
+    for table, ts_column, days in EVENT_RETENTION_TARGETS:
+        try:
+            stats = purge_table(
+                db, table=table, ts_column=ts_column,
+                retention_days=(overrides or {}).get(table, days),
+                batch_size=batch_size, max_batches=max_batches, now=now,
+                min_days=MIN_EVENT_RETENTION_DAYS,
+            )
+        except Exception as e:  # noqa: BLE001 — соседние таблицы не виноваты
+            logger.error("retention.events.table_failed table=%s: %s", table, e)
+            db.rollback()
+            per_table[table] = {"error": str(e)}
+            continue
+        per_table[table] = stats
+        deleted += stats["deleted"]
+    logger.info("retention.events.done deleted=%s tables=%s", deleted, len(per_table))
+    return {"deleted": deleted, "per_table": per_table}
+
+
 def purge_old_health(
     db: Session,
     *,
@@ -166,7 +230,7 @@ def purge_old_health(
 #: Имена таблиц и колонок подставляются в SQL текстом (параметризовать
 #: идентификаторы нельзя), поэтому берутся только из `RETENTION_TARGETS` и
 #: сверяются с ним же: снаружи произвольное имя таблицы сюда не попадёт.
-_ALLOWED_TABLES = {t: c for t, c, _ in RETENTION_TARGETS}
+_ALLOWED_TABLES = {t: c for t, c, _ in (*RETENTION_TARGETS, *EVENT_RETENTION_TARGETS)}
 
 
 def purge_table(
@@ -178,8 +242,12 @@ def purge_table(
     batch_size: int = DEFAULT_BATCH_SIZE,
     max_batches: int = DEFAULT_MAX_BATCHES,
     now: datetime | None = None,
+    min_days: int = MIN_RETENTION_DAYS,
 ) -> Dict[str, Any]:
     """Удалить строки `table` старше `retention_days` по колонке `ts_column`.
+
+    `min_days` — пол: `MIN_RETENTION_DAYS` для сэмплов,
+    `MIN_EVENT_RETENTION_DAYS` для событий (`purge_events`).
 
     Возвращает статистику прогона:
       * `deleted` — сколько строк удалено;
@@ -197,17 +265,17 @@ def purge_table(
             "таблицы — решение, которое принимают явно, а не аргументом "
             "вызова"
         )
-    if retention_days < MIN_RETENTION_DAYS:
+    if retention_days < min_days:
         logger.error(
             "retention.refused table=%s retention_days=%s < min=%s",
-            table, retention_days, MIN_RETENTION_DAYS,
+            table, retention_days, min_days,
         )
         return {
             "deleted": 0, "batches": 0, "truncated": False, "cutoff": None,
             "skipped": (
                 f"retention_days={retention_days} меньше минимума "
-                f"{MIN_RETENTION_DAYS}: внутри этого окна лежит baseline "
-                f"детектора аномалий"
+                f"{min_days}: внутри этого окна лежат данные, которые ещё "
+                f"читают (baseline детектора аномалий / таймлайн инцидентов)"
             ),
         }
 

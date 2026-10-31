@@ -46,6 +46,15 @@ register_worker_metrics_signals()
 # PENDING. Не зависит от backpressure-блока ниже (тот gated на non-eager).
 celery_app.conf.task_track_started = True
 
+# stdout НЕ перехватывать. structlog пишет через PrintLoggerFactory в stdout,
+# а Celery по умолчанию (worker_redirect_stdouts=True) заворачивает stdout
+# форков в свой logger уровнем WARNING: каждая info-строка приложения
+# уезжала в kubectl logs как `[... WARNING/ForkPoolWorker-N] ... [info ] ...`
+# с двумя таймстемпами — 36 тыс. «варнингов» в сутки при нуле реальных
+# ошибок (замер 31.10.2026). Логи Celery (старт, расписание, ошибки задач)
+# идут через logging в stderr и не затрагиваются.
+celery_app.conf.worker_redirect_stdouts = False
+
 # ── Late acknowledgement (задача переживает смерть воркера) ─────────────────
 #
 # ПРОБЛЕМА, которую это чинит. По умолчанию Celery работает в acks_early:
@@ -1109,14 +1118,19 @@ def kg_health_retention_task():
     Раз в сутки и ночью: удаление батчами всё равно нагружает автовакуум, а
     срочности в нём никакой.
     """
-    from app.knowledge_graph.health_retention import purge_observations
+    from app.knowledge_graph.health_retention import (purge_events,
+                                                      purge_observations)
 
     db = SessionLocal()
     try:
-        return purge_observations(
+        result = purge_observations(
             db,
             overrides={"kg_service_health": settings.KG_HEALTH_RETENTION_DAYS},
         )
+        # События — свой реестр и свой пол (90 дней), см. EVENT_RETENTION_TARGETS:
+        # до 31.10.2026 kg_deployments росла без срока до 1,24 млн строк.
+        result["events"] = purge_events(db)
+        return result
     except Exception as e:
         logger.warning("kg_health_retention.failed: %s", e)
         db.rollback()
@@ -1184,10 +1198,12 @@ def tc_deploys_to_kg_task():
 async def _tc_deploys_to_kg_logic() -> dict:
     from datetime import datetime, timezone
 
-    from app.knowledge_graph.populator import record_deployment
+    from app.knowledge_graph.populator import (ensure_statics_node,
+                                               record_deployment)
     from app.knowledge_graph.schema import Service
     from app.services.teamcity_service import (branch_for_namespace,
                                                is_prod_buildtype as _is_prod_buildtype,
+                                               is_statics_buildtype as _is_statics_buildtype,
                                                recent_deploys)
 
     # Берём builds за последние 24h. Cron каждые 15 мин — overkill по
@@ -1200,6 +1216,7 @@ async def _tc_deploys_to_kg_logic() -> dict:
     added = 0
     stats_skipped_no_realm = 0
     by_attribution: dict[str, int] = {"build_param": 0, "vcs_branch": 0}
+    statics_rows = 0
     try:
         # Map branch → list of namespaces в KG. Реализуется через обратное
         # отображение `branch_for_namespace`: проходим distinct namespaces
@@ -1293,21 +1310,36 @@ async def _tc_deploys_to_kg_logic() -> dict:
                 except ValueError:
                     pass
 
+            statics_build = _is_statics_buildtype(bt_id)
             for ns in target_namespaces:
                 # A3: ns-wide broadcast. Раньше писали только на «ns-representative»
                 # (первый non-synthetic) — из-за этого 98% сервисов в KG не
                 # имели deploy-истории. RecentDeployRule работает per-service,
                 # значит каждый сервис в ns должен видеть тот же deploy event.
                 # Dedup защищён уникальностью (service_id, buildtype_id, build_number).
-                q = db.query(Service).filter_by(namespace=ns, synthetic=False)
                 target_service = b.get("target_service")
-                if target_service:
-                    # Конфиг деплоит ОДИН сервис — писать деплой на все 596
-                    # значит утверждать 595 небылиц. Имя из SERVICE_NAME
-                    # сверяется точно: если такого сервиса в namespace нет,
-                    # записей просто не будет, и это честнее выдумки.
-                    q = q.filter(Service.name == target_service)
-                ns_services = q.all()
+                if statics_build:
+                    # Статика — не сервис. Сборки `Wo_StaticsNewCluster_*`
+                    # (10–15 в день, у каждой target_realm=preprod/prod)
+                    # раскладывались на все ~665 сервисов окружения: на
+                    # 31.10.2026 — 963 тыс. строк kg_deployments из 1,24 млн
+                    # при 1487 билдах, у preprod-kingdom2/bot-service 1258
+                    # «деплоев» за месяц, и в preprod факт recent_deploy был
+                    # found всегда. Теперь одна строка на (билд, namespace) на
+                    # синтетическом узле `statics`; маркер namespace_scope
+                    # остаётся — для потребителей это по-прежнему «в
+                    # namespace что-то катилось» (см. queries.recent_deploys_for
+                    # и kg_sync._refresh_stale_class_for_namespace).
+                    ns_services = [ensure_statics_node(db, ns)]
+                else:
+                    q = db.query(Service).filter_by(namespace=ns, synthetic=False)
+                    if target_service:
+                        # Конфиг деплоит ОДИН сервис — писать деплой на все 596
+                        # значит утверждать 595 небылиц. Имя из SERVICE_NAME
+                        # сверяется точно: если такого сервиса в namespace нет,
+                        # записей просто не будет, и это честнее выдумки.
+                        q = q.filter(Service.name == target_service)
+                    ns_services = q.all()
                 for svc in ns_services:
                     try:
                         record_deployment(
@@ -1366,6 +1398,8 @@ async def _tc_deploys_to_kg_logic() -> dict:
                         )
                         added += 1
                         by_attribution[attribution] += 1
+                        if statics_build:
+                            statics_rows += 1
                     except Exception as e:
                         logger.warning(
                             "tc_deploys_to_kg.record_failed ns=%s svc=%s build=#%s: %s",
@@ -1382,9 +1416,9 @@ async def _tc_deploys_to_kg_logic() -> dict:
     now_unix = datetime.now(timezone.utc).timestamp()
     logger.info(
         "tc_deploys_to_kg.done builds=%d rows=%d by_param=%d by_branch=%d "
-        "skipped_no_realm=%d at=%.0f",
+        "skipped_no_realm=%d statics_rows=%d at=%.0f",
         len(builds), added, by_attribution["build_param"],
-        by_attribution["vcs_branch"], stats_skipped_no_realm, now_unix,
+        by_attribution["vcs_branch"], stats_skipped_no_realm, statics_rows, now_unix,
     )
     return {
         "builds_fetched": len(builds),
@@ -1397,6 +1431,9 @@ async def _tc_deploys_to_kg_logic() -> dict:
         "rows_written": added,
         "by_attribution": dict(by_attribution),
         "skipped_no_realm": stats_skipped_no_realm,
+        # Строки сборок статики — по одной на (билд, namespace), на узле
+        # `statics`; до 31.10.2026 их было бы ×665.
+        "statics_rows": statics_rows,
         # Оставлено для совместимости с потребителями старого ключа
         # (dashboard, digest): то же число, честное имя рядом.
         "kg_deployments_added": added,

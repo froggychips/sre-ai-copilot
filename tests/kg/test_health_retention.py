@@ -163,11 +163,12 @@ def test_every_sampling_table_has_a_retention_target():
     }
 
 
-def test_event_tables_are_not_in_retention():
+def test_event_tables_are_not_in_sampling_retention():
     """События со смыслом сроком жизни метрик не чистятся.
 
     Деплой полугодовой давности отвечает на вопрос «когда это сломалось»,
-    и его срок — отдельное решение, а не побочный эффект уборки сэмплов.
+    и его срок — отдельное решение (EVENT_RETENTION_TARGETS), а не побочный
+    эффект уборки сэмплов.
     """
     from app.knowledge_graph.health_retention import RETENTION_TARGETS
 
@@ -175,6 +176,83 @@ def test_event_tables_are_not_in_retention():
     for table in ("kg_deployments", "kg_alerts", "kg_pod_events",
                   "kg_k8s_jobs", "kg_services", "kg_service_edges"):
         assert table not in covered, f"{table} — события, а не сэмплы"
+
+
+def test_event_registry_covers_growing_event_tables():
+    """Таблица событий без срока растёт вечно: kg_deployments — 1,24 млн строк
+    к 31.10.2026. Состояние (services, edges, k8s_jobs) в реестр не входит."""
+    from app.knowledge_graph.health_retention import (
+        EVENT_RETENTION_TARGETS, MIN_EVENT_RETENTION_DAYS)
+
+    covered = {t: (c, d) for t, c, d in EVENT_RETENTION_TARGETS}
+    assert set(covered) == {
+        "kg_deployments", "kg_alerts", "kg_pod_events",
+        "kg_remediation_events", "kg_incidents",
+    }
+    assert covered["kg_alerts"][0] == "resolved_at"
+    assert covered["kg_incidents"][0] == "resolved_at"
+    assert all(d >= MIN_EVENT_RETENTION_DAYS for _, d in covered.values())
+    assert covered["kg_deployments"][1] >= 180, "«когда это сломалось» — полгода"
+    order = [t for t, _, _ in EVENT_RETENTION_TARGETS]
+    assert order.index("kg_remediation_events") < order.index("kg_incidents"), "FK"
+
+
+def test_open_alerts_survive_event_purge(db):
+    """Время алерта — resolved_at: открытый (NULL) не удаляется никогда."""
+    from app.knowledge_graph.health_retention import purge_events
+    from app.knowledge_graph.schema import AlertEvent
+
+    db.add_all([
+        AlertEvent(service_id=1, alertname="Old", fingerprint="f-old",
+                   fired_at=NOW - timedelta(days=400),
+                   resolved_at=NOW - timedelta(days=399)),
+        AlertEvent(service_id=1, alertname="OpenForever", fingerprint="f-open",
+                   fired_at=NOW - timedelta(days=400), resolved_at=None),
+        AlertEvent(service_id=1, alertname="Fresh", fingerprint="f-new",
+                   fired_at=NOW - timedelta(days=3),
+                   resolved_at=NOW - timedelta(days=2)),
+    ])
+    db.commit()
+
+    purge_events(db, now=NOW)
+
+    left = {a.alertname for a in db.query(AlertEvent)}
+    assert left == {"OpenForever", "Fresh"}
+
+
+def test_old_deployments_go_recent_stay(db):
+    from app.knowledge_graph.health_retention import purge_events
+    from app.knowledge_graph.schema import Deployment
+
+    db.add_all([
+        Deployment(service_id=1, started_at=NOW - timedelta(days=200),
+                   buildtype_id="bt", build_number="1"),
+        Deployment(service_id=1, started_at=NOW - timedelta(days=100),
+                   buildtype_id="bt", build_number="2"),
+    ])
+    db.commit()
+
+    stats = purge_events(db, now=NOW)
+
+    assert [d.build_number for d in db.query(Deployment)] == ["2"]
+    assert stats["per_table"]["kg_deployments"]["deleted"] == 1
+
+
+def test_event_floor_is_a_quarter(db):
+    """Срок события короче MIN_EVENT_RETENTION_DAYS — отказ, не удаление."""
+    from app.knowledge_graph.health_retention import (
+        MIN_EVENT_RETENTION_DAYS, purge_events)
+    from app.knowledge_graph.schema import Deployment
+
+    db.add(Deployment(service_id=1, started_at=NOW - timedelta(days=60),
+                      buildtype_id="bt", build_number="1"))
+    db.commit()
+
+    stats = purge_events(db, now=NOW, overrides={"kg_deployments": 30})
+
+    assert MIN_EVENT_RETENTION_DAYS == 90
+    assert stats["per_table"]["kg_deployments"]["skipped"]
+    assert db.query(Deployment).count() == 1
 
 
 def test_unknown_table_is_refused(db):
