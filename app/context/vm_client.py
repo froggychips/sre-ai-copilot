@@ -15,7 +15,7 @@ import asyncio
 import logging
 import re
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, List, Optional, Union, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple, Union
 
 import httpx
 
@@ -278,6 +278,31 @@ class VMClient:
         except Exception as e:
             raise VMQueryError(f"vm {self._url}: {type(e).__name__}: {e}") from e
         return self._series_by_labels(data, by_labels)
+
+    async def query_label_sets_strict(
+        self, query: str, labels: Tuple[str, ...],
+    ) -> Set[Tuple[str, ...]]:
+        """Множество наборов меток из ответа; отказ поднимает VMQueryError.
+
+        В отличие от `query_instant_by_labels_strict` серию с ОТСУТСТВУЮЩЕЙ
+        меткой не выбрасывает, а кладёт пустую строку: у нодового алерта в
+        ALERTS нет `namespace`, но это всё ещё алерт, и при сверке покрытия
+        его потеря завысила бы долю увиденного.
+        """
+        params = {"query": query}
+        try:
+            async with httpx.AsyncClient(timeout=self._timeout) as client:
+                r = await client.get(f"{self._url}/api/v1/query", params=params)
+                r.raise_for_status()
+                data = r.json()
+        except Exception as e:
+            raise VMQueryError(f"vm {self._url}: {type(e).__name__}: {e}") from e
+        if not isinstance(data, dict) or data.get("status", "success") != "success":
+            raise VMQueryError(f"vm {self._url}: неожиданный ответ")
+        return {
+            tuple(str(series.get("metric", {}).get(lbl) or "") for lbl in labels)
+            for series in data.get("data", {}).get("result", [])
+        }
 
     @staticmethod
     def _series_by_label(data: Any, by_label: str) -> Dict[str, float]:

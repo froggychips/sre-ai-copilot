@@ -244,6 +244,13 @@ celery_app.conf.beat_schedule = {
         "schedule": crontab(hour=settings.STATS_DIGEST_HOUR_UTC, minute=0),
         "options": {"expires": 21600},
     },
+    # Еженедельная сверка «БД копилота против кластера» (пн 06:00 UTC).
+    # БЕЗ LLM, тот же канал #stats.
+    "weekly-reconciliation": {
+        "task": "weekly_reconciliation",
+        "schedule": crontab(day_of_week=1, hour=6, minute=0),
+        "options": {"expires": 21600},
+    },
     # TC deploys → kg_deployments. БЕЗ LLM. Включает RecentDeployRule
     # на live deploys без incident-flow. Каждые 15 минут берёт recent
     # builds из TC за 24h и upsert-ит в kg_deployments по (service, sha).
@@ -1698,6 +1705,30 @@ def daily_stats_digest_task():
     except Exception as e:
         logger.error("daily_stats_digest.failed: %s", e)
         # Не падаем в Celery (retry бесполезен, это аналитический task).
+        return {"status": "error", "error": str(e)}
+    finally:
+        db.close()
+
+
+@celery_app.task(name="weekly_reconciliation")
+@single_instance(ttl_seconds=1800)
+def weekly_reconciliation_task():
+    """Еженедельная сверка копилота с кластером → #stats. БЕЗ LLM.
+
+    Каждая из пяти строк сама отвечает статусом источника; задача — отчёт,
+    а не источник графа, поэтому в heartbeat-надзор не входит.
+    """
+    from app.services.weekly_reconciliation import run_weekly_reconciliation
+
+    # Read-only по PG, но между запросами — минуты VM/Discord I/O: та же
+    # AUTOCOMMIT-сессия, что у daily_stats_digest (idle-in-transaction).
+    db = ReadOnlyAutocommitSession()
+    try:
+        result = asyncio.run(run_weekly_reconciliation(db))
+        logger.info("weekly_reconciliation.done result=%s", result)
+        return result
+    except Exception as e:
+        logger.error("weekly_reconciliation.failed: %s", e)
         return {"status": "error", "error": str(e)}
     finally:
         db.close()

@@ -909,6 +909,12 @@ class Settings(BaseSettings):
     # Default False — opt-in через Helm value env.statsDigestEnabled.
     STATS_DIGEST_ENABLED: bool = Field(False, description="Enable daily stats digest beat task")
     STATS_DIGEST_HOUR_UTC: int = Field(9, description="UTC hour to run daily digest (0-23)")
+    # Еженедельная сверка БД копилота с кластером (app/services/weekly_reconciliation.py):
+    # покрытие алертов против ALERTS в VM, рост таблиц, бэкап, атрибуция,
+    # подтверждённые починки. Пн 06:00 UTC, в тот же канал #stats. БЕЗ LLM.
+    WEEKLY_RECONCILIATION_ENABLED: bool = Field(
+        True, description="Еженедельная сверка копилота с кластером в #stats",
+    )
 
     # Chronic-alerts digest (L5) — каждые 6 часов список «хронических»
     # сервисов: alert повторяется ≥CHRONIC_DIGEST_MIN_FIRES за 24h. Идёт
