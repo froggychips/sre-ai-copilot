@@ -46,6 +46,15 @@ register_worker_metrics_signals()
 # PENDING. Не зависит от backpressure-блока ниже (тот gated на non-eager).
 celery_app.conf.task_track_started = True
 
+# stdout НЕ перехватывать. structlog пишет через PrintLoggerFactory в stdout,
+# а Celery по умолчанию (worker_redirect_stdouts=True) заворачивает stdout
+# форков в свой logger уровнем WARNING: каждая info-строка приложения
+# уезжала в kubectl logs как `[... WARNING/ForkPoolWorker-N] ... [info ] ...`
+# с двумя таймстемпами — 36 тыс. «варнингов» в сутки при нуле реальных
+# ошибок (замер 31.10.2026). Логи Celery (старт, расписание, ошибки задач)
+# идут через logging в stderr и не затрагиваются.
+celery_app.conf.worker_redirect_stdouts = False
+
 # ── Late acknowledgement (задача переживает смерть воркера) ─────────────────
 #
 # ПРОБЛЕМА, которую это чинит. По умолчанию Celery работает в acks_early:

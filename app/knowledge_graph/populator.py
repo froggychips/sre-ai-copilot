@@ -315,7 +315,11 @@ def _upsert_service_pg(
     )
     db.execute(stmt)
     db.flush()
-    logger.info("kg.service_upserted", namespace=namespace, name=name, node_kind=node_kind)
+    # debug, не info: upsert идёт на каждый из ~7500 сервисов каждый час, и
+    # эта строка одна давала ~36 тыс. записей в сутки в логе воркера. Сводку
+    # по синку пишет kg_sync (`kg_sync.ns_timing`), поштучно нужно только при
+    # отладке.
+    logger.debug("kg.service_upserted", namespace=namespace, name=name, node_kind=node_kind)
     # populate_existing(): upsert шёл через Core — identity-map мог держать
     # stale-инстанс, перечитываем поверх (та же история что в record_alert_event).
     svc = (
