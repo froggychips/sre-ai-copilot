@@ -610,6 +610,10 @@ def verify_remediation(
              "checks": result["checks"], "reasons": result["reasons"]},
         )
         track_remediation_verification(result["outcome"])
+        if result["outcome"] != OUTCOME_PENDING:
+            # Карточка моста: итог проверки — в ту же карточку, где кнопка.
+            from app.remediation.bridge import annotate_verify_outcome
+            annotate_verify_outcome(analysis, result["outcome"], result.get("reasons"))
         log.info("verification.done", incident_id=incident_id, attempt=attempt,
                  outcome=result["outcome"], reasons=result["reasons"])
 

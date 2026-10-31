@@ -464,8 +464,12 @@ def apply_intent(
 
         # Снимок отбора playbook-ов пишет pipeline; gate читает его только
         # под REMEDIATION_PLAYBOOK_BINDING_ENABLED (см. remediation.binding).
+        # Intent моста собран сервером из плана playbook-а — сверка со
+        # снимком для него обязательна всегда, а не только под флагом.
+        from app.remediation.bridge import is_bridge_analysis
         gate = evaluate_intent_gate(
             intent, match_snapshot=analysis.get("playbook_match"),
+            require_binding=is_bridge_analysis(analysis),
         )
         gate_dict = gate.to_dict()
         if gate.mode == PolicyMode.BLOCK:
