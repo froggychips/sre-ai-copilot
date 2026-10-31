@@ -33,9 +33,10 @@ Copy `.env.example` to `.env` and fill in the required values:
 ANTHROPIC_API_KEY=sk-ant-…
 DATABASE_URL=postgresql+asyncpg://user:pass@host/db
 REDIS_URL=redis://:pass@host:6379/0
-DISCORD_TOKEN=…
-DISCORD_CHANNEL_ID=…        # approval channel ID
-DISCORD_APPROVER_ROLE_ID=…  # Discord role allowed to approve
+DISCORD_WEBHOOK_URL=…           # incident embeds
+DISCORD_BOT_TOKEN=…             # bot API — required for Approve/Decline buttons
+DISCORD_INCIDENT_CHANNEL_ID=…   # channel for incident messages with buttons
+DISCORD_APPROVERS_ROLE_IDS=…    # CSV of Discord role IDs allowed to approve
 ```
 
 Then:
@@ -143,11 +144,11 @@ Intents expire after 30 minutes by default. Expired intents cannot be approved.
 
 Set at least one of:
 ```env
-DISCORD_APPROVER_ROLE_ID=123456789
-DISCORD_APPROVER_USER_IDS=111222333,444555666
+DISCORD_APPROVERS_ROLE_IDS=123456789
+DISCORD_APPROVERS_USER_IDS=111222333,444555666
 ```
 
-Without this, the approval endpoint has no allowlist and any channel member can approve actions. Configure it before the copilot receives real production alerts.
+Both empty = fail-closed: every Approve/Decline click is denied and audited (`app/api/discord_interactions.py`). Configure it before the copilot receives real production alerts.
 
 ---
 
@@ -180,7 +181,7 @@ Set `K8S_DRY_RUN=true` in `.env`. The full pipeline runs (AlertManager → agent
 
 ## What model does it use and can I change it?
 
-Default: whatever is in `ANTHROPIC_MODEL` env var (e.g. `claude-opus-4-7`). The multi-step agent pipeline benefits from capable models — smaller models can produce structurally invalid `ExecutionIntent` objects that the DSL validator rejects, causing the action to be skipped silently.
+Default: `MODEL_NAME` (`claude-sonnet-4-6` unless overridden in `.env`). The multi-step agent pipeline benefits from capable models — smaller models can produce structurally invalid `ExecutionIntent` objects that the DSL validator rejects, causing the action to be skipped silently.
 
 ---
 
@@ -199,7 +200,7 @@ Replay reruns the full agent pipeline on the stored incident data without postin
 
 ## What is the /copilot endpoint?
 
-`POST /copilot` is a conversation endpoint for asking the incident analysis agents questions directly, without going through AlertManager. It runs up to 3 analysis iterations until confidence reaches the 0.7 threshold. Requires JWT authentication — set `JWT_SECRET` in `.env`.
+`POST /copilot` is a conversation endpoint for asking the incident analysis agents questions directly, without going through AlertManager. It runs up to 3 analysis iterations until confidence reaches the 0.7 threshold. Requires JWT authentication (RS256) — set `JWT_PUBLIC_KEY` in `.env`; in production `JWT_ISSUER` and `JWT_AUDIENCE` are mandatory as well.
 
 ---
 

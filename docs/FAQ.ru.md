@@ -33,9 +33,10 @@ AlertManager отправляет webhook → копилот получает а
 ANTHROPIC_API_KEY=sk-ant-…
 DATABASE_URL=postgresql+asyncpg://user:pass@host/db
 REDIS_URL=redis://:pass@host:6379/0
-DISCORD_TOKEN=…
-DISCORD_CHANNEL_ID=…        # ID канала для аппрувов
-DISCORD_APPROVER_ROLE_ID=…  # Discord-роль с правом аппрувить
+DISCORD_WEBHOOK_URL=…           # embed-ы инцидентов
+DISCORD_BOT_TOKEN=…             # bot API — нужен для кнопок Approve/Decline
+DISCORD_INCIDENT_CHANNEL_ID=…   # канал для сообщений об инцидентах с кнопками
+DISCORD_APPROVERS_ROLE_IDS=…    # CSV ID Discord-ролей с правом аппрувить
 ```
 
 Затем:
@@ -141,11 +142,11 @@ Discord; приглушённый — появляется, но тихо.
 
 Задай хотя бы одно из:
 ```env
-DISCORD_APPROVER_ROLE_ID=123456789
-DISCORD_APPROVER_USER_IDS=111222333,444555666
+DISCORD_APPROVERS_ROLE_IDS=123456789
+DISCORD_APPROVERS_USER_IDS=111222333,444555666
 ```
 
-Без этого аллоулиста любой участник канала может апрувить действия. Настрой до того как копилот начнёт получать боевые алерты.
+Оба пустые = fail-closed: каждый клик Approve/Decline отклоняется и пишется в аудит (`app/api/discord_interactions.py`). Настрой до того как копилот начнёт получать боевые алерты.
 
 ---
 
@@ -178,7 +179,7 @@ TIERS = {
 
 ## Какую модель использует и можно ли сменить?
 
-По умолчанию: то, что задано в `ANTHROPIC_MODEL` (например `claude-opus-4-7`). Многошаговый пайплайн выигрывает от мощных моделей — меньшие могут генерировать структурно невалидные `ExecutionIntent`, которые DSL-валидатор тихо отклоняет.
+По умолчанию: `MODEL_NAME` (`claude-sonnet-4-6`, если не переопределено в `.env`). Многошаговый пайплайн выигрывает от мощных моделей — меньшие могут генерировать структурно невалидные `ExecutionIntent`, которые DSL-валидатор тихо отклоняет.
 
 ---
 
@@ -197,7 +198,7 @@ Replay перезапускает пайплайн агентов на сохр�
 
 ## Что такое /copilot?
 
-`POST /copilot` — разговорный эндпоинт для прямых вопросов агентам анализа без AlertManager. Запускает до 3 итераций анализа, пока уверенность не достигнет порога 0.7. Требует JWT-аутентификацию — задай `JWT_SECRET` в `.env`.
+`POST /copilot` — разговорный эндпоинт для прямых вопросов агентам анализа без AlertManager. Запускает до 3 итераций анализа, пока уверенность не достигнет порога 0.7. Требует JWT-аутентификацию (RS256) — задай `JWT_PUBLIC_KEY` в `.env`; в проде обязательны также `JWT_ISSUER` и `JWT_AUDIENCE`.
 
 ---
 

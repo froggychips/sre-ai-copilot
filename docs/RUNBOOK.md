@@ -249,9 +249,11 @@ Click 👎 on the embed to store user feedback structurally.
 #### Stop new applies (normal control)
 
 ```bash
-helm upgrade sre-ai-copilot helm/sre-ai-copilot \
-  --reuse-values \
-  --set env.EXECUTOR_APPROVAL_ENABLED=false
+# fast: both deployments read the flag at startup, kubectl set env rolls them
+kubectl -n sre-ai set env deploy/sre-ai-api deploy/copilot-worker \
+  EXECUTOR_APPROVAL_ENABLED=false
+# durable: put the same value into k8s/base/deployment.yaml + k8s/worker.yaml
+# and run ./deploy.sh, so the manifests and the cluster agree
 ```
 
 Apply button disappears from new embeds. Already-posted embeds with the button stay in Discord history — clicking them returns `❌ EXECUTOR_APPROVAL_ENABLED=false — apply отключён.`
@@ -259,7 +261,7 @@ Apply button disappears from new embeds. Already-posted embeds with the button s
 #### Emergency (fastest, halts everything)
 
 ```bash
-kubectl scale deployment/sre-ai-copilot-worker -n sre-ai --replicas=0
+kubectl scale deployment/copilot-worker -n sre-ai --replicas=0
 ```
 
 Halts dry-run, analysis, and apply. Use only if executor is misbehaving badly.
@@ -520,14 +522,8 @@ KubeAPIServerSlo), where the card never appears at all.
 
 ### Temporarily restore loudness for a class (kill-switch)
 
-⚠️ These flags are **not** wired into the Helm chart yet — the deployment
-templates only map a fixed set (`executorEnabled`, `safeMode`, `llmBackend`,
-…) via `.Values.env.*`. So `helm upgrade --set env.META_NOISE_ENABLED=false`
-does **nothing**: the chart never consumes that value, and the app keeps its
-config.py default (`true`). The flag is read from env at process **startup**
-(not hot-reloaded), so any change needs a pod restart.
-
-Two ways to disable a class:
+The flag is read from env at process **startup** (not hot-reloaded), so any
+change needs a pod restart. Two ways to disable a class:
 
 **1. Fast / ephemeral — `kubectl set env`.** Set it on **both** deployments:
 render (enrichment + embed build) runs in the worker, while the api holds the
@@ -535,30 +531,24 @@ inline path when `PIPELINE_DIRECT_INVOKE=true`.
 
 ```bash
 kubectl set env -n sre-ai \
-  deployment/sre-ai-copilot-api deployment/sre-ai-copilot-worker \
+  deployment/sre-ai-api deployment/copilot-worker \
   META_NOISE_ENABLED=false      # or GEN_MISMATCH_NOISE_ENABLED=false
 ```
 
-`kubectl set env` triggers a rollout automatically (no manual restart). This
-override is **wiped by the next `helm upgrade`** — the chart doesn't track it.
-Use it for "make this loud right now while I investigate".
+`kubectl set env` triggers a rollout automatically (no manual restart). The
+override lives only in the cluster: nothing in `k8s/` records it, the next
+reader of the repo will not see it, and a manifest that later sets the same
+variable wins over it. Use it for "make this loud right now while I
+investigate".
 
-**2. Durable — chart change.** Add the env passthrough to **both**
-`deployment-api.yaml` and `deployment-worker.yaml`, plus a default in
-`values.yaml` (camelCase key, like `executorEnabled`):
+**2. Durable — manifest change.** Add the variable to the `env:` block of
+**both** `k8s/base/deployment.yaml` and `k8s/worker.yaml`, then `./deploy.sh`:
 
 ```yaml
-# templates/deployment-{api,worker}.yaml — under env:
+# k8s/base/deployment.yaml and k8s/worker.yaml — under env:
 - name: META_NOISE_ENABLED
-  value: {{ .Values.env.metaNoiseEnabled | default "true" | quote }}
-
-# values.yaml — under env:
-#   metaNoiseEnabled: "true"
-#   genMismatchNoiseEnabled: "true"
+  value: "false"
 ```
-
-Then `helm upgrade` — now `--set env.metaNoiseEnabled=false` actually takes
-effect and survives subsequent upgrades.
 
 Either way, the muted class reverts to normal severity-routing (loud 🚨 /
 `@mention` on critical). Re-enable by flipping the value back to `true`.
@@ -739,52 +729,25 @@ Mount it via configmap and point `OWNERSHIP_MANIFEST_PATH` at the file.
 
 ### Activate `*-shared` ownership manifest in runtime
 
-Master ships the manifest (`config/ownership.yaml`) **and** the Helm
-plumbing: `templates/ownership-configmap.yaml` renders a ConfigMap from
-`helm/sre-ai-copilot/files/ownership.yaml` (a synced copy — Helm
-`.Files.Get` can't reach outside the chart dir), and worker/api
-deployments mount it at `OWNERSHIP_MANIFEST_PATH`
-(default `/config/ownership.yaml`).
-
-CI gate `tests/test_helm_ownership_sync.py` enforces that
-`config/ownership.yaml` ≡ `helm/sre-ai-copilot/files/ownership.yaml`
-byte-for-byte. If you edit one, copy to the other:
-
-```bash
-cp config/ownership.yaml helm/sre-ai-copilot/files/ownership.yaml
-```
-
-#### A. Helm path (recommended)
-
-```bash
-# values.yaml ships ownershipManifest.enabled=true by default.
-# Edit helm/sre-ai-copilot/files/ownership.yaml if you need an additional
-# rule, then:
-helm upgrade --install sre-ai-copilot helm/sre-ai-copilot/ \
-  --namespace sre-ai \
-  -f helm/sre-ai-copilot/values.yaml \
-  -f your-overrides.yaml
-
-# Roll worker/api so they pick up the new configmap mount path:
-kubectl -n sre-ai rollout restart deploy/sre-ai-copilot-worker
-kubectl -n sre-ai rollout restart deploy/sre-ai-copilot-api
-
-# Verify:
-kubectl -n sre-ai exec deploy/sre-ai-copilot-worker -- \
-  sh -c 'echo $OWNERSHIP_MANIFEST_PATH; head -5 $OWNERSHIP_MANIFEST_PATH'
-# Expect: /config/ownership.yaml + first 5 lines of the manifest.
-```
-
-#### B. Manual configmap (no Helm)
+The manifests already carry the plumbing: `k8s/base/deployment.yaml` and
+`k8s/worker.yaml` mount ConfigMap `sre-ai-copilot-ownership` at
+`/config/ownership.yaml` (subPath, read-only) and point
+`OWNERSHIP_MANIFEST_PATH` at it. The ConfigMap itself is **not** created by
+`deploy.sh` — build it from `config/ownership.yaml` by hand:
 
 ```bash
 kubectl -n sre-ai create configmap sre-ai-copilot-ownership \
   --from-file=ownership.yaml=config/ownership.yaml \
   --dry-run=client -o yaml | kubectl apply -f -
 
-# Then patch the deployments to mount /config/ownership.yaml (subPath
-# ownership.yaml, readOnly) and set env OWNERSHIP_MANIFEST_PATH=/config/ownership.yaml.
-# See templates/deployment-worker.yaml and deployment-api.yaml for the exact shape.
+# Roll worker/api so they pick up the new content (subPath mounts are not
+# refreshed in place):
+kubectl -n sre-ai rollout restart deploy/copilot-worker deploy/sre-ai-api
+
+# Verify:
+kubectl -n sre-ai exec deploy/copilot-worker -- \
+  sh -c 'echo $OWNERSHIP_MANIFEST_PATH; head -5 $OWNERSHIP_MANIFEST_PATH'
+# Expect: /config/ownership.yaml + first 5 lines of the manifest.
 ```
 
 #### Backfill already-attributed services
@@ -803,8 +766,10 @@ manifest change.
 
 #### Disable
 
-`helm upgrade ... --set ownershipManifest.enabled=false` removes the
-ConfigMap, env var, and mount — worker falls back to the three heuristics
+Remove `OWNERSHIP_MANIFEST_PATH` and the `ownership` volume/mount from both
+Deployments in `k8s/` and run `./deploy.sh` (for a quick test:
+`kubectl -n sre-ai set env deploy/sre-ai-api deploy/copilot-worker
+OWNERSHIP_MANIFEST_PATH-`) — the worker falls back to the three heuristics
 (prefix / deploy-history / labels), and 132 `*-shared` services revert
 to unowned.
 
@@ -814,7 +779,8 @@ to unowned.
    `name_pattern` rules **above** generic `ns_pattern`-only catch-alls.
 2. Run `pytest tests/test_shared_ownership_manifest.py -x` locally to
    verify the new rule.
-3. Open a PR. Once merged, helm/configmap rollout picks up the change.
+3. Open a PR. Once merged, re-create the ConfigMap as above — the change
+   does not reach the cluster by itself.
 4. Re-classify already-attributed services that should now be re-routed:
 
    ```bash
@@ -978,16 +944,15 @@ entry-point, runs every 6 hours, scoped to high-confidence signals only.
 | `OWNERSHIP_BACKFILL_ENABLED` | `false` | Master switch. Beat task no-ops when off. |
 | `OWNERSHIP_BACKFILL_THRESHOLD` | `0.7` | Confidence floor for periodic writes. |
 
-In Helm, set via `values.yaml`:
+In the cluster both are plain env on the worker Deployment (`k8s/worker.yaml`;
+`OWNERSHIP_BACKFILL_ENABLED` is already there):
 
 ```yaml
-env:
-  ownershipBackfillEnabled: "true"
-  ownershipBackfillThreshold: "0.7"
+- name: OWNERSHIP_BACKFILL_ENABLED
+  value: "true"
+- name: OWNERSHIP_BACKFILL_THRESHOLD
+  value: "0.7"
 ```
-
-Both are wired into the worker Deployment (see
-`helm/sre-ai-copilot/templates/deployment-worker.yaml`).
 
 ### Threshold rationale: `0.4` initial vs `0.7` periodic
 
@@ -1159,15 +1124,14 @@ Rebuilding under the same tag does not fix it — `imagePullPolicy: IfNotPresent
 means nodes that already hold the tag will not re-pull it. The only real fix is
 another release, so it is cheaper to get the order right.
 
-One commit, four places, all checked by `tests/test_version_consistency.py`:
+One commit, three places, all checked by `tests/test_version_consistency.py`:
 
 ```bash
-# app/__init__.py, helm/sre-ai-copilot/Chart.yaml (appVersion),
-# README.md (badge), CHANGELOG.md (top release section)
+# app/__init__.py, README.md (badge), CHANGELOG.md (top release section)
 .venv/bin/pytest tests/test_version_consistency.py -q   # must pass BEFORE build
 ```
 
-Those tests catch the mismatch — but only between the four files. Nothing
+Those tests catch the mismatch — but only between the three files. Nothing
 checks that the image contains the bump, which is exactly how the miss above
 happened.
 

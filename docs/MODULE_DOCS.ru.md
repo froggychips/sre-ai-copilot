@@ -31,10 +31,10 @@
 - `app/diagnostics/facts.py`: `FactKind`, `Fact`, `FactStore`, `Verdict`. **Evidence-контракт (v1.0.4)**: `Fact.verdict` ∈ `found` / `absent` / `unknown`; `Fact.unknown(kind, reason)` — единственный способ породить `unknown` (confidence принудительно 0, `epistemic=unknown`, `unknown_reason` обязателен); `epistemic` / `provenance` / `window_min` / `data_age_min`; `FactStore.unknown_kinds()`; `to_prompt_context()` рисует `✓ / ✗ / ?` и предупреждает критика, что `?` — не опровержение.
 - `app/diagnostics/rules/base.py`: `Rule.sources` (поля ctx, от которых зависит правило) и `Rule.run()` = `evaluate()` + понижение `absent` → `unknown`, если объявленный источник помечен в `ctx["source_status"]`; `Rule.source_problem()`. Сторож: `tests/test_evidence_contract.py`.
 - `app/diagnostics/rules/oom.py`: `OOMKilledRule` — сначала структурный шлюз (`_check_pod_state()`), text-regex fallback только при отсутствии exit code; возвращает `observed=False` если целевой exit ≠ 0 и ≠ 137.
-- `app/diagnostics/rules/crash.py`: `ProcessCrashRule` — детектирует SIGSEGV/SIGABRT/ненулевые exit codes.
+- `app/diagnostics/rules/process_crash.py`: `ProcessCrashRule` — детектирует SIGSEGV/SIGABRT/ненулевые exit codes.
 - `app/diagnostics/rules/crashloop.py`: `CrashLoopRule` — детектирует состояние CrashLoopBackOff.
-- `app/diagnostics/rules/scheduling.py`: `FailedSchedulingRule` — детектирует ошибки планирования (ресурсы/taint/affinity).
-- `app/diagnostics/rules/deploy.py`: `RecentDeployRule` — коррелирует время деплоя TeamCity с инцидентом.
+- `app/diagnostics/rules/failed_scheduling.py`: `FailedSchedulingRule` — детектирует ошибки планирования (ресурсы/taint/affinity).
+- `app/diagnostics/rules/recent_deploy.py`: `RecentDeployRule` — коррелирует время деплоя TeamCity с инцидентом.
 
 ## Агенты
 - `app/agents/base.py`: `BaseAgent` — общий метод `ask()`, подключающий LLM backend.
@@ -244,7 +244,7 @@
 
 ## Данные и персистентность
 - `app/database.py`, `app/db/*`: engine/session helpers и интеграция БД.
-- `app/models/*` и `app/models.py`: Pydantic/ORM-модели домена.
+- `app/models/`: модели домена — `__init__.py` (SQLAlchemy `Base`, `Conversation`, `Message`), `incident.py` (Pydantic `AlertManagerAlert`, `AlertManagerWebhook`, `Incident`, `FullAnalysisReport`), `remediation_event.py` (`RemediationEventIn`).
 - `app/repository.py`: CRUD-операции разговоров и сообщений.
 
 ## Сервисы и безопасность

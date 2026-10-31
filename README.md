@@ -27,140 +27,9 @@
 >
 > **Opt-in = auto-remediator with approval.** Setting `EXECUTOR_ENABLED=true` adds a 9th pipeline stage that validates the proposed action against `kube-apiserver` via `kubectl ... --dry-run=server`. Setting `EXECUTOR_APPROVAL_ENABLED=true` additionally shows an «⚙️ Apply» button on the Discord embed (only when dry-run passed and risk ≤ medium); two-click confirmation → real `kubectl` under `K8sSecurityGuard` with full OTEL audit. See [Roadmap → Execution](#roadmap--execution) below for the ramp-up plan.
 
-### What's new
-
-- **v1.0.4 → v1.0.8 — evidence instead of flags, incidents instead of alerts**
-  (2026-09-05…07, PRs #349–#374): a deep review against the live cluster
-  turned into one roadmap series. **Evidence contract** — a fact has three
-  outcomes (`found` / `absent` / `unknown`), every rule declares its
-  `sources`, and a failed source demotes "not found" to "could not check";
-  the critic never refutes a hypothesis with an `unknown`. **SourceStatus**
-  — a sync task that observed nothing no longer writes a heartbeat.
-  **Incident** as a graph object (`kg_incidents`: one open incident per
-  service, enforced by a partial unique index, flapping re-opens instead of
-  multiplying) with a **timeline** across six tables and Known Unknowns.
-  **Blast radius** walks against dependency edges two hops deep and labels
-  every path with its weakest epistemic link. **Remediation verification**
-  snapshots the target's `uid` before writing, refuses a re-created object,
-  and re-checks the outcome 5 and 15 minutes later. **Operational memory**
-  — evidence → diagnosis → decision → action → verification on the same
-  timeline. Plus: k8s-side deploy watcher (`kg_deploy_watch`), self-health
-  exported to VictoriaMetrics, 1.7 GB of duplicate indexes dropped, noise
-  incidents flagged, `KubeJobFailed` attributed to the Job's owner instead of
-  kube-state-metrics. Contracts: [`docs/SEMANTIC_CONTRACT.md`](docs/SEMANTIC_CONTRACT.md)
-  §5.1, §11–§13; details per release in [`CHANGELOG.md`](CHANGELOG.md).
-- **v1.0.0-rc.14 / rc.15 — the two-day silent digest outage, dissected**:
-  after the rc.10–13 wave the daily digest silently vanished for two days.
-  Two independent killers: (1) workers OOM-looped every ~1.5–2h (1536Mi
-  limit + 98% CPU throttling at 200m) — with `acks_late` redis redelivered
-  the task hourly until `expires` quietly revoked it; (2) the digest builder
-  interleaves SQL with minutes of VM/Discord I/O, so its session idled in
-  transaction past the 120s kill limit introduced in rc.11. Fixes:
-  `recompute_all_health` commits in batches of 100 with `ORDER BY id`
-  (deadlocks on `kg_services`: 594/day → 0), `metrics_sync` closes its read
-  transaction before the fetch phase, digests run on a read-only
-  **AUTOCOMMIT session** (nothing left to idle, no ACCESS SHARE locks held
-  against DDL), worker gets 3Gi/600m (Guaranteed QoS).
-- **v1.0.0-rc.12 / rc.13 — deep-review wave tail**: ingress observations in
-  5 VM queries instead of ~5000 per tick; NATS edges for squad/QA stands
-  (the root of low graph connectivity); a "KG via MCP" digest section
-  (who actually uses the graph); repo ↔ cluster drift eliminated (registry,
-  RBAC, `lock_timeout`); `acks_late` + `reject_on_worker_lost` +
-  `prefetch=1`; hanging transactions and the renamed-constraint crash fixed.
-- **v1.0.0-rc.11 — KG node types, honest metrics, lock-safe migrations**:
-  `kg_services` gained `node_kind` (`service` / `workload` / `ingress`), so a
-  k8s Service and its backing Deployment are finally **different nodes**.
-  Until now they shared one row keyed by `(namespace, name)`, which meant the
-  `serves_traffic` edge could not exist at all — it always degenerated into a
-  self-loop and was dropped. On the live graph that was 2092 discarded edges
-  per sync tick against 3 surviving ones; after the change `serves_traffic`
-  holds 4234 edges and matching covers StatefulSet/DaemonSet (all `*-db`
-  nodes, previously invisible).
-  **Metrics stay honest:** `orphan_pct` deliberately does NOT count
-  `serves_traffic` as connectivity — that edge links a node to its own
-  implementation, and counting it dropped orphan from 72.5% to 42% without a
-  single new integration. `owner_pct` and `app_scope` count `service` nodes
-  only, so 2871 new workload nodes did not dilute them.
-  **Operations:** migrations run with `lock_timeout` (a queued DDL blocks
-  every reader behind it), periodic beat tasks now expire instead of piling up
-  (230 queued tasks starved the topology sync completely), and CI runs the
-  full suite against a live Postgres. Full write-up, including the mistakes
-  made along the way: [`docs/POSTMORTEM_2026_08_08.md`](docs/POSTMORTEM_2026_08_08.md).
-- **v1.0.0-rc.1 — Security & reliability hardening (release candidate)**: the
-  largest hardening pass to date — closes the full CRITICAL/P0 tier from an
-  internal deep review and makes the opt-in executor genuinely safe.
-  **Executor:** a deterministic server-side policy gate (`app/remediation`,
-  8 risk axes) recomputes risk from the *structured* intent and blocks
-  prod/system/data-plane/irreversible actions — the LLM `risk` field is now
-  advisory only; the `apply_confirm` path carries the intent signature
-  (TOCTOU), and `apply_intent` requires a matching signature **and** a
-  recorded `ActionApproval` before any real `kubectl`, with a row-lock against
-  double-apply. **Webhooks:** anti-replay timestamp-freshness on both the
-  Discord interactions (Ed25519) and AlertManager (HMAC) endpoints.
-  **Reliability:** retry-storm fix (SDK `max_retries=0` + client timeout +
-  narrowed retry predicate — no more 9× fan-out / zombie requests),
-  AlertManager-down no longer false-resolves live critical alerts, incident
-  dedup moved to a cross-replica Postgres store (no duplicate `@here`),
-  savepoint-isolated KG synchronizers (one bad row no longer kills the tick),
-  a single Celery app with backpressure, and prompt-guard no longer
-  false-blocks real crash tracebacks. **Plus:** PII-redaction gaps
-  (AWS/Basic/PEM), `/replay` RBAC + SSRF allowlist, VM None-sentinel (no
-  false-healthy snapshot), RCAExplainer fail-safe approval gating, DB-pool
-  tuning, psycopg2 leak fix. ~22 fixes; full suite 1591 passed.
-- **v0.14.0 — Alert-quality: noise suppression + ops hardening**: two new
-  render-time suppression classes that keep noisy alerts *visible but muted*
-  (grey + 🔇, no 🚨/@mention) instead of dropping or demoting them. `meta_noise`
-  catches always-noisy meta-aggregates (`*NewCriticalAlerts`,
-  `etcdInsufficientMembers`, `ScrapePoolHasNoTargets`, `RecordingRulesNoData`) —
-  each real critical still arrives as its own loud card. `gen_mismatch_noise`
-  catches *conditional* `KubeDeploymentGenerationMismatch` churn (external
-  controller bumps `metadata.generation`, rollout already converged): muted
-  **only** when replicas `ready==desired (≥1)`; fail-safe **LOUD** when
-  `ready<desired`/unknown so a genuinely stuck rollout still rings in any
-  namespace, including prod. Both gated by kill-switches (`META_NOISE_ENABLED`,
-  `GEN_MISMATCH_NOISE_ENABLED`). Ops: `copilot-beat` memory 128Mi→256Mi
-  (OOMKill crashloop fix), `cryptography`/`pydantic-settings` declared as
-  first-party deps (CI-drift + CVE fix).
-- **v0.13.0 — Security Hardening + Remediation Phase A**: authz/integrity
-  hardening across the executor/approval paths (closed apply/approve gaps,
-  removed response leaks, authz on previously-open handles incl. `/stats`),
-  PromQL-injection + SQLAlchemy session-leak + webhook insert-race fixes,
-  pipeline state-machine correctness (per-stage timeout, `TRIAGE_REQUIRED` in
-  the terminal skip-set). Remediation **Phase A** foundation: decision
-  *preview without executor* (8 discrete risk axes, YAML playbooks, rule-based
-  policy evaluator) + ownership manifest for `*-shared` infra; resilience
-  primitives wired into the hot-path.
-- **2026-06-10 — KG ingress coverage live**: nginx-ingress metrics enabled on
-  both WO controllers (shared + prod); `kg_ingress_observations` is now
-  populated every ~10 min with per-host/path p95/p99/rps/4xx/5xx, 100% of
-  rows linked to `kg_services`. Caveat: per-service `http_5xx_rate` /
-  `p95_latency_ms` in `kg_service_health` are still always 0 — app `/metrics`
-  (Kestrel) is behind JWT; pending backend ticket WO-12483.
-- **v0.12.0 — Wave 8 (KG Metadata + UX Polish)**: k8s Jobs/CronJobs coverage
-  (`kg_k8s_jobs`, `runs_as_job` edge), PVC/PV storage subgraph (`kg_storage_volumes`,
-  `uses_volume` + `bound_to` edges in `kg_volume_edges`), multi-signal owner
-  inference (prefix + deploy-history + labels + manual override), `stale_class`
-  column on `kg_services` (active/expected_stale/suspicious_stale), formal
-  KG schema/quality contract v2.2 (`app/knowledge_graph/contract.py` +
-  `docs/KG_SCHEMA_CONTRACT.md`), Discord embed UX polish (PATCH-dedup,
-  human-time, pod trail), stats digest UX overhaul (trends, unowned action
-  block, blast-radius rename), `quality_report` CLI + 7-case snapshot fixtures
-  gallery for UX regression-guard.
-- **v0.11.0 — Wave 7 (Topology Expansion)**: PodEvent ↔ ServiceEdge runtime
-  correlation (cheap OTEL-substitute, confirms existing edges), declarative
-  k8s Service + Ingress parser (new `serves_traffic` + `routes_to` edges),
-  NATS subjects parser from monorepo source (subject-level pub/sub direction
-  on `uses_nats` edges).
-- **v0.9.0–v0.10.0 — Active observability layer (Wave 1–6)**: VictoriaMetrics
-  time-series materialization (`kg_service_health`), anomaly detection
-  (robust-z + seasonal baseline), deploy ↔ incident correlator, Seq logs
-  integration, daily team digest, Discord pipeline overhaul (dedup, severity
-  routing, per-team channels), PII redaction, Approve/Decline authz, KG
-  self-health canary.
-
 ### What it does
 
-- Receives AlertManager webhooks (`POST /webhooks/alertmanager`).
+- Receives AlertManager webhooks — three endpoints under `/webhooks/alertmanager`, see [Alert path](#alert-path-what-actually-runs) below.
 - **Fingerprint deduplication**: skips re-running the pipeline for alerts already in-flight (OPEN → RESOLVED). Only FAILED incidents are retried.
 - **Flapping detection**: if an alert fires after RESOLVED, increments `flap_count` and re-runs the pipeline with explicit context — "this alert has cycled N times; RESOLVED was likely premature."
 - Runs `DiagnosticsEngine` — deterministic rules produce a typed `FactStore` (OOM killed, process crash, crashloop, …) before any LLM call.
@@ -197,7 +66,7 @@
 | LLM | Anthropic Claude (API key or `claude --print` CLI subprocess) |
 | Observability | Prometheus, OpenTelemetry → Tempo, structlog |
 | Integrations | Discord, Kubernetes, Jira, TeamCity (MCP), VictoriaMetrics |
-| Deploy | Helm chart (`helm/sre-ai-copilot/`) + k8s raw manifests (`k8s/`) |
+| Deploy | `deploy.sh` + raw manifests in `k8s/` (no Helm) |
 
 ### Quick start
 
@@ -274,12 +143,22 @@ cloudflared tunnel --url http://localhost:8000
 > 2. Set `DISCORD_WEBHOOK_URL` in production `.env`.
 > 3. Set `DISCORD_DRY_RUN=false`.
 
-### Helm install
+### Deploy
+
+There is no Helm chart. The service is rolled out by [`deploy.sh`](deploy.sh),
+which applies the raw manifests in [`k8s/`](k8s/) — migrations as a separate
+Job first, then executor, api, worker/beat and the NetworkPolicy — and the
+TeamCity build only does `kubectl set image` on the same Deployments. The
+chart that used to live in `helm/` had not been used since May and had drifted
+from the cluster (no executor, Postgres, backup CronJob or squad dashboard);
+it was removed on 2026-10-31, and replicas, resources and env defaults now
+live only in `k8s/`. Step-by-step procedure, migrations and rollback:
+[`docs/RUNBOOK.md`](docs/RUNBOOK.md#production-rollout-the-actual-procedure-2026-08-08).
 
 ```bash
-helm install sre-ai-copilot helm/sre-ai-copilot/ \
-  --set ingress.host=sre-ai.example.com \
-  --set image.tag=1.0.0-rc.15
+IMAGE_TAG=1.0.27 ./deploy.sh                         # Nexus (default)
+IMAGE_REPO=ghcr.io/froggychips/sre-ai-copilot \
+  IMAGE_TAG=<git-sha> ./deploy.sh                    # CI-built image
 ```
 
 > **Registry is a parameter, not a constant.** `deploy.sh` defaults to Nexus
@@ -289,13 +168,33 @@ helm install sre-ai-copilot helm/sre-ai-copilot/ \
 > with ImagePullBackOff in that cluster — see
 > [`docs/RUNBOOK.md`](docs/RUNBOOK.md#production-rollout-the-actual-procedure-2026-08-08).
 
-Fill secrets before installing — see `helm/sre-ai-copilot/templates/secret.yaml`.
+The Secret `sre-ai-secrets` must exist before the first run: `deploy.sh` only
+checks for it and never applies the `k8s/base/secrets.yaml` template (see the
+`*.example` files next to it for SealedSecrets / ExternalSecrets).
+
+### Alert path (what actually runs)
+
+Routing lives in [`k8s/vmalertmanagerconfig.yaml`](k8s/vmalertmanagerconfig.yaml);
+the api exposes three AlertManager endpoints (`app/api/webhooks.py`):
+
+| Endpoint | What it does | Who is routed there |
+|---|---|---|
+| `POST /webhooks/alertmanager/enrich-and-forward` | Writes the alert into the knowledge graph **and** posts an enriched card to Discord — deterministic enrichment, no LLM. The production mode. | `prod-*`, `preprod-*`, and the fallback for everything without a namespace (node and control-plane alerts) |
+| `POST /webhooks/alertmanager/store` | Knowledge graph only: history, incidents, evidence for playbooks. **Nothing goes to Discord.** | `squad-*`, `preupdate-*`, and every `severity=info` alert |
+| `POST /webhooks/alertmanager` | The full LLM pipeline (diagnostics → hypotheses → critic → synthesis → executor) | Nobody: `LLM_PIPELINE_ENABLED=false` until the E2E runs and budget caps are in place |
+
+`Watchdog` and `severity=none` go to a blackhole receiver. Squad stands being
+KG-only is a decision, not a gap: dozens of short-lived dev namespaces would
+drown the incident channel, while their history stays queryable in the graph
+(`/kg/*`, MCP tools, the squad dashboard).
 
 ### API endpoints
 
 | Endpoint | Description |
 |---|---|
-| `POST /webhooks/alertmanager` | AlertManager batch webhook (with fingerprint dedup + flapping detection) |
+| `POST /webhooks/alertmanager` | AlertManager batch webhook → full LLM pipeline (fingerprint dedup + flapping detection); off in production, see [Alert path](#alert-path-what-actually-runs) |
+| `POST /webhooks/alertmanager/store` | Same payload → knowledge graph only |
+| `POST /webhooks/alertmanager/enrich-and-forward` | Same payload → knowledge graph + enriched Discord card |
 | `GET /webhooks/status/{task_id}` | Celery task status |
 | `POST /discord/interactions` | Discord button interactions (Ed25519-verified) |
 | `POST /copilot` | Conversational analysis |
@@ -361,7 +260,7 @@ The executor track is **delivered and gated behind explicit opt-in flags** as of
 **Ramp-up plan:**
 
 1. **Dev**: `EXECUTOR_ENABLED=true`, `EXECUTOR_APPROVAL_ENABLED=true` on local dev with `DISCORD_DRY_RUN=true` — verify embed buttons appear correctly.
-2. **One preprod squad-N namespace**: enable both flags via Helm value override; trigger a synthetic alert (or wait for a real one); click Apply on a low-risk action (`get_logs`, `describe_resource`). Verify `executor_applied` row in DB and audit log.
+2. **One preprod squad-N namespace**: enable both flags via env in `k8s/base/deployment.yaml` + `k8s/worker.yaml` (`deploy.sh`); trigger a synthetic alert (or wait for a real one); click Apply on a low-risk action (`get_logs`, `describe_resource`). Verify `executor_applied` row in DB and audit log.
 3. **All preprod-squad-***: gradual rollout one namespace per day, watch for `EXECUTOR_APPLY_REFUSED` rate.
 4. **Production-squad-N**: same procedure, `low`-risk only for first week, then `medium` after one clean incident.
 5. **No HIGH risk auto-apply ever** — by design. HIGH-risk intents never get the Apply button.
@@ -420,139 +319,9 @@ See [docs/RUNBOOK.md → Executor incidents](docs/RUNBOOK.md#executor-incidents)
 >
 > **Opt-in = auto-remediator с approval.** При `EXECUTOR_ENABLED=true` добавляется 9-я стадия пайплайна: предложенное действие валидируется через `kube-apiserver` командой `kubectl ... --dry-run=server`. При `EXECUTOR_APPROVAL_ENABLED=true` на embed дополнительно появляется кнопка «⚙️ Apply» (только если dry-run прошёл и risk ≤ medium); двухшаговое подтверждение → реальный `kubectl` под `K8sSecurityGuard` + полный OTEL audit. См. [Roadmap — Execution](#roadmap--execution-1) ниже для плана выкатки.
 
-### Что нового
-
-- **v1.0.4 → v1.0.8 — доказательства вместо флагов, инциденты вместо алертов**
-  (05–07.09.2026, PR #349–#374): глубокое ревью по живому кластеру
-  превратилось в серию roadmap. **Evidence-контракт** — у факта три исхода
-  (`found` / `absent` / `unknown`), каждое правило объявляет `sources`, а
-  упавший источник понижает «не нашли» до «не смогли проверить»; критик
-  никогда не опровергает гипотезу по `unknown`. **SourceStatus** — синк,
-  который ничего не наблюдал, больше не пишет heartbeat. **Incident** как
-  объект графа (`kg_incidents`: один открытый инцидент на сервис, инвариант
-  держит частичный уникальный индекс, флаппинг переоткрывает, а не плодит) с
-  **timeline** по шести таблицам и Known Unknowns. **Blast radius** идёт
-  против рёбер зависимости на два шага и помечает каждый путь слабейшим
-  звеном. **Верификация remediation** снимает `uid` цели до записи,
-  отказывает пересозданному объекту и перепроверяет исход через 5 и 15
-  минут. **Операционная память** — свидетельства → диагноз → решение →
-  действие → верификация на той же ленте. Плюс: k8s-watcher выкатов
-  (`kg_deploy_watch`), self-health в VictoriaMetrics, снято 1,7 ГБ
-  дублирующих индексов, шумовые инциденты помечены, `KubeJobFailed`
-  атрибутируется владельцу Job, а не kube-state-metrics. Контракты:
-  [`docs/SEMANTIC_CONTRACT.md`](docs/SEMANTIC_CONTRACT.md) §5.1, §11–§13;
-  подробности по релизам — в [`CHANGELOG.md`](CHANGELOG.md).
-- **v1.0.0-rc.14 / rc.15 — разбор двухдневного молчания дайджеста**: после
-  волны rc.10–13 ежедневный дайджест два дня молча не приходил. Два
-  независимых убийцы: (1) воркеры OOM-петлились каждые ~1.5–2ч (лимит
-  1536Mi + CPU-троттлинг 98% на 200m) — при `acks_late` redis передоставлял
-  задачу ежечасно, пока `expires` тихо её не отзывал; (2) сборка дайджеста
-  перемежает SQL с минутами VM/Discord I/O, и сессия висела в
-  idle-in-transaction дольше 120с — лимита, введённого в rc.11. Фиксы:
-  `recompute_all_health` коммитит батчами по 100 с `ORDER BY id` (дедлоки на
-  `kg_services`: 594/сутки → 0), `metrics_sync` закрывает read-транзакцию до
-  fetch-фазы, дайджесты работают на read-only **AUTOCOMMIT-сессии** (висеть
-  нечему, ACCESS SHARE-локи не держатся против DDL), воркеру — 3Gi/600m
-  (Guaranteed QoS).
-- **v1.0.0-rc.12 / rc.13 — хвост волны глубокого ревью**: ingress-наблюдения
-  за 5 VM-запросов вместо ~5000 за тик; NATS-рёбра для squad/QA-стендов
-  (корень низкой связности графа); секция «KG через MCP» в дайджесте (кто
-  реально пользуется графом); устранён дрейф репозиторий ↔ кластер (registry,
-  RBAC, `lock_timeout`); `acks_late` + `reject_on_worker_lost` +
-  `prefetch=1`; починены висящие транзакции и падение синка на
-  переименованном constraint.
-- **v1.0.0-rc.11 — Типы узлов KG, честные метрики, безопасные миграции**:
-  у `kg_services` появился `node_kind` (`service` / `workload` / `ingress`) —
-  k8s Service и его backing Deployment наконец **разные узлы**. Раньше они
-  делили одну строку с ключом `(namespace, name)`, из-за чего ребро
-  `serves_traffic` не могло существовать в принципе: оно вырождалось в
-  self-loop и отбрасывалось. На живом графе это 2092 выброшенных ребра за тик
-  синка против 3 уцелевших; после правки `serves_traffic` — 4234 ребра, а
-  матчинг покрыл StatefulSet/DaemonSet (все `*-db`-узлы, прежде невидимые).
-  **Метрики остались честными:** `orphan_pct` намеренно НЕ засчитывает
-  `serves_traffic` как связность — это ребро на собственную реализацию узла, и
-  его учёт уронил orphan с 72.5% до 42% без единой новой интеграции.
-  `owner_pct` и `app_scope` считают только узлы `service`, поэтому 2871 новый
-  workload-узел их не разбавил.
-  **Эксплуатация:** миграции идут с `lock_timeout` (DDL в очереди блокирует
-  всех читателей за собой), периодические beat-задачи протухают вместо
-  накопления (230 задач в очереди полностью вытеснили синк топологии), CI
-  гоняет весь набор против живого Postgres. Подробный разбор, включая
-  допущенные промахи: [`docs/POSTMORTEM_2026_08_08.ru.md`](docs/POSTMORTEM_2026_08_08.ru.md).
-- **v1.0.0-rc.1 — Харднинг безопасности и надёжности (release candidate)**:
-  крупнейший проход харднинга — закрыт весь CRITICAL/P0-тир внутреннего
-  глубокого ревью, opt-in executor сделан реально безопасным.
-  **Executor:** детерминированный серверный policy-gate (`app/remediation`,
-  8 risk axes) пересчитывает риск из *структурного* intent-а и блокирует
-  prod/system/data-plane/необратимое — LLM-`risk` теперь лишь advisory; путь
-  `apply_confirm` несёт подпись intent-а (TOCTOU), а `apply_intent` перед
-  реальным `kubectl` требует совпадения подписи **и** записи `ActionApproval`,
-  с row-lock против двойного apply. **Вебхуки:** anti-replay по свежести
-  timestamp на Discord-interactions (Ed25519) и AlertManager (HMAC).
-  **Надёжность:** фикс retry-шторма (SDK `max_retries=0` + client-timeout +
-  сужённый retry-предикат — без 9× fan-out / зомби-запросов), AM-down больше
-  не гасит ложно живые critical, дедуп инцидентов переехал в cross-replica
-  Postgres-стор (нет дублей `@here`), savepoint-изоляция в KG-синхронизаторах
-  (один битый ряд не валит tick), единый Celery-app с backpressure,
-  prompt-guard не блокирует реальные крэш-трейсбэки. **Плюс:** пробелы
-  PII-редакции (AWS/Basic/PEM), `/replay` RBAC + SSRF-allowlist, VM
-  None-sentinel (нет ложно-healthy снимка), fail-safe гейт аппрува в
-  RCAExplainer, тюнинг пула БД, фикс psycopg2-leak. ~22 фикса; полный
-  сьют 1591 passed.
-- **v0.14.0 — Alert-quality: подавление шума + ops-харднинг**: два новых
-  класса подавления на этапе render-а — шумные алёрты остаются *видимыми, но
-  приглушёнными* (grey + 🔇, без 🚨/@mention), а не дропаются и не демотятся по
-  severity. `meta_noise` ловит всегда-шумные мета-агрегаты (`*NewCriticalAlerts`,
-  `etcdInsufficientMembers`, `ScrapePoolHasNoTargets`, `RecordingRulesNoData`) —
-  каждый реальный критикал всё равно приходит отдельной громкой карточкой.
-  `gen_mismatch_noise` ловит *условный* churn `KubeDeploymentGenerationMismatch`
-  (внешний контроллер бьёт `metadata.generation`, накат давно сошёлся):
-  приглушаем **только** при `ready==desired (≥1)`; fail-safe **LOUD** при
-  `ready<desired`/неизвестных репликах, чтобы реально зависший накат звенел в
-  любом ns, включая prod. Оба за kill-switch (`META_NOISE_ENABLED`,
-  `GEN_MISMATCH_NOISE_ENABLED`). Ops: память `copilot-beat` 128Mi→256Mi
-  (фикс OOMKill-крашлупа), `cryptography`/`pydantic-settings` объявлены как
-  first-party зависимости (фикс CI-дрейфа + CVE).
-- **v0.13.0 — Security Hardening + Remediation Phase A**: харднинг
-  authz/integrity на путях executor/approval (закрыты дыры apply/approve,
-  убраны утечки в ответах, авторизация на ранее открытых ручках вкл. `/stats`),
-  фиксы PromQL-инъекции + утечек сессий SQLAlchemy + webhook insert-race,
-  корректность стейт-машины пайплайна (per-stage timeout, `TRIAGE_REQUIRED` в
-  терминальном skip-сете). Remediation **Phase A**: decision *preview без
-  executor* (8 risk axes, YAML playbooks, rule-based policy evaluator) +
-  ownership manifest для `*-shared` инфраструктуры; resilience-примитивы в
-  hot-path.
-- **2026-06-10 — KG ingress coverage live**: nginx-ingress метрики включены
-  на обоих контроллерах WO (shared + prod); `kg_ingress_observations`
-  наполняется каждые ~10 мин per-host/path p95/p99/rps/4xx/5xx, 100% рядов
-  слинкованы с `kg_services`. Caveat: per-service `http_5xx_rate` /
-  `p95_latency_ms` в `kg_service_health` по-прежнему всегда 0 — app
-  `/metrics` (Kestrel) за JWT; ждёт бэкенд-тикета WO-12483.
-- **v0.12.0 — Wave 8 (KG Metadata + UX Polish)**: покрытие k8s Jobs/CronJobs
-  (`kg_k8s_jobs`, edge `runs_as_job`), storage-подграф PVC/PV
-  (`kg_storage_volumes`, edges `uses_volume` + `bound_to` в `kg_volume_edges`),
-  multi-signal owner inference (prefix + deploy-history + labels + manual
-  override), column `stale_class` в `kg_services` (active/expected_stale/
-  suspicious_stale), формализованный KG schema/quality contract v2.2
-  (`app/knowledge_graph/contract.py` + `docs/KG_SCHEMA_CONTRACT.md`), polish
-  Discord embed (PATCH-dedup, human-time, pod trail), переработка stats
-  digest UX (trends, unowned action block, blast-radius rename), CLI
-  `quality_report` + 7 snapshot-фикстур для UX regression-guard.
-- **v0.11.0 — Wave 7 (Topology Expansion)**: runtime correlation
-  PodEvent ↔ ServiceEdge (дешёвый OTEL-substitute, подтверждает существующие
-  edges), declarative-парсер k8s Service + Ingress (новые edges
-  `serves_traffic` + `routes_to`), парсер NATS subjects из monorepo
-  (subject-level direction pub/sub на edges `uses_nats`).
-- **v0.9.0–v0.10.0 — Active observability layer (Wave 1–6)**: time-series
-  материализация VictoriaMetrics (`kg_service_health`), детекция аномалий
-  (robust-z + seasonal baseline), deploy ↔ incident correlator, интеграция
-  Seq, daily team digest, переработка Discord-пайплайна (dedup, severity
-  routing, per-team каналы), PII redaction, authz на Approve/Decline,
-  self-health canary KG.
-
 ### Что умеет
 
-- Принимает алерты AlertManager (`POST /webhooks/alertmanager`).
+- Принимает алерты AlertManager — три endpoint-а под `/webhooks/alertmanager`, см. [Боевой путь алертов](#боевой-путь-алертов) ниже.
 - **Дедупликация по fingerprint**: повторные алерты для инцидента в статусе OPEN→RESOLVED пропускаются. Повторный запуск только для FAILED.
 - **Детекция флаппинга**: если алерт срабатывает после RESOLVED — инкрементирует `flap_count` и перезапускает пайплайн с явным контекстом «этот алерт уже циклировал N раз; RESOLVED между срабатываниями, вероятно, был ложным».
 - Запускает `DiagnosticsEngine` — детерминированные правила выдают типизированный `FactStore` (oom_killed, process_crash, crashloop, …) до любого LLM-вызова.
@@ -655,28 +424,57 @@ cloudflared tunnel --url http://localhost:8000
 > 2. Прописать `DISCORD_WEBHOOK_URL` в production `.env`.
 > 3. Установить `DISCORD_DRY_RUN=false`.
 
-### Helm
+### Деплой
+
+Helm-чарта нет. Сервис выкатывает [`deploy.sh`](deploy.sh), применяя сырые
+манифесты из [`k8s/`](k8s/) — сначала миграции отдельным Job-ом, затем
+executor, api, worker/beat и NetworkPolicy; сборка TeamCity делает только
+`kubectl set image` на тех же Deployment-ах. Чарт из `helm/` с мая не
+использовался и разъехался с кластером (ни executor-а, ни Postgres, ни
+CronJob бэкапов, ни витрины сквадов) — удалён 31.10.2026; реплики, ресурсы и
+дефолты env теперь живут только в `k8s/`. Пошаговая процедура, миграции и
+откат: [`docs/RUNBOOK.ru.md`](docs/RUNBOOK.ru.md#выкат-в-прод-реальная-процедура-08082026).
 
 ```bash
-helm install sre-ai-copilot helm/sre-ai-copilot/ \
-  --set ingress.host=sre-ai.example.com \
-  --set image.tag=1.0.0-rc.15
+IMAGE_TAG=1.0.27 ./deploy.sh                         # Nexus (по умолчанию)
+IMAGE_REPO=ghcr.io/froggychips/sre-ai-copilot \
+  IMAGE_TAG=<git-sha> ./deploy.sh                    # образ из CI
 ```
 
-> **Note on the WO cluster:** the manifests and `deploy.sh` reference
-> `ghcr.io/froggychips/...` by git-sha, but that cluster actually pulls from
-> Nexus (`docker.lastoasisgame.com/wo/sre-ai-copilot:1.0.0-rc.N`) and has no
-> `imagePullSecrets` for ghcr. The real rollout procedure is in
-> [`docs/RUNBOOK.md`](docs/RUNBOOK.md#production-rollout-the-actual-procedure-2026-08-08);
-> the drift is tracked in [`docs/POSTMORTEM_2026_08_08.md`](docs/POSTMORTEM_2026_08_08.md).
+> **Registry — параметр, а не константа.** По умолчанию `deploy.sh` берёт
+> образ из Nexus (`docker.lastoasisgame.com/wo/sre-ai-copilot`) — оттуда же,
+> откуда реально тянут поды WO-кластера; для образа из CI передаётся
+> `IMAGE_REPO=ghcr.io/froggychips/sre-ai-copilot`. До 08.08.2026 скрипт
+> хардкодил ghcr и упирался в ImagePullBackOff — разбор в
+> [`docs/POSTMORTEM_2026_08_08.ru.md`](docs/POSTMORTEM_2026_08_08.ru.md).
 
-Перед установкой заполнить секреты — см. `helm/sre-ai-copilot/templates/secret.yaml`.
+Secret `sre-ai-secrets` должен существовать до первого запуска: `deploy.sh`
+только проверяет его наличие и никогда не применяет шаблон
+`k8s/base/secrets.yaml` (рядом — `*.example` для SealedSecrets / ExternalSecrets).
+
+### Боевой путь алертов
+
+Маршрутизация — в [`k8s/vmalertmanagerconfig.yaml`](k8s/vmalertmanagerconfig.yaml);
+api отдаёт три endpoint-а для AlertManager (`app/api/webhooks.py`):
+
+| Endpoint | Что делает | Кто туда маршрутизируется |
+|---|---|---|
+| `POST /webhooks/alertmanager/enrich-and-forward` | Пишет алерт в граф знаний **и** постит обогащённую карточку в Discord — детерминированное обогащение, без LLM. Боевой режим. | `prod-*`, `preprod-*` и fallback для всего без namespace (нодовые и control-plane алерты) |
+| `POST /webhooks/alertmanager/store` | Только граф знаний: история, инциденты, свидетельства для playbook-ов. **В Discord ничего не уходит.** | `squad-*`, `preupdate-*` и все алерты с `severity=info` |
+| `POST /webhooks/alertmanager` | Полный LLM-пайплайн (диагностика → гипотезы → критик → синтез → executor) | Никто: `LLM_PIPELINE_ENABLED=false`, пока нет E2E-прогонов и потолков бюджета |
+
+`Watchdog` и `severity=none` уходят в blackhole-receiver. Сквады только в KG —
+это решение, а не дыра: десятки короткоживущих dev-стендов утопили бы канал
+инцидентов, а их история всё равно доступна из графа (`/kg/*`, MCP-инструменты,
+витрина сквадов).
 
 ### API endpoints
 
 | Endpoint | Описание |
 |---|---|
-| `POST /webhooks/alertmanager` | AlertManager webhook (с dedup + флаппинг-детекцией) |
+| `POST /webhooks/alertmanager` | AlertManager webhook → полный LLM-пайплайн (dedup + флаппинг-детекция); в проде выключен, см. [Боевой путь алертов](#боевой-путь-алертов) |
+| `POST /webhooks/alertmanager/store` | Тот же payload → только граф знаний |
+| `POST /webhooks/alertmanager/enrich-and-forward` | Тот же payload → граф знаний + обогащённая карточка в Discord |
 | `GET /webhooks/status/{task_id}` | Статус Celery-задачи |
 | `POST /discord/interactions` | Discord-взаимодействия с кнопками (Ed25519-верификация) |
 | `POST /copilot` | Разговорный анализ |
@@ -742,7 +540,7 @@ Executor-трек **сделан и закрыт за явные opt-in флаг
 **Ramp-up план:**
 
 1. **Dev**: `EXECUTOR_ENABLED=true`, `EXECUTOR_APPROVAL_ENABLED=true` локально с `DISCORD_DRY_RUN=true` — убедиться что кнопки появляются на embed-е корректно.
-2. **Один preprod squad-N namespace**: включить оба флага через Helm value override; спровоцировать синтетический алерт (или дождаться реального); кликнуть Apply на low-risk действии (`get_logs`, `describe_resource`). Проверить `executor_applied` в БД и audit log.
+2. **Один preprod squad-N namespace**: включить оба флага через env в `k8s/base/deployment.yaml` + `k8s/worker.yaml` (`deploy.sh`); спровоцировать синтетический алерт (или дождаться реального); кликнуть Apply на low-risk действии (`get_logs`, `describe_resource`). Проверить `executor_applied` в БД и audit log.
 3. **Все preprod-squad-***: постепенный rollout по одному namespace в день, watch на rate `EXECUTOR_APPLY_REFUSED`.
 4. **Production-squad-N**: та же процедура, `low`-risk только первую неделю, потом `medium` после одного чистого инцидента.
 5. **HIGH-risk auto-apply никогда** — by design. HIGH-risk intent кнопку не получает.

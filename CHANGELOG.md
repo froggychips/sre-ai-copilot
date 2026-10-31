@@ -92,6 +92,31 @@ All notable changes to this project are documented in this file.
   `last_seen`, `kg_remediation_events` 365. До этого срока у событий не было
   вовсе. `purge_events` идёт из `kg_health_retention` после сэмплов.
 
+- **Helm-чарт удалён** (`helm/`, #524). Деплой с мая идёт только через
+  `deploy.sh` + манифесты `k8s/` (и `kubectl set image` из сборки TeamCity),
+  а чарт разъехался с кластером: в нём не было ни executor-а, ни Postgres,
+  ни CronJob бэкапов, ни витрины сквадов — при этом десяток тестов держал
+  его «в синхроне» с `k8s/`. Сняты `tests/test_helm_ownership_sync.py`,
+  helm-части `test_ops_manifests.py` и `test_worker_metrics.py`,
+  `test_version_consistency.py::test_helm_chart_appversion_matches`; версия
+  живёт в трёх местах (`app/__init__.py`, бейдж README, CHANGELOG).
+- **Доки сверены с кодом** (#524). README: секции про Helm заменены
+  абзацем про `deploy.sh` + `k8s/`, добавлен боевой путь алертов (три
+  endpoint-а и кто куда маршрутизируется; сквады пишутся только в KG через
+  `/store` и в Discord не ходят — осознанно), 12 changelog-буллетов «What's
+  new» убраны из шапки (всё давно в CHANGELOG). `docs/MODULE_DOCS`: ссылки
+  на несуществующие `rules/crash.py`, `deploy.py`, `scheduling.py`,
+  `app/models.py` → реальные `process_crash.py`, `recent_deploy.py`,
+  `failed_scheduling.py`, `app/models/`. `docs/FAQ`: имена env по
+  `app/config.py` (`MODEL_NAME`, `DISCORD_BOT_TOKEN`,
+  `DISCORD_INCIDENT_CHANNEL_ID`, `DISCORD_APPROVERS_*`, `JWT_PUBLIC_KEY`;
+  пустой allowlist аппруверов = fail-closed, а не «любой участник»).
+  `SECURITY.md`: `ALERTMANAGER_REPLAY_SHARED_NONCE` — env-переменная, которую
+  читает `app/security/replay.py`, а не поле Settings. `docs/RUNBOOK`:
+  `helm upgrade` → `kubectl set env` / правка манифестов + `deploy.sh`,
+  ownership-ConfigMap создаётся руками из `config/ownership.yaml`, релизный
+  чек-лист считает три места вместо четырёх.
+
 ### Зависимости
 
 - **pip-audit снова зелёный** (#520): `certifi` 2026.4.22 → 2026.10.23

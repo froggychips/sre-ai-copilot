@@ -1,7 +1,7 @@
-"""Структурные гейты на ops-зону: манифесты k8s/, чарт helm/, версии тулинга.
+"""Структурные гейты на ops-зону: манифесты k8s/, версии тулинга.
 
 Лёгкие проверки без кластера и без рендера-в-облако: yaml.safe_load по файлам
-репозитория плюс (если рядом есть бинарь `helm`) один `helm template`.
+репозитория.
 
 Что именно держим:
 
@@ -15,26 +15,18 @@
   вместо `-b` заставляет пробу импортировать весь стек приложения (~166 MiB,
   секунды CPU в лимите 600m) каждую минуту. Обе ошибки не ломают рендер и не
   видны глазом в диффе — проверяем текстом.
-* **k8s/ ≡ helm/.** Значения расползались уже не раз (resources.worker 768Mi
-  против 3Gi в k8s/worker.yaml). Пробы синхронизируем тем же способом.
 * **Одна версия python.** ruff.toml/mypy.ini против Dockerfile: расхождение
   означает, что линт и типы проверяют не тот рантайм, в котором код поедет.
-* **Секреты чарта.** values-путь должен оставаться ОПЦИОНАЛЬНЫМ: есть
-  secrets.existingSecret, secret.yaml под условием, в NOTES.txt — warning.
 """
 from __future__ import annotations
 
 import re
-import shutil
-import subprocess
 from pathlib import Path
 
-import pytest
 import yaml
 
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 _K8S_DIR = _REPO_ROOT / "k8s"
-_CHART_DIR = _REPO_ROOT / "helm" / "sre-ai-copilot"
 
 _WORKLOAD_KINDS = frozenset({"Deployment", "StatefulSet", "DaemonSet"})
 
@@ -152,46 +144,6 @@ def test_beat_liveness_threshold_exceeds_celery_sync_interval() -> None:
     )
 
 
-@pytest.mark.parametrize(
-    "template_name",
-    ["deployment-api.yaml", "deployment-worker.yaml", "deployment-beat.yaml"],
-)
-def test_helm_workload_templates_declare_liveness_probe(template_name: str) -> None:
-    """Те же workload-ы в чарте тоже с пробами (chart-install ≠ kubectl apply)."""
-    text = (_CHART_DIR / "templates" / template_name).read_text(encoding="utf-8")
-    assert "livenessProbe:" in text, f"{template_name}: нет livenessProbe"
-
-
-def test_helm_probes_match_k8s_manifests() -> None:
-    """Пробы в чарте ≡ пробы в k8s/worker.yaml (источник истины — k8s/)."""
-    helm = shutil.which("helm")
-    if not helm:
-        pytest.skip("helm not available")
-    rendered = subprocess.run(
-        [
-            helm, "template", "sre-ai", str(_CHART_DIR),
-            "--set", "image.tag=test",
-        ],
-        capture_output=True,
-        text=True,
-    )
-    assert rendered.returncode == 0, f"helm template упал: {rendered.stderr}"
-
-    chart_probes = {}
-    for doc in yaml.safe_load_all(rendered.stdout):
-        if not isinstance(doc, dict) or doc.get("kind") != "Deployment":
-            continue
-        for container in doc["spec"]["template"]["spec"]["containers"]:
-            if container["name"] in ("worker", "beat"):
-                chart_probes[container["name"]] = container.get("livenessProbe")
-
-    for container_name in ("worker", "beat"):
-        expected = _k8s_container("worker.yaml", container_name)["livenessProbe"]
-        assert chart_probes.get(container_name) == expected, (
-            f"{container_name}: проба в чарте разъехалась с k8s/worker.yaml — "
-            "править ОБА файла (как resources.worker)"
-        )
-
 
 def test_python_version_is_consistent_across_toolchain() -> None:
     """Dockerfile (рантайм) ≡ ruff target-version ≡ mypy python_version.
@@ -261,34 +213,6 @@ def test_ci_python_matches_runtime() -> None:
 
     assert checked, "ни один workflow не задаёт версию python через uv"
 
-
-def test_helm_secret_values_path_is_optional() -> None:
-    """existingSecret — путь по умолчанию для prod, values-путь под условием."""
-    values = (_CHART_DIR / "values.yaml").read_text(encoding="utf-8")
-    assert re.search(r"^\s+existingSecret:\s*\"\"", values, re.MULTILINE), (
-        "в values.yaml нет secrets.existingSecret (ссылка на Secret, созданный "
-        "SealedSecrets/ESO) — единственный путь, при котором ключи не оседают "
-        "в helm release Secret и в shell history"
-    )
-
-    secret_tpl = (_CHART_DIR / "templates" / "secret.yaml").read_text(encoding="utf-8")
-    assert "if not .Values.secrets.existingSecret" in secret_tpl, (
-        "secret.yaml рендерится всегда: при заданном existingSecret чарт не "
-        "должен создавать свой Secret"
-    )
-
-    helpers = (_CHART_DIR / "templates" / "_helpers.tpl").read_text(encoding="utf-8")
-    assert ".Values.secrets.existingSecret" in helpers, (
-        "sre-ai-copilot.secretName не учитывает existingSecret — envFrom "
-        "продолжит ссылаться на секрет чарта"
-    )
-
-
-def test_helm_notes_warn_about_values_secrets_path() -> None:
-    """NOTES.txt обязан кричать, когда секреты поехали через values."""
-    notes = (_CHART_DIR / "templates" / "NOTES.txt").read_text(encoding="utf-8")
-    assert "existingSecret" in notes, "NOTES.txt не упоминает безопасный путь"
-    assert "WARNING" in notes, "NOTES.txt не предупреждает про values-путь"
 
 
 def test_worker_exposes_metrics_port() -> None:

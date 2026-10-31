@@ -248,9 +248,11 @@ UPDATE incidents
 #### Остановить новые applies (нормальный control)
 
 ```bash
-helm upgrade sre-ai-copilot helm/sre-ai-copilot \
-  --reuse-values \
-  --set env.EXECUTOR_APPROVAL_ENABLED=false
+# быстро: оба деплоймента читают флаг на старте, kubectl set env их прокатит
+kubectl -n sre-ai set env deploy/sre-ai-api deploy/copilot-worker \
+  EXECUTOR_APPROVAL_ENABLED=false
+# надолго: то же значение в k8s/base/deployment.yaml + k8s/worker.yaml
+# и ./deploy.sh — чтобы манифесты и кластер говорили одно
 ```
 
 Apply-кнопка исчезает с новых embed-ов. Уже выставленные embed-ы остаются в Discord history, но клик возвращает `❌ EXECUTOR_APPROVAL_ENABLED=false — apply отключён.`
@@ -258,7 +260,7 @@ Apply-кнопка исчезает с новых embed-ов. Уже выста�
 #### Emergency (быстрее всего)
 
 ```bash
-kubectl scale deployment/sre-ai-copilot-worker -n sre-ai --replicas=0
+kubectl scale deployment/copilot-worker -n sre-ai --replicas=0
 ```
 
 Останавливает всё (dry-run, analysis, apply). Только если executor сильно misbehaviour.
@@ -519,14 +521,8 @@ demote severity: инцидент по-прежнему сохраняется, 
 
 ### Временно вернуть громкость классу (kill-switch)
 
-⚠️ Эти флаги пока **не** проброшены в Helm-чарт — шаблоны деплойментов мапят
-лишь фиксированный набор (`executorEnabled`, `safeMode`, `llmBackend`, …)
-через `.Values.env.*`. Поэтому `helm upgrade --set env.META_NOISE_ENABLED=false`
-**ничего не делает**: чарт это значение не потребляет, приложение остаётся на
-дефолте из config.py (`true`). Флаг читается из env на **старте** процесса
-(не hot-reload), так что любая смена требует рестарта подов.
-
-Два способа отключить класс:
+Флаг читается из env на **старте** процесса (не hot-reload), так что любая
+смена требует рестарта подов. Два способа отключить класс:
 
 **1. Быстро / эфемерно — `kubectl set env`.** Выставить на **обоих**
 деплойментах: render (enrichment + сборка embed) идёт в worker, а api держит
@@ -534,30 +530,24 @@ inline-путь при `PIPELINE_DIRECT_INVOKE=true`.
 
 ```bash
 kubectl set env -n sre-ai \
-  deployment/sre-ai-copilot-api deployment/sre-ai-copilot-worker \
+  deployment/sre-ai-api deployment/copilot-worker \
   META_NOISE_ENABLED=false      # или GEN_MISMATCH_NOISE_ENABLED=false
 ```
 
-`kubectl set env` сам триггерит rollout (ручной рестарт не нужен). Этот
-override **затирается следующим `helm upgrade`** — чарт его не отслеживает.
-Использовать для «сделать громким прямо сейчас, пока разбираюсь».
+`kubectl set env` сам триггерит rollout (ручной рестарт не нужен). Override
+живёт только в кластере: в `k8s/` его нет, следующий читатель репозитория
+его не увидит, а манифест, который позже задаст ту же переменную, его
+перебьёт. Использовать для «сделать громким прямо сейчас, пока разбираюсь».
 
-**2. Durable — изменение чарта.** Добавить env-проброс в **оба** шаблона
-`deployment-api.yaml` и `deployment-worker.yaml` + дефолт в `values.yaml`
-(camelCase-ключ, как `executorEnabled`):
+**2. Durable — правка манифестов.** Добавить переменную в блок `env:`
+**обоих** файлов `k8s/base/deployment.yaml` и `k8s/worker.yaml`, затем
+`./deploy.sh`:
 
 ```yaml
-# templates/deployment-{api,worker}.yaml — в блок env:
+# k8s/base/deployment.yaml и k8s/worker.yaml — в блок env:
 - name: META_NOISE_ENABLED
-  value: {{ .Values.env.metaNoiseEnabled | default "true" | quote }}
-
-# values.yaml — под env:
-#   metaNoiseEnabled: "true"
-#   genMismatchNoiseEnabled: "true"
+  value: "false"
 ```
-
-Затем `helm upgrade` — теперь `--set env.metaNoiseEnabled=false` реально
-сработает и переживёт последующие upgrade-ы.
 
 В обоих случаях приглушённый класс возвращается к обычному severity-routing
 (громко 🚨 / `@mention` на critical). Вернуть назад — флипнуть значение
@@ -738,51 +728,25 @@ OWNERSHIP_MANIFEST_PATH=/etc/sre-ai/ownership.yaml
 
 ### Активация `*-shared` ownership manifest в runtime
 
-В master уже лежит и manifest (`config/ownership.yaml`), и Helm-обвязка:
-`templates/ownership-configmap.yaml` рендерит ConfigMap из
-`helm/sre-ai-copilot/files/ownership.yaml` (синхронизированная копия —
-`.Files.Get` в Helm не выходит за пределы chart-dir-а), worker/api
-deployments монтируют его в `OWNERSHIP_MANIFEST_PATH`
-(дефолт `/config/ownership.yaml`).
-
-CI gate `tests/test_helm_ownership_sync.py` проверяет, что
-`config/ownership.yaml` ≡ `helm/sre-ai-copilot/files/ownership.yaml`
-байт-в-байт. Если правите один — синкайте другой:
-
-```bash
-cp config/ownership.yaml helm/sre-ai-copilot/files/ownership.yaml
-```
-
-#### A. Через Helm (рекомендуется)
-
-```bash
-# values.yaml дефолтно ownershipManifest.enabled=true.
-# Поправили helm/sre-ai-copilot/files/ownership.yaml (новое правило):
-helm upgrade --install sre-ai-copilot helm/sre-ai-copilot/ \
-  --namespace sre-ai \
-  -f helm/sre-ai-copilot/values.yaml \
-  -f your-overrides.yaml
-
-# Прокатить worker/api чтобы подцепили configmap:
-kubectl -n sre-ai rollout restart deploy/sre-ai-copilot-worker
-kubectl -n sre-ai rollout restart deploy/sre-ai-copilot-api
-
-# Проверка:
-kubectl -n sre-ai exec deploy/sre-ai-copilot-worker -- \
-  sh -c 'echo $OWNERSHIP_MANIFEST_PATH; head -5 $OWNERSHIP_MANIFEST_PATH'
-# Ожидаем: /config/ownership.yaml + первые 5 строк manifest-а.
-```
-
-#### B. Manual configmap (без Helm)
+Обвязка уже в манифестах: `k8s/base/deployment.yaml` и `k8s/worker.yaml`
+монтируют ConfigMap `sre-ai-copilot-ownership` в `/config/ownership.yaml`
+(subPath, read-only) и указывают на него `OWNERSHIP_MANIFEST_PATH`. Сам
+ConfigMap `deploy.sh` **не** создаёт — он собирается из
+`config/ownership.yaml` руками:
 
 ```bash
 kubectl -n sre-ai create configmap sre-ai-copilot-ownership \
   --from-file=ownership.yaml=config/ownership.yaml \
   --dry-run=client -o yaml | kubectl apply -f -
 
-# Затем patch deployments — mount /config/ownership.yaml (subPath
-# ownership.yaml, readOnly) + env OWNERSHIP_MANIFEST_PATH=/config/ownership.yaml.
-# Точная форма — в templates/deployment-worker.yaml и deployment-api.yaml.
+# Прокатить worker/api, чтобы подцепили новое содержимое (subPath-маунты
+# на месте не обновляются):
+kubectl -n sre-ai rollout restart deploy/copilot-worker deploy/sre-ai-api
+
+# Проверка:
+kubectl -n sre-ai exec deploy/copilot-worker -- \
+  sh -c 'echo $OWNERSHIP_MANIFEST_PATH; head -5 $OWNERSHIP_MANIFEST_PATH'
+# Ожидаем: /config/ownership.yaml + первые 5 строк manifest-а.
 ```
 
 #### Backfill уже attribute-нутых сервисов
@@ -802,8 +766,10 @@ kubectl -n sre-ai exec deploy/sre-ai-copilot-worker -- \
 
 #### Выключить
 
-`helm upgrade ... --set ownershipManifest.enabled=false` снимает
-ConfigMap, env-var и mount — worker откатывается на три heuristics
+Убрать `OWNERSHIP_MANIFEST_PATH` и том/маунт `ownership` из обоих
+Deployment-ов в `k8s/` и прогнать `./deploy.sh` (для быстрой проверки:
+`kubectl -n sre-ai set env deploy/sre-ai-api deploy/copilot-worker
+OWNERSHIP_MANIFEST_PATH-`) — worker откатывается на три heuristics
 (prefix / deploy-history / labels), 132 `*-shared` сервиса снова
 становятся unowned.
 
@@ -812,7 +778,8 @@ ConfigMap, env-var и mount — worker откатывается на три heur
 1. Отредактировать `config/ownership.yaml` — добавить правило. Правила
    с `name_pattern` кладите **выше** generic ns catch-all-а.
 2. Локально прогнать `pytest tests/test_shared_ownership_manifest.py -x`.
-3. Открыть PR. После merge helm/configmap rollout подхватит изменения.
+3. Открыть PR. После merge пересоздать ConfigMap как выше — само в
+   кластер изменение не доедет.
 4. Перепривязать уже attribute-нутые сервисы при необходимости:
 
    ```bash
@@ -975,16 +942,15 @@ entry-point `run_backfill`, частота 6 ч, scope — только high-con
 | `OWNERSHIP_BACKFILL_ENABLED` | `false` | Master switch. Beat-таска no-op-ит когда off. |
 | `OWNERSHIP_BACKFILL_THRESHOLD` | `0.7` | Минимум confidence для периодической записи. |
 
-В Helm — через `values.yaml`:
+В кластере оба — обычные env на worker Deployment (`k8s/worker.yaml`;
+`OWNERSHIP_BACKFILL_ENABLED` там уже есть):
 
 ```yaml
-env:
-  ownershipBackfillEnabled: "true"
-  ownershipBackfillThreshold: "0.7"
+- name: OWNERSHIP_BACKFILL_ENABLED
+  value: "true"
+- name: OWNERSHIP_BACKFILL_THRESHOLD
+  value: "0.7"
 ```
-
-Оба прокидываются в worker Deployment (см.
-`helm/sre-ai-copilot/templates/deployment-worker.yaml`).
 
 ### Логика порогов: `0.4` initial vs `0.7` periodic
 
