@@ -4,6 +4,7 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+## [1.0.28] — 2026-10-31 — маршруты алертов, статика одной строкой, ретеншен событий, очередь sync
 ### Исправлено
 
 - **Self-health без ложных warn** (#523). `alerts_resolve_freshness` считал
@@ -168,6 +169,11 @@ All notable changes to this project are documented in this file.
   `copilot-executor` — добавлен `CopilotExecutorDown` (warning). Первый
   раскат — только `deploy.sh`: TC-деплой делает `set image` по известным
   deployment-ам и новый не создаст.
+
+- CI: подпись cosign и SBOM на push в master больше не роняют job
+  (`continue-on-error` на установке cosign/syft и генерации SBOM): на
+  k8s-раннере нет `envsubst`, и master краснел после каждого мержа при
+  зелёных тестах; образ для кластера собирается не здесь.
 
 ### Зависимости
 
