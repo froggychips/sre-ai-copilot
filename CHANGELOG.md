@@ -4,6 +4,14 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+### Зависимости
+
+- **pip-audit снова зелёный**: `certifi` 2026.4.22 → 2026.10.23
+  (PYSEC-2026-4320), стек OpenTelemetry 1.41.1/0.62b1 → 1.45.2/0.66b2
+  (CVE-2026-114603 в `opentelemetry-api`; с 1.45 появились
+  `opentelemetry-exporter-otlp-common` и `opentelemetry-exporter-http-transport`).
+  Остальные пины не тронуты.
+
 ## [1.0.27] — 2026-10-16 — история медика при переносе алертов, замер синка
 
 ### Исправлено
