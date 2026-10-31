@@ -21,9 +21,10 @@ on:
       - 'app/scripts/quality_report.py'
       - 'tests/test_contract_guards.py'
       - 'tests/test_kg_contract.py'
-  schedule:
-    # Каждые 6 часов — trend-tracking даже без PR.
-    - cron: '0 */6 * * *'
+  # schedule (cron каждые 6 часов, trend-tracking без PR) снят: без секрета
+  # KG_READER_DATABASE_URL оба шага проверки молча скипаются, и прогон лишь
+  # занимал единственный раннер четыре раза в сутки. cron вернуть, когда
+  # появится KG_READER_DATABASE_URL.
   workflow_dispatch:
 
 # Без явного блока джобы получают дефолтный GITHUB_TOKEN, а он на

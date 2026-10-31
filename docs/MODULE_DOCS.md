@@ -49,7 +49,6 @@
 - `app/context/logs.py`, `metrics.py`, `deployments.py`: Adapters for k8s logs, VM metrics, deploy history.
 - `app/context/jira_client.py`: `JiraClient` (Atlassian REST API v3 Basic Auth); `build_jira_context()` → `{open, resolved, has_open, has_resolved, total}` or `None`.
 - `app/core/intelligence/similar_incidents.py`: `SimilarIncidentEngine` — KG search with `_is_quality_cause()` filter, `RECURRENCE_WINDOW_DAYS=7`, `recurrence` flag per result.
-- `app/core/intelligence/blast_radius.py`, `temporal_diff.py`, `next_steps.py`: Supporting analysis helpers.
 
 ## Knowledge Graph
 
@@ -112,10 +111,8 @@ Read-side API used by enrichment + MCP tools:
 - `EnrichedContext.why_this_matters()` — derived priorization signals from `_matter_signals()`: shared dep (`total_inbound > 20`), chronic (`pod_event.count > 1000`), recurrence pattern, `team_owner=platform`.
 
 ### CLI tools (`app/scripts/`)
-- `backfill_team_owner.py` — one-shot UPDATE of `kg_services.team_owner` for legacy rows.
 - `backfill_tc_deploys.py` — extended TC history backfill (default 30 days, limit 1000).
 - `cleanup_drift.py` — thin wrapper over `drift_cleanup.py` for manual run / dry-run preview.
-- `cleanup_false_rollouts.py` — removes `k8s_rollout` rows written by the 1.0.4 watcher from `metadata.generation` growth (images unchanged); dry-run by default.
 - `reattribute_deploys.py` — re-attributes ns-broadcast `kg_deployments` rows to exact targets from TeamCity build properties (`--apply --limit-builds N`).
 - `reattribute_job_alerts.py` — moves `KubeJobFailed` / `KubeJobNotCompleted` alerts from `vm-kube-state-metrics` to the Job/CronJob owner (`job_attribution`), shrinks or deletes the emptied KSM incidents and attaches the alerts to the owner's incident; dry-run by default, `--apply` to move.
 
