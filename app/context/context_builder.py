@@ -1,18 +1,27 @@
+from types import ModuleType
+from typing import Optional
+
 import structlog
 from starlette.concurrency import run_in_threadpool
-
-try:
-    from kubernetes import config
-    from kubernetes.config.config_exception import ConfigException
-    _K8S_LIB_AVAILABLE = True
-except ImportError:
-    _K8S_LIB_AVAILABLE = False
-    config = None
-    ConfigException = Exception
 
 from app.context.deployments import DeploymentCollector
 from app.context.logs import LogCollector
 from app.context.metrics import MetricsCollector
+
+# kubernetes — опциональная зависимость (тесты/replay без неё). Имя `config`
+# оставлено модульным атрибутом: тесты патчат `context_builder.config.*`.
+config: Optional[ModuleType]
+_ConfigError: type[Exception]
+try:
+    from kubernetes import config as _k8s_config
+    from kubernetes.config.config_exception import ConfigException as _K8sConfigError
+except ImportError:
+    config = None
+    _ConfigError = Exception
+else:
+    config = _k8s_config
+    _ConfigError = _K8sConfigError
+_K8S_LIB_AVAILABLE = config is not None
 
 logger = structlog.get_logger()
 
@@ -22,18 +31,18 @@ class ContextBuilder:
         # In-cluster config — основной путь в k8s. Fallback на local kubeconfig
         # для dev/e2e. Если не доступны оба — продолжаем без K8s API (для
         # тестов и replay-режима, где K8s не нужен).
-        if not _K8S_LIB_AVAILABLE:
+        if config is None:
             logger.warning("k8s_lib_unavailable", fallback="kubernetes package not installed")
             self.k8s_available = False
         else:
             try:
                 config.load_incluster_config()
                 self.k8s_available = True
-            except ConfigException:
+            except _ConfigError:
                 try:
                     config.load_kube_config()
                     self.k8s_available = True
-                except (ConfigException, FileNotFoundError):
+                except (_ConfigError, FileNotFoundError):
                     logger.warning("k8s_config_unavailable", fallback="no-k8s-context")
                     self.k8s_available = False
 

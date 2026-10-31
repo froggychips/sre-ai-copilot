@@ -104,11 +104,18 @@ class K8sFacts:
             pods = v1.list_namespaced_pod(namespace)
             unhealthy_pods = []
             for p in pods.items:
-                if p.status.phase not in ("Running", "Succeeded"):
+                # metadata/status в схеме kube API необязательны (типы клиента
+                # 37 это честно говорят); под без имени или статуса нам нечем
+                # описать — пропускаем, а не роняем весь снапшот AttributeError.
+                if p.metadata is None or not p.metadata.name or p.status is None:
+                    continue
+                p_name: str = p.metadata.name
+                if (p.status.phase or "") not in ("Running", "Succeeded"):
                     restarts = sum(
-                        cs.restart_count for cs in (p.status.container_statuses or [])
+                        (cs.restart_count or 0 for cs in (p.status.container_statuses or [])),
+                        0,
                     )
-                    unhealthy_pods.append((p.metadata.name, p.status.phase, restarts))
+                    unhealthy_pods.append((p_name, p.status.phase, restarts))
 
                     # Structured: container terminated state (last_state wins
                     # over current state — it has the actual exit reason)
@@ -121,7 +128,7 @@ class K8sFacts:
                         waiting = getattr(cs.state, "waiting", None) if cs.state else None
                         w_reason = getattr(waiting, "reason", None)
                         if isinstance(w_reason, str) and w_reason not in _BENIGN_WAITING:
-                            container_waiting.setdefault(p.metadata.name, []).append((
+                            container_waiting.setdefault(p_name, []).append((
                                 cs.name, w_reason,
                                 # waiting.message пишет kubelet (образ, имя
                                 # Secret/ключа), но режем и редактируем так же,
@@ -130,7 +137,7 @@ class K8sFacts:
                                            max_len=_TERMINATED_MSG_LEN),
                             ))
                         if terminated:
-                            container_terminated[p.metadata.name] = {
+                            container_terminated[p_name] = {
                                 "reason": terminated.reason or "",
                                 "exit_code": terminated.exit_code,
                                 # terminated.message = хвост stderr контейнера,
@@ -204,7 +211,9 @@ class K8sFacts:
                     peer_unhealthy = [
                         p.metadata.name
                         for p in peer_pods.items
-                        if p.status.phase not in ("Running", "Succeeded")
+                        if p.metadata is not None and p.metadata.name
+                        and p.status is not None
+                        and (p.status.phase or "") not in ("Running", "Succeeded")
                     ]
                     results.append(
                         f"Peer namespace {peer} unhealthy pods: "
@@ -317,14 +326,17 @@ class K8sFacts:
             try:
                 all_pods = v1.list_namespaced_pod(namespace)
                 for p in all_pods.items:
+                    if p.metadata is None or not p.metadata.name or p.status is None:
+                        continue
                     if pod in p.metadata.name and p.status.phase == "Running":
+                        containers = p.spec.containers if p.spec else []
                         # Проверка mount_path в спеке пода, не создание tempfile.
                         has_dump_mount = any(
                             (vm.mount_path or "").startswith("/tmp/dump")  # nosec B108 — pod-spec inspection, not tempfile creation
-                            for vm in (p.spec.containers[0].volume_mounts or [])
-                            if p.spec.containers
+                            for vm in (containers[0].volume_mounts or [])
+                            if containers
                         )
-                        if has_dump_mount:
+                        if has_dump_mount and p.spec is not None:
                             node = p.spec.node_name
                             core_dump_node = node
                             results.append(

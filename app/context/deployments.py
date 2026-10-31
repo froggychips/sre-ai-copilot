@@ -45,19 +45,27 @@ def _load_k8s_once() -> bool:
         return False
 
 
+# Ключ сортировки для объекта без creationTimestamp: в схеме kube API поле
+# необязательное, а None с datetime не сравнивается (TypeError на sorted).
+_EPOCH_MIN = datetime.min.replace(tzinfo=timezone.utc)
+
+
 class DeploymentCollector:
     def get_recent_deployments(self, namespace: str, limit=3) -> list:
         apps = client.AppsV1Api()
         deployments = apps.list_namespaced_deployment(namespace)
         # Сортируем по времени создания
         sorted_deps = sorted(
-            deployments.items, key=lambda d: d.metadata.creation_timestamp, reverse=True
+            deployments.items,
+            key=lambda d: (d.metadata.creation_timestamp if d.metadata else None)
+            or _EPOCH_MIN,
+            reverse=True,
         )
         return [
             {
-                "name": d.metadata.name,
-                "created": str(d.metadata.creation_timestamp),
-                "replicas": d.spec.replicas,
+                "name": d.metadata.name if d.metadata else None,
+                "created": str(d.metadata.creation_timestamp if d.metadata else None),
+                "replicas": d.spec.replicas if d.spec else None,
             }
             for d in sorted_deps[:limit]
         ]
@@ -111,15 +119,17 @@ def fetch_live_replicas(
                     sts = apps.read_namespaced_stateful_set(
                         name, namespace, _request_timeout=timeout_sec
                     )
-                    desired = int(sts.spec.replicas or 0)
-                    ready = int(sts.status.ready_replicas or 0)
+                    desired = int((sts.spec.replicas if sts.spec else 0) or 0)
+                    # status ещё не заполнен контроллером (свежий объект) =
+                    # ни одной готовой реплики.
+                    ready = int((sts.status.ready_replicas if sts.status else 0) or 0)
                     return {"ready": ready, "desired": desired}
                 else:
                     dep = apps.read_namespaced_deployment(
                         name, namespace, _request_timeout=timeout_sec
                     )
-                    desired = int(dep.spec.replicas or 0)
-                    ready = int(dep.status.ready_replicas or 0)
+                    desired = int((dep.spec.replicas if dep.spec else 0) or 0)
+                    ready = int((dep.status.ready_replicas if dep.status else 0) or 0)
                     return {"ready": ready, "desired": desired}
             except Exception:
                 # Try next kind.
@@ -158,6 +168,13 @@ def fetch_deployment_rollout_state(
         logger.warning(
             "rollout_state_fetch_failed",
             namespace=namespace, name=name, error=type(e).__name__,
+        )
+        return None
+    if dep.status is None or dep.metadata is None or dep.spec is None:
+        # Контроллер ещё не отписал статус — «не знаю», алерт остаётся громким.
+        logger.warning(
+            "rollout_state_parse_failed",
+            namespace=namespace, name=name, error="incomplete_object",
         )
         return None
     try:
@@ -307,7 +324,9 @@ def _query_node_namespaces(node: str, timeout_sec: float) -> Optional[List[Dict[
         phase = getattr(pod.status, "phase", None) if pod.status else None
         if phase in ("Succeeded", "Failed"):
             continue
-        ns = pod.metadata.namespace
+        ns = pod.metadata.namespace if pod.metadata else None
+        if not ns:
+            continue
         counts[ns] = counts.get(ns, 0) + 1
     return [
         {"namespace": ns, "pods": n, "system": ns in NODE_SYSTEM_NAMESPACES}
