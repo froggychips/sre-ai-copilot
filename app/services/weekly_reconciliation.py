@@ -33,7 +33,7 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import cast, Any, Dict, List, Optional, Set, Tuple
 
 import structlog
 from sqlalchemy import text
@@ -197,9 +197,9 @@ def _kg_alert_pairs(db: Session, since: datetime) -> Tuple[Set[Tuple[str, str]],
     for alertname, ns, raw in rows:
         ns = ns or _raw_dict(raw).get("namespace")
         if ns:
-            pairs.add((alertname, str(ns)))
+            pairs.add((str(alertname), str(ns)))
         else:
-            nameless_ns.add(alertname)
+            nameless_ns.add(str(alertname))
     return pairs, nameless_ns
 
 
@@ -245,7 +245,9 @@ def _read_table_sizes(db: Session) -> Tuple[int, Dict[str, int]]:
         JOIN pg_namespace n ON n.oid = c.relnamespace
         WHERE c.relkind IN ('r', 'p') AND n.nspname = 'public'
     """)).fetchall()
-    return int(db_size or 0), {str(name): int(size or 0) for name, size in rows}
+    return int(cast(Any, db_size) or 0), {
+        str(name): int(cast(Any, size) or 0) for name, size in rows
+    }
 
 
 def _redis():
