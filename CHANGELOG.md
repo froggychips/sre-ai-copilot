@@ -4,6 +4,25 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+### Инфраструктура
+
+- **Alertmanager: info/none больше не забивают прод-группу** (трек A, 31.10).
+  Корневой receiver `sre-ai-prod` ловил всё, что не прошло matchers:
+  severity=info/none (CPUThrottlingHigh ×83, InfoInhibitor ×75,
+  RecordingRulesNoData…) и алерты без namespace — группа ~220 при
+  `max_alerts: 10` давала 288 батчей/сутки `webhook.batch_truncated`, копилот
+  видел 10 из 220. Теперь `severity=none` → blackhole, `severity=info` →
+  receiver `sre-ai-info` (только `/store`, история в KG без Discord),
+  `max_alerts: 0` на store-ресиверах и 50 на enrich-and-forward. Манифест
+  `k8s/vmalertmanagerconfig.yaml` синхронизирован с живым объектом (squad- и
+  blackhole-receiver-ов в репо не было, preupdate шёл не туда).
+- **`CopilotSelfHealthWarnStuck` → severity warning**: с info его не постил
+  ни один путь — три проверки висели в warn 28 часов, API писал
+  `send_not_delivered` каждые 5–10 минут.
+- **Postgres: `shared_buffers=512MB`, `work_mem=16MB`,
+  `effective_cache_size=1536MB`, `pg_stat_statements`** (`k8s/postgres.yaml`):
+  образ работал на дефолтах 128 МБ/4 МБ при БД 5,3 ГБ и лимите 2Gi.
+
 ## [1.0.27] — 2026-10-16 — история медика при переносе алертов, замер синка
 
 ### Исправлено

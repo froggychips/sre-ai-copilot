@@ -7,23 +7,28 @@
 #   /webhooks/alertmanager/store              — только KG event-store, без Discord
 #   /webhooks/alertmanager/enrich-and-forward — KG store + enriched Discord embed
 #                                               (текущий боевой режим, без LLM)
-# Старый url /webhook/alert НЕ СУЩЕСТВОВАЛ — 100% алертов получали 404 и
-# молча терялись (алерта на «отсутствие алертов» нет).
+#
+# 31.10.2026 — манифест синхронизирован с живым объектом (до этого в репо
+# не было ни squad-receiver-а, ни blackhole, а preupdate шёл в
+# enrich-and-forward). Что изменилось в тот же день и почему:
+#   * корневой receiver sre-ai-prod — fallback для всего, что не поймали
+#     маршруты ниже: нодовые алерты без namespace, monitoring/kube-system.
+#     До 31.10 туда же падали severity=info/none (CPUThrottlingHigh ×83,
+#     InfoInhibitor ×75, RecordingRulesNoData…): группа ~220 алертов при
+#     max_alerts: 10 → 288 батчей/сутки `webhook.batch_truncated`, копилот
+#     видел 10 из 220. Теперь severity=none → blackhole, severity=info →
+#     sre-ai-info (только /store, история в KG без Discord).
+#   * max_alerts: 0 (= без лимита) на store-ресиверах — там нечего беречь,
+#     Discord туда не ходит. На enrich-and-forward 50: код умеет
+#     truncatedAlerts (#433), а размер embed-а режет сам.
 #
 # ⚠️ HMAC. В prod (ENV=production) app/config.py требует
 # ALERTMANAGER_WEBHOOK_SECRET, и verify_alertmanager_signature ждёт заголовок
-# X-Alertmanager-Signature: sha256=<hmac-sha256(body)> (опционально
-# X-Alertmanager-Timestamp, тогда HMAC считается над `ts.body`).
-# Стоковый AlertManager / VMAlertmanager НЕ УМЕЕТ подписывать body — значит,
-# этот конфиг сам по себе в prod получит 401. Рабочие варианты:
-#   1. Sidecar/Deployment «signing proxy» рядом с alertmanager: принимает POST,
-#      досчитывает HMAC от тела запроса, проставляет заголовок и проксирует на
-#      sre-ai-api (nginx+lua / 20-строчный FastAPI). url ниже тогда указывает
-#      на proxy.
-#   2. Изолировать трафик NetworkPolicy (см. k8s/networkpolicy.yaml) и
-#      сознательно НЕ задавать ALERTMANAGER_WEBHOOK_SECRET вне prod —
-#      verify_alertmanager_signature в dev пропускает без подписи (с warning).
-# Без одного из этих шагов конфиг неработоспособен в prod as-is.
+# X-Alertmanager-Signature: sha256=<hmac-sha256(body)>. Стоковый
+# AlertManager / VMAlertmanager НЕ УМЕЕТ подписывать body, поэтому живой
+# деплой стоит на ALERTMANAGER_ALLOW_UNAUTHENTICATED=true, а компенсация —
+# NetworkPolicy (k8s/networkpolicy.yaml): порт 8000 открыт только из
+# monitoring и mcp.
 apiVersion: operator.victoriametrics.com/v1beta1
 kind: VMAlertmanagerConfig
 metadata:
@@ -35,25 +40,50 @@ spec:
     webhook_configs:
     - url: http://sre-ai-api.sre-ai.svc.cluster.local:8000/webhooks/alertmanager/enrich-and-forward
       send_resolved: true
-      max_alerts: 10
+      max_alerts: 50
   - name: sre-ai-preprod
     webhook_configs:
     - url: http://sre-ai-api.sre-ai.svc.cluster.local:8000/webhooks/alertmanager/enrich-and-forward
       send_resolved: true
-      max_alerts: 10
+      max_alerts: 50
   - name: sre-ai-preupdate
     webhook_configs:
-    - url: http://sre-ai-api.sre-ai.svc.cluster.local:8000/webhooks/alertmanager/enrich-and-forward
+    - url: http://sre-ai-api.sre-ai.svc.cluster.local:8000/webhooks/alertmanager/store
       send_resolved: true
-      max_alerts: 10
+      max_alerts: 0
+  - name: sre-ai-squad
+    webhook_configs:
+    - url: http://sre-ai-api.sre-ai.svc.cluster.local:8000/webhooks/alertmanager/store
+      send_resolved: true
+      max_alerts: 0
+  # severity=info: история в KG (playbook CPUThrottlingHigh читает её оттуда),
+  # в Discord не постится.
+  - name: sre-ai-info
+    webhook_configs:
+    - url: http://sre-ai-api.sre-ai.svc.cluster.local:8000/webhooks/alertmanager/store
+      send_resolved: true
+      max_alerts: 0
+  - name: blackhole
   route:
-    receiver: sre-ai-prod  # fallback (не должен срабатывать — все алерты ловятся ниже)
+    receiver: sre-ai-prod  # fallback: нодовые/системные алерты без namespace
     routes:
+    - matchers:
+      - alertname = "Watchdog"
+      receiver: blackhole
+      continue: false
+    - matchers:
+      - severity = "none"
+      receiver: blackhole
+      continue: false
+    - matchers:
+      - severity = "info"
+      receiver: sre-ai-info
+      continue: false
     - matchers:
       - severity =~ "critical|warning"
       - namespace =~ "prod-.+"
       receiver: sre-ai-prod
-      continue: true   # продолжаем — discord-error тоже должен получить
+      continue: true
     - matchers:
       - severity =~ "critical|warning"
       - namespace =~ "preprod-.+"
@@ -63,4 +93,9 @@ spec:
       - severity =~ "critical|warning"
       - namespace =~ "preupdate-.+"
       receiver: sre-ai-preupdate
+      continue: true
+    - matchers:
+      - severity =~ "critical|warning"
+      - namespace =~ "squad-.+"
+      receiver: sre-ai-squad
       continue: true
