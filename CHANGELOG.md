@@ -4,6 +4,7 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+## [1.0.29] — 2026-10-31 — probe-фильтр access-лога реально ставится
 ### Исправлено
 
 - **Probe-фильтр access-лога реально ставится в API.** В 1.0.28 он жил в
