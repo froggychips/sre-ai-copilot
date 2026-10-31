@@ -57,6 +57,8 @@ from sqlalchemy.orm import Session
 from app.config import settings
 from app.knowledge_graph.kubectl_breaker import run_kubectl
 from app.knowledge_graph.edge_decay_guard import (
+    CLEANUP_SKIP_DELETE_PCT, CLEANUP_SKIP_EMPTY_FETCH,
+    CLEANUP_SKIP_FETCH_FAILED, CLEANUP_SKIP_NO_BASELINE,
     SOURCE_STORAGE_PODS, SOURCE_STORAGE_PVCS, SOURCE_STORAGE_PVS,
     record_source_run, unhealthy_volume_sources, volume_edge_block_reason,
 )
@@ -130,15 +132,17 @@ _RECENTLY_SEEN_HOURS = 24
 # неделю запасная опора пустеет, и снимок снова принимается как бутстрап.
 _BASELINE_FALLBACK_HOURS = 24 * 7
 
-# Причины пропуска чистки (уходят в stats и в логи).
-REASON_FETCH_FAILED = "fetch_failed"
-REASON_EMPTY_FETCH = "empty_fetch"
-REASON_DELETE_PCT = "delete_pct"
+# Причины пропуска чистки (уходят в stats и в логи). Значения — общий
+# контракт блока `cleanup` (edge_decay_guard): их же пишет k8s_ingress_sync
+# и читает self_health.check_source_coverage.
+REASON_FETCH_FAILED = CLEANUP_SKIP_FETCH_FAILED
+REASON_EMPTY_FETCH = CLEANUP_SKIP_EMPTY_FETCH
+REASON_DELETE_PCT = CLEANUP_SKIP_DELETE_PCT
 # Опоры нет: синк ни разу не отмечал тома этого вида за последние сутки,
 # значит сравнивать снимок не с чем. Бутстрап после миграции
 # 20260918_0100 и возвращение синка после суток простоя — те самые два
 # случая, когда обрезанный лист выглядел бы как живой набор.
-REASON_NO_BASELINE = "no_baseline"
+REASON_NO_BASELINE = CLEANUP_SKIP_NO_BASELINE
 
 
 class KubectlFetchError(RuntimeError):
