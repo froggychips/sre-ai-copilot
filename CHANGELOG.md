@@ -53,6 +53,16 @@ All notable changes to this project are documented in this file.
 
 ### Изменено
 
+- **Сборки статики — одна строка `kg_deployments` на namespace** (#521).
+  `Wo_StaticsNewCluster_*` (10–15 в день) раскладывались ns-broadcast-ом на
+  все ~665 сервисов окружения: 963 тыс. строк из 1,24 млн при 1487 билдах,
+  у `preprod-kingdom2/bot-service` 1258 «деплоев» за октябрь, в preprod факт
+  `recent_deploy` был found всегда. Теперь строка одна, на синтетическом узле
+  `statics` (`schema.STATICS_NODE_NAME`); `recent_deploys_for` подмешивает её
+  сервисам как ns-свидетельство (INFERRED 0.6, как прежде),
+  `recent_deploys_for_namespaces` видит без правок, stale-класс берёт
+  `last_ns_deploy_at` по всему namespace. Историю схлопывает
+  `app/scripts/collapse_statics_broadcast.py` (`--apply`, затем VACUUM).
 - **Мёртвый код снят** (#519). Модули без единого импортёра: `app/topology/`,
   `app/ingestion/kubernetes_events.py`, `app/agents/critic.py` (его место
   давно занял `fact_critic`), `app/core/intelligence/next_steps.py`,
