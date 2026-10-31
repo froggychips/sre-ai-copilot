@@ -73,7 +73,13 @@ All notable changes to this project are documented in this file.
   `cleanup_false_rollouts`, `backfill_team_owner`. Настройки, которые никто
   не читал: `LOG_LEVEL` (и его env в helm-чарте), `KG_SELF_HEALTH_INTERVAL_MINUTES`,
   `OIDC_WELL_KNOWN_URL`, `REPLAY_MODE`, `CHRONIC_DIGEST_INTERVAL_HOURS`.
-<<<<<<< HEAD
+- **Ретеншен таблиц событий** (#522) — отдельный реестр
+  `EVENT_RETENTION_TARGETS` с полом `MIN_EVENT_RETENTION_DAYS=90`, не 7 дней
+  метрик: `kg_deployments` 180 дней, `kg_alerts` 180 и `kg_incidents` 365 по
+  `resolved_at` (открытые не удаляются никогда), `kg_pod_events` 90 по
+  `last_seen`, `kg_remediation_events` 365. До этого срока у событий не было
+  вовсе. `purge_events` идёт из `kg_health_retention` после сэмплов.
+
 - **Helm-чарт удалён** (`helm/`, #524). Деплой с мая идёт только через
   `deploy.sh` + манифесты `k8s/` (и `kubectl set image` из сборки TeamCity),
   а чарт разъехался с кластером: в нём не было ни executor-а, ни Postgres,
@@ -98,14 +104,8 @@ All notable changes to this project are documented in this file.
   `helm upgrade` → `kubectl set env` / правка манифестов + `deploy.sh`,
   ownership-ConfigMap создаётся руками из `config/ownership.yaml`, релизный
   чек-лист считает три места вместо четырёх.
-=======
-- **Ретеншен таблиц событий** (#522) — отдельный реестр
-  `EVENT_RETENTION_TARGETS` с полом `MIN_EVENT_RETENTION_DAYS=90`, не 7 дней
-  метрик: `kg_deployments` 180 дней, `kg_alerts` 180 и `kg_incidents` 365 по
-  `resolved_at` (открытые не удаляются никогда), `kg_pod_events` 90 по
-  `last_seen`, `kg_remediation_events` 365. До этого срока у событий не было
-  вовсе. `purge_events` идёт из `kg_health_retention` после сэмплов.
->>>>>>> origin/master
+
+### Зависимости
 
 ### Зависимости
 
