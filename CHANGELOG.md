@@ -4,6 +4,7 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+## [1.0.30] — 2026-10-31 — еженедельная сверка против кластера, kubernetes 37
 ### Зависимости
 
 - **`kubernetes` 36.0.3 → 37.0.1** (закрывает #507). Клиент 37 перегенерирован
