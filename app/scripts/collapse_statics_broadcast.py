@@ -96,7 +96,7 @@ def main(argv: list[str] | None = None) -> int:
             print("dry-run: ничего не изменено (добавь --apply).")
             return 0
 
-        namespaces = [ns for (ns,) in db.execute(_NAMESPACES_SQL, params).all()]
+        namespaces = [str(ns) for (ns,) in db.execute(_NAMESPACES_SQL, params).all()]
         for ns in namespaces:
             ensure_statics_node(db, ns)
         db.commit()
