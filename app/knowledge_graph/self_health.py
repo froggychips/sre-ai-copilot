@@ -120,6 +120,12 @@ _EVENT_RATE_METRICS = frozenset({
 #                 задачи (факт ПРОГОНА), а `column` остаётся информационным.
 #                 Нужно там, где результат задачи не обязан появляться каждый
 #                 тик (см. kg_anomaly_detection_task).
+#: Источник графа → флаг Settings, который его выключает. Выключенный
+#: источник в `check_source_coverage` идёт в `disabled`, а не в `silent`.
+_SOURCE_ENABLED_SETTING: Dict[str, str] = {
+    "nats_subjects_sync": "NATS_SUBJECTS_PARSER_ENABLED",
+}
+
 _SYNC_LAG_TARGETS: Dict[str, Dict[str, Any]] = {
     "kg_topology_sync": {
         # Topology обновляет Service.updated_at каждый час.
@@ -625,13 +631,30 @@ def check_anomaly_signal_health(db: Session) -> CheckResult:
 def check_alerts_resolve_freshness(db: Session) -> CheckResult:
     """Регрессия Wave 1 Track B: «alerts_resolve замёрз».
 
-    Сколько kg_alerts с fired_at < now()-7d AND resolved_at IS NULL.
-    >20 → warn (age-fallback тоже залип).
+    Залипший открытый алерт — тот, который Alertmanager давно НЕ ПРИСЫЛАЕТ,
+    а resolve-sync так и не закрыл: `COALESCE(last_notified_at, fired_at)`
+    старше 7 дней при `resolved_at IS NULL`. `last_notified_at` обновляется
+    на каждую доставку (populator.record_alert_event), а AM шлёт firing
+    повторно каждый repeat_interval — значит у живого алерта она свежая.
+
+    До 31.10.2026 считалось по `fired_at`: алерт, который честно горит три
+    недели (ScrapePoolHasNoTargets ×27 на осиротевших scrape-объектах),
+    выглядел как залипший, и проверка держала warn 28 часов без единого
+    сбоя resolve-sync — то есть мерила возраст алертов, а не работу синка.
+    >20 → warn.
     """
     cutoff = _now() - timedelta(days=7)
+    last_seen = func.coalesce(AlertEvent.last_notified_at, AlertEvent.fired_at)
     stale_open = (
         db.query(func.count(AlertEvent.id))
+        .filter(last_seen < cutoff)
+        .filter(AlertEvent.resolved_at.is_(None))
+        .scalar()
+    ) or 0
+    long_firing = (
+        db.query(func.count(AlertEvent.id))
         .filter(AlertEvent.fired_at < cutoff)
+        .filter(last_seen >= cutoff)
         .filter(AlertEvent.resolved_at.is_(None))
         .scalar()
     ) or 0
@@ -644,7 +667,15 @@ def check_alerts_resolve_freshness(db: Session) -> CheckResult:
     return CheckResult(
         name="alerts_resolve_freshness",
         status=status,
-        detail={"stale_open_alerts": stale_open, "older_than_days": 7, "reason": reason},
+        detail={
+            "stale_open_alerts": stale_open,
+            "older_than_days": 7,
+            "measured_by": "coalesce(last_notified_at, fired_at)",
+            # Открыты >7д, но AM их ещё присылает — живые долгие алерты,
+            # не вина resolve-sync. Видны в detail, статус не поднимают.
+            "long_firing_alerts": long_firing,
+            "reason": reason,
+        },
     )
 
 
@@ -1460,7 +1491,16 @@ def check_source_coverage(db: Session) -> CheckResult:
     # fetched больше нуля, errors ноль, — и без отдельного списка молчал бы
     # ровно в том случае, ради которого заведён.
     cleanup_blocked: Dict[str, Any] = {}
+    # Источник, выключенный флагом, не «молчит» — он и не должен отчитываться.
+    # До 31.10.2026 nats_subjects_sync (NATS_SUBJECTS_PARSER_ENABLED=False в
+    # проде) держал warn по silent бессрочно — тот же класс ложной тревоги,
+    # что чинили в sync_lag через `enabled_setting`.
+    disabled: List[str] = []
     for source in ALL_EDGE_SOURCES:
+        flag = _SOURCE_ENABLED_SETTING.get(source)
+        if flag is not None and not getattr(settings, flag, True):
+            disabled.append(source)
+            continue
         report = get_source_report(source)
         if report is None:
             silent.append(source)
@@ -1496,7 +1536,7 @@ def check_source_coverage(db: Session) -> CheckResult:
         if reason:
             unhealthy[source] = reason
 
-    total = len(ALL_EDGE_SOURCES)
+    total = len(ALL_EDGE_SOURCES) - len(disabled)
     covered = len(reported)
     # Теперь молчание источника ЗНАЧИМО и статус поднимает.
     #
@@ -1536,6 +1576,7 @@ def check_source_coverage(db: Session) -> CheckResult:
             "coverage_pct": round(covered / total * 100, 1) if total else 0.0,
             "silent": sorted(silent),
             "expired": sorted(expired),
+            "disabled": sorted(disabled),
             "unhealthy": unhealthy,
             "cleanup_blocked": cleanup_blocked,
             "reported": reported,

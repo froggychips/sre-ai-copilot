@@ -4,6 +4,18 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+### Исправлено
+
+- **Self-health без ложных warn** (#523). `alerts_resolve_freshness` считал
+  залипшим любой открытый алерт старше недели по `fired_at` — и держал warn
+  28 часов на ScrapePoolHasNoTargets ×27, которые AM честно присылает до сих
+  пор; теперь по `coalesce(last_notified_at, fired_at)`, долгие живые алерты
+  видны отдельно в `long_firing_alerts`. `source_coverage` считал молчащим
+  `nats_subjects_sync`, выключенный флагом `NATS_SUBJECTS_PARSER_ENABLED`;
+  выключенные источники идут в `disabled` и статус не поднимают.
+- **`alertmanager.webhook_unauthenticated` раз в час на процесс, а не на
+  каждый батч** (#523): 359 строк в сутки при трёх настоящих событиях.
+
 ### Инфраструктура
 
 - **Alertmanager: info/none больше не забивают прод-группу** (#517).
