@@ -36,7 +36,7 @@ from datetime import datetime, timedelta, timezone
 from typing import cast, Any, Dict, List, Optional, Set, Tuple
 
 import structlog
-from sqlalchemy import text
+from sqlalchemy import bindparam, text
 from sqlalchemy.orm import Session
 
 from app.config import settings
@@ -374,22 +374,23 @@ async def backup_line(vm: Optional[VMClient], now: datetime) -> ReconLine:
 
 def attribution_line(db: Session, now: datetime) -> ReconLine:
     title = "Карточки без атрибуции"
-    params: Dict[str, Any] = {"since": _since(now), "none": _EXCLUDED_SEVERITY}
-    in_list = ", ".join(f":exp{i}" for i in range(len(_EXPORTER_SERVICES)))
-    params.update({f"exp{i}": name for i, name in enumerate(_EXPORTER_SERVICES)})
+    params: Dict[str, Any] = {
+        "since": _since(now), "none": _EXCLUDED_SEVERITY,
+        "exporters": list(_EXPORTER_SERVICES),
+    }
     try:
-        row = db.execute(text(f"""
+        row = db.execute(text("""
             SELECT
               count(*) AS total,
               sum(CASE WHEN a.service_id IS NULL THEN 1 ELSE 0 END) AS no_service,
               sum(CASE WHEN a.service_id IS NOT NULL
-                        AND (s.synthetic OR s.name IN ({in_list}))
+                        AND (s.synthetic OR s.name IN :exporters)
                        THEN 1 ELSE 0 END) AS exporter
             FROM kg_alerts a
             LEFT JOIN kg_services s ON s.id = a.service_id
             WHERE (a.fired_at >= :since OR a.last_notified_at >= :since)
               AND (a.severity IS NULL OR a.severity != :none)
-        """), params).one()
+        """).bindparams(bindparam("exporters", expanding=True)), params).one()
     except Exception as e:  # noqa: BLE001
         return _unmeasured(title, SourceStatus.FAILED, f"kg_alerts: {type(e).__name__}")
     total = int(row[0] or 0)
