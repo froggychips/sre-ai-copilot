@@ -23,7 +23,7 @@ from sqlalchemy.orm import Session
 from app.knowledge_graph.contract import (UQ_KG_SERVICE_NS_NAME_KIND,
                                           OWNER_SOURCE_TRUST,
                                           owner_source_valid)
-from app.knowledge_graph.schema import (NODE_KIND_SERVICE, AlertEvent,
+from app.knowledge_graph.schema import (NODE_KIND_SERVICE, STATICS_NODE_NAME, AlertEvent,
                                         Deployment, PodEvent, Service,
                                         ServiceEdge)
 
@@ -606,6 +606,22 @@ def _upsert_edge_fallback(
             edge.extras = merged
         db.flush()
     return edge
+
+
+def ensure_statics_node(db: Session, namespace: str) -> Service:
+    """Синтетический узел-якорь сборок статики в namespace (idempotent).
+
+    `node_kind=service`, чтобы ns-уровневые запросы
+    (`recent_deploys_for_namespaces` фильтрует по этому kind) видели его без
+    особых случаев; `synthetic=True`, чтобы health/аномалии/витрины его не
+    считали сервисом (как у ingress-узлов). Владельца у узла нет: статику
+    катят все команды окружения.
+    """
+    return upsert_service(
+        db, namespace, STATICS_NODE_NAME,
+        synthetic=True, node_kind=NODE_KIND_SERVICE,
+        metadata={"statics_anchor": True},
+    )
 
 
 def record_deployment(

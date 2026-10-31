@@ -53,6 +53,16 @@ All notable changes to this project are documented in this file.
 
 ### Изменено
 
+- **Сборки статики — одна строка `kg_deployments` на namespace** (#521).
+  `Wo_StaticsNewCluster_*` (10–15 в день) раскладывались ns-broadcast-ом на
+  все ~665 сервисов окружения: 963 тыс. строк из 1,24 млн при 1487 билдах,
+  у `preprod-kingdom2/bot-service` 1258 «деплоев» за октябрь, в preprod факт
+  `recent_deploy` был found всегда. Теперь строка одна, на синтетическом узле
+  `statics` (`schema.STATICS_NODE_NAME`); `recent_deploys_for` подмешивает её
+  сервисам как ns-свидетельство (INFERRED 0.6, как прежде),
+  `recent_deploys_for_namespaces` видит без правок, stale-класс берёт
+  `last_ns_deploy_at` по всему namespace. Историю схлопывает
+  `app/scripts/collapse_statics_broadcast.py` (`--apply`, затем VACUUM).
 - **Мёртвый код снят** (#519). Модули без единого импортёра: `app/topology/`,
   `app/ingestion/kubernetes_events.py`, `app/agents/critic.py` (его место
   давно занял `fact_critic`), `app/core/intelligence/next_steps.py`,
@@ -63,6 +73,12 @@ All notable changes to this project are documented in this file.
   `cleanup_false_rollouts`, `backfill_team_owner`. Настройки, которые никто
   не читал: `LOG_LEVEL` (и его env в helm-чарте), `KG_SELF_HEALTH_INTERVAL_MINUTES`,
   `OIDC_WELL_KNOWN_URL`, `REPLAY_MODE`, `CHRONIC_DIGEST_INTERVAL_HOURS`.
+- **Ретеншен таблиц событий** (#522) — отдельный реестр
+  `EVENT_RETENTION_TARGETS` с полом `MIN_EVENT_RETENTION_DAYS=90`, не 7 дней
+  метрик: `kg_deployments` 180 дней, `kg_alerts` 180 и `kg_incidents` 365 по
+  `resolved_at` (открытые не удаляются никогда), `kg_pod_events` 90 по
+  `last_seen`, `kg_remediation_events` 365. До этого срока у событий не было
+  вовсе. `purge_events` идёт из `kg_health_retention` после сэмплов.
 
 ### Зависимости
 

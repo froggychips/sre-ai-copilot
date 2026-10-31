@@ -35,6 +35,15 @@ NODE_KIND_WORKLOAD = "workload"  # k8s Deployment / StatefulSet / DaemonSet
 NODE_KIND_INGRESS = "ingress"    # synthetic-узел ingress:<name>
 NODE_KINDS = (NODE_KIND_SERVICE, NODE_KIND_WORKLOAD, NODE_KIND_INGRESS)
 
+#: Имя синтетического узла-якоря сборок статики (по одному на namespace).
+#: Сборки `Wo_StaticsNewCluster_*` катят не сервис, а данные для всего
+#: окружения; до 31.10.2026 каждая раскладывалась ns-broadcast-ом на все
+#: ~665 сервисов preprod — 963 тыс. строк kg_deployments из 1,24 млн при
+#: 1487 билдах. Теперь строка одна на (билд, namespace), на этом узле;
+#: потребители ns-уровня (`recent_deploys_for_namespaces`, stale-класс)
+#: видят её через namespace, per-service путь — через `recent_deploys_for`.
+STATICS_NODE_NAME = "statics"
+
 
 #: Состояния жизненного цикла namespace (колонка kg_namespaces.state).
 #: Семантика и переходы — docs/KG_SCHEMA_CONTRACT.md.
