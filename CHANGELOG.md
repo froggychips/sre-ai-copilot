@@ -117,6 +117,11 @@ All notable changes to this project are documented in this file.
   ownership-ConfigMap создаётся руками из `config/ownership.yaml`, релизный
   чек-лист считает три места вместо четырёх.
 
+- CI: подпись cosign и SBOM на push в master больше не роняют job
+  (`continue-on-error` на установке cosign/syft и генерации SBOM): на
+  k8s-раннере нет `envsubst`, и master краснел после каждого мержа при
+  зелёных тестах; образ для кластера собирается не здесь.
+
 ### Зависимости
 
 - **pip-audit снова зелёный** (#520): `certifi` 2026.4.22 → 2026.10.23
