@@ -6,7 +6,7 @@ All notable changes to this project are documented in this file.
 
 ### Инфраструктура
 
-- **Alertmanager: info/none больше не забивают прод-группу** (трек A, 31.10).
+- **Alertmanager: info/none больше не забивают прод-группу** (#517).
   Корневой receiver `sre-ai-prod` ловил всё, что не прошло matchers:
   severity=info/none (CPUThrottlingHigh ×83, InfoInhibitor ×75,
   RecordingRulesNoData…) и алерты без namespace — группа ~220 при
@@ -16,12 +16,64 @@ All notable changes to this project are documented in this file.
   `max_alerts: 0` на store-ресиверах и 50 на enrich-and-forward. Манифест
   `k8s/vmalertmanagerconfig.yaml` синхронизирован с живым объектом (squad- и
   blackhole-receiver-ов в репо не было, preupdate шёл не туда).
-- **`CopilotSelfHealthWarnStuck` → severity warning**: с info его не постил
-  ни один путь — три проверки висели в warn 28 часов, API писал
+- **`CopilotSelfHealthWarnStuck` → severity warning** (#517): с info его не
+  постил ни один путь — три проверки висели в warn 28 часов, API писал
   `send_not_delivered` каждые 5–10 минут.
 - **Postgres: `shared_buffers=512MB`, `work_mem=16MB`,
-  `effective_cache_size=1536MB`, `pg_stat_statements`** (`k8s/postgres.yaml`):
-  образ работал на дефолтах 128 МБ/4 МБ при БД 5,3 ГБ и лимите 2Gi.
+  `effective_cache_size=1536MB`, `pg_stat_statements`** (#517,
+  `k8s/postgres.yaml`): образ работал на дефолтах 128 МБ/4 МБ при БД 5,3 ГБ
+  и лимите 2Gi. `k8s/postgres-backup.yaml` синхронизирован с живым CronJob
+  (дамп на PVC с retention, S3 опционален; подсказка называла не те ключи
+  секрета).
+- **CI: один прогон pytest вместо двух** (#516). Джоба `test` гоняла весь
+  набор на sqlite с coverage-гейтом, затем поднимала Postgres и гоняла тот же
+  набор ещё раз — вдвое дольше на единственном self-hosted раннере ради
+  одного результата, а `coverage.xml` первого прогона дальше никто не читал.
+  Остался прогон на Postgres; гейт 75% считается на нём (набор там шире:
+  `requires_postgres` не скипается). На уровне workflow — `concurrency` с
+  отменой устаревшего прогона того же ref, у обеих джоб `timeout-minutes: 45`.
+  У `kg-contract-check` снят cron раз в 6 часов: без секрета
+  `KG_READER_DATABASE_URL` шаги молча скипались; вернуть, когда секрет
+  появится.
+- Dockerfile (#519): базовый образ `python:3.11-slim` закреплён по digest
+  (manifest list; обновляет dependabot `docker`), `psycopg2-binary` в слое
+  тяжёлых пакетов поднят до 2.9.13 — версии из `requirements.txt`, иначе слой
+  переустанавливался следующим `pip install`.
+
+### Наблюдаемость
+
+- **Тихие логи** (#518). Celery больше не перехватывает stdout
+  (`worker_redirect_stdouts=False`): structlog-строки уровня info уезжали в
+  `kubectl logs` как `WARNING/ForkPoolWorker-N` с двумя таймстемпами —
+  36 тыс. «варнингов» в сутки при нуле реальных ошибок. `kg.service_upserted`
+  переведён в debug (одна строка на каждый из ~7500 сервисов каждый час).
+  Access-лог uvicorn по `/healthz` и `/readyz` со статусом < 500 глушится
+  фильтром `HealthProbeAccessFilter` — 34,5 тыс. строк в сутки от kubelet
+  при ~300 настоящих запросах; 5xx на probe остаются.
+
+### Изменено
+
+- **Мёртвый код снят** (#519). Модули без единого импортёра: `app/topology/`,
+  `app/ingestion/kubernetes_events.py`, `app/agents/critic.py` (его место
+  давно занял `fact_critic`), `app/core/intelligence/next_steps.py`,
+  `temporal_diff.py`, `blast_radius.py`. Модули, которых касались только
+  их собственные тесты: `app/rca/explainer.py`, `app/agents/hypothesis.py`
+  (пайплайн работает на `MultiHypothesisAgent`) — вместе с тестами.
+  Одноразовые скрипты, чья работа выполнена: `backfill_existing_sha`,
+  `cleanup_false_rollouts`, `backfill_team_owner`. Настройки, которые никто
+  не читал: `LOG_LEVEL` (и его env в helm-чарте), `KG_SELF_HEALTH_INTERVAL_MINUTES`,
+  `OIDC_WELL_KNOWN_URL`, `REPLAY_MODE`, `CHRONIC_DIGEST_INTERVAL_HOURS`.
+
+### Зависимости
+
+- **pip-audit снова зелёный** (#520): `certifi` 2026.4.22 → 2026.10.23
+  (PYSEC-2026-4320), стек OpenTelemetry 1.41.1/0.62b1 → 1.45.2/0.66b2
+  (CVE-2026-114603 в `opentelemetry-api`; с 1.45 появились
+  `opentelemetry-exporter-otlp-common` и `opentelemetry-exporter-http-transport`).
+  Остальные пины не тронуты.
+- `tenacity` убран из `requirements.in`/`requirements.txt` (#519): не
+  импортируется и никому из установленных пакетов не нужен.
+  `httpx2`/`httpcore2` остаются — их требует `anthropic` 1.11.0.
 
 ## [1.0.27] — 2026-10-16 — история медика при переносе алертов, замер синка
 
