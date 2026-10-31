@@ -15,7 +15,7 @@ from sqlalchemy.orm import Session
 
 from app.knowledge_graph.confidence import (confidence_label,
                                             confidence_score)
-from app.knowledge_graph.schema import (NODE_KIND_SERVICE, NODE_KIND_WORKLOAD,
+from app.knowledge_graph.schema import (NODE_KIND_SERVICE, STATICS_NODE_NAME, NODE_KIND_WORKLOAD,
                                         AlertEvent, Deployment,
                                         IngressObservation, LogObservation,
                                         PodEvent, Service, ServiceEdge,
@@ -131,6 +131,29 @@ def recent_deploys_for(
         .order_by(Deployment.started_at.desc())
         .all()
     )
+    # Сборки статики лежат одной строкой на узле `statics` namespace
+    # (tasks._tc_deploys_to_kg_logic), а не на каждом сервисе. Для сервиса
+    # это то же ns-свидетельство, что раньше приходило broadcast-ом:
+    # `namespace_scope=True` в extras → attribution_scope "namespace" →
+    # RecentDeployRule даёт INFERRED 0.6, как и прежде.
+    if svc.name != STATICS_NODE_NAME:
+        statics_rows = (
+            db.query(Deployment)
+            .join(Service, Deployment.service_id == Service.id)
+            .filter(
+                Service.namespace == namespace,
+                Service.name == STATICS_NODE_NAME,
+                Service.node_kind == NODE_KIND_SERVICE,
+                Deployment.started_at >= ensure_naive(since),
+                Deployment.started_at <= ensure_naive(before_aware),
+            )
+            .all()
+        )
+        if statics_rows:
+            rows = sorted(
+                list(rows) + list(statics_rows),
+                key=lambda d: d.started_at, reverse=True,
+            )
     out: List[Dict[str, Any]] = []
     for d in rows:
         delta_min = int(
