@@ -25,6 +25,8 @@ _REPORT_TASKS = {
     "daily-stats-digest",
     "team-daily-digest",
     "chronic-alerts-digest",
+    # Раз в неделю: пропуск = отчёта нет целую неделю.
+    "weekly-reconciliation",
 }
 
 

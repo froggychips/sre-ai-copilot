@@ -3,6 +3,7 @@
 All notable changes to this project are documented in this file.
 
 ## [Unreleased]
+
 ### Зависимости
 
 - **`kubernetes` 36.0.3 → 37.0.1** (закрывает #507). Клиент 37 перегенерирован
@@ -20,6 +21,10 @@ All notable changes to this project are documented in this file.
   проверяются явно, без `type: ignore`. Транзитивно: `typing-extensions`
   4.16.0, `pydantic` 2.13.5 / `pydantic-core` 2.46.5, `durationpy` 0.11,
   новый `aiohttp-retry` 2.9.1; остальные пины не тронуты.
+
+### Наблюдаемость
+
+- **Еженедельная сверка копилота с кластером** (`weekly_reconciliation`, пн 06:00 UTC, канал #stats, флаг `WEEKLY_RECONCILIATION_ENABLED`, по умолчанию включён). Self-health меряет копилот его же данными; сверка смотрит наружу. Пять строк с числом и пометкой ок/плохо: покрытие алертов — пары (alertname, namespace) из `ALERTS` в VictoriaMetrics против `kg_alerts` за 7 дней, severity=none исключён с обеих сторон (плохо < 90%); рост таблиц — топ-5 по `pg_total_relation_size` против прошлой недели в Redis `stats:reconciliation:last` (плохо: таблица > +30% или БД > 5 ГБ); бэкап — возраст последнего успешного `postgres-backup` по `kube_cronjob_status_last_successful_time`, без S3-ключей в копилоте (плохо > 26 ч); карточки без атрибуции — доля алертов без сервиса или на экспортере/synthetic (плохо > 30%); подтверждённые починки — verified-попытки executor-а + `fixed` у медика (плохо, если 0). Недоступный источник даёт «не измерено: <причина>» по контракту `SourceStatus`, а не ноль. Алерт без сервиса теперь хранит `raw.namespace` — без него покрытие такого алерта не сверить. Первый живой замер 31.10: покрытие 102 из 328 пар (31%; ещё 184 совпали только по имени у строк без namespace), атрибуция 224 из 446 (50%), подтверждённых починок 0 (медик 39 прогонов), бэкап 1,8 ч, БД 3,7 ГБ.
 
 ## [1.0.29] — 2026-10-31 — probe-фильтр access-лога реально ставится
 ### Исправлено
