@@ -1118,14 +1118,19 @@ def kg_health_retention_task():
     Раз в сутки и ночью: удаление батчами всё равно нагружает автовакуум, а
     срочности в нём никакой.
     """
-    from app.knowledge_graph.health_retention import purge_observations
+    from app.knowledge_graph.health_retention import (purge_events,
+                                                      purge_observations)
 
     db = SessionLocal()
     try:
-        return purge_observations(
+        result = purge_observations(
             db,
             overrides={"kg_service_health": settings.KG_HEALTH_RETENTION_DAYS},
         )
+        # События — свой реестр и свой пол (90 дней), см. EVENT_RETENTION_TARGETS:
+        # до 31.10.2026 kg_deployments росла без срока до 1,24 млн строк.
+        result["events"] = purge_events(db)
+        return result
     except Exception as e:
         logger.warning("kg_health_retention.failed: %s", e)
         db.rollback()
