@@ -258,6 +258,11 @@ class Settings(BaseSettings):
     # Default False — включается отдельно после канареечного прогона,
     # чтобы `/store`-route не получил Discord-побочку случайно.
     DISCORD_ENRICH_ENABLED: bool = False
+    # Повтор ГОРЯЩЕГО алерта от Alertmanager (repeat_interval, 4h) не постит
+    # карточку: L2 видел в нём «quiet >2h» и слал 🌀 RESURFACED, хотя алерт
+    # не гас. Видимость таких — секция «горят непрерывно» chronic-дайджеста.
+    # False — поведение 1.0.30 (повтор = resurface).
+    ALERT_SUPPRESS_AM_REPEATS: bool = True
     # Окно поиска recent_deploys/incidents_on (минуты).
     ENRICH_DEPLOY_LOOKBACK_MIN: int = 60
     ENRICH_RECURRENCE_LOOKBACK_MIN: int = 1440  # 24 ч
@@ -674,6 +679,14 @@ class Settings(BaseSettings):
         None,
         description="Discord channel ID для incident-сообщений с buttons (через bot API)",
     )
+    # Зелёная карточка «✅ resolved» — только за эпизод не короче этого
+    # (минуты). За неделю 154 из 411 сообщений канала были resolved, и
+    # большинство — от коротких флапов. 0 — постить на каждый resolve (как
+    # было). Длительность неизвестна — постим: потерять конец долгого
+    # инцидента хуже лишней строки.
+    DISCORD_RESOLVED_NOTICE_MIN_MINUTES: int = Field(
+        30, description="Min episode duration (min) for a resolved notice; 0 disables the filter"
+    )
     # Anti-replay: окно свежести X-Signature-Timestamp у Discord interactions.
     # Подпись Ed25519 валидна вечно — без окна перехваченный apply/approve-клик
     # можно переиграть и повторно запустить kubectl. Discord рекомендует ±5 мин.
@@ -983,6 +996,25 @@ class Settings(BaseSettings):
     # реестре один v2-playbook, включение сузит executor почти до нуля.
     REMEDIATION_PLAYBOOK_BINDING_ENABLED: bool = Field(
         False, description="Require mutating ExecutionIntent to reference a matching v2 playbook"
+    )
+
+    # Детерминированный мост правила → playbook → кнопка (app/remediation/
+    # bridge.py). Работает на прод-пути алертов (/store и
+    # /enrich-and-forward) без LLM: факты правил → match_playbooks → intent
+    # из plan.steps → policy. approve → карточка с кнопками в канал
+    # DISCORD_INCIDENT_CHANNEL_ID (сквадам — узкое исключение из «в канал не
+    # постим»), block → строка в обычной карточке. Default False: раскатка —
+    # отдельное решение, отдельно от REMEDIATION_PLAYBOOK_BINDING_ENABLED
+    # (LLM-путь). Кнопка исполняет только при EXECUTOR_ENABLED +
+    # EXECUTOR_APPROVAL_ENABLED и клике из DISCORD_APPROVERS_USER_IDS.
+    REMEDIATION_BRIDGE_ENABLED: bool = Field(
+        False, description="Deterministic rules→playbook→approve-card bridge on the prod alert path"
+    )
+    # Окно, в течение которого повтор того же (playbook, uid цели,
+    # incarnation) не порождает новую карточку: squad crashloop
+    # пере-шлётся каждые repeat_interval.
+    REMEDIATION_BRIDGE_DEDUP_SECONDS: int = Field(
+        6 * 3600, description="Dedup window (sec) for bridge proposals per (playbook, target uid, incarnation)"
     )
 
     # Запись об одобрении в kg_action_approvals не имела привязки ко времени:

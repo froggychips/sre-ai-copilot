@@ -6,6 +6,15 @@
       Если ≥3 повтора за 6h-окно И last_fire <2h назад → SUPPRESS_CHRONIC,
       не шлём embed (только в KG store). Quiet >2h → SEND_RESURFACED.
 
+  L2a (AM repeat) — quiet >2h бывает и у алерта, который НЕ гас: AM
+      повторяет горящую группу каждые repeat_interval (4h), и раньше такой
+      повтор приходил в канал карточкой «🌀 RESURFACED». Теперь повтор
+      отличаем от возврата по самому эпизоду: строка kg_alerts по fingerprint
+      открыта (resolved_at IS NULL), и эпизод (kg fired_at и startsAt из AM)
+      начался ДО прошлого раза, когда мы видели этот ключ, → SUPPRESS_REPEAT.
+      Возврат после resolve даёт новый startsAt (а populate сдвигает fired_at
+      резолвнутой строки на новый) — он по-прежнему SEND_RESURFACED.
+
   L4 (rollout-noise silent) — для KubeDeploymentGenerationMismatch /
       KubeReplicaSetMismatch проверяем: предыдущий fire того же ключа
       резолвнулся за <10 мин? → silent, считаем что это rollout transient,
@@ -24,14 +33,16 @@ from __future__ import annotations
 import asyncio
 from datetime import datetime, timedelta, timezone
 from enum import Enum
-from typing import Optional
+from typing import Optional, Sequence, Tuple
 
 import structlog
 from redis import asyncio as aioredis
 from sqlalchemy.orm import Session
 
 from app.config import settings
+from app.core.timeutil import parse_ts
 from app.knowledge_graph.queries import incidents_on
+from app.metrics import ALERTS_SUPPRESSED
 
 log = structlog.get_logger()
 
@@ -89,6 +100,52 @@ class Decision(str, Enum):
     SUPPRESS_CHRONIC = "suppress_chronic"  # уже >=3 за 6h, last <2h назад
     SUPPRESS_ROLLOUT = "suppress_rollout"  # rollout transient, не настоящий
     SEND_NO_DEDUP = "send_no_dedup"        # service пустой / fail-open
+    SUPPRESS_REPEAT = "suppress_repeat"    # AM repeat_interval горящего алерта
+
+
+# (fingerprint, startsAt из AM) каждого алерта группы.
+Episode = Tuple[str, Optional[str]]
+
+
+def _as_utc(ts: datetime) -> datetime:
+    """kg_alerts хранит naive-UTC; Incident.starts_at парсится в aware."""
+    return ts.replace(tzinfo=timezone.utc) if ts.tzinfo is None else ts
+
+
+def _all_continuous(db: Session, episodes: Sequence[Episode], seen_before: datetime) -> bool:
+    """Все алерты группы горят непрерывно с момента, когда ключ видели прошлый раз.
+
+    Для каждого fingerprint нужна открытая строка kg_alerts, у которой эпизод
+    (fired_at) начался не позже `seen_before`, и startsAt из AM тоже не позже.
+    Двойная проверка закрывает пропущенный resolve: resolve-sync ещё не успел
+    закрыть строку, а AM уже прислал новый эпизод с новым startsAt — это
+    возврат, а не повтор. Чего-то не хватает (нет строки, нет fingerprint-а,
+    битое время) — False: при сомнении карточку шлём.
+
+    Синхронный SQL — caller уводит его в thread pool.
+    """
+    from app.knowledge_graph.schema import AlertEvent
+
+    fps = [fp for fp, _ in episodes if fp]
+    if not fps or len(fps) != len(episodes):
+        return False
+    for _, starts_at in episodes:
+        st = parse_ts(starts_at) if starts_at else None
+        if st is None or _as_utc(st) > seen_before:
+            return False
+    rows = (
+        db.query(AlertEvent.fingerprint, AlertEvent.fired_at, AlertEvent.resolved_at)
+        .filter(AlertEvent.fingerprint.in_(fps))
+        .all()
+    )
+    by_fp = {str(r.fingerprint): r for r in rows}
+    for fp in fps:
+        row = by_fp.get(fp)
+        if row is None or row.resolved_at is not None or row.fired_at is None:
+            return False
+        if _as_utc(row.fired_at) > seen_before:
+            return False
+    return True
 
 
 async def decide_send(
@@ -98,6 +155,7 @@ async def decide_send(
     severity: str,
     db: Session,
     fire_at: Optional[datetime] = None,
+    episodes: Optional[Sequence[Episode]] = None,
 ) -> Decision:
     """Главная точка дедупа — вызывается из enrich-and-forward.
 
@@ -115,6 +173,9 @@ async def decide_send(
         severity: critical/warning/info (для будущего бранчинга)
         db: SQLAlchemy session — нужно для L4 проверки в kg_alerts
         fire_at: timestamp текущего fire-а (default now-UTC)
+        episodes: (fingerprint, startsAt) каждого алерта группы — по ним
+            повтор горящего алерта (SUPPRESS_REPEAT) отличается от возврата.
+            None — проверка повтора выключена (поведение 1.0.30).
     """
     if not service:
         # Без service-id ключ не построить — fail-open.
@@ -177,6 +238,50 @@ async def decide_send(
 
         if last is not None:
             delta = now_unix - last
+            if (
+                delta > CHRONIC_QUIET_RESET_SECONDS
+                and episodes
+                and settings.ALERT_SUPPRESS_AM_REPEATS
+            ):
+                # До claim-а resurface-маркера: повтор горящего алерта 🌀 не
+                # получает. Проверка дорогая (SQL), но сюда попадаем раз в
+                # repeat_interval на ключ.
+                try:
+                    seen_before = datetime.fromtimestamp(last, tz=timezone.utc)
+                    continuous = await asyncio.to_thread(
+                        _all_continuous, db, episodes, seen_before,
+                    )
+                except Exception as e:
+                    log.warning("alert_dedup.repeat_check_failed", error=str(e))
+                    continuous = False
+                if continuous and severity.lower() == "critical":
+                    # Critical-повтор остаётся напоминанием в канале, как до
+                    # фикса, но без ложной пометки 🌀: алерт не возвращался.
+                    # Окно якорим как resurface (cnt=1): rollback_undelivered
+                    # на недоставке снимет ровно этот инкремент.
+                    await client.set(key_cnt, 1, ex=CHRONIC_WINDOW_SECONDS)
+                    await client.set(key_last, now_unix, ex=CHRONIC_WINDOW_SECONDS)
+                    log.info(
+                        "alert_dedup.repeat_critical_reminder",
+                        alertname=alertname, service=service,
+                        fingerprints=[fp for fp, _ in episodes],
+                        quiet_seconds=delta,
+                    )
+                    return Decision.SEND
+                if continuous:
+                    # «Последний раз видели» сдвигаем: следующий AM-повтор
+                    # снова попадёт сюда же. Счётчик хроники не трогаем —
+                    # карточки не было. last_notified_at в kg_alerts уже
+                    # обновил populate_from_incident (как в /store).
+                    await client.set(key_last, now_unix, ex=CHRONIC_WINDOW_SECONDS)
+                    ALERTS_SUPPRESSED.labels(reason="repeat", alertname=alertname).inc()
+                    log.info(
+                        "alert_dedup.suppress_repeat",
+                        alertname=alertname, service=service,
+                        fingerprints=[fp for fp, _ in episodes],
+                        quiet_seconds=delta,
+                    )
+                    return Decision.SUPPRESS_REPEAT
             if delta > CHRONIC_QUIET_RESET_SECONDS:
                 # >2h тишины — это resurface. Право на 🌀-embed выдаётся
                 # АТОМАРНО (SET NX на маркер): прежний GET→check→SET

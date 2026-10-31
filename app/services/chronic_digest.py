@@ -9,12 +9,18 @@ DiscordService.send_stats_report — то есть в существующий #
 но мы всё равно должны знать «какие сервисы постоянно крашатся».
 Этот digest и есть видимость без spam'а.
 
+Вторая секция — «горят непрерывно»: открытые строки kg_alerts, чей эпизод
+идёт дольше STUCK_ALERTS_MIN_DURATION_HOURS. Один непрерывно горящий алерт —
+это ОДНА строка (fingerprint), в счёт fires выше он не попадает, а его
+повторы от Alertmanager (repeat_interval) копилот в #infra-error больше не
+постит (SUPPRESS_REPEAT). Без этой секции такие алерты пропали бы из виду.
+
 Не использует LLM. Простая агрегация SQL → markdown.
 """
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 import structlog
 from sqlalchemy import func
@@ -63,6 +69,79 @@ def _aggregate(db: Session, window_hours: int, min_fires: int) -> List[Dict[str,
     ]
 
 
+# Сколько строк «горят непрерывно» показываем (остальное — счётчиком).
+CONTINUOUS_SHOW_ROWS = 15
+# Открытая строка, по которой AM не присылал ничего дольше этого окна, —
+# скорее фантом, недобитый resolve-sync-ом, чем горящий алерт: AM повторяет
+# живую группу каждые 4 ч.
+CONTINUOUS_SEEN_WITHIN_HOURS = 12
+
+
+def _continuous(db: Session, min_hours: int) -> List[Dict[str, Any]]:
+    """Открытые алерты (resolved_at IS NULL), горящие дольше min_hours.
+
+    LEFT JOIN на kg_services: нодовые/кластерные алерты (TooManyLogs,
+    KubeVersionMismatch) сервиса не имеют, но горят ровно так же.
+    """
+    now_naive = datetime.now(timezone.utc).replace(tzinfo=None)
+    rows = (
+        db.query(
+            AlertEvent.alertname,
+            AlertEvent.severity,
+            AlertEvent.fired_at,
+            AlertEvent.raw,
+            Service.namespace.label("ns"),
+            Service.name.label("svc"),
+        )
+        .outerjoin(Service, Service.id == AlertEvent.service_id)
+        .filter(AlertEvent.resolved_at.is_(None))
+        .filter(AlertEvent.fired_at <= now_naive - timedelta(hours=min_hours))
+        .filter(
+            AlertEvent.last_notified_at
+            >= now_naive - timedelta(hours=CONTINUOUS_SEEN_WITHIN_HOURS)
+        )
+        .order_by(AlertEvent.fired_at.asc())
+        .all()
+    )
+    out: List[Dict[str, Any]] = []
+    for r in rows:
+        raw = r.raw if isinstance(r.raw, dict) else {}
+        if r.ns and r.svc:
+            where = f"{r.ns}/{r.svc}"
+        else:
+            where = str(raw.get("node") or raw.get("namespace") or "—")
+        out.append({
+            "alertname": str(r.alertname),
+            "severity": str(r.severity) if r.severity else None,
+            "where": where,
+            "fired_at": r.fired_at,
+        })
+    return out
+
+
+def _format_continuous(rows: List[Dict[str, Any]], min_hours: int) -> str:
+    if not rows:
+        return ""
+    now = datetime.now(timezone.utc)
+    lines = [
+        f"**🔥 Горят непрерывно > {min_hours} ч** (открыты в KG, повторы "
+        "Alertmanager-а в #infra-error не постятся):",
+        "",
+    ]
+    for r in rows[:CONTINUOUS_SHOW_ROWS]:
+        fired: Optional[datetime] = r["fired_at"]
+        hours = 0
+        if fired is not None:
+            if fired.tzinfo is None:
+                fired = fired.replace(tzinfo=timezone.utc)
+            hours = int((now - fired).total_seconds() // 3600)
+        sev = f" · {r['severity']}" if r.get("severity") else ""
+        lines.append(f"• `{r['alertname']}` · `{r['where']}`{sev} · горит {hours} ч")
+    if len(rows) > CONTINUOUS_SHOW_ROWS:
+        lines.append(f"_(+{len(rows) - CONTINUOUS_SHOW_ROWS} ещё)_")
+    return "\n".join(lines)
+
+
 def _format(
     rows: List[Dict[str, Any]],
     window_hours: int,
@@ -108,15 +187,21 @@ async def send_chronic_digest(db: Session) -> Dict[str, Any]:
         window_hours=settings.CHRONIC_DIGEST_WINDOW_HOURS,
         min_fires=settings.CHRONIC_DIGEST_MIN_FIRES,
     )
-    if not rows:
+    min_hours = int(settings.STUCK_ALERTS_MIN_DURATION_HOURS)
+    continuous = _continuous(db, min_hours)
+    if not rows and not continuous:
         log.info("chronic_digest.empty")
-        return {"status": "empty", "rows": 0}
+        return {"status": "empty", "rows": 0, "continuous": 0}
 
-    content = _format(
-        rows,
-        settings.CHRONIC_DIGEST_WINDOW_HOURS,
-        min_fires=settings.CHRONIC_DIGEST_MIN_FIRES,
-    )
+    parts = [
+        _format(
+            rows,
+            settings.CHRONIC_DIGEST_WINDOW_HOURS,
+            min_fires=settings.CHRONIC_DIGEST_MIN_FIRES,
+        ),
+        _format_continuous(continuous, min_hours),
+    ]
+    content = "\n\n".join(p for p in parts if p)
     from app.services.discord_service import DiscordService
     await DiscordService().send_stats_report(content)
-    return {"status": "sent", "rows": len(rows)}
+    return {"status": "sent", "rows": len(rows), "continuous": len(continuous)}

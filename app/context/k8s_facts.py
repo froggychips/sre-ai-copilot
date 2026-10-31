@@ -55,6 +55,22 @@ class K8sSnapshot:
     error: Optional[str] = None
 
 
+def _has_bad_waiting(container_statuses: Any) -> bool:
+    """Контейнер пода ждёт не штатно (CrashLoopBackOff, ImagePull*, ...).
+
+    Под в CrashLoopBackOff остаётся в phase=Running: kubelet перезапускает
+    контейнер, а не под. Фильтр «phase не Running/Succeeded» такой под
+    пропускал целиком — без terminated-state (exit_code) и логов, хотя это
+    ровно тот под, ради которого пришёл KubePodCrashLooping.
+    """
+    for cs in container_statuses or []:
+        waiting = getattr(getattr(cs, "state", None), "waiting", None)
+        reason = getattr(waiting, "reason", None)
+        if isinstance(reason, str) and reason not in _BENIGN_WAITING:
+            return True
+    return False
+
+
 class K8sFacts:
     """Собирает верифицированные факты из кластера для Critic-агента."""
 
@@ -110,7 +126,10 @@ class K8sFacts:
                 if p.metadata is None or not p.metadata.name or p.status is None:
                     continue
                 p_name: str = p.metadata.name
-                if (p.status.phase or "") not in ("Running", "Succeeded"):
+                if (
+                    (p.status.phase or "") not in ("Running", "Succeeded")
+                    or _has_bad_waiting(p.status.container_statuses)
+                ):
                     restarts = sum(
                         (cs.restart_count or 0 for cs in (p.status.container_statuses or [])),
                         0,
