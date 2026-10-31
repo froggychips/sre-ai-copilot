@@ -236,10 +236,20 @@ def _live(uid: str = "uid-1") -> TargetSnapshot:
                           name="town-service", uid=uid, replicas_desired=1)
 
 
-async def _run(db, ctx, *, send=None, live=None, dry_status="dry_run_ok"):
+def _run(db, ctx, *, send=None, live=None, dry_status="dry_run_ok", card_key=None):
+    """Мост через Celery-задачу `remediation_bridge`, как в проде.
+
+    Задача получает сериализованный Incident, открывает свою сессию
+    (подменяем на тестовую) и обогащает алерт сама (подменяем на готовый ctx).
+    """
+    from app.workers.tasks import remediation_bridge_task
+
     send = send or AsyncMock(return_value={"id": "m-1", "channel_id": "c-1"})
     facts = _facts(ctx)
     with patch.object(bridge, "collect_facts", AsyncMock(return_value=facts)), \
+         patch("app.database.SessionLocal", return_value=db), \
+         patch("app.services.alert_enrichment.enrich_alert_async",
+               AsyncMock(return_value=ctx)), \
          patch("app.remediation.verification.snapshot_target",
                return_value=live or _live()), \
          patch.object(bridge, "_dry_run",
@@ -247,18 +257,19 @@ async def _run(db, ctx, *, send=None, live=None, dry_status="dry_run_ok"):
                                     "dry_run_at": datetime.now().isoformat()}), \
          patch("app.services.discord_service.DiscordService.send_remediation_proposal",
                send):
-        outcomes = await bridge.run_bridge(db, ctx)
+        outcomes = remediation_bridge_task(
+            ctx.incident.model_dump(mode="json"), card_key=card_key,
+        )
     return outcomes, send
 
 
-@pytest.mark.asyncio
-async def test_squad_match_posts_card_with_buttons(db, bridge_on, fake_redis):
+def test_squad_match_posts_card_with_buttons(db, bridge_on, fake_redis):
     from app.database import IncidentRecord
     from app.remediation.models import RemediationDecision
     from app.services.intent_signature import compute_signature
     from app.core.execution_dsl import ExecutionIntent
 
-    outcomes, send = await _run(db, _ctx())
+    outcomes, send = _run(db, _ctx())
     assert outcomes == [{"playbook": _PLAYBOOK, "mode": "approve",
                          "outcome": bridge.OUTCOME_PROPOSED}]
     send.assert_awaited_once()
@@ -284,10 +295,9 @@ async def test_squad_match_posts_card_with_buttons(db, bridge_on, fake_redis):
     assert decision.target_ref["uid"] == "uid-1"
 
 
-@pytest.mark.asyncio
-async def test_prod_block_adds_card_line_without_buttons(db, bridge_on, fake_redis):
+def test_prod_block_adds_card_line_without_buttons(db, bridge_on, fake_redis):
     ctx = _ctx(namespace="prod-kingdom5")
-    outcomes, send = await _run(db, ctx)
+    outcomes, send = _run(db, ctx)
     assert outcomes[0]["outcome"] == bridge.OUTCOME_BLOCKED
     send.assert_not_awaited()
     assert ctx.extras["remediation_lines"] == [
@@ -338,27 +348,25 @@ async def test_enriched_card_has_no_remediation_field_without_bridge():
     assert "Remediation" not in names
 
 
-@pytest.mark.asyncio
-async def test_repeat_within_window_is_silent(db, bridge_on, fake_redis):
-    first, send1 = await _run(db, _ctx(fp="fp-a"))
+def test_repeat_within_window_is_silent(db, bridge_on, fake_redis):
+    first, send1 = _run(db, _ctx(fp="fp-a"))
     # Новый батч того же алерта (AM пере-шлёт через repeat_interval), даже
     # с другим fingerprint-ом — та же цель (uid) и тот же playbook.
-    second, send2 = await _run(db, _ctx(fp="fp-b"))
+    second, send2 = _run(db, _ctx(fp="fp-b"))
     assert first[0]["outcome"] == bridge.OUTCOME_PROPOSED
     assert second[0]["outcome"] == bridge.OUTCOME_DEDUPLICATED
     send2.assert_not_awaited()
     # Пересозданная цель (другой uid) — новое предложение.
-    third, send3 = await _run(db, _ctx(fp="fp-c"), live=_live(uid="uid-2"))
+    third, send3 = _run(db, _ctx(fp="fp-c"), live=_live(uid="uid-2"))
     assert third[0]["outcome"] == bridge.OUTCOME_PROPOSED
     send3.assert_awaited_once()
 
 
-@pytest.mark.asyncio
-async def test_dedup_falls_back_to_decisions_without_redis(db, bridge_on, monkeypatch):
+def test_dedup_falls_back_to_decisions_without_redis(db, bridge_on, monkeypatch):
     from app.remediation.models import RemediationDecision
     monkeypatch.setattr(bridge, "_redis", lambda: None)
-    first, _ = await _run(db, _ctx(fp="fp-a"))
-    second, send2 = await _run(db, _ctx(fp="fp-b"))
+    first, _ = _run(db, _ctx(fp="fp-a"))
+    second, send2 = _run(db, _ctx(fp="fp-b"))
     assert first[0]["outcome"] == bridge.OUTCOME_PROPOSED
     assert second[0]["outcome"] == bridge.OUTCOME_DEDUPLICATED
     send2.assert_not_awaited()
@@ -366,36 +374,33 @@ async def test_dedup_falls_back_to_decisions_without_redis(db, bridge_on, monkey
     for row in db.query(RemediationDecision).all():
         row.created_at = datetime.utcnow() - timedelta(hours=7)
     db.commit()
-    third, send3 = await _run(db, _ctx(fp="fp-c"))
+    third, send3 = _run(db, _ctx(fp="fp-c"))
     assert third[0]["outcome"] == bridge.OUTCOME_PROPOSED
     send3.assert_awaited_once()
 
 
 @pytest.mark.parametrize("redis_up", [True, False])
-@pytest.mark.asyncio
-async def test_failed_post_releases_claim(db, bridge_on, fake_redis, monkeypatch, redis_up):
+def test_failed_post_releases_claim(db, bridge_on, fake_redis, monkeypatch, redis_up):
     from app.database import IncidentRecord
     if not redis_up:
         monkeypatch.setattr(bridge, "_redis", lambda: None)
-    first, _ = await _run(db, _ctx(fp="fp-a"), send=AsyncMock(return_value=None))
+    first, _ = _run(db, _ctx(fp="fp-a"), send=AsyncMock(return_value=None))
     assert db.query(IncidentRecord).count() == 0
     assert first[0]["outcome"] == bridge.OUTCOME_POST_FAILED
-    second, send2 = await _run(db, _ctx(fp="fp-b"))
+    second, send2 = _run(db, _ctx(fp="fp-b"))
     assert second[0]["outcome"] == bridge.OUTCOME_PROPOSED
     send2.assert_awaited_once()
 
 
-@pytest.mark.asyncio
-async def test_failed_dry_run_posts_nothing(db, bridge_on, fake_redis):
-    outcomes, send = await _run(db, _ctx(), dry_status="dry_run_failed")
+def test_failed_dry_run_posts_nothing(db, bridge_on, fake_redis):
+    outcomes, send = _run(db, _ctx(), dry_status="dry_run_failed")
     assert outcomes[0]["outcome"] == bridge.OUTCOME_DRY_RUN_FAILED
     send.assert_not_awaited()
 
 
-@pytest.mark.asyncio
-async def test_no_card_without_executor_flags(db, bridge_on, fake_redis, monkeypatch):
+def test_no_card_without_executor_flags(db, bridge_on, fake_redis, monkeypatch):
     monkeypatch.setattr(settings, "EXECUTOR_APPROVAL_ENABLED", False)
-    outcomes, send = await _run(db, _ctx())
+    outcomes, send = _run(db, _ctx())
     assert outcomes[0]["outcome"] == bridge.OUTCOME_EXECUTOR_DISABLED
     send.assert_not_awaited()
 
@@ -411,33 +416,321 @@ async def test_flag_off_bridge_is_inert(db, monkeypatch):
     assert bridge.wants_bridge({"alertname": "KubePodCrashLooping"}) is False
 
 
-@pytest.mark.asyncio
-async def test_store_endpoint_schedules_bridge_only_with_flag(monkeypatch):
-    from app.api import webhooks
-    from app.models.incident import AlertManagerWebhook
+# ── API только ставит задачу: /store и /enrich-and-forward ───────────────
 
-    payload = AlertManagerWebhook.model_validate({
-        "version": "4", "receiver": "sre-ai-info", "status": "firing", "groupKey": "g",
-        "alerts": [{
-            "status": "firing",
-            "labels": {"alertname": "KubePodCrashLooping", "namespace": "squad-7-k5",
-                       "pod": "town-service-6c6cd4df-8hx9c", "severity": "warning"},
-            "annotations": {}, "startsAt": "2026-10-30T10:00:00Z",
-            "fingerprint": "abc",
-        }],
+class _FakeAsyncRedis:
+    def __init__(self) -> None:
+        self.store: dict = {}
+        self.ttl: dict = {}
+
+    async def set(self, key, value, nx=False, ex=None):
+        if nx and key in self.store:
+            return None
+        self.store[key] = value
+        self.ttl[key] = ex
+        return True
+
+    async def delete(self, key):
+        self.store.pop(key, None)
+
+
+def _am_alert(pod: str, fp: str, namespace: str = "squad-7-k5",
+              alertname: str = "KubePodCrashLooping", severity: str = "warning") -> dict:
+    return {
+        "status": "firing",
+        "labels": {"alertname": alertname, "namespace": namespace, "pod": pod,
+                   "service": "town-service", "severity": severity},
+        "annotations": {}, "startsAt": "2026-10-30T10:00:00Z", "fingerprint": fp,
+    }
+
+
+def _am_payload(alerts: list):
+    from app.models.incident import AlertManagerWebhook
+    return AlertManagerWebhook.model_validate({
+        "version": "4", "receiver": "sre-ai-info", "status": "firing",
+        "groupKey": "g", "alerts": alerts,
     })
-    scheduled: list = []
-    with patch("app.knowledge_graph.auto_populator.populate_from_incident",
-               return_value={}), \
-         patch.object(bridge, "schedule_bridge_for_incident",
-                      side_effect=lambda inc: scheduled.append(inc)):
+
+
+@pytest.fixture
+def dispatch(monkeypatch):
+    """Постановка моста: async-Redis в памяти + перехват apply_async."""
+    from app.remediation import bridge_dispatch
+    r = _FakeAsyncRedis()
+    queued: list = []
+    monkeypatch.setattr(bridge_dispatch, "_redis", lambda: r)
+    monkeypatch.setattr(bridge_dispatch, "_apply_async",
+                        lambda data, card_key: queued.append((data, card_key)))
+    return SimpleNamespace(redis=r, queued=queued)
+
+
+@pytest.fixture
+def forbidden_in_api(monkeypatch):
+    """Всё, что мост делает в воркере, в процессе API звать нельзя."""
+    calls: list = []
+
+    async def _k8s(*a, **k):
+        calls.append("k8s_facts")
+
+    async def _run_bridge(*a, **k):
+        calls.append("run_bridge")
+        return []
+
+    monkeypatch.setattr("app.context.k8s_facts.K8sFacts.collect_snapshot", _k8s)
+    monkeypatch.setattr(bridge, "run_bridge", _run_bridge)
+    monkeypatch.setattr(bridge, "collect_facts",
+                        AsyncMock(side_effect=lambda *a, **k: calls.append("collect_facts")))
+    return calls
+
+
+@pytest.mark.asyncio
+async def test_store_enqueues_one_task_per_dedup_key(monkeypatch, dispatch, forbidden_in_api):
+    from app.api import webhooks
+
+    # 13 сквадов в crashloop ≈ батч из десятков алертов: 30 повторов одного
+    # пода + один другой под → две задачи, а не 31.
+    alerts = [_am_alert("town-service-6c6cd4df-8hx9c", f"fp-{i}") for i in range(30)]
+    alerts.append(_am_alert("map-service-7d9f-abcde", "fp-map"))
+    enrich = AsyncMock()
+    with patch("app.knowledge_graph.auto_populator.populate_from_incident", return_value={}), \
+         patch("app.services.alert_enrichment.enrich_alert_async", enrich):
         monkeypatch.setattr(settings, "REMEDIATION_BRIDGE_ENABLED", False)
-        await webhooks.alertmanager_webhook_store_only(payload, db=MagicMock())
-        assert scheduled == []
+        await webhooks.alertmanager_webhook_store_only(_am_payload(alerts), db=MagicMock())
+        assert dispatch.queued == []
         monkeypatch.setattr(settings, "REMEDIATION_BRIDGE_ENABLED", True)
-        await webhooks.alertmanager_webhook_store_only(payload, db=MagicMock())
-    assert len(scheduled) == 1
-    assert scheduled[0].namespace == "squad-7-k5"
+        await webhooks.alertmanager_webhook_store_only(_am_payload(alerts), db=MagicMock())
+        assert len(dispatch.queued) == 2
+        # Повтор батча в окне (AM group_interval) — новых задач нет.
+        await webhooks.alertmanager_webhook_store_only(_am_payload(alerts), db=MagicMock())
+    assert len(dispatch.queued) == 2
+    pods = sorted(d["labels"]["pod"] for d, _ in dispatch.queued)
+    assert pods == ["map-service-7d9f-abcde", "town-service-6c6cd4df-8hx9c"]
+    # Сериализованный Incident восстанавливается в воркере как есть.
+    restored = Incident.model_validate(dispatch.queued[0][0])
+    assert restored.namespace == "squad-7-k5"
+    assert all(card is None for _, card in dispatch.queued)
+    assert set(dispatch.redis.ttl.values()) == {600}
+    enrich.assert_not_awaited()
+    assert forbidden_in_api == []
+
+
+@pytest.mark.asyncio
+async def test_store_redis_down_enqueues_nothing(monkeypatch, dispatch, forbidden_in_api):
+    from app.api import webhooks
+    from app.remediation import bridge_dispatch
+
+    class _Down:
+        async def set(self, *a, **k):
+            raise ConnectionError("redis down")
+
+    monkeypatch.setattr(bridge_dispatch, "_redis", lambda: _Down())
+    monkeypatch.setattr(settings, "REMEDIATION_BRIDGE_ENABLED", True)
+    with patch("app.knowledge_graph.auto_populator.populate_from_incident", return_value={}):
+        res = await webhooks.alertmanager_webhook_store_only(
+            _am_payload([_am_alert("town-service-6c6cd4df-8hx9c", "fp-1")]), db=MagicMock(),
+        )
+    assert res["status"] == "stored"
+    assert dispatch.queued == []
+
+
+@pytest.mark.asyncio
+async def test_enrich_and_forward_enqueues_after_card_with_card_key(
+    monkeypatch, dispatch, forbidden_in_api,
+):
+    from app.api import webhooks
+    from app.services.alert_dedup import Decision
+    from app.services.discord_service import DiscordService, enriched_card_key
+
+    monkeypatch.setattr(settings, "REMEDIATION_BRIDGE_ENABLED", True)
+    monkeypatch.setattr(settings, "DISCORD_ENRICH_ENABLED", True)
+    order: list = []
+
+    async def _enrich(db, inc):
+        return EnrichedContext(incident=inc, service="town-service",
+                               pod_name=inc.labels.get("pod"))
+
+    async def _send(self, ctxs, env=None, resurfaced=False):
+        order.append("card")
+        # Карточка уходит без строки моста — её допишет задача.
+        assert all("remediation_lines" not in c.extras for c in ctxs)
+        _send.ctxs = ctxs
+        return True
+
+    def _queue(data, card_key):
+        order.append("queued")
+        dispatch.queued.append((data, card_key))
+
+    from app.remediation import bridge_dispatch
+    monkeypatch.setattr(bridge_dispatch, "_apply_async", _queue)
+    monkeypatch.setattr(DiscordService, "send_enriched_alert", _send)
+    alerts = [_am_alert("town-service-6c6cd4df-8hx9c", f"fp-{i}",
+                        namespace="prod-kingdom5", severity="critical") for i in range(30)]
+    with patch("app.knowledge_graph.auto_populator.populate_from_incident", return_value={}), \
+         patch("app.services.alert_enrichment.enrich_alert_async", side_effect=_enrich), \
+         patch("app.services.alert_enrichment.prefetch_node_namespaces", AsyncMock()), \
+         patch("app.services.alert_dedup.decide_send", AsyncMock(return_value=Decision.SEND)):
+        res = await webhooks.alertmanager_webhook_enrich_and_forward(
+            _am_payload(alerts), db=MagicMock(),
+        )
+    assert res["enriched_groups"] == 1
+    assert order == ["card", "queued"]
+    [(data, card_key)] = dispatch.queued
+    assert card_key == enriched_card_key(_send.ctxs)
+    assert data["namespace"] == "prod-kingdom5"
+    assert forbidden_in_api == []
+
+
+@pytest.mark.asyncio
+async def test_slow_k8s_facts_does_not_block_api_event_loop(monkeypatch, dispatch):
+    """Регресс 31.10.2026: синхронный kubectl в мосте вешал event loop API.
+
+    K8sFacts подменён медленной синхронной функцией (2 с). Хендлер обязан
+    ответить быстрее 0,5 с, и loop не должен замирать и ПОСЛЕ ответа (до
+    фикса мост шёл create_task-ом и блокировал loop уже после 202).
+    """
+    import asyncio
+    import time as _time
+
+    from app.api import webhooks
+
+    async def _slow_snapshot(*a, **k):
+        _time.sleep(2)  # sync, как subprocess kubectl / kube API без await
+
+    async def _enrich(db, inc):
+        return _ctx()
+
+    monkeypatch.setattr("app.context.k8s_facts.K8sFacts.collect_snapshot", _slow_snapshot)
+    monkeypatch.setattr(settings, "REMEDIATION_BRIDGE_ENABLED", True)
+    gaps: list = []
+    stop = asyncio.Event()
+
+    async def _ticker():
+        last = _time.monotonic()
+        while not stop.is_set():
+            await asyncio.sleep(0.02)
+            now = _time.monotonic()
+            gaps.append(now - last)
+            last = now
+
+    ticker = asyncio.create_task(_ticker())
+    alerts = [_am_alert(f"town-service-{i}", f"fp-{i}") for i in range(5)]
+    with patch("app.knowledge_graph.auto_populator.populate_from_incident", return_value={}), \
+         patch("app.services.alert_enrichment.enrich_alert_async", side_effect=_enrich), \
+         patch("app.database.SessionLocal", MagicMock()):
+        started = _time.monotonic()
+        await webhooks.alertmanager_webhook_store_only(_am_payload(alerts), db=MagicMock())
+        elapsed = _time.monotonic() - started
+        await asyncio.sleep(0.3)
+    stop.set()
+    await ticker
+    assert elapsed < 0.5
+    assert max(gaps) < 0.5
+    assert len(dispatch.queued) == 5
+
+
+# ── строка «заблокирован policy» дописывается в отправленную карточку ────
+
+class _CardClient:
+    def __init__(self, embed: dict, calls: dict, **_):
+        self.embed, self.calls = embed, calls
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+    def get(self, url, headers=None):
+        self.calls["get"] = url
+        return SimpleNamespace(status_code=200, json=lambda: {"embeds": [self.embed]})
+
+    def patch(self, url, headers=None, json=None):
+        self.calls["patch"] = json
+        return SimpleNamespace(status_code=200)
+
+
+_LINE = f"playbook `{_PLAYBOOK}`: заблокирован policy (prod)"
+
+
+def test_blocked_line_appended_to_sent_card(monkeypatch):
+    from app.services.discord import dedup_store
+    monkeypatch.setattr(settings, "DISCORD_WEBHOOK_URL",
+                        "https://discord.com/api/webhooks/123/tok")
+    monkeypatch.setattr(dedup_store, "get_fresh",
+                        lambda key, ttl_sec, now=None: {"msg_id": "m-9"})
+    cached: dict = {}
+    monkeypatch.setattr(dedup_store, "update_embed",
+                        lambda key, embed: cached.update({key: embed}))
+    calls: dict = {}
+    embed = {"title": "t", "fields": [{"name": "Namespaces", "value": "`prod-kingdom5`"}]}
+    assert bridge.annotate_enriched_card(
+        "k-1", [_LINE], client_factory=lambda **kw: _CardClient(embed, calls, **kw),
+    )
+    assert calls["get"] == "https://discord.com/api/webhooks/123/tok/messages/m-9"
+    fields = calls["patch"]["embeds"][0]["fields"]
+    assert fields[-1] == {"name": "Remediation", "value": _LINE, "inline": False}
+    assert cached["k-1"]["fields"][-1]["name"] == "Remediation"
+    # Повторная задача той же карточки — строка не дублируется.
+    calls.clear()
+    embed2 = {"title": "t", "fields": fields}
+    assert bridge.annotate_enriched_card(
+        "k-1", [_LINE], client_factory=lambda **kw: _CardClient(embed2, calls, **kw),
+    )
+    assert "patch" not in calls
+
+
+def test_card_without_message_id_is_not_annotated(monkeypatch):
+    from app.services.discord import dedup_store
+    monkeypatch.setattr(settings, "DISCORD_WEBHOOK_URL",
+                        "https://discord.com/api/webhooks/123/tok")
+    monkeypatch.setattr(dedup_store, "get_fresh", lambda key, ttl_sec, now=None: None)
+    client = MagicMock()
+    assert bridge.annotate_enriched_card("k-1", [_LINE], client_factory=client) is False
+    client.assert_not_called()
+
+
+def test_task_prod_block_annotates_card(db, bridge_on, fake_redis):
+    annotate = MagicMock(return_value=True)
+    with patch.object(bridge, "annotate_enriched_card", annotate):
+        outcomes, send = _run(db, _ctx(namespace="prod-kingdom5"), card_key="card-1")
+    assert outcomes[0]["outcome"] == bridge.OUTCOME_BLOCKED
+    send.assert_not_awaited()
+    annotate.assert_called_once_with("card-1", [_LINE])
+
+
+def test_task_block_without_card_key_only_logs(db, bridge_on, fake_redis):
+    annotate = MagicMock()
+    with patch.object(bridge, "annotate_enriched_card", annotate):
+        outcomes, _ = _run(db, _ctx(namespace="prod-kingdom5"))
+    assert outcomes[0]["outcome"] == bridge.OUTCOME_BLOCKED
+    annotate.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_recurrence_patch_keeps_remediation_field(monkeypatch):
+    """Повтор алерта PATCH-ит карточку свежим embed-ом — поле моста не теряется."""
+    from app.services.discord import dedup_store
+    from app.services.discord_service import DiscordService
+
+    remediation = {"name": "Remediation", "value": _LINE, "inline": False}
+    monkeypatch.setattr(dedup_store, "bump", lambda key, now=None: {
+        "msg_id": "m-9", "count": 2, "first_ts": 1.0,
+        "embed": {"title": "t", "fields": [{"name": "Namespaces", "value": "x"}, remediation]},
+    })
+    monkeypatch.setattr(dedup_store, "update_embed", lambda key, embed: None)
+    sent: dict = {}
+
+    async def _req(self, client, method, url, **kw):
+        sent["json"] = kw.get("json")
+        return SimpleNamespace(status_code=200, text="")
+
+    monkeypatch.setattr(DiscordService, "_request_with_ratelimit", _req)
+    await DiscordService()._patch_enriched_recurrence(
+        url="https://discord.com/api/webhooks/123/tok",
+        embed={"title": "t", "fields": [{"name": "Namespaces", "value": "x"}]},
+        key="k-1", ttl_sec=1800, now=2.0,
+    )
+    assert remediation in sent["json"]["embeds"][0]["fields"]
 
 
 # ── клик по карточке моста ────────────────────────────────────────────────
