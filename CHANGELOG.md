@@ -4,6 +4,7 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+## [1.0.32] — 2026-10-31 — мост исполняется в Celery, включение по namespace
 ### Исправлено
 
 - **Поэтапное включение моста** — `REMEDIATION_BRIDGE_NAMESPACES` (префиксы namespace через запятую, пусто — все): после инцидента мост включается сначала на одном скваде.
