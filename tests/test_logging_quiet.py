@@ -6,7 +6,7 @@ access-лога /healthz+/readyz у API при ~300 настоящих запр�
 """
 import logging
 
-from app.logger import HealthProbeAccessFilter
+from app.observability.access_log import HealthProbeAccessFilter
 
 
 def _record(path: str, status: int, method: str = "GET") -> logging.LogRecord:
@@ -42,11 +42,28 @@ def test_non_access_shaped_record_passes():
     assert f.filter(rec) is True
 
 
-def test_filter_is_installed_on_uvicorn_access_logger():
-    import app.logger  # noqa: F401 — configure_logger() отрабатывает при импорте
+def test_api_process_installs_filter_without_app_logger():
+    """Фильтр ставит сам `app.main`, в чистом процессе.
 
-    filters = logging.getLogger("uvicorn.access").filters
-    assert sum(isinstance(x, HealthProbeAccessFilter) for x in filters) == 1
+    1.0.28: фильтр жил в app/logger.py, который API не импортирует, — в
+    проде не ставился, а прежний тест проходил, потому что импортировал
+    app.logger сам. Поэтому — отдельный интерпретатор, только `import app.main`.
+    """
+    import os
+    import subprocess
+    import sys
+
+    code = (
+        "import logging, sys; import app.main; "
+        "from app.observability.access_log import HealthProbeAccessFilter as F; "
+        "fs = logging.getLogger('uvicorn.access').filters; "
+        "sys.exit(0 if sum(isinstance(f, F) for f in fs) == 1 "
+        "and 'app.logger' not in sys.modules else 3)"
+    )
+    env = {**os.environ, "LLM_BACKEND": "claude_cli"}
+    r = subprocess.run([sys.executable, "-c", code], env=env,
+                       capture_output=True, text=True, timeout=120)
+    assert r.returncode == 0, r.stderr[-2000:]
 
 
 def test_celery_does_not_redirect_stdouts():

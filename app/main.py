@@ -12,6 +12,7 @@ from prometheus_client import start_http_server
 from sqlalchemy import text
 
 from app import repository
+from app.observability.access_log import install_probe_access_filter
 from app.api import (approvals, discord_interactions, incidents, kg_graph,
                      rate_limit, replay, webhooks)
 from app.evaluation import feedback
@@ -129,6 +130,8 @@ if settings.is_production:
 else:
     app = FastAPI(title="SRE AI Copilot", version=__version__, lifespan=lifespan)
 setup_telemetry(app)
+# Probe-строки kubelet из access-лога uvicorn — см. app/observability/access_log.py.
+install_probe_access_filter()
 
 app.add_middleware(RequestIDMiddleware)
 
