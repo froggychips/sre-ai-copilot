@@ -40,9 +40,20 @@ from app.knowledge_graph.queries import (cluster_deploy_activity,
                                          recent_deploys_for,
                                          recent_deploys_for_namespaces,
                                          recent_pod_events_for, upstream_of)
-from app.knowledge_graph.schema import (NODE_KIND_SERVICE, NODE_KIND_WORKLOAD,
-                                        Service, ServiceEdge)
+from app.knowledge_graph.schema import (NODE_KIND_SERVICE, Service,
+                                        ServiceEdge)
 from app.models.incident import Incident
+from app.services.alert_target import (  # noqa: F401 — прежнее имя
+    METRIC_EXPORTER_SOURCES)
+from app.services.alert_target import (NODE_ALERT_PREFIXES,
+                                       NODE_EXPORTER_SOURCES, POD_HASH_RE,
+                                       STS_POD_RE, TARGET_EXPORTER,
+                                       TARGET_LEGACY, TARGET_NAMESPACE,
+                                       TARGET_NODE, TARGET_SERVICE,
+                                       TARGET_UNRESOLVED, AlertTarget,
+                                       DbLookup, exporter_source,
+                                       resolve_alert_target,
+                                       strip_pod_hash)
 from app.services.node_resolver import is_node_exporter_pod
 from app.services.statics_service import (observe_statics_version,
                                           statics_env_from_namespace)
@@ -547,27 +558,11 @@ def _kg_data_age(db: Session, namespace: str, service_name: str) -> Optional[int
 # Pod-hash strip: kube создаёт pod как `<deployment>-<rs-hash>-<pod-hash>`
 # (rs-hash = 8..10 alnum, pod-hash = 5 alnum). При `Kube*` алёртах из labels
 # берём pod и режем хвост, чтобы получить имя deployment'а.
-_POD_HASH_RE = re.compile(r"^(?P<deploy>.+?)-[a-z0-9]{8,10}-[a-z0-9]{5}$")
-# StatefulSet pod: `<sts>-<ordinal>` (e.g. `town-db-postgresql-0`).
-_STS_POD_RE = re.compile(r"^(?P<sts>.+?)-(?P<ord>\d+)$")
-
-
-def _strip_pod_hash(pod: str) -> Optional[str]:
-    """Извлечь deployment-name из k8s pod-name.
-
-    `auth-service-7f8c4b6cdf-h2x9k` → `auth-service`.
-    `town-db-postgresql-0` → `town-db-postgresql` (StatefulSet ordinal).
-    Не-stripped pod → None.
-    """
-    if not pod:
-        return None
-    m = _POD_HASH_RE.match(pod)
-    if m:
-        return m.group("deploy")
-    m = _STS_POD_RE.match(pod)
-    if m:
-        return m.group("sts")
-    return None
+# Имена и регексы живут в alert_target (одна цепочка атрибуции); здесь —
+# прежние имена для импортёров и тестов.
+_POD_HASH_RE = POD_HASH_RE
+_STS_POD_RE = STS_POD_RE
+_strip_pod_hash = strip_pod_hash
 
 
 def _resolve_target_service_from_labels(
@@ -635,7 +630,7 @@ def resolve_store_service(
     fallback-цепочке (в webhooks `service→deployment`).
 
     Для дедупа и текстов уведомлений webhook-пути: если цель не нашлась (нода,
-    удалённый под), возвращается `legacy_default` — ключ дедупа и
+    namespace, удалённый под), возвращается `legacy_default` — ключ дедупа и
     resolve-уведомление в Discord остаются прежними. В граф такой алерт
     пишется без сервиса: auto_populator зовёт `resolve_store_target`.
     """
@@ -643,77 +638,22 @@ def resolve_store_service(
     return target.service or legacy_default
 
 
-#: Экспортеры метрик: их `service`/`job`/`app` — ИСТОЧНИК метрики, а не объект
-#: алерта. Замер 16.10.2026 (30 дней): 168 из 592 алертов в kg_alerts лежали на
-#: `vm-kube-state-metrics` и `vm-node-exporter`, на них же — 49 KGIncident;
-#: больше всех KubePodCrashLooping (91 алерт в 25 namespace).
-METRIC_EXPORTER_SOURCES = frozenset({
-    "vm-kube-state-metrics", "kube-state-metrics",
-    "vm-node-exporter", "node-exporter", "prometheus-node-exporter",
-})
-_NODE_EXPORTER_SOURCES = frozenset({
-    "vm-node-exporter", "node-exporter", "prometheus-node-exporter",
-})
-_NODE_ALERT_PREFIXES = ("Node", "KubeNode", "KubeletDown", "KubeletTooMany")
-
-#: scope в StoreTarget.
-STORE_SCOPE_SERVICE = "service"        # объект — workload/сервис
-STORE_SCOPE_NODE = "node"              # объект — нода, сервиса нет
-STORE_SCOPE_UNRESOLVED = "unresolved"  # пришёл через экспортер, цель не нашлась
-STORE_SCOPE_LEGACY = "legacy"          # обычный app-алерт или kill-switch
-
-
-@dataclass(frozen=True)
-class StoreTarget:
-    """Куда записать алерт в графе.
-
-    `service` — имя target-сервиса или None (алерт пишется без сервиса, #491).
-    `source` — экспортер, через который алерт пришёл (`raw.source`), если был.
-    """
-    service: Optional[str]
-    scope: str
-    source: Optional[str] = None
-    how: str = ""
-
-
-def _exporter_source(labels: Dict[str, str]) -> Optional[str]:
-    """Имя экспортера-источника метрики или None, если алерт не от экспортера."""
-    for key in ("service", "job", "app"):
-        value = (labels.get(key) or "").strip()
-        if value in METRIC_EXPORTER_SOURCES:
-            return value
-    if is_node_exporter_pod(labels.get("pod")):
-        return "vm-node-exporter"
-    return None
-
-
-def _is_node_scoped(labels: Dict[str, str], source: str) -> bool:
-    """Объект алерта — нода: node-exporter, Node*/KubeNode* или `node` без пода."""
-    if source in _NODE_EXPORTER_SOURCES:
-        return True
-    alertname = labels.get("alertname") or ""
-    if alertname.startswith(_NODE_ALERT_PREFIXES):
-        return True
-    return bool(labels.get("node")) and not labels.get("pod")
+# Прежние имена store-пути: цепочка живёт в alert_target.
+_NODE_EXPORTER_SOURCES = NODE_EXPORTER_SOURCES
+_NODE_ALERT_PREFIXES = NODE_ALERT_PREFIXES
+_exporter_source = exporter_source
+StoreTarget = AlertTarget
+STORE_SCOPE_SERVICE = TARGET_SERVICE
+STORE_SCOPE_NODE = TARGET_NODE
+STORE_SCOPE_NAMESPACE = TARGET_NAMESPACE
+STORE_SCOPE_EXPORTER = TARGET_EXPORTER
+STORE_SCOPE_UNRESOLVED = TARGET_UNRESOLVED
+STORE_SCOPE_LEGACY = TARGET_LEGACY
 
 
 def _workload_exists(db: Optional[Session], namespace: Optional[str], name: str) -> bool:
     """Есть ли такой workload/сервис в графе. Без БД — верим выводу из имени пода."""
-    if db is None:
-        return True
-    if not namespace:
-        return False
-    try:
-        # SAVEPOINT: ошибка запроса не должна оставить транзакцию store-пути
-        # в aborted-состоянии — там же дальше пишутся алерт и инцидент.
-        with db.begin_nested():
-            # Существование: годится и Service, и workload — ищем оба вида явно.
-            return db.query(Service.id).filter(
-                Service.namespace == namespace, Service.name == name,
-                Service.node_kind.in_((NODE_KIND_SERVICE, NODE_KIND_WORKLOAD)),
-            ).first() is not None
-    except Exception:  # noqa: BLE001 — граф недоступен: не хуже прежнего
-        return True
+    return DbLookup(db).workload_exists(namespace, name)
 
 
 def resolve_store_target(
@@ -721,65 +661,9 @@ def resolve_store_target(
     *,
     legacy_default: Optional[str],
     db: Optional[Session] = None,
-) -> StoreTarget:
-    """Объект алерта для записи в граф — k8s-target, а не экспортер метрики.
-
-    Тот же резолв, что у enrichment-пути (`_resolve_target_service_from_labels`:
-    deployment/statefulset/…/pod → workload), плюс правила для алертов, которые
-    пришли через экспортер (kube-state-metrics, node-exporter):
-
-      * нодовый алерт (node-exporter, Node*/KubeNode*, `node` без пода) —
-        без сервиса, scope=node: нода не притворяется сервисом (#491);
-      * под → workload, если такой workload есть в графе;
-      * цель не нашлась (под удалён, имя не разбирается) — без сервиса,
-        scope=unresolved. Метка экспортера НЕ становится владельцем: иначе та
-        же ошибка осталась бы для каждого удалённого пода. Экспортер уходит в
-        `source` — в `raw.source` строки алерта.
-
-    Обычные app-алерты (не через экспортер) — `legacy_default`, как раньше:
-    вызывающий считает его своей fallback-цепочкой (`service→app→deployment`).
-
-    kill-switch `ATTRIBUTION_RESOLVE_KUBE_TARGET_ENABLED=False` → всегда
-    `legacy_default` (полностью прежнее поведение store-пути).
-    """
-    if not settings.ATTRIBUTION_RESOLVE_KUBE_TARGET_ENABLED:
-        return StoreTarget(legacy_default, STORE_SCOPE_LEGACY, how="kill_switch")
-    labels = labels or {}
-    source = _exporter_source(labels)
-    if (
-        labels.get("deployment")
-        or labels.get("statefulset")
-        or labels.get("daemonset")
-        or labels.get("poddisruptionbudget")
-        or labels.get("horizontalpodautoscaler")
-    ):
-        _, target = _resolve_target_service_from_labels(labels)
-        if target:
-            return StoreTarget(target, STORE_SCOPE_SERVICE, source, "workload_label")
-    # Job/CronJob-алерты (KubeJobFailed): лейбл `service` — KSM, цель — в
-    # `job_name`. Владельца знает граф (kg_k8s_jobs.owner_service_name); без
-    # графа — имя CronJob из имени Job. Замер 07.09.2026: 66 алертов за 30
-    # дней все лежали на vm-kube-state-metrics.
-    if labels.get("job_name"):
-        from app.knowledge_graph.job_attribution import resolve_job_target
-        target, _how = resolve_job_target(db, labels.get("namespace"), labels["job_name"])
-        if target:
-            return StoreTarget(target, STORE_SCOPE_SERVICE, source, "job")
-    if source is None:
-        return StoreTarget(legacy_default, STORE_SCOPE_LEGACY, how="app_label")
-
-    # Дальше — алерт пришёл через экспортер, и его метка владельцем не будет.
-    if _is_node_scoped(labels, source):
-        return StoreTarget(None, STORE_SCOPE_NODE, source, "node")
-    pod = labels.get("pod")
-    if pod and not is_node_exporter_pod(pod):
-        derived = _strip_pod_hash(pod)
-        # Под самого экспортера (KSM мониторит себя) — не цель.
-        if derived and derived not in METRIC_EXPORTER_SOURCES and _workload_exists(
-            db, labels.get("namespace"), derived,
-        ):
-            return StoreTarget(derived, STORE_SCOPE_SERVICE, source, "pod")
-    return StoreTarget(None, STORE_SCOPE_UNRESOLVED, source, "no_target")
+) -> AlertTarget:
+    """Объект алерта для записи в граф — `alert_target.resolve_alert_target`."""
+    return resolve_alert_target(labels, legacy_default=legacy_default, db=db)
 
 
 # Blackbox-проба (ProdEndpointDown / PreprodEndpointDown) несёт СТАТИЧЕСКИЙ
@@ -1137,29 +1021,29 @@ def enrich_alert(db: Session, incident: Incident) -> EnrichedContext:
     """
     labels = incident.labels or {}
     pod = labels.get("pod")
-    # Root cause #1: target из labels в priority order. incident.service_name
-    # (если бы он был) сейчас глючит — приоритет за labels-resolved. Старый
-    # код брал `service || deployment` → пропускал KubeStatefulSet/Daemon/Job
-    # alerts и игнорировал pod-hash-strip. Misattribute на vm-kube-state-metrics
-    # =  330 alerts/week просачивались в #infra-error именно из-за этого.
-    resolved_ns, resolved_svc = _resolve_target_service_from_labels(labels)
-    # Job-алерт: цель — владелец Job/CronJob из графа, а не имя конкретного
-    # запуска (`…-29779065`), которого в kg_services нет и не будет.
-    if resolved_svc and labels.get("job_name") == resolved_svc:
-        from app.knowledge_graph.job_attribution import resolve_job_target
-        owner, _how = resolve_job_target(db, resolved_ns or incident.namespace, resolved_svc)
-        if owner:
-            resolved_svc = owner
+    # Объект алерта — та же цепочка, что у store-пути (kg_alerts, ключ
+    # дедупа): deployment/…/pod/scrape_job → workload, экспортер — цель только
+    # для алерта про сам экспортер. До 31.10.2026 карточка резолвила сама
+    # (`service || deployment`, потом pod-strip).
+    target = resolve_alert_target(
+        labels, legacy_default=labels.get("service") or labels.get("app"), db=db,
+    )
+    if target.service:
+        resolved_ns = target.namespace or labels.get("namespace") or None
+        resolved_svc: Optional[str] = target.service
+    else:
+        # Нода / namespace / цель не нашлась: у объекта нет сервиса, и
+        # карточка остаётся прежней — имя из меток (pod-strip) и последним
+        # шагом `service`/`app` (под и события экспортера на ноде — #21.09).
+        # Нода в карточке — отдельное поле (`ctx.node`).
+        resolved_ns, resolved_svc = _resolve_target_service_from_labels(labels)
+        if not resolved_svc:
+            resolved_svc = labels.get("service") or labels.get("app")
     # Если labels пустые/не дали target — fallback на incident.namespace.
     # Это уже не сервис-namespace, а namespace источника метрики (часто
     # `monitoring`), но без неё мы вообще ничего не найдём в KG.
     namespace = resolved_ns or incident.namespace or ""
     service = resolved_svc
-    # Legacy fallback: старые alerts с `service`/`app` label без структурных
-    # `deployment`/`pod` (например, custom Prometheus rules). Оставляем
-    # last-resort, чтобы не регрессировать на не-Kube alerts.
-    if not service:
-        service = labels.get("service") or labels.get("app")
 
     # Blackbox-проба: статический `namespace`-label (prod-shared) — лишь
     # AM-роут-метка, реальный realm в URL `instance`. Переопределяем namespace

@@ -36,12 +36,15 @@ from datetime import datetime, timedelta, timezone
 from typing import cast, Any, Dict, List, Optional, Set, Tuple
 
 import structlog
-from sqlalchemy import bindparam, text
+from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from app.config import settings
 from app.context.vm_client import VMClient
 from app.knowledge_graph.source_status import SourceStatus, mark
+from app.services.alert_target import (ATTR_NAMESPACE, ATTR_NO_SERVICE,
+                                       ATTR_NODE, ATTR_ON_EXPORTER,
+                                       classify_alert_row)
 
 log = structlog.get_logger()
 
@@ -89,15 +92,6 @@ BACKUP_CRONJOB = "postgres-backup"
 #: severity=none по замыслу уходит в blackhole Alertmanager-а и до копилота
 #: не доходит — исключаем с обеих сторон. info идёт в /store и входит.
 _EXCLUDED_SEVERITY = "none"
-
-#: Экспортеры метрик: их имя в `service` — ИСТОЧНИК метрики, а не объект
-#: алерта. Совпадает с `alert_enrichment.METRIC_EXPORTER_SOURCES` + vmagent;
-#: остальная обсервабилити помечена `kg_services.synthetic`.
-_EXPORTER_SERVICES = (
-    "vm-kube-state-metrics", "kube-state-metrics",
-    "vm-node-exporter", "node-exporter", "prometheus-node-exporter",
-    "vmagent-vm-victoria-metrics-k8s-stack", "vmagent",
-)
 
 _OK = "✅"
 _BAD = "❌"
@@ -373,38 +367,60 @@ async def backup_line(vm: Optional[VMClient], now: datetime) -> ReconLine:
 # ── 4. Атрибуция ─────────────────────────────────────────────────────────────
 
 def attribution_line(db: Session, now: datetime) -> ReconLine:
+    """Доля алертов без объекта.
+
+    Класс строки — `alert_target.classify_alert_row`: нода и namespace —
+    атрибуция (объект есть, сервиса у него нет), экспортер — только для
+    алерта про сам экспортер (`raw.target_kind=exporter`).
+    """
     title = "Карточки без атрибуции"
-    params: Dict[str, Any] = {
-        "since": _since(now), "none": _EXCLUDED_SEVERITY,
-        "exporters": list(_EXPORTER_SERVICES),
-    }
+    params: Dict[str, Any] = {"since": _since(now), "none": _EXCLUDED_SEVERITY}
     try:
-        row = db.execute(text("""
-            SELECT
-              count(*) AS total,
-              sum(CASE WHEN a.service_id IS NULL THEN 1 ELSE 0 END) AS no_service,
-              sum(CASE WHEN a.service_id IS NOT NULL
-                        AND (s.synthetic OR s.name IN :exporters)
-                       THEN 1 ELSE 0 END) AS exporter
+        rows = db.execute(text("""
+            SELECT s.name, s.synthetic, a.raw,
+                   EXISTS (SELECT 1 FROM kg_services w
+                           WHERE w.namespace = s.namespace AND w.name = s.name
+                             AND w.node_kind = 'workload' AND NOT w.synthetic)
+                     AS real_workload
             FROM kg_alerts a
             LEFT JOIN kg_services s ON s.id = a.service_id
             WHERE (a.fired_at >= :since OR a.last_notified_at >= :since)
               AND (a.severity IS NULL OR a.severity != :none)
-        """).bindparams(bindparam("exporters", expanding=True)), params).one()
+        """), params).all()
     except Exception as e:  # noqa: BLE001
         return _unmeasured(title, SourceStatus.FAILED, f"kg_alerts: {type(e).__name__}")
-    total = int(row[0] or 0)
+    total = len(rows)
     if total == 0:
         return _unmeasured(title, SourceStatus.EMPTY, f"в kg_alerts за {WINDOW_DAYS} дн. нет алертов")
-    no_service, exporter = int(row[1] or 0), int(row[2] or 0)
+    counts: Dict[str, int] = {}
+    for name, synthetic, raw, real_workload in rows:
+        cls = classify_alert_row(
+            name if isinstance(name, str) else None, bool(synthetic), _json_obj(raw),
+            real_workload=bool(real_workload),
+        )
+        counts[cls] = counts.get(cls, 0) + 1
+    no_service = counts.get(ATTR_NO_SERVICE, 0)
+    exporter = counts.get(ATTR_ON_EXPORTER, 0)
     pct = 100.0 * (no_service + exporter) / total
+    to_node, to_ns = counts.get(ATTR_NODE, 0), counts.get(ATTR_NAMESPACE, 0)
+    extra = f"; на ноде {to_node}, на namespace {to_ns}" if to_node or to_ns else ""
     return ReconLine(
         title=title, status=SourceStatus.SUCCESS,
         text=(f"{no_service + exporter} из {total} = {pct:.0f}% "
-              f"(без сервиса {no_service}, на экспортере/synthetic {exporter}; "
+              f"(без сервиса {no_service}, на экспортере/synthetic {exporter}{extra}; "
               f"порог {UNATTRIBUTED_MAX_PCT:.0f}%)"),
         bad=pct > UNATTRIBUTED_MAX_PCT, value=pct,
     )
+
+
+def _json_obj(raw: Any) -> Any:
+    """raw из text()-запроса: dict у psycopg2, строка у sqlite."""
+    if isinstance(raw, str):
+        try:
+            return json.loads(raw)
+        except ValueError:
+            return None
+    return raw
 
 
 # ── 5. Подтверждённые починки ────────────────────────────────────────────────

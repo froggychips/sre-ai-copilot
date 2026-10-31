@@ -385,3 +385,25 @@ def test_enrich_legacy_service_label_still_works():
          patch("app.services.alert_enrichment.recent_pod_events_for", return_value=[]):
         ctx = enrich_alert(db, inc)
     assert ctx.service == "legacy-svc"
+
+
+def test_enrich_uses_attribution_chain_for_scrape_pool():
+    """Карточка и kg_alerts — одна цепочка: ScrapePoolHasNoTargets приходит с
+    `service=vmagent`, объект — в `scrape_job` (и namespace тоже оттуда)."""
+    inc = _make_incident(
+        "ScrapePoolHasNoTargets",
+        {"namespace": "monitoring", "service": "vmagent-vm-victoria-metrics-k8s-stack",
+         "job": "vmagent-vm-victoria-metrics-k8s-stack",
+         "scrape_job": "serviceScrape/prod-shared/chat-db-postgresql/0"},
+    )
+    db = MagicMock()
+    db.query.return_value.filter.return_value.filter.return_value.first.return_value = None
+    db.query.return_value.filter.return_value.first.return_value = None
+    with patch("app.services.alert_enrichment.recent_deploys_for", return_value=[]), \
+         patch("app.services.alert_enrichment.nearby_alerts", return_value=[]), \
+         patch("app.services.alert_enrichment.incidents_on", return_value=[]), \
+         patch("app.services.alert_enrichment._downstream_count_by_kind", return_value={}), \
+         patch("app.services.alert_enrichment.upstream_of", return_value=[]), \
+         patch("app.services.alert_enrichment.recent_pod_events_for", return_value=[]):
+        ctx = enrich_alert(db, inc)
+    assert ctx.service == "chat-db-postgresql"

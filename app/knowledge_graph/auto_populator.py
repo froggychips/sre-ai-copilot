@@ -43,10 +43,12 @@ def populate_from_incident(db: Session, incident: Incident) -> Dict[str, int]:
     labels = incident.labels or {}
     # Алерт пишется на свой k8s-target, а не на экспортер метрики: у
     # kube-resource-алертов лейбл `service` = источник (`vm-kube-state-metrics`,
-    # `vm-node-exporter`). Под → workload, нода → без сервиса, цель не нашлась →
-    # без сервиса; экспортер остаётся только в raw.source. Обычные app-алерты —
-    # прежняя fallback-цепочка `service→app→deployment`.
-    from app.services.alert_enrichment import (STORE_SCOPE_UNRESOLVED,
+    # `vm-node-exporter`). Цепочка — `alert_target.resolve_alert_target`: под →
+    # workload, нода/namespace → без сервиса (raw.target_kind), цель не нашлась
+    # → без сервиса; экспортер остаётся только в raw.source. Обычные
+    # app-алерты — прежняя fallback-цепочка `service→app→deployment`.
+    from app.services.alert_enrichment import (STORE_SCOPE_LEGACY,
+                                               STORE_SCOPE_UNRESOLVED,
                                                resolve_store_target)
     target = resolve_store_target(
         labels,
@@ -58,7 +60,9 @@ def populate_from_incident(db: Session, incident: Incident) -> Dict[str, int]:
     service_name = target.service
     if target.scope == STORE_SCOPE_UNRESOLVED:
         stats["attribution_unresolved"] = 1
-    namespace = incident.namespace
+    # Объект скрейпа (ScrapePoolHasNoTargets, TargetDown{job=<ns>/<name>})
+    # живёт не в namespace метки, а в namespace из scrape_job/job.
+    namespace = target.namespace or incident.namespace
 
     # Сначала Service — если его можно определить. Без него граф обогащать
     # нечем (деплои, инцидент сервиса), но сам факт алерта хранить есть что:
@@ -165,6 +169,12 @@ def populate_from_incident(db: Session, incident: Incident) -> Dict[str, int]:
     if target.source:
         alert_raw["source"] = target.source
         alert_raw["attribution"] = target.how
+    # Исход цепочки: нода/namespace — объект есть, хотя service_id пуст;
+    # exporter — алерт про сам экспортер. Сверка (weekly_reconciliation)
+    # различает по нему «без атрибуции» и «атрибутирован не к сервису».
+    if target.scope != STORE_SCOPE_LEGACY:
+        alert_raw["target_kind"] = target.scope
+        alert_raw.setdefault("attribution", target.how)
     if fired_at is not None:
         try:
             with db.begin_nested():

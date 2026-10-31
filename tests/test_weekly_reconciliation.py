@@ -239,6 +239,29 @@ def test_attribution_counts_no_service_and_exporters(db):
     assert "без сервиса 1, на экспортере/synthetic 2" in line.text
 
 
+def test_attribution_node_namespace_and_exporter_self_are_attributed(db):
+    """Нода и namespace — объект есть, хотя сервиса нет; экспортер — атрибуция
+    только для алерта про сам экспортер; synthetic DB-узел с живым workload-
+    двойником — настоящий объект (map-db-postgresql сквада)."""
+    town = _svc(db, "prod-k5", "town-service")
+    nexp = _svc(db, "monitoring", "vm-node-exporter")
+    mapdb = _svc(db, "squad-32-kingdom7", "map-db-postgresql", synthetic=True)
+    db.add(Service(namespace="squad-32-kingdom7", name="map-db-postgresql",
+                   node_kind="workload", synthetic=False))
+    db.flush()
+    _alert(db, "a1", "X", town)
+    _alert(db, "a2", "NodeDiskIOSaturation", None, raw={"target_kind": "node", "node": "dev-16"})
+    _alert(db, "a3", "NodeCPUHighUsage", None, raw={"source": "vm-node-exporter", "attribution": "node"})
+    _alert(db, "a4", "ProdRestartsSpike", None, raw={"target_kind": "namespace"})
+    _alert(db, "a5", "ProdNodeExporterDown", nexp, raw={"target_kind": "exporter"})
+    _alert(db, "a6", "CPUThrottlingHigh", mapdb)
+    _alert(db, "a7", "TooManyLogs", None, raw={"target_kind": "unresolved"})
+    _alert(db, "a8", "KubePodCrashLooping", nexp)
+    line = wr.attribution_line(db, NOW)
+    assert line.value == 25.0
+    assert "без сервиса 1, на экспортере/synthetic 1; на ноде 2, на namespace 1" in line.text
+
+
 def test_attribution_ok_and_empty(db):
     assert wr.attribution_line(db, NOW).status is SourceStatus.EMPTY
     town = _svc(db, "prod-k5", "town-service")
