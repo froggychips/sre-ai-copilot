@@ -156,6 +156,7 @@ def evaluate_intent_gate(
     intent: ExecutionIntent,
     *,
     match_snapshot: Optional[Mapping[str, Any]] = None,
+    require_binding: bool = False,
 ) -> PolicyDecision:
     """Детерминированно оценить ExecutionIntent против executor safety-policy.
 
@@ -168,6 +169,11 @@ def evaluate_intent_gate(
     запрещён. Не зависит от LLM-`risk` поля intent-а — namespace/kind/replicas
     берутся из структурного intent-а; недоступные сигналы трактуются
     fail-closed (см. _apply_fail_closed_axes).
+
+    `require_binding=True` включает сверку со снимком независимо от флага:
+    intent детерминированного моста (`app.remediation.bridge`) без
+    playbook-а не бывает, и его политика обязана проверяться на apply-пути
+    даже при выключенном REMEDIATION_PLAYBOOK_BINDING_ENABLED.
     """
     target = _intent_to_target(intent)
     spec = action_spec(intent.action)
@@ -189,7 +195,10 @@ def evaluate_intent_gate(
     axes = _apply_fail_closed_axes(axes, intent)
     decision = evaluate_policy(_EXECUTOR_GATE_POLICY, axes, target=target)
 
-    if not getattr(settings, "REMEDIATION_PLAYBOOK_BINDING_ENABLED", False):
+    if not (
+        require_binding
+        or getattr(settings, "REMEDIATION_PLAYBOOK_BINDING_ENABLED", False)
+    ):
         return decision
     # Чтение не требует playbook-а: describe/logs ничего не меняют, а
     # требование привязки для них только выключило бы расследование.

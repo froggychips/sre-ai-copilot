@@ -4,6 +4,47 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+### Изменено
+
+- **Детерминированный мост правила → playbook → кнопка** (`app/remediation/
+  bridge.py`, флаг `REMEDIATION_BRIDGE_ENABLED`, default off). Remediation-слой
+  (matcher, binding, gate, executor, verify) раньше был достижим только из
+  LLM-пайплайна, который на проде выключен. Теперь прод-путь алертов сам
+  доходит до действия: факты правил `enrich_alert` + состояние пода из
+  K8sFacts → `match_playbooks` → intent из `plan.steps` playbook-а (собирает
+  сервер, не модель) → тот же снимок и привязка, что у pipeline
+  (`build_match_snapshot`, `bind_server_params`) → gate. Policy `approve` —
+  снимок цели (uid), server dry-run, `IncidentRecord(APPROVAL_PENDING)` +
+  `kg_remediation_decisions` и карточка с кнопками «Применить/Отклонить» в
+  `DISCORD_INCIDENT_CHANNEL_ID` через бота; дальше обычный путь кнопки
+  (allowlist `DISCORD_APPROVERS_USER_IDS`, fail-closed → `apply_intent` →
+  verify), итог verify дописывается в ту же карточку. Policy `block`
+  (prod/preprod/system) — кнопок нет, в обычной карточке строка «playbook X:
+  заблокирован policy (prod)». Сквадовые алерты (`/store`) в канал по-прежнему
+  не идут; узкое исключение — только карточка предложения с policy approve.
+  Повтор того же (playbook, uid цели, incarnation) молчит 6 ч
+  (`REMEDIATION_BRIDGE_DEDUP_SECONDS`, Redis `SET NX`, без Redis — по
+  `kg_remediation_decisions`). Кнопка появляется только при
+  `EXECUTOR_ENABLED` + `EXECUTOR_APPROVAL_ENABLED`. На apply-пути intent моста
+  сверяется со снимком всегда, независимо от
+  `REMEDIATION_PLAYBOOK_BINDING_ENABLED`. Первый живой playbook —
+  `restart_crashloop_deployment` (squad/dev, approve).
+
+- **K8sFacts видит под в CrashLoopBackOff.** Такой под остаётся в
+  `phase=Running`, и фильтр «не Running/Succeeded» пропускал его целиком: ни
+  terminated-state (`exit_code`), ни логов. Из-за этого `process_crash` по
+  crashloop-у не находился структурно ни в пайплайне, ни в мосте. Теперь под
+  с нештатным waiting-состоянием контейнера считается нездоровым.
+
+### Исправлено
+
+- **Зелёная «✅ resolved» — только за эпизод от 30 минут.** За неделю 154 из
+  411 сообщений канала были resolved, в основном флапы на минуты: конец
+  короткого эпизода и так виден по свежей firing-карточке. Порог —
+  `DISCORD_RESOLVED_NOTICE_MIN_MINUTES` (30; `0` — постить всё, как раньше);
+  длительность неизвестна — постим. В канал по-прежнему идут резолвы только
+  critical-алертов, `resolved_posted` считает фактически отправленные.
+
 ## [1.0.30] — 2026-10-31 — еженедельная сверка против кластера, kubernetes 37
 ### Зависимости
 
