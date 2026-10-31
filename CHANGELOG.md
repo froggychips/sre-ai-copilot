@@ -80,7 +80,7 @@ All notable changes to this project are documented in this file.
   `last_seen`, `kg_remediation_events` 365. До этого срока у событий не было
   вовсе. `purge_events` идёт из `kg_health_retention` после сэмплов.
 - **Очередь `sync` для тяжёлых синков, `single_instance` на всех beat-задачах**
-  (#PR_NUMBER). Четыре слота `copilot-worker` (2 × `--concurrency=2`) делили
+  (#525). Четыре слота `copilot-worker` (2 × `--concurrency=2`) делили
   35 beat-записей (~95 запусков в час) и инцидентный пайплайн: часовой
   `kg_topology_sync` (4–10 мин) и 15-минутный `tc_deploys_to_kg` занимали
   слоты, минутная `kg_external_probe` с `expires=50` и инцидент ждали за
