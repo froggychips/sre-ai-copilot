@@ -197,6 +197,39 @@ async def test_am_no_secret_explicit_opt_out_allows(monkeypatch):
     assert await webhooks.verify_alertmanager_signature(req) is None
 
 
+@pytest.mark.asyncio
+async def test_am_unauthenticated_warning_is_rate_limited(monkeypatch):
+    """Факт «принимаем без подписи» один на процесс в час, а не на каждый батч.
+
+    31.10.2026: 359 строк `alertmanager.webhook_unauthenticated` в сутки при
+    трёх настоящих событиях в логе API.
+    """
+    fake_settings = SimpleNamespace(
+        ALERTMANAGER_WEBHOOK_SECRET=None,
+        ALERTMANAGER_ALLOW_UNAUTHENTICATED=True,
+        ENV="development",
+    )
+    monkeypatch.setattr(webhooks, "settings", fake_settings)
+    monkeypatch.setattr(webhooks, "_unauth_last_warned", None)
+    calls: list = []
+    monkeypatch.setattr(webhooks, "log", SimpleNamespace(
+        warning=lambda *a, **k: calls.append(a[0]),
+        error=lambda *a, **k: None, info=lambda *a, **k: None,
+    ))
+    body = json.dumps({"alerts": []}).encode()
+    for _ in range(5):
+        await webhooks.verify_alertmanager_signature(_am_request(body, "x"))
+    assert calls == ["alertmanager.webhook_unauthenticated"]
+
+    # Прошёл час — напоминание повторяется.
+    monkeypatch.setattr(
+        webhooks, "_unauth_last_warned",
+        webhooks.datetime.utcnow() - webhooks._UNAUTH_WARN_INTERVAL,
+    )
+    await webhooks.verify_alertmanager_signature(_am_request(body, "x"))
+    assert len(calls) == 2
+
+
 # ── seen-signature cache (anti-replay без signing-proxy) ─────────────────
 
 

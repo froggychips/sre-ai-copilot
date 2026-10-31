@@ -6,6 +6,8 @@ test_knowledge_graph.py.
 from datetime import datetime, timedelta
 
 import pytest
+
+from app.config import settings
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
@@ -523,6 +525,63 @@ def test_alerts_resolve_freshness_ok_when_resolved(db):
         ))
     db.commit()
     result = check_alerts_resolve_freshness(db)
+    assert result.status == "ok"
+
+
+def test_alerts_resolve_freshness_long_firing_is_not_stuck(db):
+    """Алерт, который AM присылает до сих пор, — живой, а не залипший.
+
+    31.10.2026: ScrapePoolHasNoTargets ×27 горел три недели, проверка по
+    fired_at держала warn 28 часов без единого сбоя resolve-sync.
+    """
+    svc = _mk_service(db)
+    old = datetime.utcnow() - timedelta(days=21)
+    for i in range(25):
+        db.add(AlertEvent(
+            service_id=svc.id, alertname=f"ScrapePoolHasNoTargets{i}",
+            fingerprint=f"fp-live-{i}", fired_at=old, resolved_at=None,
+            last_notified_at=datetime.utcnow() - timedelta(hours=2),
+        ))
+    db.commit()
+    result = check_alerts_resolve_freshness(db)
+    assert result.status == "ok"
+    assert result.detail["stale_open_alerts"] == 0
+    assert result.detail["long_firing_alerts"] == 25
+
+
+def test_alerts_resolve_freshness_counts_alerts_am_stopped_sending(db):
+    """Открыт, а последняя доставка старше недели — вот это залипание."""
+    svc = _mk_service(db)
+    old = datetime.utcnow() - timedelta(days=21)
+    for i in range(25):
+        db.add(AlertEvent(
+            service_id=svc.id, alertname=f"Ghost{i}", fingerprint=f"fp-ghost-{i}",
+            fired_at=old, resolved_at=None,
+            last_notified_at=old + timedelta(days=1),
+        ))
+    db.commit()
+    result = check_alerts_resolve_freshness(db)
+    assert result.status == "warn"
+    assert result.detail["stale_open_alerts"] == 25
+
+
+def test_source_coverage_disabled_source_is_not_silent(monkeypatch):
+    """Источник, выключенный флагом, не поднимает warn и не входит в total."""
+    from app.knowledge_graph import edge_decay_guard as g
+    from app.knowledge_graph.self_health import check_source_coverage
+
+    monkeypatch.setattr(settings, "NATS_SUBJECTS_PARSER_ENABLED", False)
+    for src in g.ALL_EDGE_SOURCES:
+        if src != g.SOURCE_NATS_SUBJECTS_SYNC:
+            g.record_source_run(src, {g._SOURCE_FETCH_KEY.get(src, "fetched"): 1,
+                                      "errors": 0})
+    monkeypatch.setattr(g, "_report_from_redis", lambda source: None)
+
+    result = check_source_coverage(None)  # type: ignore[arg-type]
+
+    assert result.detail["disabled"] == [g.SOURCE_NATS_SUBJECTS_SYNC]
+    assert g.SOURCE_NATS_SUBJECTS_SYNC not in result.detail["silent"]
+    assert result.detail["sources_total"] == len(g.ALL_EDGE_SOURCES) - 1
     assert result.status == "ok"
 
 
