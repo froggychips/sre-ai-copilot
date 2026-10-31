@@ -3,9 +3,37 @@
 All notable changes to this project are documented in this file.
 
 ## [Unreleased]
+
 ### Исправлено
 
 - **Повтор горящего алерта от Alertmanager больше не постит карточку «🌀 RESURFACED».** 31.10 в 11:52 UTC в #infra-error пачкой пришли 7 таких карточек (NodeDiskIOSaturation dev-32, TooManyScrapeErrors, TooManyLogs, ScrapePoolHasNoTargets, CnpgDrReplicaMissing, KubeVersionMismatch, DevNodeDiskPressureImminent dev-4) — все горели непрерывно днями, AM просто повторил группу через `repeat_interval` (4 ч), а L2 принимал «4 ч без fire» за затишье > 2 ч. Теперь в ветке затишья `decide_send` сначала смотрит эпизод: если по каждому fingerprint группы строка `kg_alerts` открыта (`resolved_at IS NULL`), а эпизод — `fired_at` в KG и `startsAt` из AM — начался до прошлого раза, когда ключ видели, это повтор: решение `SUPPRESS_REPEAT`, карточки нет, `last_notified_at` обновлён `populate_from_incident` как в /store, «последний раз видели» в Redis сдвинут, метрика `alerts_suppressed_total{reason="repeat"}`, лог `alert_dedup.suppress_repeat` с alertname/fingerprints. Возврат после resolve (populate сдвигает `fired_at` резолвнутой строки на новый эпизод, AM даёт новый `startsAt`) по-прежнему `SEND_RESURFACED`; нет строки в KG, новый fingerprint в группе или сбой SQL — тоже карточка. Critical-повтор остаётся напоминанием каждые 4 ч, но обычной карточкой без ложной 🌀. Флаг `ALERT_SUPPRESS_AM_REPEATS` (по умолчанию включён), `false` — поведение 1.0.30. Чтобы такие алерты не пропали из виду, chronic-дайджест (#stats, раз в 6 ч) получил секцию «🔥 Горят непрерывно > N ч» — открытые строки `kg_alerts` старше `STUCK_ALERTS_MIN_DURATION_HOURS` (24), по которым AM присылал что-то за 12 ч; раньше дайджест считал только число fires, а непрерывный алерт — одна строка, и в него не попадал.
+
+- **Алерт привязывается к объекту, а не к экспортеру метрики.** Еженедельная
+  сверка 31.10.2026: 50% алертов без атрибуции. Разбор живых меток (серия
+  `ALERTS` в VM, сопоставленная с `kg_alerts` по fingerprint Alertmanager-а,
+  480 из 480 строк недели) показал дыры: CPUThrottlingHigh (117 за неделю —
+  метрика cAdvisor без `service`/`job`, только `pod`), ScrapePoolHasNoTargets
+  (объект в `scrape_job`, а не в `service=vmagent`), TargetDown с
+  `job=<ns>/<name>`, namespace-алерты (ProdRestartsSpike, Seq*), нодовые
+  алерты, которые сверка считала «без сервиса». Новый
+  `app/services/alert_target.py` — одна цепочка приоритета меток:
+  алерт про сам экспортер (`*ExporterDown`, `TargetDown{job=<экспортер>}`) →
+  `deployment`/`statefulset`/`daemonset` → `cronjob`/`job_name` → HPA/PDB →
+  app-алерт как раньше → нода → `persistentvolumeclaim` (через
+  `kg_volume_edges`) → `pod` → `container` → `scrape_job`/`job=<ns>/<name>` →
+  `service` → нода без пода → namespace. Её зовут store-путь
+  (`auto_populator`, ключ дедупа `/enrich-and-forward`) и карточка
+  (`enrich_alert`). Исход пишется в `kg_alerts.raw.target_kind`
+  (`service`/`node`/`namespace`/`exporter`/`unresolved`) — без миграции.
+  Экспортер становится целью только для алерта про сам экспортер; список
+  экспортеров один (`alert_target.EXPORTER_SERVICES` + шаблон имени).
+  Сверка считает ноду и namespace атрибуцией, а synthetic DB-узел с живым
+  workload-двойником — настоящим объектом. Короткий rs-hash пода
+  (`bot-service-64f9bdf-th89b`) разбирается в алфавите k8s. История —
+  `python -m app.scripts.reattribute_alerts [--days N] [--apply]` (метки из
+  VM по fingerprint, dry-run по умолчанию). Dry-run на выгрузке недели:
+  без атрибуции 49,6% → 16,9%, из оставшихся 79 из 81 — узлы снесённых
+  после алерта стендов (synthetic), без объекта 2 (0,4%).
 
 ### Изменено
 
