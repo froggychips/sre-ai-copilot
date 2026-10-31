@@ -1,6 +1,7 @@
 import hashlib
 import hmac
 import re
+from datetime import datetime, timedelta
 from typing import Iterable, List, Optional
 
 import structlog
@@ -191,6 +192,28 @@ def _filter_suppressed(
     return passed, suppressed
 
 
+#: Как часто напоминать в логе, что вебхук принимается без подписи. Факт
+#: один и тот же на каждый батч: 31.10.2026 — 359 строк в сутки при трёх
+#: настоящих событиях в логе API. Раз в час достаточно, чтобы его не забыть,
+#: и мало, чтобы он не заслонял остальное. Состояние на процесс.
+_UNAUTH_WARN_INTERVAL = timedelta(hours=1)
+_unauth_last_warned: Optional[datetime] = None
+
+
+def _note_unauthenticated_optin() -> None:
+    global _unauth_last_warned
+    now = datetime.utcnow()
+    if (_unauth_last_warned is None
+            or now - _unauth_last_warned >= _UNAUTH_WARN_INTERVAL):
+        _unauth_last_warned = now
+        log.warning(
+            "alertmanager.webhook_unauthenticated",
+            env=settings.ENV,
+            reason="explicit ALERTMANAGER_ALLOW_UNAUTHENTICATED opt-in",
+            next_reminder_in=str(_UNAUTH_WARN_INTERVAL),
+        )
+
+
 async def verify_alertmanager_signature(request: Request):
     """Verify HMAC-SHA256 signature on AlertManager webhook.
 
@@ -203,11 +226,7 @@ async def verify_alertmanager_signature(request: Request):
     """
     if not settings.ALERTMANAGER_WEBHOOK_SECRET:
         if getattr(settings, "ALERTMANAGER_ALLOW_UNAUTHENTICATED", False):
-            log.warning(
-                "alertmanager.webhook_unauthenticated",
-                env=settings.ENV,
-                reason="explicit ALERTMANAGER_ALLOW_UNAUTHENTICATED opt-in",
-            )
+            _note_unauthenticated_optin()
             return
         log.error(
             "alertmanager.webhook_rejected_no_secret",

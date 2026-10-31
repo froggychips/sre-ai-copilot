@@ -4,6 +4,18 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+### Исправлено
+
+- **Self-health без ложных warn** (#523). `alerts_resolve_freshness` считал
+  залипшим любой открытый алерт старше недели по `fired_at` — и держал warn
+  28 часов на ScrapePoolHasNoTargets ×27, которые AM честно присылает до сих
+  пор; теперь по `coalesce(last_notified_at, fired_at)`, долгие живые алерты
+  видны отдельно в `long_firing_alerts`. `source_coverage` считал молчащим
+  `nats_subjects_sync`, выключенный флагом `NATS_SUBJECTS_PARSER_ENABLED`;
+  выключенные источники идут в `disabled` и статус не поднимают.
+- **`alertmanager.webhook_unauthenticated` раз в час на процесс, а не на
+  каждый батч** (#523): 359 строк в сутки при трёх настоящих событиях.
+
 ### Инфраструктура
 
 - **Alertmanager: info/none больше не забивают прод-группу** (#517).
@@ -73,6 +85,16 @@ All notable changes to this project are documented in this file.
 
 ### Изменено
 
+- **Сборки статики — одна строка `kg_deployments` на namespace** (#521).
+  `Wo_StaticsNewCluster_*` (10–15 в день) раскладывались ns-broadcast-ом на
+  все ~665 сервисов окружения: 963 тыс. строк из 1,24 млн при 1487 билдах,
+  у `preprod-kingdom2/bot-service` 1258 «деплоев» за октябрь, в preprod факт
+  `recent_deploy` был found всегда. Теперь строка одна, на синтетическом узле
+  `statics` (`schema.STATICS_NODE_NAME`); `recent_deploys_for` подмешивает её
+  сервисам как ns-свидетельство (INFERRED 0.6, как прежде),
+  `recent_deploys_for_namespaces` видит без правок, stale-класс берёт
+  `last_ns_deploy_at` по всему namespace. Историю схлопывает
+  `app/scripts/collapse_statics_broadcast.py` (`--apply`, затем VACUUM).
 - **Мёртвый код снят** (#519). Модули без единого импортёра: `app/topology/`,
   `app/ingestion/kubernetes_events.py`, `app/agents/critic.py` (его место
   давно занял `fact_critic`), `app/core/intelligence/next_steps.py`,
@@ -83,6 +105,37 @@ All notable changes to this project are documented in this file.
   `cleanup_false_rollouts`, `backfill_team_owner`. Настройки, которые никто
   не читал: `LOG_LEVEL` (и его env в helm-чарте), `KG_SELF_HEALTH_INTERVAL_MINUTES`,
   `OIDC_WELL_KNOWN_URL`, `REPLAY_MODE`, `CHRONIC_DIGEST_INTERVAL_HOURS`.
+- **Ретеншен таблиц событий** (#522) — отдельный реестр
+  `EVENT_RETENTION_TARGETS` с полом `MIN_EVENT_RETENTION_DAYS=90`, не 7 дней
+  метрик: `kg_deployments` 180 дней, `kg_alerts` 180 и `kg_incidents` 365 по
+  `resolved_at` (открытые не удаляются никогда), `kg_pod_events` 90 по
+  `last_seen`, `kg_remediation_events` 365. До этого срока у событий не было
+  вовсе. `purge_events` идёт из `kg_health_retention` после сэмплов.
+
+- **Helm-чарт удалён** (`helm/`, #524). Деплой с мая идёт только через
+  `deploy.sh` + манифесты `k8s/` (и `kubectl set image` из сборки TeamCity),
+  а чарт разъехался с кластером: в нём не было ни executor-а, ни Postgres,
+  ни CronJob бэкапов, ни витрины сквадов — при этом десяток тестов держал
+  его «в синхроне» с `k8s/`. Сняты `tests/test_helm_ownership_sync.py`,
+  helm-части `test_ops_manifests.py` и `test_worker_metrics.py`,
+  `test_version_consistency.py::test_helm_chart_appversion_matches`; версия
+  живёт в трёх местах (`app/__init__.py`, бейдж README, CHANGELOG).
+- **Доки сверены с кодом** (#524). README: секции про Helm заменены
+  абзацем про `deploy.sh` + `k8s/`, добавлен боевой путь алертов (три
+  endpoint-а и кто куда маршрутизируется; сквады пишутся только в KG через
+  `/store` и в Discord не ходят — осознанно), 12 changelog-буллетов «What's
+  new» убраны из шапки (всё давно в CHANGELOG). `docs/MODULE_DOCS`: ссылки
+  на несуществующие `rules/crash.py`, `deploy.py`, `scheduling.py`,
+  `app/models.py` → реальные `process_crash.py`, `recent_deploy.py`,
+  `failed_scheduling.py`, `app/models/`. `docs/FAQ`: имена env по
+  `app/config.py` (`MODEL_NAME`, `DISCORD_BOT_TOKEN`,
+  `DISCORD_INCIDENT_CHANNEL_ID`, `DISCORD_APPROVERS_*`, `JWT_PUBLIC_KEY`;
+  пустой allowlist аппруверов = fail-closed, а не «любой участник»).
+  `SECURITY.md`: `ALERTMANAGER_REPLAY_SHARED_NONCE` — env-переменная, которую
+  читает `app/security/replay.py`, а не поле Settings. `docs/RUNBOOK`:
+  `helm upgrade` → `kubectl set env` / правка манифестов + `deploy.sh`,
+  ownership-ConfigMap создаётся руками из `config/ownership.yaml`, релизный
+  чек-лист считает три места вместо четырёх.
 
 ### Зависимости
 

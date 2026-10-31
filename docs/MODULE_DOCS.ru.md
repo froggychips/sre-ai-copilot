@@ -31,10 +31,10 @@
 - `app/diagnostics/facts.py`: `FactKind`, `Fact`, `FactStore`, `Verdict`. **Evidence-контракт (v1.0.4)**: `Fact.verdict` ∈ `found` / `absent` / `unknown`; `Fact.unknown(kind, reason)` — единственный способ породить `unknown` (confidence принудительно 0, `epistemic=unknown`, `unknown_reason` обязателен); `epistemic` / `provenance` / `window_min` / `data_age_min`; `FactStore.unknown_kinds()`; `to_prompt_context()` рисует `✓ / ✗ / ?` и предупреждает критика, что `?` — не опровержение.
 - `app/diagnostics/rules/base.py`: `Rule.sources` (поля ctx, от которых зависит правило) и `Rule.run()` = `evaluate()` + понижение `absent` → `unknown`, если объявленный источник помечен в `ctx["source_status"]`; `Rule.source_problem()`. Сторож: `tests/test_evidence_contract.py`.
 - `app/diagnostics/rules/oom.py`: `OOMKilledRule` — сначала структурный шлюз (`_check_pod_state()`), text-regex fallback только при отсутствии exit code; возвращает `observed=False` если целевой exit ≠ 0 и ≠ 137.
-- `app/diagnostics/rules/crash.py`: `ProcessCrashRule` — детектирует SIGSEGV/SIGABRT/ненулевые exit codes.
+- `app/diagnostics/rules/process_crash.py`: `ProcessCrashRule` — детектирует SIGSEGV/SIGABRT/ненулевые exit codes.
 - `app/diagnostics/rules/crashloop.py`: `CrashLoopRule` — детектирует состояние CrashLoopBackOff.
-- `app/diagnostics/rules/scheduling.py`: `FailedSchedulingRule` — детектирует ошибки планирования (ресурсы/taint/affinity).
-- `app/diagnostics/rules/deploy.py`: `RecentDeployRule` — коррелирует время деплоя TeamCity с инцидентом.
+- `app/diagnostics/rules/failed_scheduling.py`: `FailedSchedulingRule` — детектирует ошибки планирования (ресурсы/taint/affinity).
+- `app/diagnostics/rules/recent_deploy.py`: `RecentDeployRule` — коррелирует время деплоя TeamCity с инцидентом.
 
 ## Агенты
 - `app/agents/base.py`: `BaseAgent` — общий метод `ask()`, подключающий LLM backend.
@@ -49,7 +49,6 @@
 - `app/context/logs.py`, `metrics.py`, `deployments.py`: адаптеры k8s-логов, VM-метрик, истории деплоев.
 - `app/context/jira_client.py`: `JiraClient` (Atlassian REST API v3, Basic Auth); `build_jira_context()` → `{open, resolved, has_open, has_resolved, total}` или `None`.
 - `app/core/intelligence/similar_incidents.py`: `SimilarIncidentEngine` — поиск по KG с фильтром `_is_quality_cause()`, `RECURRENCE_WINDOW_DAYS=7`, флаг `recurrence` в каждом результате.
-- `app/core/intelligence/blast_radius.py`, `temporal_diff.py`, `next_steps.py`: вспомогательные аналитические функции.
 
 ## Knowledge Graph
 
@@ -108,10 +107,8 @@
 - `primary_hypothesis()` — top-1 observed Fact; `why_this_matters()` — derived priorization (shared dep, chronic, recurrence, infra-critical team).
 
 ### CLI tools (`app/scripts/`)
-- `backfill_team_owner.py` — one-shot UPDATE `team_owner` для legacy строк.
 - `backfill_tc_deploys.py` — расширенный TC history backfill (default 30 дней).
 - `cleanup_drift.py` — thin wrapper над `drift_cleanup.py` для ручного dry-run / apply.
-- `cleanup_false_rollouts.py` — удаляет записи `k8s_rollout`, которые watcher 1.0.4 писал по росту `metadata.generation` (образы не менялись); dry-run по умолчанию.
 - `reattribute_deploys.py` — переатрибутирует ns-broadcast записи `kg_deployments` на точные цели по build properties TeamCity (`--apply --limit-builds N`).
 - `reattribute_job_alerts.py` — переносит `KubeJobFailed` / `KubeJobNotCompleted` с `vm-kube-state-metrics` на владельца Job/CronJob (`job_attribution`), ужимает или удаляет опустевшие KSM-инциденты и присоединяет алерты к инциденту владельца; dry-run по умолчанию, `--apply` для переноса.
 
@@ -247,7 +244,7 @@
 
 ## Данные и персистентность
 - `app/database.py`, `app/db/*`: engine/session helpers и интеграция БД.
-- `app/models/*` и `app/models.py`: Pydantic/ORM-модели домена.
+- `app/models/`: модели домена — `__init__.py` (SQLAlchemy `Base`, `Conversation`, `Message`), `incident.py` (Pydantic `AlertManagerAlert`, `AlertManagerWebhook`, `Incident`, `FullAnalysisReport`), `remediation_event.py` (`RemediationEventIn`).
 - `app/repository.py`: CRUD-операции разговоров и сообщений.
 
 ## Сервисы и безопасность

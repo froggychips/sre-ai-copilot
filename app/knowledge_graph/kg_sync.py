@@ -1408,6 +1408,12 @@ def _refresh_stale_class_for_namespace(db: Session, namespace: str) -> int:
 
     svc_ids = [s.id for s in services]
     last_service_deploy, last_ns_deploy = _last_deploys_by_service(db, svc_ids)
+    # ns-broadcast — свойство namespace, а не сервиса. Пока `tc_deploys_to_kg`
+    # раскладывал broadcast на каждый сервис, per-service max совпадал с
+    # ns-wide; с 31.10.2026 сборки статики пишутся одной строкой на
+    # синтетический узел `statics`, и «был ли деплой в ns» надо брать по
+    # всем узлам namespace, иначе остальные сервисы ns-свидетельство теряют.
+    ns_wide_last_ns_deploy = max(last_ns_deploy.values(), default=None)
 
     # Живые k8s Service namespace — для правила «-cnpg-rw без клиентов» (#493):
     # он инфра, только если рядом жив алиас `<база>-db-postgresql`. Живость —
@@ -1444,7 +1450,7 @@ def _refresh_stale_class_for_namespace(db: Session, namespace: str) -> int:
             # (см. attribution_known в classify_stale_with_deploys).
             last_deploy_at=None,
             last_service_deploy_at=last_service_deploy.get(svc_id_int),
-            last_ns_deploy_at=last_ns_deploy.get(svc_id_int),
+            last_ns_deploy_at=ns_wide_last_ns_deploy,
             team_owner=cast(Optional[str], svc.team_owner),
             live_service_names=live_service_names,
         )

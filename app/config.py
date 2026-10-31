@@ -465,8 +465,6 @@ class Settings(BaseSettings):
         6, ge=1, description="batch: max hypotheses per LLM call"
     )
 
-    LOG_LEVEL: str = Field("INFO", description="Standard logging level")
-
     DISCORD_WEBHOOK_URL: Optional[str] = Field(None, description="Discord webhook — канал #error (инциденты)")
     DISCORD_WEBHOOK_STATS_URL: Optional[str] = Field(None, description="Discord webhook — канал #stats (cluster health, daily report)")
     # Per-team channel routing. JSON `{"squad-1":"https://discord.com/api/webhooks/.../...", ...}`.
@@ -553,10 +551,6 @@ class Settings(BaseSettings):
     KG_SELF_HEALTH_KNOWN_ZERO_METRICS: str = Field(
         "http_5xx_rate,p95_latency_ms",
         description="CSV колонок kg_service_health которые могут быть 0 — не алёртить",
-    )
-    KG_SELF_HEALTH_INTERVAL_MINUTES: int = Field(
-        30,
-        description="Период beat-задачи kg_self_health_check (для документации; реальный расписан в tasks.py)",
     )
     # Webhook отдельного dev-канала команды copilot. Пусто → Discord-уведомление
     # отключено, остаётся только audit-log. Намеренно НЕ DISCORD_WEBHOOK_URL —
@@ -690,7 +684,6 @@ class Settings(BaseSettings):
 
     # Auth
     JWT_PUBLIC_KEY: str = Field("", description="RSA Public Key for JWT validation")
-    OIDC_WELL_KNOWN_URL: Optional[str] = None
     JWT_ALGORITHM: str = "RS256"
     JWT_AUDIENCE: Optional[str] = None
     # Ожидаемый issuer токена. Без сверки `iss` любой токен, подписанный тем же
@@ -754,7 +747,6 @@ class Settings(BaseSettings):
     )
     SAFE_MODE: bool = True
     APPROVAL_REQUIRED: bool = True
-    REPLAY_MODE: bool = False
 
     # Observability
     # OTLP gRPC endpoint. Пусто → traces не экспортируются (см. setup_telemetry —
@@ -914,7 +906,6 @@ class Settings(BaseSettings):
     # сервисов: alert повторяется ≥CHRONIC_DIGEST_MIN_FIRES за 24h. Идёт
     # в #stats канал (DISCORD_WEBHOOK_STATS_URL), а не в #error — анти-mute.
     CHRONIC_DIGEST_ENABLED: bool = False
-    CHRONIC_DIGEST_INTERVAL_HOURS: int = 6
     CHRONIC_DIGEST_WINDOW_HOURS: int = 24
     CHRONIC_DIGEST_MIN_FIRES: int = 5
     STATS_DIGEST_STALE_DAYS: int = Field(30, description="Threshold days for stale-deployment detection")

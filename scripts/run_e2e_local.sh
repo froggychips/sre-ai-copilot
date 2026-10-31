@@ -37,7 +37,6 @@ export TEAMCITY_WEB_URL=https://wo-teamcity.lastoasisgame.com
 export TC_LOOKBACK_MINUTES=10080                # неделя — гарантированно что-нибудь найдём
 export SAFE_MODE=true
 export APPROVAL_REQUIRED=false
-export LOG_LEVEL=INFO
 NAMESPACE="${E2E_NAMESPACE:-preprod-shared}"
 
 API_PORT=8888
