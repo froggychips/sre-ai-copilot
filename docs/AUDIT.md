@@ -114,7 +114,7 @@ span.events:
 2. structlog audit log → Loki (already implemented, stdout)
 3. Critical spans (`sre.risk.level=high`, `sre.guardrail.decision=blocked`) → 100% tail-based sampling
 
-**Helm**: `values.yaml` exposes `env.otlpExporterEndpoint`. Point it at your OTEL Collector ClusterIP.
+**Kubernetes**: set `OTLP_EXPORTER_ENDPOINT` in the `env:` of the api/worker Deployments (`k8s/base/deployment.yaml`, `k8s/worker.yaml`) to your OTEL Collector ClusterIP; empty (the default) means traces are not exported.
 
 ---
 

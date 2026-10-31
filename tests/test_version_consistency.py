@@ -4,10 +4,12 @@
 FastAPI отдавал `1.0.0-rc.3` (двенадцать релизов назад), Helm-чарт
 `1.0.0-rc.8`, README-бейдж и CHANGELOG `1.0.0-rc.15`. Каждое место
 обновлялось руками и по отдельности, поэтому расхождение накапливалось молча
-и обнаруживалось случайно.
+и обнаруживалось случайно. Helm-чарт удалён 31.10.2026 (деплой идёт через
+`deploy.sh` + `k8s/`), мест осталось три: `app/__init__.py`, бейдж README и
+верхняя релизная секция CHANGELOG.
 
 Тест намеренно проверяет ИМЕННО те поверхности, которые видит человек снаружи:
-`/docs` и OpenAPI-схему, установленный чарт, README и CHANGELOG.
+`/docs` и OpenAPI-схему, README и CHANGELOG.
 """
 import json
 import re
@@ -35,19 +37,6 @@ def test_fastapi_reports_the_same_version():
 
     assert app.version == __version__
 
-
-def test_helm_chart_appversion_matches():
-    """appVersion чарта описывает, что реально крутится в кластере.
-
-    Расхождение уже случалось: в чарте стояло 0.5.0, когда в ns sre-ai
-    работал 1.0.0-rc.7 — репозиторий врал о собственном проде.
-    """
-    chart = (REPO_ROOT / "helm" / "sre-ai-copilot" / "Chart.yaml").read_text(encoding="utf-8")
-    m = re.search(r'^appVersion:\s*"([^"]+)"', chart, re.MULTILINE)
-    assert m, "в Chart.yaml не найден appVersion"
-    assert m.group(1) == __version__, (
-        f"Chart.yaml appVersion={m.group(1)}, а app.__version__={__version__}"
-    )
 
 
 def test_readme_badge_matches():

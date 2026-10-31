@@ -4,6 +4,18 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+### Исправлено
+
+- **Self-health без ложных warn** (#523). `alerts_resolve_freshness` считал
+  залипшим любой открытый алерт старше недели по `fired_at` — и держал warn
+  28 часов на ScrapePoolHasNoTargets ×27, которые AM честно присылает до сих
+  пор; теперь по `coalesce(last_notified_at, fired_at)`, долгие живые алерты
+  видны отдельно в `long_firing_alerts`. `source_coverage` считал молчащим
+  `nats_subjects_sync`, выключенный флагом `NATS_SUBJECTS_PARSER_ENABLED`;
+  выключенные источники идут в `disabled` и статус не поднимают.
+- **`alertmanager.webhook_unauthenticated` раз в час на процесс, а не на
+  каждый батч** (#523): 359 строк в сутки при трёх настоящих событиях.
+
 ### Инфраструктура
 
 - **Alertmanager: info/none больше не забивают прод-группу** (#517).
@@ -79,32 +91,31 @@ All notable changes to this project are documented in this file.
   `resolved_at` (открытые не удаляются никогда), `kg_pod_events` 90 по
   `last_seen`, `kg_remediation_events` 365. До этого срока у событий не было
   вовсе. `purge_events` идёт из `kg_health_retention` после сэмплов.
-- **Очередь `sync` для тяжёлых синков, `single_instance` на всех beat-задачах**
-  (#525). Четыре слота `copilot-worker` (2 × `--concurrency=2`) делили
-  35 beat-записей (~95 запусков в час) и инцидентный пайплайн: часовой
-  `kg_topology_sync` (4–10 мин) и 15-минутный `tc_deploys_to_kg` занимали
-  слоты, минутная `kg_external_probe` с `expires=50` и инцидент ждали за
-  ними. Теперь 11 тяжёлых (`SYNC_QUEUE_TASKS`: topology, tc_deploys, storage,
-  metrics, endpoints, signal_aggregates, health_retention,
-  topology_resources, anomaly_detection, runtime_correlation,
-  nats_subjects) уходят через `task_routes` в очередь `sync`
-  (`SYNC_QUEUE_NAME`), её слушает новый Deployment `copilot-worker-sync`
-  (1 × `--concurrency=2`, `-Q sync -n sync@%h`, те же env/SA/пробы/3Gi);
-  `copilot-worker` получил явный `-Q celery`. Лок `single_instance` стоял
-  на 17 задачах из 35 — теперь на всех (ttl ≈ интервал, у probe 50 с); у
-  восьми тяжёлых свои `soft_time_limit`/`time_limit` (tc_deploys 600/720,
-  metrics и anomaly 420/540, endpoints 300/420, storage и
-  runtime_correlation 900/1080, signal_aggregates 900/1200,
-  topology_resources 600/720; topology/retention/nats — глобальные
-  1500/1800). `celery_queue_length` был Gauge, который никто не выставлял
-  (вечный ноль под `CopilotCeleryBacklog`) — теперь Collector читает `LLEN`
-  по очередям на скрейпе api, с лейблом `queue`; правило — `max by (queue)`.
-  Новый воркер добавлен в NetworkPolicy, VMPodScrape, `deploy.sh` (rollout
-  status, подсказки scale) и получил `CopilotWorkerSyncDown`; тест «у каждого
-  celery-воркера есть правило Down» заодно нашёл, что его нет у
-  `copilot-executor` — добавлен `CopilotExecutorDown` (warning). Первый
-  раскат — только `deploy.sh`: TC-деплой делает `set image` по известным
-  deployment-ам и новый не создаст.
+
+- **Helm-чарт удалён** (`helm/`, #524). Деплой с мая идёт только через
+  `deploy.sh` + манифесты `k8s/` (и `kubectl set image` из сборки TeamCity),
+  а чарт разъехался с кластером: в нём не было ни executor-а, ни Postgres,
+  ни CronJob бэкапов, ни витрины сквадов — при этом десяток тестов держал
+  его «в синхроне» с `k8s/`. Сняты `tests/test_helm_ownership_sync.py`,
+  helm-части `test_ops_manifests.py` и `test_worker_metrics.py`,
+  `test_version_consistency.py::test_helm_chart_appversion_matches`; версия
+  живёт в трёх местах (`app/__init__.py`, бейдж README, CHANGELOG).
+- **Доки сверены с кодом** (#524). README: секции про Helm заменены
+  абзацем про `deploy.sh` + `k8s/`, добавлен боевой путь алертов (три
+  endpoint-а и кто куда маршрутизируется; сквады пишутся только в KG через
+  `/store` и в Discord не ходят — осознанно), 12 changelog-буллетов «What's
+  new» убраны из шапки (всё давно в CHANGELOG). `docs/MODULE_DOCS`: ссылки
+  на несуществующие `rules/crash.py`, `deploy.py`, `scheduling.py`,
+  `app/models.py` → реальные `process_crash.py`, `recent_deploy.py`,
+  `failed_scheduling.py`, `app/models/`. `docs/FAQ`: имена env по
+  `app/config.py` (`MODEL_NAME`, `DISCORD_BOT_TOKEN`,
+  `DISCORD_INCIDENT_CHANNEL_ID`, `DISCORD_APPROVERS_*`, `JWT_PUBLIC_KEY`;
+  пустой allowlist аппруверов = fail-closed, а не «любой участник»).
+  `SECURITY.md`: `ALERTMANAGER_REPLAY_SHARED_NONCE` — env-переменная, которую
+  читает `app/security/replay.py`, а не поле Settings. `docs/RUNBOOK`:
+  `helm upgrade` → `kubectl set env` / правка манифестов + `deploy.sh`,
+  ownership-ConfigMap создаётся руками из `config/ownership.yaml`, релизный
+  чек-лист считает три места вместо четырёх.
 
 ### Зависимости
 

@@ -73,11 +73,18 @@ spec:
 
     # warn держится сутки — значит это не «моргнуло», а состояние, которое
     # никто не разбирает.
+    #
+    # severity: warning, а не info (31.10.2026). Путь enrich-and-forward
+    # info-алерты в Discord не постит — алерт горел 28 часов, API писал
+    # `enrich_forward.send_not_delivered` каждые 5–10 минут, и никто ничего
+    # не видел. С 31.10 info ещё и маршрутизируется в /store без Discord
+    # (k8s/vmalertmanagerconfig.yaml), так что warning — единственный уровень,
+    # на котором собственная тревога копилота доходит до людей.
     - alert: CopilotSelfHealthWarnStuck
       expr: copilot_self_health_check_status == 1
       for: 24h
       labels:
-        severity: info
+        severity: warning
         team: platform
       annotations:
         summary: "проверка {{ $labels.check }} сутки в warn"

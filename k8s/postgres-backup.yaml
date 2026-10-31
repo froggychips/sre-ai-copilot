@@ -3,78 +3,127 @@
 # Если используется CloudNativePG (postgres.cnpg.yaml.example), бэкапы уже
 # идут через barmanObjectStore + ScheduledBackup, и этот CronJob не нужен.
 #
-# Бакет / endpoint / credentials лежат в Secret `postgres-backup-s3`
-# (создать через ExternalSecret из общего secret store).
-#
-# УСТРОЙСТВО: дамп и загрузка разнесены по контейнерам, потому что
-# runAsUser=999 + readOnlyRootFilesystem=true исключают установку пакетов в
-# рантайме (старый вариант `apk add aws-cli` падал первой же командой — job
-# не отработал НИ РАЗУ, «RPO ≈ 24ч» был фикцией):
-#   initContainer  pg-dump   (postgres:15-alpine)  → дамп в emptyDir /backup
-#   container      s3-upload (amazon/aws-cli)      → aws s3 cp из /backup
-# Падение любого из них = Failed Job → алерт SREAICopilotPostgresBackup*
-# (см. k8s/prometheus-rules.yaml).
+# 31.10.2026: манифест синхронизирован с живым объектом (в репо лежала
+# старая версия с emptyDir и обязательным секретом; живой CronJob с
+# 19.08.2026 устроен иначе — см. ниже). Две линии защиты:
+#   initContainer  pg-dump   (postgres:15-alpine)  → дамп на ПОСТОЯННЫЙ том
+#                  postgres-backup-data (local-path 20Gi, retention BACKUP_KEEP=7)
+#   container      s3-upload (amazon/aws-cli)      → aws s3 cp в
+#                  s3://$BUCKET/postgres/ — только если есть Secret
+#                  postgres-backup-s3 (ключи BUCKET / ACCESS_KEY_ID /
+#                  SECRET_ACCESS_KEY / REGION, все optional). Без секрета Job
+#                  зелёный с локальным дампом; но local-path привязан к ноде,
+#                  потеря ноды = потеря дампов — секрет нужен.
+# Падение pg-dump = Failed Job → алерт CopilotPostgresBackupFailed
+# (k8s/monitoring.yaml). runAsUser=999 + readOnlyRootFilesystem: никаких
+# установок пакетов в рантайме (старый `apk add aws-cli` не работал ни разу).
 
 apiVersion: v1
 kind: ServiceAccount
 metadata:
   name: postgres-backup
 ---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  labels:
+    app.kubernetes.io/part-of: sre-ai-copilot
+  name: postgres-backup-data
+spec:
+  accessModes:
+  - ReadWriteOnce
+  resources:
+    requests:
+      storage: 20Gi
+  storageClassName: local-path
+---
 apiVersion: batch/v1
 kind: CronJob
 metadata:
   name: postgres-backup
 spec:
-  # Ежедневно в 02:00 UTC. RPO ≈ 24ч — задокументировано в docs/DR.md.
-  # Для меньшего RPO — PITR через WAL (cnpg.yaml.example).
-  schedule: "0 2 * * *"
   concurrencyPolicy: Forbid
-  successfulJobsHistoryLimit: 3
   failedJobsHistoryLimit: 5
   jobTemplate:
     spec:
-      backoffLimit: 2
       activeDeadlineSeconds: 3600
+      backoffLimit: 2
       template:
-        metadata:
-          labels:
-            app: postgres-backup
         spec:
-          serviceAccountName: postgres-backup
-          restartPolicy: OnFailure
-          securityContext:
-            runAsNonRoot: true
-            runAsUser: 999
-            fsGroup: 999
-          initContainers:
-          - name: pg-dump
-            image: postgres:15-alpine
+          containers:
+          - command:
+            - /bin/sh
+            - -ec
+            - |
+              dump_name="$(cat /backup/LATEST)"
+
+              # Выгрузка наружу — ВТОРАЯ линия защиты, а не единственная.
+              # Локальный дамп уже сделан init-контейнером и лежит на
+              # постоянном томе. Если секрета postgres-backup-s3 нет, ронять
+              # Job нельзя: это превратило бы работающий локальный бэкап в
+              # «бэкапа нет» — ровно то состояние, в котором система прожила
+              # год до 19.08.2026.
+              if [ -z "${S3_BUCKET:-}" ]; then
+                echo "S3_BUCKET не задан — выгрузка пропущена."
+                echo "Локальный дамп: /backup/${dump_name} (том postgres-backup-data)."
+                echo "ВНИМАНИЕ: том привязан к ноде, потеря ноды = потеря дампа."
+                echo "Чтобы включить выгрузку, создай секрет postgres-backup-s3"
+                echo "с ключами BUCKET / ACCESS_KEY_ID / SECRET_ACCESS_KEY / REGION."
+                exit 0
+              fi
+
+              echo "Uploading /backup/${dump_name} -> s3://${S3_BUCKET}/postgres/"
+              aws s3 cp "/backup/${dump_name}" "s3://${S3_BUCKET}/postgres/${dump_name}"
+              echo "Backup complete: ${dump_name}"
+            env:
+            - name: HOME
+              value: /tmp
+            - name: S3_BUCKET
+              valueFrom:
+                secretKeyRef:
+                  key: BUCKET
+                  name: postgres-backup-s3
+                  optional: true
+            - name: AWS_ACCESS_KEY_ID
+              valueFrom:
+                secretKeyRef:
+                  key: ACCESS_KEY_ID
+                  name: postgres-backup-s3
+                  optional: true
+            - name: AWS_SECRET_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  key: SECRET_ACCESS_KEY
+                  name: postgres-backup-s3
+                  optional: true
+            - name: AWS_DEFAULT_REGION
+              valueFrom:
+                secretKeyRef:
+                  key: REGION
+                  name: postgres-backup-s3
+                  optional: true
+            image: amazon/aws-cli:2.17.52
+            name: s3-upload
+            resources:
+              limits:
+                cpu: 500m
+                memory: 512Mi
+              requests:
+                cpu: 100m
+                memory: 128Mi
             securityContext:
-              readOnlyRootFilesystem: true
               allowPrivilegeEscalation: false
               capabilities:
-                drop: ["ALL"]
-            env:
-            - name: PGHOST
-              value: "postgres"
-            - name: PGPORT
-              value: "5432"
-            - name: PGUSER
-              valueFrom:
-                secretKeyRef:
-                  name: postgres-secret
-                  key: POSTGRES_USER
-            - name: PGPASSWORD
-              valueFrom:
-                secretKeyRef:
-                  name: postgres-secret
-                  key: POSTGRES_PASSWORD
-            - name: PGDATABASE
-              valueFrom:
-                secretKeyRef:
-                  name: postgres-secret
-                  key: POSTGRES_DB
-            command:
+                drop:
+                - ALL
+              readOnlyRootFilesystem: true
+            volumeMounts:
+            - mountPath: /backup
+              name: backup
+            - mountPath: /tmp
+              name: tmp
+          initContainers:
+          - command:
             - /bin/sh
             - -ec
             - |
@@ -88,6 +137,38 @@ spec:
               # Имя файла для upload-контейнера (basename, без пути).
               basename "${dump_file}" > /backup/LATEST
               echo "Dump complete: $(basename "${dump_file}")"
+
+              # Ретеншен: держим последние KEEP дампов. Без него том заполнится
+              # молча, и первым сломается именно бэкап — то, что должно
+              # работать, когда сломалось всё остальное.
+              KEEP=${BACKUP_KEEP:-7}
+              ls -1t /backup/sre-ai-*.sql.gz 2>/dev/null | tail -n +$((KEEP + 1)) | while read -r old; do
+                echo "Retention: removing $(basename "$old")"
+                rm -f "$old"
+              done
+              echo "Kept: $(ls -1 /backup/sre-ai-*.sql.gz 2>/dev/null | wc -l) dumps, free: $(df -h /backup | tail -1 | awk '{print $4}')"
+            env:
+            - name: PGHOST
+              value: postgres
+            - name: PGPORT
+              value: '5432'
+            - name: PGUSER
+              valueFrom:
+                secretKeyRef:
+                  key: POSTGRES_USER
+                  name: postgres-secret
+            - name: PGPASSWORD
+              valueFrom:
+                secretKeyRef:
+                  key: POSTGRES_PASSWORD
+                  name: postgres-secret
+            - name: PGDATABASE
+              valueFrom:
+                secretKeyRef:
+                  key: POSTGRES_DB
+                  name: postgres-secret
+            image: postgres:15-alpine
+            name: pg-dump
             resources:
               limits:
                 cpu: 500m
@@ -95,67 +176,27 @@ spec:
               requests:
                 cpu: 100m
                 memory: 128Mi
-            volumeMounts:
-            - name: backup
-              mountPath: /backup
-          containers:
-          - name: s3-upload
-            # aws-cli уже внутри образа — НИКАКИХ установок в рантайме
-            # (readOnlyRootFilesystem это и не позволит).
-            image: amazon/aws-cli:2.17.52
             securityContext:
-              readOnlyRootFilesystem: true
               allowPrivilegeEscalation: false
               capabilities:
-                drop: ["ALL"]
-            env:
-            # aws-cli пишет кэш/конфиг в $HOME — направляем во writable emptyDir.
-            - name: HOME
-              value: "/tmp"
-            - name: S3_BUCKET
-              valueFrom:
-                secretKeyRef:
-                  name: postgres-backup-s3
-                  key: BUCKET
-            - name: AWS_ACCESS_KEY_ID
-              valueFrom:
-                secretKeyRef:
-                  name: postgres-backup-s3
-                  key: ACCESS_KEY_ID
-            - name: AWS_SECRET_ACCESS_KEY
-              valueFrom:
-                secretKeyRef:
-                  name: postgres-backup-s3
-                  key: SECRET_ACCESS_KEY
-            - name: AWS_DEFAULT_REGION
-              valueFrom:
-                secretKeyRef:
-                  name: postgres-backup-s3
-                  key: REGION
-            command:
-            - /bin/sh
-            - -ec
-            - |
-              dump_name="$(cat /backup/LATEST)"
-              echo "Uploading /backup/${dump_name} -> s3://${S3_BUCKET}/postgres/"
-              aws s3 cp "/backup/${dump_name}" "s3://${S3_BUCKET}/postgres/${dump_name}"
-              echo "Backup complete: ${dump_name}"
-            resources:
-              limits:
-                cpu: 500m
-                memory: 512Mi
-              requests:
-                cpu: 100m
-                memory: 128Mi
+                drop:
+                - ALL
+              readOnlyRootFilesystem: true
             volumeMounts:
-            - name: backup
-              mountPath: /backup
-            - name: tmp
-              mountPath: /tmp
+            - mountPath: /backup
+              name: backup
+          restartPolicy: OnFailure
+          securityContext:
+            fsGroup: 999
+            runAsNonRoot: true
+            runAsUser: 999
+          serviceAccountName: postgres-backup
           volumes:
           - name: backup
-            emptyDir:
-              sizeLimit: 5Gi
-          - name: tmp
-            emptyDir:
+            persistentVolumeClaim:
+              claimName: postgres-backup-data
+          - emptyDir:
               sizeLimit: 128Mi
+            name: tmp
+  schedule: 0 2 * * *
+  successfulJobsHistoryLimit: 3

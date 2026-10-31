@@ -31,10 +31,10 @@
 - `app/diagnostics/facts.py`: `FactKind`, `Fact`, `FactStore`, `Verdict`. **Evidence contract (v1.0.4)**: `Fact.verdict` ∈ `found` / `absent` / `unknown`; `Fact.unknown(kind, reason)` is the only way to produce `unknown` (confidence forced to 0, `epistemic=unknown`, `unknown_reason` mandatory); `epistemic` / `provenance` / `window_min` / `data_age_min`; `FactStore.unknown_kinds()`; `to_prompt_context()` renders `✓ / ✗ / ?` and warns the critic that `?` is not a refutation.
 - `app/diagnostics/rules/base.py`: `Rule.sources` (ctx fields the rule depends on) and `Rule.run()` = `evaluate()` + demotion of `absent` → `unknown` when a declared source is listed in `ctx["source_status"]`; `Rule.source_problem()`. Guard: `tests/test_evidence_contract.py`.
 - `app/diagnostics/rules/oom.py`: `OOMKilledRule` — structured gate first (`_check_pod_state()`), text-regex fallback only when target pod has no exit code data; returns `observed=False` if target exit ≠ 0 and ≠ 137.
-- `app/diagnostics/rules/crash.py`: `ProcessCrashRule` — detects SIGSEGV/SIGABRT/non-zero exit codes.
+- `app/diagnostics/rules/process_crash.py`: `ProcessCrashRule` — detects SIGSEGV/SIGABRT/non-zero exit codes.
 - `app/diagnostics/rules/crashloop.py`: `CrashLoopRule` — detects CrashLoopBackOff state.
-- `app/diagnostics/rules/scheduling.py`: `FailedSchedulingRule` — detects resource/taint/affinity scheduling failures.
-- `app/diagnostics/rules/deploy.py`: `RecentDeployRule` — correlates TeamCity deploy timing with incident.
+- `app/diagnostics/rules/failed_scheduling.py`: `FailedSchedulingRule` — detects resource/taint/affinity scheduling failures.
+- `app/diagnostics/rules/recent_deploy.py`: `RecentDeployRule` — correlates TeamCity deploy timing with incident.
 
 ## Agents
 - `app/agents/base.py`: `BaseAgent` — shared `ask()` method wiring LLM backend.
@@ -49,7 +49,6 @@
 - `app/context/logs.py`, `metrics.py`, `deployments.py`: Adapters for k8s logs, VM metrics, deploy history.
 - `app/context/jira_client.py`: `JiraClient` (Atlassian REST API v3 Basic Auth); `build_jira_context()` → `{open, resolved, has_open, has_resolved, total}` or `None`.
 - `app/core/intelligence/similar_incidents.py`: `SimilarIncidentEngine` — KG search with `_is_quality_cause()` filter, `RECURRENCE_WINDOW_DAYS=7`, `recurrence` flag per result.
-- `app/core/intelligence/blast_radius.py`, `temporal_diff.py`, `next_steps.py`: Supporting analysis helpers.
 
 ## Knowledge Graph
 
@@ -112,10 +111,8 @@ Read-side API used by enrichment + MCP tools:
 - `EnrichedContext.why_this_matters()` — derived priorization signals from `_matter_signals()`: shared dep (`total_inbound > 20`), chronic (`pod_event.count > 1000`), recurrence pattern, `team_owner=platform`.
 
 ### CLI tools (`app/scripts/`)
-- `backfill_team_owner.py` — one-shot UPDATE of `kg_services.team_owner` for legacy rows.
 - `backfill_tc_deploys.py` — extended TC history backfill (default 30 days, limit 1000).
 - `cleanup_drift.py` — thin wrapper over `drift_cleanup.py` for manual run / dry-run preview.
-- `cleanup_false_rollouts.py` — removes `k8s_rollout` rows written by the 1.0.4 watcher from `metadata.generation` growth (images unchanged); dry-run by default.
 - `reattribute_deploys.py` — re-attributes ns-broadcast `kg_deployments` rows to exact targets from TeamCity build properties (`--apply --limit-builds N`).
 - `reattribute_job_alerts.py` — moves `KubeJobFailed` / `KubeJobNotCompleted` alerts from `vm-kube-state-metrics` to the Job/CronJob owner (`job_attribution`), shrinks or deletes the emptied KSM incidents and attaches the alerts to the owner's incident; dry-run by default, `--apply` to move.
 
@@ -199,8 +196,7 @@ Read-side API used by enrichment + MCP tools:
   через `populator.upsert_edge` (`extras.discovery_sources`).
 - **Cluster-wide RBAC**: требует `services`, `ingresses`, `deployments`,
   `statefulsets`, `daemonsets` на verbs
-  `get`/`list`/`watch` в ClusterRole (см. `k8s/base/rbac.yaml`,
-  `helm/sre-ai-copilot/templates/rbac.yaml`).
+  `get`/`list`/`watch` в ClusterRole (см. `k8s/base/rbac.yaml`).
 - **Без feature flag** — declarative, idempotent, нет внешних зависимостей
   кроме `kubectl` в окружении worker-pod-а.
 - **Failure mode**: `subprocess.TimeoutExpired` или non-zero exit kubectl —
@@ -454,7 +450,7 @@ Read-side API used by enrichment + MCP tools:
 
 ## Data & Persistence
 - `app/database.py`, `app/db/*`: Engine/session helpers and database integration.
-- `app/models/*` and `app/models.py`: Pydantic/ORM domain models.
+- `app/models/`: domain models — `__init__.py` (SQLAlchemy `Base`, `Conversation`, `Message`), `incident.py` (Pydantic `AlertManagerAlert`, `AlertManagerWebhook`, `Incident`, `FullAnalysisReport`), `remediation_event.py` (`RemediationEventIn`).
 - `app/repository.py`: CRUD operations for conversations and messages.
 
 ## Services & Safety

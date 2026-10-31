@@ -54,6 +54,21 @@ spec:
       containers:
         - name: postgres
           image: postgres:15-alpine
+          # 31.10.2026: образ стартовал на дефолтах — shared_buffers 128 МБ при
+          # БД 5,3 ГБ и лимите 2Gi, work_mem 4 МБ, без pg_stat_statements
+          # (медленный синк диагностировали вслепую, см. 16.10 ниже).
+          # Значения под limits.memory 2Gi: буферы четверть, остальное —
+          # page cache. Расширение после рестарта создаётся один раз:
+          #   CREATE EXTENSION IF NOT EXISTS pg_stat_statements;
+          args:
+            - -c
+            - shared_buffers=512MB
+            - -c
+            - work_mem=16MB
+            - -c
+            - effective_cache_size=1536MB
+            - -c
+            - shared_preload_libraries=pg_stat_statements
           ports:
             - containerPort: 5432
               name: postgres

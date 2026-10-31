@@ -130,7 +130,7 @@ spec:
       port: 6443
   # VictoriaMetrics (vmsingle...monitoring:8428) — metrics_sync, enrichment.
   # AlertManager   (vmalertmanager...monitoring:9093) — resolve-sync.
-  # Дефолтные URL: app/config.py (VICTORIA_METRICS_URL / ALERTMANAGER_URL).
+  # Дефолтные URL: app/config.py (VICTORIA_METRICS_URL / ALERTMANAGER_API_URL).
   - to:
     - namespaceSelector: {}
     ports:

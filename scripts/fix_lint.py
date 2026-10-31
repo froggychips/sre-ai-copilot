@@ -6,15 +6,6 @@ from pathlib import Path
 
 # Map of file paths to fixes
 FIXES = {
-    "app/core/intelligence/blast_radius.py": [
-        ("from typing import List\n\nimport structlog", "import structlog"),
-    ],
-    "app/core/intelligence/next_steps.py": [
-        ("from typing import Dict\n\nimport structlog", "import structlog"),
-    ],
-    "app/ingestion/kubernetes_events.py": [
-        ("import time\n\nfrom typing import List\n\nimport structlog", "import structlog"),
-    ],
     "app/observability/ai_metrics.py": [
         (
             "from prometheus_client import Summary\n\nfrom app.models import IncidentRecord",
@@ -32,12 +23,6 @@ FIXES = {
         (
             "from anthropic import AsyncAnthropic\nfrom app.config import settings\nfrom app.services.resilience import llm_retry_strategy\nfrom app.services.claude_cli_service import ClaudeCliService\nimport logging\nimport asyncio\nfrom httpx import TimeoutException, AsyncClient",
             "import asyncio\nimport logging\n\nfrom anthropic import AsyncAnthropic\n\nfrom app.config import settings\nfrom app.services.claude_cli_service import ClaudeCliService\nfrom app.services.resilience import llm_retry_strategy",
-        ),
-    ],
-    "app/rca/explainer.py": [
-        (
-            "import structlog\nfrom app.core.intelligence.next_steps import NextStepsGenerator\nfrom app.core.intelligence.similar_incidents import SimilarIncidentEngine\nfrom app.core.intelligence.temporal_diff import TemporalDiffEngine",
-            "import structlog",
         ),
     ],
 }
