@@ -31,10 +31,10 @@
 - `app/diagnostics/facts.py`: `FactKind`, `Fact`, `FactStore`, `Verdict`. **Evidence contract (v1.0.4)**: `Fact.verdict` ∈ `found` / `absent` / `unknown`; `Fact.unknown(kind, reason)` is the only way to produce `unknown` (confidence forced to 0, `epistemic=unknown`, `unknown_reason` mandatory); `epistemic` / `provenance` / `window_min` / `data_age_min`; `FactStore.unknown_kinds()`; `to_prompt_context()` renders `✓ / ✗ / ?` and warns the critic that `?` is not a refutation.
 - `app/diagnostics/rules/base.py`: `Rule.sources` (ctx fields the rule depends on) and `Rule.run()` = `evaluate()` + demotion of `absent` → `unknown` when a declared source is listed in `ctx["source_status"]`; `Rule.source_problem()`. Guard: `tests/test_evidence_contract.py`.
 - `app/diagnostics/rules/oom.py`: `OOMKilledRule` — structured gate first (`_check_pod_state()`), text-regex fallback only when target pod has no exit code data; returns `observed=False` if target exit ≠ 0 and ≠ 137.
-- `app/diagnostics/rules/crash.py`: `ProcessCrashRule` — detects SIGSEGV/SIGABRT/non-zero exit codes.
+- `app/diagnostics/rules/process_crash.py`: `ProcessCrashRule` — detects SIGSEGV/SIGABRT/non-zero exit codes.
 - `app/diagnostics/rules/crashloop.py`: `CrashLoopRule` — detects CrashLoopBackOff state.
-- `app/diagnostics/rules/scheduling.py`: `FailedSchedulingRule` — detects resource/taint/affinity scheduling failures.
-- `app/diagnostics/rules/deploy.py`: `RecentDeployRule` — correlates TeamCity deploy timing with incident.
+- `app/diagnostics/rules/failed_scheduling.py`: `FailedSchedulingRule` — detects resource/taint/affinity scheduling failures.
+- `app/diagnostics/rules/recent_deploy.py`: `RecentDeployRule` — correlates TeamCity deploy timing with incident.
 
 ## Agents
 - `app/agents/base.py`: `BaseAgent` — shared `ask()` method wiring LLM backend.
@@ -196,8 +196,7 @@ Read-side API used by enrichment + MCP tools:
   через `populator.upsert_edge` (`extras.discovery_sources`).
 - **Cluster-wide RBAC**: требует `services`, `ingresses`, `deployments`,
   `statefulsets`, `daemonsets` на verbs
-  `get`/`list`/`watch` в ClusterRole (см. `k8s/base/rbac.yaml`,
-  `helm/sre-ai-copilot/templates/rbac.yaml`).
+  `get`/`list`/`watch` в ClusterRole (см. `k8s/base/rbac.yaml`).
 - **Без feature flag** — declarative, idempotent, нет внешних зависимостей
   кроме `kubectl` в окружении worker-pod-а.
 - **Failure mode**: `subprocess.TimeoutExpired` или non-zero exit kubectl —
@@ -451,7 +450,7 @@ Read-side API used by enrichment + MCP tools:
 
 ## Data & Persistence
 - `app/database.py`, `app/db/*`: Engine/session helpers and database integration.
-- `app/models/*` and `app/models.py`: Pydantic/ORM domain models.
+- `app/models/`: domain models — `__init__.py` (SQLAlchemy `Base`, `Conversation`, `Message`), `incident.py` (Pydantic `AlertManagerAlert`, `AlertManagerWebhook`, `Incident`, `FullAnalysisReport`), `remediation_event.py` (`RemediationEventIn`).
 - `app/repository.py`: CRUD operations for conversations and messages.
 
 ## Services & Safety
