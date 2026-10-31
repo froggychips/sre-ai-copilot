@@ -47,6 +47,14 @@ spec:
         - app.workers.tasks.celery_app
         - worker
         - --loglevel=info
+        # ТОЛЬКО очередь `celery` (пайплайн инцидентов, лёгкие и минутные
+        # beat-задачи). Тяжёлые синки — SYNC_QUEUE_TASKS в
+        # app/workers/tasks.py — уезжают в очередь `sync`, которую слушает
+        # copilot-worker-sync ниже. Без -Q воркер и так слушал бы только
+        # default-очередь, но контракт «кто что слушает» должен читаться
+        # из манифеста, а не из дефолтов celery.
+        - -Q
+        - celery
         # concurrency=2, НЕ 4 — см. арифметику в resources ниже.
         - --concurrency=2
         ports:
@@ -296,6 +304,184 @@ spec:
   selector:
     matchLabels:
       app: copilot-worker
+
+---
+# copilot-worker-sync — воркер очереди `sync`: тяжёлые синки KG отдельно от
+# пайплайна и минутных задач.
+#
+# Аудит 31.10.2026: copilot-worker (2 реплики × concurrency=2 = четыре
+# слота) разбирал одну очередь на всё — 35 beat-записей (~95 запусков в час),
+# process_incident и remediation_verify. Часовой kg_topology_sync (4–10 мин)
+# и 15-минутный tc_deploys_to_kg занимали слоты, а минутная kg_external_probe
+# с expires=50 с и инцидентный пайплайн ждали за ними. Расписание со
+# смещениями (см. комментарии к beat_schedule) лечило только память, не
+# очередь.
+#
+# Решение то же, что у copilot-executor: своя очередь, свой deployment.
+# Какие задачи сюда уезжают — SYNC_QUEUE_TASKS в app/workers/tasks.py
+# (маршрутизация task_routes, beat об очереди не знает). Тот же образ, тот
+# же SA sre-ai, те же env и тома, что у copilot-worker: задача не должна
+# вести себя по-разному в зависимости от того, какой воркер её взял —
+# за равенством env следит tests/test_ops_manifests.py.
+#
+# Одна реплика: синки под single_instance-локами и так не параллелятся, а
+# два слота concurrency=2 хватает на ~30 запусков в час (сумма расписаний
+# задач sync). PDB намеренно нет — minAvailable=1 при одной реплике
+# блокировал бы drain ноды навсегда, а потеря пода на минуту для часовых
+# синков безвредна (acks_late вернёт задачу в очередь).
+#
+# ПЕРВЫЙ РАСКАТ — только deploy.sh (apply k8s/worker.yaml): TC-деплой делает
+# `kubectl set image` по известным ему deployment-ам и этот не создаст.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: copilot-worker-sync
+  labels:
+    app: copilot-worker-sync
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: copilot-worker-sync
+  template:
+    metadata:
+      labels:
+        app: copilot-worker-sync
+    spec:
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: env
+                    operator: In
+                    values: ["dev"]
+      serviceAccountName: sre-ai
+      automountServiceAccountToken: true
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        fsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+      - name: worker
+        # IMAGE_PLACEHOLDER подставляет deploy.sh — тот же образ, что у
+        # copilot-worker (см. комментарий там про registry).
+        image: IMAGE_PLACEHOLDER
+        imagePullPolicy: IfNotPresent
+        command:
+        - celery
+        - -A
+        - app.workers.tasks.celery_app
+        - worker
+        - --loglevel=info
+        # ТОЛЬКО очередь sync: default-очередь (пайплайн, лёгкие задачи)
+        # этот под не берёт, иначе инцидент снова встал бы за топологией.
+        - -Q
+        - sync
+        # Два слота: синки под локами не параллелятся сами с собой, а два
+        # разных (topology + metrics) могут идти рядом. Память — см. resources.
+        - --concurrency=2
+        # Имя celery-нода `sync@<pod>`: отличается от `celery@` воркеров и
+        # читается в `inspect`-выводе; liveness-проба целится в него же.
+        - -n
+        - sync@%h
+        ports:
+        # Тот же сервер метрик на :8001, что у copilot-worker; VMPodScrape
+        # перечисляет copilot-worker-sync в селекторе.
+        - containerPort: 8001
+          name: metrics
+        securityContext:
+          readOnlyRootFilesystem: true
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop: ["ALL"]
+        envFrom:
+        - secretRef:
+            name: sre-ai-secrets
+        # env — КОПИЯ copilot-worker, обоснование каждой переменной там.
+        # Менять только вместе: тест сверяет списки один в один.
+        env:
+        - name: PROMETHEUS_MULTIPROC_DIR
+          value: /tmp/prometheus-multiproc
+        - name: ENV
+          value: "production"
+        - name: SAFE_MODE
+          value: "true"
+        - name: EXECUTOR_DISPATCH
+          value: "queue"
+        - name: SEQ_SQUAD_DISCOVERY_ENABLED
+          value: "true"
+        - name: ALERTMANAGER_ALLOW_UNAUTHENTICATED
+          value: "true"
+        - name: OWNERSHIP_MANIFEST_PATH
+          value: /config/ownership.yaml
+        - name: PEOPLE_MANIFEST_PATH
+          value: /config/people.json
+        - name: TC_USERS_TOKEN
+          valueFrom:
+            secretKeyRef:
+              name: squad-dashboard-secrets
+              key: tc_token
+              optional: true
+        - name: BUILD_VERSION
+          value: "BUILD_VERSION_PLACEHOLDER"
+        - name: STATS_DIGEST_ENABLED
+          value: "true"
+        - name: OWNERSHIP_BACKFILL_ENABLED
+          value: "true"
+        - name: DISCORD_DRY_RUN
+          value: "false"
+        # Проба та же, что у copilot-worker, и по тем же причинам (`-b`
+        # вместо `-A`, `-d` на свой нод, 5 минут grace); отличается только
+        # destination — имя нода задано выше через `-n sync@%h`.
+        livenessProbe:
+          exec:
+            command:
+            - sh
+            - -c
+            - 'celery -b "$REDIS_URL" inspect ping -d "sync@${HOSTNAME:-$(hostname)}" -t 10'
+          initialDelaySeconds: 120
+          periodSeconds: 60
+          timeoutSeconds: 15
+          failureThreshold: 5
+        # Те же лимиты, что у copilot-worker: 3 процесса × ~170Mi базы плюс
+        # рабочая куча синков (kg_topology_resources_sync — 244 МБ пик,
+        # kg_topology_sync — 229) и kubectl-subprocess в том же cgroup.
+        # Guaranteed QoS (requests == limits) — выселяется последним.
+        resources:
+          limits:
+            cpu: 600m
+            memory: 3Gi
+          requests:
+            cpu: 600m
+            memory: 3Gi
+        volumeMounts:
+        - name: ownership
+          mountPath: /config/ownership.yaml
+          subPath: ownership.yaml
+          readOnly: true
+        - name: people
+          mountPath: /config/people.json
+          subPath: people.json
+          readOnly: true
+        - name: tmp
+          mountPath: /tmp
+        - name: prometheus-multiproc
+          mountPath: /tmp/prometheus-multiproc
+      volumes:
+      - name: prometheus-multiproc
+        emptyDir: {}
+      - name: ownership
+        configMap:
+          name: sre-ai-copilot-ownership
+      - name: people
+        configMap:
+          name: sre-ai-copilot-people
+          optional: true
+      - name: tmp
+        emptyDir: {}
 
 ---
 # Celery beat — планировщик периодических задач (kg_topology_sync hourly и др.).

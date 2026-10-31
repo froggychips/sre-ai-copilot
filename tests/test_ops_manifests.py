@@ -253,3 +253,160 @@ def test_worker_exposes_metrics_port() -> None:
         f"каталог {env['PROMETHEUS_MULTIPROC_DIR']} вне смонтированных томов "
         f"({mounts}), а readOnlyRootFilesystem запрещает запись"
     )
+
+
+# ── copilot-worker-sync: очередь `sync` отдельным deployment-ом ─────────────
+#
+# 31.10.2026: тяжёлые синки (SYNC_QUEUE_TASKS в app/workers/tasks.py) уехали
+# из общей очереди в `sync`, которую слушает copilot-worker-sync. Контракт
+# держится на трёх строках в разных файлах — `-Q` в манифесте, имя очереди в
+# Settings, task_routes в коде — и ни одна поломка не видна в рендере:
+# задачи просто лягут в очередь, которую никто не читает.
+
+
+def _k8s_deployment(manifest: str, name: str) -> dict:
+    docs = yaml.safe_load_all((_K8S_DIR / manifest).read_text(encoding="utf-8"))
+    for doc in docs:
+        if isinstance(doc, dict) and doc.get("kind") == "Deployment" \
+                and doc["metadata"]["name"] == name:
+            return doc
+    raise AssertionError(f"{manifest}: Deployment {name} не найден")
+
+
+def _celery_queues(container: dict) -> list:
+    cmd = container["command"]
+    return [cmd[i + 1] for i, arg in enumerate(cmd) if arg == "-Q"]
+
+
+def test_each_worker_listens_to_its_own_queue_only() -> None:
+    from app.config import settings
+    from app.workers.tasks import celery_app
+
+    worker = _k8s_deployment("worker.yaml", "copilot-worker")
+    sync = _k8s_deployment("worker.yaml", "copilot-worker-sync")
+    w_cont = worker["spec"]["template"]["spec"]["containers"][0]
+    s_cont = sync["spec"]["template"]["spec"]["containers"][0]
+
+    assert _celery_queues(w_cont) == [celery_app.conf.task_default_queue], (
+        "copilot-worker обязан слушать только default-очередь: без явного "
+        "-Q контракт «кто что слушает» живёт в дефолтах celery"
+    )
+    assert _celery_queues(s_cont) == [settings.SYNC_QUEUE_NAME], (
+        "copilot-worker-sync слушает только очередь sync, иначе инцидентный "
+        "пайплайн снова встанет за kg_topology_sync"
+    )
+    assert settings.SYNC_QUEUE_NAME != celery_app.conf.task_default_queue
+
+
+def test_sync_worker_is_a_single_replica_with_two_slots() -> None:
+    sync = _k8s_deployment("worker.yaml", "copilot-worker-sync")
+    cmd = sync["spec"]["template"]["spec"]["containers"][0]["command"]
+    assert sync["spec"]["replicas"] == 1
+    assert "--concurrency=2" in cmd
+    assert cmd[cmd.index("-n") + 1] == "sync@%h"
+
+
+def test_sync_worker_probe_targets_its_own_node() -> None:
+    """`-n sync@%h` без `-d "sync@…"` в пробе = проба спрашивает несуществующий
+    `celery@<pod>` и рестартует здоровый под каждые 5 минут."""
+    cont = _k8s_deployment("worker.yaml", "copilot-worker-sync")["spec"]["template"]["spec"]["containers"][0]
+    script = cont["livenessProbe"]["exec"]["command"][-1]
+    assert "inspect ping" in script
+    assert re.search(r'-d\s+"sync@', script), script
+    assert " -A " not in f" {script} "
+    assert '"$REDIS_URL"' in script
+
+
+def test_sync_worker_mirrors_worker_runtime() -> None:
+    """Задача не должна вести себя иначе от того, какой воркер её взял.
+
+    Env, Secret, SA, тома, лимиты и тайминги пробы — один в один с
+    copilot-worker; отличаются только очередь, имя нода и destination пробы.
+    """
+    worker = _k8s_deployment("worker.yaml", "copilot-worker")
+    sync = _k8s_deployment("worker.yaml", "copilot-worker-sync")
+    w_spec, s_spec = worker["spec"]["template"]["spec"], sync["spec"]["template"]["spec"]
+    w_cont, s_cont = w_spec["containers"][0], s_spec["containers"][0]
+
+    assert s_spec["serviceAccountName"] == w_spec["serviceAccountName"] == "sre-ai"
+    assert s_spec["securityContext"] == w_spec["securityContext"]
+    assert s_spec["affinity"] == w_spec["affinity"]
+    assert s_cont["env"] == w_cont["env"], "env разъехался — править оба"
+    assert s_cont["envFrom"] == w_cont["envFrom"]
+    assert s_cont["resources"] == w_cont["resources"]
+    assert s_cont["securityContext"] == w_cont["securityContext"]
+    assert s_cont["image"] == w_cont["image"]
+    assert {m["mountPath"] for m in s_cont["volumeMounts"]} == \
+        {m["mountPath"] for m in w_cont["volumeMounts"]}
+    assert {v["name"] for v in s_spec["volumes"]} == {v["name"] for v in w_spec["volumes"]}
+    assert {p["containerPort"] for p in s_cont["ports"]} == \
+        {p["containerPort"] for p in w_cont["ports"]}
+
+    w_probe = dict(w_cont["livenessProbe"])
+    s_probe = dict(s_cont["livenessProbe"])
+    w_probe.pop("exec"), s_probe.pop("exec")
+    assert s_probe == w_probe, "тайминги пробы обоснованы в copilot-worker — те же"
+
+
+def test_sync_worker_has_no_min_available_pdb() -> None:
+    """minAvailable=1 при одной реплике блокирует drain ноды навсегда."""
+    docs = [d for d in yaml.safe_load_all((_K8S_DIR / "worker.yaml").read_text(encoding="utf-8"))
+            if isinstance(d, dict) and d.get("kind") == "PodDisruptionBudget"]
+    for pdb in docs:
+        selector = pdb["spec"]["selector"]["matchLabels"]
+        if selector.get("app") == "copilot-worker-sync":
+            assert "minAvailable" not in pdb["spec"], pdb["metadata"]["name"]
+
+
+def test_network_policy_and_scrape_cover_both_workers() -> None:
+    policy = next(d for d in yaml.safe_load_all((_K8S_DIR / "networkpolicy.yaml").read_text(encoding="utf-8"))
+                  if isinstance(d, dict) and d.get("kind") == "NetworkPolicy")
+    selected = policy["spec"]["podSelector"]["matchExpressions"][0]["values"]
+    assert {"copilot-worker", "copilot-worker-sync"} <= set(selected), (
+        "воркер вне NetworkPolicy = открытые egress/ingress"
+    )
+
+    scrape = next(d for d in yaml.safe_load_all((_K8S_DIR / "monitoring.yaml").read_text(encoding="utf-8"))
+                  if isinstance(d, dict) and d.get("kind") == "VMPodScrape")
+    scraped = scrape["spec"]["selector"]["matchExpressions"][0]["values"]
+    assert {"copilot-worker", "copilot-worker-sync"} <= set(scraped)
+
+
+def _vmrule_alerts() -> dict:
+    rule = next(d for d in yaml.safe_load_all((_K8S_DIR / "monitoring.yaml").read_text(encoding="utf-8"))
+                if isinstance(d, dict) and d.get("kind") == "VMRule")
+    return {r["alert"]: r for g in rule["spec"]["groups"] for r in g["rules"] if "alert" in r}
+
+
+def test_every_celery_worker_deployment_has_a_down_alert() -> None:
+    """Воркер без правила «ноль реплик» умирает молча — как второй воркер, у
+    которого нет ни пайплайна, ни пробы, по которым заметили бы остановку."""
+    alerts = _vmrule_alerts()
+    exprs = " ".join(str(r["expr"]) for r in alerts.values())
+    for _name, _kind, workload, container in _iter_workload_containers():
+        cmd = container.get("command") or []
+        if "celery" not in cmd or "worker" not in cmd:
+            continue
+        assert f'deployment="{workload}"' in exprs, (
+            f"{workload}: celery-воркер без правила CopilotXxxDown в k8s/monitoring.yaml"
+        )
+    assert alerts["CopilotWorkerSyncDown"]["labels"]["severity"] == "critical"
+
+
+def test_celery_backlog_alert_is_per_queue() -> None:
+    """Метрика с лейблом queue; без `by (queue)` сумма скрыла бы, какая из
+    очередей встала, а без агрегации алерт дублировался бы по api-подам."""
+    expr = str(_vmrule_alerts()["CopilotCeleryBacklog"]["expr"])
+    assert "celery_queue_length" in expr
+    assert "by (queue)" in expr
+
+
+def test_deploy_sh_waits_for_sync_worker_rollout() -> None:
+    text = (_REPO_ROOT / "deploy.sh").read_text(encoding="utf-8")
+    loop = text[text.index("for d in "):].splitlines()[0]
+    assert "copilot-worker-sync" in loop, (
+        "rollout status не ждёт copilot-worker-sync — упавший выкат sync-воркера "
+        "отчитается как Deploy OK"
+    )
+    # Подсказки про остановку писателей перед миграцией — тоже с ним.
+    assert "scale deploy copilot-worker copilot-worker-sync copilot-beat --replicas=0" in text

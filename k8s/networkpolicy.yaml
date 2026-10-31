@@ -23,7 +23,10 @@ spec:
       # kube-apiserver 6443 (kubectl), postgres, redis, Discord API 443
       # (followup после apply). Не попав в список, он остался бы вне
       # политики вовсе, то есть с открытым egress/ingress.
-      values: ["sre-ai-api", "copilot-worker", "copilot-beat", "sre-ai-migrate", "copilot-executor"]
+      # copilot-worker-sync (31.10.2026) — тот же код и те же источники,
+      # что у copilot-worker (kube-apiserver, VM, Seq, TeamCity, statics),
+      # только очередь `sync`; без строки здесь он тоже был бы вне политики.
+      values: ["sre-ai-api", "copilot-worker", "copilot-worker-sync", "copilot-beat", "sre-ai-migrate", "copilot-executor"]
   policyTypes:
   - Ingress
   - Egress

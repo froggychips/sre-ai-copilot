@@ -149,7 +149,8 @@ def _run_statics_sync(observe_result):
 
     with patch("app.services.statics_service.observe_statics_version",
                return_value=observe_result), \
-         patch.object(m.settings, "STATICS_TRACK_ENVS", "prod,preprod"):
+         patch.object(m.settings, "STATICS_TRACK_ENVS", "prod,preprod"), \
+         patch("app.workers.task_lock._redis_client", return_value=None):
         return m.kg_statics_versions_sync_task()
 
 
@@ -228,4 +229,30 @@ def test_every_data_source_declares_its_status(task):
     assert any(w in src for w in _STATUS_WRAPPERS), (
         f"{task} не проставляет source_status: оберни return в _src_status / "
         "_src_polled / _src_seq (см. source_status.py)"
+    )
+
+
+# ── Каждая beat-задача — под single_instance ────────────────────────────────
+#
+# 31.10.2026: лок стоял на 17 из 35 beat-задач. Без лока второй экземпляр
+# стартует поверх первого, как только прогон перерастает интервал (замер
+# 14.08.2026 — kg_storage_sync и kg_anomaly_detection_task парами в
+# unacked), а с acks_late повторная доставка после смерти воркера даёт
+# дубль дайджеста в канал. Исключение здесь — только с причиной.
+
+#: Задачи, которым лок осознанно НЕ нужен → причина. Сейчас пусто: даже
+#: минутной kg_external_probe лок дешевле дубля (ttl=50 < тика).
+_LOCK_EXEMPT: dict = {}
+
+
+@pytest.mark.parametrize("entry,task", sorted(
+    (entry, cfg["task"]) for entry, cfg in celery_app.conf.beat_schedule.items()
+))
+def test_every_beat_task_is_single_instance(entry, task):
+    if task in _LOCK_EXEMPT:
+        pytest.skip(_LOCK_EXEMPT[task])
+    run = celery_app.tasks[task].run
+    assert getattr(run, "lock_lease_seconds", None) is not None, (
+        f"{task} ({entry}) без @single_instance: второй экземпляр стартует "
+        "поверх первого, как только прогон перерастёт интервал"
     )

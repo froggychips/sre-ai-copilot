@@ -169,6 +169,68 @@ if settings.CELERY_TASK_ALWAYS_EAGER:
     celery_app.conf.task_always_eager = True
     celery_app.conf.task_eager_propagates = True
 
+# ── Очередь `sync`: тяжёлые синки отдельно от пайплайна и минутных задач ────
+#
+# Аудит 31.10.2026: Deployment copilot-worker — 2 реплики × --concurrency=2,
+# то есть ЧЕТЫРЕ слота на всё: 35 записей beat (~95 запусков в час),
+# process_incident и remediation_verify. Слоты делили задачи несопоставимого
+# веса: kg_topology_sync на ровном часе идёт 4 минуты (бывает 10+),
+# tc_deploys_to_kg каждые 15 минут ходит в TeamCity за сутки сборок,
+# kg_metrics_sync шесть раз в час опрашивает VictoriaMetrics по каждому
+# сервису, — а рядом стоит kg_external_probe с тиком в минуту и expires=50 с
+# и инцидентный пайплайн, которому важна задержка старта. Когда два тяжёлых
+# синка занимали два слота, а инцидент — третий, минутная проба просто
+# протухала в очереди (см. также замер в task_lock.py: kg_topology_sync ждал
+# свободный слот час при собственных 95 секундах).
+#
+# Лечение — то же, что у executor-а (EXECUTOR_QUEUE_NAME): отдельная очередь
+# и отдельный deployment `copilot-worker-sync` (k8s/worker.yaml, 1 реплика ×
+# concurrency=2, `-Q sync`). copilot-worker слушает только `celery`
+# (`-Q celery` там же): пайплайн и лёгкие задачи больше не стоят за синками,
+# а синки не выбивают пайплайн из памяти — у каждого свой лимит 3Gi.
+#
+# Критерий отбора — замеры и докстринги, а не «всё с kg_ в имени»:
+#   * kg_topology_sync — обход ~200 namespace, 4–10 мин, 229 МБ пик;
+#   * tc_deploys_to_kg — TeamCity за 24 ч + upsert kg_deployments, 4 раза в час;
+#   * kg_storage_sync, kg_anomaly_detection_task — 14.08.2026 оба висели в
+#     unacked по два экземпляра: прогон перерастал интервал;
+#   * kg_metrics_sync — per-service запросы к одиночному vmsingle, наложение
+#     его перегружало (recon 2026-06-05);
+#   * kg_endpoints_sync — ~55 с, 122 МБ пик; kg_topology_resources_sync —
+#     Services+Ingresses cluster-wide, 244 МБ пик;
+#   * kg_signal_aggregates_compute — SQL-агрегаты по всему графу за 24 ч;
+#   * kg_runtime_correlation_sync — «дорогой запрос», скользящее окно 7 дней;
+#   * kg_health_retention — ночное удаление батчами из шести таблиц;
+#   * kg_nats_subjects_sync — git clone + grep по монорепе (выключен по
+#     умолчанию, но если включат — ему место здесь).
+# Остальные остаются в `celery`: они либо короткие (один kubectl get,
+# один SQL), либо им важна задержка (kg_deploy_watch — «успеть до алерта»,
+# kg_external_probe, kg_incidents_lifecycle, дайджесты по часам).
+#
+# Маршрутизация через task_routes, а не `queue=` в apply_async: beat и api
+# ставят задачи по имени и об очереди не знают; достаточно одного списка.
+# В eager-режиме (тесты) task_routes безвредны — задача исполняется на месте.
+SYNC_QUEUE_TASKS: frozenset = frozenset({
+    "kg_topology_sync",
+    "tc_deploys_to_kg",
+    "kg_storage_sync",
+    "kg_metrics_sync",
+    "kg_endpoints_sync",
+    "kg_signal_aggregates_compute",
+    "kg_health_retention",
+    "kg_topology_resources_sync",
+    "kg_anomaly_detection_task",
+    "kg_runtime_correlation_sync",
+    "kg_nats_subjects_sync",
+})
+
+celery_app.conf.task_routes = {
+    name: {"queue": settings.SYNC_QUEUE_NAME} for name in sorted(SYNC_QUEUE_TASKS)
+}
+# Явно, а не дефолтом: copilot-worker запускается с `-Q celery`, и имя
+# очереди по умолчанию теперь — контракт между кодом и манифестом.
+celery_app.conf.task_default_queue = "celery"
+
 celery_app.conf.beat_schedule = {
     "kg-topology-sync": {
         "task": "kg_topology_sync",
@@ -698,6 +760,8 @@ async def async_process_incident(
             db.close()
 
 
+# Очередь `sync` (SYNC_QUEUE_TASKS). Лимиты — глобальные 1500/1800: это
+# самый долгий штатный прогон (4–10 мин, обход ~200 namespace), запас нужен.
 @celery_app.task(name="kg_topology_sync")
 @single_instance(ttl_seconds=3600)
 def kg_topology_sync_task():
@@ -763,7 +827,9 @@ def kg_nodes_sync_task():
         db.close()
 
 
-@celery_app.task(name="kg_topology_resources_sync")
+# Очередь `sync`. Интервал 15 мин, 244 МБ пик: прогон длиннее 10 минут —
+# это уже не синк, а зависший kubectl, и его лучше снять до следующего тика.
+@celery_app.task(name="kg_topology_resources_sync", soft_time_limit=600, time_limit=720)
 @single_instance(ttl_seconds=3600)
 def kg_topology_resources_sync_task():
     """Wave 7 / G1.3: declarative k8s Service + Ingress resources → KG.
@@ -864,6 +930,7 @@ def remediation_verify_task(incident_id: str, attempt: int = 1):
 
 
 @celery_app.task(name="kg_jobs_sync")
+@single_instance(ttl_seconds=900)
 def kg_jobs_sync_task():
     """KG Coverage #1: k8s Job + CronJob → kg_k8s_jobs (per 15 мин).
 
@@ -885,7 +952,9 @@ def kg_jobs_sync_task():
         db.close()
 
 
-@celery_app.task(name="kg_storage_sync")
+# Очередь `sync`. Интервал 30 мин; 14.08.2026 прогон перерастал его и копии
+# висели в unacked парами — лимит 15/18 мин снимает зависший раньше тика.
+@celery_app.task(name="kg_storage_sync", soft_time_limit=900, time_limit=1080)
 @single_instance(ttl_seconds=1800)
 def kg_storage_sync_task():
     """KG Coverage #2: sync PVC + PV + uses_volume/bound_to edges.
@@ -907,7 +976,10 @@ def kg_storage_sync_task():
         db.close()
 
 
+# ttl=50 — короче минутного тика и expires=50 в beat: аренда лока равна
+# ttl (min(LEASE, ttl)), иначе смерть воркера съедала бы следующий тик.
 @celery_app.task(name="kg_external_probe")
+@single_instance(ttl_seconds=50)
 def kg_external_probe_task():
     """External probe: DNS+TCP+HTTPS на synthetic `ingress:<host>` узлы.
 
@@ -929,6 +1001,7 @@ def kg_external_probe_task():
 
 
 @celery_app.task(name="kg_health_recompute")
+@single_instance(ttl_seconds=1200)
 def kg_health_recompute_task():
     """ChatGPT review #4.3: composite health score per real service."""
     from app.knowledge_graph.health_score import recompute_all_health
@@ -944,6 +1017,7 @@ def kg_health_recompute_task():
 
 
 @celery_app.task(name="kg_alerts_resolve_sync")
+@single_instance(ttl_seconds=900)
 def kg_alerts_resolve_sync_task():
     """Точка роста #2: AlertEvent.resolved_at refresh из AM API."""
     import asyncio as _aio
@@ -1074,7 +1148,9 @@ def kg_db_edge_rehome_task():
         db.close()
 
 
-@celery_app.task(name="kg_endpoints_sync")
+# Очередь `sync`. ~55 с штатно при интервале 15 мин: пять минут — уже
+# аномалия (endpoints по 4,7 тыс. Service, но это один kubectl get).
+@celery_app.task(name="kg_endpoints_sync", soft_time_limit=300, time_limit=420)
 @single_instance(ttl_seconds=900)
 def kg_endpoints_sync_task():
     """Сверить Service-узлы с реальными endpoints кластера.
@@ -1099,6 +1175,8 @@ def kg_endpoints_sync_task():
         db.close()
 
 
+# Очередь `sync`. Лимиты глобальные (1500/1800): удаление батчами из шести
+# таблиц раз в сутки может идти долго, и обрывать его тиком незачем.
 @celery_app.task(name="kg_health_retention")
 @single_instance(ttl_seconds=3600)
 def kg_health_retention_task():
@@ -1140,6 +1218,7 @@ def kg_health_retention_task():
 
 
 @celery_app.task(name="kg_drift_cleanup")
+@single_instance(ttl_seconds=1800)
 def kg_drift_cleanup_task():
     """D2-auto: пометить services из несуществующих ns как synthetic.
 
@@ -1160,6 +1239,7 @@ def kg_drift_cleanup_task():
 
 
 @celery_app.task(name="discord_dedup_purge")
+@single_instance(ttl_seconds=900)
 def discord_dedup_purge_task():
     """Janitor discord_dedup: удалить stale-строки PATCH-dedup.
 
@@ -1177,7 +1257,11 @@ def discord_dedup_purge_task():
         return {"error": str(e)}
 
 
-@celery_app.task(name="tc_deploys_to_kg")
+# Очередь `sync`. Интервал 15 мин, expires 810: TeamCity за сутки сборок +
+# upsert — 10 минут с запасом; дольше значит TC не отвечает, и ждать его
+# следующий тик всё равно не будет.
+@celery_app.task(name="tc_deploys_to_kg", soft_time_limit=600, time_limit=720)
+@single_instance(ttl_seconds=900)
 def tc_deploys_to_kg_task():
     """Pull recent TC deploys → upsert в kg_deployments. БЕЗ LLM-вызовов.
 
@@ -1441,6 +1525,7 @@ async def _tc_deploys_to_kg_logic() -> dict:
 
 
 @celery_app.task(name="chronic_alerts_digest")
+@single_instance(ttl_seconds=1800)
 def chronic_alerts_digest_task():
     """L5: список «хронически тлеющих» сервисов в канал #stats.
 
@@ -1463,7 +1548,10 @@ def chronic_alerts_digest_task():
         db.close()
 
 
-@celery_app.task(name="kg_metrics_sync")
+# Очередь `sync`. Интервал 10 мин, expires 540: наложение прогонов
+# перегружало одиночный vmsingle (recon 2026-06-05), поэтому hard-лимит
+# равен expires — зависший опрос снимается до того, как придёт следующий.
+@celery_app.task(name="kg_metrics_sync", soft_time_limit=420, time_limit=540)
 @single_instance(ttl_seconds=1800)
 def kg_metrics_sync_task():
     """Per-service метрики из VM → kg_service_health (snapshot per ~10 мин)."""
@@ -1480,6 +1568,7 @@ def kg_metrics_sync_task():
 
 
 @celery_app.task(name="kg_cluster_health_sync")
+@single_instance(ttl_seconds=270)
 def kg_cluster_health_sync_task():
     """Global cluster snapshot из VM → kg_cluster_observations (per ~5 мин)."""
     from app.knowledge_graph.cluster_health_sync import sync_cluster_health
@@ -1495,6 +1584,7 @@ def kg_cluster_health_sync_task():
 
 
 @celery_app.task(name="kg_ingress_observations_sync")
+@single_instance(ttl_seconds=540)
 def kg_ingress_observations_sync_task():
     """Per ingress endpoint metrics → kg_ingress_observations (per ~10 мин)."""
     from app.knowledge_graph.ingress_observations_sync import \
@@ -1510,7 +1600,10 @@ def kg_ingress_observations_sync_task():
         db.close()
 
 
-@celery_app.task(name="kg_signal_aggregates_compute")
+# Очередь `sync`. Ежечасно, чистый SQL по всему графу за 24 ч: 15/20 мин —
+# потолок, за которым агрегаты уже не «предрасчёт», а конкурент синкам за БД.
+@celery_app.task(name="kg_signal_aggregates_compute", soft_time_limit=900, time_limit=1200)
+@single_instance(ttl_seconds=1800)
 def kg_signal_aggregates_compute_task():
     """Pre-compute per-service агрегатов сигналов из KG (24h окно, hourly)."""
     from app.knowledge_graph.signal_aggregates import compute_signal_aggregates
@@ -1525,7 +1618,9 @@ def kg_signal_aggregates_compute_task():
         db.close()
 
 
-@celery_app.task(name="kg_anomaly_detection_task")
+# Очередь `sync`. Интервал 10 мин, expires 540; 14.08.2026 копии висели в
+# unacked парами — hard-лимит равен expires, как у kg_metrics_sync.
+@celery_app.task(name="kg_anomaly_detection_task", soft_time_limit=420, time_limit=540)
 @single_instance(ttl_seconds=1800)
 def kg_anomaly_detection_task():
     """Rolling z-score аномалии по kg_service_health → kg_anomaly_observations.
@@ -1544,7 +1639,10 @@ def kg_anomaly_detection_task():
         db.close()
 
 
-@celery_app.task(name="kg_runtime_correlation_sync")
+# Очередь `sync`. Интервал 30 мин, скользящее окно 7 дней — «дорогой
+# запрос» по докстрингу; 15/18 мин, чтобы не дожить до следующего тика.
+@celery_app.task(name="kg_runtime_correlation_sync", soft_time_limit=900, time_limit=1080)
+@single_instance(ttl_seconds=1500)
 def kg_runtime_correlation_sync_task():
     """Подтверждение existing edges через co-occurrence warning-событий.
 
@@ -1579,6 +1677,7 @@ def kg_runtime_correlation_sync_task():
 
 
 @celery_app.task(name="daily_stats_digest")
+@single_instance(ttl_seconds=1800)
 def daily_stats_digest_task():
     """Daily Discord-stats report. Pure data-aggregation, БЕЗ LLM-вызовов.
 
@@ -1605,6 +1704,7 @@ def daily_stats_digest_task():
 
 
 @celery_app.task(name="team_daily_digest")
+@single_instance(ttl_seconds=1800)
 def team_daily_digest_task():
     """Daily per-team Discord digest. Pure data-aggregation, БЕЗ LLM.
 
@@ -1627,6 +1727,7 @@ def team_daily_digest_task():
 
 
 @celery_app.task(name="kg_self_health_check")
+@single_instance(ttl_seconds=1500)
 def kg_self_health_check_task():
     """KG self-health canary (Wave 5 retrospective).
 
@@ -1732,6 +1833,7 @@ async def _kg_self_health_logic() -> dict:
 
 
 @celery_app.task(name="kg_stuck_alerts_check")
+@single_instance(ttl_seconds=1800)
 def kg_stuck_alerts_check_task():
     """Stuck-alerts escalation: firing >MIN_DURATION_HOURS без resolved_at.
 
@@ -1847,6 +1949,7 @@ def kg_seq_logs_sync_task():
 
 
 @celery_app.task(name="kg_statics_versions_sync")
+@single_instance(ttl_seconds=270)
 def kg_statics_versions_sync_task():
     """Statics version delta tracking → Redis (per ~5 мин).
 
@@ -1907,6 +2010,8 @@ def kg_statics_versions_sync_task():
     return _src_status({"envs": len(envs), "observed": observed, "with_prev": changed}, observed=('observed',), unavailable=('skipped',))
 
 
+# Очередь `sync`: git clone + grep по монорепе. Лимиты глобальные —
+# задача редкая (6 ч) и по умолчанию выключена.
 @celery_app.task(name="kg_nats_subjects_sync")
 @single_instance(ttl_seconds=3600)
 def kg_nats_subjects_sync_task():
@@ -1939,6 +2044,7 @@ def kg_nats_subjects_sync_task():
 
 
 @celery_app.task(name="kg_ownership_backfill")
+@single_instance(ttl_seconds=1800)
 def kg_ownership_backfill_task():
     """Periodic backfill team_owner через multi-signal inference.
 
