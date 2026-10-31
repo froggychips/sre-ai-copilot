@@ -936,6 +936,32 @@ def remediation_verify_task(incident_id: str, attempt: int = 1):
     return result
 
 
+@celery_app.task(
+    name="remediation_bridge",
+    # Без autoretry: повтор моста — новый батч Alertmanager-а через
+    # group_interval, а дедуп предложений (6 ч) не даст второй карточки.
+    # acks_late — глобальный (см. «Late acknowledgement»): смерть воркера
+    # вернёт задачу, повтор безопасен тем же дедупом.
+    soft_time_limit=120,
+    time_limit=180,
+)
+def remediation_bridge_task(incident_data: dict, card_key: str | None = None):
+    """Детерминированный мост правила → playbook → карточка для одного алерта.
+
+    Ставится из API (`app/remediation/bridge_dispatch.py`) на `/store` и
+    `/enrich-and-forward`. Обогащение, K8sFacts, dry-run и запись решений —
+    здесь, в воркере, а не в event loop API (инцидент 31.10.2026).
+    """
+    from app.models.incident import Incident
+    from app.remediation.bridge import run_bridge_for_incident
+
+    incident = Incident.model_validate(incident_data)
+    outcomes = asyncio.run(run_bridge_for_incident(incident, card_key=card_key))
+    logger.info("remediation_bridge.done incident=%s outcomes=%s",
+                incident.incident_id, [o.get("outcome") for o in outcomes])
+    return outcomes
+
+
 @celery_app.task(name="kg_jobs_sync")
 @single_instance(ttl_seconds=900)
 def kg_jobs_sync_task():

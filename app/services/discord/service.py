@@ -531,6 +531,35 @@ def _render_compact_warning_line(
     return " · ".join(parts)
 
 
+def _enriched_card_namespaces(contexts: List["EnrichedContext"]) -> List[str]:
+    """Namespace-ы группы в порядке батча, без повторов (как в заголовке)."""
+    namespaces: List[str] = []
+    for c in contexts:
+        ns = c.incident.namespace or c.incident.labels.get("namespace") or "?"
+        if ns not in namespaces:
+            namespaces.append(ns)
+    return namespaces
+
+
+def enriched_card_key(contexts: List["EnrichedContext"]) -> Optional[str]:
+    """Ключ PATCH-дедупа карточки, которую `send_enriched_alert` шлёт по группе.
+
+    Тот же состав, что в `send_enriched_alert` → `_post_or_patch_enriched`.
+    По нему задача моста находит message_id уже отправленной карточки и
+    дописывает строку «заблокирован policy» (bridge.annotate_enriched_card).
+    """
+    if not contexts:
+        return None
+    head = contexts[0]
+    namespaces = _enriched_card_namespaces(contexts)
+    return _compute_enriched_key(
+        alertname=head.incident.labels.get("alertname", "unknown"),
+        namespace=("+".join(sorted(namespaces)) if namespaces else None),
+        service_name=head.service,
+        severity=(head.incident.severity or "unknown").lower(),
+    )
+
+
 class DiscordService:
     async def send_report(self, report_text: str):
         if settings.DISCORD_DRY_RUN:
@@ -1521,13 +1550,7 @@ class DiscordService:
         env_part = f"{env.upper()} · " if env else ""
 
         # namespace список (если несколько алертов одного типа в разных ns)
-        namespaces = []
-        seen_ns = set()
-        for c in contexts:
-            ns = c.incident.namespace or c.incident.labels.get("namespace") or "?"
-            if ns not in seen_ns:
-                seen_ns.add(ns)
-                namespaces.append(ns)
+        namespaces = _enriched_card_namespaces(contexts)
 
         ns_str = ", ".join(namespaces[:4]) + (f" (+{len(namespaces) - 4})" if len(namespaces) > 4 else "")
         # У нодовых алертов сервиса нет, а pod — это `vm-node-exporter-XXXXX`,
@@ -2558,6 +2581,20 @@ class DiscordService:
         # Берём новый embed (с актуальными KG-данными — KG mог обновиться
         # за окно дедупа), но обновляем footer counter'ом.
         patched_embed = dict(embed)
+        # Поле «Remediation» дописывает задача моста уже после отправки
+        # (bridge.annotate_enriched_card) — в свежем embed-е повтора его нет.
+        # Переносим из закешированного, иначе повтор стирал бы строку.
+        cached_fields = (cached_embed or {}).get("fields") or []
+        new_fields = list(patched_embed.get("fields") or [])
+        carried = next(
+            (f for f in cached_fields if f.get("name") == "Remediation"), None,
+        )
+        if (
+            carried is not None
+            and not any(f.get("name") == "Remediation" for f in new_fields)
+            and len(new_fields) < 25
+        ):
+            patched_embed["fields"] = new_fields + [carried]
         first_seen = datetime.fromtimestamp(first_ts, tz=timezone.utc).strftime("%H:%M")
         last_seen = datetime.fromtimestamp(now, tz=timezone.utc).strftime("%H:%M")
         original_footer = (patched_embed.get("footer") or {}).get("text") or ""

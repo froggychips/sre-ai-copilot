@@ -1016,6 +1016,18 @@ class Settings(BaseSettings):
     REMEDIATION_BRIDGE_DEDUP_SECONDS: int = Field(
         6 * 3600, description="Dedup window (sec) for bridge proposals per (playbook, target uid, incarnation)"
     )
+    # Дедуп ПОСТАНОВКИ задачи моста на стороне API: (alertname, namespace,
+    # pod/workload) → не чаще одной задачи `remediation_bridge` за окно.
+    # Без него батч /store на 30 алертов ставил 30 задач (инцидент 31.10.2026).
+    REMEDIATION_BRIDGE_ENQUEUE_DEDUP_SECONDS: int = Field(
+        600, description="API-side dedup window (sec) for enqueuing remediation_bridge per (alertname, ns, pod/workload)"
+    )
+    # Поэтапное включение моста: префиксы namespace через запятую (например
+    # "squad-49-" — один стенд). Пусто — все namespace. После инцидента
+    # 31.10.2026 мост включается сначала на одном скваде под нагрузкой.
+    REMEDIATION_BRIDGE_NAMESPACES: str = Field(
+        "", description="Comma-separated namespace prefixes where the bridge runs (empty = all)"
+    )
 
     # Запись об одобрении в kg_action_approvals не имела привязки ко времени:
     # approval четырёхчасовой давности продолжал авторизовывать реальный write

@@ -11,8 +11,10 @@ FixAgent), а он на проде выключен. Прод-путь алер�
         → render_plan: intent = первый мутирующий шаг plan.steps (сервер, не LLM)
         → build_match_snapshot + bind_server_params (тот же снимок, что у pipeline)
         → evaluate_intent_gate(require_binding=True)
-              ├─ block   → строка «playbook X: заблокирован policy (tier)» в
-              │            обычной карточке + решение в kg_remediation_decisions
+              ├─ block   → решение в kg_remediation_decisions + строка
+              │            «playbook X: заблокирован policy (tier)», которую
+              │            задача дописывает в уже отправленную обычную
+              │            карточку (annotate_enriched_card)
               └─ approve → снимок цели (uid) → дедуп (playbook, uid, incarnation)
                            → server dry-run → IncidentRecord(APPROVAL_PENDING)
                            + kg_remediation_decisions → карточка с кнопками
@@ -32,6 +34,11 @@ FixAgent), а он на проде выключен. Прод-путь алер�
 
 Флаг — REMEDIATION_BRIDGE_ENABLED (default False). Выключен — ни один путь
 сюда не заходит.
+
+Где исполняется. Только в Celery-воркере (задача `remediation_bridge`,
+очередь `celery`). API на `/store` и `/enrich-and-forward` делает дешёвый
+`wants_bridge` + Redis-дедуп и `apply_async` (`bridge_dispatch.py`) — ни
+сессий, ни K8sFacts, ни kubectl в процессе API.
 """
 from __future__ import annotations
 
@@ -42,7 +49,7 @@ import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from functools import lru_cache
-from typing import TYPE_CHECKING, Any, Dict, FrozenSet, List, Optional, Set
+from typing import TYPE_CHECKING, Any, Dict, FrozenSet, List, Optional
 
 import structlog
 
@@ -64,8 +71,8 @@ __all__ = [
     "is_bridge_analysis",
     "plan_proposals",
     "run_bridge",
+    "annotate_enriched_card",
     "run_bridge_for_incident",
-    "schedule_bridge_for_incident",
     "wants_bridge",
 ]
 
@@ -574,8 +581,9 @@ async def _propose(db: Any, incident: "Incident", proposal: Proposal) -> str:
 async def run_bridge(db: Any, ctx: "EnrichedContext") -> List[Dict[str, Any]]:
     """Мост для одного обогащённого алерта. Возвращает исходы по playbook-ам.
 
-    block — строка в `ctx.extras["remediation_lines"]` (её рисует обычная
-    карточка, если алерт вообще идёт в канал) и решение в БД. approve —
+    block — строка в `ctx.extras["remediation_lines"]` (её дописывает в
+    уже отправленную обычную карточку `run_bridge_for_incident`) и решение
+    в БД. approve —
     отдельная карточка с кнопками (см. _propose). Наружу не бросает.
     """
     incident = ctx.incident
@@ -620,12 +628,21 @@ async def run_bridge(db: Any, ctx: "EnrichedContext") -> List[Dict[str, Any]]:
     return outcomes
 
 
-async def run_bridge_for_incident(incident: "Incident") -> List[Dict[str, Any]]:
-    """Мост для алерта из `/store`: своя сессия, своё обогащение.
+async def run_bridge_for_incident(
+    incident: "Incident", *, card_key: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    """Мост для одного алерта в процессе Celery-воркера (`remediation_bridge`).
 
-    /store обогащение не делает (сквады в канал не ходят), поэтому для
-    кандидатов моста — тот же `enrich_alert`, что у enrich-and-forward.
-    Запускается фоном после ответа AlertManager-у.
+    Своя сессия, своё обогащение (`enrich_alert_async`), K8sFacts, dry-run.
+    В процессе API ничего из этого не исполняется: до 31.10.2026 мост
+    запускался `create_task`-ом прямо в event loop API, синхронные SQL и
+    kubectl блокировали loop, и на шторме crashloop-ов поды API переставали
+    отвечать на пробы (см. CHANGELOG, «Исправлено»). API теперь только
+    ставит задачу — `app/remediation/bridge_dispatch.py`.
+
+    `card_key` — ключ PATCH-дедупа обычной карточки `/enrich-and-forward`
+    (`enriched_card_key`), если она уже ушла: строку «заблокирован policy»
+    задача дописывает в неё сама (`annotate_enriched_card`).
     """
     from app.database import SessionLocal
     from app.services.alert_enrichment import enrich_alert_async
@@ -635,28 +652,97 @@ async def run_bridge_for_incident(incident: "Incident") -> List[Dict[str, Any]]:
     db = SessionLocal()
     try:
         ctx = await enrich_alert_async(db, incident)
-        return await run_bridge(db, ctx)
+        outcomes = await run_bridge(db, ctx)
     except Exception as e:
-        log.warning("remediation_bridge.store_failed", error=type(e).__name__)
+        log.warning("remediation_bridge.task_failed", error=type(e).__name__)
         return []
     finally:
         db.close()
+    lines = list(ctx.extras.get("remediation_lines") or [])
+    if lines:
+        if card_key:
+            await asyncio.to_thread(annotate_enriched_card, card_key, lines)
+        else:
+            # /store (сквады в канал не ходят) или карточка не ушла —
+            # решение уже в kg_remediation_decisions, дописывать некуда.
+            log.info("remediation_bridge.block_line_no_card",
+                     alertname=(incident.labels or {}).get("alertname"),
+                     namespace=incident.namespace)
+    return outcomes
 
 
-# Strong-ref на фоновые задачи: asyncio держит на задачу только weakref, и
-# незапомненная задача может быть собрана GC до завершения.
-_BACKGROUND: Set["asyncio.Task[Any]"] = set()
+# ── строка «заблокирован policy» → в уже отправленную обычную карточку ───
+
+REMEDIATION_FIELD = "Remediation"
 
 
-def schedule_bridge_for_incident(incident: "Incident") -> Optional["asyncio.Task[Any]"]:
-    """Запустить run_bridge_for_incident фоном — ответ AlertManager-у не ждёт."""
+def annotate_enriched_card(
+    card_key: str, lines: List[str], *, client_factory: Any = None,
+) -> bool:
+    """Дописать строки моста полем `Remediation` в карточку enrich-and-forward.
+
+    Карточка уходит вебхуком с `?wait=true`, её message_id лежит в
+    PATCH-дедупе (`discord_dedup`, ключ `card_key`). GET → PATCH, как у
+    `annotate_verify_outcome`: между отправкой и этой задачей карточку мог
+    перепатчить повтор алерта. После PATCH обновляем embed в дедупе —
+    следующий повтор переносит поле (`_patch_enriched_recurrence`).
+    Нет message_id (DRY_RUN, вебхук без wait, окно дедупа истекло) — не
+    дописываем, только лог. Best-effort, не бросает.
+    """
+    from app.services.discord import dedup_store
+    from app.services.discord.dedup import _webhook_edit_endpoint
+
+    if not lines:
+        return False
     try:
-        task = asyncio.get_running_loop().create_task(run_bridge_for_incident(incident))
-    except RuntimeError:
-        return None
-    _BACKGROUND.add(task)
-    task.add_done_callback(_BACKGROUND.discard)
-    return task
+        ttl = int(getattr(settings, "ENRICHED_DEDUP_WINDOW_SECONDS", 1800) or 1800)
+        rec = dedup_store.get_fresh(card_key, ttl_sec=ttl)
+    except Exception as e:
+        log.warning("remediation_bridge.card_lookup_failed", error=type(e).__name__)
+        return False
+    msg_id = str((rec or {}).get("msg_id") or "")
+    endpoint = (
+        _webhook_edit_endpoint(str(settings.DISCORD_WEBHOOK_URL or ""), msg_id)
+        if msg_id else None
+    )
+    if not endpoint:
+        log.info("remediation_bridge.card_not_annotated", reason="no_message_id")
+        return False
+    import httpx
+    try:
+        with (client_factory or httpx.Client)(timeout=10.0) as client:
+            r = client.get(endpoint)
+            if r.status_code >= 400:
+                log.warning("remediation_bridge.card_get_failed", status=int(r.status_code))
+                return False
+            embeds = list((r.json() or {}).get("embeds") or [])
+            if not embeds:
+                return False
+            fields = list(embeds[0].get("fields") or [])
+            existing = next((f for f in fields if f.get("name") == REMEDIATION_FIELD), None)
+            have = str(existing.get("value") or "").split("\n") if existing else []
+            merged = have + [ln for ln in lines if ln not in have]
+            if existing is not None and merged == have:
+                return True
+            value = "\n".join(ln for ln in merged if ln)[:1024]
+            fields = [f for f in fields if f.get("name") != REMEDIATION_FIELD]
+            if len(fields) >= 25:
+                log.warning("remediation_bridge.card_fields_full")
+                return False
+            fields.append({"name": REMEDIATION_FIELD, "value": value, "inline": False})
+            embeds[0]["fields"] = fields
+            p = client.patch(endpoint, json={"embeds": embeds})
+            if p.status_code >= 400:
+                log.warning("remediation_bridge.card_patch_failed", status=int(p.status_code))
+                return False
+    except Exception as e:
+        log.warning("remediation_bridge.card_annotate_failed", error=type(e).__name__)
+        return False
+    try:
+        dedup_store.update_embed(card_key, embeds[0])
+    except Exception as e:
+        log.debug("remediation_bridge.card_cache_update_failed", error=type(e).__name__)
+    return True
 
 
 # ── итог verify → в ту же карточку ────────────────────────────────────────

@@ -741,19 +741,23 @@ async def alertmanager_webhook_store_only(
 
     # Детерминированный мост (REMEDIATION_BRIDGE_ENABLED). Сквадовые алерты
     # в канал не идут — исключение одно: playbook с policy approve даёт
-    # карточку с кнопками (дедуп 6 ч на цель). Обогащение + K8sFacts +
-    # dry-run — секунды, поэтому фоном после ответа AlertManager-у.
-    from app.remediation.bridge import schedule_bridge_for_incident, wants_bridge
+    # карточку с кнопками (дедуп 6 ч на цель). Здесь — только постановка
+    # задачи в Celery с дедупом по (alertname, ns, pod): обогащение,
+    # K8sFacts и dry-run в event loop API клали поды 31.10.2026.
+    from app.remediation.bridge import wants_bridge
+    from app.remediation.bridge_dispatch import enqueue_bridge
+    bridge_incidents: List[Incident] = []
     for alert in payload_alerts:
         if alert.status == "resolved" or not wants_bridge(alert.labels):
             continue
         try:
-            bridge_incident = Incident.from_alertmanager(
+            bridge_incidents.append(Incident.from_alertmanager(
                 alert, batch_truncated_alerts=truncated,
-            )
+            ))
         except HTTPException:
             continue
-        schedule_bridge_for_incident(bridge_incident)
+    if bridge_incidents:
+        await enqueue_bridge(bridge_incidents)
 
     return {
         "status": "stored",
@@ -976,18 +980,30 @@ async def alertmanager_webhook_enrich_and_forward(
                     ]
                     if kinds:
                         _mark_incidents_noise(db, [inc], kinds)
-                # Детерминированный мост правила → playbook (флаг
-                # REMEDIATION_BRIDGE_ENABLED): block → строка в этой же
-                # карточке, approve → отдельная карточка с кнопками.
-                from app.remediation.bridge import bridge_enabled, run_bridge
-                if bridge_enabled():
-                    for c in ctxs:
-                        await run_bridge(db, c)
                 env_hint = _env_hint(incs[0].namespace)
                 resurfaced = (decision == Decision.SEND_RESURFACED)
                 delivered = await discord_service.send_enriched_alert(
                     ctxs, env=env_hint, resurfaced=resurfaced,
                 )
+                # Детерминированный мост (REMEDIATION_BRIDGE_ENABLED) — после
+                # отправки и только постановкой в Celery: карточка не ждёт
+                # моста. block → задача сама допишет строку «заблокирован
+                # policy» в эту карточку по ключу её PATCH-дедупа; approve →
+                # отдельная карточка с кнопками.
+                # Флаг выключен — сюда не заходим вовсе; сбой постановки не
+                # должен влиять на учёт доставки карточки.
+                from app.remediation.bridge import bridge_enabled
+                if bridge_enabled():
+                    from app.remediation.bridge_dispatch import enqueue_bridge
+                    from app.services.discord.service import enriched_card_key
+                    card_key: Optional[str] = None
+                    if delivered is not False:
+                        try:
+                            card_key = enriched_card_key(ctxs)
+                        except Exception as e:
+                            log.warning("enrich_forward.bridge_card_key_failed",
+                                        error=type(e).__name__)
+                    await enqueue_bridge(incs, card_key=card_key)
                 # Фаза подтверждения дедупа. decide_send уже нарастил
                 # chronic-счётчик (tentative) — если embed не ушёл, счётчик
                 # надо откатить, иначе три подряд неудачные доставки глушат
