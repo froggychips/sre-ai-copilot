@@ -109,7 +109,45 @@ spec:
         team: platform
       annotations:
         summary: "copilot-worker: ноль доступных реплик"
-        description: "Все синки графа стоят: данные устаревают молча."
+        description: >-
+          Очередь `celery` никто не разбирает: инцидентный пайплайн,
+          минутная kg_external_probe и лёгкие синки стоят.
+
+    # Второй воркер (очередь `sync`, 31.10.2026) — одна реплика, и её
+    # остановка не видна ни по пайплайну, ни по пробе: они живут на
+    # copilot-worker. Без отдельного правила тяжёлые синки — топология,
+    # деплои из TeamCity, метрики сервисов — протухали бы молча.
+    - alert: CopilotWorkerSyncDown
+      expr: kube_deployment_status_replicas_available{namespace="sre-ai", deployment="copilot-worker-sync"} == 0
+      for: 5m
+      labels:
+        severity: critical
+        team: platform
+      annotations:
+        summary: "copilot-worker-sync: ноль доступных реплик"
+        description: >-
+          Очередь `sync` никто не разбирает: kg_topology_sync,
+          tc_deploys_to_kg, kg_metrics_sync и остальные тяжёлые синки
+          (SYNC_QUEUE_TASKS в app/workers/tasks.py) копятся в Redis и
+          умирают по expires. Граф устаревает молча.
+
+    # Нашлось тестом-инвариантом «у каждого celery-воркера есть правило
+    # Down» (tests/test_ops_manifests.py, 31.10.2026): executor один, и без
+    # него dry-run стадии пайплайна упирается в таймаут (fail-closed, кнопки
+    # Apply нет), а поставленный apply ждёт в очереди — всё это без единой
+    # ошибки. warning, не critical: пайплайн и синки живут без него.
+    - alert: CopilotExecutorDown
+      expr: kube_deployment_status_replicas_available{namespace="sre-ai", deployment="copilot-executor"} == 0
+      for: 5m
+      labels:
+        severity: warning
+        team: platform
+      annotations:
+        summary: "copilot-executor: ноль доступных реплик"
+        description: >-
+          Очередь `executor` никто не разбирает: dry-run стадии пайплайна
+          упирается в EXECUTOR_DRY_RUN_TIMEOUT_SECONDS (кнопки Apply не
+          будет), нажатые apply ждут в Redis.
 
     - alert: CopilotPodCrashLooping
       expr: |
@@ -150,17 +188,25 @@ spec:
 
   - name: sre-ai-copilot.pipeline
     rules:
+    # Метрика с лейблом `queue` (celery / sync / executor) и читается из
+    # Redis на скрейпе api-пода (app/metrics.py). До 31.10.2026 это был
+    # Gauge, который никто не выставлял: правило стояло на вечном нуле.
+    # `max by (queue)` — api-реплик две, обе отдают одно и то же число;
+    # без агрегации алерт дублировался бы по pod.
     - alert: CopilotCeleryBacklog
-      expr: celery_queue_length > 100
+      expr: max by (queue) (celery_queue_length) > 100
       for: 15m
       labels:
         severity: warning
         team: platform
       annotations:
-        summary: "очередь Celery {{ $value }} задач"
+        summary: "очередь Celery `{{ $labels.queue }}`: {{ $value }} задач"
         description: >-
-          Синки не успевают за расписанием: часть данных графа устареет
-          молча, без единой ошибки в логах.
+          Воркер очереди `{{ $labels.queue }}` не успевает за расписанием:
+          часть данных графа устареет молча, без единой ошибки в логах.
+          `sync` — copilot-worker-sync (тяжёлые синки), `celery` —
+          copilot-worker (пайплайн и лёгкие задачи), `executor` —
+          copilot-executor.
 
 ---
 # Скрейп метрик копилота.
@@ -186,7 +232,9 @@ spec:
       # beat метрик не отдаёт (сервер поднимает только api), но перечисляем
       # его явно: молчащий таргет в списке честнее отсутствия строки, из
       # которой не видно, обошли его намеренно или забыли.
-      values: ["sre-ai-api", "copilot-worker"]
+      # copilot-worker-sync — тот же сервер метрик на :8001, что у
+      # copilot-worker (длительности задач, LLM-слой здесь не ходит).
+      values: ["sre-ai-api", "copilot-worker", "copilot-worker-sync"]
   podMetricsEndpoints:
   - port: metrics
     path: /metrics

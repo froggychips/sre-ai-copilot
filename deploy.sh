@@ -138,7 +138,7 @@ long_tx="$(kubectl -n "${NAMESPACE}" exec postgres-0 -- sh -c \
 if [[ "${long_tx:-0}" -gt "${LONG_TX_SECONDS}" ]]; then
     echo "WARNING: в БД есть транзакция возрастом ${long_tx}s (порог ${LONG_TX_SECONDS}s)." >&2
     echo "  Миграция может не взять лок. Если Job упадёт по lock_timeout — заглуши писателей:" >&2
-    echo "    kubectl -n ${NAMESPACE} scale deploy copilot-worker copilot-beat --replicas=0" >&2
+    echo "    kubectl -n ${NAMESPACE} scale deploy copilot-worker copilot-worker-sync copilot-beat --replicas=0" >&2
 fi
 
 kubectl -n "${NAMESPACE}" delete job sre-ai-migrate --ignore-not-found
@@ -149,10 +149,10 @@ if ! kubectl -n "${NAMESPACE}" wait --for=condition=complete --timeout=300s job/
     kubectl -n "${NAMESPACE}" logs "job/sre-ai-migrate" --tail=100 >&2 || true
     echo "" >&2
     echo "Если в логах lock_timeout — лок держит долгая транзакция. Заглуши писателей:" >&2
-    echo "  kubectl -n ${NAMESPACE} scale deploy copilot-worker copilot-beat --replicas=0" >&2
+    echo "  kubectl -n ${NAMESPACE} scale deploy copilot-worker copilot-worker-sync copilot-beat --replicas=0" >&2
     echo "  ./deploy.sh ${NAMESPACE}   # повторить" >&2
     echo "  kubectl -n ${NAMESPACE} scale deploy copilot-worker --replicas=2" >&2
-    echo "  kubectl -n ${NAMESPACE} scale deploy copilot-beat --replicas=1" >&2
+    echo "  kubectl -n ${NAMESPACE} scale deploy copilot-worker-sync copilot-beat --replicas=1" >&2
     exit 1
 fi
 
@@ -190,7 +190,11 @@ kubectl -n "${NAMESPACE}" apply -f k8s/networkpolicy.yaml
 ROLLOUT_TIMEOUT="${ROLLOUT_TIMEOUT:-600s}"
 
 rollout_failed=""
-for d in copilot-executor sre-ai-api copilot-worker copilot-beat; do
+# copilot-worker-sync (очередь `sync`, k8s/worker.yaml) появился 31.10.2026.
+# TC-деплой делает `kubectl set image` только по известным ему deployment-ам
+# и новый не создаст: первый раскат — этим скриптом (apply_with_image
+# k8s/worker.yaml выше), дальше `set image` подхватит его как остальные.
+for d in copilot-executor sre-ai-api copilot-worker copilot-worker-sync copilot-beat; do
     if ! kubectl -n "${NAMESPACE}" rollout status "deploy/${d}" \
             --timeout="${ROLLOUT_TIMEOUT}"; then
         echo "ERROR: rollout deploy/${d} не сошёлся за ${ROLLOUT_TIMEOUT}." >&2

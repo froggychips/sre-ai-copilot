@@ -92,6 +92,10 @@ async def lifespan(app: FastAPI):
     # скрейп попадёт в реестр без него и вернёт метрики без проверок.
     from app.knowledge_graph.self_health_metrics import register_collector
     register_collector()
+    # Длина очередей Celery (celery_queue_length{queue}) — тоже из Redis на
+    # скрейпе: до 31.10.2026 метрика была Gauge, который никто не выставлял.
+    from app.metrics import register_queue_length_collector
+    register_queue_length_collector()
     start_http_server(port=8001, addr=settings.METRICS_BIND_ADDR)
     log.info("application_startup", prometheus_port=8001)
     # KG contract drift guard — read-only diagnostic, не блокирует boot.

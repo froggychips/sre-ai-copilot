@@ -129,7 +129,7 @@ def test_executor_deployment_listens_only_to_executor_queue() -> None:
     assert cmd[cmd.index("-n") + 1] == "executor@%h"
 
 
-@pytest.mark.parametrize("name", ["sre-ai-api", "copilot-worker"])
+@pytest.mark.parametrize("name", ["sre-ai-api", "copilot-worker", "copilot-worker-sync"])
 def test_api_and_worker_dispatch_to_queue_under_read_only_sa(name: str) -> None:
     w = _workloads()[name]
     assert w["spec"]["template"]["spec"]["serviceAccountName"] == "sre-ai"

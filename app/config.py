@@ -1032,6 +1032,18 @@ class Settings(BaseSettings):
     EXECUTOR_QUEUE_NAME: str = Field(
         "executor", description="Celery-очередь, которую слушает copilot-executor"
     )
+    # Очередь тяжёлых синков KG (kg_topology_sync, tc_deploys_to_kg,
+    # kg_metrics_sync, …) — её слушает ОТДЕЛЬНЫЙ deployment
+    # `copilot-worker-sync`. До 31.10.2026 все 35 beat-задач и
+    # process_incident делили одну очередь `celery` на 4 слота: часовой
+    # kg_topology_sync (4–10 мин) и 15-минутный tc_deploys_to_kg занимали
+    # слоты, а минутный kg_external_probe с expires=50 с и инцидентный
+    # пайплайн ждали за ними. Список задач — `SYNC_QUEUE_TASKS` в
+    # app/workers/tasks.py; маршрутизация через task_routes, то есть
+    # beat и api ничего об очереди не знают.
+    SYNC_QUEUE_NAME: str = Field(
+        "sync", description="Celery-очередь тяжёлых синков KG (copilot-worker-sync)"
+    )
     # Сколько стадия пайплайна ждёт dry-run из очереди. Истёк — dry-run не
     # подтверждён: executor_result.status='error', кнопки Apply нет
     # (fail-closed). Упавший или не раскатанный copilot-executor не должен

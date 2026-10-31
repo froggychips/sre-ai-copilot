@@ -79,6 +79,32 @@ All notable changes to this project are documented in this file.
   `resolved_at` (открытые не удаляются никогда), `kg_pod_events` 90 по
   `last_seen`, `kg_remediation_events` 365. До этого срока у событий не было
   вовсе. `purge_events` идёт из `kg_health_retention` после сэмплов.
+- **Очередь `sync` для тяжёлых синков, `single_instance` на всех beat-задачах**
+  (#PR_NUMBER). Четыре слота `copilot-worker` (2 × `--concurrency=2`) делили
+  35 beat-записей (~95 запусков в час) и инцидентный пайплайн: часовой
+  `kg_topology_sync` (4–10 мин) и 15-минутный `tc_deploys_to_kg` занимали
+  слоты, минутная `kg_external_probe` с `expires=50` и инцидент ждали за
+  ними. Теперь 11 тяжёлых (`SYNC_QUEUE_TASKS`: topology, tc_deploys, storage,
+  metrics, endpoints, signal_aggregates, health_retention,
+  topology_resources, anomaly_detection, runtime_correlation,
+  nats_subjects) уходят через `task_routes` в очередь `sync`
+  (`SYNC_QUEUE_NAME`), её слушает новый Deployment `copilot-worker-sync`
+  (1 × `--concurrency=2`, `-Q sync -n sync@%h`, те же env/SA/пробы/3Gi);
+  `copilot-worker` получил явный `-Q celery`. Лок `single_instance` стоял
+  на 17 задачах из 35 — теперь на всех (ttl ≈ интервал, у probe 50 с); у
+  восьми тяжёлых свои `soft_time_limit`/`time_limit` (tc_deploys 600/720,
+  metrics и anomaly 420/540, endpoints 300/420, storage и
+  runtime_correlation 900/1080, signal_aggregates 900/1200,
+  topology_resources 600/720; topology/retention/nats — глобальные
+  1500/1800). `celery_queue_length` был Gauge, который никто не выставлял
+  (вечный ноль под `CopilotCeleryBacklog`) — теперь Collector читает `LLEN`
+  по очередям на скрейпе api, с лейблом `queue`; правило — `max by (queue)`.
+  Новый воркер добавлен в NetworkPolicy, VMPodScrape, `deploy.sh` (rollout
+  status, подсказки scale) и получил `CopilotWorkerSyncDown`; тест «у каждого
+  celery-воркера есть правило Down» заодно нашёл, что его нет у
+  `copilot-executor` — добавлен `CopilotExecutorDown` (warning). Первый
+  раскат — только `deploy.sh`: TC-деплой делает `set image` по известным
+  deployment-ам и новый не создаст.
 
 ### Зависимости
 
