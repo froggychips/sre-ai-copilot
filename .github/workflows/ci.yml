@@ -6,6 +6,14 @@ on:
   pull_request:
     branches: [ master, main ]
 
+# Один живой прогон на ref. Раннер один (self-hosted в кластере), и новый
+# push в ту же ветку обесценивает прогон, который ещё идёт: он занимал бы
+# раннер до конца, а следующий ждал бы в очереди. Группа включает имя
+# workflow, чтобы не пересекаться с eval-live/kg-contract-check.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 # Дефолт для всех джоб. Без него `test` брала дефолтный GITHUB_TOKEN,
 # а он на push-событиях идёт с write-правами на содержимое репозитория
 # (CodeQL: actions/missing-workflow-permissions). Джобе нужен только
@@ -39,6 +47,9 @@ jobs:
     # homebrew-сборка 3.11 была нерабочей под macOS 26.1
     # (`platform.mac_ver()` пуст → падал ensurepip).
     runs-on: sre-copilot-k8s
+    # Потолок с запасом, но конечный: зависший шаг не должен держать
+    # единственный раннер до дефолтных 6 часов GitHub-а.
+    timeout-minutes: 45
     # Изоляция self-hosted раннера от чужого кода (security finding 19.08.2026).
     #
     # Условие оставлено и после переезда в кластер, хотя ключей разработчика
@@ -129,20 +140,14 @@ jobs:
       - name: Run Mypy (Type Checking)
         run: .venv/bin/mypy .
 
-      # Coverage gate. Фактическое покрытие 13.08.2026 — 80% (18312 строк,
-      # 3649 не покрыто); гейт 75% = буфер 5пп на флуктуации.
-      # До этого гейт стоял на 55% при baseline 58% — и с тех пор покрытие
-      # выросло на 22пп, а гейт не двигался. Разрыв в 25пп означал, что можно
-      # удалить четверть тестов и CI останется зелёным: гейт не защищал ничего.
-      # Поднимать осознанно, вместе с ростом покрытия; опускать — только с
-      # объяснением, почему деградация допустима.
-      - name: Run Pytest with Coverage
-        run: .venv/bin/pytest --cov=app --cov-report=xml --cov-fail-under=75
-
-      # Postgres для интеграционных тестов. Без него всё, что помечено
+      # Postgres для всего набора тестов. Без него всё, что помечено
       # requires_postgres, СКИПАЕТСЯ — именно поэтому 07.08.2026 в master
       # уехала регрессия с несуществующей колонкой: 1765 юнит-тестов зелёные,
       # а SQL до базы не доходил вообще (секции мокают db.execute).
+      # Прогон один. Раньше их было два: сначала весь набор на sqlite с
+      # coverage-гейтом, потом тот же набор ещё раз на живом Postgres —
+      # вдвое дольше на единственном раннере ради одного результата, а
+      # coverage.xml первого прогона никто дальше не читал.
       # Docker на self-hosted раннере — от Rancher Desktop, сокет в ~/.rd
       # (тот же путь, что в джобе build-and-push).
       - name: Start Postgres for integration tests
@@ -198,11 +203,20 @@ jobs:
           LLM_BACKEND: claude_cli
         run: .venv/bin/alembic upgrade head
 
-      - name: Full test suite against real Postgres
+      # Coverage gate. Фактическое покрытие 13.08.2026 — 80% (18312 строк,
+      # 3649 не покрыто); гейт 75% = буфер 5пп на флуктуации.
+      # До этого гейт стоял на 55% при baseline 58% — и с тех пор покрытие
+      # выросло на 22пп, а гейт не двигался. Разрыв в 25пп означал, что можно
+      # удалить четверть тестов и CI останется зелёным: гейт не защищал ничего.
+      # Поднимать осознанно, вместе с ростом покрытия; опускать — только с
+      # объяснением, почему деградация допустима.
+      # Покрытие считается на этом же прогоне: с Postgres набор шире, чем на
+      # sqlite (requires_postgres не скипается), так что цифра не ниже прежней.
+      - name: Full test suite against real Postgres (with coverage)
         env:
           DATABASE_URL: postgresql://ci:ci@127.0.0.1:${{ env.PG_PORT }}/ci
           LLM_BACKEND: claude_cli
-        run: .venv/bin/pytest -q
+        run: .venv/bin/pytest -q --cov=app --cov-report=xml --cov-fail-under=75
 
       - name: Stop Postgres
         if: always()
@@ -273,6 +287,7 @@ jobs:
     # джоба умирает за секунды без раннера (та же болезнь, что и macos-latest).
     # Self-hosted Mac: docker от Rancher Desktop, amd64 через эмуляцию VM.
     runs-on: sre-copilot-k8s
+    timeout-minutes: 45
     if: github.event_name == 'push'
     permissions:
       contents: read
