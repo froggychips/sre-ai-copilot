@@ -4,6 +4,17 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+### Наблюдаемость
+
+- **Тихие логи** (трек B3, 31.10). Celery больше не перехватывает stdout
+  (`worker_redirect_stdouts=False`): structlog-строки уровня info уезжали в
+  `kubectl logs` как `WARNING/ForkPoolWorker-N` с двумя таймстемпами —
+  36 тыс. «варнингов» в сутки при нуле реальных ошибок. `kg.service_upserted`
+  переведён в debug (одна строка на каждый из ~7500 сервисов каждый час).
+  Access-лог uvicorn по `/healthz` и `/readyz` со статусом < 500 глушится
+  фильтром `HealthProbeAccessFilter` — 34,5 тыс. строк в сутки от kubelet
+  при ~300 настоящих запросах; 5xx на probe остаются.
+
 ## [1.0.27] — 2026-10-16 — история медика при переносе алертов, замер синка
 
 ### Исправлено
