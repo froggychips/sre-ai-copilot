@@ -205,6 +205,19 @@ REASON_FETCH_ERRORS = "fetch_errors"
 REASON_EMPTY_FETCH = "empty_fetch"
 REASON_NO_RECENT_REFRESH = "no_recent_refresh"
 
+# ── Причины отмены чистки УЗЛОВ: значения `stats["cleanup"]["skipped"]` ─────
+#
+# Контракт между синками, которые чистят узлы по снимку кластера
+# (`k8s_storage_sync`, `k8s_ingress_sync`), и `self_health.check_source_coverage`,
+# который показывает отменённую чистку человеку (`cleanup_blocked`). Блок
+# `cleanup` в stats читает `record_source_run` ниже; `no_baseline` и
+# `delete_pct` там считаются actionable — синк отработал, но сам себе не
+# поверил, и решать, верить ли снимку, должен человек.
+CLEANUP_SKIP_FETCH_FAILED = "fetch_failed"
+CLEANUP_SKIP_EMPTY_FETCH = REASON_EMPTY_FETCH
+CLEANUP_SKIP_NO_BASELINE = "no_baseline"
+CLEANUP_SKIP_DELETE_PCT = "delete_pct"
+
 
 @dataclass(frozen=True)
 class SourceReport:

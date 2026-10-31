@@ -13,19 +13,20 @@ backfill (читать k8s API, TeamCity history, alertmanager dump) — отд�
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 import sqlalchemy as sa
 import structlog
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
+from app.database import Base
 from app.knowledge_graph.contract import (UQ_KG_SERVICE_NS_NAME_KIND,
                                           OWNER_SOURCE_TRUST,
                                           owner_source_valid)
 from app.knowledge_graph.schema import (NODE_KIND_SERVICE, AlertEvent,
                                         Deployment, PodEvent, Service,
-                                        ServiceEdge)
+                                        ServiceEdge, VolumeEdge)
 
 logger = structlog.get_logger()
 
@@ -449,6 +450,125 @@ def _upsert_service_fallback(
         if changed:
             db.flush()
     return svc
+
+
+# ── Удаление узла ────────────────────────────────────────────────────────────
+#
+# До 31.10.2026 пути удаления kg_services не было вовсе: узлы только
+# заводились. Первым он понадобился k8s_ingress_sync: synthetic-узлы
+# `ingress:<host>` переживали свои Ingress-ы навсегда — 184 из 354 (52%)
+# описывали хосты, которых в кластере нет, и `check_node_freshness` висел в
+# warn. Хелпер общий, а не ingress-овый: вопрос «что делать с FK» одинаков
+# для любого узла, и отвечать на него надо в одном месте.
+
+#: Tagged-id в `kg_volume_edges`, под которым там лежат id из kg_services
+#: (k8s_storage_sync.NODE_SERVICE; FK у tagged-id нет — каскада БД не будет).
+_VOLUME_EDGE_SERVICE_KIND = "service"
+
+#: Причина отказа: у узла есть строки с NOT NULL `service_id`.
+DELETE_BLOCKED_HARD_DEPENDENCIES = "hard_dependencies"
+
+
+def _service_fk_columns() -> List[sa.Column]:
+    """Все колонки схемы с FK на kg_services.id.
+
+    Из метаданных, а не из списка руками: новая таблица со ссылкой на узел
+    попадёт сюда сама и либо отвяжется (nullable), либо заблокирует
+    удаление — а не уронит его IntegrityError-ом уже на проде. sqlite в
+    тестах FK не проверяет, так что пропажу из рукописного списка он бы не
+    показал.
+    """
+    target = f"{Service.__tablename__}.id"
+    cols: List[sa.Column] = []
+    for table in Base.metadata.sorted_tables:
+        for fk in table.foreign_keys:
+            if fk.target_fullname == target:
+                cols.append(fk.parent)
+    return cols
+
+
+def delete_service_node(db: Session, service_id: int) -> Dict[str, Any]:
+    """Удалить узел kg_services вместе с тем, что без него бессмысленно.
+
+    Единственный путь удаления узла — по той же причине, по которой
+    `upsert_service` единственный путь записи: на kg_services ссылается
+    десяток таблиц, и у каждой ссылки своё решение.
+
+      * `kg_service_edges` (src или dst) и tagged-рёбра `kg_volume_edges`
+        (`src_kind`/`dst_kind` = 'service') — удаляются: ребро без конца не
+        ребро;
+      * nullable `service_id` (alerts, pod_events, log_observations,
+        incidents, ingress_observations) — обнуляется: строка — история, и
+        её источники сами пишут её без узла, когда узел не найден;
+      * NOT NULL `service_id` (deployments, service_health,
+        signal_aggregates, anomaly_observations) — узел НЕ удаляется:
+        отвязать такую строку нельзя, а терять историю ради чистки нельзя
+        тем более. Вызывающему возвращается `deleted=False`,
+        `reason=hard_dependencies` и `blockers` — таблица → число строк.
+
+    Транзакцией не управляет: SAVEPOINT и commit держит вызывающий, как и у
+    остальных писателей графа. Для одного ingress-узла это несколько
+    точечных запросов по индексированным FK — чистка идёт сотнями узлов,
+    не тысячами, и здесь это дешевле, чем держать bulk-вариант.
+    """
+    result: Dict[str, Any] = {
+        "deleted": False, "reason": "", "edges_deleted": 0,
+        "unlinked": {}, "blockers": {},
+    }
+    purge_cols: List[sa.Column] = []
+    unlink_cols: List[sa.Column] = []
+    for col in _service_fk_columns():
+        if col.table.name == ServiceEdge.__tablename__:
+            purge_cols.append(col)
+        elif col.nullable:
+            unlink_cols.append(col)
+        else:
+            n = db.execute(
+                sa.select(sa.func.count())
+                .select_from(col.table)
+                .where(col == service_id)
+            ).scalar() or 0
+            if n:
+                result["blockers"][col.table.name] = int(n)
+    if result["blockers"]:
+        result["reason"] = DELETE_BLOCKED_HARD_DEPENDENCIES
+        return result
+
+    for col in purge_cols:
+        res = db.execute(sa.delete(col.table).where(col == service_id))
+        result["edges_deleted"] += int(getattr(res, "rowcount", 0) or 0)
+    result["edges_deleted"] += int(
+        db.query(VolumeEdge)
+        .filter(sa.or_(
+            sa.and_(VolumeEdge.src_kind == _VOLUME_EDGE_SERVICE_KIND,
+                    VolumeEdge.src_id == service_id),
+            sa.and_(VolumeEdge.dst_kind == _VOLUME_EDGE_SERVICE_KIND,
+                    VolumeEdge.dst_id == service_id),
+        ))
+        .delete(synchronize_session=False)
+        or 0
+    )
+    for col in unlink_cols:
+        res = db.execute(
+            sa.update(col.table)
+            .where(col == service_id)
+            .values({col.name: None})
+        )
+        n = int(getattr(res, "rowcount", 0) or 0)
+        if n:
+            result["unlinked"][col.table.name] = n
+
+    deleted = int(
+        db.query(Service)
+        .filter(Service.id == service_id)
+        .delete(synchronize_session=False)
+        or 0
+    )
+    if not deleted:
+        result["reason"] = "not_found"
+        return result
+    result["deleted"] = True
+    return result
 
 
 def upsert_edge(

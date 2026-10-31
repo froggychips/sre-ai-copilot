@@ -28,13 +28,17 @@ from __future__ import annotations
 import json
 import logging
 import subprocess
-from typing import Any, Dict, List
+from datetime import datetime, timedelta
+from typing import Any, Dict, List, Set
 
 from sqlalchemy.orm import Session
 
 from app.knowledge_graph.edge_decay_guard import (
+    CLEANUP_SKIP_DELETE_PCT, CLEANUP_SKIP_EMPTY_FETCH,
+    CLEANUP_SKIP_FETCH_FAILED, CLEANUP_SKIP_NO_BASELINE,
     SOURCE_INGRESS_SYNC, record_source_run)
-from app.knowledge_graph.populator import upsert_edge, upsert_service
+from app.knowledge_graph.populator import (delete_service_node, upsert_edge,
+                                           upsert_service)
 from app.knowledge_graph.kubectl_breaker import run_kubectl
 from app.knowledge_graph.schema import (NODE_KIND_INGRESS, NODE_KIND_SERVICE,
                                         Service)
@@ -43,6 +47,39 @@ log = logging.getLogger(__name__)
 
 
 _KUBECTL_TIMEOUT_S = 30
+
+# ── Чистка узлов исчезнувших хостов ─────────────────────────────────────────
+#
+# Синк только добавлял: `ingress:<host>` заводился при первом появлении
+# Ingress-а и жил вечно. Пересозданный стенд или снятый Ingress оставляли
+# узел в графе, и тот продолжал выдавать себя за точку входа. Замер
+# 31.10.2026: 354 ingress-узла в живых namespace при 223 Ingress-ах в
+# кластере, 184 (52%) не освежались больше суток — `check_node_freshness`
+# висел в warn, а blast-radius считал трафик с хостов, которых нет.
+#
+# `updated_at` у ingress-узла — честный маркер свежести: его трогает только
+# этот синк (health-пересчёт синтетику обходит), так что «не обновлялся N
+# дней» и значит «N дней не виден в кластере».
+
+#: Через сколько дней молчания узел считается исчезнувшим. Синк идёт раз в
+#: час — неделя это 168 пропущенных тиков. Сутки-трое дали бы ложные
+#: удаления на длинном сбое самого синка (kubectl-таймауты, упавший beat на
+#: выходных): после них узлы живых хостов освежатся первым же удачным
+#: прогоном, но до него успели бы попасть под нож. Неделю такой сбой не
+#: длится, а пересозданный стенд получает тот же host обратно за часы.
+INGRESS_NODE_STALE_DAYS = 7
+
+#: Окно опоры: узлы, освежённые за эти часы ДО прогона, — это хосты, которые
+#: синк недавно видел живыми. 24 тика.
+_INGRESS_RECENTLY_SEEN_HOURS = 24
+
+#: Усадка живого набора против опоры, после которой снимку не верим.
+#: Тот же порог, что у `check_node_freshness`/`check_edges_freshness`.
+_INGRESS_MAX_SHRINK_PCT = 30.0
+
+#: Потолок удалений за проход: накопленное за месяцы разбирается порциями,
+#: и ошибка видна на первой сотне строк, а не на всём графе.
+_INGRESS_MAX_DELETE_PER_RUN = 100
 
 
 class IngressFetchError(RuntimeError):
@@ -267,7 +304,174 @@ def _sync_one_route(
     stats["edges_created"] += 1
 
 
-def sync_all_ingresses(db: Session) -> Dict[str, int]:
+def _recently_refreshed_ingress_nodes(db: Session, now: datetime) -> int:
+    """Сколько ingress-узлов синк освежал за последние сутки. Считать ДО
+    апсертов текущего прогона — иначе опора включит в себя сам проверяемый
+    снимок и любая усадка станет нулевой (та же оговорка, что у
+    `k8s_storage_sync._recently_seen_count`)."""
+    since = now - timedelta(hours=_INGRESS_RECENTLY_SEEN_HOURS)
+    return int(
+        db.query(Service.id)
+        .filter(Service.node_kind == NODE_KIND_INGRESS,
+                Service.updated_at >= since)
+        .count()
+        or 0
+    )
+
+
+def _cleanup_vanished_ingress_nodes(
+    db: Session,
+    *,
+    seen_hosts: Set[str],
+    fetch_ok: bool,
+    baseline: int,
+    now: datetime,
+) -> Dict[str, Any]:
+    """Удалить `ingress:<host>`-узлы, которых синк не видел INGRESS_NODE_STALE_DAYS.
+
+    Кандидат — узел `node_kind='ingress'` с `updated_at` старше порога, чьего
+    host-а НЕТ в текущем снимке. Второе условие страхует первое: route без
+    backend-а в графе (`skipped_no_backend_match`) узел не освежает, хотя
+    Ingress жив, — такой узел по одному `updated_at` выглядел бы исчезнувшим.
+
+    Предохранители — по дисциплине `k8s_storage_sync._cleanup_absent_volumes`:
+      * fetch сбойнул → снимок неполный, не чистим (`fetch_failed`);
+      * в снимке 0 Ingress-ов → сбой неотличим от пустого кластера (`empty_fetch`);
+      * опоры нет — за сутки синк не освежил ни одного узла (вернулся после
+        простоя) → сравнивать снимок не с чем, fail-closed (`no_baseline`);
+      * живой набор ужался больше чем на `_INGRESS_MAX_SHRINK_PCT`% против
+        опоры → снимок подозрительно мал, не чистим (`delete_pct`).
+
+    Порог намеренно про усадку ЖИВОГО набора, а не про долю кандидатов от
+    всех узлов: вторая формула блокирует сама себя — мусор копится именно
+    оттого, что чистка не идёт, доля растёт, порог держит крепче. На
+    сегодняшних 52% устаревших узлов такой порог не отпустил бы чистку
+    никогда (ровно эту ловушку уже разбирали в storage-синке и drift_cleanup).
+
+    Удаление — через `populator.delete_service_node`, по узлу под SAVEPOINT:
+    узел с NOT NULL-зависимостями (health, деплои) пропускается с причиной,
+    а не роняет проход.
+    """
+    cleanup: Dict[str, Any] = {
+        "candidates": 0, "nodes_deleted": 0, "nodes_delete_skipped": 0,
+        "edges_deleted": 0, "skipped": "", "skip_reasons": {},
+    }
+    if not fetch_ok:
+        cleanup["skipped"] = CLEANUP_SKIP_FETCH_FAILED
+        log.warning(
+            "ingress_sync.node_cleanup_skipped reason=%s — снимок неполный, "
+            "узлы не чистим", CLEANUP_SKIP_FETCH_FAILED,
+        )
+        return cleanup
+    if not seen_hosts:
+        cleanup["skipped"] = CLEANUP_SKIP_EMPTY_FETCH
+        log.warning(
+            "ingress_sync.node_cleanup_skipped reason=%s — 0 Ingress-ов в "
+            "снимке (сбой неотличим от пустого кластера)",
+            CLEANUP_SKIP_EMPTY_FETCH,
+        )
+        return cleanup
+
+    cutoff = now - timedelta(days=INGRESS_NODE_STALE_DAYS)
+    rows_total = int(
+        db.query(Service.id)
+        .filter(Service.node_kind == NODE_KIND_INGRESS)
+        .count() or 0
+    )
+    # `updated_at IS NULL` под `<` не попадает — и правильно: без метки
+    # доказать молчание нечем, а недоказанное не удаляют.
+    seen_names = {f"ingress:{host}" for host in seen_hosts}
+    candidates = [
+        (int(node_id), str(ns), str(name))
+        for node_id, ns, name in (
+            db.query(Service.id, Service.namespace, Service.name)
+            .filter(Service.node_kind == NODE_KIND_INGRESS,
+                    Service.updated_at < cutoff)
+            .order_by(Service.updated_at, Service.id)
+            .all()
+        )
+        if name not in seen_names
+    ]
+    cleanup["candidates"] = len(candidates)
+    if not candidates:
+        return cleanup
+
+    if baseline <= 0:
+        cleanup["skipped"] = CLEANUP_SKIP_NO_BASELINE
+        cleanup["snapshot"] = len(seen_hosts)
+        cleanup["rows_total"] = rows_total
+        log.warning(
+            "ingress_sync.node_cleanup_skipped reason=%s candidates=%d — за "
+            "последние %dч синк не освежил ни одного ingress-узла, сравнивать "
+            "снимок (%d хостов при %d узлах) не с чем",
+            CLEANUP_SKIP_NO_BASELINE, len(candidates),
+            _INGRESS_RECENTLY_SEEN_HOURS, len(seen_hosts), rows_total,
+        )
+        return cleanup
+
+    shrink_pct = max(0.0, 100.0 * (baseline - len(seen_hosts)) / baseline)
+    if shrink_pct > _INGRESS_MAX_SHRINK_PCT:
+        cleanup["skipped"] = CLEANUP_SKIP_DELETE_PCT
+        # Процент без обоих чисел не читается: «ужалось на 75%» — это 300
+        # против 75 или 4 против 1? Решение принимает человек по отчёту
+        # источника, поэтому рядом опора, снимок и размер графа.
+        cleanup["shrink_pct"] = round(shrink_pct, 1)
+        cleanup["baseline"] = baseline
+        cleanup["snapshot"] = len(seen_hosts)
+        cleanup["rows_total"] = rows_total
+        log.warning(
+            "ingress_sync.node_cleanup_skipped reason=%s candidates=%d "
+            "live_set_shrank=%.1f%% > %.1f%% (хостов сейчас %d, за сутки "
+            "видели %d) — снимок подозрительно мал, узлы не чистим",
+            CLEANUP_SKIP_DELETE_PCT, len(candidates), shrink_pct,
+            _INGRESS_MAX_SHRINK_PCT, len(seen_hosts), baseline,
+        )
+        return cleanup
+
+    if len(candidates) > _INGRESS_MAX_DELETE_PER_RUN:
+        cleanup["capped_to"] = _INGRESS_MAX_DELETE_PER_RUN
+        candidates = candidates[:_INGRESS_MAX_DELETE_PER_RUN]
+
+    reasons: Dict[str, int] = {}
+    deleted_names: List[str] = []
+    for node_id, ns, name in candidates:
+        try:
+            # SAVEPOINT на узел: сбой на одном (гонка с параллельным
+            # писателем, неожиданный FK) откатывает только его.
+            with db.begin_nested():
+                outcome = delete_service_node(db, node_id)
+        except Exception as e:  # noqa: BLE001 — savepoint откатил узел, идём дальше
+            cleanup["nodes_delete_skipped"] += 1
+            reasons["error"] = reasons.get("error", 0) + 1
+            log.warning(
+                "ingress_sync.node_delete_failed ns=%s name=%s err=%s",
+                ns, name, e,
+            )
+            continue
+        if outcome["deleted"]:
+            cleanup["nodes_deleted"] += 1
+            cleanup["edges_deleted"] += int(outcome["edges_deleted"])
+            deleted_names.append(f"{ns}/{name}")
+        else:
+            cleanup["nodes_delete_skipped"] += 1
+            why = str(outcome["reason"] or "unknown")
+            reasons[why] = reasons.get(why, 0) + 1
+            log.info(
+                "ingress_sync.node_delete_skipped ns=%s name=%s reason=%s "
+                "blockers=%s", ns, name, why, outcome.get("blockers"),
+            )
+    cleanup["skip_reasons"] = reasons
+    log.info(
+        "ingress_sync.node_cleanup candidates=%d deleted=%d skipped=%d "
+        "reasons=%s edges_deleted=%d stale_after=%dd of total=%d sample=%s",
+        cleanup["candidates"], cleanup["nodes_deleted"],
+        cleanup["nodes_delete_skipped"], reasons, cleanup["edges_deleted"],
+        INGRESS_NODE_STALE_DAYS, rows_total, deleted_names[:10],
+    )
+    return cleanup
+
+
+def sync_all_ingresses(db: Session) -> Dict[str, Any]:
     """Sync — главная entry point.
 
     Возвращает stats:
@@ -275,7 +479,14 @@ def sync_all_ingresses(db: Session) -> Dict[str, int]:
       / skipped_no_backend_match (backend service не существует в KG yet)
       / errors (routes, откатившиеся per-item savepoint-ом, + сбой fetch-а:
         kubectl-timeout считается ошибкой, а не «в кластере 0 ingress-ов»)
+      / nodes_deleted / nodes_delete_skipped / cleanup (чистка узлов
+        исчезнувших хостов, см. `_cleanup_vanished_ingress_nodes`)
     """
+    # Опора для чистки — ДО fetch-а и апсертов: сколько узлов синк освежал
+    # за прошлые сутки без учёта текущего снимка.
+    run_started = datetime.utcnow()
+    baseline = _recently_refreshed_ingress_nodes(db, run_started)
+
     # Fetch-сбой не роняет тик: считаем его в errors и идём до
     # record_source_run — иначе трейсбек уносил и отчёт guard'у (тик терялся
     # целиком), и тот бы судил свежесть ingress-рёбер по фоллбэку.
@@ -290,14 +501,19 @@ def sync_all_ingresses(db: Session) -> Dict[str, int]:
             "рёбра не освежаем", e,
         )
 
-    stats = {
+    stats: Dict[str, Any] = {
         "ingresses_fetched": len(ingresses),
         "routes_seen": 0,
         "nodes_created": 0,
         "edges_created": 0,
         "skipped_no_backend_match": 0,
         "errors": fetch_errors,
+        "nodes_deleted": 0,
+        "nodes_delete_skipped": 0,
     }
+    # Хосты текущего снимка — все, включая route без backend-а в графе: такой
+    # Ingress жив, и его узел чистке не кандидат.
+    seen_hosts: Set[str] = set()
 
     for ing in ingresses:
         meta = ing.get("metadata") or {}
@@ -307,6 +523,7 @@ def sync_all_ingresses(db: Session) -> Dict[str, int]:
         routes = _extract_routes(ing)
         for r in routes:
             stats["routes_seen"] += 1
+            seen_hosts.add(r["host"])
             try:
                 # SAVEPOINT на route: один DataError не переводит Session в
                 # aborted-состояние и не роняет весь tick (зеркалит
@@ -323,11 +540,32 @@ def sync_all_ingresses(db: Session) -> Dict[str, int]:
                 )
 
     db.commit()
+
+    # Чистка — после коммита апсертов: освежённые узлы уже в базе, и сбой
+    # чистки не откатит работу синка. Любая её ошибка считается в errors
+    # (источник на этот цикл признаётся нездоровым — decay его рёбер
+    # подождёт), а отчёт guard'у уходит в любом случае.
+    try:
+        cleanup = _cleanup_vanished_ingress_nodes(
+            db, seen_hosts=seen_hosts, fetch_ok=fetch_errors == 0,
+            baseline=baseline, now=run_started,
+        )
+        db.commit()
+    except Exception as e:  # noqa: BLE001 — чистка не должна уносить тик и отчёт
+        db.rollback()
+        stats["errors"] += 1
+        cleanup = {"skipped": "error", "error": type(e).__name__}
+        log.warning("ingress_sync.node_cleanup_failed err=%s", e)
+    stats["cleanup"] = cleanup
+    stats["nodes_deleted"] = int(cleanup.get("nodes_deleted") or 0)
+    stats["nodes_delete_skipped"] = int(cleanup.get("nodes_delete_skipped") or 0)
+
     log.info(
-        "ingress_sync.done ingresses=%d routes=%d edges=%d skipped=%d errors=%d",
+        "ingress_sync.done ingresses=%d routes=%d edges=%d skipped=%d errors=%d "
+        "nodes_deleted=%d",
         stats["ingresses_fetched"], stats["routes_seen"],
         stats["edges_created"], stats["skipped_no_backend_match"],
-        stats["errors"],
+        stats["errors"], stats["nodes_deleted"],
     )
     # Отчёт для edge-decay guard: этот синк — единственный, кто освежает
     # ingress-овые `calls` (discovered_by='kg_sync/ingress'). Живой env-scan
