@@ -37,7 +37,7 @@ if TYPE_CHECKING:
 
 log = structlog.get_logger()
 
-__all__ = ["enqueue_bridge", "enqueue_dedup_key"]
+__all__ = ["enqueue_bridge", "enqueue_dedup_key", "namespace_allowed"]
 
 _ENQUEUE_PREFIX = "copilot:remediation_bridge:enqueue:"
 _REDIS_TIMEOUT_SEC = 2.0
@@ -50,6 +50,15 @@ def _ttl_seconds() -> int:
         return max(1, int(getattr(settings, "REMEDIATION_BRIDGE_ENQUEUE_DEDUP_SECONDS", 600)))
     except (TypeError, ValueError):
         return 600
+
+
+def namespace_allowed(namespace: Optional[str]) -> bool:
+    """REMEDIATION_BRIDGE_NAMESPACES: пусто — все, иначе префиксы через запятую."""
+    raw = str(getattr(settings, "REMEDIATION_BRIDGE_NAMESPACES", "") or "")
+    prefixes = [p.strip() for p in raw.split(",") if p.strip()]
+    if not prefixes:
+        return True
+    return bool(namespace) and any(str(namespace).startswith(p) for p in prefixes)
 
 
 def enqueue_dedup_key(labels: Optional[Dict[str, Any]], namespace: Optional[str] = None) -> str:
@@ -121,6 +130,8 @@ async def enqueue_bridge(
     for incident in incidents:
         try:
             if incident.status == "resolved" or not wants_bridge(incident.labels):
+                continue
+            if not namespace_allowed(incident.namespace or (incident.labels or {}).get("namespace")):
                 continue
             key = enqueue_dedup_key(incident.labels, incident.namespace)
             if key in seen:
