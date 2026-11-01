@@ -15,6 +15,17 @@ The copilot can propose and (after human approval) execute Kubernetes operations
 
 All of this is captured as a single distributed trace per incident.
 
+> **Scope (as of 1.0.33).** The span tree below belongs to the LLM pipeline
+> (`process_incident`), which is disabled in production
+> (`LLM_PIPELINE_ENABLED=false`). The production action path — the deterministic
+> remediation bridge (`app/remediation/bridge.py`) → Discord button → executor
+> (`app/services/executor_apply.py`) — creates no dedicated spans; its trail is the
+> structured audit log (`audit_service.log_event`: `REMEDIATION_BRIDGE_PROPOSED`,
+> `REMEDIATION_BRIDGE_DRY_RUN_FAILED`, `DISCORD_APPROVAL_DENIED_*`,
+> `EXECUTOR_APPLIED`, `EXECUTOR_APPLY_REFUSED*`, `EXECUTOR_VERIFY_<OUTCOME>`, …) plus
+> the tables `kg_remediation_decisions` and `kg_remediation_attempts`. The
+> `guardrail.blocked` event from `K8sSecurityGuard` applies to both paths.
+
 ---
 
 ## Span tree (one incident)

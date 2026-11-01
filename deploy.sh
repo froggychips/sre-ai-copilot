@@ -220,5 +220,5 @@ if [[ -n "${rollout_failed}" ]]; then
 fi
 
 echo "Deploy OK: ${IMAGE} → ns ${NAMESPACE}"
-echo "(Опционально: k8s/prometheus-rules.yaml, k8s/vmalertmanagerconfig.yaml,"
+echo "(Опционально: k8s/vmalertmanagerconfig.yaml, k8s/monitoring.yaml,"
 echo " k8s/postgres-backup.yaml, k8s/squad-dashboard.yaml — применяются отдельно.)"

@@ -293,6 +293,18 @@ DB/headless/system безрёберны by design (см. секцию 3).
 Эвристика fallback (`is_synthetic` в `contract.py`) — по префиксу
 имени, на случай legacy-rows без flag.
 
+**Пометка дрейфа** (`drift_cleanup`, ежечасно). Узлы namespace, чьё
+отсутствие подтверждено дважды (нет в `kubectl get ns` и
+`kg_namespaces.state='missing'` дольше 24 ч), получают `synthetic=true` +
+`metadata.drift_reason` / `drift_marked_at` / `drift_prev_synthetic`.
+С 1.0.33 пометка обратима (`_unmark_revived`): когда namespace снова есть в
+`kubectl get ns` и `active` в `kg_namespaces`, drift-ключи снимаются, а
+`synthetic` возвращается к значению до пометки (у старых пометок без
+`drift_prev_synthetic` — `false`; ingress, NATS subjects и узлы из алертов
+вернут `true` своим следующим прогоном). До этого стенд, пересозданный под
+тем же именем, оставался синтетикой и выпадал из health и метрик качества.
+Версия контракта не менялась (семантика `synthetic` та же).
+
 ---
 
 ## 5. Owner-known

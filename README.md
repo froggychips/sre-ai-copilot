@@ -2,71 +2,64 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Python](https://img.shields.io/badge/python-3.13+-blue.svg)](https://www.python.org/)
-[![Tests](https://img.shields.io/badge/tests-3477%20pass-brightgreen.svg)](tests)
+[![Tests](https://img.shields.io/badge/tests-4691%20pass-brightgreen.svg)](tests)
 [![Checks](https://img.shields.io/badge/ruff%20%2B%20mypy-clean-brightgreen.svg)](.github/workflows)
 [![Release](https://img.shields.io/badge/release-v1.0.33-blue)](CHANGELOG.md)
 
-**Homepage:** [sre.froggychips.xyz](https://sre.froggychips.xyz) · **Stack:** FastAPI + Celery + Postgres-KG + LLM + MCP
+**Homepage:** [sre.froggychips.xyz](https://sre.froggychips.xyz) · **Stack:** FastAPI + Celery + Postgres-KG + MCP (LLM optional)
 
-> **Let an AI run incident response for Kubernetes — without letting it touch prod on a hunch.** Whether to apply a `kubectl` fix is decided by a deterministic policy engine (8 risk axes), *not* taken from the model's answer — so the copilot is safe to put next to production. KG-first enrichment, multi-hypothesis RCA, controlled remediation, and honest about its own blind spots.
+> **Kubernetes alerts enriched from a knowledge graph of the cluster, plus remediation that a human approves in Discord.** In production the alert path is deterministic: no LLM call decides what a card says or whether a `kubectl` runs. A remediation is proposed only by a playbook from the registry, checked by a server-side policy gate, and applied only after a click from an operator on the allowlist. An LLM RCA pipeline exists in the code but is switched off in production.
 
 > **[English](#english) · [Русский](#русский)**
 
 ![Demo: enriched critical alerts, KG cascade reasoning and daily digest in Discord](docs/assets/copilot-demo.gif)
 
-*Live output formats on synthetic data: user-facing endpoint-down critical with a `kubectl` hint, slow-crashloop catcher, deploy-regression enrichment with blast radius, KG upstream-cascade reasoning, resolved notice and the daily cluster digest. Source page: [docs/assets/demo-alerts.html](docs/assets/demo-alerts.html).*
+*Output formats on synthetic data: user-facing endpoint-down critical with a `kubectl` hint, slow-crashloop catcher, deploy-regression enrichment with blast radius, KG upstream-cascade reasoning, resolved notice and the daily cluster digest. Source page: [docs/assets/demo-alerts.html](docs/assets/demo-alerts.html).*
 
 ---
 
 <a name="english"></a>
 ## English
 
-**SRE AI Copilot** is a backend service that turns Prometheus AlertManager webhooks into either an **advisory analysis** (default) or an **auto-remediation with human approval** (opt-in) of a Kubernetes incident — root cause + recommended actions, posted as a Discord embed.
+**SRE AI Copilot** is a backend service that receives Alertmanager webhooks, records every alert in a Postgres knowledge graph (KG) of the cluster, and posts deterministically enriched cards to Discord. For a small set of alert types it proposes a remediation from a playbook, with approve / decline buttons.
 
-> **Default = advisory mode.** With out-of-the-box settings (`EXECUTOR_ENABLED=false`, `EXECUTOR_APPROVAL_ENABLED=false`) the copilot does **not** call `kubectl` — it analyzes, posts to Discord, and stops. Engineer acts manually.
->
-> **Opt-in = auto-remediator with approval.** Setting `EXECUTOR_ENABLED=true` adds a 9th pipeline stage that validates the proposed action against `kube-apiserver` via `kubectl ... --dry-run=server`. Setting `EXECUTOR_APPROVAL_ENABLED=true` additionally shows an «⚙️ Apply» button on the Discord embed (only when dry-run passed and risk ≤ medium); two-click confirmation → real `kubectl` under `K8sSecurityGuard` with full OTEL audit. See [Roadmap → Execution](#roadmap--execution) below for the ramp-up plan.
+### What runs in production
 
-### What it does
+- **KG-first enrichment → Discord.** `prod-*`, `preprod-*` and alerts without a namespace (nodes, control plane) go to `/webhooks/alertmanager/enrich-and-forward`: the alert is written to the KG and an enriched card is posted to the incident channel. Enrichment is rules + graph, no LLM: rule facts with evidence (`verdict` found / absent / unknown, `epistemic`, `provenance`; a failed source answers `?`, not «not found»), recent deploys, nearby alerts and open incidents, owner team, blast radius. Meta-aggregate alerts and `KubeDeploymentGenerationMismatch` churn with healthy replicas are rendered muted (grey, 🔇, no mention) instead of dropped.
+- **Attribution to the k8s object, not to the exporter** (`app/services/alert_target.py`, 1.0.31): one label-priority chain (workload → CronJob/Job → HPA/PDB → node → PVC → pod → scrape job → service → namespace) used by both the store path and the card; the outcome is stored in `kg_alerts.raw.target_kind`.
+- **Less channel noise** (1.0.31): a «✅ resolved» card only for an episode of at least 30 min (`DISCORD_RESOLVED_NOTICE_MIN_MINUTES`); an Alertmanager repeat of a still-firing alert no longer posts «🌀 RESURFACED» (`ALERT_SUPPRESS_AM_REPEATS`).
+- **KG as history.** `squad-*`, `preupdate-*` and every `severity=info` alert go to `/webhooks/alertmanager/store`: KG only, nothing in Discord — a decision, not a gap. The graph holds incidents (`kg_incidents`, one open per service), an incident timeline, blast radius with evidence per path, rollouts detected from the cluster (`kg_deploy_watch`), node zones and traffic entrypoints. Queryable via `/kg/*`, MCP tools and the squad dashboard.
+- **Deterministic remediation bridge** (`app/remediation/`, 1.0.31; runs in Celery since 1.0.32): rule facts + live pod state → `match_playbooks` → intent built by the server from the playbook's `plan.steps` → policy gate. On `approve` the target is snapshotted, dry-run against the API server, and a card with **Apply / Decline** buttons is posted to the incident channel; on `block` (prod / preprod / system) the regular card only gets a «blocked by policy» line. Playbooks reachable by alert name: `restart_crashloop_deployment` and `scale_out_cpu_throttled_deployment` (the latter does not produce a card yet: the bridge does not compute the target `replicas`, plan rendering fails); `approve` is allowed only for dev / squad namespaces. The same proposal is not repeated for 6 h. For squads this is a narrow exception to «store only»: a card appears only when a playbook applies.
+- **Buttons: allowlist only.** A click is accepted only from a user in `DISCORD_APPROVERS_USER_IDS` (fail-closed, roles are not used). In this deployment the Discord application's Interactions Endpoint points to a separate bot service, which relays `approve:` / `decline:` clicks to the copilot's `/discord/interactions`; the copilot verifies the Ed25519 signature itself.
+- **Guarded write path** (compressed; details in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) and [docs/REMEDIATION_PLAYBOOK_CONTRACT.md](docs/REMEDIATION_PLAYBOOK_CONTRACT.md)): deterministic policy gate over 8 risk axes, target identity check before the write (`target_reincarnated`), re-dry-run, matching intent signature and a fresh `ActionApproval` (expires after 1 h), `in_flight` claim before `kubectl`, a separate executor with its own ServiceAccount, and outcome verification at +5 / +15 min (`verified` / `failed` / `pending` / `unknown`). Every step is an OTEL / audit event ([docs/AUDIT.md](docs/AUDIT.md)).
+- **Remediation events from an external squad medic** are received over HMAC into `kg_remediation_events`; `fixed` means the stand was healthy after treatment.
+- **Self-health and reconciliation.** `copilot_self_health_*` metrics with `VMRule sre-ai-copilot` alerts; a weekly reconciliation against the cluster (`weekly_reconciliation`, Mon 06:00 UTC, #stats): alert coverage vs VictoriaMetrics `ALERTS`, table growth, backup age, share of unattributed alerts, confirmed fixes — an unavailable source reads «not measured», not zero.
+- **Digests**: daily cluster digest (`daily_stats_digest`), chronic alerts digest every 6 h (`chronic_alerts_digest`, opt-in `CHRONIC_DIGEST_ENABLED`) with a section for alerts firing continuously for more than 24 h.
 
-- Receives AlertManager webhooks — three endpoints under `/webhooks/alertmanager`, see [Alert path](#alert-path-what-actually-runs) below.
-- **Fingerprint deduplication**: skips re-running the pipeline for alerts already in-flight (OPEN → RESOLVED). Only FAILED incidents are retried.
-- **Flapping detection**: if an alert fires after RESOLVED, increments `flap_count` and re-runs the pipeline with explicit context — "this alert has cycled N times; RESOLVED was likely premature."
-- Runs `DiagnosticsEngine` — deterministic rules produce a typed `FactStore` (OOM killed, process crash, crashloop, …) before any LLM call.
-- Detects **fact conflicts** (`oom_killed` + `process_crash` both true = contradiction → confidence capped, `<conflicts>` block injected into prompts).
-- Runs a **multi-hypothesis fan-out** across 4 perspectives (app / infra / deps / runtime) filtered by `PERSPECTIVE_PRECONDITIONS`, then adversarially grounds each hypothesis against the `FactStore` via `FactCriticAgent`.
-- Enriches context with **cluster-wide health snapshot** at incident time: nodes ready, pod failures, crashloops, CPU/mem/disk peak, firing alert counts — same metrics as the `#stats` daily report. Lets the LLM distinguish "isolated pod issue" from "cluster-wide pressure."
-- Supports **Node\* alerts** (NodeDiskIOSaturation, NodeMemoryWillExhaustSoon, …): `instance`/`node` labels are used for enrichment and displayed in the Discord embed instead of `pod`.
-- **Alert-quality noise suppression**: meta-aggregate alerts (`*NewCriticalAlerts`, control-plane scrape-gap derivatives) and *conditional* `KubeDeploymentGenerationMismatch` churn are rendered **muted** (grey + 🔇, no 🚨/@mention) rather than dropped — visible for eyeballing but never paging. `gen_mismatch_noise` is health-gated (muted only when `ready==desired`, LOUD otherwise); both classes have kill-switches. Distinct from the input-level `ALERT_SUPPRESS_NAMES` drop and from `rollout_noise` deploy-window suppression.
-- Enriches context from **Atlassian Jira** (open/resolved tickets for the service), **TeamCity** (recent deploys), and **VictoriaMetrics** (memory/CPU window per pod + cluster health).
-- Detects **recurrence**: same service resolved < 7 days → `FixAgent` switches to investigative mode (no restart recommendations).
-- Posts a **single Discord embed** per incident (title + root cause + synthesis + feedback buttons), replacing the previous two-message flow.
-- **👍 / 👎 feedback buttons** on every embed: 👍 saves immediately; 👎 requires a two-step confirmation ("Confirm: was the model's *analysis* wrong?") to prevent accidental negative feedback. Stored in `IncidentRecord.user_feedback`.
-- **Structured `ExecutionIntent`** alongside prose: `FixAgent` emits JSON in the `ExecutionIntent` schema (`action`, `resource_type`, `resource_name`, `namespace`, `params`, `risk`); pydantic-validated, `FORBIDDEN_NAMESPACES` rejected at parse time, persisted to `IncidentRecord.analysis.execution_intent`.
-- **Executor stage** (opt-in via `EXECUTOR_ENABLED=true`): server-side dry-run of the intent (`kubectl ... --dry-run=server`) under `K8sSecurityGuard`; result captured in `executor_result` and shown as a "Dry-run verdict" field on the Discord embed.
-- **Discord Apply button** (opt-in via `EXECUTOR_APPROVAL_ENABLED=true`): two-click confirmation on the embed → invokes `K8sService.execute_intent(intent, dry_run=False, post_approval=True)`; idempotency by `incident_id`, eligible only when dry-run passed and risk ∈ {low, medium}; HIGH-risk and ineligible incidents never get the button.
-- **Approve / Decline buttons** are gated by the *same* `EXECUTOR_APPROVAL_ENABLED` flag. Previously the green «Approve & Run» button rendered whenever an `execution_intent` existed and the bot could post, and its handler dispatched the real write on `EXECUTOR_ENABLED` alone — so a deployment that set only `EXECUTOR_ENABLED=true` (documented here as dry-run validation) got a one-click real `kubectl`, bypassing both the two-step confirmation and the documented prod opt-in. `EXECUTOR_ENABLED=true` now means dry-run only, as described above.
-- **Approval freshness + in-flight claim**: a recorded `ActionApproval` expires after `EXECUTOR_APPROVAL_MAX_AGE_SECONDS` (default 1h), so a stale approval cannot authorize a later write; and the apply path commits an `in_flight` claim *before* invoking kubectl, so a worker dying mid-mutation can't leave the cluster changed with the idempotency marker unwritten.
-- Full **OTEL audit trail**: `sre.copilot.incident.process` root span, per-stage child spans, `execution_intent_parsed` / `executor_status` attributes, `guardrail.blocked` events emitted when the guard rejects an operation, `EXECUTOR_APPLIED` / `EXECUTOR_APPLY_REFUSED` audit events.
-- **Evidence, not flags** (v1.0.4): every rule fact carries `verdict` (`found` / `absent` / `unknown`), `epistemic` (observed / declared / inferred …), `provenance` and the search window; a source that failed marks its fields in `source_status`, and the rule answers `?` instead of a confident «not found». Deploy attribution is evidence too: an exact record (`namespace_scope=false`) is `observed 0.95`, a namespace-wide broadcast is `inferred 0.6`.
-- **Incidents as graph objects** (v1.0.6): `kg_incidents` — one open incident per service (partial unique index), alerts attach, flapping re-opens within 30 min, lifecycle closes when every alert is resolved; `noise=true` when enrichment classified all of its alerts as noise (`GET /kg/incidents` hides those by default).
-- **Incident timeline** (`GET /kg/incidents/{id}/timeline`): deploys, pod events, anomalies (bucketed per metric·hour), error logs, alerts and the copilot's own operational memory (evidence → diagnosis → decision → action → verification) on one axis, each event with `evidence = {epistemic, provenance}`, plus `unknowns` for sources that could not be queried.
-- **Blast radius with evidence** (`GET /kg/blast-radius`): who breaks if X breaks — a walk against `calls` / `uses_db` / `uses_nats` / `serves_traffic` up to two hops; each path inherits its weakest epistemic link; «callers unknown» and «no callers» are different answers.
-- **Remediation verification** (v1.0.7): before `kubectl` the live target is snapshotted (`uid`, `generation`, template hash, replicas) and compared with the graph's `target_ref` — a re-created object refuses the write (`target_reincarnated`); after the write a Celery task re-checks at +5 and +15 min: same identity, rollout converged, ready == desired, alert resolved, no new CrashLoop/OOM → `verified` / `failed` / `pending` / `unknown`.
-- **Deploy watcher from the cluster** (`kg_deploy_watch`, every 5 min): rollouts detected from image / `spec.template` changes, not from `metadata.generation` (which HPA bumps every tick) — the second, exact source of `kg_deployments`.
-- **Self-health in metrics**: `copilot_self_health_*` scraped by VictoriaMetrics, `VMRule sre-ai-copilot` alerts on stale / failing checks; a source disabled by config reports `disabled`, not `warn`.
+**Recent changes (1.0.28 → 1.0.33)** — details in [CHANGELOG.md](CHANGELOG.md):
+
+- separate `sync` queue and `copilot-worker-sync` Deployment for heavy KG syncs; `single_instance` on beat tasks (1.0.28);
+- statics builds stored as one `kg_deployments` row per namespace instead of a broadcast to every service (1.0.28);
+- retention for event tables (`EVENT_RETENTION_TARGETS`) next to the 30-day `kg_service_health` retention; Postgres backup CronJob synced with the cluster (dump on PVC, optional S3 upload) (1.0.28);
+- weekly reconciliation (1.0.30); remediation bridge with buttons, resolved ≥ 30 min, no repeat RESURFACED, object attribution (1.0.31);
+- bridge moved out of the API event loop into the Celery task `remediation_bridge`, enabled per namespace prefix via `REMEDIATION_BRIDGE_NAMESPACES` (1.0.32);
+- PriorityClass `sre-ai-copilot-stateful` for postgres / redis (evicted last); logging configured in every process (`LOG_LEVEL`, httpx / httpcore at WARNING); KG upserts skip unchanged rows; drift mark removed from nodes of a re-created namespace; Python 3.13 (1.0.33).
+
+### LLM pipeline (implemented, off in production)
+
+`POST /webhooks/alertmanager` runs the full LLM pipeline: deterministic diagnostics → multi-hypothesis fan-out → fact critic → synthesis → `FixAgent` with a structured `ExecutionIntent` → optional executor dry-run and Apply button. No Alertmanager route points there: `LLM_PIPELINE_ENABLED=false`, and enabling it requires a finite `LLM_DAILY_BUDGET_USD` (the config validator refuses to start otherwise). Stages, prompts and the golden eval set: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md), [tests/golden/README.md](tests/golden/README.md).
 
 ### Tech stack
 
 | Layer | Technology |
 |---|---|
 | API | FastAPI + Uvicorn |
-| Queue | Celery + Redis |
+| Queue | Celery + Redis (queues `celery`, `sync`, `executor`) |
 | Database | PostgreSQL + SQLAlchemy (SQLite for local dev) |
-| LLM | Anthropic Claude (API key or `claude --print` CLI subprocess) |
-| Observability | Prometheus, OpenTelemetry → Tempo, structlog |
+| LLM | Anthropic Claude (API key or `claude --print` CLI) — LLM pipeline only, off in production |
+| Observability | Prometheus / VictoriaMetrics, OpenTelemetry → Tempo, structlog |
 | Integrations | Discord, Kubernetes, Jira, TeamCity (MCP), VictoriaMetrics |
-| Deploy | `deploy.sh` + raw manifests in `k8s/` (no Helm) |
+| Deploy | TeamCity build + `deploy.sh` with raw manifests in `k8s/` |
 
 ### Quick start
 
@@ -97,104 +90,69 @@ DISCORD_DRY_RUN=true
 PIPELINE_DIRECT_INVOKE=true
 ```
 
-**Full `.env` reference:**
+> `LLM_BACKEND=claude_cli` is a subprocess wrapper around `claude --print`; it matters only for the LLM pipeline.
+
+**Main `.env` keys:**
 
 | Key | Purpose | Required |
 |---|---|---|
-| `ANTHROPIC_API_KEY` | Required when `LLM_BACKEND=anthropic` | prod |
-| `DISCORD_WEBHOOK_URL` | Incident embed + approval notifications | prod |
+| `DISCORD_WEBHOOK_URL` | Alert cards | prod |
 | `DISCORD_PUBLIC_KEY` | Ed25519 key for `/discord/interactions` signature verification | for buttons |
+| `DISCORD_APPROVERS_USER_IDS` | Comma-separated Discord user IDs allowed to press Apply / Decline; empty = nobody | for buttons |
+| `DISCORD_INCIDENT_CHANNEL_ID` | Channel for remediation proposal cards (posted by the bot) | for the bridge |
 | `DISCORD_DRY_RUN` | `true` = log instead of posting to Discord | dev |
 | `ALERTMANAGER_WEBHOOK_SECRET` | HMAC-SHA256 webhook auth — mandatory in `ENV=production` | prod |
-| `DISCORD_INTERACTION_MAX_AGE_SECONDS` | Anti-replay window for Discord interaction timestamp; default 300 | optional |
-| `ALERTMANAGER_WEBHOOK_MAX_AGE_SECONDS` | Anti-replay window for AlertManager timestamp (if signer sends it); default 300 | optional |
+| `ALERTMANAGER_WEBHOOK_MAX_AGE_SECONDS` / `DISCORD_INTERACTION_MAX_AGE_SECONDS` | Anti-replay windows; default 300 | optional |
 | `ALERTMANAGER_REQUIRE_SIGNED_TIMESTAMP` | Reject body-only HMAC without a timestamp; default `false` | optional |
 | `JWT_PUBLIC_KEY` | `/copilot` endpoint auth | prod |
-| `JIRA_BASE_URL` / `JIRA_EMAIL` / `JIRA_API_TOKEN` | Jira enrichment | optional |
-| `VICTORIA_METRICS_URL` | Pod metrics window + cluster health snapshot | optional |
-| `TEAMCITY_MCP_URL` / `TEAMCITY_MCP_TOKEN` | Deploy context via TeamCity MCP | optional |
+| `VICTORIA_METRICS_URL` | Pod metrics, cluster health snapshot, reconciliation | optional |
+| `JIRA_*` / `TEAMCITY_MCP_URL` / `TEAMCITY_MCP_TOKEN` | Jira and deploy context | optional |
+| `REMEDIATION_BRIDGE_ENABLED` / `REMEDIATION_BRIDGE_NAMESPACES` | Deterministic bridge; namespace prefixes, empty = all; default off | optional |
+| `EXECUTOR_ENABLED` / `EXECUTOR_APPROVAL_ENABLED` | Executor dry-run / Apply buttons (both needed for buttons); default `false` | optional |
+| `LLM_PIPELINE_ENABLED` / `LLM_DAILY_BUDGET_USD` / `ANTHROPIC_API_KEY` | LLM pipeline; default off | optional |
+| `ROLLOUT_SUPPRESS_ENABLED` / `META_NOISE_ENABLED` / `GEN_MISMATCH_NOISE_ENABLED` | Mute deploy-window / meta-aggregate / generation-mismatch noise; default `true` | optional |
+| `DISCORD_RESOLVED_NOTICE_MIN_MINUTES` | Minimum episode length for a resolved card; default 30, `0` = all | optional |
+| `WEEKLY_RECONCILIATION_ENABLED` / `CHRONIC_DIGEST_ENABLED` | Weekly reconciliation (default on) / chronic digest (default off) | optional |
+| `LOG_LEVEL` | Log level of every process; default `INFO` | optional |
 | `PIPELINE_DIRECT_INVOKE` | Run pipeline inline (skip Celery) — for local e2e | dev |
-| `ROLLOUT_SUPPRESS_ENABLED` | Mute alerts inside a deploy window (`rollout_noise`); default `true` | optional |
-| `META_NOISE_ENABLED` | Mute always-noisy meta-aggregate / scrape-gap alerts; default `true` | optional |
-| `GEN_MISMATCH_NOISE_ENABLED` | Mute `KubeDeploymentGenerationMismatch` churn when replicas healthy; default `true` | optional |
-| `EXECUTOR_ENABLED` / `EXECUTOR_APPROVAL_ENABLED` | Opt-in executor stage + Discord Apply button; default `false` | optional |
 
 ### Discord integration
 
-The copilot posts a single embed per incident to `DISCORD_WEBHOOK_URL` containing the alert header, root cause, and synthesis. Feedback buttons (👍 / 👎) allow engineers to rate the analysis quality.
-
-**Enabling feedback buttons** requires registering an Interactions Endpoint URL in the Discord Developer Portal:
-
-```
-Discord Developer Portal → Application → General Information →
-  Interactions Endpoint URL = https://<your-host>/discord/interactions
-```
-
-Set `DISCORD_PUBLIC_KEY` (from General Information) in `.env`. For local testing, expose the service with [cloudflared](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/):
-
-```bash
-cloudflared tunnel --url http://localhost:8000
-```
-
-> **✅ Confirmed (post-experiment)**: the single embed replaced the previous two-message flow
-> (Spidey Bot raw alert + copilot analysis) — the routing is now the default in production.
-> To activate on a fresh channel:
-> 1. Remove the direct AlertManager → Discord webhook for incident alerts.
-> 2. Set `DISCORD_WEBHOOK_URL` in production `.env`.
-> 3. Set `DISCORD_DRY_RUN=false`.
+Cards go to `DISCORD_WEBHOOK_URL`; remediation proposals are posted by the bot to `DISCORD_INCIDENT_CHANNEL_ID`. Buttons need an Interactions Endpoint URL in the Discord Developer Portal (`https://<your-host>/discord/interactions`, or a relay that forwards to it) and `DISCORD_PUBLIC_KEY`. For local testing expose the service with [cloudflared](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/): `cloudflared tunnel --url http://localhost:8000`. To take over a channel, remove the direct Alertmanager → Discord webhook for those alerts and set `DISCORD_DRY_RUN=false`.
 
 ### Deploy
 
-There is no Helm chart. The service is rolled out by [`deploy.sh`](deploy.sh),
-which applies the raw manifests in [`k8s/`](k8s/) — migrations as a separate
-Job first, then executor, api, worker/beat and the NetworkPolicy — and the
-TeamCity build only does `kubectl set image` on the same Deployments. The
-chart that used to live in `helm/` had not been used since May and had drifted
-from the cluster (no executor, Postgres, backup CronJob or squad dashboard);
-it was removed on 2026-10-31, and replicas, resources and env defaults now
-live only in `k8s/`. Step-by-step procedure, migrations and rollback:
-[`docs/RUNBOOK.md`](docs/RUNBOOK.md#production-rollout-the-actual-procedure-2026-08-08).
+Components in namespace `sre-ai`: Deployments `sre-ai-api` (2, FastAPI :8000), `copilot-worker` (2, queue `celery`), `copilot-worker-sync` (1, queue `sync`), `copilot-executor` (1, queue `executor`, separate ServiceAccount with write rights), `copilot-beat` (1); StatefulSets `postgres` and `redis` (local-path volumes, PriorityClass `sre-ai-copilot-stateful`); CronJobs `postgres-backup`, `squad-dashboard`, `ci-deadman`. The Helm chart was removed in #524; manifests live only in [`k8s/`](k8s/).
 
-```bash
-IMAGE_TAG=1.0.27 ./deploy.sh                         # Nexus (default)
-IMAGE_REPO=ghcr.io/froggychips/sre-ai-copilot \
-  IMAGE_TAG=<git-sha> ./deploy.sh                    # CI-built image
-```
+1. **Release:** bump `app/__init__.py`, the README badge and CHANGELOG → PR → merge → tag `vX.Y.Z` → GitHub Release.
+2. **Build and roll out:** TeamCity `SreAiCopilotBuildAndDeploy` with parameter `TAG=X.Y.Z` builds `docker.lastoasisgame.com/wo/sre-ai-copilot:X.Y.Z` and runs `kubectl set image` on the five Deployments.
+3. **Version in cards:** `kubectl -n sre-ai set env deploy/<each of the five> BUILD_VERSION=X.Y.Z` — the card footer reads the env, not the image tag.
+4. **Manifests:** `IMAGE_TAG=X.Y.Z ./deploy.sh sre-ai` only when Deployment / NetworkPolicy / RBAC / PriorityClass manifests change (it runs migrations as a Job first and checks that Secret `sre-ai-secrets` exists; it never applies the secrets template). `deploy.sh` does not apply the postgres / redis StatefulSets: change them with `kubectl patch`, not `apply` — the live StatefulSets carry node pinning that is not in git.
+5. **Manual build** (without TeamCity): `docker buildx build --platform linux/amd64 --provenance=false --sbom=false ... --push`.
 
-> **Registry is a parameter, not a constant.** `deploy.sh` defaults to Nexus
-> (`docker.lastoasisgame.com/wo/sre-ai-copilot`), which is where the WO cluster
-> actually pulls from; pass `IMAGE_REPO=ghcr.io/froggychips/sre-ai-copilot` for
-> a CI-built image. Until 2026-08-08 the script hard-coded ghcr and stalled
-> with ImagePullBackOff in that cluster — see
-> [`docs/RUNBOOK.md`](docs/RUNBOOK.md#production-rollout-the-actual-procedure-2026-08-08).
+**Rollback:** `kubectl set image` to the previous tag + `BUILD_VERSION`. Do not re-run TeamCity with an old `TAG`: it builds `master`, so it would overwrite the old image with current code. Enable new flags on one namespace under load first, then everywhere. Procedure and migrations: [docs/RUNBOOK.md](docs/RUNBOOK.md#production-rollout-the-actual-procedure-2026-08-08); backup and restore: [docs/DR.md](docs/DR.md).
 
-The Secret `sre-ai-secrets` must exist before the first run: `deploy.sh` only
-checks for it and never applies the `k8s/base/secrets.yaml` template (see the
-`*.example` files next to it for SealedSecrets / ExternalSecrets).
+**Backup:** `postgres-backup` (02:00 UTC) writes `pg_dump` to PVC `postgres-backup-data` (keeps the last N), then uploads it with `aws s3 cp` when Secret `postgres-backup-s3` exists.
 
 ### Alert path (what actually runs)
 
-Routing lives in [`k8s/vmalertmanagerconfig.yaml`](k8s/vmalertmanagerconfig.yaml);
-the api exposes three AlertManager endpoints (`app/api/webhooks.py`):
+Routing lives in [`k8s/vmalertmanagerconfig.yaml`](k8s/vmalertmanagerconfig.yaml); the api exposes three Alertmanager endpoints (`app/api/webhooks.py`):
 
 | Endpoint | What it does | Who is routed there |
 |---|---|---|
-| `POST /webhooks/alertmanager/enrich-and-forward` | Writes the alert into the knowledge graph **and** posts an enriched card to Discord — deterministic enrichment, no LLM. The production mode. | `prod-*`, `preprod-*`, and the fallback for everything without a namespace (node and control-plane alerts) |
-| `POST /webhooks/alertmanager/store` | Knowledge graph only: history, incidents, evidence for playbooks. **Nothing goes to Discord.** | `squad-*`, `preupdate-*`, and every `severity=info` alert |
-| `POST /webhooks/alertmanager` | The full LLM pipeline (diagnostics → hypotheses → critic → synthesis → executor) | Nobody: `LLM_PIPELINE_ENABLED=false` until the E2E runs and budget caps are in place |
+| `POST /webhooks/alertmanager/enrich-and-forward` | Writes the alert into the KG **and** posts an enriched card to Discord — deterministic enrichment, no LLM | `prod-*`, `preprod-*`, and everything without a namespace (node and control-plane alerts) |
+| `POST /webhooks/alertmanager/store` | KG only: history, incidents, evidence for playbooks. **Nothing goes to Discord** (except a remediation proposal) | `squad-*`, `preupdate-*`, and every `severity=info` alert |
+| `POST /webhooks/alertmanager` | The full LLM pipeline | Nobody: `LLM_PIPELINE_ENABLED=false` |
 
-`Watchdog` and `severity=none` go to a blackhole receiver. Squad stands being
-KG-only is a decision, not a gap: dozens of short-lived dev namespaces would
-drown the incident channel, while their history stays queryable in the graph
-(`/kg/*`, MCP tools, the squad dashboard).
+`Watchdog` and `severity=none` go to a blackhole receiver. On both live paths the API only does a cheap `wants_bridge` check and a Redis `SET NX` enqueue dedup, then hands the alert to the `remediation_bridge` Celery task; Redis down → no task (fail-closed).
 
 ### API endpoints
 
 | Endpoint | Description |
 |---|---|
-| `POST /webhooks/alertmanager` | AlertManager batch webhook → full LLM pipeline (fingerprint dedup + flapping detection); off in production, see [Alert path](#alert-path-what-actually-runs) |
-| `POST /webhooks/alertmanager/store` | Same payload → knowledge graph only |
-| `POST /webhooks/alertmanager/enrich-and-forward` | Same payload → knowledge graph + enriched Discord card |
+| `POST /webhooks/alertmanager` | Alertmanager batch → full LLM pipeline; off in production |
+| `POST /webhooks/alertmanager/store` | Same payload → KG only |
+| `POST /webhooks/alertmanager/enrich-and-forward` | Same payload → KG + enriched Discord card |
 | `GET /webhooks/status/{task_id}` | Celery task status |
 | `POST /discord/interactions` | Discord button interactions (Ed25519-verified) |
 | `POST /copilot` | Conversational analysis |
@@ -210,7 +168,7 @@ drown the incident channel, while their history stays queryable in the graph
 
 ### Combat runs (accuracy history)
 
-Full details: [docs/RUNBOOK.md](docs/RUNBOOK.md)
+*Historical: hand-checked runs of the LLM pipeline, spring 2026.* Full details: [docs/RUNBOOK.md](docs/RUNBOOK.md)
 
 | Run | Incident | Result | Problem found | Fix shipped |
 |---|---|---|---|---|
@@ -221,15 +179,7 @@ Full details: [docs/RUNBOOK.md](docs/RUNBOOK.md)
 | 5 | Live preprod pod crash | ✅ **resolved** | TC context missing (`no_deploys_or_no_timestamp`) — flagged as gap, not false root cause | Correct cautious behaviour; TC MCP URL not configured locally |
 | 6 | Live preprod pod crash | ✅ **resolved** | Pipeline self-diagnosed a false refutation in synthesis | Correct — synthesis explicitly noted the contradiction and recommended manual check |
 
-Those six runs were **hand-checked** — which is exactly the problem they
-illustrate: everything else here is gated automatically (ruff, mypy, bandit,
-pip-audit, coverage, KG contract drift), while the one thing the product is
-*for* was measured by eye. The **[golden set](tests/golden/README.md)** closes
-that gap: 20 frozen incidents with expectations, run on every PR in `replay`
-mode (recorded LLM answers — no network, no key, deterministic) and against
-the real model on a schedule (`.github/workflows/eval-live.yml`). Runs 1–3
-above are now cases `001` and `013`: the false positive that cost three runs
-cannot come back unnoticed.
+Being hand-checked is exactly the problem these runs illustrate. The **[golden set](tests/golden/README.md)** closes it: 20 frozen incidents with expectations, run on every PR in `replay` mode (recorded LLM answers — no network, no key, deterministic) and against the real model on a schedule (`.github/workflows/eval-live.yml`). Runs 1–3 are now cases `001` and `013`.
 
 ```bash
 python scripts/eval_golden.py --mode replay --check-baseline
@@ -237,75 +187,70 @@ python scripts/eval_golden.py --mode replay --check-baseline
 
 ### Security
 
-- **Defence in depth around kubectl** (hardened in v1.0.0-rc.1): AI never calls kubectl directly — `FixAgent` emits structured `ExecutionIntent` (JSON, pydantic-validated, `FORBIDDEN_NAMESPACES` rejected at parse time), the `DSLTranslator` produces the canonical `kubectl` string deterministically, and `K8sSecurityGuard` validates `(verb, resource, namespace)` derived structurally from the action — not from text-parsing the command. Before any real write the apply path now passes a **deterministic server-side policy gate** (`app/remediation`, 8 risk axes) that recomputes risk from the *structured* intent and blocks prod/system/data-plane/irreversible — the LLM `risk` field is advisory only and cannot be talked past via prompt injection. `apply_intent` additionally requires a matching intent **signature** (TOCTOU) **and** a recorded `ActionApproval` for the incident before executing, with a row-lock against double-apply. `post_approval=True` (the legacy SAFE_MODE bypass) is no longer trusted on its own.
-- Tiered namespace policy enforced by `K8sSecurityGuard.validate`: `prod`/`preprod` read-only; `squad-*` write via approval; `kube-*`/`mcp` forbidden.
-- `SAFE_MODE=true` enforced in `ENV=production` (config validator raises otherwise) — a real write outside an approved path returns `SAFE_MODE: Manual approval required.`
-- AlertManager webhook auth: HMAC-SHA256 on the body (`ALERTMANAGER_WEBHOOK_SECRET` is mandatory in production, the config validator refuses to start without it). Anti-replay: when the signer sends `X-Alertmanager-Timestamp` the HMAC covers `ts.body` and a freshness window is enforced (`ALERTMANAGER_WEBHOOK_MAX_AGE_SECONDS`, default 300s); `ALERTMANAGER_REQUIRE_SIGNED_TIMESTAMP=true` rejects body-only signatures.
-- Prompt injection guard: real injection patterns (`ignore previous instructions`, …) are blocked; oversized input is **truncated** (not rejected) so large but legitimate incidents aren't dropped, and code-shaped strings (`import os`, `eval(`) are no longer blocked — crash tracebacks legitimately contain them.
-- Discord interactions endpoint verifies Ed25519 signature on every request (Discord requirement) **and enforces timestamp freshness** (`DISCORD_INTERACTION_MAX_AGE_SECONDS`, default 300s) as anti-replay — a captured signed apply/approve click can no longer be replayed. Apply button uses two-click confirmation (mirror of the 👎 feedback flow) to prevent accidental writes.
+- **No model decides a write.** Intents are structured (`ExecutionIntent`, pydantic, `FORBIDDEN_NAMESPACES` rejected at parse time); `DSLTranslator` builds the `kubectl` command deterministically; `K8sSecurityGuard` validates `(verb, resource, namespace)` structurally; the server-side policy gate (`app/remediation`, 8 risk axes) recomputes risk and blocks prod / system / data-plane / irreversible actions — an LLM `risk` field is advisory only. `apply_intent` requires a matching intent signature (TOCTOU) and a recorded `ActionApproval`, with a row lock against double apply.
+- Tiered namespace policy in `K8sSecurityGuard.validate`: `prod`/`preprod` read-only; `squad-*` write via approval; `kube-*`/`mcp` forbidden.
+- `SAFE_MODE=true` enforced in `ENV=production` (config validator raises otherwise).
+- Buttons: approver allowlist `DISCORD_APPROVERS_USER_IDS`, fail-closed; Ed25519 signature and timestamp freshness on every interaction (anti-replay).
+- Alertmanager webhook: HMAC-SHA256 on the body, mandatory in production; with `X-Alertmanager-Timestamp` the HMAC covers `ts.body` and a freshness window applies.
+- Prompt injection guard (LLM pipeline): injection patterns blocked, oversized input truncated rather than rejected.
 - Full OTEL audit trail and `EXECUTOR_APPLIED` / `EXECUTOR_APPLY_REFUSED` events — see [docs/AUDIT.md](docs/AUDIT.md).
 
 ### Roadmap — Execution
 
-The executor track is **delivered and gated behind explicit opt-in flags** as of v0.7.0. The remaining work is operational, not code.
-
 | # | Step | Status |
 |---|---|---|
 | 1 | `FixAgent` emits structured `ExecutionIntent` alongside prose | ✅ v0.7.0 (PR #23) |
-| 2 | `executor` stage after `risk` with `dry_run=True` + `K8sSecurityGuard.validate` | ✅ v0.7.0 (PR #26) |
+| 2 | `executor` stage with `dry_run=True` + `K8sSecurityGuard.validate` | ✅ v0.7.0 (PR #26) |
 | 3 | Discord Apply consumer with two-click confirm → real `kubectl` under guard | ✅ v0.7.0 (PR #27) |
-| 4 | End-to-end smoke on non-prod `squad-*` cluster + production ramp-up plan | 🟡 Operational ramp-up — advisory mode is the production default; opt-in apply (`EXECUTOR_APPROVAL_ENABLED`) not yet enabled on shared clusters |
-| 5 | Remediation verification — target identity snapshot before/after, delayed outcome check (`verified` / `failed` / `pending` / `unknown`) | ✅ v1.0.7 (PR #369) |
+| 4 | Remediation verification — target identity snapshot, delayed outcome check | ✅ v1.0.7 (PR #369) |
+| 5 | Deterministic bridge rule → playbook → Apply / Decline buttons, enabled in production (`REMEDIATION_BRIDGE_ENABLED`, `EXECUTOR_ENABLED`, `EXECUTOR_APPROVAL_ENABLED` = true, approver allowlist) | ✅ v1.0.31 |
+| 6 | Bridge in Celery instead of the API event loop; per-namespace enablement | ✅ v1.0.32 |
 
-**Ramp-up plan:**
-
-1. **Dev**: `EXECUTOR_ENABLED=true`, `EXECUTOR_APPROVAL_ENABLED=true` on local dev with `DISCORD_DRY_RUN=true` — verify embed buttons appear correctly.
-2. **One preprod squad-N namespace**: enable both flags via env in `k8s/base/deployment.yaml` + `k8s/worker.yaml` (`deploy.sh`); trigger a synthetic alert (or wait for a real one); click Apply on a low-risk action (`get_logs`, `describe_resource`). Verify `executor_applied` row in DB and audit log.
-3. **All preprod-squad-***: gradual rollout one namespace per day, watch for `EXECUTOR_APPLY_REFUSED` rate.
-4. **Production-squad-N**: same procedure, `low`-risk only for first week, then `medium` after one clean incident.
-5. **No HIGH risk auto-apply ever** — by design. HIGH-risk intents never get the Apply button.
-
-See [docs/RUNBOOK.md → Executor incidents](docs/RUNBOOK.md#executor-incidents) for operational procedures.
+Rules that stay: `approve` only for dev / squad namespaces, prod / preprod / system are blocked by policy; no HIGH-risk auto-apply; new flags go to one namespace under load before all. Operations: [docs/RUNBOOK.md → Executor incidents](docs/RUNBOOK.md#executor-incidents).
 
 ### Roadmap — Knowledge graph
 
 | # | Step | Status |
 |---|---|---|
-| 1 | Evidence semantics: `verdict` / `epistemic` / `provenance` on facts, `sources` on rules, Known Unknowns via `source_status` | ✅ v1.0.7 (PR #365) |
-| 2 | Incident as a first-class graph object (`kg_incidents`) | ✅ v1.0.7 (PR #366) |
-| 3 | Incident timeline across deploys / pod events / anomalies / logs / alerts | ✅ v1.0.7 (PR #366) |
-| 4 | Blast radius with evidence per path | ✅ v1.0.7 (PR #368) |
-| 5 | Operational memory: evidence → diagnosis → decision → action → verification on the timeline | ✅ v1.0.8 (PR #371) |
-| 6 | Incident correlation across services (shared dependency, deploy in window, `calls` edge) — as edges between incidents | 🟡 after a month of `kg_incidents` data (from 2026-09-07) |
-| 7 | Deterministic, evidence-backed RCA | 🟡 after 6 |
-| 8 | LLM on top of a deterministic `IncidentContext` (planner → KG → evidence → model), never on raw tables | ⬜ |
+| 1 | Evidence semantics: `verdict` / `epistemic` / `provenance`, Known Unknowns via `source_status` | ✅ v1.0.7 (PR #365) |
+| 2 | Incident as a graph object (`kg_incidents`) + timeline | ✅ v1.0.7 (PR #366) |
+| 3 | Blast radius with evidence per path | ✅ v1.0.7 (PR #368) |
+| 4 | Operational memory: evidence → diagnosis → decision → action → verification | ✅ v1.0.8 (PR #371) |
+| 5 | One point-in-time incident context from the graph for rules, model and card (`app/context/kg_incident_context.py`) | ✅ v1.0.20 |
+| 6 | Node zones and traffic entrypoints (`kg_nodes`, `kg_entrypoints`), databases as graph nodes | ✅ v1.0.24 |
+| 7 | Alert attributed to its k8s object instead of the metrics exporter | ✅ v1.0.25, v1.0.31 |
+| 8 | Incident correlation across services — as edges between incidents | ⬜ not implemented |
+| 9 | Deterministic, evidence-backed RCA | ⬜ after 8 |
 
 ### Documentation
 
 | Document | EN | RU |
 |---|---|---|
-| Architecture | [ARCHITECTURE.md](docs/ARCHITECTURE.md) | [ARCHITECTURE.ru.md](docs/ARCHITECTURE.ru.md) |
-| Runbook / Combat runs | [RUNBOOK.md](docs/RUNBOOK.md) | [RUNBOOK.ru.md](docs/RUNBOOK.ru.md) |
+| Architecture (incl. LLM pipeline) | [ARCHITECTURE.md](docs/ARCHITECTURE.md) | [ARCHITECTURE.ru.md](docs/ARCHITECTURE.ru.md) |
+| Runbook / rollout / combat runs | [RUNBOOK.md](docs/RUNBOOK.md) | [RUNBOOK.ru.md](docs/RUNBOOK.ru.md) |
 | Module docs | [MODULE_DOCS.md](docs/MODULE_DOCS.md) | [MODULE_DOCS.ru.md](docs/MODULE_DOCS.ru.md) |
-| Audit trail (OTEL) | [AUDIT.md](docs/AUDIT.md) | — |
-| Semantic contract | [SEMANTIC_CONTRACT.md](docs/SEMANTIC_CONTRACT.md) | — |
-| KG schema / quality contract | — | [KG_SCHEMA_CONTRACT.md](docs/KG_SCHEMA_CONTRACT.md) |
-| Metrics (signals, self-health) | [METRICS.md](docs/METRICS.md) | [METRICS.ru.md](docs/METRICS.ru.md) |
 | FAQ | [FAQ.md](docs/FAQ.md) | [FAQ.ru.md](docs/FAQ.ru.md) |
+| Metrics (signals, self-health) | [METRICS.md](docs/METRICS.md) | [METRICS.ru.md](docs/METRICS.ru.md) |
+| Remediation playbook contract | — | [REMEDIATION_PLAYBOOK_CONTRACT.md](docs/REMEDIATION_PLAYBOOK_CONTRACT.md) |
+| KG schema / quality contract | — | [KG_SCHEMA_CONTRACT.md](docs/KG_SCHEMA_CONTRACT.md) |
+| Semantic contract | [SEMANTIC_CONTRACT.md](docs/SEMANTIC_CONTRACT.md) | — |
+| Audit trail (OTEL) | [AUDIT.md](docs/AUDIT.md) | — |
 | DR plan | [DR.md](docs/DR.md) | — |
+| Post-mortem 2026-08-08 (historical) | [POSTMORTEM_2026_08_08.md](docs/POSTMORTEM_2026_08_08.md) | [POSTMORTEM_2026_08_08.ru.md](docs/POSTMORTEM_2026_08_08.ru.md) |
+| KG quality baseline 2026-05-24 (historical) | — | [quality_report_baseline_2026_05_24.md](docs/quality_report_baseline_2026_05_24.md) |
 | Golden eval set | [tests/golden/README.md](tests/golden/README.md) | — |
-| Changelog | [CHANGELOG.md](CHANGELOG.md) | — |
+| Changelog | — | [CHANGELOG.md](CHANGELOG.md) |
 
 ### sre-ai-copilot vs froggy-sre
 
 | | sre-ai-copilot | [froggy-sre](https://github.com/froggychips/froggy-sre) |
 |---|---|---|
-| **Trigger** | AlertManager webhook (headless) | MCP tool call from Claude Code |
-| **Runtime** | Any server / k8s pod | macOS dev machine |
-| **LLM** | Anthropic API | Froggy local → Anthropic fallback |
+| **Trigger** | Alertmanager webhook (headless) | MCP tool call from Claude Code |
+| **Runtime** | Kubernetes pods | macOS dev machine |
+| **Analysis** | Deterministic rules + KG (LLM pipeline off) | Froggy local → Anthropic fallback |
 | **k8s context** | In-cluster Kubernetes SDK | `kubectl` via kubeconfig |
 | **Storage** | PostgreSQL + Celery queue | `~/.froggy-sre/incidents/` (local JSON) |
-| **Notifications** | Discord webhook | Reply in Claude Code |
+| **Notifications** | Discord | Reply in Claude Code |
 | **When to use** | Persistent headless alerting in production | Interactive incident analysis via Claude Code |
 
 ---
@@ -313,40 +258,45 @@ See [docs/RUNBOOK.md → Executor incidents](docs/RUNBOOK.md#executor-incidents)
 <a name="русский"></a>
 ## Русский
 
-**SRE AI Copilot** — backend-сервис, который превращает webhook-и Prometheus AlertManager либо в **аналитическую справку** (по дефолту), либо в **авто-ремедиатор с human approval** (opt-in) по инциденту в Kubernetes: root cause + рекомендуемые действия, постит embed-ом в Discord.
+**SRE AI Copilot** — backend-сервис: принимает вебхуки Alertmanager, записывает каждый алерт в граф знаний кластера (KG) на Postgres и постит в Discord карточки с детерминированным обогащением. Для небольшого набора типов алертов предлагает действие из playbook-а с кнопками «Применить / Отклонить».
 
-> **Default = advisory-режим.** Со стандартными настройками (`EXECUTOR_ENABLED=false`, `EXECUTOR_APPROVAL_ENABLED=false`) copilot **не** вызывает `kubectl` — анализирует, постит в Discord, останавливается. Инженер действует руками.
->
-> **Opt-in = auto-remediator с approval.** При `EXECUTOR_ENABLED=true` добавляется 9-я стадия пайплайна: предложенное действие валидируется через `kube-apiserver` командой `kubectl ... --dry-run=server`. При `EXECUTOR_APPROVAL_ENABLED=true` на embed дополнительно появляется кнопка «⚙️ Apply» (только если dry-run прошёл и risk ≤ medium); двухшаговое подтверждение → реальный `kubectl` под `K8sSecurityGuard` + полный OTEL audit. См. [Roadmap — Execution](#roadmap--execution-1) ниже для плана выкатки.
+### Что работает в проде
 
-### Что умеет
+- **Обогащение из KG → Discord.** `prod-*`, `preprod-*` и алерты без namespace (ноды, control plane) идут в `/webhooks/alertmanager/enrich-and-forward`: алерт пишется в граф, в канал инцидентов уходит обогащённая карточка. Обогащение — правила и граф, без LLM: факты правил со свидетельствами (`verdict` found / absent / unknown, `epistemic`, `provenance`; упавший источник отвечает `?`, а не «не нашли»), недавние деплои, соседние алерты и открытые инциденты, команда-владелец, blast radius. Мета-агрегаты и churn `KubeDeploymentGenerationMismatch` при здоровых репликах рисуются приглушённо (серым, 🔇, без упоминания), а не выбрасываются.
+- **Атрибуция к k8s-объекту, а не к экспортеру** (`app/services/alert_target.py`, 1.0.31): одна цепочка приоритета меток (workload → CronJob/Job → HPA/PDB → нода → PVC → под → scrape job → service → namespace) для store-пути и для карточки; исход — в `kg_alerts.raw.target_kind`.
+- **Меньше шума в канале** (1.0.31): карточка «✅ resolved» только за эпизод от 30 минут (`DISCORD_RESOLVED_NOTICE_MIN_MINUTES`); повтор горящего алерта от Alertmanager больше не постит «🌀 RESURFACED» (`ALERT_SUPPRESS_AM_REPEATS`).
+- **KG как история.** `squad-*`, `preupdate-*` и все алерты `severity=info` идут в `/webhooks/alertmanager/store`: только граф, в Discord ничего — это решение, а не дыра. В графе — инциденты (`kg_incidents`, один открытый на сервис), timeline инцидента, blast radius со свидетельствами на каждом пути, выкаты, замеченные в самом кластере (`kg_deploy_watch`), зоны нод и точки входа трафика. Доступно через `/kg/*`, MCP-инструменты и витрину сквадов.
+- **Детерминированный мост remediation** (`app/remediation/`, 1.0.31; в Celery с 1.0.32): факты правил + живое состояние пода → `match_playbooks` → intent из `plan.steps` playbook-а (собирает сервер) → policy-gate. При `approve` — снимок цели, server dry-run и карточка с кнопками **Применить / Отклонить** в канале инцидентов; при `block` (prod / preprod / system) в обычной карточке только строка «заблокирован policy». Playbook-и, доступные мосту по имени алерта: `restart_crashloop_deployment` и `scale_out_cpu_throttled_deployment` (второй карточку пока не даёт: мост не вычисляет целевое `replicas`, рендер плана падает); `approve` разрешён только для dev / squad. Одно и то же предложение не повторяется 6 ч. Для сквадов это узкое исключение из «только в KG»: карточка появляется, только когда playbook применим.
+- **Кнопки — только allowlist.** Клик принимается только от пользователя из `DISCORD_APPROVERS_USER_IDS` (fail-closed, роли не используются). В этой установке Interactions Endpoint Discord-приложения указывает на отдельный сервис бота, который пересылает клики `approve:` / `decline:` в `/discord/interactions` копилота; подпись Ed25519 копилот проверяет сам.
+- **Защищённый путь записи** (кратко; подробно — [docs/ARCHITECTURE.ru.md](docs/ARCHITECTURE.ru.md) и [docs/REMEDIATION_PLAYBOOK_CONTRACT.md](docs/REMEDIATION_PLAYBOOK_CONTRACT.md)): детерминированный policy-gate по 8 осям риска, проверка идентичности цели перед записью (`target_reincarnated`), повторный dry-run, совпадение подписи intent-а и свежий `ActionApproval` (протухает через 1 ч), claim `in_flight` до `kubectl`, отдельный executor со своим ServiceAccount и проверка исхода через 5 и 15 минут (`verified` / `failed` / `pending` / `unknown`). Каждый шаг — событие OTEL / аудита ([docs/AUDIT.md](docs/AUDIT.md)).
+- **События лечения от внешнего медика стендов** принимаются по HMAC в `kg_remediation_events`; `fixed` — стенд здоров после лечения.
+- **Self-health и сверка.** Метрики `copilot_self_health_*` с алертами `VMRule sre-ai-copilot`; еженедельная сверка с кластером (`weekly_reconciliation`, пн 06:00 UTC, #stats): покрытие алертов против `ALERTS` в VictoriaMetrics, рост таблиц, возраст бэкапа, доля алертов без атрибуции, подтверждённые починки — недоступный источник даёт «не измерено», а не ноль.
+- **Дайджесты**: ежедневный по кластеру (`daily_stats_digest`), хронические алерты раз в 6 ч (`chronic_alerts_digest`, opt-in `CHRONIC_DIGEST_ENABLED`) с секцией алертов, горящих непрерывно дольше 24 ч.
 
-- Принимает алерты AlertManager — три endpoint-а под `/webhooks/alertmanager`, см. [Боевой путь алертов](#боевой-путь-алертов) ниже.
-- **Дедупликация по fingerprint**: повторные алерты для инцидента в статусе OPEN→RESOLVED пропускаются. Повторный запуск только для FAILED.
-- **Детекция флаппинга**: если алерт срабатывает после RESOLVED — инкрементирует `flap_count` и перезапускает пайплайн с явным контекстом «этот алерт уже циклировал N раз; RESOLVED между срабатываниями, вероятно, был ложным».
-- Запускает `DiagnosticsEngine` — детерминированные правила выдают типизированный `FactStore` (oom_killed, process_crash, crashloop, …) до любого LLM-вызова.
-- Детектирует **факт-конфликты** (`oom_killed` + `process_crash` одновременно True = противоречие → cap конфиденса, блок `<conflicts>` в промпт).
-- Запускает **многогипотезный fan-out** по 4 перспективам (app / infra / deps / runtime) с фильтром `PERSPECTIVE_PRECONDITIONS`, затем adversarially проверяет каждую гипотезу через `FactCriticAgent`.
-- Обогащает контекст **snapshot кластерного здоровья** в момент инцидента: ноды ready, упавшие поды, crashloop-ы, CPU/mem/disk peak, счётчики firing alerts — те же метрики, что в ежедневном отчёте `#stats`. Позволяет LLM различать «изолированный pod» и «кластерное давление».
-- Поддерживает **Node\*-алерты** (NodeDiskIOSaturation, NodeMemoryWillExhaustSoon, …): labels `instance`/`node` используются для обогащения и отображаются в Discord вместо `pod`.
-- **Подавление шумных алёртов (alert-quality)**: мета-агрегаты (`*NewCriticalAlerts`, производные control-plane scrape-gap) и *условный* churn `KubeDeploymentGenerationMismatch` рендерятся **приглушённо** (grey + 🔇, без 🚨/@mention), а не дропаются — видимы для глазной проверки, но не пейджат. `gen_mismatch_noise` health-gated (приглушаем только при `ready==desired`, иначе LOUD); у обоих классов есть kill-switch. Отличается от input-уровня `ALERT_SUPPRESS_NAMES` (дроп) и от `rollout_noise` (подавление в окне деплоя).
-- Обогащает контекст из **Atlassian Jira** (тикеты по сервису), **TeamCity** (последние деплои), **VictoriaMetrics** (память/CPU пода + кластерный snapshot).
-- Детектирует **рецидивы**: тот же сервис resolved < 7 дней → `FixAgent` переключается в investigative-режим (не рекомендует рестарт).
-- Постит **один Discord embed** на инцидент (заголовок алерта + root cause + синтез + кнопки фидбека), заменяя прежние два сообщения.
-- **Кнопки 👍 / 👎** на каждом embed: 👍 сохраняется сразу; 👎 требует двухшагового подтверждения («Подтверди: выводы модели были ошибочными?») — защита от случайного клика. Результат сохраняется в `IncidentRecord.user_feedback`.
-- **Структурный `ExecutionIntent`** рядом с prose: `FixAgent` выдаёт JSON по схеме `ExecutionIntent` (`action`, `resource_type`, `resource_name`, `namespace`, `params`, `risk`); pydantic-валидация, `FORBIDDEN_NAMESPACES` отбрасываются на парсе, сохраняется в `IncidentRecord.analysis.execution_intent`.
-- **Executor-стадия** (opt-in `EXECUTOR_ENABLED=true`): server-side dry-run intent-а (`kubectl ... --dry-run=server`) под `K8sSecurityGuard`; результат в `executor_result` и на Discord-embed полем «Dry-run verdict».
-- **Discord Apply-кнопка** (opt-in `EXECUTOR_APPROVAL_ENABLED=true`): двухшаговое подтверждение на embed → `K8sService.execute_intent(intent, dry_run=False, post_approval=True)`; идемпотентность по `incident_id`, eligible только при dry-run ok и risk ∈ {low, medium}; HIGH-risk и ineligible инциденты кнопку не получают вообще.
-- **Кнопки Approve / Decline** закрыты тем же флагом `EXECUTOR_APPROVAL_ENABLED`. Раньше зелёная «Approve & Run» рисовалась при любом распарсенном `execution_intent`, а её хендлер запускал реальный write по одному лишь `EXECUTOR_ENABLED` — то есть стенд, включивший «безопасную» dry-run-валидацию, получал реальный `kubectl` в один клик мимо двухшагового подтверждения. Теперь `EXECUTOR_ENABLED=true` означает ровно dry-run, как и заявлено выше.
-- **Срок годности одобрения + in-flight claim**: запись `ActionApproval` протухает через `EXECUTOR_APPROVAL_MAX_AGE_SECONDS` (по умолчанию 1 час) — старое одобрение больше не авторизует поздний write; claim `in_flight` коммитится ДО вызова kubectl, поэтому смерть воркера в момент мутации не оставит кластер изменённым с незаписанным маркером идемпотентности.
-- Полный **OTEL audit trail**: root span `sre.copilot.incident.process`, child-спан на стадию, атрибуты `execution_intent_parsed` / `executor_status`, events `guardrail.blocked` при отказе guard-а, audit-события `EXECUTOR_APPLIED` / `EXECUTOR_APPLY_REFUSED`.
-- **Доказательства, а не флаги** (v1.0.4): у каждого факта правил есть `verdict` (`found` / `absent` / `unknown`), `epistemic` (observed / declared / inferred …), `provenance` и окно поиска; упавший источник помечает свои поля в `source_status`, и правило отвечает `?`, а не уверенным «не нашли». Привязка деплоя — тоже свидетельство: точная запись (`namespace_scope=false`) даёт `observed 0.95`, ns-broadcast — `inferred 0.6`.
-- **Инциденты как объекты графа** (v1.0.6): `kg_incidents` — один открытый инцидент на сервис (частичный уникальный индекс), алерты присоединяются, флаппинг переоткрывает в окне 30 мин, жизненный цикл закрывает, когда все алерты resolved; `noise=true`, если обогащение сочло все его алерты шумом (`GET /kg/incidents` такие скрывает по умолчанию).
-- **Timeline инцидента** (`GET /kg/incidents/{id}/timeline`): деплои, события подов, аномалии (по метрике и часу), ошибки логов, алерты и собственная операционная память копилота (свидетельства → диагноз → решение → действие → верификация) на одной оси; у каждого события `evidence = {epistemic, provenance}`, плюс `unknowns` — источники, которые опросить было нечем.
-- **Blast radius с доказательствами** (`GET /kg/blast-radius`): что сломается, если X сломается — обход против `calls` / `uses_db` / `uses_nats` / `serves_traffic` до двух шагов; путь наследует слабейшее звено; «вызывающие неизвестны» и «вызывающих нет» — разные ответы.
-- **Верификация remediation** (v1.0.7): перед `kubectl` снимается живая цель (`uid`, `generation`, hash шаблона, реплики) и сверяется с `target_ref` из графа — пересозданный объект получает отказ (`target_reincarnated`); после записи Celery-задача перепроверяет через 5 и 15 минут: та же идентичность, rollout сошёлся, ready == desired, алерт resolved, новых CrashLoop/OOM нет → `verified` / `failed` / `pending` / `unknown`.
-- **Watcher выкатов из кластера** (`kg_deploy_watch`, каждые 5 мин): выкат определяется по смене образа или `spec.template`, а не по `metadata.generation` (его крутит HPA каждый тик) — второй, точный источник `kg_deployments`.
-- **Self-health в метриках**: `copilot_self_health_*` скрейпит VictoriaMetrics, `VMRule sre-ai-copilot` алертит на протухшие/упавшие проверки; источник, выключенный настройкой, отдаёт `disabled`, а не `warn`.
+**Что нового (1.0.28 → 1.0.33)** — подробно в [CHANGELOG.md](CHANGELOG.md):
+
+- отдельная очередь `sync` и Deployment `copilot-worker-sync` для тяжёлых синков KG; `single_instance` на beat-задачах (1.0.28);
+- сборки статики — одна строка `kg_deployments` на namespace вместо рассылки на все сервисы (1.0.28);
+- ретеншен таблиц событий (`EVENT_RETENTION_TARGETS`) рядом с 30-дневным ретеншеном `kg_service_health`; CronJob бэкапа Postgres сверен с кластером (дамп на PVC, опциональная выгрузка в S3) (1.0.28);
+- еженедельная сверка (1.0.30); мост remediation с кнопками, resolved ≥ 30 мин, без повторного RESURFACED, атрибуция к объекту (1.0.31);
+- мост вынесен из event loop API в Celery-задачу `remediation_bridge`, включение по префиксам namespace через `REMEDIATION_BRIDGE_NAMESPACES` (1.0.32);
+- PriorityClass `sre-ai-copilot-stateful` у postgres / redis (выселяются последними); логирование настроено в каждом процессе (`LOG_LEVEL`, httpx / httpcore на WARNING); upsert-ы KG не переписывают неизменившиеся строки; пометка дрейфа снимается с узлов пересозданного namespace; Python 3.13 (1.0.33).
+
+### LLM-конвейер (реализован, в проде выключен)
+
+`POST /webhooks/alertmanager` запускает полный LLM-конвейер: детерминированная диагностика → многогипотезный fan-out → критик фактов → синтез → `FixAgent` со структурным `ExecutionIntent` → опционально dry-run executor-а и кнопка Apply. Ни один маршрут Alertmanager туда не ведёт: `LLM_PIPELINE_ENABLED=false`, а для включения нужен конечный `LLM_DAILY_BUDGET_USD` (иначе config-validator не даёт стартовать). Стадии, промпты и golden-набор: [docs/ARCHITECTURE.ru.md](docs/ARCHITECTURE.ru.md), [tests/golden/README.md](tests/golden/README.md).
+
+### Стек
+
+| Слой | Технология |
+|---|---|
+| API | FastAPI + Uvicorn |
+| Очереди | Celery + Redis (очереди `celery`, `sync`, `executor`) |
+| База | PostgreSQL + SQLAlchemy (SQLite для локальной разработки) |
+| LLM | Anthropic Claude (API key или CLI `claude --print`) — только LLM-конвейер, в проде выключен |
+| Наблюдаемость | Prometheus / VictoriaMetrics, OpenTelemetry → Tempo, structlog |
+| Интеграции | Discord, Kubernetes, Jira, TeamCity (MCP), VictoriaMetrics |
+| Деплой | Сборка TeamCity + `deploy.sh` с сырыми манифестами из `k8s/` |
 
 ### Быстрый старт
 
@@ -377,104 +327,69 @@ DISCORD_DRY_RUN=true
 PIPELINE_DIRECT_INVOKE=true
 ```
 
-> **LLM_BACKEND=claude_cli** — subprocess-обёртка вокруг `claude --print`.
-> Полный пайплайн без Anthropic API key. Для production: `LLM_BACKEND=anthropic` + `ANTHROPIC_API_KEY`.
+> `LLM_BACKEND=claude_cli` — subprocess-обёртка вокруг `claude --print`; нужна только LLM-конвейеру.
 
-**Все переменные окружения:**
+**Основные переменные окружения:**
 
 | Ключ | Назначение | Обязательность |
 |---|---|---|
-| `ANTHROPIC_API_KEY` | При `LLM_BACKEND=anthropic` | prod |
-| `DISCORD_WEBHOOK_URL` | Embed-отчёты + approval | prod |
+| `DISCORD_WEBHOOK_URL` | Карточки алертов | prod |
 | `DISCORD_PUBLIC_KEY` | Ed25519-ключ для верификации `/discord/interactions` | для кнопок |
+| `DISCORD_APPROVERS_USER_IDS` | Discord ID пользователей через запятую, кому можно жать Применить / Отклонить; пусто — никому | для кнопок |
+| `DISCORD_INCIDENT_CHANNEL_ID` | Канал для карточек-предложений моста (постит бот) | для моста |
 | `DISCORD_DRY_RUN` | `true` = логировать вместо отправки | dev |
-| `ALERTMANAGER_WEBHOOK_SECRET` | HMAC-SHA256 аутентификация вебхука | prod |
-| `DISCORD_INTERACTION_MAX_AGE_SECONDS` | Anti-replay окно для timestamp Discord-interaction; дефолт 300 | опционально |
-| `ALERTMANAGER_WEBHOOK_MAX_AGE_SECONDS` | Anti-replay окно для AlertManager timestamp (если signer шлёт); дефолт 300 | опционально |
+| `ALERTMANAGER_WEBHOOK_SECRET` | HMAC-SHA256 аутентификация вебхука — обязателен в `ENV=production` | prod |
+| `ALERTMANAGER_WEBHOOK_MAX_AGE_SECONDS` / `DISCORD_INTERACTION_MAX_AGE_SECONDS` | Окна anti-replay; дефолт 300 | опционально |
 | `ALERTMANAGER_REQUIRE_SIGNED_TIMESTAMP` | Отвергать body-only HMAC без timestamp; дефолт `false` | опционально |
 | `JWT_PUBLIC_KEY` | Аутентификация `/copilot` | prod |
-| `JIRA_BASE_URL` / `JIRA_EMAIL` / `JIRA_API_TOKEN` | Обогащение из Jira | опционально |
-| `VICTORIA_METRICS_URL` | Метрики пода + кластерный snapshot | опционально |
-| `TEAMCITY_MCP_URL` / `TEAMCITY_MCP_TOKEN` | Контекст деплоев через TeamCity MCP | опционально |
-| `PIPELINE_DIRECT_INVOKE` | Запуск пайплайна inline без Celery | dev |
-| `ROLLOUT_SUPPRESS_ENABLED` | Приглушать алёрты в окне деплоя (`rollout_noise`); по умолчанию `true` | optional |
-| `META_NOISE_ENABLED` | Приглушать всегда-шумные мета-агрегаты / scrape-gap алёрты; по умолчанию `true` | optional |
-| `GEN_MISMATCH_NOISE_ENABLED` | Приглушать churn `KubeDeploymentGenerationMismatch` при здоровых репликах; по умолчанию `true` | optional |
-| `EXECUTOR_ENABLED` / `EXECUTOR_APPROVAL_ENABLED` | Opt-in executor-стадия + Discord-кнопка Apply; по умолчанию `false` | optional |
+| `VICTORIA_METRICS_URL` | Метрики пода, снимок кластера, сверка | опционально |
+| `JIRA_*` / `TEAMCITY_MCP_URL` / `TEAMCITY_MCP_TOKEN` | Контекст Jira и деплоев | опционально |
+| `REMEDIATION_BRIDGE_ENABLED` / `REMEDIATION_BRIDGE_NAMESPACES` | Детерминированный мост; префиксы namespace, пусто — все; по умолчанию выключен | опционально |
+| `EXECUTOR_ENABLED` / `EXECUTOR_APPROVAL_ENABLED` | Dry-run executor-а / кнопки Apply (для кнопок нужны оба); по умолчанию `false` | опционально |
+| `LLM_PIPELINE_ENABLED` / `LLM_DAILY_BUDGET_USD` / `ANTHROPIC_API_KEY` | LLM-конвейер; по умолчанию выключен | опционально |
+| `ROLLOUT_SUPPRESS_ENABLED` / `META_NOISE_ENABLED` / `GEN_MISMATCH_NOISE_ENABLED` | Приглушать шум окна деплоя / мета-агрегатов / generation mismatch; по умолчанию `true` | опционально |
+| `DISCORD_RESOLVED_NOTICE_MIN_MINUTES` | Минимальная длина эпизода для resolved-карточки; дефолт 30, `0` — все | опционально |
+| `WEEKLY_RECONCILIATION_ENABLED` / `CHRONIC_DIGEST_ENABLED` | Еженедельная сверка (по умолчанию вкл) / хронический дайджест (по умолчанию выкл) | опционально |
+| `LOG_LEVEL` | Уровень логов каждого процесса; дефолт `INFO` | опционально |
+| `PIPELINE_DIRECT_INVOKE` | Запуск пайплайна inline без Celery — для локального e2e | dev |
 
 ### Discord-интеграция
 
-Copilot постит один embed на инцидент: заголовок алерта (alertname · namespace), root cause, синтез и кнопки фидбека. Кнопки требуют регистрации Interactions Endpoint:
-
-```
-Discord Developer Portal → Application → General Information →
-  Interactions Endpoint URL = https://<your-host>/discord/interactions
-```
-
-Установить `DISCORD_PUBLIC_KEY` (из General Information) в `.env`. Для локального теста — пробросить порт через [cloudflared](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/):
-
-```bash
-cloudflared tunnel --url http://localhost:8000
-```
-
-> **✅ Подтверждено (после эксперимента)**: один embed заменил прежний флоу из двух
-> сообщений (сырой алерт от Spidey Bot + анализ copilot) — это теперь дефолт в проде.
-> Для активации на новом канале:
-> 1. Убрать прямой Alertmanager → Discord webhook для инцидентных алертов.
-> 2. Прописать `DISCORD_WEBHOOK_URL` в production `.env`.
-> 3. Установить `DISCORD_DRY_RUN=false`.
+Карточки уходят в `DISCORD_WEBHOOK_URL`; предложения моста бот постит в `DISCORD_INCIDENT_CHANNEL_ID`. Для кнопок нужен Interactions Endpoint URL в Discord Developer Portal (`https://<your-host>/discord/interactions` или relay, который туда пересылает) и `DISCORD_PUBLIC_KEY`. Для локального теста — [cloudflared](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/): `cloudflared tunnel --url http://localhost:8000`. Чтобы забрать канал, уберите прямой вебхук Alertmanager → Discord для этих алертов и выставьте `DISCORD_DRY_RUN=false`.
 
 ### Деплой
 
-Helm-чарта нет. Сервис выкатывает [`deploy.sh`](deploy.sh), применяя сырые
-манифесты из [`k8s/`](k8s/) — сначала миграции отдельным Job-ом, затем
-executor, api, worker/beat и NetworkPolicy; сборка TeamCity делает только
-`kubectl set image` на тех же Deployment-ах. Чарт из `helm/` с мая не
-использовался и разъехался с кластером (ни executor-а, ни Postgres, ни
-CronJob бэкапов, ни витрины сквадов) — удалён 31.10.2026; реплики, ресурсы и
-дефолты env теперь живут только в `k8s/`. Пошаговая процедура, миграции и
-откат: [`docs/RUNBOOK.ru.md`](docs/RUNBOOK.ru.md#выкат-в-прод-реальная-процедура-08082026).
+Компоненты в namespace `sre-ai`: Deployment-ы `sre-ai-api` (2, FastAPI :8000), `copilot-worker` (2, очередь `celery`), `copilot-worker-sync` (1, очередь `sync`), `copilot-executor` (1, очередь `executor`, отдельный ServiceAccount с правом записи), `copilot-beat` (1); StatefulSet-ы `postgres` и `redis` (тома local-path, PriorityClass `sre-ai-copilot-stateful`); CronJob-ы `postgres-backup`, `squad-dashboard`, `ci-deadman`. Helm-чарт удалён в #524; манифесты живут только в [`k8s/`](k8s/).
 
-```bash
-IMAGE_TAG=1.0.27 ./deploy.sh                         # Nexus (по умолчанию)
-IMAGE_REPO=ghcr.io/froggychips/sre-ai-copilot \
-  IMAGE_TAG=<git-sha> ./deploy.sh                    # образ из CI
-```
+1. **Релиз:** бамп `app/__init__.py`, бейджа README и CHANGELOG → PR → мерж → тег `vX.Y.Z` → GitHub Release.
+2. **Сборка и выкат:** TeamCity `SreAiCopilotBuildAndDeploy` с параметром `TAG=X.Y.Z` собирает `docker.lastoasisgame.com/wo/sre-ai-copilot:X.Y.Z` и делает `kubectl set image` на пять Deployment-ов.
+3. **Версия в карточках:** `kubectl -n sre-ai set env deploy/<каждый из пяти> BUILD_VERSION=X.Y.Z` — футер карточки читает env, а не тег образа.
+4. **Манифесты:** `IMAGE_TAG=X.Y.Z ./deploy.sh sre-ai` — только когда меняются манифесты Deployment / NetworkPolicy / RBAC / PriorityClass (сначала миграции Job-ом, проверяет наличие Secret `sre-ai-secrets`, шаблон секретов не применяет никогда). StatefulSet-ы postgres / redis `deploy.sh` не применяет: менять их `kubectl patch`, не `apply` — у живых StatefulSet-ов есть привязка к ноде, которой нет в git.
+5. **Ручная сборка** (без TeamCity): `docker buildx build --platform linux/amd64 --provenance=false --sbom=false ... --push`.
 
-> **Registry — параметр, а не константа.** По умолчанию `deploy.sh` берёт
-> образ из Nexus (`docker.lastoasisgame.com/wo/sre-ai-copilot`) — оттуда же,
-> откуда реально тянут поды WO-кластера; для образа из CI передаётся
-> `IMAGE_REPO=ghcr.io/froggychips/sre-ai-copilot`. До 08.08.2026 скрипт
-> хардкодил ghcr и упирался в ImagePullBackOff — разбор в
-> [`docs/POSTMORTEM_2026_08_08.ru.md`](docs/POSTMORTEM_2026_08_08.ru.md).
+**Откат:** `kubectl set image` на прежний тег + `BUILD_VERSION`. TeamCity со старым `TAG` не запускать: он собирает `master` и перезапишет старый образ текущим кодом. Новые флаги — сначала на одном namespace под нагрузкой, потом на всех. Процедура и миграции: [docs/RUNBOOK.ru.md](docs/RUNBOOK.ru.md#выкат-в-прод-реальная-процедура-08082026); бэкап и восстановление: [docs/DR.md](docs/DR.md).
 
-Secret `sre-ai-secrets` должен существовать до первого запуска: `deploy.sh`
-только проверяет его наличие и никогда не применяет шаблон
-`k8s/base/secrets.yaml` (рядом — `*.example` для SealedSecrets / ExternalSecrets).
+**Бэкап:** `postgres-backup` (02:00 UTC) пишет `pg_dump` на PVC `postgres-backup-data` (хранит последние N), затем выгружает его `aws s3 cp`, если есть Secret `postgres-backup-s3`.
 
 ### Боевой путь алертов
 
-Маршрутизация — в [`k8s/vmalertmanagerconfig.yaml`](k8s/vmalertmanagerconfig.yaml);
-api отдаёт три endpoint-а для AlertManager (`app/api/webhooks.py`):
+Маршрутизация — в [`k8s/vmalertmanagerconfig.yaml`](k8s/vmalertmanagerconfig.yaml); api отдаёт три endpoint-а для Alertmanager (`app/api/webhooks.py`):
 
 | Endpoint | Что делает | Кто туда маршрутизируется |
 |---|---|---|
-| `POST /webhooks/alertmanager/enrich-and-forward` | Пишет алерт в граф знаний **и** постит обогащённую карточку в Discord — детерминированное обогащение, без LLM. Боевой режим. | `prod-*`, `preprod-*` и fallback для всего без namespace (нодовые и control-plane алерты) |
-| `POST /webhooks/alertmanager/store` | Только граф знаний: история, инциденты, свидетельства для playbook-ов. **В Discord ничего не уходит.** | `squad-*`, `preupdate-*` и все алерты с `severity=info` |
-| `POST /webhooks/alertmanager` | Полный LLM-пайплайн (диагностика → гипотезы → критик → синтез → executor) | Никто: `LLM_PIPELINE_ENABLED=false`, пока нет E2E-прогонов и потолков бюджета |
+| `POST /webhooks/alertmanager/enrich-and-forward` | Пишет алерт в KG **и** постит обогащённую карточку в Discord — детерминированно, без LLM | `prod-*`, `preprod-*` и всё без namespace (нодовые и control-plane алерты) |
+| `POST /webhooks/alertmanager/store` | Только KG: история, инциденты, свидетельства для playbook-ов. **В Discord ничего** (кроме предложения моста) | `squad-*`, `preupdate-*` и все алерты с `severity=info` |
+| `POST /webhooks/alertmanager` | Полный LLM-конвейер | Никто: `LLM_PIPELINE_ENABLED=false` |
 
-`Watchdog` и `severity=none` уходят в blackhole-receiver. Сквады только в KG —
-это решение, а не дыра: десятки короткоживущих dev-стендов утопили бы канал
-инцидентов, а их история всё равно доступна из графа (`/kg/*`, MCP-инструменты,
-витрина сквадов).
+`Watchdog` и `severity=none` уходят в blackhole-receiver. На обоих живых путях API делает только дешёвую проверку `wants_bridge` и дедуп постановки через Redis `SET NX`, дальше алерт обрабатывает Celery-задача `remediation_bridge`; Redis недоступен — задача не ставится (fail-closed).
 
 ### API endpoints
 
 | Endpoint | Описание |
 |---|---|
-| `POST /webhooks/alertmanager` | AlertManager webhook → полный LLM-пайплайн (dedup + флаппинг-детекция); в проде выключен, см. [Боевой путь алертов](#боевой-путь-алертов) |
-| `POST /webhooks/alertmanager/store` | Тот же payload → только граф знаний |
-| `POST /webhooks/alertmanager/enrich-and-forward` | Тот же payload → граф знаний + обогащённая карточка в Discord |
+| `POST /webhooks/alertmanager` | Батч Alertmanager → полный LLM-конвейер; в проде выключен |
+| `POST /webhooks/alertmanager/store` | Тот же payload → только KG |
+| `POST /webhooks/alertmanager/enrich-and-forward` | Тот же payload → KG + обогащённая карточка в Discord |
 | `GET /webhooks/status/{task_id}` | Статус Celery-задачи |
 | `POST /discord/interactions` | Discord-взаимодействия с кнопками (Ed25519-верификация) |
 | `POST /copilot` | Разговорный анализ |
@@ -490,7 +405,7 @@ api отдаёт три endpoint-а для AlertManager (`app/api/webhooks.py`):
 
 ### Боевые прогоны (история точности)
 
-Подробно: [docs/RUNBOOK.ru.md](docs/RUNBOOK.ru.md)
+*Исторический раздел: ручные прогоны LLM-конвейера весной 2026.* Подробно: [docs/RUNBOOK.ru.md](docs/RUNBOOK.ru.md)
 
 | Прогон | Инцидент | Результат | Найденная проблема | Задеплоенный фикс |
 |---|---|---|---|---|
@@ -501,15 +416,7 @@ api отдаёт три endpoint-а для AlertManager (`app/api/webhooks.py`):
 | 5 | Live preprod pod crash | ✅ **resolved** | TC-контекст missing (`no_deploys_or_no_timestamp`) — отмечен как gap, не ложный root cause | Корректная осторожность; `TEAMCITY_MCP_URL` не настроен локально |
 | 6 | Live preprod pod crash | ✅ **resolved** | Пайплайн самодиагностировал ложное опровержение в синтезе | Корректно — синтез явно отметил противоречие и рекомендовал ручную проверку |
 
-Эти шесть прогонов проверены **руками** — и в этом ровно та проблема, которую
-они же иллюстрируют: всё остальное здесь под автоматикой (ruff, mypy, bandit,
-pip-audit, coverage, KG contract drift), а единственное, ради чего продукт
-существует, меряли на глаз. Дыру закрывает
-**[golden-набор](tests/golden/README.md)**: 20 зафиксированных инцидентов с
-ожиданиями, прогон на каждом PR в режиме `replay` (записанные ответы LLM — без
-сети, без ключа, детерминированно) и против живой модели по расписанию
-(`.github/workflows/eval-live.yml`). Прогоны 1–3 выше стали кейсами `001` и
-`013`: false positive, стоивший трёх разборов, больше не вернётся незаметно.
+Проверка руками — ровно та проблема, которую эти прогоны иллюстрируют. Её закрывает **[golden-набор](tests/golden/README.md)**: 20 зафиксированных инцидентов с ожиданиями, прогон на каждом PR в режиме `replay` (записанные ответы LLM — без сети, без ключа, детерминированно) и против живой модели по расписанию (`.github/workflows/eval-live.yml`). Прогоны 1–3 стали кейсами `001` и `013`.
 
 ```bash
 python scripts/eval_golden.py --mode replay --check-baseline
@@ -517,61 +424,68 @@ python scripts/eval_golden.py --mode replay --check-baseline
 
 ### Безопасность
 
-- **Defence in depth вокруг kubectl** (усилено в v1.0.0-rc.1): AI не вызывает kubectl напрямую — `FixAgent` выдаёт структурный `ExecutionIntent` (JSON, pydantic-валидирован, `FORBIDDEN_NAMESPACES` отбрасываются на парсе), `DSLTranslator` детерминированно строит kubectl-строку, `K8sSecurityGuard` валидирует `(verb, resource, namespace)` структурно (не через text-parsing). Перед любым реальным write apply-путь теперь проходит **детерминированный серверный policy-gate** (`app/remediation`, 8 risk axes): риск пересчитывается из *структурного* intent-а и блокируется prod/system/data-plane/необратимое — LLM-`risk` лишь advisory, его нельзя обойти prompt-injection'ом. `apply_intent` дополнительно требует совпадения **подписи** intent-а (TOCTOU) **и** записи `ActionApproval` для инцидента до выполнения, с row-lock против двойного apply. `post_approval=True` (прежний обход SAFE_MODE) больше не является достаточным сам по себе.
+- **Запись не решает модель.** Intent-ы структурные (`ExecutionIntent`, pydantic, `FORBIDDEN_NAMESPACES` отбрасываются на парсе); `DSLTranslator` детерминированно строит команду `kubectl`; `K8sSecurityGuard` структурно валидирует `(verb, resource, namespace)`; серверный policy-gate (`app/remediation`, 8 осей риска) пересчитывает риск и блокирует prod / system / data-plane / необратимое — поле `risk` от LLM лишь advisory. `apply_intent` требует совпадения подписи intent-а (TOCTOU) и записи `ActionApproval`, с row-lock против двойного apply.
 - Tiered namespace policy в `K8sSecurityGuard.validate`: `prod`/`preprod` — read-only; `squad-*` — write через approval; `kube-*`/`mcp` — forbidden.
-- `SAFE_MODE=true` принудительно в `ENV=production` (config-validator валит старт иначе) — реальный write вне утверждённого пути возвращает `SAFE_MODE: Manual approval required.`
-- AlertManager-webhook аутентификация: HMAC-SHA256 на body (`ALERTMANAGER_WEBHOOK_SECRET` обязателен в production, без него config-validator не даёт стартовать). Anti-replay: если signer шлёт `X-Alertmanager-Timestamp`, HMAC считается над `ts.body` + проверяется окно свежести (`ALERTMANAGER_WEBHOOK_MAX_AGE_SECONDS`, дефолт 300с); `ALERTMANAGER_REQUIRE_SIGNED_TIMESTAMP=true` отвергает body-only подпись.
-- Защита от prompt injection: реальные injection-паттерны (`ignore previous instructions`, …) блокируются; слишком длинный ввод **обрезается** (не отклоняется), чтобы крупные легит-инциденты не терялись, а код-образные строки (`import os`, `eval(`) больше не блокируются — крэш-трейсбэки их легитимно содержат.
-- Discord Interactions endpoint верифицирует Ed25519-подпись на каждом запросе (требование Discord) **и проверяет свежесть timestamp** (`DISCORD_INTERACTION_MAX_AGE_SECONDS`, дефолт 300с) как anti-replay — перехваченный подписанный apply/approve-клик нельзя переиграть. Кнопка Apply имеет двухшаговое подтверждение (паттерн зеркал 👎) — защита от случайных кликов.
+- `SAFE_MODE=true` принудительно в `ENV=production` (иначе config-validator валит старт).
+- Кнопки: allowlist `DISCORD_APPROVERS_USER_IDS`, fail-closed; подпись Ed25519 и свежесть timestamp на каждом взаимодействии (anti-replay).
+- Вебхук Alertmanager: HMAC-SHA256 на body, обязателен в production; при `X-Alertmanager-Timestamp` HMAC считается над `ts.body` и действует окно свежести.
+- Защита от prompt injection (LLM-конвейер): injection-паттерны блокируются, слишком длинный ввод обрезается, а не отклоняется.
 - Полный OTEL audit trail + события `EXECUTOR_APPLIED` / `EXECUTOR_APPLY_REFUSED` — см. [docs/AUDIT.md](docs/AUDIT.md).
 
 ### Roadmap — Execution
 
-Executor-трек **сделан и закрыт за явные opt-in флаги** в v0.7.0. Оставшаяся работа — операционная, не кодовая.
-
 | # | Шаг | Статус |
 |---|---|---|
 | 1 | `FixAgent` отдаёт структурный `ExecutionIntent` рядом с prose | ✅ v0.7.0 (PR #23) |
-| 2 | `executor`-стадия после `risk` с `dry_run=True` + `K8sSecurityGuard.validate` | ✅ v0.7.0 (PR #26) |
+| 2 | `executor`-стадия с `dry_run=True` + `K8sSecurityGuard.validate` | ✅ v0.7.0 (PR #26) |
 | 3 | Discord Apply consumer с двухшаговым confirm → реальный `kubectl` под guard | ✅ v0.7.0 (PR #27) |
-| 4 | End-to-end smoke на non-prod `squad-*` кластере + production ramp-up план | 🟡 Операционная раскатка — advisory-режим уже дефолт в проде; opt-in apply (`EXECUTOR_APPROVAL_ENABLED`) на shared-кластерах пока не включён |
-| 5 | Верификация remediation — снимок идентичности цели до/после, отложенная проверка исхода (`verified` / `failed` / `pending` / `unknown`) | ✅ v1.0.7 (PR #369) |
+| 4 | Верификация remediation — снимок идентичности цели, отложенная проверка исхода | ✅ v1.0.7 (PR #369) |
+| 5 | Детерминированный мост правило → playbook → кнопки Применить / Отклонить, включён в проде (`REMEDIATION_BRIDGE_ENABLED`, `EXECUTOR_ENABLED`, `EXECUTOR_APPROVAL_ENABLED` = true, allowlist approver-ов) | ✅ v1.0.31 |
+| 6 | Мост в Celery вместо event loop API; включение по namespace | ✅ v1.0.32 |
 
-**Ramp-up план:**
-
-1. **Dev**: `EXECUTOR_ENABLED=true`, `EXECUTOR_APPROVAL_ENABLED=true` локально с `DISCORD_DRY_RUN=true` — убедиться что кнопки появляются на embed-е корректно.
-2. **Один preprod squad-N namespace**: включить оба флага через env в `k8s/base/deployment.yaml` + `k8s/worker.yaml` (`deploy.sh`); спровоцировать синтетический алерт (или дождаться реального); кликнуть Apply на low-risk действии (`get_logs`, `describe_resource`). Проверить `executor_applied` в БД и audit log.
-3. **Все preprod-squad-***: постепенный rollout по одному namespace в день, watch на rate `EXECUTOR_APPLY_REFUSED`.
-4. **Production-squad-N**: та же процедура, `low`-risk только первую неделю, потом `medium` после одного чистого инцидента.
-5. **HIGH-risk auto-apply никогда** — by design. HIGH-risk intent кнопку не получает.
-
-См. [docs/RUNBOOK.md → Executor incidents](docs/RUNBOOK.md#executor-incidents) для операционных процедур.
+Правила остаются: `approve` только для dev / squad, prod / preprod / system блокирует policy; HIGH-risk auto-apply не бывает; новые флаги — сначала на один namespace под нагрузкой, потом на все. Эксплуатация: [docs/RUNBOOK.ru.md → Executor-инциденты](docs/RUNBOOK.ru.md#executor-инциденты).
 
 ### Roadmap — Knowledge graph
 
 | # | Шаг | Статус |
 |---|---|---|
-| 1 | Семантика свидетельств: `verdict` / `epistemic` / `provenance` у фактов, `sources` у правил, Known Unknowns через `source_status` | ✅ v1.0.7 (PR #365) |
-| 2 | Incident как объект графа (`kg_incidents`) | ✅ v1.0.7 (PR #366) |
-| 3 | Timeline инцидента по деплоям / событиям подов / аномалиям / логам / алертам | ✅ v1.0.7 (PR #366) |
-| 4 | Blast radius с доказательствами на каждом пути | ✅ v1.0.7 (PR #368) |
-| 5 | Операционная память: свидетельства → диагноз → решение → действие → верификация на ленте | ✅ v1.0.8 (PR #371) |
-| 6 | Корреляция инцидентов между сервисами (общая зависимость, деплой в окне, ребро `calls`) — рёбрами между инцидентами | 🟡 после месяца данных `kg_incidents` (с 07.09.2026) |
-| 7 | Детерминированный RCA на доказательствах | 🟡 после п.6 |
-| 8 | LLM поверх детерминированного `IncidentContext` (планировщик → граф → свидетельства → модель), никогда поверх сырых таблиц | ⬜ |
+| 1 | Семантика свидетельств: `verdict` / `epistemic` / `provenance`, Known Unknowns через `source_status` | ✅ v1.0.7 (PR #365) |
+| 2 | Incident как объект графа (`kg_incidents`) + timeline | ✅ v1.0.7 (PR #366) |
+| 3 | Blast radius с доказательствами на каждом пути | ✅ v1.0.7 (PR #368) |
+| 4 | Операционная память: свидетельства → диагноз → решение → действие → верификация | ✅ v1.0.8 (PR #371) |
+| 5 | Единый контекст инцидента из графа на момент T — для правил, модели и карточки (`app/context/kg_incident_context.py`) | ✅ v1.0.20 |
+| 6 | Зоны нод и точки входа трафика (`kg_nodes`, `kg_entrypoints`), базы как узлы графа | ✅ v1.0.24 |
+| 7 | Алерт привязан к своему k8s-объекту, а не к экспортеру метрик | ✅ v1.0.25, v1.0.31 |
+| 8 | Корреляция инцидентов между сервисами — рёбрами между инцидентами | ⬜ не реализовано |
+| 9 | Детерминированный RCA на доказательствах | ⬜ после п.8 |
 
 ### Документация
 
 | Документ | EN | RU |
 |---|---|---|
-| Архитектура | [ARCHITECTURE.md](docs/ARCHITECTURE.md) | [ARCHITECTURE.ru.md](docs/ARCHITECTURE.ru.md) |
-| Боевые прогоны | [RUNBOOK.md](docs/RUNBOOK.md) | [RUNBOOK.ru.md](docs/RUNBOOK.ru.md) |
+| Архитектура (в т.ч. LLM-конвейер) | [ARCHITECTURE.md](docs/ARCHITECTURE.md) | [ARCHITECTURE.ru.md](docs/ARCHITECTURE.ru.md) |
+| Runbook / выкат / боевые прогоны | [RUNBOOK.md](docs/RUNBOOK.md) | [RUNBOOK.ru.md](docs/RUNBOOK.ru.md) |
 | Модули | [MODULE_DOCS.md](docs/MODULE_DOCS.md) | [MODULE_DOCS.ru.md](docs/MODULE_DOCS.ru.md) |
-| Audit trail (OTEL) | [AUDIT.md](docs/AUDIT.md) | — |
-| Semantic Contract | [SEMANTIC_CONTRACT.md](docs/SEMANTIC_CONTRACT.md) | — |
-| KG schema / quality contract | — | [KG_SCHEMA_CONTRACT.md](docs/KG_SCHEMA_CONTRACT.md) |
-| Метрики (сигналы, self-health) | [METRICS.md](docs/METRICS.md) | [METRICS.ru.md](docs/METRICS.ru.md) |
 | FAQ | [FAQ.md](docs/FAQ.md) | [FAQ.ru.md](docs/FAQ.ru.md) |
-| DR Plan | [DR.md](docs/DR.md) | — |
+| Метрики (сигналы, self-health) | [METRICS.md](docs/METRICS.md) | [METRICS.ru.md](docs/METRICS.ru.md) |
+| Контракт playbook-а remediation | — | [REMEDIATION_PLAYBOOK_CONTRACT.md](docs/REMEDIATION_PLAYBOOK_CONTRACT.md) |
+| KG schema / quality contract | — | [KG_SCHEMA_CONTRACT.md](docs/KG_SCHEMA_CONTRACT.md) |
+| Semantic contract | [SEMANTIC_CONTRACT.md](docs/SEMANTIC_CONTRACT.md) | — |
+| Audit trail (OTEL) | [AUDIT.md](docs/AUDIT.md) | — |
+| DR-план | [DR.md](docs/DR.md) | — |
+| Post-mortem 08.08.2026 (исторический) | [POSTMORTEM_2026_08_08.md](docs/POSTMORTEM_2026_08_08.md) | [POSTMORTEM_2026_08_08.ru.md](docs/POSTMORTEM_2026_08_08.ru.md) |
+| Базовый срез качества KG 24.05.2026 (исторический) | — | [quality_report_baseline_2026_05_24.md](docs/quality_report_baseline_2026_05_24.md) |
 | Golden eval set | [tests/golden/README.md](tests/golden/README.md) | — |
-| Changelog | [CHANGELOG.md](CHANGELOG.md) | — |
+| Changelog | — | [CHANGELOG.md](CHANGELOG.md) |
+
+### sre-ai-copilot и froggy-sre
+
+| | sre-ai-copilot | [froggy-sre](https://github.com/froggychips/froggy-sre) |
+|---|---|---|
+| **Триггер** | Вебхук Alertmanager (headless) | Вызов MCP-инструмента из Claude Code |
+| **Где работает** | Поды Kubernetes | macOS-машина разработчика |
+| **Анализ** | Детерминированные правила + KG (LLM-конвейер выключен) | Froggy локально → fallback на Anthropic |
+| **k8s-контекст** | In-cluster Kubernetes SDK | `kubectl` через kubeconfig |
+| **Хранилище** | PostgreSQL + очередь Celery | `~/.froggy-sre/incidents/` (локальный JSON) |
+| **Уведомления** | Discord | Ответ в Claude Code |
+| **Когда использовать** | Постоянный headless-алертинг в проде | Интерактивный разбор инцидента через Claude Code |

@@ -1,5 +1,7 @@
 # Post-mortem 2026-08-08 — KG node type split and its fallout
 
+> **Historical document (2026-08-08); current state — [README](../README.md) / [ARCHITECTURE](ARCHITECTURE.md).**
+
 A review of the `node_kind` rollout to production: what was fixed, what broke
 in the process, and which measurements caught it. This document deliberately
 records the **mistakes**, not just the outcome — most of them were invisible

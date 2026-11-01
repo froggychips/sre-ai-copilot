@@ -105,11 +105,24 @@ intent-а. Порядок поиска: сначала запись из поп�
 FixAgent, вход в этот контракт — прямо с прод-пути алертов (`/store`,
 `/enrich-and-forward`):
 
+- API только ставит задачу: `app/remediation/bridge_dispatch.py` проверяет
+  `wants_bridge` (флаг + `alertname` из `match.alertnames` исполнимого playbook-а),
+  `REMEDIATION_BRIDGE_NAMESPACES` (префиксы; пусто — все) и дедуп постановки
+  (Redis `SET NX EX`, `REMEDIATION_BRIDGE_ENQUEUE_DEDUP_SECONDS`), затем
+  `apply_async` задачи `remediation_bridge` в очередь `celery` (с 1.0.32). Redis
+  недоступен — задача не ставится. Вся работа ниже идёт в воркере;
+
 - preconditions считаются по фактам правил `enrich_alert` и по фактам
   состояния пода (K8sFacts → `OOMKilledRule`, `ProcessCrashRule`,
   `PodEventsRule`); снимок не снят — `absent` понижается до `unknown`;
 - intent — первый мутирующий шаг `plan.steps`, собранный `render_plan`; снимок
-  и привязка — `build_match_snapshot` + `bind_server_params`, как у pipeline;
+  и привязка — `build_match_snapshot` + `bind_server_params`, как у pipeline.
+  Мост подставляет в план только `namespace` и имя цели (плюс серверный
+  `current_replicas`). Оба playbook-а исполнимы и их алерты (`KubePodCrashLooping`
+  / `PodCrashLooping`, `CPUThrottlingHigh`) мост берёт, но план scale с шаблоном
+  `{replicas}` у него не рендерится (`remediation_bridge.plan_render_failed`) —
+  карточки по scale сейчас нет. v1-playbook-и (`cleanup_stale_failed_job`, только
+  `match.classification`) мост не берёт;
 - gate зовётся с `require_binding=True` и при отборе, и на apply-пути
   (`analysis.source == "remediation_bridge"`), независимо от
   `REMEDIATION_PLAYBOOK_BINDING_ENABLED`;

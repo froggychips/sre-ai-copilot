@@ -1,5 +1,7 @@
 # KG Quality Report — baseline 2026-05-24
 
+> **Исторический документ (24.05.2026); актуальное состояние — [README](../README.md) / [ARCHITECTURE](ARCHITECTURE.ru.md).**
+
 > **Цель документа.** Точка отсчёта перед Phase A (remediation). После
 > merge 17 PR за 2026-05-24 (Wave 7 X/Y/Z + storage + jobs + owner inference
 > multi-signal + stale_class column + contract v2.1 + Discord UX) KG
