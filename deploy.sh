@@ -60,6 +60,8 @@ fi
 # ── 2. RBAC ───────────────────────────────────────────────────────────────
 # ServiceAccount sre-ai нужен до старта Job/Deployment.
 kubectl -n "${NAMESPACE}" apply -f k8s/base/rbac.yaml
+# PriorityClass кластерный: postgres/redis ссылаются на него (k8s/priorityclass.yaml).
+kubectl apply -f k8s/priorityclass.yaml
 
 # Права проверяем ФАКТИЧЕСКИ, а не по манифесту: 08.08.2026 выяснилось, что
 # ClusterRole из репозитория в WO-кластере не применялась вовсе (там свои

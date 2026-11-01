@@ -12,6 +12,7 @@ from sqlalchemy.orm.attributes import flag_modified
 from app.config import settings
 from app.core.state_machine import IncidentState
 from app.database import IncidentRecord, ReadOnlyAutocommitSession, SessionLocal
+from app.observability.logging_setup import configure_logging
 from app.observability.ai_metrics import track_budget_denied
 from app.observability.worker_metrics import (
     register_celery_signals as register_worker_metrics_signals,
@@ -54,6 +55,10 @@ celery_app.conf.task_track_started = True
 # ошибок (замер 31.10.2026). Логи Celery (старт, расписание, ошибки задач)
 # идут через logging в stderr и не затрагиваются.
 celery_app.conf.worker_redirect_stdouts = False
+
+# Уровень structlog и тишина httpx — для всех процессов Celery (worker,
+# worker-sync, executor, beat): все они грузят этот модуль.
+configure_logging()
 
 # ── Late acknowledgement (задача переживает смерть воркера) ─────────────────
 #
