@@ -117,11 +117,9 @@ FixAgent, вход в этот контракт — прямо с прод-пу�
   `PodEventsRule`); снимок не снят — `absent` понижается до `unknown`;
 - intent — первый мутирующий шаг `plan.steps`, собранный `render_plan`; снимок
   и привязка — `build_match_snapshot` + `bind_server_params`, как у pipeline.
-  Мост подставляет в план только `namespace` и имя цели (плюс серверный
-  `current_replicas`). Оба playbook-а исполнимы и их алерты (`KubePodCrashLooping`
-  / `PodCrashLooping`, `CPUThrottlingHigh`) мост берёт, но план scale с шаблоном
-  `{replicas}` у него не рендерится (`remediation_bridge.plan_render_failed`) —
-  карточки по scale сейчас нет. v1-playbook-и (`cleanup_stale_failed_job`, только
+  Мост подставляет в план `namespace`, имя цели и серверные шаблоны
+  (`_plan_context`): плану scale-out мост ставит `current_replicas` = живое `spec.replicas` и `replicas` = на одну больше (реплик нет или ноль — предложения нет); `resource_pressure` берётся из самого горящего `CPUThrottlingHigh`, а `crashloop: absent` — только из успешного снимка, где целевой под не нездоров (с 1.0.34). Другие шаблоны мост не заполняет — `plan_render_failed`,
+  предложения нет. v1-playbook-и (`cleanup_stale_failed_job`, только
   `match.classification`) мост не берёт;
 - gate зовётся с `require_binding=True` и при отборе, и на apply-пути
   (`analysis.source == "remediation_bridge"`), независимо от

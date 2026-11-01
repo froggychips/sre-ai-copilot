@@ -303,9 +303,7 @@ Two schema versions:
   `restart_crashloop_deployment` and `scale_out_cpu_throttled_deployment`.
   The bridge takes alerts of both (`KubePodCrashLooping` / `PodCrashLooping`,
   `CPUThrottlingHigh`; approve only in dev/squad), but builds the plan only
-  from server-known parameters: the scale-out plan needs `{replicas}`, so for
-  it the bridge currently logs `remediation_bridge.plan_render_failed` and
-  posts no card. `cleanup_stale_failed_job` (v1, `match.classification`
+  from server-known parameters: the scale-out plan gets `current_replicas` = live `spec.replicas` and `replicas` = one more (no live replicas or zero — no proposal); `resource_pressure` comes from the firing `CPUThrottlingHigh` itself and `crashloop: absent` only from a successful snapshot where the target pod is not unhealthy (since 1.0.34). `cleanup_stale_failed_job` (v1, `match.classification`
   only) is never taken by the bridge.
 
 `_executor_apply_gate.yaml` is not a playbook: it is the server gate policy

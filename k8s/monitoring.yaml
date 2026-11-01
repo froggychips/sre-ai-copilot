@@ -242,7 +242,9 @@ spec:
       # которой не видно, обошли его намеренно или забыли.
       # copilot-worker-sync — тот же сервер метрик на :8001, что у
       # copilot-worker (длительности задач, LLM-слой здесь не ходит).
-      values: ["sre-ai-api", "copilot-worker", "copilot-worker-sync"]
+      # copilot-executor (с 01.11.2026) — там исполняется apply по кнопке:
+      # pipeline_executor_applied_total, переходы kg_remediation_attempts.
+      values: ["sre-ai-api", "copilot-worker", "copilot-worker-sync", "copilot-executor"]
   podMetricsEndpoints:
   - port: metrics
     path: /metrics

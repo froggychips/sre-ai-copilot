@@ -76,6 +76,13 @@ spec:
         # уникально, но явный префикс читается в `inspect`-выводе).
         - -n
         - executor@%h
+        ports:
+        # Метрики executor-а (тот же сервер, что у воркеров: celeryd_init →
+        # start_worker_metrics_server). До 01.11.2026 порт не был объявлен и
+        # под не входил в VMPodScrape — pipeline_executor_applied_total и
+        # переходы попыток apply при EXECUTOR_DISPATCH=queue терялись.
+        - containerPort: 8001
+          name: metrics
         securityContext:
           readOnlyRootFilesystem: true
           allowPrivilegeEscalation: false
