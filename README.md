@@ -1,7 +1,7 @@
 # SRE AI Copilot
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
-[![Python](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/)
+[![Python](https://img.shields.io/badge/python-3.13+-blue.svg)](https://www.python.org/)
 [![Tests](https://img.shields.io/badge/tests-3477%20pass-brightgreen.svg)](tests)
 [![Checks](https://img.shields.io/badge/ruff%20%2B%20mypy-clean-brightgreen.svg)](.github/workflows)
 [![Release](https://img.shields.io/badge/release-v1.0.32-blue)](CHANGELOG.md)
