@@ -217,12 +217,18 @@ def _process_batch(
         stats["matched"] += 1
 
         meta: Dict[str, Any] = dict(node.metadata_json or {})
-        meta["endpoints_ready"] = ready
-        meta["endpoints_checked_at"] = stamp
-        node.metadata_json = meta
-        # JSON-колонка: SQLAlchemy не видит мутацию словаря по значению, и без
-        # явного флага UPDATE не уйдёт. Тот же приём в external_probe_sync.
-        flag_modified(node, "metadata_json")
+        # Пишем только при смене числа готовых подов. До 01.11.2026 метка
+        # endpoints_checked_at обновлялась на каждом прогоне (4 раза в час на
+        # ~8,2 тыс. узлов) и переписывала строку kg_services целиком — 310 тыс.
+        # UPDATE metadata_json за 25 ч. Читателей у метки нет; теперь она
+        # означает «когда endpoints_ready последний раз изменился».
+        if meta.get("endpoints_ready") != ready or "endpoints_checked_at" not in meta:
+            meta["endpoints_ready"] = ready
+            meta["endpoints_checked_at"] = stamp
+            node.metadata_json = meta
+            # JSON-колонка: SQLAlchemy не видит мутацию словаря по значению, и
+            # без явного флага UPDATE не уйдёт. Тот же приём в external_probe_sync.
+            flag_modified(node, "metadata_json")
 
         if ready == 0:
             stats["empty"] += 1
