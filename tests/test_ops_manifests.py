@@ -410,3 +410,23 @@ def test_deploy_sh_waits_for_sync_worker_rollout() -> None:
     )
     # Подсказки про остановку писателей перед миграцией — тоже с ним.
     assert "scale deploy copilot-worker copilot-worker-sync copilot-beat --replicas=0" in text
+
+
+def test_stateful_pods_use_existing_priority_class():
+    """postgres и redis на local-path не переезжают — выселять их последними.
+
+    Имя класса должно совпадать с объявленным в k8s/priorityclass.yaml, иначе
+    StatefulSet не создаст под вовсе (unknown PriorityClass).
+    """
+    import yaml
+
+    pc = yaml.safe_load((_REPO_ROOT / "k8s" / "priorityclass.yaml").read_text(encoding="utf-8"))
+    assert pc["kind"] == "PriorityClass" and pc["value"] > 0
+    assert pc.get("preemptionPolicy") == "Never"
+    for name in ("postgres.yaml", "redis.yaml"):
+        docs = yaml.safe_load_all((_REPO_ROOT / "k8s" / name).read_text(encoding="utf-8"))
+        sts = [d for d in docs if d and d.get("kind") == "StatefulSet"]
+        assert sts, name
+        assert sts[0]["spec"]["template"]["spec"].get("priorityClassName") == pc["metadata"]["name"], name
+    deploy = (_REPO_ROOT / "deploy.sh").read_text(encoding="utf-8")
+    assert "k8s/priorityclass.yaml" in deploy

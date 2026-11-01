@@ -47,6 +47,8 @@ spec:
                   - key: env
                     operator: In
                     values: ["dev"]
+      # Не переезжает (local-path на dev-4) — выселять последним, см. k8s/priorityclass.yaml.
+      priorityClassName: sre-ai-copilot-stateful
       securityContext:
         runAsNonRoot: true
         runAsUser: 999
@@ -98,9 +100,12 @@ spec:
             limits:
               cpu: "4"
               memory: 2Gi
+            # 01.11.2026: requests.memory 1Gi → 2Gi (= limit). Рабочий набор
+            # 1,28 ГиБ сейчас, пик 1,79 ГиБ за неделю — при 1Gi postgres всё время
+            # «над requests» и при нехватке ресурсов ноды выселялся бы первым.
             requests:
               cpu: "1"
-              memory: 1Gi
+              memory: 2Gi
           livenessProbe:
             exec:
               command: ["/bin/sh", "-c", "pg_isready -U \"$POSTGRES_USER\" -d \"$POSTGRES_DB\""]

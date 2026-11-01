@@ -1,0 +1,21 @@
+# Приоритет stateful-частей copilot (postgres, redis) выше подов по умолчанию (0).
+#
+# Оба живут на local-path томе ноды dev-4 и уехать на другую ноду не могут:
+# выселенный под висит Pending, пока на ноде не освободят место, — copilot
+# лежит целиком. kubelet при DiskPressure/MemoryPressure выбирает жертву по
+# превышению requests, затем по priority. 01.11.2026 dev-4 подошла к eviction
+# на 19 ГБ, а postgres тогда был над своим requests (1,28 из 1Gi) — первый
+# кандидат.
+#
+# preemptionPolicy: Never — ради этих подов планировщик НЕ вытесняет чужие
+# (стенды на той же ноде); приоритет работает только при выборе жертвы.
+apiVersion: scheduling.k8s.io/v1
+kind: PriorityClass
+metadata:
+  name: sre-ai-copilot-stateful
+  labels:
+    app.kubernetes.io/part-of: sre-ai-copilot
+value: 100000
+preemptionPolicy: Never
+globalDefault: false
+description: "sre-ai-copilot postgres/redis: local-path, переезд на другую ноду невозможен"

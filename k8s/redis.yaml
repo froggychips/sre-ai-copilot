@@ -68,6 +68,8 @@ spec:
       labels:
         app: redis
     spec:
+      # Не переезжает (local-path на dev-4) — выселять последним, см. k8s/priorityclass.yaml.
+      priorityClassName: sre-ai-copilot-stateful
       affinity:
         nodeAffinity:
           requiredDuringSchedulingIgnoredDuringExecution:
