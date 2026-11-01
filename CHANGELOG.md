@@ -4,6 +4,7 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+## [1.0.34] — 2026-11-01 — мост scale-out по CPUThrottlingHigh, метрики executor-а
 ## [1.0.33] — 2026-11-01 — Python 3.13, логирование в каждом процессе, меньше WAL, снятие пометки дрейфа
 ### Исправлено
 
