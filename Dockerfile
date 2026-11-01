@@ -1,8 +1,8 @@
 # Base-образ закреплён по digest (manifest list, все архитектуры), чтобы
 # «тот же тег» не подменял рантайм между сборками. Обновляет dependabot
 # (ecosystem docker в .github/dependabot.yml); руками — без демона:
-#   skopeo inspect --raw docker://docker.io/library/python:3.11-slim | sha256sum
-# Текущая закреплённая версия пакета: 3.11-slim (Debian 12 trixie line).
+#   skopeo inspect --raw docker://docker.io/library/python:3.13-slim | sha256sum
+# Текущая закреплённая версия пакета: 3.13-slim (Debian 13 trixie).
 #
 # ЭТА СТРОКА — ЕДИНСТВЕННЫЙ ИСТОЧНИК ИСТИНЫ ПО ВЕРСИИ PYTHON. Меняешь минор —
 # меняешь в том же коммите ruff.toml (target-version) и mypy.ini
@@ -12,11 +12,10 @@
 # tests/test_ops_manifests.py::test_python_version_is_consistent_across_toolchain
 # (до 2026-08-10 расхождение и было: тут 3.11, в ruff/mypy — 3.12).
 #
-# Подъём до 3.12 сам по себе выглядит безопасным (cp312-колёса есть у всех
-# бинарных пинов — проверено для grpcio/psycopg2-binary/pydantic-core/uvloop),
-# но это смена рантайма прода и делается отдельно, с прогоном сборки образа и
-# полного сьюта, а не заодно с правкой конфигов линтера.
-FROM python:3.11-slim@sha256:673719e071ecf27434fd2635bbd8d00f49f4fdd81f243143438a42ced8bedf60
+# 3.11 → 3.13 (ноябрь 2026): cp313-колёса есть у всех бинарных пинов, сборка
+# образа и полный сьют прогнаны. 3.15 (dependabot #515) не берём: свежий минор,
+# колёс части зависимостей под него ещё нет.
+FROM python:3.13-slim@sha256:2d44738ebf4ce5f63b9d9ea871e9c7cfdc0426f7b0c97cac915fd88ded1d86bb
 
 # kubectl-версия пиннится явно. Обновлять — осознанно, вместе с KUBECTL_SHA256.
 # Получить актуальный sha256:

@@ -41,7 +41,7 @@ jobs:
     # но и не вредит — оставлен, чтобы не трогать чекаут заодно с переездом.
     #
     # Долг «тесты идут не на версии прода» закрыт тогда же: интерпретатор
-    # берётся ровно тот, что в Dockerfile (3.11), и держится тестом
+    # берётся ровно тот, что в Dockerfile (3.13), и держится тестом
     # tests/test_ops_manifests.py::test_python_version_is_consistent_across_toolchain.
     # Ставит его uv: в образе раннера питона нужной версии нет, а на маке
     # homebrew-сборка 3.11 была нерабочей под macOS 26.1
@@ -92,8 +92,8 @@ jobs:
       - name: Show Python version
         run: |
           export PATH="$HOME/.local/bin:$PATH"
-          uv python find 3.11 >/dev/null || uv python install 3.11
-          uv run --python 3.11 python --version
+          uv python find 3.13 >/dev/null || uv python install 3.13
+          uv run --python 3.13 python --version
 
       # Версии инструментов запинены. Без пинов они ставились «последние», а
       # стабильность держалась случайно: .venv переиспользуется между прогонами
@@ -107,11 +107,11 @@ jobs:
       - name: Create venv and install dependencies
         run: |
           export PATH="$HOME/.local/bin:$PATH"
-          # venv пересоздаётся под 3.11: при clean:false здесь мог остаться
+          # venv пересоздаётся под 3.13: при clean:false здесь мог остаться
           # каталог, собранный прежним интерпретатором 3.12, и тогда прогон
           # молча продолжился бы на нём.
           rm -rf .venv
-          uv venv --python 3.11 .venv
+          uv venv --python 3.13 .venv
           uv pip install --python .venv/bin/python \
             ruff==0.15.20 \
             mypy==2.1.0 \
