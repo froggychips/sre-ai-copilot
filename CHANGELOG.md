@@ -4,6 +4,7 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+## [1.0.33] — 2026-11-01 — Python 3.13, логирование в каждом процессе, меньше WAL, снятие пометки дрейфа
 ## [1.0.32] — 2026-10-31 — мост исполняется в Celery, включение по namespace
 ### Исправлено
 
