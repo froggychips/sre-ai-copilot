@@ -305,9 +305,7 @@ Playbook-и — YAML-файлы со строгой схемой в `app/remedia
   `restart_crashloop_deployment` и `scale_out_cpu_throttled_deployment`.
   Мост берёт алерты обоих (`KubePodCrashLooping` / `PodCrashLooping`,
   `CPUThrottlingHigh`; approve только в dev/squad), но план собирает только
-  из параметров, известных серверу: плану scale-out нужен `{replicas}`, поэтому
-  по нему мост сейчас пишет в лог `remediation_bridge.plan_render_failed` и
-  карточку не постит. `cleanup_stale_failed_job` (v1, только
+  из параметров, известных серверу: плану scale-out мост ставит `current_replicas` = живое `spec.replicas` и `replicas` = на одну больше (реплик нет или ноль — предложения нет); `resource_pressure` берётся из самого горящего `CPUThrottlingHigh`, а `crashloop: absent` — только из успешного снимка, где целевой под не нездоров (с 1.0.34). `cleanup_stale_failed_job` (v1, только
   `match.classification`) мост не берёт никогда.
 
 `_executor_apply_gate.yaml` — не playbook, а серверная политика gate для

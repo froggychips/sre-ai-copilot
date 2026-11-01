@@ -174,7 +174,54 @@ def pod_state_facts(
             facts.extend(rule.run(rule_ctx))
         except Exception as e:
             log.warning("remediation_bridge.rule_failed", rule=rule.name, error=type(e).__name__)
+    facts.extend(_signal_facts(ctx, snap, existing=list(ctx.rule_facts or []) + facts))
     return facts
+
+
+#: Алерты, которые сами по себе — наблюдение давления по CPU (Prometheus
+#: посчитал долю троттлинга). Для scale_out_cpu_throttled_deployment это
+#: и есть `resource_pressure: found`; другого источника на пути моста нет
+#: (ResourcePressureRule смотрит метрики/логи, которых здесь не собирают).
+_CPU_PRESSURE_ALERTS = frozenset({"CPUThrottlingHigh"})
+
+
+def _signal_facts(ctx: "EnrichedContext", snap: Any, existing: List["Fact"]) -> List["Fact"]:
+    """Факты, которые следуют из самого алерта и из снимка здоровья подов.
+
+    До 01.11.2026 scale_out_cpu_throttled_deployment на пути моста не
+    матчился никогда: `resource_pressure` не появлялся вовсе, а `crashloop`
+    без события в kg_pod_events оставался «не знаем» — preconditions
+    требуют found / absent.
+
+    * `resource_pressure: found` — когда горит алерт из `_CPU_PRESSURE_ALERTS`.
+    * `crashloop: absent` — только если снимок снят (error=None), целевой
+      под не числится в нём нездоровым (нет в unhealthy_pods и в terminated), и никакого
+      другого факта о crashloop нет. Без снимка — ничего: молчание не
+      доказательство.
+    """
+    from app.diagnostics.facts import Fact
+
+    labels = ctx.incident.labels or {}
+    pod = ctx.pod_name or labels.get("pod")
+    out: List[Fact] = []
+    alertname = labels.get("alertname", "")
+    if alertname in _CPU_PRESSURE_ALERTS:
+        out.append(Fact(
+            kind="resource_pressure", observed=True, confidence=0.9,
+            evidence={"alertname": alertname, "container": labels.get("container")},
+            subject=pod, source_rule="AlertSignal", provenance="alertmanager",
+        ))
+    has_crashloop_fact = any(f.kind == "crashloop" for f in existing)
+    snap_ok = snap is not None and not getattr(snap, "error", None)
+    unhealthy = getattr(snap, "unhealthy_pods", None)
+    if (pod and snap_ok and isinstance(unhealthy, list) and not has_crashloop_fact
+            and pod not in unhealthy and pod not in (getattr(snap, "container_terminated", None) or {})):
+        out.append(Fact(
+            kind="crashloop", observed=False, confidence=0.8,
+            evidence={"unhealthy_pods": len(unhealthy)},
+            subject=pod, source_rule="K8sSnapshotHealth", provenance="kubernetes",
+        ))
+    return out
 
 
 async def collect_facts(ctx: "EnrichedContext") -> "FactStore":
@@ -231,6 +278,40 @@ def _probe_current_replicas(intent: "ExecutionIntent") -> Optional[int]:
     return None if snap.unknown else snap.replicas_desired
 
 
+#: Шаблоны плана, которые мост умеет заполнить сам (числом реплик цели).
+_REPLICA_TEMPLATES = frozenset({"replicas", "current_replicas"})
+
+
+def _plan_context(pb: Any, namespace: str, name: str) -> Dict[str, Any]:
+    """Значения шаблонов plan.steps, которые решает сервер, а не модель.
+
+    Scale-out: `current_replicas` — живое spec.replicas цели, `replicas` —
+    на одну больше. Детерминированно и консервативно (+1); одобряет человек,
+    а `kubectl scale --current-replicas` и пере-dry-run перед записью
+    отказывают, если число реплик успели поменять. Неизвестный шаблон, цель
+    без реплик или без снимка — PlanRenderError: предложения нет.
+    """
+    from app.core.execution_dsl import ActionType, ExecutionIntent
+    from app.remediation.matcher import PlanRenderError
+    from app.remediation.playbook import template_name
+
+    wanted = {
+        t for step in (pb.plan.steps or ()) for v in (step.params or {}).values()
+        if (t := template_name(v)) is not None
+    }
+    if not wanted:
+        return {}
+    unknown = wanted - _REPLICA_TEMPLATES
+    if unknown:
+        raise PlanRenderError(f"bridge cannot fill templates {sorted(unknown)}")
+    probe = ExecutionIntent(action=ActionType.DESCRIBE_RESOURCE, resource_type="deployment",
+                            resource_name=name, namespace=namespace, playbook=pb.name)
+    current = _probe_current_replicas(probe)
+    if not isinstance(current, int) or isinstance(current, bool) or current < 1:
+        raise PlanRenderError(f"live replicas unknown or zero ({current!r})")
+    return {"current_replicas": current, "replicas": current + 1}
+
+
 def _target_name(ctx: "EnrichedContext") -> Optional[str]:
     labels = ctx.incident.labels or {}
     return labels.get("deployment") or ctx.service or None
@@ -274,7 +355,13 @@ def plan_proposals(
     proposals: List[Proposal] = []
     for pb in candidates:
         try:
-            rendered = render_plan(pb, namespace=namespace, resource_name=name)
+            plan_ctx = _plan_context(pb, namespace, name)
+        except PlanRenderError as e:
+            log.info("remediation_bridge.plan_render_failed", playbook=pb.name, error=str(e)[:160])
+            continue
+        try:
+            rendered = render_plan(pb, namespace=namespace, resource_name=name,
+                                   context=plan_ctx)
         except (PlanRenderError, ValueError) as e:
             log.info("remediation_bridge.plan_render_failed", playbook=pb.name, error=str(e)[:160])
             continue

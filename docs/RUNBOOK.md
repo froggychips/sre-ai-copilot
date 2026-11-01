@@ -457,7 +457,7 @@ Deterministic path without an LLM (since 1.0.31, executed in Celery since 1.0.32
 - Proposal dedup inside the task: (playbook, target uid, incarnation), `REMEDIATION_BRIDGE_DEDUP_SECONDS` (6 h); Redis, falling back to `kg_remediation_decisions`.
 - Executable playbooks (v2; `cleanup_stale_failed_job` is v1, preview only, and the bridge does not take it):
   - `restart_crashloop_deployment` (`KubePodCrashLooping` / `PodCrashLooping`): crashloop without OOM, without a recent deploy and without a signal crash (exit 132/134/135/136/138/139);
-  - `scale_out_cpu_throttled_deployment` (`CPUThrottlingHigh`): CPU pressure with a healthy process — no crashloop, no OOM, no recent deploy. **Does not produce a card yet:** the bridge does not compute the target `{replicas}`, plan rendering fails (`PlanRenderError`).
+  - `scale_out_cpu_throttled_deployment` (`CPUThrottlingHigh`): CPU pressure with a healthy process — no crashloop, no OOM, no recent deploy. The bridge proposes +1 replica to the live `spec.replicas` (since 1.0.34).
 - Policy of both: approve only in `dev` / `squad` namespaces, block `prod` / `preprod` / `system` / data plane. A blocked proposal is a line in the regular card, not a button.
 
 ### Flags

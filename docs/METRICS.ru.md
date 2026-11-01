@@ -140,7 +140,7 @@ owner-coverage с 99.5% до ~50% в день выката — регресси�
 |---|---|---|
 | `sre-ai-api` | `:8001/metrics` (`start_http_server` в `app/main.py`) плюс два Collector-а ниже | да |
 | `copilot-worker`, `copilot-worker-sync` | `:8001/metrics`, multiprocess-режим (`app/observability/worker_metrics.py`, `PROMETHEUS_MULTIPROC_DIR`) | да |
-| `copilot-executor` | тот же сервер воркера поднимается (манифест задаёт `PROMETHEUS_MULTIPROC_DIR`), но порта `metrics` у пода нет | **нет** — счётчики, которые там растут (`pipeline_executor_applied_total`, `remediation_attempt_transitions_total` из `apply_intent`), не собираются |
+| `copilot-executor` | тот же сервер воркера (`celeryd_init`), порт `metrics` :8001 объявлен с 1.0.34 | да — `pipeline_executor_applied_total`, `remediation_attempt_transitions_total` из `apply_intent` (до 1.0.34 не собирались) |
 | `copilot-beat` | сервера нет | перечислен в селекторе, остаётся пустым таргетом |
 
 NetworkPolicy пускает на :8001 только из ns `monitoring`.

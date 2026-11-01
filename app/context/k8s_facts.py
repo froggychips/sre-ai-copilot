@@ -53,6 +53,11 @@ class K8sSnapshot:
     pod_events: List[Dict[str, Any]] = field(default_factory=list)
     core_dump_node: Optional[str] = None
     error: Optional[str] = None
+    # Имена нездоровых подов namespace-а (phase не Running/Succeeded или
+    # не штатное waiting, напр. CrashLoopBackOff). Пустой список при
+    # error=None — «видели, нездоровых нет»: на этом мост строит
+    # `crashloop: absent` для playbook-ов, которым нужен здоровый процесс.
+    unhealthy_pods: List[str] = field(default_factory=list)
 
 
 def _has_bad_waiting(container_statuses: Any) -> bool:
@@ -371,6 +376,7 @@ class K8sFacts:
             container_terminated=container_terminated,
             pod_events=pod_events,
             core_dump_node=core_dump_node,
+            unhealthy_pods=[name for name, _, _ in unhealthy_pods],
         )
 
     @staticmethod

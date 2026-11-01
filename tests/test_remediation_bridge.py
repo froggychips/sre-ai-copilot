@@ -889,3 +889,89 @@ async def test_short_resolved_episode_not_posted(monkeypatch):
     assert long_ is True
     post.assert_awaited_once()
     assert "длился 45м" in post.await_args.args[1]["embeds"][0]["description"]
+
+
+# ── scale-out по CPUThrottlingHigh ─────────────────────────────────────────
+
+_SCALE = "scale_out_cpu_throttled_deployment"
+
+
+def _cpu_ctx(namespace: str = "squad-7-k5") -> EnrichedContext:
+    inc = Incident(
+        incident_id="fp-cpu-1", severity="info", status="firing",
+        summary="CPU throttling",
+        description="35% throttling of CPU for container town-service.",
+        namespace=namespace,
+        labels={"alertname": "CPUThrottlingHigh", "namespace": namespace,
+                "pod": "town-service-6c6cd4df-8hx9c", "container": "town-service"},
+        annotations={}, starts_at="2026-10-30T10:00:00Z",
+    )
+    return EnrichedContext(
+        incident=inc, service="town-service", pod_name="town-service-6c6cd4df-8hx9c",
+        rule_facts=[Fact(kind="recent_deploy", observed=False, confidence=0.9)],
+    )
+
+
+def _healthy_snap(unhealthy=None, error=None):
+    return SimpleNamespace(text="Unhealthy pods: none", container_terminated={},
+                           pod_events=[], error=error,
+                           unhealthy_pods=[] if unhealthy is None else unhealthy)
+
+
+def _cpu_facts(ctx, snap) -> FactStore:
+    store = FactStore(list(ctx.rule_facts))
+    store.extend(bridge.pod_state_facts(ctx, snap))
+    return store
+
+
+def test_cpu_throttling_with_healthy_pod_matches_scale_out():
+    """До 01.11.2026 не матчился никогда: resource_pressure не было, crashloop
+    без события оставался «не знаем»."""
+    ctx = _cpu_ctx()
+    names = [pb.name for pb in match_playbooks(
+        alertname="CPUThrottlingHigh", classification=None,
+        facts=_cpu_facts(ctx, _healthy_snap()))]
+    assert names == [_SCALE]
+
+
+@pytest.mark.parametrize("snap", [
+    None,                                                   # снимка нет
+    _healthy_snap(error="ApiException"),                    # снимок упал
+    _healthy_snap(unhealthy=["town-service-6c6cd4df-8hx9c"]),  # под нездоров
+])
+def test_scale_out_needs_proven_healthy_pod(snap):
+    ctx = _cpu_ctx()
+    assert match_playbooks(alertname="CPUThrottlingHigh", classification=None,
+                           facts=_cpu_facts(ctx, snap)) == []
+
+
+def test_crashloop_alert_gets_no_absent_crashloop_fact():
+    """Своё «absent» не перебивает crashloop из графа у KubePodCrashLooping."""
+    ctx = _ctx()
+    facts = bridge.pod_state_facts(ctx, _healthy_snap())
+    assert not [f for f in facts if f.kind == "crashloop"]
+
+
+def test_scale_out_plan_adds_one_replica(db, monkeypatch):
+    monkeypatch.setattr(bridge, "_probe_current_replicas", lambda intent: 2)
+    ctx = _cpu_ctx()
+    [p] = bridge.plan_proposals(ctx, _cpu_facts(ctx, _healthy_snap()), db)
+    assert p.playbook == _SCALE and p.mode == "approve" and p.tier == "squad"
+    assert p.intent.action.value == "scale_deployment"
+    assert p.intent.params["replicas"] == 3
+    assert p.intent.params["current_replicas"] == 2
+    assert "--replicas=3" in p.command_preview and "--current-replicas=2" in p.command_preview
+
+
+@pytest.mark.parametrize("live", [None, 0])
+def test_scale_out_without_live_replicas_proposes_nothing(db, monkeypatch, live):
+    monkeypatch.setattr(bridge, "_probe_current_replicas", lambda intent: live)
+    ctx = _cpu_ctx()
+    assert bridge.plan_proposals(ctx, _cpu_facts(ctx, _healthy_snap()), db) == []
+
+
+def test_scale_out_in_prod_is_blocked(db, monkeypatch):
+    monkeypatch.setattr(bridge, "_probe_current_replicas", lambda intent: 4)
+    ctx = _cpu_ctx(namespace="prod-kingdom5")
+    [p] = bridge.plan_proposals(ctx, _cpu_facts(ctx, _healthy_snap()), db)
+    assert p.mode == "block"

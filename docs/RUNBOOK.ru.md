@@ -456,7 +456,7 @@ curl -s -H "Authorization: Bearer $JWT" "$API/kg/incidents/42/timeline" | jq '{c
 - Дедуп предложений внутри задачи: (playbook, uid цели, incarnation), `REMEDIATION_BRIDGE_DEDUP_SECONDS` (6 ч); Redis, при его отказе — `kg_remediation_decisions`.
 - Исполнимые playbook-и (v2; `cleanup_stale_failed_job` — v1, только preview, мост его не берёт):
   - `restart_crashloop_deployment` (`KubePodCrashLooping` / `PodCrashLooping`): crashloop без OOM, без свежего деплоя и без падения по сигналу (exit 132/134/135/136/138/139);
-  - `scale_out_cpu_throttled_deployment` (`CPUThrottlingHigh`): давление по CPU при здоровом процессе — без crashloop, без OOM, без свежего деплоя. **Карточку пока не даёт:** мост не вычисляет целевое `{replicas}`, рендер плана падает (`PlanRenderError`).
+  - `scale_out_cpu_throttled_deployment` (`CPUThrottlingHigh`): давление по CPU при здоровом процессе — без crashloop, без OOM, без свежего деплоя. Мост предлагает +1 реплику к живому `spec.replicas` (с 1.0.34).
 - Policy у обоих: approve только в namespace `dev` / `squad`, block для `prod` / `preprod` / `system` / data plane. Заблокированное предложение — строка в обычной карточке, а не кнопка.
 
 ### Флаги

@@ -142,7 +142,7 @@ Updated: **2026-11-01**. Every name below was checked against `app/` (`prometheu
 |---|---|---|
 | `sre-ai-api` | `:8001/metrics` (`start_http_server` in `app/main.py`), plus the two Collectors below | yes |
 | `copilot-worker`, `copilot-worker-sync` | `:8001/metrics`, multiprocess mode (`app/observability/worker_metrics.py`, `PROMETHEUS_MULTIPROC_DIR`) | yes |
-| `copilot-executor` | the same worker server starts (the manifest sets `PROMETHEUS_MULTIPROC_DIR`), but the pod declares no `metrics` port | **no** — counters incremented there (`pipeline_executor_applied_total`, `remediation_attempt_transitions_total` from `apply_intent`) are not collected |
+| `copilot-executor` | the same worker server (`celeryd_init`), port `metrics` :8001 declared since 1.0.34 | yes — `pipeline_executor_applied_total`, `remediation_attempt_transitions_total` from `apply_intent` (before 1.0.34 these were not collected) |
 | `copilot-beat` | no server | listed in the selector, stays an empty target |
 
 NetworkPolicy admits :8001 only from ns `monitoring`.

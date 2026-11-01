@@ -466,3 +466,14 @@ def test_deploy_sh_write_leak_check_is_per_namespace_and_fatal() -> None:
     assert "kubectl get rolebindings -A" in block
     assert '-n "${rb_ns}"' in block
     assert "exit 1" in block
+
+
+def test_executor_metrics_are_scraped() -> None:
+    """Executor поднимает тот же сервер метрик, что воркеры (celeryd_init), —
+    до 01.11.2026 порт не был объявлен и под не входил в VMPodScrape."""
+    w = _workloads()["copilot-executor"]
+    ports = w["spec"]["template"]["spec"]["containers"][0].get("ports") or []
+    assert {"containerPort": 8001, "name": "metrics"} in ports
+    scrape = next(d for d in _docs(_K8S / "monitoring.yaml")
+                  if d and d.get("kind") == "VMPodScrape")
+    assert "copilot-executor" in scrape["spec"]["selector"]["matchExpressions"][0]["values"]
