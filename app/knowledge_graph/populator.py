@@ -12,7 +12,7 @@ backfill (читать k8s API, TeamCity history, alertmanager dump) — отд�
 """
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional
 
 import sqlalchemy as sa
@@ -165,6 +165,26 @@ def upsert_service(
     )
 
 
+# Как часто upsert «касается» строки, у которой ничего не изменилось.
+#
+# До 01.11.2026 каждый upsert переписывал строку целиком ради одной метки
+# времени: kg_services — 22,9 тыс. строк и ~610 тыс. upsert'ов в сутки,
+# kg_service_edges — 28 тыс. строк и 1,41 млн (индекс на last_seen_at делает
+# каждое такое обновление не-HOT: новые записи во всех пяти индексах). Вместе
+# с kg_deployments это 48% WAL базы (11 ГБ за 25 ч, замер pg_stat_statements).
+#
+# Окна, в которых метки читаются, — от 24 ч (seen-окна kg_sync и ingress,
+# _NODE_STALE_AFTER_HOURS) до 7/30 дней (decay рёбер, удаление ingress-узлов),
+# так что касание раз в 30 мин / 3 ч их не задевает. Любое реальное изменение
+# (владелец, uid, stale_class, рост weight) пишется сразу, как раньше.
+#
+# updated_at сервиса и так освежает kg_health_recompute каждые 20 минут
+# (onupdate при записи health_computed_at), поэтому 30 минут — без видимой
+# разницы для kg_data_age_sec в карточках и sync_lag self-health.
+SERVICE_TOUCH_INTERVAL = timedelta(minutes=30)
+EDGE_TOUCH_INTERVAL = timedelta(hours=3)
+
+
 def _trust_expr(col: Any) -> Any:
     """SQL-выражение: вес доверия источника из колонки.
 
@@ -311,6 +331,19 @@ def _upsert_service_pg(
         .on_conflict_do_update(
             constraint=UQ_KG_SERVICE_NS_NAME_KIND,
             set_=set_clause,
+            # Пишем, только если что-то из set_clause реально меняется или
+            # метке пора освежиться (SERVICE_TOUCH_INTERVAL). При ложном
+            # условии строка не трогается и RETURNING пуст — id ниже берётся
+            # отдельным SELECT, как и раньше.
+            where=sa.or_(
+                tbl_ref.c.updated_at.is_(None),
+                tbl_ref.c.updated_at < now - SERVICE_TOUCH_INTERVAL,
+                *[
+                    tbl_ref.c[col].is_distinct_from(expr)
+                    for col, expr in set_clause.items()
+                    if col != "updated_at"
+                ],
+            ),
         )
         .returning(Service.__table__.c.id)
     )
@@ -633,15 +666,25 @@ def _upsert_edge_pg(
     # weight=1 (дефолт upsert_edge). Если runtime/traffic-источник проставил
     # «жирность» (доля трафика, важность), следующий env-sync затёр бы её в 1.
     # GREATEST(existing, excluded) — монотонный апдейт: weight только растёт.
+    edge_tbl = ServiceEdge.__table__
     stmt = stmt.on_conflict_do_update(
         constraint="uq_kg_edge_src_dst_kind_direction",
         set_={
             "last_seen_at": now,
-            "weight": func.greatest(
-                ServiceEdge.__table__.c.weight, stmt.excluded.weight
-            ),
+            "weight": func.greatest(edge_tbl.c.weight, stmt.excluded.weight),
             **({"discovered_by": discovered_by} if discovered_by else {}),
         },
+        # Касание — раз в EDGE_TOUCH_INTERVAL; рост weight пишется сразу.
+        # Смена discovered_by поводом НЕ считается: serves_traffic по очереди
+        # подтверждают два синка (topology_resources и endpoints), и колонка
+        # переписывалась бы на каждом проходе. Её читает только decay — у
+        # рёбер, не виденных 7+ дней, где «последний, кто видел» не меняется.
+        # Полный список источников — extras.discovery_sources (ниже).
+        where=sa.or_(
+            edge_tbl.c.last_seen_at.is_(None),
+            edge_tbl.c.last_seen_at < now - EDGE_TOUCH_INTERVAL,
+            edge_tbl.c.weight < stmt.excluded.weight,
+        ),
     )
     db.execute(stmt)
     db.flush()
@@ -785,6 +828,10 @@ def record_deployment(
         stmt = stmt.on_conflict_do_update(
             index_elements=["service_id", "buildtype_id", "build_number"],
             set_={"sha": func.coalesce(tbl.c.sha, stmt.excluded.sha)},
+            # Только реальный бэкфилл: без условия tc_deploys_to_kg каждые
+            # 15 минут переписывал все недавние сборки (244 тыс. upsert'ов
+            # за 25 ч, 12% WAL), ничего в них не меняя.
+            where=sa.and_(tbl.c.sha.is_(None), stmt.excluded.sha.isnot(None)),
         )
         db.execute(stmt)
         db.flush()
