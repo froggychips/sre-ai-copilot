@@ -1,16 +1,17 @@
-"""Remediation pipeline — Phase A foundation.
+"""Remediation: детерминированный путь «правило → playbook → policy → кнопка».
 
-**Phase A scope (см. memory/project_remediation_pipeline_plan.md)**:
-- Decision preview только. Executor отсутствует физически (не отключённый
-  флаг — модуль `kubectl_executor` просто не реализован).
-- Pipeline: candidate -> target_ref -> classification -> risk_axes ->
-  policy_decision -> planned_command_preview.
-- Outcome — `RemediationDecisionPreview` со статусом всегда
-  `not_executable / preview_only`.
+Начиналось (Phase A) как decision preview без исполнения. Сейчас:
+- playbook-и — `app/remediation/registry/*.yaml` (v1 — только preview,
+  v2 — исполнимые, с `plan.steps`), загрузка/валидация — `playbook.py`,
+  выбор — `matcher.py`, политика — `policy.py` / `executor_gate.py`;
+- мост `bridge.py` + `bridge_dispatch.py` (Celery-задача
+  `remediation_bridge`, с 1.0.31/1.0.32) строит intent на сервере и при
+  `approve` постит карточку с кнопками; запись — через executor
+  (`app/services/executor_apply.py`) после клика оператора из allowlist;
+- след решений и попыток — `kg_remediation_decisions` /
+  `kg_remediation_attempts`, проверка исхода — `verify_checks.py`.
 
-Phase B+ добавит dry-run, observe loop, approve queue, audit ledger и
-таблицы `remediation_actions` / `_observations` / `_approvals`. В Phase A
-используется единая таблица `kg_remediation_decisions`.
+Подробно — docs/REMEDIATION_PLAYBOOK_CONTRACT.md и docs/ARCHITECTURE.md.
 """
 from __future__ import annotations
 

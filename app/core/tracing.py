@@ -76,9 +76,9 @@ def record_llm_call(backend: str, duration_ms: int, error: str | None = None) ->
 
     Делает два:
       1. Инкрементит Prometheus-метрики (llm_request_duration_seconds,
-         llm_api_errors_total). На эти метрики опираются PrometheusRule в
-         k8s/prometheus-rules.yaml — без этого вызова алерты SREAICopilotLLMSilence
-         сработают всегда (absent()).
+         llm_api_errors_total) — их читают дашборды LLM-пайплайна. (Правила
+         k8s/prometheus-rules.yaml с SREAICopilotLLMSilence удалены в #356;
+         актуальные алерты — k8s/monitoring.yaml.)
       2. Пишет в активный StageTimer (per-incident trace в IncidentRecord.trace).
          No-op, если вызов вне StageTimer (unit-tests, ad-hoc) — Prometheus всё
          равно фиксирует, чтобы метрики не выпадали.

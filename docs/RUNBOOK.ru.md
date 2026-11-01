@@ -1,10 +1,40 @@
-# SRE AI Copilot — Runbook и история боевых прогонов
+# SRE AI Copilot — Runbook
 
-В этом документе зафиксированы сквозные тест-прогоны («боевые прогоны»), которые использовались для проверки и улучшения точности диагностического пайплайна. Для каждого прогона описаны: инжектируемый алерт, что наблюдал пайплайн, какая проблема была найдена, какой фикс был задеплоен и результат.
+Операционные процедуры для прод-развёртывания (namespace `sre-ai`), актуально для **v1.0.33**. Во второй половине документа сохранена история «боевых прогонов» LLM-конвейера (прогоны 1–4): этот конвейер **в проде выключен** (`LLM_PIPELINE_ENABLED=false`), прогоны оставлены как история.
 
 ---
 
-## Обзор пайплайна (краткая справка)
+## Текущее состояние (v1.0.33)
+
+**Пути алертов** (`k8s/vmalertmanagerconfig.yaml`):
+
+| Endpoint | Что туда роутится | Что делает |
+|---|---|---|
+| `POST /webhooks/alertmanager/enrich-and-forward` | `prod-*`, `preprod-*`, алерты без namespace (ноды, control plane) | запись в KG + детерминированная обогащённая карточка в Discord (без LLM) |
+| `POST /webhooks/alertmanager/store` | `squad-*`, `preupdate-*`, `severity=info` | только KG (история, инциденты); в Discord ничего — это решение |
+| `POST /webhooks/alertmanager` | ничего | полный LLM-конвейер; `LLM_PIPELINE_ENABLED=false` |
+
+Watchdog и `severity=none` уходят в blackhole. Единственное исключение из «сквады не постим»: мост remediation постит карточку, когда есть применимый playbook (см. [Мост remediation и кнопки](#мост-remediation-и-кнопки)).
+
+**Компоненты** (namespace `sre-ai`):
+
+| Объект | Тип | Примечание |
+|---|---|---|
+| `sre-ai-api` | Deployment, 2 реплики | FastAPI :8000, метрики :8001 |
+| `copilot-worker` | Deployment, 2 | Celery, очередь `celery` |
+| `copilot-worker-sync` | Deployment, 1 | Celery, очередь `sync` (тяжёлые синки KG, с 1.0.28) |
+| `copilot-executor` | Deployment, 1 | Celery, очередь `executor`; SA `sre-ai-executor` — единственный с правом записи в кластер |
+| `copilot-beat` | Deployment, 1 | Celery beat |
+| `postgres` | StatefulSet | `postgres:15-alpine`, local-path PVC 50Gi на ноде `dev-4` |
+| `redis` | StatefulSet | `redis:7-alpine`, local-path PVC 10Gi на ноде `dev-4` |
+| `postgres-backup` | CronJob | 02:00 UTC, см. [DR.md](DR.md) |
+| `squad-dashboard`, `ci-deadman` | CronJob | |
+
+Флаги рантайма лежат в Secret `sre-ai-secrets` (`envFrom` у всех пяти Deployment); в манифестах в git — только `BUILD_VERSION` и `EXECUTOR_DISPATCH`. У `postgres` и `redis` PriorityClass `sre-ai-copilot-stateful` (100000, `preemptionPolicy: Never`): local-path тома не переезжают, поэтому эти поды выселяются последними.
+
+---
+
+## Обзор LLM-конвейера (история — в проде выключен)
 
 ```
 AlertManager webhook
@@ -175,7 +205,7 @@ Jira REST API v3 `GET /search` вернул `410 Gone`. Atlassian перешёл
 
 ## Executor-инциденты
 
-Применимо к v0.7.0+ когда `EXECUTOR_ENABLED=true` и/или `EXECUTOR_APPROVAL_ENABLED=true`. С дефолтами (оба `false`) пайплайн чисто advisory и эта секция N/A.
+В проде `EXECUTOR_ENABLED=true` и `EXECUTOR_APPROVAL_ENABLED=true`; единственный источник исполнимых intent-ов — детерминированный [мост remediation](#мост-remediation-и-кнопки). Поля embed-а и запросы к таблице `incidents` ниже описывают **LLM-путь** (в проде выключен) и оставлены на случай его включения; отказы kubectl, рубильники и audit-события относятся к обоим путям.
 
 ### Как опознать executor-инцидент
 
@@ -243,31 +273,35 @@ UPDATE incidents
 
 Кликнуть 👎 на embed чтобы зафиксировать negative feedback структурно.
 
-### Killing executor
+### Как выключить executor
 
-#### Остановить новые applies (нормальный control)
+#### Остановить новые apply (штатно)
 
 ```bash
-# быстро: оба деплоймента читают флаг на старте, kubectl set env их прокатит
+# быстро: env на Deployment перекрывает значение из Secret sre-ai-secrets;
+# set env сам запускает rollout. Флаг читают API (клик по кнопке) и
+# worker (карточки моста).
 kubectl -n sre-ai set env deploy/sre-ai-api deploy/copilot-worker \
   EXECUTOR_APPROVAL_ENABLED=false
-# надолго: то же значение в k8s/base/deployment.yaml + k8s/worker.yaml
-# и ./deploy.sh — чтобы манифесты и кластер говорили одно
+# надолго: тот же ключ в Secret sre-ai-secrets, затем снять перекрытие
+# (поды читают envFrom на старте — rollout от set env подхватит Secret):
+kubectl -n sre-ai patch secret sre-ai-secrets -p '{"stringData":{"EXECUTOR_APPROVAL_ENABLED":"false"}}'
+kubectl -n sre-ai set env deploy/sre-ai-api deploy/copilot-worker EXECUTOR_APPROVAL_ENABLED-
 ```
 
-Apply-кнопка исчезает с новых embed-ов. Уже выставленные embed-ы остаются в Discord history, но клик возвращает `❌ EXECUTOR_APPROVAL_ENABLED=false — apply отключён.`
+Мост перестаёт постить карточки с кнопками. Кнопки на уже отправленных карточках API отклоняет.
 
-#### Emergency (быстрее всего)
+#### Аварийно (быстрее всего, останавливает любую запись в кластер)
 
 ```bash
-kubectl scale deployment/copilot-worker -n sre-ai --replicas=0
+kubectl -n sre-ai scale deploy/copilot-executor --replicas=0
 ```
 
-Останавливает всё (dry-run, analysis, apply). Только если executor сильно misbehaviour.
+`copilot-executor` — единственный процесс с write-ролью (`EXECUTOR_DISPATCH=queue` у API и воркеров). Apply-задачи, вставшие в очередь, пока он лежит, после подъёма всё равно проходят все проверки `apply_intent`, включая возраст одобрения (`EXECUTOR_APPROVAL_MAX_AGE_SECONDS`, 3600 с), — если исполнять их не нужно, сначала выключите одобрения.
 
-#### Permanent
+#### Насовсем
 
-Поставить и `EXECUTOR_ENABLED=false`, и `EXECUTOR_APPROVAL_ENABLED=false`. Пайплайн опускается до advisory.
+Поставить в `sre-ai-secrets` и `EXECUTOR_ENABLED=false`, и `EXECUTOR_APPROVAL_ENABLED=false`. Карточек с кнопками нет, ничего не исполняется.
 
 ### Audit trail
 
@@ -414,9 +448,101 @@ curl -s -H "Authorization: Bearer $JWT" "$API/kg/incidents/42/timeline" | jq '{c
 
 Отказ `target_reincarnated:*` значит, что объект пересоздан после инцидента (`uid` графа ≠ живой) — перезапускать разбор по текущему объекту, а не переодобрять. Каждая проверка — `True / False / None`; `None` — «не смогли проверить», никогда не «ок». Audit-события: `EXECUTOR_APPLY_REFUSED_TARGET_REINCARNATED`, `EXECUTOR_VERIFY_VERIFIED / _FAILED / _PENDING / _UNKNOWN`. Настройки: `REMEDIATION_VERIFY_ENABLED`, `REMEDIATION_VERIFY_DELAYS_SEC` (по умолчанию `300,900`).
 
-## Setting up Discord approvers
+## Мост remediation и кнопки
+
+Детерминированный путь без LLM (с 1.0.31, исполняется в Celery с 1.0.32): алерт → факты правил → matcher playbook-ов → policy → карточка с кнопками `approve:` / `decline:` в канале инцидентов (`DISCORD_INCIDENT_CHANNEL_ID`, не в личке). Код: `app/remediation/bridge.py`, `app/remediation/bridge_dispatch.py`, Celery-задача `remediation_bridge` (очередь `celery`).
+
+- API делает только дешёвый фильтр (`wants_bridge`: флаг + alertname исполнимого v2-playbook-а из `app/remediation/registry/`) и ставит задачу. Дедуп постановки: Redis `SET NX EX` по (alertname, namespace, pod/workload), `REMEDIATION_BRIDGE_ENQUEUE_DEDUP_SECONDS` (600). Redis недоступен — задача не ставится (fail-closed).
+- Дедуп предложений внутри задачи: (playbook, uid цели, incarnation), `REMEDIATION_BRIDGE_DEDUP_SECONDS` (6 ч); Redis, при его отказе — `kg_remediation_decisions`.
+- Исполнимые playbook-и (v2; `cleanup_stale_failed_job` — v1, только preview, мост его не берёт):
+  - `restart_crashloop_deployment` (`KubePodCrashLooping` / `PodCrashLooping`): crashloop без OOM, без свежего деплоя и без падения по сигналу (exit 132/134/135/136/138/139);
+  - `scale_out_cpu_throttled_deployment` (`CPUThrottlingHigh`): давление по CPU при здоровом процессе — без crashloop, без OOM, без свежего деплоя. **Карточку пока не даёт:** мост не вычисляет целевое `{replicas}`, рендер плана падает (`PlanRenderError`).
+- Policy у обоих: approve только в namespace `dev` / `squad`, block для `prod` / `preprod` / `system` / data plane. Заблокированное предложение — строка в обычной карточке, а не кнопка.
+
+### Флаги
+
+Все они — ключи Secret `sre-ai-secrets`, а не манифестов в `k8s/`.
+
+| Переменная | В проде | Смысл |
+|---|---|---|
+| `REMEDIATION_BRIDGE_ENABLED` | `true` | мост вкл/выкл (по умолчанию `false`) |
+| `REMEDIATION_BRIDGE_NAMESPACES` | пусто (все) | **префиксы** namespace через запятую; пусто = все |
+| `EXECUTOR_ENABLED` | `true` | без него мост не постит кнопки |
+| `EXECUTOR_APPROVAL_ENABLED` | `true` | без него мост не постит кнопки; API отклоняет клики |
+| `DISCORD_APPROVERS_USER_IDS` | allowlist | кто может нажимать (см. ниже) |
+
+### Кто может нажимать
+
+Только пользователи Discord из `DISCORD_APPROVERS_USER_IDS` (операторы из allowlist). Пустой allowlist — любой клик отклоняется (fail-closed). Роли (`DISCORD_APPROVERS_ROLE_IDS`) код поддерживает, но в проде они не используются. Подробнее: [Настройка Discord approvers](#настройка-discord-approvers).
+
+### Путь клика
+
+1. Карточки шлёт то же приложение Discord (AI Bot), что и ai-reviewer, поэтому **Interactions Endpoint URL приложения указывает на ai-reviewer** (отдельный сервис, namespace `ai-reviewer-net`).
+2. ai-reviewer пересылает interactions `approve:` / `decline:` на `http://sre-ai-api.sre-ai.svc.cluster.local:8000/discord/interactions` (его настройка `DISCORD_INTERACTIONS_COPILOT_RELAY_URL`) и возвращает Discord тело ответа копилота.
+3. API копилота проверяет подпись Ed25519 (`DISCORD_PUBLIC_KEY`), allowlist и флаги и ставит apply в очередь `executor`; исполняет `copilot-executor`.
+
+### Как выключить
+
+```bash
+kubectl -n sre-ai set env deploy/sre-ai-api deploy/copilot-worker \
+  REMEDIATION_BRIDGE_ENABLED=false
+```
+
+Надолго — в Secret (поды читают `envFrom` на старте, отсюда рестарт), затем снять перекрытие `set env`:
+
+```bash
+kubectl -n sre-ai patch secret sre-ai-secrets -p '{"stringData":{"REMEDIATION_BRIDGE_ENABLED":"false"}}'
+kubectl -n sre-ai set env deploy/sre-ai-api deploy/copilot-worker REMEDIATION_BRIDGE_ENABLED-
+kubectl -n sre-ai rollout restart deploy/sre-ai-api deploy/copilot-worker
+```
+
+ Остановить исполнение, но оставить расчёт моста — см. [Как выключить executor](#как-выключить-executor).
+
+### Кнопки не работают — чек-лист
+
+| Симптом | Что проверить |
+|---|---|
+| Discord пишет «interaction failed», в логе API копилота пусто | ai-reviewer жив и по-прежнему Interactions Endpoint; relay URL у него задан; NetworkPolicy `copilot-network-policy` (`k8s/networkpolicy.yaml`) пускает ingress из namespace `ai-reviewer-net` на порт 8000 |
+| API отвечает 503 `DISCORD_PUBLIC_KEY not configured` | ключа нет в `sre-ai-secrets` |
+| API отвечает 401 `Invalid Discord signature` | `DISCORD_PUBLIC_KEY` — не ключ приложения, которое шлёт карточки |
+| Ephemeral `❌ EXECUTOR_APPROVAL_ENABLED=false` | флаг выключен (или перекрыт `set env`) |
+| Отказ с audit `DISCORD_APPROVAL_DENIED_*` | пользователя нет в `DISCORD_APPROVERS_USER_IDS` или allowlist пуст |
+| Одобрено, но ничего не происходит | `copilot-executor` запущен; нет `EXECUTOR_APPLIED` / `EXECUTOR_APPLY_REFUSED*` в audit-логе → смотреть лог executor |
+| Карточек нет вообще | `REMEDIATION_BRIDGE_ENABLED`, `REMEDIATION_BRIDGE_NAMESPACES`, tier namespace (прод всегда block), окна дедупа |
+
+---
+
+## Включение новых флагов
+
+Новый путь кода включается **сначала на одном namespace под реальной нагрузкой**, потом везде. Для моста это `REMEDIATION_BRIDGE_NAMESPACES`, например префикс одного сквада:
+
+```bash
+kubectl -n sre-ai set env deploy/sre-ai-api deploy/copilot-worker \
+  REMEDIATION_BRIDGE_ENABLED=true REMEDIATION_BRIDGE_NAMESPACES=squad-49-
+```
+
+Наблюдать readiness/liveness API, `AlertmanagerClusterFailedToSendAlerts`, длину очереди Celery и соединения с БД хотя бы через один шторм алертов; только потом расширять список или очищать его. Когда всё устоялось — перенести значения в `sre-ai-secrets` и снять перекрытия `set env` (как в [Как выключить](#как-выключить)).
+
+**Почему (инцидент 31.10.2026).** В 1.0.31 мост запускался `asyncio.create_task` в event loop API на каждый алерт батча `/store`, с синхронными вызовами БД/K8s внутри. С флагом на все namespace 13 сквадов в crashloop остановили loop: оба пода `sre-ai-api` ~30 мин не проходили пробы, Alertmanager терял вебхуки. С 1.0.32 API только ставит задачу (см. выше). Всё новое на пути запроса API должно быть дешёвым и неблокирующим; тяжёлое — в Celery.
+
+---
+
+## Логирование
+
+`configure_logging()` из `app/observability/logging_setup.py` вызывается в `app/main.py` (API) и `app/workers/tasks.py` (все процессы Celery).
+
+- Уровень: `LOG_LEVEL` (по умолчанию `INFO`; неизвестное значение — тоже `INFO`). Задаётся через `sre-ai-secrets` или `kubectl set env` на нужном Deployment.
+- `httpx` / `httpcore` прибиты к `WARNING`: на `INFO` они пишут полный URL запроса, а в URL вебхука Discord лежит токен.
+- Формат: консольный рендерер structlog, не JSON.
+- До 1.0.33 логирование никто не настраивал (structlog по умолчанию — DEBUG); `app/logger.py` удалён.
+
+---
+
+## Настройка Discord approvers
 
 Approve / Decline на incident-embed'ах гейтятся. Без сконфигурированных approver'ов система fail-closed — кнопки отказывают с audit `DISCORD_APPROVAL_DENIED_NO_APPROVERS_CONFIGURED`.
+
+В проде задан только `DISCORD_APPROVERS_USER_IDS` (ключи лежат в Secret `sre-ai-secrets`); роли не используются.
 
 ### Получить Discord user ID
 
@@ -443,8 +569,8 @@ DISCORD_APPROVAL_RATE_LIMIT_PER_HOUR="10"
 
 ### Тестирование
 
-1. Прописать env-vars, рестартнуть API + worker.
-2. Послать тестовый incident; убедиться что в embed'е есть кнопки Approve / Decline.
+1. Прописать ключи в `sre-ai-secrets`, рестартнуть `sre-ai-api` + `copilot-worker`.
+2. Дождаться карточки моста в namespace `dev` / `squad`; убедиться, что в ней есть кнопки Approve / Decline.
 3. Из-под allowlisted юзера: клик Approve → ephemeral "approved" + строка в audit log.
 4. Из-под не-allowlisted юзера: клик Approve → ephemeral deny + audit `DISCORD_APPROVAL_DENIED_UNAUTHORIZED`. Проверить что отказ НЕ потребил rate-limit квоту легитимного approver'а.
 
@@ -756,7 +882,7 @@ kubectl -n sre-ai exec deploy/copilot-worker -- \
 всегда выигрывает):
 
 ```bash
-kubectl -n sre-ai exec deploy/sre-ai-copilot-worker -- \
+kubectl -n sre-ai exec deploy/copilot-worker -- \
   python -m app.scripts.backfill_ownership --apply --filter-ns '*-shared'
 ```
 
@@ -1091,109 +1217,96 @@ side-by-side, или открыть `input.json` и перерисовать в 
 
 ---
 
-## Выкат в прод (реальная процедура, 08.08.2026)
+## Релиз, раскатка и откат
 
-> **Про `deploy.sh`:** registry больше не захардкожен. По умолчанию скрипт
-> берёт образ из Nexus (`docker.lastoasisgame.com/wo/sre-ai-copilot`) — то
-> есть оттуда же, откуда реально тянут поды; для образа из CI передаётся
-> `IMAGE_REPO=ghcr.io/froggychips/sre-ai-copilot`. До 08.08.2026 скрипт
-> хардкодил ghcr и в этом кластере упирался в ImagePullBackOff, поэтому
-> выкаты шли мимо него руками.
->
-> Скрипт теперь предупреждает о долгих транзакциях перед миграциями и
-> проверяет RBAC фактически (`kubectl auth can-i`). Шаги ниже описывают
-> ручную процедуру — она валидна и полезна, когда нужно контролировать
-> каждый шаг (например, при первом выкате после долгого перерыва).
+Helm-чарт удалён (#524). Прод катит TeamCity; `deploy.sh` — для изменений манифестов.
 
-```bash
-IMAGE_TAG=1.0.0-rc.N ./deploy.sh                       # Nexus (по умолчанию)
-IMAGE_REPO=ghcr.io/froggychips/sre-ai-copilot \
-  IMAGE_TAG=<git-sha> ./deploy.sh                      # образ из CI
-```
+### 1. Релиз
 
-### 1. Собрать и запушить образ
+Один PR: бамп `app/__init__.py`, бейджа README и верхней секции `CHANGELOG.md` (все три сверяет `tests/test_version_consistency.py`). Мерж → тег `vX.Y.Z` → GitHub Release.
 
-Обязательно `--platform linux/amd64`: ноды amd64, сборка на ARM-машине без
-флага даёт образ, который не запустится.
+Бампить **до** сборки образа. 21.08.2026 образ собрали раньше, и под показывал `__version__` старше своего тега; пересборка под тем же тегом не помогает (`imagePullPolicy: IfNotPresent`), лечит только следующий релиз.
 
-```bash
-export DOCKER_HOST="unix://$HOME/.rd/docker.sock"     # Rancher Desktop
-docker build --platform linux/amd64 \
-  -t docker.lastoasisgame.com/wo/sre-ai-copilot:1.0.0-rc.N .
-docker push docker.lastoasisgame.com/wo/sre-ai-copilot:1.0.0-rc.N
-```
+### 2. Сборка, миграции, раскатка — TeamCity
 
-Перед пушем полезно убедиться, что в образе то, что ожидаешь:
+Запустить `Wo_Backend_K8sNewCluster_SreAiCopilotBuildAndDeploy` с `TAG=X.Y.Z` (без ветки: конфигурация собирает `master`, `TAG` только именует образ). Шаги:
+
+1. `docker build --platform linux/amd64` + push `docker.lastoasisgame.com/wo/sre-ai-copilot:X.Y.Z`;
+2. миграции: Job `sre-ai-migrate` из `k8s/migrate-job.yaml` на **новом** образе (`PGOPTIONS=-c lock_timeout=15s`); упали — образ не выкатывается;
+3. `kubectl set image` на `sre-ai-api`, `copilot-worker`, `copilot-beat`, `copilot-executor`, `copilot-worker-sync` + `rollout status`.
+
+Запускать сразу после мержа: более поздний коммит в `master` уедет под вашим тегом.
+
+### 3. BUILD_VERSION
+
+TeamCity меняет только образ. Футер карточек читает env `BUILD_VERSION`, а не тег образа:
 
 ```bash
-docker run --rm --platform linux/amd64 -e LLM_BACKEND=claude_cli \
-  --entrypoint sh docker.lastoasisgame.com/wo/sre-ai-copilot:1.0.0-rc.N \
-  -c "ls alembic/versions/ | tail -3"
+kubectl -n sre-ai set env \
+  deploy/sre-ai-api deploy/copilot-worker deploy/copilot-worker-sync \
+  deploy/copilot-executor deploy/copilot-beat BUILD_VERSION=X.Y.Z
 ```
 
-### 2. Миграции — отдельным Job-ом и ТОЛЬКО с `lock_timeout`
+### 4. deploy.sh — только при изменении манифестов
 
-`ALTER TABLE` требует ACCESS EXCLUSIVE. Если лок занят, DDL встаёт в очередь
-и **блокирует всех, кто пришёл после него** — 08.08.2026 так зависли семь
-читателей `kg_services`, приложение стояло 6 минут.
+`IMAGE_TAG=X.Y.Z ./deploy.sh sre-ai`, когда релиз меняет манифесты Deployment, NetworkPolicy, RBAC или PriorityClass. Скрипт проверяет Secret `sre-ai-secrets`, применяет `k8s/base/rbac.yaml` и `k8s/priorityclass.yaml`, проверяет RBAC (SA `sre-ai` **не** должен уметь patch deployments), предупреждает о долгих транзакциях, гоняет `sre-ai-migrate`, применяет `k8s/executor.yaml`, `k8s/base/deployment.yaml`, `k8s/worker.yaml`, `k8s/networkpolicy.yaml` с подстановкой `BUILD_VERSION` и ждёт все пять rollout-ов.
 
-В манифест Job-а добавляется:
+Он **не** трогает `postgres` / `redis`, `k8s/vmalertmanagerconfig.yaml`, `k8s/monitoring.yaml`, `k8s/postgres-backup.yaml`, `k8s/squad-dashboard.yaml` — они применяются отдельно.
 
-```yaml
-        env:
-        - name: PGOPTIONS
-          value: "-c lock_timeout=15s"
-```
-
-Не получил лок за 15 секунд — Job упал, читатели не пострадали, пробуем
-снова. Перед запуском стоит посмотреть, есть ли долгие транзакции:
+**StatefulSet: `kubectl patch`, никогда `kubectl apply`.** Живые StatefulSet `postgres` и `redis` привязаны к `dev-4` (affinity по hostname), где лежат их local-path тома; в git — только `env In [dev]`. `apply` из `k8s/postgres.yaml` / `k8s/redis.yaml` снял бы привязку. Пример:
 
 ```bash
-kubectl -n sre-ai exec postgres-0 -- sh -c 'psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "
-SELECT (now()-xact_start)::text AS возраст, state,
-       left(regexp_replace(query,E'\''\\s+'\'','\'' '\'','\''g'\''),50)
-FROM pg_stat_activity WHERE datname=current_database() AND state<>'\''idle'\''
-ORDER BY xact_start LIMIT 5;"'
+kubectl -n sre-ai patch sts postgres --type=json -p \
+  '[{"op":"replace","path":"/spec/template/spec/containers/0/resources/limits/cpu","value":"<cpu>"}]'
 ```
 
-Если транзакции старше пары минут — заглушить писателей на время наката. Для `kg_service_health` и
-`kg_anomaly_observations` глушить **всегда**, не глядя на `pg_stat_activity`: урок 1.0.9 (07.09.2026) — долгих
-транзакций не было, а `ADD COLUMN` не взял ACCESS EXCLUSIVE за 15 с из-за постоянного потока коротких запросов
-metrics_sync и детектора; Job упал по BackoffLimit, схема осталась прежней. `deploy.sh` после scale-to-0 сам
-вернёт реплики при apply манифестов.
+### 5. Ручная сборка (TeamCity недоступен)
 
 ```bash
-kubectl -n sre-ai scale deploy copilot-worker copilot-beat --replicas=0
-# ... миграции ...
+docker buildx build --platform linux/amd64 \
+  --provenance=false --sbom=false \
+  -t docker.lastoasisgame.com/wo/sre-ai-copilot:X.Y.Z --push .
+```
+
+`--provenance=false --sbom=false` обязательны: по умолчанию buildx прикладывает аттестации и пушит manifest index вместо одного образа. Дальше — миграции и `set image`, как в TeamCity (или `IMAGE_TAG=X.Y.Z ./deploy.sh sre-ai`), и шаг 3.
+
+### Миграции и блокировки
+
+`ALTER TABLE` требует ACCESS EXCLUSIVE; DDL в очереди блокирует всех читателей, пришедших после него (08.08.2026: приложение стояло 6 минут). Поэтому в Job `lock_timeout=15s`: лок не взят — Job падает, читатели не страдают, повторить. Для `kg_service_health` и `kg_anomaly_observations` писателей глушить **всегда** (1.0.9: долгих транзакций не было, но поток коротких запросов всё равно не дал `ADD COLUMN` взять лок):
+
+```bash
+kubectl -n sre-ai scale deploy copilot-worker copilot-worker-sync copilot-beat --replicas=0
+# ... миграции (перезапуск TeamCity или deploy.sh) ...
 kubectl -n sre-ai scale deploy copilot-worker --replicas=2
-kubectl -n sre-ai scale deploy copilot-beat --replicas=1
+kubectl -n sre-ai scale deploy copilot-worker-sync copilot-beat --replicas=1
 ```
 
-### 3. Выкатить приложение
+### Проверка
 
 ```bash
-IMG=docker.lastoasisgame.com/wo/sre-ai-copilot:1.0.0-rc.N
-kubectl -n sre-ai set image deploy/sre-ai-api api=$IMG
-kubectl -n sre-ai set image deploy/copilot-worker worker=$IMG
-kubectl -n sre-ai set image deploy/copilot-beat beat=$IMG
-for d in sre-ai-api copilot-worker copilot-beat; do
-  kubectl -n sre-ai rollout status deploy/$d --timeout=300s
-done
-```
-
-### 4. Проверить после выката
-
-```bash
-# схема доехала
+kubectl -n sre-ai get deploy -o custom-columns='NAME:.metadata.name,READY:.status.readyReplicas,IMAGE:.spec.template.spec.containers[*].image'
+kubectl -n sre-ai get pods                                   # рестартов нет
 kubectl -n sre-ai exec postgres-0 -- sh -c \
   'psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -tAc "SELECT version_num FROM alembic_version"'
-
-# рестартов нет
-kubectl -n sre-ai get pods | grep -E "sre-ai-api|copilot"
-
-# очередь не растёт
-kubectl -n sre-ai exec redis-0 -- redis-cli LLEN celery
+kubectl -n sre-ai exec redis-0 -- redis-cli LLEN celery      # очередь не растёт
 ```
+
+`self_health.check_schema_version` падает, когда база отстаёт от кода.
+
+### Откат
+
+Вернуть Deployment-ы на прежний образ. **Не** перезапускать TeamCity со старым `TAG`: он соберёт текущий `master` и перезапишет старый тег в registry.
+
+```bash
+OLD=docker.lastoasisgame.com/wo/sre-ai-copilot:<previous>
+for d in sre-ai-api:api copilot-worker:worker copilot-worker-sync:worker copilot-executor:executor copilot-beat:beat; do
+  kubectl -n sre-ai set image deploy/${d%%:*} ${d##*:}=$OLD
+done
+kubectl -n sre-ai set env deploy/sre-ai-api deploy/copilot-worker deploy/copilot-worker-sync \
+  deploy/copilot-executor deploy/copilot-beat BUILD_VERSION=<previous>
+```
+
+Миграции не откатываются: база впереди кода — только warning в `check_schema_version`. Если релиз нужно не откатить, а выключить, лучше его флагом (см. [Включение новых флагов](#включение-новых-флагов)).
 
 ---
 
@@ -1284,3 +1397,45 @@ for r in deployments statefulsets daemonsets; do
     --as=system:serviceaccount:sre-ai:sre-ai --all-namespaces
 done
 ```
+
+---
+
+## CI-раннеры
+
+CI идёт на эфемерных раннерах ARC в кластере (метка `sre-copilot-k8s`, namespace `sre-ai-ci`, `k8s/github-runner.yaml`): один под на job. GitHub-hosted раннеры на аккаунте недоступны (блокировка по биллингу), так что упавший контроллер или listener ARC означает, что CI молча стоит в очереди. Раннер и listener прибиты к dev-нодам.
+
+До переезда CI жил на одном self-hosted ноутбуке и был мёртв 27 дней (04.07–31.07.2026) без единого алерта.
+
+Канарейка `scripts/ci_deadman.py` работает как CronJob `ci-deadman` (`k8s/ci-deadman.yaml`) — намеренно в кластере, а не workflow: проверяет, что есть живой раннер, ничего не стоит в очереди дольше `QUEUE_MINUTES`, зелёный PR не висит дольше `STALE_PR_DAYS` и дефолтная ветка не красная; пишет только когда что-то не так. Прежде чем на неё полагаться, проверьте, не приостановлена ли она (`kubectl -n sre-ai get cronjob ci-deadman`). Ручной прогон, ничего не пишет:
+
+```bash
+GITHUB_TOKEN=$(gh auth token) DRY_RUN=1 python3 scripts/ci_deadman.py
+```
+
+---
+
+## Релиз: миграции — часть деплоя (инцидент 14.08.2026)
+
+Образ `rc.19` привёз код с новой колонкой (`kg_services.owner_source`), а миграцию не применили — в рецепте релиза миграций не было. `kg_topology_sync` падал на всех 129 namespace с `column "owner_source" does not exist` и ничего не писал. Алерта не было; единственный симптом — подозрительно быстрый тик. Данные уцелели, потому что deadman `edge_decay` при ошибках выборки отказался удалять ~17 тыс. рёбер.
+
+Сейчас миграции — шаг сборки TeamCity и `deploy.sh`, до `set image`, на новом образе (файлы миграций едут внутри него). `self_health.check_schema_version` падает, когда база **отстаёт** от кода.
+
+### Если деплой уже ушёл без миграций
+
+Симптомы: синки массово падают с `UndefinedColumn` / `UndefinedTable`, тики резко короче, `services=0 edges=0 errors=<число namespace>`. Запустить Job — он идемпотентен:
+
+```bash
+IMG=docker.lastoasisgame.com/wo/sre-ai-copilot:X.Y.Z
+kubectl -n sre-ai delete job sre-ai-migrate --ignore-not-found
+sed -e "s|IMAGE_PLACEHOLDER|$IMG|g" -e "s|BUILD_VERSION_PLACEHOLDER|X.Y.Z|g" \
+  k8s/migrate-job.yaml | kubectl -n sre-ai apply -f -
+kubectl -n sre-ai wait --for=condition=complete job/sre-ai-migrate --timeout=300s
+```
+
+Потом проверить, что `edge_decay` пропустил, а не удалил; удалённые рёбра восстановятся на следующем удачном тике, история узлов — нет.
+
+---
+
+## Бэкапы и восстановление
+
+См. [DR.md](DR.md): CronJob `postgres-backup`, восстановление из S3 и из локальной копии, потеря ноды `dev-4`.

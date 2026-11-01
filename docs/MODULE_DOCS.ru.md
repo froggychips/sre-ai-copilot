@@ -4,13 +4,13 @@
 - `app/api/incidents.py`: `GET /kg/incidents` (`status`, `namespace`, `service`, `include_noise`; шум скрыт по умолчанию), `GET /kg/incidents/{id}` (с алертами), `GET /kg/incidents/{id}/timeline` (`incident_timeline.build_timeline`). Подключён с router-level `get_current_user`.
 - `app/api/kg_graph.py`: `GET /kg/blast-radius?namespace=&service=&hops=&limit=&include_inactive=` → `blast_radius.blast_radius_v2`; 404, если цели нет в графе.
 - `app/main.py`: инициализация FastAPI, middleware, роутеры, health/readiness, async job endpoints.
-- `app/api/webhooks.py`: endpoint для AlertManager webhook и статус фоновой задачи.
+- `app/api/webhooks.py`: приёмники Alertmanager — `/webhooks/alertmanager/enrich-and-forward` (KG + обогащённая карточка в Discord; prod, preprod, ноды), `/webhooks/alertmanager/store` (только KG; сквады, preupdate, info), `/webhooks/alertmanager` (LLM-пайплайн, в проде на него не маршрутизируется) — и статус фоновой задачи. Оба боевых пути только ставят в очередь мост remediation (`bridge_dispatch`).
 - `app/api/replay.py`: повторный запуск анализа по историческому `incident_id`.
 - `app/api/approvals.py`: approve/reject/get для approval workflow.
 - `app/evaluation/feedback.py`: прием пользовательского feedback и агрегированная статистика.
 
 ### Discord interactions (`app/api/discord_interactions.py`)
-- Discord application-interactions endpoint — принимает клики Approve / Decline с incident-embed'а.
+- Discord application-interactions endpoint (`POST /discord/interactions`) — принимает клики `approve:` / `decline:` с карточки инцидента (мост remediation или LLM-пайплайн). В проде Interactions Endpoint приложения AI Bot указывает на отдельный сервис, который пересылает эти клики в копилот (`DISCORD_INTERACTIONS_COPILOT_RELAY_URL` на его стороне) и возвращает тело ответа копилота; подпись Ed25519 проверяется здесь (`DISCORD_PUBLIC_KEY`).
 - **Authorization gate (fail-closed):**
   - Allow если `interaction.user.id ∈ DISCORD_APPROVERS_USER_IDS`, ИЛИ
   - Allow если `member.roles ∩ DISCORD_APPROVERS_ROLE_IDS ≠ ∅`.
@@ -20,7 +20,10 @@
 - **Persistence:** при accept'е пишет одну `ActionApproval` строку (UNIQUE `(incident_id, intent_signature)`). Конкурентные клики коллизионятся на UNIQUE, второй получает «already approved/declined by @user» ephemeral.
 
 ## Workers и оркестрация
-- `app/workers/tasks.py`: Celery-задача `process_incident` — полный 8-стадийный агентный пайплайн: DiagnosticsEngine, MultiHypothesis, FactCritic, Jira enrichment, Fix, Risk, обновление KG.
+- `app/workers/tasks.py`: Celery-приложение, расписание beat и задачи. `process_incident` — полный 8-стадийный агентный пайплайн (DiagnosticsEngine, MultiHypothesis, FactCritic, Jira enrichment, Fix, Risk, обновление KG); при `LLM_PIPELINE_ENABLED=false` (прод) выходит без вызовов LLM. `remediation_bridge` — детерминированный мост (очередь `celery`); `remediation_verify` — проверка после записи. Тяжёлые синки KG (`SYNC_QUEUE_TASKS`) маршрутизируются в очередь `sync` (`copilot-worker-sync`), остальное — в `celery`. При импорте вызывает `configure_logging()` (все процессы Celery).
+- `app/workers/executor_tasks.py`: `executor_dry_run` / `executor_apply` в очереди `executor` (`EXECUTOR_QUEUE_NAME`) при `EXECUTOR_DISPATCH=queue` — единственный процесс с ServiceAccount на запись (`copilot-executor`).
+- `app/workers/task_lock.py`: singleton-локи beat-задач (второй экземпляр поверх идущего не запускается).
+- `app/workers/pipeline_scope.py`: какие алерты вообще могут дойти до LLM-пайплайна (scope по severity / namespace).
 - `app/workers/pipeline.py`: `IncidentPipeline` — сами стадии, по одному async-методу на каждую, с возобновлением из checkpoint-а после Celery-ретрая.
 - `app/workers/report_delivery.py`: `ReportDelivery` — outbox доставки Discord-отчёта (маркеры `report_pending` / `report_sent` / `report_failed`, счётчик попыток, решение «ретраить или сдаться»). Намеренно не стадия пайплайна: работает ПОСЛЕ коммита терминального state, переживает смерть воркера и ретраится Celery без повторного прожига LLM-стадий.
 - `app/celery_worker.py`: Celery-задача `generate_reply`, переходы состояний, итеративный confidence loop.
@@ -65,7 +68,7 @@
 - `IngressObservation` (`kg_ingress_observations`) — per-endpoint (host/path) HTTP-снапшоты: `p95_latency_ms` / `p99_latency_ms` / `rps` / `error_5xx_rate` / `error_4xx_rate`, `service_id` FK на backend-сервис; `UNIQUE (ingress_name, host, path, ts)`. Наполняется с 2026-06-10 (см. Ingress observations sync).
 
 ### Schema / quality contract (`app/knowledge_graph/contract.py`)
-- `KG_SCHEMA_VERSION` — текущая версия (`2.5`, после 2026-08-08: orphan не засчитывает serves_traffic как связность). Bump rules — `docs/KG_SCHEMA_CONTRACT.md` §8.
+- `KG_SCHEMA_VERSION` — текущая версия (`2.9`, владелец namespace `kg_namespaces.owner_*`; история — в модуле и в `docs/KG_SCHEMA_CONTRACT.md`). Bump rules — `docs/KG_SCHEMA_CONTRACT.md` §8.
 - `EDGE_KINDS` — реестр всех edge kinds + spec (`semantic` / `src_kinds` / `dst_kinds` / `source` / `status` / `table`). `table` = где edge живёт: `kg_service_edges` / `kg_volume_edges` / `fk_only` (через FK) / `metadata_only` (через owner_service_id).
 - `OWNER_SOURCES` / `OWNER_SOURCE_ALIASES` — canonical источники owner-а + маппинг коротких имён из `ownership_suggester`.
 - `STALE_CLASS_VALUES` — enum значений `kg_services.stale_class`.
@@ -77,7 +80,7 @@
 - `app/knowledge_graph/k8s_events_sync.py`: `sync_all_events()` — каждые 10 мин `kubectl get events --field-selector type=Warning` → `kg_pod_events`. Pod-name → service резолвится regex'ом стандартного k8s pod-hash паттерна.
 - `app/knowledge_graph/k8s_ingress_sync.py`: `sync_all_ingresses()` — раз в час `kubectl get ingresses -A` → synthetic-узлы `ingress:<host>` + рёбра `calls` к backend-сервисам.
 - `app/knowledge_graph/alerts_resolve_sync.py`: `run_alerts_resolve_sync()` — каждые 15 мин сравнивает `kg_alerts.fingerprint` с `GET AM /api/v2/alerts` → не-firing → `resolved_at=NOW`. Safety: min 1 active fingerprint.
-- `app/knowledge_graph/drift_cleanup.py`: `run_drift_cleanup()` — раз в час; services из несуществующих ns → `synthetic=true` + `metadata.drift_reason`. Safety threshold 20% drift_pct.
+- `app/knowledge_graph/drift_cleanup.py`: `run_drift_cleanup()` — раз в час помечает узлы namespace, чьё отсутствие подтверждено дважды (нет в `kubectl get ns` и `kg_namespaces.state='missing'` дольше 24 ч): `synthetic=true` + `metadata.drift_reason` / `drift_marked_at` / `drift_prev_synthetic`. Safety: no-op, если live-набор namespace усох больше чем на 20%. С 1.0.33 `_unmark_revived` снимает пометку с узлов вернувшегося namespace (есть в `kubectl get ns` и `active` в `kg_namespaces`) и возвращает прежний `synthetic`; в stats — `unmarked_services`.
 - `app/knowledge_graph/k8s_topology_resources_sync.py` (Wave 7-X): каждые 15 минут `kubectl get services/ingresses -A -o json` → edges `serves_traffic` (Service → backing **workload** по selector-match) и `routes_to` (Ingress-как-ресурс → backend Service). Workload — отдельный узел `node_kind='workload'`, синк заводит его сам; матчатся Deployment, **StatefulSet и DaemonSet** (без последних двух 2231 Service за тик уходил в `skipped_no_match` — это все `*-db`). Коммит батчами по 200: одна транзакция на 4200+ upsert-ов держала ACCESS SHARE 12-13 минут и блокировала миграции. Параллельный slice к `k8s_ingress_sync` (Ingress-as-host). RBAC: cluster-role требует `services`, `ingresses`, а также `deployments`/`statefulsets`/`daemonsets` на verbs `get`/`list`/`watch` — проверять через `kubectl auth can-i`, а не по манифесту.
 - `app/knowledge_graph/runtime_correlation.py` (Wave 7-Y): каждые 30 минут sliding-window по `kg_pod_events`. Для каждой пары `(src, dst)` где edge уже существует, считает co-occurrences warning-событий в окне (default 15 мин). При count ≥ MIN_COUNT — подтверждает edge новым `discovery_source = "kg_sync/runtime_corr"` (tier-1 precedence 0.95). Не создаёт новые edges (симметричный сигнал не определяет direction). Feature flag `RUNTIME_CORRELATION_ENABLED=true`.
 - `app/knowledge_graph/nats_subjects_sync.py` (Wave 7-Z): каждые 6 часов shallow clone + sparse-checkout WO monorepo, regex-парсер C# исходников на consumers (`NatsJetStreamConsumer<T>`) и publish call-sites (`SendToJetStreamAsync`). Subject = synthetic-Service в `nats-subjects` namespace, `name=subject:<value>`. Edge `uses_nats` с `extras.direction ∈ {pub, sub}`, `weight = count(call-sites)`. Feature flag `NATS_SUBJECTS_PARSER_ENABLED=false` (требует ssh-доступ к gitlab-monorepo).
@@ -87,29 +90,37 @@
 
 ### Population (`app/knowledge_graph/populator.py`)
 Идемпотентные upsert'ы, используются всеми sync'ами:
-- `upsert_service(namespace, name, team_owner, synthetic, metadata)` — идемпотентно по `(namespace, name)`.
-- `upsert_edge(src, dst, kind, discovered_by, extras)` — обновляет `last_seen_at` и merge `discovery_sources` (unique-preserved-order list).
-- `record_deployment` / `record_alert_event` / `record_pod_event` — идемпотентны по соответствующим natural keys.
+- `upsert_service(namespace, name, team_owner, synthetic, metadata)` — идемпотентно по `(namespace, name, node_kind)`. С 1.0.33 строка переписывается, только если реально меняется какое-то поле или `updated_at` старше `SERVICE_TOUCH_INTERVAL` (30 мин).
+- `upsert_edge(src, dst, kind, discovered_by, extras)` — идемпотентно по `(src_id, dst_id, kind)`; merge `discovery_sources` (unique-preserved-order list). С 1.0.33 `last_seen_at` касается, только если старше `EDGE_TOUCH_INTERVAL` (3 ч) или растёт `weight`.
+- `record_deployment(service, started_at, sha, buildtype_id, build_number, ...)` — идемпотентно по `(service_id, buildtype_id, build_number)`; существующая строка обновляется только для бэкфилла `sha` (1.0.33).
+- `record_alert_event(service, alertname, fingerprint, ...)` — идемпотентно по `fingerprint`.
+- `record_pod_event(service, event_uid, reason, count, ...)` — идемпотентно по k8s `event_uid`; при повторном синке обновляет `last_seen` и `count`.
 
 ### Queries (`app/knowledge_graph/queries.py`)
-- `recent_deploys_for(ns, svc, before, lookback_minutes)` — deploy-записи с `triggered_by` и TC build URL.
-- `upstream_of(ns, svc, kinds=None, fresh_only_days=N)` — outgoing edges с `confidence_score`/`confidence_label`.
-- `incidents_on` / `nearby_alerts` / `recent_pod_events_for` — оставшиеся read-side queries для enrichment.
+Read-side API для enrichment и MCP-тулов:
+- `recent_deploys_for(ns, svc, before, lookback_minutes)` — deploy-записи с `triggered_by` и URL сборки TC.
+- `upstream_of(ns, svc, kinds=None, fresh_only_days=N)` — исходящие рёбра; `fresh_only_days` фильтрует по `last_seen_at`; в результате `confidence_score` + `confidence_label`.
+- `incidents_on(ns, svc, since, until)` — события алертов сервиса в окне.
+- `nearby_alerts(ns, svc, around, window_minutes)` — алерты upstream-сервисов в окне времени.
+- `recent_pod_events_for(ns, svc, around, window_minutes)` — pod-события с `reason`, `count`, `minutes_before`.
 
 ### Confidence (`app/knowledge_graph/confidence.py`)
-- `confidence_score(extras, last_seen_at)` → [0, 1]. Формула: `base × source_count_mul × freshness_mul`.
-- `confidence_label` (`high`/`medium`/`low`) + `confidence_badge` (`●●●`/`●●○`/`●○○`).
-- LLM-readiness: при включении LLM-пайплайна модель видит «inferred с env+url confidence 0.7».
+- `confidence_score(extras, last_seen_at)` → [0, 1]. Формула: `base × source_count_mul × freshness_mul`, с clamp.
+- `confidence_label(score)` → `high`/`medium`/`low` (пороги 0.7 / 0.4).
+- `confidence_badge(score)` → `●●●` / `●●○` / `●○○` (рендер в Discord embed).
+- LLM-readiness: при включении LLM-пайплайна модель видит «inferred с env+url confidence 0.7», а не голый «факт».
 
 ### Alert enrichment (`app/services/alert_enrichment.py`)
 - `enrich_alert(db, incident)` → `EnrichedContext`. Синхронно, ~5 SQL-запросов, **без LLM**. Путь: `/webhooks/alertmanager/enrich-and-forward`.
-- Adaptive `effective_at = max(starts_at, now-24h)` — для длительных хроник anchor на `now`.
-- `primary_hypothesis()` — top-1 observed Fact; `why_this_matters()` — derived priorization (shared dep, chronic, recurrence, infra-critical team).
+- Adaptive `effective_at = max(starts_at, now-24h)` — для длительных хроник запросы якорятся на `now`, а не на первом срабатывании алерта (оно может быть дни назад).
+- `EnrichedContext.primary_hypothesis()` — top-1 observed Fact (детерминированно из `_fact_to_short_text`).
+- `EnrichedContext.why_this_matters()` — derived-сигналы приоритета из `_matter_signals()`: shared dep (`total_inbound > 20`), chronic (`pod_event.count > 1000`), recurrence pattern, `team_owner=platform`.
 
 ### CLI tools (`app/scripts/`)
 - `backfill_tc_deploys.py` — расширенный TC history backfill (default 30 дней).
 - `cleanup_drift.py` — thin wrapper над `drift_cleanup.py` для ручного dry-run / apply.
 - `reattribute_deploys.py` — переатрибутирует ns-broadcast записи `kg_deployments` на точные цели по build properties TeamCity (`--apply --limit-builds N`).
+- `reattribute_alerts.py` — переатрибутирует исторические алерты к k8s-объекту через `alert_target` (метки из VictoriaMetrics по fingerprint; `--days N`, dry-run по умолчанию, `--apply`).
 - `reattribute_job_alerts.py` — переносит `KubeJobFailed` / `KubeJobNotCompleted` с `vm-kube-state-metrics` на владельца Job/CronJob (`job_attribution`), ужимает или удаляет опустевшие KSM-инциденты и присоединяет алерты к инциденту владельца; dry-run по умолчанию, `--apply` для переноса.
 
 ### Metrics sync (`app/knowledge_graph/metrics_sync.py`)
@@ -164,6 +175,191 @@
   - pod event count
   - log error rate
 - Питает daily team digest (fragile top-5 ranking) и `health_score.py` (per-service composite).
+
+### Wave 7-X: declarative k8s topology resources (`app/knowledge_graph/k8s_topology_resources_sync.py`)
+- `sync_topology_resources(db)` — главная функция. Каждые 15 минут beat task
+  `kg_topology_resources_sync` делает `kubectl get services -A -o json` и
+  `kubectl get ingresses -A -o json`, upsert-ит `kg_services` с
+  `metadata_json` (service_type, ports, selector), и пишет два новых вида edges.
+- **Edge `serves_traffic`** (`EDGE_SERVES_TRAFFIC`): Service → backing
+  **workload**. Алгоритм — selector-match Service.spec.selector на pod
+  template labels workload'ов того же namespace; матчатся Deployment,
+  **StatefulSet и DaemonSet** (без двух последних 2231 Service за тик уходил
+  в `skipped_no_match` — это все `*-db` / `*-postgresql` / clickhouse).
+  Workload — отдельный узел `node_kind='workload'`, синк заводит его сам и
+  наследует `team_owner` от Service. До contract 2.4 Service и Deployment с
+  одним именем были ОДНОЙ строкой, и это ребро вырождалось в self-loop:
+  2092 отброшенных ребра за тик при 3 уцелевших в графе.
+  Если Service не имеет match'а, он всё равно регистрируется как node
+  (downstream Ingress может на него routes-ить).
+- **Коммит батчами** (`_COMMIT_BATCH = 200`): одна транзакция на 4200+
+  upsert-ов жила 12-13 минут и всё это время держала ACCESS SHARE, из-за
+  чего DDL-миграция вставала в очередь и блокировала читателей. Тик
+  перестал быть атомарным осознанно — синк идемпотентен.
+- **Edge `routes_to`** (`EDGE_ROUTES_TO`): Ingress (как ресурс) → backend
+  Service. Synthetic-узел `ingress:<name>` создаётся, если в KG ещё нет.
+  Параллельный slice к `k8s_ingress_sync` (который строит `ingress:<host>` →
+  backend как `calls`) — Ingress-as-resource vs Ingress-as-host. Merge
+  через `populator.upsert_edge` (`extras.discovery_sources`).
+- **Cluster-wide RBAC**: требует `services`, `ingresses`, `deployments`,
+  `statefulsets`, `daemonsets` на verbs
+  `get`/`list`/`watch` в ClusterRole (см. `k8s/base/rbac.yaml`).
+- **Без feature flag** — declarative, idempotent, нет внешних зависимостей
+  кроме `kubectl` в окружении worker-pod-а.
+- **Failure mode**: `subprocess.TimeoutExpired` или non-zero exit kubectl —
+  logs.warning, beat tick'а возвращает пустой result, следующий tick попробует
+  снова.
+- CLI: `python -m app.knowledge_graph.k8s_topology_resources_sync [namespace]`
+  (один ns или все).
+
+### Wave 7-Y: PodEvent runtime correlation (`app/knowledge_graph/runtime_correlation.py`)
+- `run_runtime_correlation_sync(db)` — главная async-функция. Beat task
+  `kg_runtime_correlation_sync` каждые 30 минут.
+- **Метод.** Sliding window `RUNTIME_CORRELATION_LOOKBACK_DAYS` (default 7d)
+  по `kg_pod_events`. Для каждой пары (src, dst), где edge уже существует,
+  считаем co-occurrences в окне `RUNTIME_CORRELATION_WINDOW_MINUTES` (default
+  15 мин). Если count ≥ `RUNTIME_CORRELATION_MIN_COUNT` (default 2) —
+  подтверждаем edge: вызываем `populator.upsert_edge` с `discovered_by =
+  "kg_sync/runtime_corr"`. `populator` добавит источник в
+  `extras.discovery_sources`-merge и обновит `last_seen_at`.
+- **Confidence integration.** `kg_sync/runtime_corr` зарегистрирован в
+  `confidence._SOURCE_PRECEDENCE` как tier-1 источник (precedence 0.95).
+  Multi-source provenance (env + runtime_corr) → высший confidence
+  badge в Discord embed.
+- **Не создаёт новые edges.** По дизайну — симметричный сигнал co-fail
+  не определяет direction. Если в KG нет edge (src, dst, kind), runtime
+  correlation его не добавит. Direction discovery остаётся за declarative
+  источниками (env, Service-selector, Ingress, NATS-monorepo).
+- **Reasons whitelist** (`DEFAULT_CORRELATION_REASONS`): BackOff, Unhealthy,
+  OOMKilled, FailedScheduling, CrashLoopBackOff, FailedMount,
+  ImagePullBackOff. Узкая diagnostic-subset — NodeNotReady и подобные
+  cluster-wide reasons исключены: они дают false-positive каждой паре
+  сервисов на ноде.
+- **Synthetic-исключение.** `_is_synthetic()` фильтрует synthetic-узлы
+  (NATS-cluster, ingress:host, subject:* и т.п.) — их pod_events идут
+  через cluster-wide kubelet.
+- **Feature flag:** `RUNTIME_CORRELATION_ENABLED=true` (включён по
+  умолчанию). При `False` task пропускается с info-логом.
+- CLI: `python -m app.knowledge_graph.runtime_correlation`.
+
+### Wave 7-Z: NATS subjects parser (`app/knowledge_graph/nats_subjects_sync.py`)
+- `sync_nats_subjects(db, monorepo_path=...)` — главная функция. Beat
+  task `kg_nats_subjects_sync` каждые 6 часов @ minute=43 (offset от drift/ingress/stuck).
+- **Stage 1 — git sync** (`_ensure_monorepo`): shallow clone
+  (`--depth=1`) + sparse-checkout (`GR.Platform`, `GR.Platform.Features`,
+  `GR.WO.*`) в `WO_MONOREPO_PATH` (default `/var/lib/sre-ai/wo-monorepo`).
+  При повторном run — `git fetch origin master + reset --hard`.
+- **Stage 2 — parse** (`parse_monorepo` → `parse_csharp_text`):
+  - **Subject constants resolver** (`_load_subject_constants`) — один
+    проход по `GR.Platform/DataBus/Nats/NatsConst.cs`,
+    собирает `NatsSubjectConst.<NAME>` → литеральная строка.
+  - **Subscribers** — regex на классы, унаследованные от
+    `NatsJetStreamConsumer<T>` / `NatsJetStreamBatchConsumer<T>` /
+    `MapNatsJetStreamConsumer<T>` / `MapNatsJetStreamBatchConsumer<T>`.
+    Subject из `Subject => NatsSubjectConst.<NAME>` или `Subject => "literal"`.
+  - **Publishers** — regex на `SendToJetStreamAsync(...)` /
+    `PublishAsync(...)`, первый аргумент или named `subject:` =
+    `NatsSubjectConst.<NAME>` или литерал.
+  - **Service name** (`_service_name_from_path`): путь
+    `GR.WO.<X.Y.Z>/...` → `<x>-<y>-<z>` (lowercase, dots-to-dash).
+    Примеры: `GR.WO.Map.Service/...` → `map-service`,
+    `GR.WO.MapCoordinator.Service/...` → `mapcoordinator-service`,
+    `GR.WO.City.Workers/...` → `city-workers`. Эти имена матчатся с
+    Deployment-именами в k8s.
+- **Stage 3 — persist** (`persist_to_kg`):
+  - Subject = synthetic-Service в `nats-subjects` namespace, `name =
+    subject:<value>`. Hidden by `synthetic=True`.
+  - Edge `uses_nats`, src=service, dst=subject. `extras.direction ∈
+    {pub, sub}`, `weight = count(call-sites)`. Идемпотентно по
+    `(src_id, dst_id, kind, extras.direction)`.
+- **Failure mode.** Git/ssh failure → logger.warning + skip; tests via
+  `tests/kg/fixtures/nats_csharp/` без сетевых вызовов.
+- **Feature flag:** `NATS_SUBJECTS_PARSER_ENABLED=false` (выключен по
+  умолчанию — требует ssh-доступ к gitlab-monorepo). Включается осознанно
+  после ручного `--dry-run` прогона.
+- **Env vars**: `WO_MONOREPO_PATH`, `WO_MONOREPO_SSH_URL`,
+  `WO_MONOREPO_SPARSE_DIRS`.
+- CLI: `python -m app.knowledge_graph.nats_subjects_sync [--dry-run]
+  [--path PATH]`.
+
+### Wave 8-A: k8s Jobs/CronJobs sync (`app/knowledge_graph/k8s_jobs_sync.py`)
+- `sync_k8s_jobs(db)` — главная функция. Beat task `kg_jobs_sync` каждые 15
+  минут делает `kubectl get jobs,cronjobs -A -o json` и upsert'ит в новую
+  таблицу `kg_k8s_jobs` (отдельная от `kg_services` — Job/CronJob не "service",
+  не имеет постоянного pod-а).
+- **Поля Jobs** (`kind='job'`): `succeeded_count` / `failed_count` /
+  `active_count` / `completion_time` / `last_pod_exit_code`. Last exit code
+  достаётся из podStatus последнего pod-а по label-selector `job-name=<name>`.
+- **Поля CronJobs** (`kind='cronjob'`): `schedule` / `last_schedule_time` /
+  `last_successful_time` / `suspended`.
+- **Semantic edge `runs_as_job`** — НЕ отдельный edge-row в `kg_service_edges`,
+  а `K8sJob.owner_service_id` metadata-column (FK к `kg_services.id`).
+  Owner резолвится через label `app.kubernetes.io/part-of` или `app`
+  совпадающий с `kg_services.name` в том же namespace. Если matched нет —
+  owner просто NULL (без bloat).
+- **Failure mode**: subprocess.TimeoutExpired или non-zero exit kubectl —
+  log.warning, beat tick возвращает пустой result, не raise.
+- CLI: `python -m app.knowledge_graph.k8s_jobs_sync [namespace]`.
+
+### Wave 8-B: k8s storage sync (`app/knowledge_graph/k8s_storage_sync.py`)
+- `sync_storage(db)` — главная функция. Beat task `kg_storage_sync` каждые
+  30 минут (storage редко меняется — claim ~раз в неделю, capacity статична —
+  но phase-переходы Bound→Released важны в течение получаса).
+- **Отдельные проходы**:
+  - PV (cluster-scoped, `namespace=''`).
+  - PVC (namespace-scoped).
+  - Scan `pod.spec.volumes[]` cluster-wide для `uses_volume` edges.
+- **Edges идут в `kg_volume_edges`** (heterogeneous, tagged `src_kind`/`dst_kind`,
+  без FK constraint):
+  - `uses_volume` (Service → PVC): для каждого
+    `pod.spec.volumes[].persistentVolumeClaim.claimName` → edge от owning
+    Service (через ownerReference Deployment/StatefulSet/RS).
+  - `bound_to` (PVC → PV): через `pvc.spec.volumeName`.
+- **disk_pct enrichment** под флагом `STORAGE_METRICS_ENABLED=false`
+  (default OFF). PromQL:
+  `100 * kubelet_volume_stats_used_bytes / kubelet_volume_stats_capacity_bytes`
+  per `(namespace, persistentvolumeclaim)`. Если scrape config
+  `kubelet_volume_stats_*` не настроен — все ответы 0, отличить от
+  «реально не использован» нельзя.
+- CLI: `python -m app.knowledge_graph.k8s_storage_sync`.
+
+### Wave 8-D: stale classifier (`app/knowledge_graph/stale_classifier.py`)
+- `classify_stale_with_deploys(name, ns, last_deploy_at, team_owner)` →
+  `'active'` / `'expected_stale'` / `'suspicious_stale'`. Канонические
+  значения re-export'ятся из `contract.STALE_CLASS_VALUES`.
+- **Эвристики `expected_stale`**:
+  - Suffix `*-backup` / `*-cron` / `*-cronjob` / `*-job`.
+  - Infix `backup-` / `-backup-` / `-cron-`.
+  - Системные ns: `kube-system`, `cattle-system`, `monitoring`, etc.
+  - `team_owner ∈ {infra, platform}` вне `ACTIVE_WINDOW_DAYS`.
+- `ACTIVE_WINDOW_DAYS` default 30. Override через env.
+- **Использование**:
+  - `kg_sync.sync_namespace` — переписывает `kg_services.stale_class`
+    идемпотентно на каждом sync.
+  - `stats_digest.stale_deployments_section` — читает column как primary,
+    fallback на legacy `_classify_stale` если column пуст (старая
+    инсталляция без свежего sync).
+  - SQL: `WHERE stale_class = 'suspicious_stale'` для dashboards.
+- Значение `gone` (контракт 2.8, namespace снесён) ставит `namespace_lifecycle`, а не
+  этот классификатор.
+
+### KG schema/quality contract (`app/knowledge_graph/contract.py`)
+- **Единственный источник истины** о том, что в KG считается service /
+  orphan / synthetic / owner-known, и какие edge kinds допустимы.
+- `KG_SCHEMA_VERSION: str = "2.9"` — текущая версия контракта. Bump rules
+  в `docs/KG_SCHEMA_CONTRACT.md` §8 (major = breaking, minor = additive).
+- `EDGE_KINDS: Dict[str, EdgeKindSpec]` — реестр всех edge kinds. Каждый
+  spec содержит: `semantic`, `src_kinds`, `dst_kinds`, `source`, `status`
+  (`active` / `planned` / `deprecated`), `table` (`kg_service_edges` /
+  `kg_volume_edges` / `fk_only` / `metadata_only`).
+- `REAL_SERVICE_KINDS` / `SYNTHETIC_KINDS` / `OWNER_SOURCES` /
+  `OWNER_SOURCE_ALIASES` / `STALE_CLASS_VALUES` — canonical sets.
+- **Утилиты**: `is_synthetic(svc)`, `is_orphan(svc, edges)`,
+  `service_kind_of(svc)`, `owner_known(svc)`,
+  `STARTUP_CONTRACT_CHECK(db)` (boot-time drift-логирование).
+- **Gate #22** — `tests/test_contract_drift.py` (auto-validation, что
+  реальные kinds в БД соответствуют реестру; CI-блокирующий).
+- Человекочитаемая версия — `docs/KG_SCHEMA_CONTRACT.md`.
 
 ### Multi-signal owner inference (`app/services/ownership_suggester.py`)
 - Эвристика предложения owner-а для unowned-namespace. Используется в `stats_digest` для секции `Unowned namespaces`.
@@ -242,8 +438,20 @@
 ### Верификация remediation (`app/remediation/verification.py`)
 `TargetSnapshot`, `snapshot_target(intent)` (read-only `kubectl get -o json` через `kubectl_breaker.run_kubectl`), `expected_identity(db, incident_id)` (последний `kg_remediation_decisions.target_ref`), `identity_mismatch` / `identity_check`, `schedule_verification` (Celery `remediation_verify`, `REMEDIATION_VERIFY_DELAYS_SEC`), `assess()` (чистая), `verify_remediation()` → `analysis["executor_verification"]`, `executor_state` `verified` / `verification_failed`, audit `EXECUTOR_VERIFY_<OUTCOME>`, метрика `remediation_verification_total`.
 
+## Remediation (`app/remediation/`)
+- `playbook.py`: загрузчик YAML + строгая схема (`remediation.playbook/v1` — только preview, `/v2` — исполнимый: `match.alertnames`, `preconditions`, `plan.steps`, `verify`); `load_registry()` пропускает файлы на `_`. Реестр: `app/remediation/registry/` (`restart_crashloop_deployment`, `scale_out_cpu_throttled_deployment` — v2; `cleanup_stale_failed_job` — v1; `_executor_apply_gate.yaml` — политика gate). Контракт: `docs/REMEDIATION_PLAYBOOK_CONTRACT.md`.
+- `matcher.py`: `match_playbooks` (только v2; `match` + `preconditions` по `FactStore`, без LLM), `render_plan` (шаблон без значения → `PlanRenderError`), `classify_alert`.
+- `binding.py`: серверный снимок совпадения (`build_match_snapshot`) и привязка intent-а (`bind_server_params`; серверный параметр `current_replicas`).
+- `executor_gate.py`: `evaluate_intent_gate` — детерминированный серверный risk-gate на apply-пути; политика из `_executor_apply_gate.yaml` складывается с политикой playbook-а по строжайшему вердикту.
+- `policy.py`, `risk_axes.py`, `classifier.py`, `target_resolver.py`, `preview.py`: слой Phase A — risk axes, policy evaluator (`auto` / `approve` / `block`), rule-based классификация, резолв цели, preview решения.
+- `bridge.py`: детерминированный мост правила → v2-playbook → карточка с кнопками (`REMEDIATION_BRIDGE_ENABLED`). `wants_bridge` (флаг + `alertname` исполнимого playbook-а), `collect_facts` (факты правил + состояние пода из K8sFacts), `plan_proposals`, дедуп предложений по (playbook, uid, incarnation) на `REMEDIATION_BRIDGE_DEDUP_SECONDS` (Redis `SET NX`, запасной путь — `kg_remediation_decisions`).
+- `bridge_dispatch.py`: постановка из процесса API (с 1.0.32): `namespace_allowed` (`REMEDIATION_BRIDGE_NAMESPACES`), дедуп постановки (Redis `SET NX EX`, `REMEDIATION_BRIDGE_ENQUEUE_DEDUP_SECONDS`), `apply_async` Celery-задачи `remediation_bridge`. Redis недоступен → ничего не ставится (fail-closed).
+- `attempts.py`: попытки исполнения (`kg_remediation_attempts`): claim, блокировка повтора, последняя применённая попытка.
+- `models.py`: ORM `kg_remediation_decisions`.
+- `verify_checks.py`: именованные проверки исхода для секции `verify` playbook-а (`same_identity`, `action_took_effect`, `converged`, `healthy`, `no_new_crash_events`).
+
 ## Данные и персистентность
-- `app/database.py`, `app/db/*`: engine/session helpers и интеграция БД.
+- `app/database.py`: engine/session helpers и интеграция БД; миграции схемы — в `alembic/`.
 - `app/models/`: модели домена — `__init__.py` (SQLAlchemy `Base`, `Conversation`, `Message`), `incident.py` (Pydantic `AlertManagerAlert`, `AlertManagerWebhook`, `Incident`, `FullAnalysisReport`), `remediation_event.py` (`RemediationEventIn`).
 - `app/repository.py`: CRUD-операции разговоров и сообщений.
 
@@ -251,10 +459,14 @@
 - `app/services/mcp_client.py`: клиент для выполнения инструментов на внешних MCP-серверах.
 - `app/services/teamcity_service.py`: интеграция с TeamCity для анализа деплоев через MCP.
 - `app/services/approval_manager.py`: Redis-based lifecycle аппрувов.
-- `app/services/k8s_guard.py`: policy-check операций (verb/resource/namespace/body).
+- `app/services/k8s_guard.py`: policy-check операций (verb/resource/namespace/body); списки namespace — из `app/security/namespaces.py` (запрещённые / только чтение / шаблоны записи).
+- `app/services/executor_apply.py`: `apply_intent` — единственный путь исполнения одобренного `ExecutionIntent` (claim, пере-dry-run, запись, постановка верификации).
+- `app/services/alert_target.py`: `resolve_alert_target` — привязывает алерт к k8s-объекту (workload, job, PVC, под, нода, namespace), а не к экспортеру метрики; исход пишется в `kg_alerts.raw.target_kind`.
+- `app/services/alert_dedup.py`: дедуп карточек Discord (chronic suppress, rollout-noise silent, `SUPPRESS_REPEAT` для повтора горящего алерта).
+- `app/services/chronic_digest.py`, `app/services/stats_digest.py`, `app/services/weekly_reconciliation.py`: дайджест хронических алертов (раз в 6 ч), ежедневный дайджест статистики, еженедельная сверка с кластером (пн 06:00 UTC, #stats).
 - `app/core/execution_dsl.py`: строго типизированный `ExecutionIntent` и kubectl-транслятор.
 - `app/services/resilience.py`: retry/circuit breaker логика вокруг LLM-вызовов.
-- `app/services/discord_service.py`: отправка уведомлений в Discord. Отрисовывает incident-embed'ы, держит 30-мин dedup (PATCH через `webhook?wait=true`), severity routing, per-team channel routing (`DISCORD_TEAM_CHANNEL_MAP`), блоки suspect-deploy / log-error / anomaly / recurrence / linked-alerts и action row с Approve/Decline.
+- `app/services/discord/` (`service.py`, `embed_builder.py`, `dedup.py`, `dedup_store.py`, `routing.py`; `app/services/discord_service.py` — шим обратной совместимости): отправка уведомлений в Discord. Отрисовывает incident-embed'ы, держит 30-мин dedup (PATCH через `webhook?wait=true`), severity routing, per-team channel routing (`DISCORD_TEAM_CHANNEL_MAP`), блоки suspect-deploy / log-error / anomaly / recurrence / linked-alerts и action row с Approve/Decline.
 - `app/services/prompt_guard.py`: детекция prompt injection с лимитом на длину входа.
 
 ### PII redaction (`app/services/pii_redaction.py`)
@@ -269,5 +481,8 @@
 - Статус финальный при создании (`approved` | `declined`); промежуточного `pending` нет — либо кнопку нажали, либо нет.
 
 ## Observability
-- `app/telemetry.py`, `app/observability/*`: трассировка, AI-метрики, структурированное логирование.
+- `app/telemetry.py`: трассировка (OpenTelemetry).
+- `app/observability/logging_setup.py`: `configure_logging()` — уровень structlog из `LOG_LEVEL` (по умолчанию INFO), WARNING для httpx/httpcore (в URL запросов — токены). Вызывается в `app/main.py` и `app/workers/tasks.py`; консольный формат не менялся (1.0.33, заменил неиспользуемый `app/logger.py`).
+- `app/observability/access_log.py`: фильтр access-лога uvicorn, отбрасывающий успешные пробы kubelet (`/healthz`, `/readyz`); ставится из `app/main.py`.
+- `app/observability/ai_metrics.py`, `app/observability/worker_metrics.py`: метрики AI-пайплайна и Prometheus-экспорт из Celery-воркеров.
 - `app/metrics.py`: Prometheus-метрики приложения.

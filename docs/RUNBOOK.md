@@ -1,10 +1,40 @@
-# SRE AI Copilot — Runbook & Combat Run History
+# SRE AI Copilot — Runbook
 
-This document records the end-to-end test runs ("combat runs") used to validate and improve the accuracy of the diagnostic pipeline. Each run documents the alert that was injected, what the pipeline observed, what problem was found, what fix was shipped, and the outcome.
+Operational procedures for the production deployment (namespace `sre-ai`), current as of **v1.0.33**. The second half of the document keeps the history of the LLM pipeline "combat runs" (Runs 1–4): that pipeline is **disabled in production** (`LLM_PIPELINE_ENABLED=false`), the runs are kept as history only.
 
 ---
 
-## Pipeline Overview (quick reference)
+## Current state (v1.0.33)
+
+**Alert paths** (`k8s/vmalertmanagerconfig.yaml`):
+
+| Endpoint | What is routed there | What it does |
+|---|---|---|
+| `POST /webhooks/alertmanager/enrich-and-forward` | `prod-*`, `preprod-*`, alerts without a namespace (nodes, control plane) | writes to the KG + deterministic enriched card in Discord (no LLM) |
+| `POST /webhooks/alertmanager/store` | `squad-*`, `preupdate-*`, `severity=info` | KG only (history, incidents); nothing goes to Discord — by decision |
+| `POST /webhooks/alertmanager` | nothing | full LLM pipeline; `LLM_PIPELINE_ENABLED=false` |
+
+Watchdog and `severity=none` go to a blackhole. The only exception to "squads are not posted": the remediation bridge posts a card when an applicable playbook exists (see [Remediation bridge and buttons](#remediation-bridge-and-buttons)).
+
+**Components** (namespace `sre-ai`):
+
+| Object | Kind | Notes |
+|---|---|---|
+| `sre-ai-api` | Deployment, 2 replicas | FastAPI :8000, metrics :8001 |
+| `copilot-worker` | Deployment, 2 | Celery, queue `celery` |
+| `copilot-worker-sync` | Deployment, 1 | Celery, queue `sync` (heavy KG syncs, since 1.0.28) |
+| `copilot-executor` | Deployment, 1 | Celery, queue `executor`; SA `sre-ai-executor` — the only one with cluster write |
+| `copilot-beat` | Deployment, 1 | Celery beat |
+| `postgres` | StatefulSet | `postgres:15-alpine`, local-path PVC 50Gi on node `dev-4` |
+| `redis` | StatefulSet | `redis:7-alpine`, local-path PVC 10Gi on node `dev-4` |
+| `postgres-backup` | CronJob | 02:00 UTC, see [DR.md](DR.md) |
+| `squad-dashboard`, `ci-deadman` | CronJob | |
+
+Runtime flags live in Secret `sre-ai-secrets` (`envFrom` on all five Deployments); the manifests in git carry only `BUILD_VERSION` and `EXECUTOR_DISPATCH`. `postgres` and `redis` have PriorityClass `sre-ai-copilot-stateful` (100000, `preemptionPolicy: Never`): local-path volumes cannot move, so these pods are evicted last.
+
+---
+
+## LLM pipeline overview (history — disabled in production)
 
 ```
 AlertManager webhook
@@ -176,7 +206,7 @@ Jira REST API v3 `GET /search` endpoint returned `410 Gone`. Atlassian migrated 
 
 ## Executor incidents
 
-Applies to v0.7.0+ when `EXECUTOR_ENABLED=true` and/or `EXECUTOR_APPROVAL_ENABLED=true` are set. With defaults (both `false`) the pipeline is purely advisory and this section is N/A.
+In production `EXECUTOR_ENABLED=true` and `EXECUTOR_APPROVAL_ENABLED=true`; the only producer of executable intents is the deterministic [remediation bridge](#remediation-bridge-and-buttons). The embed fields and the `incidents`-table queries below describe the **LLM path** (disabled in production) and are kept for when it is turned on; the kubectl failure modes, the kill switches and the audit events apply to both paths.
 
 ### Recognizing an executor incident
 
@@ -249,26 +279,30 @@ Click 👎 on the embed to store user feedback structurally.
 #### Stop new applies (normal control)
 
 ```bash
-# fast: both deployments read the flag at startup, kubectl set env rolls them
+# fast: env on the Deployment overrides the value from Secret sre-ai-secrets;
+# set env triggers a rollout. The flag is read by the API (button click) and
+# by the worker (bridge cards).
 kubectl -n sre-ai set env deploy/sre-ai-api deploy/copilot-worker \
   EXECUTOR_APPROVAL_ENABLED=false
-# durable: put the same value into k8s/base/deployment.yaml + k8s/worker.yaml
-# and run ./deploy.sh, so the manifests and the cluster agree
+# durable: the same key in Secret sre-ai-secrets, then drop the override
+# (pods read envFrom at start — the set env rollout picks up the Secret):
+kubectl -n sre-ai patch secret sre-ai-secrets -p '{"stringData":{"EXECUTOR_APPROVAL_ENABLED":"false"}}'
+kubectl -n sre-ai set env deploy/sre-ai-api deploy/copilot-worker EXECUTOR_APPROVAL_ENABLED-
 ```
 
-Apply button disappears from new embeds. Already-posted embeds with the button stay in Discord history — clicking them returns `❌ EXECUTOR_APPROVAL_ENABLED=false — apply отключён.`
+The bridge stops posting cards with buttons. Buttons on already-posted cards are refused by the API.
 
-#### Emergency (fastest, halts everything)
+#### Emergency (fastest, halts all cluster writes)
 
 ```bash
-kubectl scale deployment/copilot-worker -n sre-ai --replicas=0
+kubectl -n sre-ai scale deploy/copilot-executor --replicas=0
 ```
 
-Halts dry-run, analysis, and apply. Use only if executor is misbehaving badly.
+`copilot-executor` is the only process with the write role (`EXECUTOR_DISPATCH=queue` on the API and workers). Apply tasks queued while it is down still go through every check in `apply_intent` when it comes back, including approval age (`EXECUTOR_APPROVAL_MAX_AGE_SECONDS`, 3600 s) — disable approvals first if you do not want them executed.
 
 #### Permanent
 
-Set both `EXECUTOR_ENABLED=false` and `EXECUTOR_APPROVAL_ENABLED=false`. Pipeline drops to advisory.
+Set both `EXECUTOR_ENABLED=false` and `EXECUTOR_APPROVAL_ENABLED=false` in `sre-ai-secrets`. No cards with buttons; nothing is executed.
 
 ### Audit trail
 
@@ -415,9 +449,101 @@ Data hygiene: after a release that changes attribution, run the matching script 
 
 Refusal `target_reincarnated:*` means the object was re-created since the incident (graph `uid` ≠ live `uid`) — re-run the analysis on the current object rather than re-approving. Every check is `True / False / None`; `None` is «could not check», never «ok». Audit events: `EXECUTOR_APPLY_REFUSED_TARGET_REINCARNATED`, `EXECUTOR_VERIFY_VERIFIED / _FAILED / _PENDING / _UNKNOWN`. Settings: `REMEDIATION_VERIFY_ENABLED`, `REMEDIATION_VERIFY_DELAYS_SEC` (default `300,900`).
 
+## Remediation bridge and buttons
+
+Deterministic path without an LLM (since 1.0.31, executed in Celery since 1.0.32): alert → rule facts → playbook matcher → policy → card with `approve:` / `decline:` buttons in the incident channel (`DISCORD_INCIDENT_CHANNEL_ID`, not DMs). Code: `app/remediation/bridge.py`, `app/remediation/bridge_dispatch.py`, Celery task `remediation_bridge` (queue `celery`).
+
+- The API only runs the cheap filter (`wants_bridge`: flag + alertname of an executable v2 playbook in `app/remediation/registry/`) and enqueues the task. Enqueue dedup: Redis `SET NX EX` per (alertname, namespace, pod/workload), `REMEDIATION_BRIDGE_ENQUEUE_DEDUP_SECONDS` (600). Redis unavailable → the task is not enqueued (fail-closed).
+- Proposal dedup inside the task: (playbook, target uid, incarnation), `REMEDIATION_BRIDGE_DEDUP_SECONDS` (6 h); Redis, falling back to `kg_remediation_decisions`.
+- Executable playbooks (v2; `cleanup_stale_failed_job` is v1, preview only, and the bridge does not take it):
+  - `restart_crashloop_deployment` (`KubePodCrashLooping` / `PodCrashLooping`): crashloop without OOM, without a recent deploy and without a signal crash (exit 132/134/135/136/138/139);
+  - `scale_out_cpu_throttled_deployment` (`CPUThrottlingHigh`): CPU pressure with a healthy process — no crashloop, no OOM, no recent deploy. **Does not produce a card yet:** the bridge does not compute the target `{replicas}`, plan rendering fails (`PlanRenderError`).
+- Policy of both: approve only in `dev` / `squad` namespaces, block `prod` / `preprod` / `system` / data plane. A blocked proposal is a line in the regular card, not a button.
+
+### Flags
+
+All of them are keys of Secret `sre-ai-secrets`, not of the manifests in `k8s/`.
+
+| Variable | Production | Meaning |
+|---|---|---|
+| `REMEDIATION_BRIDGE_ENABLED` | `true` | bridge on/off (default `false`) |
+| `REMEDIATION_BRIDGE_NAMESPACES` | empty (all) | comma-separated namespace **prefixes**; empty = all |
+| `EXECUTOR_ENABLED` | `true` | without it the bridge posts no buttons |
+| `EXECUTOR_APPROVAL_ENABLED` | `true` | without it the bridge posts no buttons; the API refuses clicks |
+| `DISCORD_APPROVERS_USER_IDS` | allowlist | who may click (see below) |
+
+### Who can click
+
+Only Discord users listed in `DISCORD_APPROVERS_USER_IDS` (operators from the allowlist). Empty allowlist → every click is denied (fail-closed). Roles (`DISCORD_APPROVERS_ROLE_IDS`) are supported by the code but not used in production. Details: [Setting up Discord approvers](#setting-up-discord-approvers).
+
+### Click path
+
+1. The cards are sent by the same Discord application (AI Bot) that ai-reviewer uses, so the application's **Interactions Endpoint URL points to ai-reviewer** (a separate service, namespace `ai-reviewer-net`).
+2. ai-reviewer forwards `approve:` / `decline:` interactions to `http://sre-ai-api.sre-ai.svc.cluster.local:8000/discord/interactions` (its setting `DISCORD_INTERACTIONS_COPILOT_RELAY_URL`) and returns the copilot response body to Discord.
+3. The copilot API verifies the Ed25519 signature (`DISCORD_PUBLIC_KEY`), checks the allowlist and flags, and enqueues the apply into the `executor` queue; `copilot-executor` executes it.
+
+### Turning it off
+
+```bash
+kubectl -n sre-ai set env deploy/sre-ai-api deploy/copilot-worker \
+  REMEDIATION_BRIDGE_ENABLED=false
+```
+
+Durable — in the Secret (pods read `envFrom` at start, hence the restart), then drop the `set env` override:
+
+```bash
+kubectl -n sre-ai patch secret sre-ai-secrets -p '{"stringData":{"REMEDIATION_BRIDGE_ENABLED":"false"}}'
+kubectl -n sre-ai set env deploy/sre-ai-api deploy/copilot-worker REMEDIATION_BRIDGE_ENABLED-
+kubectl -n sre-ai rollout restart deploy/sre-ai-api deploy/copilot-worker
+```
+
+ To stop executing but keep the bridge computing, see [Killing the executor](#killing-the-executor).
+
+### Buttons do not work — checklist
+
+| Symptom | Check |
+|---|---|
+| Discord shows "interaction failed", nothing in the copilot API log | ai-reviewer is up and still the Interactions Endpoint; its relay URL is set; NetworkPolicy `copilot-network-policy` (`k8s/networkpolicy.yaml`) allows ingress from namespace `ai-reviewer-net` to port 8000 |
+| API answers 503 `DISCORD_PUBLIC_KEY not configured` | key missing in `sre-ai-secrets` |
+| API answers 401 `Invalid Discord signature` | `DISCORD_PUBLIC_KEY` is not the key of the application that sends the cards |
+| Ephemeral `❌ EXECUTOR_APPROVAL_ENABLED=false` | flag is off (or overridden by `set env`) |
+| Deny with audit `DISCORD_APPROVAL_DENIED_*` | the user is not in `DISCORD_APPROVERS_USER_IDS`, or the allowlist is empty |
+| Approved, but nothing happens | `copilot-executor` is running; no `EXECUTOR_APPLIED` / `EXECUTOR_APPLY_REFUSED*` in the audit log → look at the executor log |
+| No cards at all | `REMEDIATION_BRIDGE_ENABLED`, `REMEDIATION_BRIDGE_NAMESPACES`, the namespace tier (prod is always blocked), dedup windows |
+
+---
+
+## Enabling new flags
+
+A new code path is enabled **on one namespace first, under real load**, then everywhere. For the bridge this is `REMEDIATION_BRIDGE_NAMESPACES`, e.g. a single squad prefix:
+
+```bash
+kubectl -n sre-ai set env deploy/sre-ai-api deploy/copilot-worker \
+  REMEDIATION_BRIDGE_ENABLED=true REMEDIATION_BRIDGE_NAMESPACES=squad-49-
+```
+
+Watch API readiness/liveness, `AlertmanagerClusterFailedToSendAlerts`, Celery queue length and DB connections through at least one alert storm; only then widen the list or clear it. When settled, move the values into `sre-ai-secrets` and drop the `set env` overrides (as in [Turning it off](#turning-it-off)).
+
+**Why (incident 31.10.2026).** 1.0.31 ran the bridge with `asyncio.create_task` inside the API event loop, for every alert of a `/store` batch, with synchronous DB/K8s calls inside. With the flag on for all namespaces, 13 crashlooping squads stopped the loop: both `sre-ai-api` pods failed probes for ~30 min, Alertmanager lost webhooks. Since 1.0.32 the API only enqueues (see above). Anything new on the API request path must be cheap and non-blocking; heavy work goes to Celery.
+
+---
+
+## Logging
+
+`app/observability/logging_setup.py` `configure_logging()` is called in `app/main.py` (API) and `app/workers/tasks.py` (all Celery processes).
+
+- Level: `LOG_LEVEL` (default `INFO`; an unknown value falls back to `INFO`). Set it via `sre-ai-secrets` or `kubectl set env` on the Deployment you are debugging.
+- `httpx` / `httpcore` are pinned to `WARNING`: at `INFO` they log full request URLs, and Discord webhook URLs contain the token.
+- Format: structlog console renderer, not JSON.
+- Before 1.0.33 nothing configured logging (structlog defaulted to DEBUG); `app/logger.py` is removed.
+
+---
+
 ## Setting up Discord approvers
 
 The Approve / Decline buttons on incident embeds are gated. With no approvers configured the system is fail-closed — buttons are denied with audit `DISCORD_APPROVAL_DENIED_NO_APPROVERS_CONFIGURED`.
+
+In production only `DISCORD_APPROVERS_USER_IDS` is set (keys live in Secret `sre-ai-secrets`); roles are not used.
 
 ### Get a Discord user ID
 
@@ -444,8 +570,8 @@ If both `DISCORD_APPROVERS_USER_IDS` and `DISCORD_APPROVERS_ROLE_IDS` are empty,
 
 ### Testing
 
-1. Configure the env vars and restart the API + worker.
-2. Send a test incident; verify the embed has Approve / Decline buttons.
+1. Set the keys in `sre-ai-secrets` and restart `sre-ai-api` + `copilot-worker`.
+2. Wait for a bridge card in a `dev` / `squad` namespace; verify it has Approve / Decline buttons.
 3. As an allowlisted user: click Approve → ephemeral "approved" reply + audit log line.
 4. As a non-allowlisted user: click Approve → ephemeral deny + audit `DISCORD_APPROVAL_DENIED_UNAUTHORIZED`. Verify the deny did NOT consume rate-limit quota for the legitimate approver.
 
@@ -756,7 +882,7 @@ After the configmap is live, re-run inference on `*-shared` so old
 attributions converge to manifest verdicts (confidence=1.0 always wins):
 
 ```bash
-kubectl -n sre-ai exec deploy/sre-ai-copilot-worker -- \
+kubectl -n sre-ai exec deploy/copilot-worker -- \
   python -m app.scripts.backfill_ownership --apply --filter-ns '*-shared'
 ```
 
@@ -1094,131 +1220,96 @@ should have at least one case to detect regression.
 
 ---
 
-## Production rollout (the actual procedure, 2026-08-08)
+## Release, rollout and rollback
 
-> **About `deploy.sh`:** the registry is no longer hard-coded. By default the
-> script pulls from Nexus (`docker.lastoasisgame.com/wo/sre-ai-copilot`) — the
-> same place the pods actually pull from; for a CI image pass
-> `IMAGE_REPO=ghcr.io/froggychips/sre-ai-copilot`. Until 2026-08-08 the script
-> hard-coded ghcr and stalled with ImagePullBackOff in this cluster, which is
-> why rollouts bypassed it entirely.
->
-> The script now warns about long transactions before migrations and verifies
-> RBAC for real (`kubectl auth can-i`). The steps below describe the manual
-> procedure — still valid, and useful when you want to control every step.
+The Helm chart is gone (#524). Production is rolled out by TeamCity; `deploy.sh` is for manifest changes.
 
-```bash
-IMAGE_TAG=1.0.0-rc.N ./deploy.sh                       # Nexus (default)
-IMAGE_REPO=ghcr.io/froggychips/sre-ai-copilot \
-  IMAGE_TAG=<git-sha> ./deploy.sh                      # image from CI
-```
+### 1. Release
 
-### 0. Bump the version BEFORE building the image
+One PR: bump `app/__init__.py`, the README badge and the top section of `CHANGELOG.md` (all three are checked by `tests/test_version_consistency.py`). Merge → tag `vX.Y.Z` → GitHub Release.
 
-Order matters, and getting it wrong is silent. On 2026-08-21 the image was
-built first and `__version__` bumped afterwards: the tag `v1.0.0-rc.35` then
-pointed at a commit that was not inside the `rc.35` image, and the running pod
-reported `__version__=1.0.0-rc.29` next to `BUILD_VERSION=1.0.0-rc.35`.
+Bump **before** the image is built. On 2026-08-21 the image was built first and the pod reported an older `__version__` than its tag; rebuilding under the same tag does not help (`imagePullPolicy: IfNotPresent`), only another release does.
 
-Rebuilding under the same tag does not fix it — `imagePullPolicy: IfNotPresent`
-means nodes that already hold the tag will not re-pull it. The only real fix is
-another release, so it is cheaper to get the order right.
+### 2. Build, migrate, roll out — TeamCity
 
-One commit, three places, all checked by `tests/test_version_consistency.py`:
+Run `Wo_Backend_K8sNewCluster_SreAiCopilotBuildAndDeploy` with `TAG=X.Y.Z` (no branch: the configuration builds `master`, `TAG` only names the image). Steps:
+
+1. `docker build --platform linux/amd64` + push `docker.lastoasisgame.com/wo/sre-ai-copilot:X.Y.Z`;
+2. migrations: Job `sre-ai-migrate` from `k8s/migrate-job.yaml` on the **new** image (`PGOPTIONS=-c lock_timeout=15s`); if it fails, the image is not rolled out;
+3. `kubectl set image` on `sre-ai-api`, `copilot-worker`, `copilot-beat`, `copilot-executor`, `copilot-worker-sync` + `rollout status`.
+
+Trigger it right after the merge: a later commit on `master` would end up under your tag.
+
+### 3. BUILD_VERSION
+
+TeamCity changes only the image. The card footer reads the `BUILD_VERSION` env, not the image tag:
 
 ```bash
-# app/__init__.py, README.md (badge), CHANGELOG.md (top release section)
-.venv/bin/pytest tests/test_version_consistency.py -q   # must pass BEFORE build
+kubectl -n sre-ai set env \
+  deploy/sre-ai-api deploy/copilot-worker deploy/copilot-worker-sync \
+  deploy/copilot-executor deploy/copilot-beat BUILD_VERSION=X.Y.Z
 ```
 
-Those tests catch the mismatch — but only between the three files. Nothing
-checks that the image contains the bump, which is exactly how the miss above
-happened.
+### 4. deploy.sh — only for manifest changes
 
-### 1. Build and push the image
+`IMAGE_TAG=X.Y.Z ./deploy.sh sre-ai` when a release changes Deployment, NetworkPolicy, RBAC or PriorityClass manifests. It checks Secret `sre-ai-secrets`, applies `k8s/base/rbac.yaml` and `k8s/priorityclass.yaml`, checks RBAC (the `sre-ai` SA must **not** be able to patch deployments), warns about long transactions, runs `sre-ai-migrate`, applies `k8s/executor.yaml`, `k8s/base/deployment.yaml`, `k8s/worker.yaml`, `k8s/networkpolicy.yaml` with `BUILD_VERSION` substituted, and waits for all five rollouts.
 
-`--platform linux/amd64` is mandatory: the nodes are amd64, and a build on an
-ARM machine without the flag produces an image that will not start.
+It does **not** touch `postgres` / `redis`, `k8s/vmalertmanagerconfig.yaml`, `k8s/monitoring.yaml`, `k8s/postgres-backup.yaml`, `k8s/squad-dashboard.yaml` — those are applied separately.
+
+**StatefulSets: `kubectl patch`, never `kubectl apply`.** The live `postgres` and `redis` StatefulSets are pinned to `dev-4` (hostname affinity) where their local-path volumes are; git has only `env In [dev]`. An `apply` of `k8s/postgres.yaml` / `k8s/redis.yaml` would drop the pin. Example:
 
 ```bash
-export DOCKER_HOST="unix://$HOME/.rd/docker.sock"     # Rancher Desktop
-docker build --platform linux/amd64 \
-  -t docker.lastoasisgame.com/wo/sre-ai-copilot:1.0.0-rc.N .
-docker push docker.lastoasisgame.com/wo/sre-ai-copilot:1.0.0-rc.N
+kubectl -n sre-ai patch sts postgres --type=json -p \
+  '[{"op":"replace","path":"/spec/template/spec/containers/0/resources/limits/cpu","value":"<cpu>"}]'
 ```
 
-Before pushing, confirm the image contains what you expect:
+### 5. Manual build (TeamCity unavailable)
 
 ```bash
-docker run --rm --platform linux/amd64 -e LLM_BACKEND=claude_cli \
-  --entrypoint sh docker.lastoasisgame.com/wo/sre-ai-copilot:1.0.0-rc.N \
-  -c "ls alembic/versions/ | tail -3"
+docker buildx build --platform linux/amd64 \
+  --provenance=false --sbom=false \
+  -t docker.lastoasisgame.com/wo/sre-ai-copilot:X.Y.Z --push .
 ```
 
-### 2. Migrations — a separate Job, and ONLY with `lock_timeout`
+`--provenance=false --sbom=false` are mandatory: by default buildx attaches attestations and pushes a manifest index instead of a single image. Then run migrations and `set image` as TeamCity does (or `IMAGE_TAG=X.Y.Z ./deploy.sh sre-ai`), and step 3.
 
-`ALTER TABLE` needs ACCESS EXCLUSIVE. If the lock is held, the DDL queues up
-and **blocks everyone who arrives after it** — on 2026-08-08 seven
-`kg_services` readers hung this way and the application stalled for 6 minutes.
+### Migrations and locks
 
-Add to the Job manifest:
-
-```yaml
-        env:
-        - name: PGOPTIONS
-          value: "-c lock_timeout=15s"
-```
-
-No lock within 15 seconds — the Job fails, readers are unaffected, try again.
-Before running, check for long transactions:
+`ALTER TABLE` needs ACCESS EXCLUSIVE; a queued DDL blocks every reader that arrives after it (2026-08-08: the application stalled for 6 minutes). Hence `lock_timeout=15s` in the Job: no lock → the Job fails, readers are unaffected, retry. For `kg_service_health` and `kg_anomaly_observations` silence the writers **always** (1.0.9: no long transactions, but the stream of short queries still kept `ADD COLUMN` from getting the lock):
 
 ```bash
-kubectl -n sre-ai exec postgres-0 -- sh -c 'psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "
-SELECT (now()-xact_start)::text AS age, state,
-       left(regexp_replace(query,E'\''\\s+'\'','\'' '\'','\''g'\''),50)
-FROM pg_stat_activity WHERE datname=current_database() AND state<>'\''idle'\''
-ORDER BY xact_start LIMIT 5;"'
-```
-
-If transactions are older than a couple of minutes, silence the writers for
-the duration. For `kg_service_health` and `kg_anomaly_observations` silence them **always**, whatever
-`pg_stat_activity` says: the 1.0.9 lesson (2026-09-07) — no long transactions, yet `ADD COLUMN` could not take
-ACCESS EXCLUSIVE within 15 s because of the constant stream of short metrics_sync / detector queries; the Job hit
-BackoffLimit and the schema stayed as it was. After scale-to-0, `deploy.sh` restores the replicas itself when it
-applies the manifests.
-
-```bash
-kubectl -n sre-ai scale deploy copilot-worker copilot-beat --replicas=0
-# ... migrations ...
+kubectl -n sre-ai scale deploy copilot-worker copilot-worker-sync copilot-beat --replicas=0
+# ... migrations (TeamCity re-run or deploy.sh) ...
 kubectl -n sre-ai scale deploy copilot-worker --replicas=2
-kubectl -n sre-ai scale deploy copilot-beat --replicas=1
+kubectl -n sre-ai scale deploy copilot-worker-sync copilot-beat --replicas=1
 ```
 
-### 3. Roll out the application
+### Verify
 
 ```bash
-IMG=docker.lastoasisgame.com/wo/sre-ai-copilot:1.0.0-rc.N
-kubectl -n sre-ai set image deploy/sre-ai-api api=$IMG
-kubectl -n sre-ai set image deploy/copilot-worker worker=$IMG
-kubectl -n sre-ai set image deploy/copilot-beat beat=$IMG
-for d in sre-ai-api copilot-worker copilot-beat; do
-  kubectl -n sre-ai rollout status deploy/$d --timeout=300s
-done
-```
-
-### 4. Verify after rollout
-
-```bash
-# schema arrived
+kubectl -n sre-ai get deploy -o custom-columns='NAME:.metadata.name,READY:.status.readyReplicas,IMAGE:.spec.template.spec.containers[*].image'
+kubectl -n sre-ai get pods                                   # no restarts
 kubectl -n sre-ai exec postgres-0 -- sh -c \
   'psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -tAc "SELECT version_num FROM alembic_version"'
-
-# no restarts
-kubectl -n sre-ai get pods | grep -E "sre-ai-api|copilot"
-
-# queue is not growing
-kubectl -n sre-ai exec redis-0 -- redis-cli LLEN celery
+kubectl -n sre-ai exec redis-0 -- redis-cli LLEN celery      # queue is not growing
 ```
+
+`self_health.check_schema_version` fails when the database is behind the code.
+
+### Rollback
+
+Point the Deployments back at the previous image. Do **not** re-run TeamCity with the old `TAG`: it builds the current `master` and would overwrite the old tag in the registry.
+
+```bash
+OLD=docker.lastoasisgame.com/wo/sre-ai-copilot:<previous>
+for d in sre-ai-api:api copilot-worker:worker copilot-worker-sync:worker copilot-executor:executor copilot-beat:beat; do
+  kubectl -n sre-ai set image deploy/${d%%:*} ${d##*:}=$OLD
+done
+kubectl -n sre-ai set env deploy/sre-ai-api deploy/copilot-worker deploy/copilot-worker-sync \
+  deploy/copilot-executor deploy/copilot-beat BUILD_VERSION=<previous>
+```
+
+Migrations are not rolled back: a database ahead of the code is only a warning in `check_schema_version`. If a release must be turned off rather than rolled back, prefer its flag (see [Enabling new flags](#enabling-new-flags)).
 
 ---
 
@@ -1313,159 +1404,42 @@ done
 
 ---
 
-## CI runner is a single point of failure
+## CI runners
 
-All CI for this repository runs on **one** self-hosted runner
-(`jabbook-air-m3-sre-copilot`, a personal Mac). GitHub-hosted runners are not
-an option today: the account is locked for a billing issue and any job with
-`runs-on: ubuntu-latest` dies in ~3s with the annotation *"The job was not
-started because your account is locked due to a billing issue."* (verified
-2026-08-13).
+CI runs on ephemeral ARC runners in the cluster (label `sre-copilot-k8s`, namespace `sre-ai-ci`, `k8s/github-runner.yaml`): one pod per job. GitHub-hosted runners are not available on the account (billing lock), so a dead ARC controller or listener means CI silently queues forever. Runner and listener are pinned to dev nodes.
 
-Consequence: when that Mac sleeps, loses the LaunchAgent, or the runner
-process dies, **CI silently stops** — pushes get queued forever instead of
-failing. That is exactly how CI stayed dead for 27 days (2026-07-04 →
-2026-07-31) without a single alert.
+Until the move, CI lived on a single self-hosted laptop and was dead for 27 days (2026-07-04 → 2026-07-31) without a single alert.
 
-### The canary
-
-`scripts/ci_deadman.py`, deployed as the `ci-deadman` CronJob
-(`k8s/ci-deadman.yaml`), runs **in the cluster** — deliberately not as a
-workflow, because a workflow-based check dies together with what it watches.
-Hourly it verifies: runner online, no run queued longer than `QUEUE_MINUTES`,
-no green PR sitting longer than `STALE_PR_DAYS` (the dependabot deadlock), and
-the default branch not red. It posts to Discord only when something is wrong.
-
-Run it by hand (nothing is written anywhere with `DRY_RUN=1`):
+The canary `scripts/ci_deadman.py` runs as CronJob `ci-deadman` (`k8s/ci-deadman.yaml`), deliberately in the cluster and not as a workflow: it checks that a runner is online, nothing is queued longer than `QUEUE_MINUTES`, no green PR waits longer than `STALE_PR_DAYS`, and the default branch is not red; it posts only when something is wrong. Check whether it is suspended before relying on it (`kubectl -n sre-ai get cronjob ci-deadman`). Manual run, writes nothing:
 
 ```bash
 GITHUB_TOKEN=$(gh auth token) DRY_RUN=1 python3 scripts/ci_deadman.py
 ```
 
-### Runner is offline — recovery
+---
+
+## Releasing: migrations are part of the deploy (incident 2026-08-14)
+
+Image `rc.19` shipped code using a new column (`kg_services.owner_source`), but the migration was never applied — the release recipe did not mention migrations. `kg_topology_sync` failed on all 129 namespaces with `column "owner_source" does not exist` and wrote nothing. No alert caught it; the only symptom was a suspiciously fast tick. The data survived because the `edge_decay` deadman refused to delete ~17k edges on fetch errors.
+
+Today migrations are a step of the TeamCity build and of `deploy.sh`, before `set image`, on the new image (the migration files ship inside it). `self_health.check_schema_version` fails when the database is **behind** the code.
+
+### If a deploy went out without migrations
+
+Symptoms: syncs failing wholesale with `UndefinedColumn` / `UndefinedTable`, tick durations collapsing, `services=0 edges=0 errors=<number of namespaces>`. Run the Job — it is idempotent:
 
 ```bash
-# 1. Is it the runner or GitHub?
-gh api /repos/froggychips/sre-ai-copilot/actions/runners \
-  --jq '.runners[] | "\(.name) \(.status) busy=\(.busy)"'
-
-# 2. On the Mac: the runner is a LaunchAgent, not a shell session.
-launchctl list | grep -i actions.runner
-launchctl kickstart -k "gui/$(id -u)/actions.runner.froggychips-sre-ai-copilot.$(hostname -s)"
-
-# 3. Logs (the runner writes its own, GitHub shows nothing for a dead runner):
-tail -50 ~/actions-runner-sre-copilot/_diag/Runner_*.log
+IMG=docker.lastoasisgame.com/wo/sre-ai-copilot:X.Y.Z
+kubectl -n sre-ai delete job sre-ai-migrate --ignore-not-found
+sed -e "s|IMAGE_PLACEHOLDER|$IMG|g" -e "s|BUILD_VERSION_PLACEHOLDER|X.Y.Z|g" \
+  k8s/migrate-job.yaml | kubectl -n sre-ai apply -f -
+kubectl -n sre-ai wait --for=condition=complete job/sre-ai-migrate --timeout=300s
 ```
 
-Two known traps on this host, both already paid for once:
-* the LaunchAgent session has no Keychain access (`errSecInteractionNotAllowed
-  -25308`) — Docker credentials must come from a job-local `docker config`
-  without `credsStore`, which `ci.yml` already does;
-* `caffeinate` matters: a sleeping Mac is indistinguishable from a dead runner
-  from GitHub's side.
-
-### Rebuilding the runner on another machine
-
-The runner registration is per-repository and disposable — re-registering
-elsewhere is the fastest disaster recovery, and it needs no state from the old
-host:
-
-```bash
-mkdir actions-runner && cd actions-runner
-curl -o actions-runner-osx-arm64.tar.gz -L \
-  https://github.com/actions/runner/releases/latest/download/actions-runner-osx-arm64-<VER>.tar.gz
-tar xzf actions-runner-osx-arm64.tar.gz
-./config.sh --url https://github.com/froggychips/sre-ai-copilot \
-  --token "$(gh api -X POST /repos/froggychips/sre-ai-copilot/actions/runners/registration-token --jq .token)" \
-  --labels self-hosted,macOS,ARM64 --unattended
-./svc.sh install && ./svc.sh start
-```
-
-The workflows target the **labels** (`[self-hosted, macOS, ARM64]`), not the
-runner name, so a replacement host picks up jobs with no workflow change. The
-new host still needs: Docker (Rancher Desktop, socket in `~/.rd`), Homebrew
-Python 3.12, and the `~/.docker/cli-plugins` buildx plugin — see the comments
-in `.github/workflows/ci.yml`.
-
-### The real fix
-
-Unlocking billing (or moving the account to a paid plan) puts `ubuntu-latest`
-back on the table, at which point `Lint and Test` should move to GitHub-hosted
-and the Mac should keep only what genuinely needs macOS. Until then the single
-runner stays a known, monitored risk rather than an invisible one.
+Then check that `edge_decay` skipped rather than deleted; deleted edges rebuild on the next successful tick, node history does not.
 
 ---
 
-## Releasing: migrations are part of the deploy, not an afterthought
+## Backups and restore
 
-**Incident 2026-08-14.** Image `rc.19` shipped code referencing a new column
-(`kg_services.owner_source`), but the migration was never applied to prod —
-the release recipe simply did not mention migrations. `kg_topology_sync` then
-failed on **all 129 namespaces** with `column "owner_source" does not exist`
-and wrote zero nodes and zero edges per tick.
-
-Two things are worth remembering about how it was found and why it wasn't worse.
-
-It was **not** caught by an alert. The only visible symptom was a suspiciously
-fast tick — 40 seconds instead of minutes — noticed while looking at something
-else. Nothing in the monitoring said "schema is behind the code".
-
-Data survived by architecture, not by vigilance: `edge_decay`'s deadman saw the
-fetch errors and refused to delete anything (`edge_decay_deadman errors=234 —
-decay пропущен`). Without that guard it would have concluded the whole topology
-had vanished and dropped ~17k edges.
-
-### The order that actually works
-
-```bash
-SHA=<merged master sha>
-DST=docker.lastoasisgame.com/wo/sre-ai-copilot:<next-rc>
-
-# 1. mirror the image CI already built and signed
-docker pull --platform linux/amd64 ghcr.io/froggychips/sre-ai-copilot:$SHA
-docker tag  ghcr.io/froggychips/sre-ai-copilot:$SHA $DST
-docker push $DST
-
-# 2. MIGRATIONS FIRST — on the new image, before any pod runs the new code.
-#    PGOPTIONS=-c lock_timeout=15s is already baked into the Job manifest:
-#    ALTER TABLE takes ACCESS EXCLUSIVE, and a queued DDL blocks every reader
-#    that arrives after it (POSTMORTEM 2026-08-08 §3.2).
-kubectl -n sre-ai delete job sre-ai-migrate --ignore-not-found=true
-sed "s|IMAGE_PLACEHOLDER|$DST|" k8s/migrate-job.yaml | kubectl -n sre-ai apply -f -
-kubectl -n sre-ai wait --for=condition=complete job/sre-ai-migrate --timeout=300s
-kubectl -n sre-ai logs job/sre-ai-migrate | tail -5
-
-# 3. only then roll the deployments
-kubectl -n sre-ai set image deploy/sre-ai-api api=$DST
-kubectl -n sre-ai set image deploy/copilot-worker worker=$DST
-kubectl -n sre-ai set image deploy/copilot-beat beat=$DST
-kubectl -n sre-ai set env deploy/sre-ai-api deploy/copilot-worker deploy/copilot-beat \
-  BUILD_VERSION=<next-rc>
-```
-
-**Why migrations run on the new image:** the migration files themselves ship
-inside it. Running `alembic upgrade head` from the old image applies only the
-revisions the old image knows about — which is exactly nothing new.
-
-### Verifying afterwards
-
-```bash
-kubectl -n sre-ai exec deploy/copilot-worker -- python3 -c "
-import os, psycopg2
-c = psycopg2.connect(os.environ['DATABASE_URL']); cur = c.cursor()
-cur.execute('SELECT version_num FROM alembic_version'); print(cur.fetchone()[0])"
-```
-
-Compare it with the head revision the code expects. Since 2026-08-14 this is
-also checked automatically: `self_health.check_schema_version` compares
-`alembic_version` against the revision chain in `alembic/versions` and fails
-when the database is **behind** the code (a database ahead of the code is only
-a warning — that happens on image rollback and breaks nothing).
-
-### If a deploy already went out without migrations
-
-Symptoms: syncs failing wholesale with `UndefinedColumn` / `UndefinedTable`,
-tick durations collapsing, `services=0 edges=0 errors=<number of namespaces>`.
-Fix is the Job above — it is idempotent and safe to run at any time. Check
-afterwards that `edge_decay` skipped rather than deleted; if it did delete,
-edges rebuild on the next successful tick, but node history does not.
+See [DR.md](DR.md): CronJob `postgres-backup`, restore from S3 or the local copy, loss of node `dev-4`.

@@ -1,15 +1,12 @@
 # Semantic Contract
 
-This document describes the actual contract of the current implementation (v1.0.8) to synchronise the API, workers, and operations.
+This document describes the actual contract of the current implementation (written at v1.0.8; §1 and §4 re-checked at v1.0.33) to synchronise the API, workers, and operations. Note: the LLM pipeline (`process_incident`, sections 1, 7, 9) is disabled in production (`LLM_PIPELINE_ENABLED=false`); the production action path is the deterministic remediation bridge (`docs/REMEDIATION_PLAYBOOK_CONTRACT.md` §7).
 
 ## 1. Incident Lifecycle Contract
 
-`IncidentRecord.status`:
-- `PENDING` — incident accepted by the API, queued.
-- `COMPLETED` — pipeline completed successfully, results saved.
-- `FAILED` — error during analysis/generation.
+`IncidentRecord.status` — a value of `IncidentState` (`app/core/state_machine.py`): `OPEN` → `INVESTIGATING` → `FACTS_COLLECTED` → `HYPOTHESIS_GENERATED` → `FIX_PROPOSED` → `RESOLVED` / `TRIAGE_REQUIRED`; with human approval `FIX_PROPOSED` → `APPROVAL_PENDING` → `EXECUTING` → `RESOLVED`; `FAILED` — error during analysis/generation. Legacy values `PENDING` / `COMPLETED` are read as `OPEN` / `RESOLVED` (`_LEGACY_STATUS_ALIAS` in `app/workers/pipeline.py`). The remediation bridge creates its record directly in `APPROVAL_PENDING`.
 
-`analysis` JSON fields (set on `COMPLETED`):
+`analysis` JSON fields (set when the pipeline finishes):
 - `cause: str | null` — root cause string, or `null` when no hypothesis survived.
 - `triage_note: str | null` — populated when `cause` is null; describes the no-survivor reason.
 - `resolution_quality: "resolved" | "unresolved"` — quality gate result.
@@ -53,7 +50,7 @@ Every remediation operation must satisfy two layers:
    - system namespaces blocked by the validator
 2. **Runtime policy** (`K8sSecurityGuard`):
    - verb/resource allowlist
-   - namespace blocklist
+   - namespace lists from `app/security/namespaces.py`: forbidden (`kube-system`, `kube-public`, `kube-node-lease`, `chaos-mesh`, `mcp`), read-only (`prod`/`preprod`/`preupdate`/`production` and their `<env>-` prefixes), writes only in `^squad-\d+$` / `^squad-gd$`
    - deep body inspection (e.g. `privileged: true` is rejected)
 
 ## 5. FactStore Contract

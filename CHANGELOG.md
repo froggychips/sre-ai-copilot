@@ -5,6 +5,66 @@ All notable changes to this project are documented in this file.
 ## [Unreleased]
 
 ## [1.0.33] — 2026-11-01 — Python 3.13, логирование в каждом процессе, меньше WAL, снятие пометки дрейфа
+### Исправлено
+
+- **Логирование настраивается в каждом процессе** (#541). `app/logger.py`
+  никто не импортировал: structlog работал с умолчаниями (уровень DEBUG),
+  httpx — на INFO с полными URL запросов. Замер 01.11.2026: у
+  `copilot-worker-sync` 25,5 из 26,8 тыс. строк за сутки — debug
+  `kg.service_upserted`; `copilot-worker` записал в лог URL вебхука Discord
+  с токеном в пути и ещё ~15,6 тыс. URL запросов за сутки. Новый
+  `app/observability/logging_setup.py`: `configure_logging()` ставит уровень
+  structlog из `LOG_LEVEL` (по умолчанию INFO) и WARNING для
+  httpx/httpcore. Вызывается в `app/main.py` (API) и `app/workers/tasks.py`
+  (worker, worker-sync, executor, beat). Формат вывода не менялся (переход на
+  JSON — отдельное решение). `app/logger.py` удалён. Тест — в чистом
+  интерпретаторе через импорт точки входа.
+- **Снятие пометки дрейфа с узлов вернувшегося namespace** (#543).
+  `drift_cleanup` только ставил пометку (`synthetic=true` + `drift_reason`)
+  на узлы снесённого namespace и никогда её не снимал: стенд, пересозданный
+  под тем же именем, оставался синтетикой (топология передаёт
+  `synthetic=None` и флаг не трогает). Замер 01.11.2026: 6717 узлов в живых
+  namespace числились synthetic (health по ним не считался), 1214 — с
+  устаревшими drift-ключами. Теперь `_unmark_revived`: namespace есть в
+  `kubectl get ns` сейчас и active в `kg_namespaces` → drift-ключи
+  убираются, `synthetic` возвращается к значению до пометки. Пометка
+  сохраняет `drift_prev_synthetic` (у старых пометок его нет — `False`;
+  ingress, NATS subjects и узлы из алертов вернут `synthetic=True` своим
+  прогоном). Обратный ход идёт до проверки порога усадки и от неё не
+  зависит; `apply=False` только считает; в stats — `unmarked_services`.
+
+### Производительность
+
+- **Upsert'ы KG не переписывают неизменившиеся строки** (#542). Замер
+  01.11.2026 (`pg_stat_statements.wal_bytes`, 25 ч, 11 ГБ WAL): upsert рёбер
+  21%, сервисов 15%, деплоев 12%, UPDATE `metadata_json` 4% — всего 48%
+  WAL, почти всё ради одной метки времени. `upsert_service` обновляет
+  строку, только если что-то реально меняется или `updated_at` старше 30 мин
+  (`SERVICE_TOUCH_INTERVAL`); `upsert_edge` — если `last_seen_at` старше 3 ч
+  (`EDGE_TOUCH_INTERVAL`) или растёт `weight` (смена `discovered_by` поводом
+  не считается). `record_deployment` обновляет строку только при реальном
+  бэкфилле sha; `k8s_endpoints_sync` пишет `metadata` (`endpoints_checked_at`)
+  только при смене `endpoints_ready`. Окна чтения меток — от 24 ч до 30
+  дней, касание раз в 30 мин / 3 ч их не задевает.
+
+### Инфраструктура
+
+- **postgres и redis выселяются последними** (#541). Оба на local-path томе
+  одной ноды и не переезжают: выселенный под висит Pending, и copilot лежит
+  целиком; 01.11 нода подошла к eviction, а postgres был над requests.
+  PriorityClass `sre-ai-copilot-stateful` (`k8s/priorityclass.yaml`, 100000,
+  `preemptionPolicy: Never` — чужие поды ради них не вытесняются),
+  применяется `deploy.sh`. postgres `requests.memory` 1Gi → 2Gi (= limit).
+
+### Зависимости
+
+- **Python 3.11 → 3.13** (#540, вместо dependabot #515 на 3.15). Dockerfile —
+  `python:3.13-slim` по digest; `ruff.toml` target-version py313,
+  `mypy.ini` python_version 3.13; CI и раннер — `uv venv --python 3.13`;
+  бейдж README 3.13+. Тест `test_python_version_is_consistent_across_toolchain`
+  держит одну версию во всех местах. Предупреждения `datetime.utcnow()` на
+  3.12+ работу не ломают; перевод на aware-время — отдельно.
+
 ## [1.0.32] — 2026-10-31 — мост исполняется в Celery, включение по namespace
 ### Исправлено
 

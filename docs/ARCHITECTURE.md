@@ -1,60 +1,176 @@
 # SRE AI Copilot — Architecture
 
+State as of v1.0.33 (2026-11-01).
+
 ## 1. System Overview
 
-The application consists of: an HTTP API (FastAPI), background tasks (Celery), a data layer (PostgreSQL), external MCP servers (integrations), supporting infrastructure (Redis, Discord, Kubernetes), and a fact-anchored diagnostic engine that feeds a multi-hypothesis LLM pipeline.
+The application consists of: an HTTP API (FastAPI), Celery workers and a beat scheduler, PostgreSQL (the Knowledge Graph and incident records), Redis (Celery broker, dedup keys, beat heartbeats, self-health snapshot), Discord as the output channel, and Kubernetes as the observed system (and, through a separate executor, the narrowly acted-upon one).
+
+In production the alert path is **deterministic**: alerts are written to the KG, enriched from it with SQL and rules, and rendered as Discord cards. The fact-anchored multi-hypothesis LLM pipeline (§3, §4) is still in the code, but **no Alertmanager route points to it and it is switched off by `LLM_PIPELINE_ENABLED=false`** — `process_incident` returns `skipped` without calling a model.
+
+### 1.1 Production alert path
+
+```
+VMAlertmanager (k8s/vmalertmanagerconfig.yaml)
+ │
+ ├─ prod-*, preprod-*, and the root fallback (alerts without namespace:
+ │  nodes, control plane, monitoring/kube-system)
+ │    → POST /webhooks/alertmanager/enrich-and-forward      (max_alerts 50)
+ │        → KG write (kg_alerts, kg_incidents, populate_from_incident)
+ │        → deterministic enrichment (alert_enrichment, no LLM)   §3a
+ │        → decide_send (chronic / repeat / rollout suppression)
+ │        → Discord card in #infra-error
+ │        → wants_bridge? → enqueue `remediation_bridge` (Celery)  §2.3
+ │
+ ├─ squad-*, preupdate-*, any severity=info
+ │    → POST /webhooks/alertmanager/store                   (max_alerts 0)
+ │        → KG only — no Discord card (deliberate, not a gap)
+ │        → wants_bridge? → enqueue `remediation_bridge`
+ │
+ ├─ alertname=Watchdog, severity=none → blackhole
+ │
+ └─ (no route) POST /webhooks/alertmanager → full LLM pipeline   §3
+                (LLM_PIPELINE_ENABLED=false)
+
+External: squad-medic → POST /webhooks/remediation → kg_remediation_events  §2.4
+```
+
+The alert target (which k8s object the alert is about) is resolved by one label-priority chain in `app/services/alert_target.py`: an alert about an exporter itself lands on the exporter; otherwise `deployment`/`statefulset`/`daemonset` → `cronjob`/`job_name` → HPA/PDB → app alert → node → PVC → pod → container → `scrape_job`/`job=<ns>/<name>` → `service` → namespace. The outcome is stored in `kg_alerts.raw.target_kind` (`service` / `node` / `namespace` / `exporter` / `unresolved`).
+
+Card rules worth knowing: a repeat of a still-firing alert sent by Alertmanager on `repeat_interval` is suppressed (`SUPPRESS_REPEAT`, metric `alerts_suppressed_total{reason="repeat"}`, flag `ALERT_SUPPRESS_AM_REPEATS`), not posted as «RESURFACED»; a green «✅ resolved» card is posted only for critical episodes of at least `DISCORD_RESOLVED_NOTICE_MIN_MINUTES` (30). Alerts that fire continuously for more than `STUCK_ALERTS_MIN_DURATION_HOURS` (24) appear in the chronic digest instead.
 
 ## 2. Runtime Components
 
-- **API app (`app.main`)**: routing, auth dependency, metrics middleware, health/readiness endpoints.
-- **Webhook pipeline (`app.api.webhooks` + `app.workers.tasks`)**: receives AlertManager payloads, builds context, runs the agent pipeline.
-- **Copilot pipeline (`app.main:/copilot` + `app.celery_worker`)**: background conversational analysis with a confidence-threshold loop.
-- **DiagnosticsEngine (`app.diagnostics.engine`)**: rule-based evaluation producing a typed `FactStore`.
-- **FactStore (`app.diagnostics.facts`)**: canonical ground-truth about the incident; supports conflict detection and prompt serialization.
-- **MultiHypothesisAgent (`app.agents.multi_hypothesis`)**: fan-out to 4 perspectives (app/infra/deps/runtime) with precondition filtering.
-- **FactCriticAgent (`app.agents.fact_critic`)**: adversarial grounding — eliminates hypotheses that contradict observed facts.
-- **FixAgent (`app.agents.fix`)**: generates a structured `ExecutionIntent`; recurrence-aware and Jira-enriched.
-- **SimilarIncidentEngine (`app.core.intelligence.similar_incidents`)**: KG-based recurrence detection (7-day window).
-- **JiraClient (`app.context.jira_client`)**: Atlassian REST API enrichment for FixAgent context.
-- **Knowledge Graph (`app.knowledge_graph.*`)**: auto-populating directed graph in Postgres. Core tables: `kg_services`, `kg_service_edges`, `kg_deployments`, `kg_alerts`, `kg_pod_events`. Storage subgraph (PR #84): `kg_storage_volumes` (PVC/PV) + `kg_volume_edges` (heterogeneous). Jobs (PR #82): `kg_k8s_jobs` (Job/CronJob с `owner_service_id`). 10+ sync sources (env-vars, NATS env, DSN-from-secret-key, k8s events, k8s ingresses-as-host, **k8s Services + Ingresses (Wave 7-X)**, **NATS subjects from monorepo source (Wave 7-Z)**, **runtime PodEvent co-occurrence (Wave 7-Y)**, **k8s Jobs/CronJobs (PR #82)**, **PVC/PV storage (PR #84)**). Schema/quality contract — `app/knowledge_graph/contract.py` (KG_SCHEMA_VERSION=2.5); confidence scoring with multi-source provenance. Since 2.4 a node carries `node_kind` (`service` / `workload` / `ingress`): a k8s Service and its backing Deployment are **different nodes**, so the `serves_traffic` edge between them can exist at all (see below).
-- **Alert enrichment (`app.services.alert_enrichment`)**: deterministic KG-based enrichment for `/webhooks/alertmanager/enrich-and-forward` — runs without LLM, ~5 SQL queries, builds `EnrichedContext` (recent_deploys, upstream_alerts, outgoing_deps, pod_events, jira_issues, primary_hypothesis, why_this_matters).
-- **Data layer (`app.database`, `app.repository`)**: SQLAlchemy models and CRUD operations.
-- **Integration layer (`app.services.mcp_client`)**: MCP client for k8s, TeamCity, and other external tools.
-- **Safety services**: approval manager, K8s guard, execution DSL.
+### 2.1 Processes (namespace `sre-ai`, manifests in `k8s/`)
 
-### Beat tasks (Celery, periodic)
-
-| Task | Schedule | Purpose |
+| Component | Kind | Role |
 |---|---|---|
-| `kg_topology_sync` | hourly @ :00 | k8s deployments → `kg_services` + edges (calls/uses_nats/uses_db) |
-| `tc_deploys_to_kg` | every 15 min | TC builds → `kg_deployments` (multi-project, SUCCESS+FAILURE) |
-| `k8s_pod_events_sync` | every 10 min | k8s Warning events → `kg_pod_events` |
-| `kg_ingress_sync` | hourly @ :37 | k8s Ingresses → external entrypoint edges |
-| `kg_alerts_resolve_sync` | every 15 min | refresh `kg_alerts.resolved_at` from AM API |
-| `kg_drift_cleanup` | hourly @ :17 | services from missing namespaces → `synthetic=true` |
-| `daily_stats_digest` | daily | KG-summary digest to Discord #stats |
-| `chronic_alerts_digest` | every 6h | chronic-suppressed alerts visibility digest |
-| `kg_metrics_sync` | every 5 min | VictoriaMetrics PromQL → `kg_service_health` (cpu_pct, mem_pct, restarts_rate, http_5xx_rate, p95_latency_ms — the last two are still always 0: app `/metrics` is behind JWT, pending WO-12483) |
-| `kg_cluster_health_sync` | every 5 min | k8s node-level snapshot → `kg_cluster_observations` |
-| `kg_ingress_observations_sync` | every ~10 min | nginx-ingress PromQL → `kg_ingress_observations` (per-host/path p95/p99/rps/4xx/5xx; live since 2026-06-10 — ingress metrics enabled cluster-wide) |
-| `kg_anomaly_detect` | every 5 min | rolling robust-z scan → `kg_anomaly_observations` |
-| `kg_signal_aggregates` | every 10 min | 24h roll-up of anomalies/alerts/deploys/pod_events → `kg_signal_aggregates` |
-| `kg_seq_logs_sync` | every 10 min | Seq REST API → `kg_log_observations` (per service × level) |
-| `kg_deploy_correlator` | every 15 min | recent incidents × deploys → multi-factor confidence + verdict |
-| `team_digest` | daily @ 09:00 UTC | per-team fragile services digest |
-| `kg_self_health_check` | every 30 min | 6 canaries against KG data quality |
-| `kg_stuck_alerts_check` | hourly @ :11 | alerts firing >24h без resolved_at → escalation digest |
-| `kg_topology_resources_sync` | every 15 min | **Wave 7-X**: k8s Service+Ingress declarative → edges `serves_traffic` + `routes_to` |
-| `kg_runtime_correlation_sync` | every 30 min | **Wave 7-Y**: pod_event co-occurrence (7d window) подтверждает existing edges |
-| `kg_nats_subjects_sync` | every 6h @ :43 | **Wave 7-Z**: parse C# monorepo → subject nodes + `uses_nats` edges с direction (off by default) |
-| `kg_jobs_sync` | every 15 min | **Wave 8-A (PR #82)**: k8s Job/CronJob → `kg_k8s_jobs` + `runs_as_job` linkage (через `owner_service_id` metadata column) |
-| `kg_storage_sync` | every 30 min | **Wave 8-B (PR #84)**: PVC/PV + `uses_volume` / `bound_to` edges в `kg_volume_edges` (heterogeneous Service↔PVC↔PV graph) |
-| `kg_deploy_watch` | every 5 min @ :03,:08… | **v1.0.4/1.0.5**: rollouts seen by the cluster — image or `spec.template` hash change (not `metadata.generation`, which HPA bumps) → exact `kg_deployments` rows (`namespace_scope=false`, `attribution=k8s_rollout`) |
-| `kg_health_retention` | daily | **v1.0.4**: batched purge of `kg_service_health`, anomaly / signal / ingress / log / cluster observations older than the retention window |
-| `kg_incidents_lifecycle` | every 5 min @ :04,:09… | **v1.0.6**: closes `kg_incidents` whose alerts are all resolved (`all_alerts_resolved`), ages out incidents silent for 7 days (`aged_out`) |
-| `remediation_verify` (not beat — `apply_async(countdown)`) | +5 min, +15 min after apply | **v1.0.7**: re-snapshots the target and assesses the outcome (`verified` / `failed` / `pending` / `unknown`) |
+| `sre-ai-api` | Deployment, 2 replicas | FastAPI on :8000 (webhooks, `/discord/interactions`, `/kg/*`, `/copilot`, `/healthz`, `/readyz`); Prometheus metrics on :8001 |
+| `copilot-worker` | Deployment, 2 × `--concurrency=2`, `-Q celery` | incident pipeline, `remediation_bridge`, `remediation_verify`, light beat tasks |
+| `copilot-worker-sync` | Deployment, 1 × `--concurrency=2`, `-Q sync` | heavy KG syncs (since 1.0.28) |
+| `copilot-executor` | Deployment, 1 × `--concurrency=1`, `-Q executor` | the only process with cluster write access: ServiceAccount `sre-ai-executor`; runs `executor_apply` / `executor_dry_run` |
+| `copilot-beat` | Deployment, always 1 replica | Celery beat |
+| `postgres` | StatefulSet (`postgres:15-alpine`, local-path PVC) | KG + incidents (`sre_copilot` DB) |
+| `redis` | StatefulSet (local-path PVC) | broker, dedup, heartbeats, snapshots |
+| `postgres-backup` | CronJob, 02:00 UTC | §2.6 |
+| `squad-dashboard`, `ci-deadman` | CronJobs | squad dashboard; CI runner watchdog |
 
-## 3. Data Flow (Webhook Incident Pipeline)
+`postgres` and `redis` carry PriorityClass `sre-ai-copilot-stateful` (`k8s/priorityclass.yaml`, value 100000, `preemptionPolicy: Never`): their volumes are local-path and cannot move to another node, so they are evicted last.
+
+Deploy: the image is built by CI and rolled out with `kubectl set image` on the five Deployments (plus `BUILD_VERSION` env, which the card footer reads); `deploy.sh` applies `k8s/` only when Deployment/NetworkPolicy/RBAC/PriorityClass manifests change. `deploy.sh` does not apply the `postgres`/`redis` StatefulSets — those are changed with `kubectl patch`. The Helm chart was removed in 1.0.28. Details — `docs/RUNBOOK.md`.
+
+### 2.2 Celery queues and the beat schedule
+
+| Queue | Consumer | What goes there |
+|---|---|---|
+| `celery` (default, `task_default_queue`) | `copilot-worker` | `process_incident`, `generate_reply`, `remediation_bridge`, `remediation_verify`, light beat tasks |
+| `sync` (`SYNC_QUEUE_NAME`) | `copilot-worker-sync` | `SYNC_QUEUE_TASKS` routed by `task_routes`: `kg_topology_sync`, `tc_deploys_to_kg`, `kg_storage_sync`, `kg_metrics_sync`, `kg_endpoints_sync`, `kg_signal_aggregates_compute`, `kg_health_retention`, `kg_topology_resources_sync`, `kg_anomaly_detection_task`, `kg_runtime_correlation_sync`, `kg_nats_subjects_sync` |
+| `executor` (`EXECUTOR_QUEUE_NAME`) | `copilot-executor` | `executor_apply`, `executor_dry_run` (when `EXECUTOR_DISPATCH=queue`, as in the manifests) |
+
+Every beat task holds a `single_instance` lease, so a slow run is not overlapped by the next tick. Queue lengths are exported as `celery_queue_length{queue}` (see `docs/METRICS.md` §7).
+
+Beat schedule (`app/workers/tasks.py`, `beat_schedule`, 36 entries), grouped:
+
+| Group | Tasks (schedule) |
+|---|---|
+| Topology and inventory | `kg_topology_sync` (hourly :00), `kg_topology_resources_sync` (15 min), `kg_ingress_sync` (hourly :37), `kg_endpoints_sync` (15 min), `kg_jobs_sync` (15 min), `kg_storage_sync` (30 min), `kg_nodes_sync` (30 min), `kg_namespace_lifecycle` (10 min), `kg_namespace_owner_sync` (hourly), `kg_db_edge_rehome` (hourly), `kg_drift_cleanup` (hourly :17), `kg_ownership_backfill` (6 h), `kg_nats_subjects_sync` (6 h, off by default) |
+| Events and deploys | `tc_deploys_to_kg` (15 min), `kg_deploy_watch` (5 min), `k8s_pod_events_sync` (10 min), `kg_alerts_resolve_sync` (15 min), `kg_incidents_lifecycle` (5 min), `kg_statics_versions_sync` (5 min) |
+| Metrics and signals | `kg_metrics_sync` (10 min), `kg_cluster_health_sync` (5 min), `kg_ingress_observations_sync` (10 min), `kg_seq_logs_sync` (10 min), `kg_anomaly_detection_task` (10 min), `kg_signal_aggregates_compute` (hourly :23), `kg_runtime_correlation_sync` (30 min), `kg_health_recompute` (20 min), `kg_external_probe` (every minute) |
+| Digests and reports | `daily_stats_digest` (daily, `STATS_DIGEST_HOUR_UTC`), `team_daily_digest` (daily, `TEAM_DIGEST_HOUR_UTC`), `chronic_alerts_digest` (6 h), `weekly_reconciliation` (Mon 06:00 UTC) |
+| Supervision and housekeeping | `kg_self_health_check` (30 min), `kg_stuck_alerts_check` (hourly :11), `kg_health_retention` (daily 03:40 UTC), `discord_dedup_purge` (30 min) |
+
+Not on beat: `remediation_verify` (`apply_async(countdown)` at +5 and +15 min after an apply, §3f), `remediation_bridge` (enqueued by the API), `process_incident` / `generate_reply`, executor tasks.
+
+### 2.3 Deterministic remediation bridge
+
+`app/remediation/` (bridge since 1.0.31, executed in Celery since 1.0.32). It lets the production alert path reach an action without the LLM pipeline.
+
+```
+API (/enrich-and-forward or /store)
+  → wants_bridge(labels): flag + alertname present in the playbook registry
+  → namespace_allowed: REMEDIATION_BRIDGE_NAMESPACES (prefixes; empty = all)
+  → enqueue dedup: Redis SET NX EX on (alertname, namespace, pod/workload),
+    REMEDIATION_BRIDGE_ENQUEUE_DEDUP_SECONDS (600) + dedup inside the batch;
+    Redis unavailable → not enqueued (fail-closed)
+  → apply_async `remediation_bridge` (queue celery, soft/hard limit 120/180 s)
+
+Worker: remediation_bridge
+  → rule facts from enrich_alert + pod state from K8sFacts
+  → match_playbooks (app/remediation/registry/*.yaml)
+  → intent built by the server from the playbook's plan.steps
+  → match snapshot + bind_server_params → gate (policy)
+     approve → target snapshot (uid), server dry-run,
+               IncidentRecord(APPROVAL_PENDING) + kg_remediation_decisions,
+               card with Apply / Decline buttons in #infra-error (bot)
+     block   → no buttons; "playbook X: blocked by policy" is PATCHed into
+               the already-sent alert card (prod / preprod / system)
+  → proposal dedup: (playbook, target uid, incarnation) for 6 h
+    (REMEDIATION_BRIDGE_DEDUP_SECONDS)
+```
+
+- Code: `bridge.py` (worker side), `bridge_dispatch.py` (cheap API-side enqueue), task `remediation_bridge` in `app/workers/tasks.py`. The 1.0.31 version ran the bridge inside the API event loop and took the API down (incident 2026-10-31); the API now only enqueues.
+- The bridge only takes executable playbooks matched by alertname (`_candidate_alertnames()` in `bridge.py`). Two qualify: `restart_crashloop_deployment` (`KubePodCrashLooping` / `PodCrashLooping`; excludes OOM, a fresh deploy and signal exits — exit codes 132/134/135/136/138/139) and `scale_out_cpu_throttled_deployment` (`CPUThrottlingHigh`; approve only on dev/squad tiers). **Known gap (1.0.33):** the bridge renders the plan with `namespace` and the target name only, while the scale-out template also needs `{replicas}` — rendering fails with `PlanRenderError`, so today only the crashloop restart produces a card. `cleanup_stale_failed_job` matches by `classification` only, so the bridge does not take it.
+- Buttons appear only with `EXECUTOR_ENABLED` and `EXECUTOR_APPROVAL_ENABLED`. Squad alerts still do not go to the channel; the only exception is a proposal card with policy `approve`.
+- Flags: `REMEDIATION_BRIDGE_ENABLED`, `REMEDIATION_BRIDGE_NAMESPACES`, `EXECUTOR_ENABLED`, `EXECUTOR_APPROVAL_ENABLED` (all default off in `app/config.py`; in production they are set in Secret `sre-ai-secrets`, not in the `k8s/` manifests, and are on). New flags are enabled on one namespace under load first.
+
+Button click path:
+
+```
+Discord → the bot application's Interactions Endpoint (ai-reviewer, a separate
+          service in ns ai-reviewer-net)
+  → relays approve:/decline: → POST /discord/interactions (sre-ai-api :8000)
+     (NetworkPolicy admits ai-reviewer-net → API)
+  → Ed25519 signature check with DISCORD_PUBLIC_KEY (in the copilot)
+  → allowlist DISCORD_APPROVERS_USER_IDS (fail-closed; role allowlist exists
+    in code but is not configured in production)
+  → executor_apply (queue executor, copilot-executor, SA sre-ai-executor)
+  → remediation_verify at +5 / +15 min → result appended to the same card
+```
+
+The relay returns the copilot's response body to Discord unchanged.
+
+### 2.4 External remediation events (squad-medic)
+
+`POST /webhooks/remediation` accepts run reports from an external executor — the squad-medic CronJob, which treats squad stands every 15 minutes. Auth is HMAC-SHA256 over `timestamp.body` with a mandatory timestamp and anti-replay (`REMEDIATION_WEBHOOK_SECRET`, fail-closed). A repeat of `(actor, run_id, namespace)` is idempotent. Events land in `kg_remediation_events`, are linked to the incident open at that moment on any namespace of the stand, and appear in the incident timeline as `remediation.external`. The `fixed` field means «the stand was healthy after treatment».
+
+### 2.5 Supervision
+
+- **Self-health** (`kg_self_health_check`, every 30 min): 15 checks over KG data and sources (§3c), snapshot in Redis `stats:self_health:last`, exported as metrics by the API and alerted on by `VMRule sre-ai-copilot` (`docs/METRICS.md` §7).
+- **Weekly reconciliation** (`weekly_reconciliation`, `app/services/weekly_reconciliation.py`, Mon 06:00 UTC, #stats, `WEEKLY_RECONCILIATION_ENABLED`, default on): compares the copilot against the outside world — alert coverage (`ALERTS` in VictoriaMetrics vs `kg_alerts` for 7 days), table growth (top-5 by size vs last week), backup age (`kube_cronjob_status_last_successful_time`), share of alerts without attribution, confirmed fixes (verified executor attempts + medic `fixed`). An unavailable source reports «not measured», not zero.
+- **Digests**: `daily_stats_digest`, `team_daily_digest`, `chronic_alerts_digest` (every 6 h, `CHRONIC_DIGEST_ENABLED`; includes alerts firing continuously longer than 24 h).
+
+### 2.6 Data lifecycle
+
+- **Retention** (`app/knowledge_graph/health_retention.py`, task `kg_health_retention`, daily 03:40 UTC, batched deletes). Samples (`RETENTION_TARGETS`, floor `MIN_RETENTION_DAYS`=7): `kg_service_health` (`KG_HEALTH_RETENTION_DAYS`, 30), `kg_anomaly_observations`, `kg_signal_aggregates`, `kg_ingress_observations`, `kg_log_observations` — 30 days; `kg_cluster_observations` — 90. Events (`EVENT_RETENTION_TARGETS`, floor `MIN_EVENT_RETENTION_DAYS`=90): `kg_deployments` 180 days by `started_at`, `kg_alerts` 180 and `kg_incidents` 365 by `resolved_at` (open rows are never deleted), `kg_pod_events` 90 by `last_seen`, `kg_remediation_events` 365.
+- **Write volume**: KG upserts skip unchanged rows (`SERVICE_TOUCH_INTERVAL` 30 min, `EDGE_TOUCH_INTERVAL` 3 h in `populator.py`); `k8s_endpoints_sync` writes metadata only when `endpoints_ready` changes.
+- **Backup** (`k8s/postgres-backup.yaml`, CronJob 02:00 UTC): `pg_dump` (custom format, gzip) onto PVC `postgres-backup-data` on a different node than the database, keeping the last `BACKUP_KEEP` (7) dumps, then `aws s3 cp` to the bucket from Secret `postgres-backup-s3` (upload is skipped if the secret is absent). Alerts: `CopilotPostgresBackupFailed` / `CopilotPostgresBackupMissing`.
+
+### 2.7 Logging
+
+`app/observability/logging_setup.py` `configure_logging()` is called in `app/main.py` (API) and `app/workers/tasks.py` (every Celery process: worker, worker-sync, executor, beat). Level from `LOG_LEVEL` (default INFO); `httpx`/`httpcore` are raised to WARNING because they log full URLs, including tokens in webhook paths. Output is the default structlog console renderer, not JSON. Celery does not hijack stdout (`worker_redirect_stdouts=False`); uvicorn access-log lines for `/healthz` and `/readyz` with status < 500 are dropped by `app/observability/access_log.py`. The audit log (`app/services/audit_logger.py`) writes JSON lines to stdout.
+
+### 2.8 Modules
+
+- **API app (`app.main`)**: routing, auth dependency, metrics middleware, health/readiness endpoints.
+- **Webhooks (`app.api.webhooks`)**: the four endpoints of §1.1; `/webhooks/alertmanager` dispatches `process_incident`, which is gated by `LLM_PIPELINE_ENABLED`.
+- **Copilot pipeline (`app.main:/copilot` + `app.celery_worker`)**: background conversational analysis with a confidence-threshold loop (`generate_reply`, same Celery app).
+- **DiagnosticsEngine (`app.diagnostics.engine`)**: rule-based evaluation producing a typed `FactStore`. Used by both the LLM pipeline and the deterministic path.
+- **FactStore (`app.diagnostics.facts`)**: canonical ground-truth about the incident; supports conflict detection and prompt serialization.
+- **MultiHypothesisAgent (`app.agents.multi_hypothesis`)**: fan-out to 4 perspectives (app/infra/deps/runtime) with precondition filtering. *LLM pipeline only.*
+- **FactCriticAgent (`app.agents.fact_critic`)**: adversarial grounding — eliminates hypotheses that contradict observed facts. *LLM pipeline only.*
+- **FixAgent (`app.agents.fix`)**: generates a structured `ExecutionIntent`; recurrence-aware and Jira-enriched. *LLM pipeline only.*
+- **SimilarIncidentEngine (`app.core.intelligence.similar_incidents`)**: KG-based recurrence detection (7-day window).
+- **JiraClient (`app.context.jira_client`)**: Atlassian REST API enrichment.
+- **Knowledge Graph (`app.knowledge_graph.*`)**: auto-populating directed graph in Postgres. Core tables: `kg_services`, `kg_service_edges`, `kg_deployments`, `kg_alerts`, `kg_incidents`, `kg_pod_events`, `kg_namespaces`; storage `kg_storage_volumes` + `kg_volume_edges`; jobs `kg_k8s_jobs` + `kg_k8s_job_runs`; nodes and traffic entrypoints `kg_nodes` + `kg_entrypoints`; remediation `kg_remediation_decisions`, `kg_remediation_attempts`, `kg_remediation_events`; time series (§3b). Schema/quality contract — `app/knowledge_graph/contract.py` (`KG_SCHEMA_VERSION` = 2.9, history in `docs/KG_SCHEMA_CONTRACT.md`). A node carries `node_kind` (`service` / `workload` / `ingress`): a k8s Service and its backing Deployment are **different nodes**, so the `serves_traffic` edge between them can exist.
+- **Alert enrichment (`app.services.alert_enrichment`)**: deterministic KG-based enrichment for `/webhooks/alertmanager/enrich-and-forward` — runs without LLM, builds `EnrichedContext` (recent_deploys, upstream_alerts, outgoing_deps, pod_events, jira_issues, primary_hypothesis, why_this_matters).
+- **Remediation (`app.remediation`)**: playbook registry, matcher, binding, policy gate, attempts, verification, the deterministic bridge (§2.3).
+- **Data layer (`app.database`, `app.repository`, `app.models`)**: SQLAlchemy models and CRUD operations.
+- **Integration layer (`app.services.mcp_client`)**: MCP client for k8s, TeamCity, and other external tools.
+- **Safety services**: approval manager, K8s guard, execution DSL, executor gate (`app/remediation/registry/_executor_apply_gate.yaml`).
+
+## 3. Data Flow (LLM Incident Pipeline — not routed in production)
+
+> **Status:** no Alertmanager receiver points to `/webhooks/alertmanager`, and `process_incident` returns `skipped` while `LLM_PIPELINE_ENABLED=false` (the default and the production value). Enabling it also requires a finite `LLM_DAILY_BUDGET_USD` (config validator). The description below is the code path, kept for reference.
 
 ```
 AlertManager webhook
@@ -93,7 +209,7 @@ AlertManager webhook
 
 ## 3a. KG-only Enrichment Flow (without LLM)
 
-A parallel webhook path provides deterministic alert enrichment without LLM. Used as the primary Discord output channel; the full LLM pipeline above is gated behind `LLM_PIPELINE_ENABLED=False` by default.
+The production path (§1.1): deterministic alert enrichment without LLM, the only Discord output channel for alerts. `/webhooks/alertmanager/store` shares the KG write (and the remediation-bridge enqueue) but sends no card.
 
 ```
 AlertManager webhook
@@ -117,6 +233,7 @@ AlertManager webhook
         → severity-aware embed (muted render — grey + 🔇 — when a noise flag is set)
         → confidence badges (●●●/●●○/●○○) with provenance
         → clickable TC build links + deployer name
+     → wants_bridge? → enqueue remediation_bridge (§2.3)
 ```
 
 Latency budget: <500ms p95 synchronous in HTTP handler. No LLM tokens. Total cost: 0 per alert.
@@ -147,10 +264,10 @@ Beyond the discrete event tables (deployments / alerts / pod_events), the KG als
 
 | Table | Source | Granularity |
 |---|---|---|
-| `kg_service_health` | VictoriaMetrics PromQL via `metrics_sync.py` | 5-min, per service |
+| `kg_service_health` | VictoriaMetrics PromQL via `metrics_sync.py` | 10-min, per service |
 | `kg_cluster_observations` | k8s node API via `cluster_health_sync.py` | 5-min, per node |
 | `kg_ingress_observations` | nginx-ingress PromQL via `ingress_observations_sync.py` | ~10-min, per host/path |
-| `kg_signal_aggregates` | 24-h roll-up via `signal_aggregates.py` | hourly refresh, per service |
+| `kg_signal_aggregates` | 24-h roll-up via `signal_aggregates.py` | hourly refresh (:23), per service |
 
 Every PromQL fetch is wrapped in a Postgres `SAVEPOINT` per row insert; an `IntegrityError` on the unique key (e.g. duplicate `(service_id, ts)`) rolls back to the savepoint and continues. This makes the sync naturally idempotent on overlapping windows.
 
@@ -172,7 +289,7 @@ Remaining honest limitation: per-service `http_5xx_rate` and `p95_latency_ms` in
 
 ### Deploy ↔ Incident correlator (Wave 2 + Wave 6 update)
 
-`app/rca/deploy_correlator.py` is invoked inline by `IncidentPipeline._enrich_deploy_correlation` for every incident that reaches enrichment.
+`app/rca/deploy_correlator.py` is invoked inline by `IncidentPipeline._enrich_deploy_correlation` for every incident that reaches enrichment. This is part of the LLM pipeline (`app/workers/pipeline.py`), so it does not run in production while `LLM_PIPELINE_ENABLED=false`.
 
 - **Window:** `[incident − 2h, incident]`. Every deployment of the affected service inside the window is a candidate.
 - **Confidence formula.** Multi-factor score, each component clamped to `[0, 1]`:
@@ -198,7 +315,7 @@ Remaining honest limitation: per-service `http_5xx_rate` and `p95_latency_ms` in
 
 ### Daily team digest (Wave 2)
 
-`app/services/team_digest.py` runs daily at 09:00 UTC and produces a per-team Discord embed with:
+`app/services/team_digest.py` (task `team_daily_digest`) runs daily at `TEAM_DIGEST_HOUR_UTC` and produces a per-team Discord embed with:
 
 - Fragile top-5 services by `health_score` (the lowest scores)
 - Deploy success-rate over the last 24h
@@ -245,8 +362,8 @@ The redactor is idempotent: running it twice produces the same output.
 
 The Discord interactions endpoint (`app/api/discord_interactions.py`) now gates Approve / Decline button presses:
 
-- `DISCORD_APPROVERS_USER_IDS` — comma-separated allowlist of Discord user IDs
-- `DISCORD_APPROVERS_ROLE_IDS` — comma-separated allowlist of Discord role IDs (the interaction member must hold at least one)
+- `DISCORD_APPROVERS_USER_IDS` — comma-separated allowlist of Discord user IDs (the only list configured in production)
+- `DISCORD_APPROVERS_ROLE_IDS` — comma-separated allowlist of Discord role IDs (the interaction member must hold at least one); supported, not used in production
 - `DISCORD_APPROVAL_RATE_LIMIT_PER_HOUR` — per-user quota, default 5
 
 Semantics:
@@ -259,16 +376,18 @@ Semantics:
 
 `app/knowledge_graph/self_health.py` is a "monitoring of the monitoring" beat task, triggered after the Wave 5 mem_pct silent-failure to make sure that class of regression is detected automatically.
 
-Runs every 30 minutes. Six checks, each returning `ok` / `warn` / `fail`:
+Runs every 30 minutes (`kg_self_health_check`). Fifteen checks (`_ALL_CHECKS`), each returning `ok` / `warn` / `fail`; a source switched off by configuration is reported as `disabled` and does not raise the overall status. The original six:
 
 1. **`materialization_zero_rate`** — % of rows in `kg_service_health` where a metric is 0 or NULL over 24h. Allowlist for known-zero metrics (`http_5xx_rate`, `p95_latency_ms` while app `/metrics` stays behind JWT — WO-12483).
 2. **`sync_lag`** — `max(ts)` per beat task vs expected interval; >2× → warn, >5× → fail.
 3. **`anomaly_signal_health`** — count of `kg_anomaly_observations` over 24h. 0 → warn (flat baseline or detector broken). >500 → warn (threshold too loose, overload).
-4. **`alerts_resolve_freshness`** — count of `kg_alerts` with `fired_at < 7d ago` and `resolved_at IS NULL`. >20 → warn.
+4. **`alerts_resolve_freshness`** — open `kg_alerts` whose `coalesce(last_notified_at, fired_at)` is older than 7 days. >20 → warn. Long-living alerts that Alertmanager still sends are listed separately as `long_firing_alerts`.
 5. **`pod_events_link_rate`** — % of `kg_pod_events` over 24h with `service_id NOT NULL`. <80% warn, <50% fail (StatefulSet resolver regression).
 6. **`edges_freshness`** — % of `kg_service_edges` with `last_seen_at < 24h` or `NULL`. >30% stale → warn (kg_topology_sync regression).
 
-Output: audit-log line per run; on any `fail`/`warn`, a single Discord embed is posted to `DISCORD_WEBHOOK_SELF_HEALTH_URL` — kept separate from `#infra-error` to avoid drowning operational alerts. A 6-hour dedup window prevents the same canary fail from spamming the channel.
+Added later: `digest_delivery`, `edge_kind_freshness`, `node_freshness`, `source_coverage` (per-source `SourceStatus`, including `cleanup_blocked`), `silent_gaps`, `deploy_stream_ingestion`, `graph_integrity` (phantom DB duplicates, `serves_traffic` self-loops, dangling edges), `orphan_namespaces`, `schema_version`.
+
+Output: audit-log line per run; the snapshot is written to Redis `stats:self_health:last` and exported as metrics (§3f, `docs/METRICS.md` §7); on any `fail`/`warn`, a single Discord embed is posted to `DISCORD_WEBHOOK_SELF_HEALTH_URL` — kept separate from `#infra-error` to avoid drowning operational alerts. A 6-hour dedup window prevents the same canary fail from spamming the channel.
 
 ## 3d. Topology Expansion (Wave 7)
 
@@ -454,9 +573,11 @@ primary с fallback на legacy `_classify_stale` (старая инсталля
 
 `app/knowledge_graph/contract.py` — единственный источник истины:
 
-- `KG_SCHEMA_VERSION = "2.5"` (Wave 7 → 2.1; PR #82/#84/#86 → 2.2; orphan на
+- `KG_SCHEMA_VERSION = "2.9"` (Wave 7 → 2.1; PR #82/#84/#86 → 2.2; orphan на
   app-scope → 2.3; `node_kind` → 2.4; orphan перестал считать `serves_traffic`
-  связностью → 2.5). История и мотивация каждого шага — `docs/KG_SCHEMA_CONTRACT.md` §1.
+  связностью → 2.5; `owner_source` → 2.6; `stale_class = gone` → 2.8;
+  владелец namespace `kg_namespaces.owner_*` → 2.9). История и мотивация
+  каждого шага — `docs/KG_SCHEMA_CONTRACT.md` §1.
 - `EDGE_KINDS` — реестр всех edge kinds + spec (semantic / src_kinds /
   dst_kinds / source / status / table). Поле `table` различает где
   edge живёт: `kg_service_edges` / `kg_volume_edges` / `fk_only` (через
@@ -574,22 +695,25 @@ If a match is found, `recurrence=True` is set in the pipeline output. `FixAgent`
 
 ## 7. Reliability & Observability
 
-- Celery retries are configured on critical tasks.
+- Celery retries are configured on critical tasks; every beat task holds a `single_instance` lease; heavy syncs run on their own queue (§2.2).
 - `/readyz` checks PostgreSQL availability with `SELECT 1`.
-- Prometheus latency metrics are collected by the request middleware.
-- OpenTelemetry tracing is initialized at startup (exports to Tempo if available).
-- Structured audit log via `structlog` (stdout for production, file for local dev).
+- Prometheus metrics: API on :8001 (request latency, webhook counters, self-health and queue-length collectors), workers on :8001 in multiprocess mode (`app/observability/worker_metrics.py`); scraped by `VMPodScrape sre-ai-copilot`, alerted on by `VMRule sre-ai-copilot` (`k8s/monitoring.yaml`). Inventory — `docs/METRICS.md` §7.
+- OpenTelemetry tracing is initialized at startup when `OTLP_EXPORTER_ENDPOINT` is set.
+- Logging — §2.7; audit log — JSON lines to stdout (a file only if `AUDIT_LOG_PATH` is set).
+- Self-health, weekly reconciliation, retention, backup — §2.5–§2.6.
 
 ## 8. Security
 
 - JWT-based user dependency for `/copilot`.
-- `ALERTMANAGER_WEBHOOK_SECRET` HMAC validation for webhook endpoints.
+- `ALERTMANAGER_WEBHOOK_SECRET` HMAC validation for Alertmanager webhook endpoints; `REMEDIATION_WEBHOOK_SECRET` (HMAC over `timestamp.body`, anti-replay) for `/webhooks/remediation`.
+- Discord interactions: Ed25519 signature check with `DISCORD_PUBLIC_KEY`; clicks arrive via the ai-reviewer relay, admitted by NetworkPolicy from `ai-reviewer-net` only (§2.3).
+- Cluster writes only from `copilot-executor` under its own ServiceAccount `sre-ai-executor`: Role `sre-ai-remediate` (`deployments`, `deployments/scale`: get/list/patch/update) is bound per namespace to that SA only (`k8s/base/rbac.yaml`); API and workers run as `sre-ai` with read-only access.
 - Guardrails at the DSL level (`ExecutionIntent`) and k8s policy validator (`K8sSecurityGuard`).
 - Approval API for human-in-the-loop before any write action.
 - `SAFE_MODE=true` is enforced in production (config validator raises on `SAFE_MODE=false` + `ENV=production`).
 - Prompt injection guard (`prompt_guard.detect_injection`) with input length cap (`PROMPT_INPUT_MAX_CHARS`).
 - **PII redaction** (`app/services/pii_redaction.py`) — write-time scrubbing of Seq log samples and defense-in-depth scrubbing of Discord embed strings. Patterns: emails, IPv4/IPv6, JWT, bearer tokens, UUIDs, long hex, `password|token|secret|api_key` key/value pairs.
-- **Approve / Decline authz** on Discord buttons — `DISCORD_APPROVERS_USER_IDS` / `DISCORD_APPROVERS_ROLE_IDS` allowlists, `DISCORD_APPROVAL_RATE_LIMIT_PER_HOUR` quota. Fail-closed when both allowlists are empty.
+- **Approve / Decline authz** on Discord buttons — `DISCORD_APPROVERS_USER_IDS` / `DISCORD_APPROVERS_ROLE_IDS` allowlists (production uses the user list only), `DISCORD_APPROVAL_RATE_LIMIT_PER_HOUR` quota. Fail-closed when both allowlists are empty.
 - **Dedicated read-only Postgres role** (`kg_reader`) for any external KG access — separate user, `SELECT` on `kg_*` and `alembic_version` only, no default privileges (future tables must be granted explicitly).
 
 ## 9. External Integrations
@@ -600,10 +724,12 @@ If a match is found, `recurrence=True` is set in the pipeline output. `FixAgent`
 | VictoriaMetrics | Memory/CPU metrics window before incident | `VICTORIA_METRICS_URL` |
 | TeamCity (MCP) | Recent deploy context | `TEAMCITY_MCP_URL`, `TEAMCITY_MCP_TOKEN` |
 | Atlassian Jira | Known open/resolved tickets for the service | `JIRA_BASE_URL`, `JIRA_EMAIL`, `JIRA_API_TOKEN` |
-| Discord | Approval flow + incident report | `DISCORD_WEBHOOK_URL` |
+| Discord | Alert cards, digests | `DISCORD_WEBHOOK_URL` |
+| Discord (bot) | Proposal cards with buttons, interactions | `DISCORD_BOT_TOKEN`, `DISCORD_INCIDENT_CHANNEL_ID`, `DISCORD_PUBLIC_KEY` |
 | Discord (per-team) | Per-team channel routing for digests/incidents | `DISCORD_TEAM_CHANNEL_MAP` (JSON) |
 | Discord (self-health) | KG canary alerts, separate from `#infra-error` | `DISCORD_WEBHOOK_SELF_HEALTH_URL` |
 | Discord (authz) | Allowlist for Approve/Decline buttons | `DISCORD_APPROVERS_USER_IDS`, `DISCORD_APPROVERS_ROLE_IDS`, `DISCORD_APPROVAL_RATE_LIMIT_PER_HOUR` |
-| Seq | Application log stream → `kg_log_observations` | `SEQ_URL`, `SEQ_API_KEY` |
+| Seq | Application log stream → `kg_log_observations` | `SEQ_INSTANCES` or `SEQ_URL_<ENV>` / `SEQ_TOKEN_<ENV>` |
+| squad-medic (external) | Remediation run events → `kg_remediation_events` | `REMEDIATION_WEBHOOK_SECRET` |
 | OpenTelemetry | Distributed tracing | `OTLP_EXPORTER_ENDPOINT` |
 | Anomaly tuning | Robust-z thresholds | `KG_ANOMALY_ROBUST_Z_WARN`, `KG_ANOMALY_ROBUST_Z_CRIT` |

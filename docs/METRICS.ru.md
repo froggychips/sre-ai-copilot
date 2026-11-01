@@ -1,6 +1,6 @@
 # SRE AI Copilot — Metrics Pipeline
 
-Обновлено: **2026-08-08**.
+Обновлено: **2026-11-01** (v1.0.33). §1–§5 — конвейер метрик KG, §6 — метрики качества графа, §7 — собственные Prometheus-метрики копилота и алерты.
 
 Карта потока метрик: какие сигналы есть в VictoriaMetrics, какие из них материализуются в Knowledge Graph, каким sync'ом, и — не менее важно — каких сигналов **нет** и что на самом деле означают их нули.
 
@@ -43,7 +43,7 @@ Per `(ingress_name, host, path)`: `p95_latency_ms` / `p99_latency_ms` / `rps` / 
 
 Это **endpoint-уровневый** разрез (per host/path) — другой срез, чем per-service в `kg_service_health`. Сейчас это единственный источник реальных HTTP 5xx / latency в KG.
 
-### `kg_anomaly_observations` ← `anomaly_detection.py` (beat: `kg_anomaly_detect`)
+### `kg_anomaly_observations` ← `anomaly_detection.py` (beat: `kg_anomaly_detection_task`, ~10 мин)
 
 Robust-z (median + MAD, сезонный baseline) по материализованным рядам: `cpu_pct` / `mem_pct` / `restarts_rate` из `kg_service_health`, плюс `log_error_rate` из Seq-логов (`kg_log_observations`). Anomaly detection на плоско-нулевой метрике (например `http_5xx_rate`) просто не порождает observations — graceful degradation, без false positive.
 
@@ -130,17 +130,75 @@ owner-coverage с 99.5% до ~50% в день выката — регресси�
 топология заведомо неполна. Отсутствие ребра означает «связь неизвестна», а
 не «связи нет» (см. §7 в `KG_SCHEMA_CONTRACT.md`).
 
-## 7. Метрики self-health и диагностики копилота (v1.0.4+)
+## 7. Собственные метрики копилота (перечень, v1.0.33)
 
-Экспортируются на поде API (`:8001/metrics`), скрейпятся `VMPodScrape sre-ai-copilot` (`k8s/monitoring.yaml`); правила алертов — в `VMRule sre-ai-copilot`.
+Обновлено: **2026-11-01**. Каждое имя ниже сверено с `app/` (`Counter`/`Histogram` из `prometheus_client` и собственные `Collector`-ы).
+
+### Где экспортируются
+
+| Процесс | Endpoint | Скрейпит `VMPodScrape sre-ai-copilot` |
+|---|---|---|
+| `sre-ai-api` | `:8001/metrics` (`start_http_server` в `app/main.py`) плюс два Collector-а ниже | да |
+| `copilot-worker`, `copilot-worker-sync` | `:8001/metrics`, multiprocess-режим (`app/observability/worker_metrics.py`, `PROMETHEUS_MULTIPROC_DIR`) | да |
+| `copilot-executor` | тот же сервер воркера поднимается (манифест задаёт `PROMETHEUS_MULTIPROC_DIR`), но порта `metrics` у пода нет | **нет** — счётчики, которые там растут (`pipeline_executor_applied_total`, `remediation_attempt_transitions_total` из `apply_intent`), не собираются |
+| `copilot-beat` | сервера нет | перечислен в селекторе, остаётся пустым таргетом |
+
+NetworkPolicy пускает на :8001 только из ns `monitoring`.
+
+### Collector-ы (считаются в момент скрейпа, только в API)
 
 | Метрика | Тип | Смысл |
 |---|---|---|
-| `copilot_self_health_status` | gauge | Общий вердикт последнего прогона self-health: 0 ok, 1 warn, 2 fail |
-| `copilot_self_health_check_status{check}` | gauge | Вердикт по проверке (`sync_lag`, `schema_version`, `anomaly_signal_health`, `materialization_zero_rate`, …); источники `disabled` в худший-из не входят |
-| `copilot_self_health_last_run_timestamp` | gauge | Unix-время последнего снимка в Redis (`stats:self_health:last`) |
-| `diagnostic_facts_verdict_total{kind, verdict}` | counter | Факты по вердикту свидетельства — доля `unknown` по kind напрямую меряет Known Unknowns (источники, которые копилот не смог опросить) |
+| `copilot_self_health_status` | gauge | Общий вердикт последнего прогона self-health: 0 ok, 1 warn, 2 fail, 3 unknown |
+| `copilot_self_health_check_status{check}` | gauge | Вердикт по проверке (15 проверок: `sync_lag`, `source_coverage`, `graph_integrity`, `schema_version`, …); источники `disabled` в худший-из не входят |
+| `copilot_self_health_last_run_timestamp` | gauge | Unix-время снимка в Redis (`stats:self_health:last`) |
+| `celery_queue_length{queue}` | gauge | Задачи, ждущие воркера, по очередям брокера (`LLEN`): `celery`, `sync`, `executor`. Redis недоступен → серий нет (не ноль). С 1.0.28; до этого — Gauge, который никто не выставлял |
+
+Нет снимка / нет Redis → серий нет, а не ноль.
+
+### Процесс API
+
+| Метрика | Тип | Смысл |
+|---|---|---|
+| `request_duration_seconds` | histogram | Латенси HTTP-запросов (middleware) |
+| `alerts_suppressed_total{reason, alertname}` | counter | Алерты, отброшенные до карточки: `allowlist`, `self_noise`, `inhibited_warn`, `repeat` (повтор горящего алерта от Alertmanager, 1.0.31), `controller_lag_rancher_churn` (churn GenerationMismatch на `/store`) |
+| `alertmanager_alerts_truncated_total{endpoint, receiver}` | counter | Алерты, обрезанные Alertmanager-ом по `max_alerts` (`truncatedAlerts` в payload) — часть группы до копилота не дошла |
+| `webhook_replay_rejected_total{source}` | counter | Подписанные запросы вебхука, отклонённые как повтор (`local` — кэш процесса, `shared` — Redis) |
+| `webhook_replay_shared_store_errors_total` | counter | Сбои Redis-хранилища nonce — anti-replay деградировал до процесса |
+| `rate_limit_redis_errors_total{limiter}` | counter | Проверки rate-limit, не достучавшиеся до Redis |
+| `rate_limit_local_fallback_total{limiter, decision}` | counter | Решения запасного лимитера в процессе |
+
+### Процессы воркеров — диагностика, remediation, LLM-слой
+
+| Метрика | Тип | Смысл |
+|---|---|---|
+| `diagnostic_facts_verdict_total{kind, verdict}` | counter | Факты по вердикту свидетельства — доля `unknown` по kind напрямую меряет Known Unknowns |
 | `diagnostic_facts_observed_total{kind, observed}` | counter | Старый двузначный счётчик, оставлен ради дашбордов |
 | `remediation_verification_total{outcome}` | counter | Исходы `remediation_verify`: `verified` / `failed` / `pending` / `unknown` |
+| `remediation_attempt_transitions_total{from_status, to_status}` | counter | Переходы статуса в `kg_remediation_attempts` |
+| `pipeline_executor_applied_total{success}` | counter | Реальные исходы apply после аппрува |
+| `pipeline_stage_duration_seconds{stage}` | histogram | Латенси по стадиям |
+| `pipeline_executor_status_total{status}`, `pipeline_execution_intent_total{parsed, action}`, `pipeline_resolution_quality_total{quality}`, `pipeline_incident_recurrence_total{is_recurrence}`, `pipeline_incident_flapping_total`, `pipeline_fact_conflicts_total{kind_a, kind_b}`, `pipeline_no_survivor_total`, `pipeline_hypotheses_count`, `pipeline_survivors_count` | counters / histograms | Исходы LLM-пайплайна |
+| `hypothesis_generated_total{perspective}`, `hypothesis_grounded_total{perspective}`, `hypothesis_refuted_total{by}`, `hypothesis_disagreement_total` | counters | Multi-hypothesis / FactCritic |
+| `llm_request_duration_seconds{model}`, `llm_api_errors_total{model, error_type}` | histogram / counter | Латенси и ошибки LLM по backend-у (`app/core/tracing.py`) |
+| `llm_tokens_per_agent_total{agent, model, direction}`, `llm_latency_per_agent_seconds{agent, model}`, `llm_errors_per_agent_total{agent, model, error_type}` | counter / histogram / counter | Расход по агентам |
+| `llm_cost_usd_total{model}` | counter | Оценка расхода на LLM |
+| `llm_budget_denied_total{reason}` | counter | Отказы предохранителя бюджета (потолок не задан / исчерпан / состояние счётчика неизвестно) |
+| `prompt_input_truncated_total`, `prompt_input_chars` | counter / histogram | Обрезка входа промпта перед вызовом модели; размер входа до обрезки |
 
-Алерты (`VMRule sre-ai-copilot`): `CopilotSelfHealthStale` (снимок старше 2 интервалов), `CopilotSelfHealthAbsent`, `CopilotSelfHealthFailing` (статус 2), `CopilotSelfHealthWarnStuck` (статус 1 в течение 6 ч — первое боевое срабатывание 06.09.2026 было по `anomaly_signal_health` на стенде под длительной нагрузкой: легитимно), `CopilotApiDown` / `CopilotWorkerDown`, `CopilotPodCrashLooping`, `CopilotPostgresBackupFailed` / `Missing`, `CopilotCeleryBacklog`.
+Всё, что под «pipeline», «hypothesis», «llm», «prompt», пишет только LLM-пайплайн. При `LLM_PIPELINE_ENABLED=false` в проде эти серии пустые; ровный ноль там — не сигнал здоровья. `llm_tokens_total{model, type}` объявлен в `app/observability/ai_metrics.py`, но его никто не инкрементирует (у хелпера `track_llm_metrics` нет вызовов).
+
+### Алерты (`VMRule sre-ai-copilot`, `k8s/monitoring.yaml`)
+
+| Алерт | Условие | Severity |
+|---|---|---|
+| `CopilotSelfHealthStale` | снимок старше 1 ч, в течение 15 м | warning |
+| `CopilotSelfHealthAbsent` | нет `copilot_self_health_last_run_timestamp` 30 м | warning |
+| `CopilotSelfHealthFailing` | любая проверка `>= 2` 30 м | warning |
+| `CopilotSelfHealthWarnStuck` | любая проверка `== 1` 24 ч | warning (до 1.0.28 был info — его не постил ни один путь) |
+| `CopilotApiDown` / `CopilotWorkerDown` / `CopilotWorkerSyncDown` | 0 доступных реплик `sre-ai-api` / `copilot-worker` / `copilot-worker-sync` 5 м | critical |
+| `CopilotExecutorDown` | 0 доступных реплик `copilot-executor` 5 м | warning |
+| `CopilotPodCrashLooping` | рестарты в ns `sre-ai` 15 м | warning |
+| `CopilotPostgresBackupFailed` | упавший Job `postgres-backup-*` | warning |
+| `CopilotPostgresBackupMissing` | нет успешного `postgres-backup` дольше 26 ч (или нет данных) | warning |
+| `CopilotCeleryBacklog` | `max by (queue) (celery_queue_length) > 100` 15 м | warning |

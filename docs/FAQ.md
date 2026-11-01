@@ -6,9 +6,9 @@ Practical answers for setting up and configuring the AI-powered SRE assistant.
 
 ## What does this do?
 
-AlertManager fires a webhook → the copilot receives the alert → a multi-agent LLM pipeline (Analyzer → Hypothesis → Critic → Fix → Risk) produces an analysis and, if needed, an `ExecutionIntent` → the intent goes to Discord for approval → you approve → the action runs in Kubernetes.
+The production path is deterministic, without an LLM. Alertmanager sends alerts to the copilot → it writes them into the knowledge graph (KG) and, for prod/preprod and node-level alerts, posts an enriched card to Discord (owner, recent deploys, blast radius, rule facts). For a few alert classes the remediation bridge (`app/remediation/`) matches a playbook and posts a card with «Apply / Decline» buttons; an operator from the allowlist approves → the action runs in Kubernetes from a separate executor process → the outcome is verified and written back into the same card.
 
-The copilot also has a `/copilot` conversation endpoint for asking questions about incidents directly, and a `/replay` endpoint for rerunning past incidents through the agent pipeline without side effects.
+The multi-agent LLM pipeline (Analyzer → Hypothesis → Critic → Fix → Risk, endpoint `POST /webhooks/alertmanager`) is still in the code, but it is **disabled in production** (`LLM_PIPELINE_ENABLED=false`, no route points at it). The same applies to `/copilot` (conversation with the agents) and `/replay` (rerun a past incident without side effects): they exist, but require the LLM backend.
 
 ---
 
@@ -16,12 +16,12 @@ The copilot also has a `/copilot` conversation endpoint for asking questions abo
 
 | Component | Role |
 |---|---|
-| Kubernetes | Target for actions; source of deployment/pod context |
-| AlertManager | Webhook source (kube-prometheus-stack or standalone) |
-| Redis | Celery task queue + approval lifecycle state |
-| PostgreSQL | Incident records, conversation history, audit log |
-| Discord bot | Approval channel notifications and buttons |
-| Anthropic API key | LLM inference for all agents |
+| Kubernetes | Source of context (pods, deployments, events); target for approved actions |
+| Alertmanager | Webhook source (VMAlertmanager in production, `k8s/vmalertmanagerconfig.yaml`) |
+| Redis | Celery broker (queues `celery`, `sync`, `executor`) + dedup and approval state |
+| PostgreSQL | Knowledge graph, incident records, decisions, audit log |
+| Discord bot + webhook | Alert cards, buttons, digests |
+| Anthropic API key | Only for the LLM pipeline (`LLM_BACKEND=anthropic`); not needed while it is disabled |
 
 ---
 
@@ -30,13 +30,13 @@ The copilot also has a `/copilot` conversation endpoint for asking questions abo
 Copy `.env.example` to `.env` and fill in the required values:
 
 ```env
-ANTHROPIC_API_KEY=sk-ant-…
 DATABASE_URL=postgresql+asyncpg://user:pass@host/db
 REDIS_URL=redis://:pass@host:6379/0
 DISCORD_WEBHOOK_URL=…           # incident embeds
-DISCORD_BOT_TOKEN=…             # bot API — required for Approve/Decline buttons
+DISCORD_BOT_TOKEN=…             # bot API — required for Apply/Decline buttons
 DISCORD_INCIDENT_CHANNEL_ID=…   # channel for incident messages with buttons
-DISCORD_APPROVERS_ROLE_IDS=…    # CSV of Discord role IDs allowed to approve
+DISCORD_APPROVERS_USER_IDS=…    # CSV of Discord user IDs allowed to press the buttons
+ANTHROPIC_API_KEY=sk-ant-…      # only if you enable the LLM pipeline
 ```
 
 Then:
@@ -44,41 +44,46 @@ Then:
 docker compose up -d
 ```
 
-The API starts on port 8000. Check `/healthz` for liveness and `/readyz` for readiness (the latter queries PostgreSQL).
+The API starts on port 8000. Check `/healthz` for liveness and `/readyz` for readiness (the latter queries PostgreSQL). In production the copilot runs from the manifests in `k8s/` via `deploy.sh` (the Helm chart was removed in 1.0.28).
 
 ---
 
 ## How does the AlertManager integration work?
 
-Add a webhook receiver in `alertmanager.yml`:
+There are three receiving endpoints; production routing is in `k8s/vmalertmanagerconfig.yaml`:
 
-```yaml
-receivers:
-  - name: ai-copilot
-    webhook_configs:
-      - url: 'http://sre-copilot:8000/webhooks/alertmanager'
-        send_resolved: true
-```
+| Endpoint | What it does | Who is routed there |
+|---|---|---|
+| `POST /webhooks/alertmanager/enrich-and-forward` | KG write + enriched Discord card | `prod-*`, `preprod-*`, alerts without a namespace (nodes, control plane) |
+| `POST /webhooks/alertmanager/store` | KG write only, nothing in Discord (by design) | `squad-*`, `preupdate-*`, `severity=info` |
+| `POST /webhooks/alertmanager` | Full LLM pipeline | nobody (`LLM_PIPELINE_ENABLED=false`) |
 
-The endpoint **fails closed**: it requires an HMAC-SHA256 signature (`X-Alertmanager-Signature`, keyed by `ALERTMANAGER_WEBHOOK_SECRET`), and without a configured secret every request is rejected with 401. Stock AlertManager cannot sign the body, so you have two options (details in [SECURITY.md](../SECURITY.md) and `k8s/vmalertmanagerconfig.yaml`):
+Watchdog and `severity=none` go to a blackhole receiver.
+
+The endpoints **fail closed**: they require an HMAC-SHA256 signature (`X-Alertmanager-Signature`, keyed by `ALERTMANAGER_WEBHOOK_SECRET`), and without a configured secret every request is rejected with 401. Stock AlertManager cannot sign the body, so you have two options (details in [SECURITY.md](../SECURITY.md) and `k8s/vmalertmanagerconfig.yaml`):
 
 - put a signing proxy next to AlertManager (preferred; set `ALERTMANAGER_REQUIRE_SIGNED_TIMESTAMP=true`);
 - or set the explicit opt-out `ALERTMANAGER_ALLOW_UNAUTHENTICATED=true` **and** restrict ingress on port 8000 with a NetworkPolicy to the AlertManager namespace only. The opt-out without that NetworkPolicy leaves the endpoint open to every pod in the cluster.
-
-Each alert in the payload generates a separate Celery task and goes through the full agent pipeline independently.
 
 ---
 
 ## What happens to each alert?
 
 ```
-Alert arrives at POST /webhooks/alertmanager
-  → IncidentRecord created (status: PENDING)
-  → Celery task: process_incident
-  → Analyzer → Hypothesis → Critic → Fix → Risk agents
-  → IncidentRecord updated (status: COMPLETED, analysis attached)
-  → Discord report posted
-  → If ExecutionIntent generated: approval request posted to Discord
+/enrich-and-forward (prod, preprod, nodes)
+  → KG: kg_alerts / kg_incidents, attribution to the k8s object (app/services/alert_target.py)
+  → dedup (repeat of a still-firing alert is not re-posted)
+  → deterministic enrichment (rule facts, owner, deploys, blast radius)
+  → Discord card in the incident channel
+  → if a playbook may apply: task remediation_bridge in Celery
+
+/store (squads, preupdate, info)
+  → KG only; Discord — only a remediation proposal card when an
+    applicable playbook with policy «approve» matched
+
+/webhooks/alertmanager (LLM pipeline, disabled in production)
+  → IncidentRecord → Celery process_incident → Analyzer → Hypothesis → Critic → Fix → Risk
+  → with LLM_PIPELINE_ENABLED=false the task exits without LLM calls
 ```
 
 ---
@@ -129,14 +134,16 @@ Never set `SAFE_MODE=false` in production.
 
 ## How does the approval flow work?
 
-1. Agent pipeline produces an `ExecutionIntent`
-2. Discord message posted with action summary + Approve / Reject buttons
-3. Authorized user (configured role or ID allowlist) clicks Approve
-4. `POST /approvals/{id}/approve` is called internally
-5. Action executes via `ExecutionIntent` DSL → kubectl translator
-6. Result posted back to Discord
+In production the buttons come from the deterministic remediation bridge (since 1.0.31; executed in Celery since 1.0.32):
 
-Intents expire after 30 minutes by default. Expired intents cannot be approved.
+1. An alert whose `alertname` belongs to an executable (v2) playbook enqueues the Celery task `remediation_bridge` (enqueue dedup — Redis `SET NX`).
+2. The task collects rule facts + pod state (K8sFacts), `match_playbooks` checks `match` and `preconditions`, the server builds the intent from the playbook's `plan.steps` (not a model), policy decides `approve` / `block`.
+3. `approve`: target snapshot (uid), server dry-run, `IncidentRecord(APPROVAL_PENDING)` + `kg_remediation_decisions`, and a card with «Apply / Decline» buttons (`approve:` / `decline:`) in `DISCORD_INCIDENT_CHANNEL_ID`. `block` (prod/preprod/system): no buttons, only a line «playbook X: blocked by policy» in the regular card.
+4. An operator from `DISCORD_APPROVERS_USER_IDS` clicks. The click reaches `POST /discord/interactions`; the Ed25519 signature is checked against `DISCORD_PUBLIC_KEY`.
+5. With `EXECUTOR_DISPATCH=queue` the write runs in `copilot-executor` (queue `executor`, separate ServiceAccount with write rights) under `K8sSecurityGuard`.
+6. Verify checks from the playbook run after the write; the result is appended to the same card.
+
+The bridge needs `REMEDIATION_BRIDGE_ENABLED`, `EXECUTOR_ENABLED` and `EXECUTOR_APPROVAL_ENABLED`; `REMEDIATION_BRIDGE_NAMESPACES` limits it to namespace prefixes (empty = all). In the LLM pipeline (disabled in production) the intent comes from FixAgent and goes through the same gate and button.
 
 ---
 
@@ -144,38 +151,32 @@ Intents expire after 30 minutes by default. Expired intents cannot be approved.
 
 Set at least one of:
 ```env
-DISCORD_APPROVERS_ROLE_IDS=123456789
 DISCORD_APPROVERS_USER_IDS=111222333,444555666
+DISCORD_APPROVERS_ROLE_IDS=123456789
 ```
 
-Both empty = fail-closed: every Approve/Decline click is denied and audited (`app/api/discord_interactions.py`). Configure it before the copilot receives real production alerts.
+Both empty = fail-closed: every Apply/Decline click is denied and audited (`app/api/discord_interactions.py`). The production deployment uses only the user allowlist; roles are not configured. Configure it before the copilot receives real production alerts.
 
 ---
 
-## How do I configure namespace tiers in k8s_guard.py?
+## Which namespaces can it write to?
 
-Edit `app/services/k8s_guard.py`. Namespaces are classified by regex against their name:
+Namespace lists live in `app/security/namespaces.py`; both `K8sSecurityGuard` (`app/services/k8s_guard.py`) and the execution DSL import them:
 
-```python
-TIERS = {
-    "production": re.compile(r"^prod.*|.*-prod$"),
-    "staging":    re.compile(r"^stag.*|.*-staging$"),
-    "dev":        re.compile(r"^dev.*|.*-dev$"),
-}
-```
+- `FORBIDDEN_NAMESPACES` — never touched, not even for reads (`kube-system`, `kube-public`, `kube-node-lease`, `chaos-mesh`, `mcp`);
+- `READ_ONLY_NAMESPACES` — exact name or `<env>-` prefix for `prod`, `preprod`, `preupdate`, `production`: read-only;
+- `WRITE_NAMESPACE_PATTERNS` — the only place writes are allowed (after approval): `^squad-\d+$`, `^squad-gd$`.
 
-- `production` — always requires approval, ignores SAFE_MODE
-- `staging` — requires approval when SAFE_MODE=true
-- `dev` — executes directly
-- Unmatched namespaces default to `production` tier (most restrictive)
-
-Anchor patterns with `^` and `$` to prevent substring matches from misclassifying namespaces.
+Remediation policy additionally classifies the namespace tier (`app/remediation/risk_axes.py`): playbooks allow `approve` only for `dev` / `squad` and `block` `prod` / `preprod` / `system`.
 
 ---
 
 ## Can I test the pipeline without touching Kubernetes?
 
-Set `K8S_DRY_RUN=true` in `.env`. The full pipeline runs (AlertManager → agents → Discord approval flow) but actions are logged instead of executed. Good for validating agent output and the approval flow before going live.
+There is no global Kubernetes dry-run switch. What exists:
+
+- `EXECUTOR_ENABLED=true` with `EXECUTOR_APPROVAL_ENABLED=false` — the intent is validated by `kubectl … --dry-run=server`, but there is no Apply button, so nothing is written;
+- `DISCORD_DRY_RUN=true` — Discord messages are logged instead of sent (local e2e).
 
 ---
 
@@ -286,19 +287,31 @@ for what to check when the table stops filling.
 
 ## How do I add a new playbook (Phase A remediation)?
 
-**Phase A foundation is implemented as of v0.13.0 (PR #99): decision
-*preview* without an executor.** Playbooks are matched, scored against 8
-discrete risk axes, and run through a rule-based policy evaluator that
-produces an `auto` / `approve` / `block` verdict — but the plan is **not
-executed**; Phase A only surfaces the recommended action. (Actual writes
-remain the separate, opt-in per-incident `executor` track gated behind
-`EXECUTOR_APPROVAL_ENABLED` — it is not yet driven by playbooks.)
+Playbooks are strict-schema YAML files in `app/remediation/registry/`,
+loaded by `load_registry()` in `app/remediation/playbook.py` (`extra="forbid"`
+— a typo in any key fails at parse time, not at use; files starting with `_`
+are skipped). Contract: [REMEDIATION_PLAYBOOK_CONTRACT.md](REMEDIATION_PLAYBOOK_CONTRACT.md).
+Two schema versions:
 
-A playbook is a single strict-schema YAML file in
-`app/remediation/registry/`, loaded by `load_registry()` in
-`app/remediation/playbook.py`. Schema is `remediation.playbook/v1` with
-`extra="forbid"` — a typo in any key fails at parse time, not at use.
-To add one, drop a new `*.yaml` (unique `name`) with these sections:
+- **`remediation.playbook/v1`** — preview only (the Phase A layer from
+  v0.13.0, PR #99): matched, scored against discrete risk axes, policy
+  verdict `auto` / `approve` / `block`, nothing executed. Example below.
+- **`remediation.playbook/v2`** — executable: `match.alertnames`,
+  `preconditions` on rule facts (`found` / `absent`; `unknown` never
+  passes), `plan.steps` from actions known to the executor, `verify` checks.
+  Only v2 playbooks are offered by the remediation bridge. In the registry:
+  `restart_crashloop_deployment` and `scale_out_cpu_throttled_deployment`.
+  The bridge takes alerts of both (`KubePodCrashLooping` / `PodCrashLooping`,
+  `CPUThrottlingHigh`; approve only in dev/squad), but builds the plan only
+  from server-known parameters: the scale-out plan needs `{replicas}`, so for
+  it the bridge currently logs `remediation_bridge.plan_render_failed` and
+  posts no card. `cleanup_stale_failed_job` (v1, `match.classification`
+  only) is never taken by the bridge.
+
+`_executor_apply_gate.yaml` is not a playbook: it is the server gate policy
+for human-approved applies, loaded only by `executor_gate`.
+
+To add a v1 playbook, drop a new `*.yaml` (unique `name`) with these sections:
 
 ```yaml
 schema_version: remediation.playbook/v1
@@ -419,5 +432,8 @@ Before `expires` the queue piled up silently — 230 tasks, 94 of them
 and never ran at all.
 
 Check queue depth with `kubectl -n sre-ai exec redis-0 -- redis-cli LLEN celery`.
-If it grows steadily, the workers cannot keep up — a separate problem that
+Heavy KG syncs (`kg_topology_sync`, `tc_deploys_to_kg`, `kg_storage_sync` and
+others, `SYNC_QUEUE_TASKS` in `app/workers/tasks.py`) run in a separate queue
+`sync` served by `copilot-worker-sync` (since 1.0.28) — check `LLEN sync` too.
+If a queue grows steadily, the workers cannot keep up — a separate problem that
 `expires` merely masks.

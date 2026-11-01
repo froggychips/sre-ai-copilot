@@ -6,9 +6,9 @@
 
 ## Что это делает?
 
-AlertManager отправляет webhook → копилот получает алерт → многоагентный LLM-пайплайн (Analyzer → Hypothesis → Critic → Fix → Risk) выдаёт анализ и, если нужно, `ExecutionIntent` → намерение уходит в Discord на аппрув → ты одобряешь → действие выполняется в Kubernetes.
+Боевой путь — детерминированный, без LLM. Alertmanager шлёт алерты в копилот → тот пишет их в граф знаний (KG) и для prod/preprod и алертов уровня нод отправляет в Discord обогащённую карточку (владелец, недавние деплои, blast radius, факты правил). Для нескольких классов алертов мост remediation (`app/remediation/`) подбирает playbook и постит карточку с кнопками «Применить / Отклонить»; оператор из allowlist одобряет → действие выполняется в Kubernetes отдельным процессом-исполнителем → результат проверяется и дописывается в ту же карточку.
 
-Также есть `/copilot` — разговорный эндпоинт для прямых вопросов агентам, и `/replay` — перезапуск прошлого инцидента через пайплайн без побочных эффектов.
+Многоагентный LLM-пайплайн (Analyzer → Hypothesis → Critic → Fix → Risk, эндпоинт `POST /webhooks/alertmanager`) в коде есть, но **в проде выключен** (`LLM_PIPELINE_ENABLED=false`, ни один маршрут на него не ведёт). То же относится к `/copilot` (разговор с агентами) и `/replay` (перезапуск прошлого инцидента без побочных эффектов): они есть, но требуют LLM-бэкенда.
 
 ---
 
@@ -16,12 +16,12 @@ AlertManager отправляет webhook → копилот получает а
 
 | Компонент | Роль |
 |---|---|
-| Kubernetes | Цель для действий; источник контекста деплоев/подов |
-| AlertManager | Источник вебхуков (kube-prometheus-stack или standalone) |
-| Redis | Очередь задач Celery + состояние аппрувов |
-| PostgreSQL | Записи инцидентов, история разговоров, аудит |
-| Discord бот | Нотификации и кнопки в канале аппрувов |
-| Anthropic API key | Инференс LLM для всех агентов |
+| Kubernetes | Источник контекста (поды, деплои, события); цель одобренных действий |
+| Alertmanager | Источник вебхуков (в проде VMAlertmanager, `k8s/vmalertmanagerconfig.yaml`) |
+| Redis | Брокер Celery (очереди `celery`, `sync`, `executor`) + дедуп и состояние аппрувов |
+| PostgreSQL | Граф знаний, записи инцидентов, решения, аудит |
+| Discord бот + вебхук | Карточки алертов, кнопки, дайджесты |
+| Anthropic API key | Только для LLM-пайплайна (`LLM_BACKEND=anthropic`); пока он выключен — не нужен |
 
 ---
 
@@ -30,13 +30,13 @@ AlertManager отправляет webhook → копилот получает а
 Скопируй `.env.example` в `.env` и заполни нужные значения:
 
 ```env
-ANTHROPIC_API_KEY=sk-ant-…
 DATABASE_URL=postgresql+asyncpg://user:pass@host/db
 REDIS_URL=redis://:pass@host:6379/0
 DISCORD_WEBHOOK_URL=…           # embed-ы инцидентов
-DISCORD_BOT_TOKEN=…             # bot API — нужен для кнопок Approve/Decline
+DISCORD_BOT_TOKEN=…             # bot API — нужен для кнопок Применить/Отклонить
 DISCORD_INCIDENT_CHANNEL_ID=…   # канал для сообщений об инцидентах с кнопками
-DISCORD_APPROVERS_ROLE_IDS=…    # CSV ID Discord-ролей с правом аппрувить
+DISCORD_APPROVERS_USER_IDS=…    # CSV ID пользователей Discord с правом жать кнопки
+ANTHROPIC_API_KEY=sk-ant-…      # только если включаешь LLM-пайплайн
 ```
 
 Затем:
@@ -44,38 +44,46 @@ DISCORD_APPROVERS_ROLE_IDS=…    # CSV ID Discord-ролей с правом а
 docker compose up -d
 ```
 
-API стартует на порту 8000. `/healthz` — liveness, `/readyz` — readiness (делает `SELECT 1` к PostgreSQL).
+API стартует на порту 8000. `/healthz` — liveness, `/readyz` — readiness (делает `SELECT 1` к PostgreSQL). В проде копилот разворачивается из манифестов `k8s/` через `deploy.sh` (Helm-чарт удалён в 1.0.28).
 
 ---
 
 ## Как работает интеграция с AlertManager?
 
-Добавь webhook-ресивер в `alertmanager.yml`:
+Принимающих эндпоинтов три; боевая маршрутизация — в `k8s/vmalertmanagerconfig.yaml`:
 
-```yaml
-receivers:
-  - name: ai-copilot
-    webhook_configs:
-      - url: 'http://sre-copilot:8000/webhooks/alertmanager'
-        send_resolved: true
-```
+| Эндпоинт | Что делает | Кто туда маршрутизируется |
+|---|---|---|
+| `POST /webhooks/alertmanager/enrich-and-forward` | запись в KG + обогащённая карточка в Discord | `prod-*`, `preprod-*`, алерты без namespace (ноды, control plane) |
+| `POST /webhooks/alertmanager/store` | только запись в KG, в Discord ничего (осознанно) | `squad-*`, `preupdate-*`, `severity=info` |
+| `POST /webhooks/alertmanager` | полный LLM-пайплайн | никто (`LLM_PIPELINE_ENABLED=false`) |
 
-Эндпоинт не имеет аутентификации по умолчанию — ограничь его на сетевом уровне (Kubernetes NetworkPolicy или IP-аллоулист в ingress), чтобы к нему мог достучаться только AlertManager.
+Watchdog и `severity=none` уходят в blackhole.
 
-Каждый алерт в пейлоаде генерирует отдельную задачу Celery и независимо проходит весь пайплайн агентов.
+Эндпоинты **fail-closed**: нужна подпись HMAC-SHA256 (`X-Alertmanager-Signature`, ключ `ALERTMANAGER_WEBHOOK_SECRET`), без настроенного секрета любой запрос получает 401. Штатный AlertManager подписывать тело не умеет, поэтому вариантов два (подробно — в [SECURITY.md](../SECURITY.md) и `k8s/vmalertmanagerconfig.yaml`):
+
+- подписывающий прокси рядом с AlertManager (предпочтительно; поставь `ALERTMANAGER_REQUIRE_SIGNED_TIMESTAMP=true`);
+- либо явный opt-out `ALERTMANAGER_ALLOW_UNAUTHENTICATED=true` **и** NetworkPolicy, пускающая на порт 8000 только namespace AlertManager. Opt-out без такой NetworkPolicy оставляет эндпоинт открытым для любого пода кластера.
 
 ---
 
 ## Что происходит с каждым алертом?
 
 ```
-Алерт приходит на POST /webhooks/alertmanager
-  → создаётся IncidentRecord (статус: PENDING)
-  → задача Celery: process_incident
-  → агенты Analyzer → Hypothesis → Critic → Fix → Risk
-  → IncidentRecord обновляется (статус: COMPLETED, анализ прикреплён)
-  → репорт отправляется в Discord
-  → если сгенерирован ExecutionIntent: запрос аппрува в Discord
+/enrich-and-forward (prod, preprod, ноды)
+  → KG: kg_alerts / kg_incidents, атрибуция к k8s-объекту (app/services/alert_target.py)
+  → дедуп (повтор горящего алерта карточку не постит)
+  → детерминированное обогащение (факты правил, владелец, деплои, blast radius)
+  → карточка в Discord, канал инцидентов
+  → если может подойти playbook: задача remediation_bridge в Celery
+
+/store (сквады, preupdate, info)
+  → только KG; в Discord — лишь карточка предложения remediation, когда
+    сматчился применимый playbook с policy «approve»
+
+/webhooks/alertmanager (LLM-пайплайн, в проде выключен)
+  → IncidentRecord → Celery process_incident → Analyzer → Hypothesis → Critic → Fix → Risk
+  → при LLM_PIPELINE_ENABLED=false задача выходит без вызовов LLM
 ```
 
 ---
@@ -127,14 +135,16 @@ Discord; приглушённый — появляется, но тихо.
 
 ## Как работает флоу аппрувов?
 
-1. Пайплайн агентов генерирует `ExecutionIntent`
-2. В Discord отправляется сообщение с описанием действия + кнопки Approve / Reject
-3. Авторизованный пользователь (по роли или ID из конфига) нажимает Approve
-4. Внутренне вызывается `POST /approvals/{id}/approve`
-5. Действие выполняется через DSL `ExecutionIntent` → транслятор kubectl
-6. Результат постится в Discord
+В проде кнопки приходят из детерминированного моста remediation (с 1.0.31; исполняется в Celery с 1.0.32):
 
-Намерения протухают через 30 минут по умолчанию. Протухшие аппрувить нельзя.
+1. Алерт, чей `alertname` есть у исполнимого (v2) playbook-а, ставит в Celery задачу `remediation_bridge` (дедуп постановки — Redis `SET NX`).
+2. Задача собирает факты правил + состояние пода (K8sFacts), `match_playbooks` проверяет `match` и `preconditions`, intent собирает сервер из `plan.steps` playbook-а (не модель), policy решает `approve` / `block`.
+3. `approve`: снимок цели (uid), серверный dry-run, `IncidentRecord(APPROVAL_PENDING)` + `kg_remediation_decisions` и карточка с кнопками «Применить / Отклонить» (`approve:` / `decline:`) в `DISCORD_INCIDENT_CHANNEL_ID`. `block` (prod/preprod/system): кнопок нет, только строка «playbook X: заблокирован policy» в обычной карточке.
+4. Оператор из `DISCORD_APPROVERS_USER_IDS` нажимает кнопку. Клик приходит на `POST /discord/interactions`; подпись Ed25519 проверяется по `DISCORD_PUBLIC_KEY`.
+5. При `EXECUTOR_DISPATCH=queue` запись выполняет `copilot-executor` (очередь `executor`, отдельный ServiceAccount с правом записи) под `K8sSecurityGuard`.
+6. После записи идут verify-проверки playbook-а; итог дописывается в ту же карточку.
+
+Мосту нужны `REMEDIATION_BRIDGE_ENABLED`, `EXECUTOR_ENABLED` и `EXECUTOR_APPROVAL_ENABLED`; `REMEDIATION_BRIDGE_NAMESPACES` ограничивает его префиксами namespace (пусто — все). В LLM-пайплайне (в проде выключен) intent приходит от FixAgent и проходит тот же gate и ту же кнопку.
 
 ---
 
@@ -142,38 +152,32 @@ Discord; приглушённый — появляется, но тихо.
 
 Задай хотя бы одно из:
 ```env
-DISCORD_APPROVERS_ROLE_IDS=123456789
 DISCORD_APPROVERS_USER_IDS=111222333,444555666
+DISCORD_APPROVERS_ROLE_IDS=123456789
 ```
 
-Оба пустые = fail-closed: каждый клик Approve/Decline отклоняется и пишется в аудит (`app/api/discord_interactions.py`). Настрой до того как копилот начнёт получать боевые алерты.
+Оба пустые = fail-closed: любой клик Применить/Отклонить отклоняется и пишется в аудит (`app/api/discord_interactions.py`). Боевое развёртывание использует только allowlist пользователей, роли не настроены. Настрой до того, как копилот начнёт получать реальные прод-алерты.
 
 ---
 
-## Как настроить тиры неймспейсов в k8s_guard.py?
+## Куда копилот может писать?
 
-Редактируй `app/services/k8s_guard.py`. Неймспейсы классифицируются по регулярке к имени:
+Списки namespace — в `app/security/namespaces.py`; их импортируют и `K8sSecurityGuard` (`app/services/k8s_guard.py`), и DSL исполнения:
 
-```python
-TIERS = {
-    "production": re.compile(r"^prod.*|.*-prod$"),
-    "staging":    re.compile(r"^stag.*|.*-staging$"),
-    "dev":        re.compile(r"^dev.*|.*-dev$"),
-}
-```
+- `FORBIDDEN_NAMESPACES` — не трогаются никогда, даже на чтение (`kube-system`, `kube-public`, `kube-node-lease`, `chaos-mesh`, `mcp`);
+- `READ_ONLY_NAMESPACES` — точное имя или префикс `<env>-` для `prod`, `preprod`, `preupdate`, `production`: только чтение;
+- `WRITE_NAMESPACE_PATTERNS` — единственное место, где разрешена запись (после аппрува): `^squad-\d+$`, `^squad-gd$`.
 
-- `production` — всегда требует аппрув, игнорирует SAFE_MODE
-- `staging` — требует аппрув при SAFE_MODE=true
-- `dev` — выполняется напрямую
-- Неймспейсы, не попавшие ни под один паттерн — дефолтятся в `production`
-
-Якори паттерны через `^` и `$`, чтобы не было матча по подстроке.
+Policy remediation дополнительно классифицирует тир namespace (`app/remediation/risk_axes.py`): playbook-и разрешают `approve` только для `dev` / `squad` и дают `block` для `prod` / `preprod` / `system`.
 
 ---
 
 ## Можно протестировать пайплайн без реального Kubernetes?
 
-Установи `K8S_DRY_RUN=true` в `.env`. Пайплайн запускается полностью (AlertManager → агенты → аппрув в Discord), но действия логируются вместо выполнения. Удобно для валидации работы агентов и флоу аппрувов до выхода в прод.
+Глобального dry-run для Kubernetes нет. Что есть:
+
+- `EXECUTOR_ENABLED=true` при `EXECUTOR_APPROVAL_ENABLED=false` — intent проверяется `kubectl … --dry-run=server`, но кнопки Apply нет, записи не будет;
+- `DISCORD_DRY_RUN=true` — сообщения в Discord логируются вместо отправки (локальный e2e).
 
 ---
 
@@ -285,20 +289,31 @@ Column переписывается идемпотентно через `kg_sync
 
 ## Как добавить новый playbook (Phase A remediation)?
 
-**Phase A foundation реализован начиная с v0.13.0 (PR #99): decision
-*preview* без executor-а.** Playbook-и матчатся, скорятся по 8 дискретным
-risk axes и прогоняются через rule-based policy evaluator, который выдаёт
-вердикт `auto` / `approve` / `block` — но план **не выполняется**; Phase A
-лишь показывает рекомендованное действие. (Реальные записи остаются за
-отдельным opt-in per-incident `executor`-треком за
-`EXECUTOR_APPROVAL_ENABLED` — он пока не управляется playbook-ами.)
+Playbook-и — YAML-файлы со строгой схемой в `app/remediation/registry/`,
+загружаются `load_registry()` в `app/remediation/playbook.py` (`extra="forbid"`
+— опечатка в любом ключе падает на parse, а не на использовании; файлы на `_`
+пропускаются). Контракт: [REMEDIATION_PLAYBOOK_CONTRACT.md](REMEDIATION_PLAYBOOK_CONTRACT.md).
+Версий схемы две:
 
-Playbook — это один YAML-файл со строгой схемой в
-`app/remediation/registry/`, загружается `load_registry()` в
-`app/remediation/playbook.py`. Схема `remediation.playbook/v1` с
-`extra="forbid"` — опечатка в любом ключе падает на parse, не на
-использовании. Чтобы добавить — положи новый `*.yaml` (уникальный `name`)
-с секциями:
+- **`remediation.playbook/v1`** — только preview (слой Phase A из v0.13.0,
+  PR #99): матчится, скорится по дискретным risk axes, policy выдаёт
+  `auto` / `approve` / `block`, ничего не исполняется. Пример ниже.
+- **`remediation.playbook/v2`** — исполнимый: `match.alertnames`,
+  `preconditions` по фактам правил (`found` / `absent`; `unknown` не проходит
+  никогда), `plan.steps` из действий, известных исполнителю, проверки
+  `verify`. Мост remediation предлагает только v2. В реестре:
+  `restart_crashloop_deployment` и `scale_out_cpu_throttled_deployment`.
+  Мост берёт алерты обоих (`KubePodCrashLooping` / `PodCrashLooping`,
+  `CPUThrottlingHigh`; approve только в dev/squad), но план собирает только
+  из параметров, известных серверу: плану scale-out нужен `{replicas}`, поэтому
+  по нему мост сейчас пишет в лог `remediation_bridge.plan_render_failed` и
+  карточку не постит. `cleanup_stale_failed_job` (v1, только
+  `match.classification`) мост не берёт никогда.
+
+`_executor_apply_gate.yaml` — не playbook, а серверная политика gate для
+одобренных человеком apply; её грузит только `executor_gate`.
+
+Чтобы добавить v1 — положи новый `*.yaml` (уникальный `name`) с секциями:
 
 ```yaml
 schema_version: remediation.playbook/v1
@@ -395,7 +410,10 @@ selector'ом, orphan «улучшился» с 72.5% до 42.0% — при то
 и не выполнялся вовсе.
 
 Проверить глубину очереди: `kubectl -n sre-ai exec redis-0 -- redis-cli LLEN celery`.
-Если она стабильно растёт — воркеры не успевают, и это отдельная проблема,
+Тяжёлые синки KG (`kg_topology_sync`, `tc_deploys_to_kg`, `kg_storage_sync` и
+другие, `SYNC_QUEUE_TASKS` в `app/workers/tasks.py`) идут в отдельную очередь
+`sync`, её слушает `copilot-worker-sync` (с 1.0.28) — смотри и `LLEN sync`.
+Если очередь стабильно растёт — воркеры не успевают, и это отдельная проблема,
 которую `expires` только маскирует.
 
 ## Почему факт показан как `?`, а не `✓` или `✗`?

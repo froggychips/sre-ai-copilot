@@ -1,6 +1,6 @@
 # SRE AI Copilot — Metrics Pipeline
 
-Last updated: **2026-06-10**.
+Last updated: **2026-11-01** (v1.0.33). §1–§5 describe the KG metrics pipeline, §6 graph-quality metrics, §7 the copilot's own Prometheus metrics and alerts.
 
 Map of the metrics flow: which signals exist in VictoriaMetrics, which of them are materialised into the Knowledge Graph, by which sync, and — just as important — which signals are **absent** and what their zeros actually mean.
 
@@ -43,7 +43,7 @@ Per `(ingress_name, host, path)`: `p95_latency_ms` / `p99_latency_ms` / `rps` / 
 
 This is the **endpoint-level** slice (per host/path) — a different cut than the per-service one in `kg_service_health`. It is currently the only source of real HTTP 5xx / latency in the KG.
 
-### `kg_anomaly_observations` ← `anomaly_detection.py` (beat: `kg_anomaly_detect`)
+### `kg_anomaly_observations` ← `anomaly_detection.py` (beat: `kg_anomaly_detection_task`, ~10 min)
 
 Robust-z (median + MAD, seasonal baseline) over the materialised series: `cpu_pct` / `mem_pct` / `restarts_rate` from `kg_service_health`, plus `log_error_rate` derived from Seq logs (`kg_log_observations`). Anomaly detection on a flat-zero metric (e.g. `http_5xx_rate`) simply produces no observations — graceful degradation, no false positives.
 
@@ -132,17 +132,76 @@ including dev/preprod where topology is knowingly incomplete. A missing edge
 means "the relationship is unknown", not "there is no relationship" (see §7 in
 `KG_SCHEMA_CONTRACT.md`).
 
-## 7. Copilot self-health and diagnostics metrics (v1.0.4+)
+## 7. Copilot's own metrics (inventory, v1.0.33)
 
-Exported on the API pod (`:8001/metrics`), scraped by `VMPodScrape sre-ai-copilot` (`k8s/monitoring.yaml`); alert rules live in `VMRule sre-ai-copilot`.
+Updated: **2026-11-01**. Every name below was checked against `app/` (`prometheus_client` `Counter`/`Histogram` and the custom `Collector`s).
+
+### Where they are exported
+
+| Process | Endpoint | Scraped by `VMPodScrape sre-ai-copilot` |
+|---|---|---|
+| `sre-ai-api` | `:8001/metrics` (`start_http_server` in `app/main.py`), plus the two Collectors below | yes |
+| `copilot-worker`, `copilot-worker-sync` | `:8001/metrics`, multiprocess mode (`app/observability/worker_metrics.py`, `PROMETHEUS_MULTIPROC_DIR`) | yes |
+| `copilot-executor` | the same worker server starts (the manifest sets `PROMETHEUS_MULTIPROC_DIR`), but the pod declares no `metrics` port | **no** — counters incremented there (`pipeline_executor_applied_total`, `remediation_attempt_transitions_total` from `apply_intent`) are not collected |
+| `copilot-beat` | no server | listed in the selector, stays an empty target |
+
+NetworkPolicy admits :8001 only from ns `monitoring`.
+
+### Collectors (computed at scrape time, API process only)
 
 | Metric | Type | Meaning |
 |---|---|---|
-| `copilot_self_health_status` | gauge | Overall verdict of the last self-health run: 0 ok, 1 warn, 2 fail |
-| `copilot_self_health_check_status{check}` | gauge | Per-check verdict (`sync_lag`, `schema_version`, `anomaly_signal_health`, `materialization_zero_rate`, …); `disabled` sources are excluded from the worst-of |
-| `copilot_self_health_last_run_timestamp` | gauge | Unix time of the last snapshot in Redis (`stats:self_health:last`) |
-| `diagnostic_facts_verdict_total{kind, verdict}` | counter | Facts by evidence verdict — the `unknown` share per kind is the direct measure of Known Unknowns (sources the copilot could not query) |
+| `copilot_self_health_status` | gauge | Overall verdict of the last self-health run: 0 ok, 1 warn, 2 fail, 3 unknown |
+| `copilot_self_health_check_status{check}` | gauge | Per-check verdict (15 checks: `sync_lag`, `source_coverage`, `graph_integrity`, `schema_version`, …); `disabled` sources are excluded from the worst-of |
+| `copilot_self_health_last_run_timestamp` | gauge | Unix time of the snapshot in Redis (`stats:self_health:last`) |
+| `celery_queue_length{queue}` | gauge | Pending tasks per broker queue (`LLEN`): `celery`, `sync`, `executor`. Redis unavailable → no series (not zero). Since 1.0.28; before that it was a Gauge nobody set |
+
+No snapshot / no Redis → the series are absent, not zero.
+
+### API process
+
+| Metric | Type | Meaning |
+|---|---|---|
+| `request_duration_seconds` | histogram | HTTP request latency (middleware) |
+| `alerts_suppressed_total{reason, alertname}` | counter | Alerts dropped before a card: `allowlist`, `self_noise`, `inhibited_warn`, `repeat` (Alertmanager repeat of a still-firing alert, 1.0.31), `controller_lag_rancher_churn` (GenerationMismatch churn on `/store`) |
+| `alertmanager_alerts_truncated_total{endpoint, receiver}` | counter | Alerts Alertmanager cut by `max_alerts` (`truncatedAlerts` in the payload) — part of the group never reached the copilot |
+| `webhook_replay_rejected_total{source}` | counter | Signed webhook requests rejected as replays (`local` cache / `shared` Redis store) |
+| `webhook_replay_shared_store_errors_total` | counter | Redis nonce-store failures — anti-replay degraded to per-process |
+| `rate_limit_redis_errors_total{limiter}` | counter | Rate-limit checks that could not reach Redis |
+| `rate_limit_local_fallback_total{limiter, decision}` | counter | Decisions of the in-process fallback limiter |
+
+### Worker processes — diagnostics, remediation, LLM layer
+
+| Metric | Type | Meaning |
+|---|---|---|
+| `diagnostic_facts_verdict_total{kind, verdict}` | counter | Facts by evidence verdict — the `unknown` share per kind is the direct measure of Known Unknowns |
 | `diagnostic_facts_observed_total{kind, observed}` | counter | Legacy two-state counter, kept for dashboards |
 | `remediation_verification_total{outcome}` | counter | Outcomes of `remediation_verify`: `verified` / `failed` / `pending` / `unknown` |
+| `remediation_attempt_transitions_total{from_status, to_status}` | counter | Status transitions in `kg_remediation_attempts` |
+| `pipeline_executor_applied_total{success}` | counter | Real apply outcomes after approval |
+| `pipeline_stage_duration_seconds{stage}` | histogram | Per-stage latency |
+| `pipeline_executor_status_total{status}`, `pipeline_execution_intent_total{parsed, action}`, `pipeline_resolution_quality_total{quality}`, `pipeline_incident_recurrence_total{is_recurrence}`, `pipeline_incident_flapping_total`, `pipeline_fact_conflicts_total{kind_a, kind_b}`, `pipeline_no_survivor_total`, `pipeline_hypotheses_count`, `pipeline_survivors_count` | counters / histograms | LLM pipeline outcomes |
+| `hypothesis_generated_total{perspective}`, `hypothesis_grounded_total{perspective}`, `hypothesis_refuted_total{by}`, `hypothesis_disagreement_total` | counters | Multi-hypothesis / FactCritic |
+| `llm_request_duration_seconds{model}`, `llm_api_errors_total{model, error_type}` | histogram / counter | Per-backend LLM latency and errors (`app/core/tracing.py`) |
+| `llm_tokens_per_agent_total{agent, model, direction}`, `llm_latency_per_agent_seconds{agent, model}`, `llm_errors_per_agent_total{agent, model, error_type}` | counter / histogram / counter | Per-agent usage |
+| `llm_cost_usd_total{model}` | counter | Estimated LLM spend |
+| `llm_budget_denied_total{reason}` | counter | Budget guard refusals (ceiling not set / exhausted / counter state unknown) |
+| `prompt_input_truncated_total`, `prompt_input_chars` | counter / histogram | Prompt inputs truncated before the model call; input size before truncation |
 
-Alerts (`VMRule sre-ai-copilot`): `CopilotSelfHealthStale` (snapshot older than 2 intervals), `CopilotSelfHealthAbsent`, `CopilotSelfHealthFailing` (status 2), `CopilotSelfHealthWarnStuck` (status 1 for 6 h — its first real firing on 2026-09-06 was `anomaly_signal_health` on a stand under sustained load: legitimate), `CopilotApiDown` / `CopilotWorkerDown`, `CopilotPodCrashLooping`, `CopilotPostgresBackupFailed` / `Missing`, `CopilotCeleryBacklog`.
+Everything under «pipeline», «hypothesis», «llm», «prompt» is produced only by the LLM pipeline. With `LLM_PIPELINE_ENABLED=false` in production these series stay empty; a flat zero there is not a health signal. `llm_tokens_total{model, type}` is declared in `app/observability/ai_metrics.py`, but nothing increments it (its helper `track_llm_metrics` has no callers).
+
+### Alerts (`VMRule sre-ai-copilot`, `k8s/monitoring.yaml`)
+
+| Alert | Condition | Severity |
+|---|---|---|
+| `CopilotSelfHealthStale` | snapshot older than 1 h, for 15 m | warning |
+| `CopilotSelfHealthAbsent` | `copilot_self_health_last_run_timestamp` absent for 30 m | warning |
+| `CopilotSelfHealthFailing` | any check `>= 2` for 30 m | warning |
+| `CopilotSelfHealthWarnStuck` | any check `== 1` for 24 h | warning (was info until 1.0.28 — no path posted it) |
+| `CopilotApiDown` / `CopilotWorkerDown` / `CopilotWorkerSyncDown` | 0 available replicas of `sre-ai-api` / `copilot-worker` / `copilot-worker-sync` for 5 m | critical |
+| `CopilotExecutorDown` | 0 available replicas of `copilot-executor` for 5 m | warning |
+| `CopilotPodCrashLooping` | restarts in ns `sre-ai` for 15 m | warning |
+| `CopilotPostgresBackupFailed` | failed `postgres-backup-*` Job | warning |
+| `CopilotPostgresBackupMissing` | no successful `postgres-backup` for more than 26 h (or no data) | warning |
+| `CopilotCeleryBacklog` | `max by (queue) (celery_queue_length) > 100` for 15 m | warning |
+
