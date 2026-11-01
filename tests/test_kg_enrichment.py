@@ -1367,3 +1367,100 @@ def test_health_skips_when_no_metric_data():
     assert signals["http_5xx_rate"] is None
     assert signals["deploy_failure_pct"] is None
     assert signals["slo_burn_pct"] is None
+
+
+# ── обратный ход дрейфа: пересозданный namespace ───────────────────────────
+
+
+def _marked_svc(db, name, ns, *, prev=None):
+    from app.knowledge_graph.schema import Service
+
+    meta = {"drift_reason": "ns_not_in_k8s", "drift_marked_at": "2026-10-03T05:17:34Z",
+            "k8s_workload": {"replicas": 1}}
+    if prev is not None:
+        meta["drift_prev_synthetic"] = prev
+    s = Service(name=name, namespace=ns, synthetic=True, metadata_json=meta)
+    db.add(s)
+    return s
+
+
+def test_drift_unmarks_services_of_revived_namespace():
+    """squad-28 снесли и пересоздали: пометка дрейфа должна сняться.
+
+    До 01.11.2026 её только ставили — 6717 узлов в живых ns числились
+    синтетикой, health по ним не считался.
+    """
+    from app.knowledge_graph.schema import NS_STATE_ACTIVE
+
+    db = _drift_db()
+    _ns_row(db, "squad-28-shared", state=NS_STATE_ACTIVE)
+    legacy = _marked_svc(db, "notificator", "squad-28-shared")
+    was_synth = _marked_svc(db, "ingress:x", "squad-28-shared", prev=True)
+    db.commit()
+
+    result = _run_drift(db, {"squad-28-shared"}, apply=True)
+
+    assert result["unmarked_services"] == 2
+    db.refresh(legacy)
+    db.refresh(was_synth)
+    assert legacy.synthetic is False
+    assert was_synth.synthetic is True
+    for s in (legacy, was_synth):
+        assert not {"drift_reason", "drift_marked_at", "drift_prev_synthetic"} & set(s.metadata_json)
+    assert legacy.metadata_json["k8s_workload"] == {"replicas": 1}
+
+
+def test_drift_keeps_mark_until_namespace_confirmed_active():
+    """Мало, что kubectl видит ns: lifecycle ещё держит его missing — ждём."""
+    from app.knowledge_graph.schema import NS_STATE_MISSING
+
+    db = _drift_db()
+    _ns_row(db, "squad-9-shared", state=NS_STATE_MISSING, missing_hours=48)
+    svc = _marked_svc(db, "svc", "squad-9-shared")
+    _ns_row(db, "squad-1-shared", state="active")
+    gone = _marked_svc(db, "svc", "squad-1-shared")
+    db.commit()
+
+    # squad-9 вернулся в kubectl, но не в lifecycle; squad-1 активен в графе,
+    # но в kubectl его нет.
+    result = _run_drift(db, {"squad-9-shared"}, apply=True, max_drift_pct=100.0)
+
+    assert result["unmarked_services"] == 0
+    db.refresh(svc)
+    db.refresh(gone)
+    assert svc.synthetic is True and gone.synthetic is True
+
+
+def test_drift_unmark_dry_run_counts_without_writing():
+    from app.knowledge_graph.schema import NS_STATE_ACTIVE
+
+    db = _drift_db()
+    _ns_row(db, "squad-3-shared", state=NS_STATE_ACTIVE)
+    svc = _marked_svc(db, "svc", "squad-3-shared")
+    db.commit()
+
+    result = _run_drift(db, {"squad-3-shared"}, apply=False)
+
+    assert result["unmarked_services"] == 1
+    db.refresh(svc)
+    assert svc.synthetic is True and "drift_reason" in svc.metadata_json
+
+
+def test_drift_mark_remembers_previous_synthetic():
+    from app.knowledge_graph.schema import NS_STATE_ACTIVE, NS_STATE_MISSING, Service
+
+    db = _drift_db()
+    _ns_row(db, "live", state=NS_STATE_ACTIVE)
+    _svc_row(db, "svc", "live")
+    _ns_row(db, "gone", state=NS_STATE_MISSING, missing_hours=48)
+    real = Service(name="real", namespace="gone", synthetic=False)
+    synth = Service(name="ingress:h", namespace="gone", synthetic=True)
+    db.add_all([real, synth])
+    db.commit()
+
+    _run_drift(db, {"live"}, apply=True, max_drift_pct=100.0)
+
+    db.refresh(real)
+    db.refresh(synth)
+    assert real.synthetic is True and real.metadata_json["drift_prev_synthetic"] is False
+    assert synth.metadata_json["drift_prev_synthetic"] is True

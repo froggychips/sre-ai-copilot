@@ -30,7 +30,9 @@ import logging
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Optional, Set
 
+import sqlalchemy as sa
 from sqlalchemy.orm import Session
+from sqlalchemy.orm.attributes import flag_modified
 
 from app.knowledge_graph.kubectl_breaker import run_kubectl
 from app.knowledge_graph.nats_subjects_sync import NATS_SUBJECTS_NAMESPACE
@@ -50,6 +52,61 @@ _SYNTHETIC_NAMESPACES = frozenset({NATS_SUBJECTS_NAMESPACE})
 #: (lifecycle ходит каждые 10 минут и снимает отметку сразу же), и заведомо
 #: меньше срока, за который снесённый стенд успевает испортить отчёты.
 _MISSING_GRACE = timedelta(hours=24)
+
+
+#: Ключи метаданных, которые ставит пометка дрейфа.
+_DRIFT_KEYS = ("drift_reason", "drift_marked_at", "drift_prev_synthetic")
+
+
+def _unmark_revived(db: Session, live: Set[str], apply: bool) -> int:
+    """Снять пометку дрейфа с узлов namespace, который снова живой.
+
+    До 01.11.2026 пометку только ставили. Стенд, снесённый и пересозданный
+    под тем же именем (обычное дело для squad-N), оставался со
+    `synthetic=true` на всех узлах: синки, которые не передают `synthetic`
+    явно (топология — None), флаг не трогают. Замер 01.11: 6717 узлов в 175
+    живых namespace числились синтетикой — health по ним не считался, — и
+    ещё 1214 несли устаревшие drift-ключи.
+
+    Подтверждение — то же двойное, что у пометки, только зеркально: ns есть
+    в `kubectl get ns` СЕЙЧАС и `kg_namespaces` держит его `active`.
+
+    `synthetic` возвращается к значению до пометки (`drift_prev_synthetic`,
+    сохраняется с 01.11.2026). У старых пометок его нет — ставим False:
+    источники, для которых узел синтетичен по построению (ingress, NATS
+    subjects, узлы из алертов), передают `synthetic=True` явно и вернут
+    флаг своим следующим прогоном.
+    """
+    active = {
+        ns for (ns,) in db.query(Namespace.namespace)
+        .filter(Namespace.state == NS_STATE_ACTIVE).all()
+    }
+    revived_ns = (live & active) - _SYNTHETIC_NAMESPACES
+    if not revived_ns:
+        return 0
+    rows = (
+        db.query(Service)
+        .filter(Service.namespace.in_(sorted(revived_ns)),
+                sa.cast(Service.metadata_json, sa.String).like('%"drift_reason"%'))
+        .all()
+    )
+    unmarked = 0
+    for svc in rows:
+        meta = svc.metadata_json if isinstance(svc.metadata_json, dict) else {}
+        if "drift_reason" not in meta:
+            continue
+        unmarked += 1
+        if not apply:
+            continue
+        new_meta = {k: v for k, v in meta.items() if k not in _DRIFT_KEYS}
+        svc.synthetic = bool(meta.get("drift_prev_synthetic", False))
+        svc.metadata_json = new_meta
+        flag_modified(svc, "metadata_json")
+    if apply and unmarked:
+        db.commit()
+        log.info("drift_cleanup.unmarked_revived services=%d namespaces=%d",
+                 unmarked, len({s.namespace for s in rows}))
+    return unmarked
 
 
 class DriftCleanupSkipped(Exception):
@@ -133,11 +190,15 @@ def run_drift_cleanup(
           "shrink_pct": float,            # усадка live-набора vs active в графе
           "skipped_threshold": bool,
           "marked_services": int,  # 0 если apply=False или skipped
+          "unmarked_services": int,  # снята пометка: ns снова живой
           "applied": bool,
         }
     """
     stamp = now or datetime.now(timezone.utc).replace(tzinfo=None)
     k8s_ns = _k8s_live_namespaces()
+    # Сначала — обратный ход: узлы вернувшихся namespace. Он не зависит от
+    # порога усадки: снимает пометку только там, где ns подтверждённо живой.
+    unmarked = _unmark_revived(db, k8s_ns, apply)
     kg_ns = {
         ns for (ns,) in db.query(Service.namespace).distinct().all()
         if ns not in _SYNTHETIC_NAMESPACES
@@ -163,6 +224,7 @@ def run_drift_cleanup(
         "shrink_pct": shrink_pct,
         "skipped_threshold": False,
         "marked_services": 0,
+        "unmarked_services": unmarked,
         "applied": False,
     }
 
@@ -208,8 +270,11 @@ def run_drift_cleanup(
         existing_meta: Dict[str, Any] = s.metadata_json if isinstance(s.metadata_json, dict) else {}
         if s.synthetic and existing_meta.get("drift_reason"):
             continue  # уже помечен ранее — пропускаем
-        s.synthetic = True
         meta = dict(existing_meta)
+        # Прежнее значение — чтобы при возвращении ns вернуть как было
+        # (см. _unmark_revived).
+        meta["drift_prev_synthetic"] = bool(s.synthetic)
+        s.synthetic = True
         meta["drift_marked_at"] = now_iso
         meta["drift_reason"] = "ns_not_in_k8s"
         s.metadata_json = meta
