@@ -10,9 +10,10 @@
 Env: DATABASE_URL, TC_URL, TC_TOKEN, CONFLUENCE_BASE, CONFLUENCE_EMAIL, CONFLUENCE_TOKEN,
      CONFLUENCE_PAGE_ID, CONFLUENCE_TITLE, [WINDOW=400], [SQUADS="1..24"], [DRY_RUN=1],
      [NAME_OVERRIDES='{"логин":"Имя Фамилия"}' — для учёток вне TeamCity],
-     [RESERVED_MAP='{"squad-N":"логин · dev-N"}' — резерв нод, зеркало squad-mapping.yaml].
-Обе карты — только через env (ConfigMap squad-dashboard-env): репозиторий публичный,
-связка логин↔человек и логин↔нода в нём не хранится.
+     [SQUAD_MAPPING_URL — GitLab raw API на services/squad-mapping.yaml (wo-k8s),
+      SQUAD_MAPPING_TOKEN — read_repository-токен к нему; колонка «Reserved for»].
+NAME_OVERRIDES и SQUAD_MAPPING_URL — только через env (ConfigMap squad-dashboard-env):
+репозиторий публичный, связка логин↔человек и логин↔нода в нём не хранится.
 DRY_RUN=1 — всё собрать и отрендерить, но НЕ писать в Confluence (печатает сводку).
 
 Источники логики: ref_kg_squad_dashboard_query (KG-SQL), ~/tc_squad_last_build.sh (TC REST).
@@ -25,6 +26,7 @@ import html
 import datetime
 import requests
 import psycopg2
+import yaml
 
 WINDOW = int(os.environ.get("WINDOW", "400"))
 STALE_DAYS = int(os.environ.get("STALE_DAYS", "14"))  # нет деплоя/активности дольше → «протух»
@@ -42,9 +44,9 @@ CH_HOST_TEMPLATE = os.environ.get("CH_HOST_TEMPLATE",
 SQUAD_NUMS = [int(x) for x in SQUADS.split()] if SQUADS else list(range(1, 70))
 
 # Резервирование новых дедик-нод под разработчиков (WO-12485): squad -> «TC-логин · нода».
-# Зеркало services/squad-mapping.yaml (wo-k8s). Карта задаётся ТОЛЬКО через env RESERVED_MAP —
-# см. reserved_map(); в репозитории её нет и быть не должно по той же причине, что и у
-# NAME_OVERRIDES: репозиторий публичный, а связка логин↔нода — личные данные.
+# Источник — services/squad-mapping.yaml (wo-k8s), читается на каждом прогоне, см. reserved_map().
+# До 04.11.2026 здесь была ручная копия в env RESERVED_MAP: её забывали обновлять, и витрина
+# показывала устаревший резерв. В репозитории карты нет и быть не должно — он публичный.
 _RESERVED = None
 DRY_RUN = os.environ.get("DRY_RUN", "") not in ("", "0", "false", "False")
 
@@ -260,22 +262,47 @@ def name_overrides():
     return _OVERRIDES
 
 
+def reserved_from_mapping(doc):
+    """squad-mapping.yaml → {squad-N: «логин · нода»}.
+
+    Резерв — секция owners:, нода — из squads:. Выведенные (retired:) не показываем,
+    даже если в owners их забыли убрать.
+    """
+    def section(name):
+        v = doc.get(name) if isinstance(doc, dict) else None
+        return v if isinstance(v, dict) else {}
+
+    squads, retired = section("squads"), section("retired")
+    out = {}
+    for squad, login in section("owners").items():
+        if not login or squad in retired:
+            continue
+        node = squads.get(squad)
+        out[squad] = f"{login} · {node}" if node else str(login)
+    return out
+
+
 def reserved_map():
     """squad-N → «TC-логин · нода» для колонки «Reserved for» (WO-12485).
 
-    Зеркало services/squad-mapping.yaml (wo-k8s). Задаётся ТОЛЬКО через env RESERVED_MAP
-    (JSON, ConfigMap squad-dashboard-env) — по той же причине, что и NAME_OVERRIDES:
-    репозиторий публичный, а связка логин↔нода — личные данные. Карты нет — колонка
-    просто остаётся пустой, прогон не падает. Кривой JSON — тоже не роняем.
+    Читает services/squad-mapping.yaml из GitLab (SQUAD_MAPPING_URL + SQUAD_MAPPING_TOKEN).
+    Не настроено или GitLab не ответил — колонка остаётся пустой, прогон не падает.
     """
     global _RESERVED
     if _RESERVED is None:
-        raw = (os.environ.get("RESERVED_MAP") or "").strip()
+        _RESERVED = {}
+        url = (os.environ.get("SQUAD_MAPPING_URL") or "").strip()
+        if not url:
+            log("  squad-mapping: SQUAD_MAPPING_URL не задан → колонка «Reserved for» пустая")
+            return _RESERVED
+        token = (os.environ.get("SQUAD_MAPPING_TOKEN") or "").strip()
         try:
-            _RESERVED = json.loads(raw) if raw else {}
-        except ValueError as e:
-            log(f"  RESERVED_MAP: не разобрался как JSON ({e}) → игнорируем")
-            _RESERVED = {}
+            r = requests.get(url, headers={"PRIVATE-TOKEN": token} if token else {}, timeout=20)
+            r.raise_for_status()
+            _RESERVED = reserved_from_mapping(yaml.safe_load(r.text))
+            log(f"  squad-mapping: резерв у {len(_RESERVED)} сквадов")
+        except (requests.RequestException, yaml.YAMLError) as e:
+            log(f"  squad-mapping: не прочитался ({e}) → колонка «Reserved for» пустая")
     return _RESERVED
 
 
@@ -844,7 +871,7 @@ def render(rows, gen_date, jira_statuses=None, today=None):
         f'деплойера, пока новый владелец не катал полный деплой.</li>'
         f'<li><strong>Reserved for</strong> — за кем закреплён сквад и на какой выделенной 128GB-ноде (WO-12485), '
         f'формат «имя и фамилия · нода»; по 2 сквада на разработчика, оба на одной ноде (co-location из-за local-path PVC). '
-        f'Резерв (squad→разработчик→нода) — из карты в генераторе, зеркало <code>services/squad-mapping.yaml</code> (wo-k8s). '
+        f'Резерв (squad→разработчик→нода) читается на каждом прогоне из <code>services/squad-mapping.yaml</code> (wo-k8s, секции owners/squads). '
         f'Пусто = сквад не зарезервирован под дедик-ноду. Для squad-40..53 и squad-60..69 сквад может ещё не быть создан.</li>'
         f'<li><strong>Задача</strong> — WO-тикет из ветки деплоя; пусто при preprod/default.</li>'
         f'<li><strong>Ветка</strong> — <code>deployed-branch</code> из лейбла namespace.</li>'
