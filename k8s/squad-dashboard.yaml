@@ -21,7 +21,9 @@
 #     --from-literal=WINDOW=400 \
 #     --from-literal=CH_USER=analytics \
 #     --from-literal=CH_PORT=8123 \
+#     --from-literal=SQUAD_MAPPING_URL='https://<gitlab-host>/api/v4/projects/<id>/repository/files/services%2Fsquad-mapping.yaml/raw?ref=preprod' \
 #     --dry-run=client -o yaml | kubectl apply -f -
+#   # SQUAD_MAPPING_URL — источник колонки «Reserved for» (owners/squads из wo-k8s).
 #   # Все сквады резолвятся по фолбэку clickhouse.squad-N-shared.svc.cluster.local.
 #   # (bare-ns clickhouse.squad-N.svc из mcp-tools-server-config из ns sre-ai НЕ резолвится;
 #   #  при необходимости индивидуальный override — env CH_SQUAD{N}_HOST.)
@@ -32,8 +34,10 @@
 #     --from-file=tc_token=/path/tc_token \
 #     --from-file=confluence_token=/path/confluence_token \
 #     --from-file=ch_password=/path/ch_password \
+#     --from-file=gitlab_token=/path/gitlab_token \
 #     --dry-run=client -o yaml | kubectl apply -f -
 #   # ch_password = CH_PASSWORD из secret mcp-shared-secret (ns mcp), юзер analytics
+#   # gitlab_token = project access token wo-k8s (Reporter, read_repository) — читать squad-mapping.yaml
 #
 # DATABASE_URL берётся из существующего секрета sre-ai-secrets (envFrom).
 # Образ: в проде патчится на внутренний реестр (kubectl set image), как у copilot-worker.
@@ -110,6 +114,12 @@ spec:
                 secretKeyRef:
                   name: squad-dashboard-secrets
                   key: ch_password
+            - name: SQUAD_MAPPING_TOKEN         # read_repository к wo-k8s (squad-mapping.yaml)
+              valueFrom:
+                secretKeyRef:
+                  name: squad-dashboard-secrets
+                  key: gitlab_token
+                  optional: true
             resources:
               limits:
                 cpu: 500m
