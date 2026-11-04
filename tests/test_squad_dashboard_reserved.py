@@ -82,3 +82,9 @@ def test_gitlab_down_leaves_column_empty(dash, monkeypatch):
 def test_not_configured_leaves_column_empty(dash, monkeypatch):
     monkeypatch.delenv("SQUAD_MAPPING_URL", raising=False)
     assert dash.reserved_map() == {}
+
+
+@pytest.mark.parametrize("doc", [None, "текст", ["squad-1"], {"owners": ["squad-1"]}])
+def test_wrong_shape_is_empty_not_crash(dash, doc):
+    """URL указал не на тот файл/ref — колонка пустая, прогон живёт."""
+    assert dash.reserved_from_mapping(doc) == {}

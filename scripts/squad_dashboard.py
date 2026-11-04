@@ -268,11 +268,13 @@ def reserved_from_mapping(doc):
     Резерв — секция owners:, нода — из squads:. Выведенные (retired:) не показываем,
     даже если в owners их забыли убрать.
     """
-    doc = doc or {}
-    squads = doc.get("squads") or {}
-    retired = doc.get("retired") or {}
+    def section(name):
+        v = doc.get(name) if isinstance(doc, dict) else None
+        return v if isinstance(v, dict) else {}
+
+    squads, retired = section("squads"), section("retired")
     out = {}
-    for squad, login in (doc.get("owners") or {}).items():
+    for squad, login in section("owners").items():
         if not login or squad in retired:
             continue
         node = squads.get(squad)
