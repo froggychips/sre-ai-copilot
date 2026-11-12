@@ -31,8 +31,8 @@ from typing import List, Optional
 log = logging.getLogger(__name__)
 
 __all__ = [
-    "KubectlCircuitOpen", "guard_kubectl", "record_failure", "record_success",
-    "run_kubectl",
+    "KubectlCircuitOpen", "apiserver_answered", "guard_kubectl",
+    "record_failure", "record_success", "run_kubectl",
 ]
 
 #: Сколько подряд неудач открывают брейкер. Три — компромисс: одиночный
@@ -90,6 +90,29 @@ def guard_kubectl(operation: str = "kubectl") -> None:
         raise
     except Exception as e:  # noqa: BLE001
         log.debug("kubectl_cb.check_failed: %s", e)
+
+
+#: Ответы, которые apiserver ДАЛ: объекта нет, прав нет, объект уже есть,
+#: запрос кривой. Ненулевой код kubectl, но сервер жив и ответил быстро —
+#: это не повод отсекать соседей. 12.11.2026: remediation_bridge снимал
+#: снапшоты несуществующих Deployment-ов (цели CPUThrottlingHigh по нодам),
+#: три NotFound подряд открывали брейкер на 60 с — 15 раз за 3 ч, и
+#: `kubectl get ingresses -A` из kg_topology_resources_sync попадал в окно
+#: на каждом тике: `routes_to` не обновлялись 7 ч (CopilotSelfHealthFailing).
+_APISERVER_ANSWERED_MARKERS = (
+    "(NotFound)", "(Forbidden)", "(AlreadyExists)", "(Conflict)",
+    "(BadRequest)", "(Invalid)", "(MethodNotAllowed)",
+    "the server doesn't have a resource type",
+)
+
+
+def apiserver_answered(stderr: Optional[str]) -> bool:
+    """Ненулевой выход kubectl — это ответ apiserver-а, а не его молчание?
+
+    Брейкер про недоступность apiserver (таймауты, connection refused, 5xx),
+    а не про то, что спрошенного объекта нет."""
+    err = stderr or ""
+    return any(m in err for m in _APISERVER_ANSWERED_MARKERS)
 
 
 def record_failure(operation: str = "kubectl") -> None:
@@ -152,8 +175,10 @@ def run_kubectl(
     тестом `test_no_direct_kubectl_calls`.
 
     Бросает `KubectlCircuitOpen`, если брейкер открыт — до похода в сеть.
-    Ненулевой код возврата и исключения subprocess считаются неудачей и
-    приближают открытие; успех обнуляет счётчик.
+    Исключения subprocess (таймаут) и ненулевой код возврата считаются
+    неудачей и приближают открытие — кроме ответов, которые apiserver дал
+    (NotFound, Forbidden, … — `apiserver_answered`): они, как и успех,
+    обнуляют счётчик.
 
     `check=False` по умолчанию намеренно: синки в этом проекте разбирают
     stderr сами и деградируют, а не падают, — так guard'ы вроде
@@ -182,7 +207,7 @@ def run_kubectl(
     except Exception:
         record_failure(op)
         raise
-    if out.returncode != 0:
+    if out.returncode != 0 and not apiserver_answered(out.stderr):
         record_failure(op)
     else:
         record_success(op)

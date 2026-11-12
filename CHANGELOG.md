@@ -4,6 +4,27 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+### Исправлено
+
+- **Брейкер kubectl больше не открывается от NotFound/Forbidden.** `run_kubectl`
+  считал отказом apiserver-а любой ненулевой код kubectl. 12.11.2026
+  `remediation_bridge` снимал снапшоты несуществующих Deployment-ов (цели
+  `CPUThrottlingHigh` по нодам): три NotFound подряд открывали общий брейкер
+  на 60 с — 15 раз за 3 ч. `kubectl get ingresses -A` из
+  `kg_topology_resources_sync` попадал в окно на каждом тике, рёбра
+  `routes_to` не обновлялись 7 ч, у `kg_sync` 68 ошибок из 86 —
+  `CopilotSelfHealthFailing` (`edge_kind_freshness`). Ответы, которые сервер
+  дал (`NotFound`, `Forbidden`, `AlreadyExists`, `Conflict`, `BadRequest`,
+  `Invalid`, нет типа ресурса), теперь обнуляют серию, как успех; отказ —
+  только таймауты и недоступность.
+- **Сбой выборки services/ingresses — `error` в отчёте источника, а не
+  «ноль объектов».** `_kubectl_get_all` при сбое возвращал `[]`, и синк
+  отчитывался `fetched=0 errors=0`. Теперь источник помечается failed:
+  edge-decay guard не трогает рёбра, `source_coverage` показывает его
+  unhealthy сразу, а не через устаревание рёбер.
+- **self-health: пишущая задача `routes_to` — `kg_topology_resources_sync`**,
+  а не `kg_ingress_sync` (тот строит точки входа `ingress:<host>`).
+
 ## [1.0.34] — 2026-11-01 — мост scale-out по CPUThrottlingHigh, метрики executor-а
 ## [1.0.33] — 2026-11-01 — Python 3.13, логирование в каждом процессе, меньше WAL, снятие пометки дрейфа
 ### Исправлено

@@ -916,3 +916,44 @@ def test_legacy_edge_without_provenance_is_kept(db):
             db, deployments_index=_index_deployments_by_ns(deps))
 
     assert stats["edges_dropped_stale_selector"] == 0
+
+
+def test_ingresses_fetch_failure_is_reported_not_empty(db, monkeypatch):
+    """Сбой `kubectl get ingresses` (открытый брейкер) — это `error` в отчёте
+    источника, а не «ingress-ов ноль, ошибок ноль»: иначе self-health видит
+    только устаревание `routes_to` через часы (12.11.2026)."""
+    from app.knowledge_graph import k8s_topology_resources_sync as mod
+    from app.knowledge_graph.kubectl_breaker import KubectlCircuitOpen
+
+    def boom(*a, **k):
+        raise KubectlCircuitOpen("get ingresses: circuit open")
+
+    monkeypatch.setattr(mod, "run_kubectl", boom)
+    reported = {}
+    monkeypatch.setattr(mod, "record_source_run",
+                        lambda source, stats: reported.update({source: dict(stats)}))
+
+    stats = mod.sync_all_ingresses_declarative(db)
+
+    assert stats["ingresses_fetched"] == 0
+    assert "circuit open" in stats["error"]
+    assert "circuit open" in reported[mod.SOURCE_TOPOLOGY_INGRESSES]["error"]
+
+
+def test_ingresses_successful_fetch_clears_previous_error(db, monkeypatch):
+    """Ошибка прошлого тика не прилипает к следующему успешному."""
+    from app.knowledge_graph import k8s_topology_resources_sync as mod
+
+    mod._LAST_FETCH_ERROR["ingresses"] = "kubectl_rc_1"
+
+    class R:
+        returncode = 0
+        stdout = '{"items": []}'
+        stderr = ""
+
+    monkeypatch.setattr(mod, "run_kubectl", lambda *a, **k: R())
+    monkeypatch.setattr(mod, "record_source_run", lambda *a, **k: None)
+
+    stats = mod.sync_all_ingresses_declarative(db)
+
+    assert "error" not in stats

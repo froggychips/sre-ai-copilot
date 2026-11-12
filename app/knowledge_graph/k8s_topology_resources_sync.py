@@ -153,6 +153,15 @@ timeout=_KUBECTL_TIMEOUT_NS_S,
     return items
 
 
+#: Почему последний `_kubectl_get_all(resource)` вернул [] из-за сбоя, а не
+#: потому что объектов нет. Пишется и читается в одном процессе подряд
+#: (синк зовёт выборку и сразу смотрит сюда), форки не делят память — гонок
+#: нет. Без этого сбой выборки уходил в отчёт источника как
+#: `fetched=0 errors=0`: «ingress-ов в кластере ноль», и self-health видел
+#: только устаревание рёбер через несколько часов.
+_LAST_FETCH_ERROR: Dict[str, str] = {}
+
+
 def _kubectl_get_all(resource: str) -> List[Dict[str, Any]]:
     """`kubectl get <resource> -A -o json` → items list (или [] при ошибке).
 
@@ -163,6 +172,7 @@ def _kubectl_get_all(resource: str) -> List[Dict[str, Any]]:
     подхватывает per-namespace фоллбэк — иначе один медленный ответ
     apiserver'а обнулял весь тик (см. комментарий к _KUBECTL_TIMEOUT_S).
     """
+    _LAST_FETCH_ERROR.pop(resource, None)
     try:
         out = run_kubectl(
 ["kubectl", "get", resource, "-A", "-o", "json",
@@ -180,6 +190,7 @@ timeout=_KUBECTL_TIMEOUT_S,
             "k8s_topology_resources.kubectl_exception resource=%s err=%s",
             resource, e,
         )
+        _LAST_FETCH_ERROR[resource] = f"kubectl_exception: {e}"[:200]
         return []
 
     if out.returncode != 0:
@@ -187,6 +198,7 @@ timeout=_KUBECTL_TIMEOUT_S,
             "k8s_topology_resources.kubectl_failed resource=%s rc=%d stderr=%s",
             resource, out.returncode, (out.stderr or "").strip()[:200],
         )
+        _LAST_FETCH_ERROR[resource] = f"kubectl_rc_{out.returncode}"
         return []
 
     try:
@@ -196,6 +208,7 @@ timeout=_KUBECTL_TIMEOUT_S,
             "k8s_topology_resources.json_decode_failed resource=%s err=%s",
             resource, e,
         )
+        _LAST_FETCH_ERROR[resource] = "json_decode_failed"
         return []
 
     items = data.get("items") or []
@@ -527,6 +540,10 @@ def sync_all_services(
         "errors": 0,
     }
 
+    if _LAST_FETCH_ERROR.get("services"):
+        # См. ingresses: сбой выборки ≠ «Service-ов ноль».
+        stats["error"] = _LAST_FETCH_ERROR["services"]
+
     for i, svc in enumerate(services, 1):
         try:
             # SAVEPOINT на item: один DataError не переводит Session в
@@ -791,6 +808,11 @@ def sync_all_ingresses_declarative(db: Session) -> Dict[str, int]:
         # Ingress-ы, откатившиеся per-item savepoint-ом.
         "errors": 0,
     }
+    if _LAST_FETCH_ERROR.get("ingresses"):
+        # Выборка не удалась — это не «ingress-ов ноль». `error` в отчёте
+        # источника = failed: edge-decay guard не тронет `routes_to`,
+        # self-health покажет источник unhealthy сразу.
+        stats["error"] = _LAST_FETCH_ERROR["ingresses"]
 
     for i, ing in enumerate(ingresses, 1):
         try:
