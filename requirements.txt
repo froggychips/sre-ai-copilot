@@ -39,7 +39,7 @@ kubernetes==37.0.1
 mako==1.4.2
 markupsafe==3.0.3
 multidict==6.9.1
-oauthlib==4.0.0
+oauthlib==4.0.1
 opentelemetry-api==1.45.2
 opentelemetry-exporter-http-transport[requests]==0.66b2
 opentelemetry-exporter-otlp==1.45.2

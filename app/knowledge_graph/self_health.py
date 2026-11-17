@@ -782,7 +782,11 @@ _EDGE_KIND_SOURCES: Dict[str, Dict[str, Any]] = {
     "uses_db": {"task": "kg_topology_sync", "stale_after_minutes": 180},
     "uses_nats": {"task": "kg_nats_subjects_sync", "stale_after_minutes": 180},
     "serves_traffic": {"task": "kg_topology_resources_sync", "stale_after_minutes": 120},
-    "routes_to": {"task": "kg_ingress_sync", "stale_after_minutes": 180},
+    # Пишет k8s_topology_resources_sync (срез ingresses, задача
+    # kg_topology_resources_sync), а не kg_ingress_sync — тот строит
+    # `ingress:<host>` точки входа. Неверное имя уводило разбор: kg_ingress_sync
+    # зелёный, а рёбра стареют (12.11.2026).
+    "routes_to": {"task": "kg_topology_resources_sync", "stale_after_minutes": 180},
 }
 
 

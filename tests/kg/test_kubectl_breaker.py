@@ -234,3 +234,39 @@ def test_wrapper_resets_on_success(redis, monkeypatch):
     cb.record_failure("get pods")
 
     cb.guard_kubectl("get pods")   # три было, но не подряд
+
+
+@pytest.mark.parametrize("stderr", [
+    'Error from server (NotFound): deployments.apps "kube-proxy" not found',
+    'Error from server (Forbidden): pods is forbidden: User "x" cannot list',
+    "error: the server doesn't have a resource type \"foo\"",
+])
+def test_wrapper_does_not_count_apiserver_answers_as_failure(redis, monkeypatch, stderr):
+    """NotFound/Forbidden — apiserver жив и ответил. 12.11.2026: три NotFound
+    от снапшотов remediation_bridge открывали брейкер всем синкам."""
+    class R:
+        returncode = 1
+        stdout = ""
+
+    R.stderr = stderr
+    monkeypatch.setattr(cb.subprocess, "run", lambda *a, **k: R())
+    for _ in range(cb.FAILURES_TO_OPEN * 2):
+        cb.run_kubectl(["kubectl", "get", "deployment", "x"])
+
+    cb.guard_kubectl("get ingresses")   # не открыт
+
+
+def test_apiserver_answer_resets_the_streak(redis, monkeypatch):
+    """Ответ сервера посреди сбоев рвёт серию «подряд», как и успех."""
+    class R:
+        returncode = 1
+        stdout = ""
+        stderr = 'Error from server (NotFound): pods "x" not found'
+
+    monkeypatch.setattr(cb.subprocess, "run", lambda *a, **k: R())
+    cb.record_failure("get pods")
+    cb.record_failure("get pods")
+    cb.run_kubectl(["kubectl", "get", "pods", "x"])
+    cb.record_failure("get pods")
+
+    cb.guard_kubectl("get pods")

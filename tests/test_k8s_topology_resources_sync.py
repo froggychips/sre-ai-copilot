@@ -679,6 +679,51 @@ def test_per_namespace_fallback_skips_broken_namespace():
         items = mod._kubectl_get_all("services")
 
     assert [i["metadata"]["name"] for i in items] == ["dep-good"]
+    # Частичный сбор помечает источник сбойным: иначе edge-decay снял бы
+    # рёбра пропущенного namespace как исчезнувшие.
+    assert mod._LAST_FETCH_ERROR["services"] == "per_namespace_fallback: failed_ns=1/2"
+
+
+def test_per_namespace_fallback_clean_run_leaves_no_error():
+    """Фоллбэк без сбойных namespace — источник здоров, ошибки нет."""
+    import subprocess
+
+    from app.knowledge_graph import k8s_topology_resources_sync as mod
+
+    def fake_run(cmd, **kwargs):
+        if "-A" in cmd:
+            raise subprocess.TimeoutExpired(cmd=cmd, timeout=1)
+        if "namespaces" in cmd:
+            return SimpleNamespace(returncode=0, stdout="good\n", stderr="")
+        return SimpleNamespace(
+            returncode=0,
+            stdout=json.dumps({"items": [{"metadata": {"name": "dep-good"}}]}),
+            stderr="",
+        )
+
+    with patch.object(mod.subprocess, "run", side_effect=fake_run):
+        items = mod._kubectl_get_all("services")
+
+    assert len(items) == 1
+    assert "services" not in mod._LAST_FETCH_ERROR
+
+
+def test_per_namespace_fallback_ns_list_failure_is_fetch_error():
+    """Не получили список namespace — это сбой выборки, а не «объектов ноль»."""
+    import subprocess
+
+    from app.knowledge_graph import k8s_topology_resources_sync as mod
+
+    def fake_run(cmd, **kwargs):
+        if "-A" in cmd:
+            raise subprocess.TimeoutExpired(cmd=cmd, timeout=1)
+        return SimpleNamespace(returncode=1, stdout="", stderr="boom")
+
+    with patch.object(mod.subprocess, "run", side_effect=fake_run):
+        items = mod._kubectl_get_all("ingresses")
+
+    assert items == []
+    assert mod._LAST_FETCH_ERROR["ingresses"] == "per_namespace_fallback: ns_list_failed"
 
 
 # ── смена selector'а: ребро на прежний workload обязано сниматься ───────────
@@ -916,3 +961,44 @@ def test_legacy_edge_without_provenance_is_kept(db):
             db, deployments_index=_index_deployments_by_ns(deps))
 
     assert stats["edges_dropped_stale_selector"] == 0
+
+
+def test_ingresses_fetch_failure_is_reported_not_empty(db, monkeypatch):
+    """Сбой `kubectl get ingresses` (открытый брейкер) — это `error` в отчёте
+    источника, а не «ingress-ов ноль, ошибок ноль»: иначе self-health видит
+    только устаревание `routes_to` через часы (12.11.2026)."""
+    from app.knowledge_graph import k8s_topology_resources_sync as mod
+    from app.knowledge_graph.kubectl_breaker import KubectlCircuitOpen
+
+    def boom(*a, **k):
+        raise KubectlCircuitOpen("get ingresses: circuit open")
+
+    monkeypatch.setattr(mod, "run_kubectl", boom)
+    reported = {}
+    monkeypatch.setattr(mod, "record_source_run",
+                        lambda source, stats: reported.update({source: dict(stats)}))
+
+    stats = mod.sync_all_ingresses_declarative(db)
+
+    assert stats["ingresses_fetched"] == 0
+    assert "circuit open" in stats["error"]
+    assert "circuit open" in reported[mod.SOURCE_TOPOLOGY_INGRESSES]["error"]
+
+
+def test_ingresses_successful_fetch_clears_previous_error(db, monkeypatch):
+    """Ошибка прошлого тика не прилипает к следующему успешному."""
+    from app.knowledge_graph import k8s_topology_resources_sync as mod
+
+    mod._LAST_FETCH_ERROR["ingresses"] = "kubectl_rc_1"
+
+    class R:
+        returncode = 0
+        stdout = '{"items": []}'
+        stderr = ""
+
+    monkeypatch.setattr(mod, "run_kubectl", lambda *a, **k: R())
+    monkeypatch.setattr(mod, "record_source_run", lambda *a, **k: None)
+
+    stats = mod.sync_all_ingresses_declarative(db)
+
+    assert "error" not in stats
