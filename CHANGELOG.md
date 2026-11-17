@@ -21,7 +21,9 @@ All notable changes to this project are documented in this file.
   «ноль объектов».** `_kubectl_get_all` при сбое возвращал `[]`, и синк
   отчитывался `fetched=0 errors=0`. Теперь источник помечается failed:
   edge-decay guard не трогает рёбра, `source_coverage` показывает его
-  unhealthy сразу, а не через устаревание рёбер.
+  unhealthy сразу, а не через устаревание рёбер. То же при запасной
+  выборке по namespace: если часть namespace не ответила или не получен их
+  список, данные берутся частичные, но источник помечается failed.
 - **self-health: пишущая задача `routes_to` — `kg_topology_resources_sync`**,
   а не `kg_ingress_sync` (тот строит точки входа `ingress:<host>`).
 

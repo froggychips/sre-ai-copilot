@@ -129,6 +129,8 @@ def _kubectl_get_per_namespace(resource: str) -> List[Dict[str, Any]]:
     """
     namespaces = _kubectl_namespaces()
     if not namespaces:
+        # Список namespace не получен — выборки нет вовсе, а не «объектов ноль».
+        _LAST_FETCH_ERROR[resource] = "per_namespace_fallback: ns_list_failed"
         return []
     items: List[Dict[str, Any]] = []
     failed = 0
@@ -150,6 +152,13 @@ timeout=_KUBECTL_TIMEOUT_NS_S,
         "k8s_topology_resources.per_namespace_fallback resource=%s ns=%d items=%d failed_ns=%d",
         resource, len(namespaces), len(items), failed,
     )
+    if failed:
+        # Частичные данные отдаём (лучше пустого тика), но источник помечаем
+        # сбойным: иначе отчёт выглядит здоровым и edge-decay снимет рёбра
+        # пропущенных namespace как «исчезнувшие».
+        _LAST_FETCH_ERROR[resource] = (
+            f"per_namespace_fallback: failed_ns={failed}/{len(namespaces)}"
+        )
     return items
 
 
@@ -507,7 +516,7 @@ def _extract_ingress_routes(
 def sync_all_services(
     db: Session,
     deployments_index: Optional[Dict[str, List[Dict[str, Any]]]] = None,
-) -> Dict[str, int]:
+) -> Dict[str, Any]:
     """Загрузить все Services cluster-wide, upsert nodes + edges.
 
     Возвращает stats:
@@ -524,7 +533,7 @@ def sync_all_services(
     if deployments_index is None:
         deployments_index = _index_deployments_by_ns(_kubectl_get_deployments_all())
 
-    stats = {
+    stats: Dict[str, Any] = {
         "services_fetched": len(services),
         "nodes_upserted": 0,
         "workload_nodes_upserted": 0,
@@ -589,7 +598,7 @@ def _drop_stale_selector_edges(
     db: Session,
     svc_node: Service,
     selector: Dict[str, str],
-    stats: Dict[str, int],
+    stats: Dict[str, Any],
 ) -> None:
     """Снять serves_traffic-рёбра, построенные по УСТАРЕВШЕМУ selector'у.
 
@@ -654,7 +663,7 @@ def _sync_one_service(
     db: Session,
     svc: Dict[str, Any],
     deployments_index: Dict[str, Any],
-    stats: Dict[str, int],
+    stats: Dict[str, Any],
 ) -> None:
     """Тело обработки одного Service — вынесено ради per-item SAVEPOINT."""
     meta = svc.get("metadata") or {}
@@ -785,7 +794,7 @@ def _sync_one_service(
 # ── ingress sync ────────────────────────────────────────────────────────────
 
 
-def sync_all_ingresses_declarative(db: Session) -> Dict[str, int]:
+def sync_all_ingresses_declarative(db: Session) -> Dict[str, Any]:
     """Declarative Ingress → routes_to Service edges.
 
     Параллельный источник к `app.knowledge_graph.k8s_ingress_sync` (который
@@ -799,7 +808,7 @@ def sync_all_ingresses_declarative(db: Session) -> Dict[str, int]:
         / skipped_no_backend_match
     """
     ingresses = _kubectl_get_all("ingresses")
-    stats = {
+    stats: Dict[str, Any] = {
         "ingresses_fetched": len(ingresses),
         "routes_seen": 0,
         "nodes_created": 0,
@@ -845,7 +854,7 @@ def sync_all_ingresses_declarative(db: Session) -> Dict[str, int]:
 
 
 def _sync_one_ingress(
-    db: Session, ing: Dict[str, Any], stats: Dict[str, int],
+    db: Session, ing: Dict[str, Any], stats: Dict[str, Any],
 ) -> None:
     """Тело обработки одного Ingress — вынесено ради per-item SAVEPOINT."""
     meta = ing.get("metadata") or {}

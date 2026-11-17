@@ -679,6 +679,51 @@ def test_per_namespace_fallback_skips_broken_namespace():
         items = mod._kubectl_get_all("services")
 
     assert [i["metadata"]["name"] for i in items] == ["dep-good"]
+    # Частичный сбор помечает источник сбойным: иначе edge-decay снял бы
+    # рёбра пропущенного namespace как исчезнувшие.
+    assert mod._LAST_FETCH_ERROR["services"] == "per_namespace_fallback: failed_ns=1/2"
+
+
+def test_per_namespace_fallback_clean_run_leaves_no_error():
+    """Фоллбэк без сбойных namespace — источник здоров, ошибки нет."""
+    import subprocess
+
+    from app.knowledge_graph import k8s_topology_resources_sync as mod
+
+    def fake_run(cmd, **kwargs):
+        if "-A" in cmd:
+            raise subprocess.TimeoutExpired(cmd=cmd, timeout=1)
+        if "namespaces" in cmd:
+            return SimpleNamespace(returncode=0, stdout="good\n", stderr="")
+        return SimpleNamespace(
+            returncode=0,
+            stdout=json.dumps({"items": [{"metadata": {"name": "dep-good"}}]}),
+            stderr="",
+        )
+
+    with patch.object(mod.subprocess, "run", side_effect=fake_run):
+        items = mod._kubectl_get_all("services")
+
+    assert len(items) == 1
+    assert "services" not in mod._LAST_FETCH_ERROR
+
+
+def test_per_namespace_fallback_ns_list_failure_is_fetch_error():
+    """Не получили список namespace — это сбой выборки, а не «объектов ноль»."""
+    import subprocess
+
+    from app.knowledge_graph import k8s_topology_resources_sync as mod
+
+    def fake_run(cmd, **kwargs):
+        if "-A" in cmd:
+            raise subprocess.TimeoutExpired(cmd=cmd, timeout=1)
+        return SimpleNamespace(returncode=1, stdout="", stderr="boom")
+
+    with patch.object(mod.subprocess, "run", side_effect=fake_run):
+        items = mod._kubectl_get_all("ingresses")
+
+    assert items == []
+    assert mod._LAST_FETCH_ERROR["ingresses"] == "per_namespace_fallback: ns_list_failed"
 
 
 # ── смена selector'а: ребро на прежний workload обязано сниматься ───────────
