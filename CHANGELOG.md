@@ -4,6 +4,8 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+## [1.0.35] — 2026-11-17 — брейкер kubectl не открывается от NotFound
+
 ### Исправлено
 
 - **Брейкер kubectl больше не открывается от NotFound/Forbidden.** `run_kubectl`
@@ -26,6 +28,14 @@ All notable changes to this project are documented in this file.
   список, данные берутся частичные, но источник помечается failed.
 - **self-health: пишущая задача `routes_to` — `kg_topology_resources_sync`**,
   а не `kg_ingress_sync` (тот строит точки входа `ingress:<host>`).
+
+### Зависимости
+
+- oauthlib 4.0.1 (CVE-2026-49272; блокирующий `pip-audit` краснил все PR).
+- Сводное обновление (#560): sqlalchemy 2.1.8, kubernetes 37.0.2, pydantic
+  2.14.3, python-dateutil 4.0.0, fastapi 0.162.0, pydantic-settings 2.16.2,
+  alembic 1.20.1; GitHub Actions — codeql-action 4.39.1, setup-node 7.1.0,
+  docker/login-action 4.7.0.
 
 ## [1.0.34] — 2026-11-01 — мост scale-out по CPUThrottlingHigh, метрики executor-а
 ## [1.0.33] — 2026-11-01 — Python 3.13, логирование в каждом процессе, меньше WAL, снятие пометки дрейфа
