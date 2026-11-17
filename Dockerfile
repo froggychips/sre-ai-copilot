@@ -49,7 +49,7 @@ RUN set -eux; \
 RUN pip install --no-cache-dir \
     grpcio==1.80.0 \
     psycopg2-binary==2.9.13 \
-    pydantic-core==2.46.4
+    pydantic-core==2.50.4
 
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
