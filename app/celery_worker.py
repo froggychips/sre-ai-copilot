@@ -64,6 +64,8 @@ _LAZY_ATTRS = {
     "ContextBuilder": "app.context.context_builder",
 }
 
+_DISABLED_REASON = "LLM_PIPELINE_ENABLED=false"
+
 
 def _lazy(name: str):
     try:
@@ -215,6 +217,20 @@ def generate_reply(
     snapshot: dict | None = None,
     environment_fingerprint: str | None = None,
 ):
+    # Тот же предохранитель, что у process_incident: при выключенном
+    # LLM-контуре задача не трогает ни БД, ни LLM и НЕ ретраится. Без него
+    # при `LLM_BACKEND=claude_cli` и отсутствии бинарника в образе задача
+    # падала и трижды уходила в retry. Постановку закрывают сами ручки
+    # (/copilot, /replay отвечают 503); эта проверка — для сообщений, уже
+    # лежащих в очереди, и для окна выкатки, когда api и worker расходятся
+    # в настройках.
+    if not settings.LLM_PIPELINE_ENABLED:
+        logger.warning(
+            "generate_reply.skipped_disabled",
+            conversation_id=conversation_id,
+            replay_mode=replay_mode,
+        )
+        return {"status": "skipped", "reason": _DISABLED_REASON}
     try:
         return asyncio.run(
             _generate_reply_logic(
