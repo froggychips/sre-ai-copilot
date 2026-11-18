@@ -30,11 +30,15 @@
 Contract». Guard'ы — tests/test_db_engine_pool_config.py и
 tests/test_idle_transaction_guard.py.
 """
+import threading
+from contextlib import contextmanager
 from datetime import date, datetime
 
-from typing import Any, Optional
+from typing import Any, Iterator, Optional
 from sqlalchemy import (JSON, BigInteger, Date, DateTime, Integer,
-                        String, create_engine, func)
+                        String, create_engine, event, func)
+from sqlalchemy.exc import DBAPIError, InterfaceError, OperationalError
+from sqlalchemy.exc import TimeoutError as PoolTimeoutError
 from sqlalchemy.orm import declarative_base, Mapped, mapped_column, sessionmaker
 
 from app.config import settings
@@ -166,6 +170,175 @@ ReadOnlyAutocommitSession = sessionmaker(
 Base = declarative_base()
 
 
+# ── Роль процесса и таймауты сессии ───────────────────────────────────────
+#
+# lock_timeout и statement_timeout нужны разные: API отвечает Alertmanager-у
+# и пробам kubelet, ему ждать чужой row-lock дольше пары секунд нельзя;
+# воркер гоняет синки, где запрос на десятки секунд — норма. Отдельного
+# признака роли в процессе не было, и новый env под него не заводим:
+#   * API объявляет себя сам — `set_process_role(ROLE_API)` в lifespan
+#     приложения (app/main.py);
+#   * worker/executor/beat — по сигналам Celery ниже (тем же способом, каким
+#     этот модуль уже узнаёт про fork: `worker_process_init`);
+#   * всё остальное (разовые скрипты, `python -m …` из пода, pytest) остаётся
+#     ROLE_SCRIPT и ограничений не получает. alembic сюда не попадает вовсе:
+#     у него свой engine (alembic/env.py) и свой `SET LOCAL lock_timeout`.
+#
+# Таймауты ставятся на соединение при его установлении (событие `connect`),
+# а не в `options` libpq: роль становится известна ПОСЛЕ импорта модуля, когда
+# engine уже создан. Смена роли сбрасывает пул, чтобы ни одно соединение не
+# осталось со старыми значениями.
+ROLE_SCRIPT = "script"
+ROLE_API = "api"
+ROLE_WORKER = "worker"
+
+_process_role: str = ROLE_SCRIPT
+
+
+def process_role() -> str:
+    return _process_role
+
+
+def session_timeouts_ms(role: Optional[str] = None, cfg: Any = None) -> tuple[int, int]:
+    """(lock_timeout, statement_timeout) в мс для роли; 0 — без ограничения."""
+    role = role or _process_role
+    cfg = cfg if cfg is not None else settings
+    if role == ROLE_API:
+        pair = (cfg.DB_API_LOCK_TIMEOUT_MS, cfg.DB_API_STATEMENT_TIMEOUT_MS)
+    elif role == ROLE_WORKER:
+        pair = (cfg.DB_WORKER_LOCK_TIMEOUT_MS, cfg.DB_WORKER_STATEMENT_TIMEOUT_MS)
+    else:
+        return (0, 0)
+    return (max(0, int(pair[0] or 0)), max(0, int(pair[1] or 0)))
+
+
+def set_process_role(role: str) -> None:
+    """Объявить роль процесса. Вызывать на старте, до работы с БД.
+
+    Идемпотентно. При смене роли пул сбрасывается: соединения, открытые до
+    объявления (импорт-тайм, startup-проверки), получили бы таймауты прежней
+    роли и жили бы с ними до pool_recycle.
+    """
+    global _process_role
+    if role not in (ROLE_SCRIPT, ROLE_API, ROLE_WORKER):
+        raise ValueError(f"unknown process role: {role!r}")
+    if role == _process_role:
+        return
+    _process_role = role
+    engine.dispose()
+
+
+def _apply_session_timeouts(dbapi_connection: Any, _connection_record: Any = None) -> None:
+    """`SET lock_timeout / statement_timeout` на новом соединении Postgres.
+
+    В autocommit: psycopg2 открывает транзакцию на первом же execute, а пул
+    при возврате соединения делает ROLLBACK — `SET` внутри транзакции был бы
+    откатан вместе с ней, и таймауты молча исчезли бы после первого запроса.
+    """
+    lock_ms, statement_ms = session_timeouts_ms()
+    if not lock_ms and not statement_ms:
+        return
+    previous = dbapi_connection.autocommit
+    dbapi_connection.autocommit = True
+    try:
+        cursor = dbapi_connection.cursor()
+        try:
+            if lock_ms:
+                cursor.execute(f"SET lock_timeout = {int(lock_ms)}")
+            if statement_ms:
+                cursor.execute(f"SET statement_timeout = {int(statement_ms)}")
+        finally:
+            cursor.close()
+    finally:
+        dbapi_connection.autocommit = previous
+
+
+# SQLSTATE, при которых запрос стоит повторить позже, а не считать ошибкой
+# данных: 57014 query_canceled (statement_timeout), 55P03 lock_not_available
+# (lock_timeout), 25P03 idle_in_transaction_session_timeout, а также классы
+# 08 (соединение), 40 (deadlock/serialization), 53 (нет ресурсов, в т.ч.
+# too_many_connections) и 57 (вмешательство оператора, остановка сервера).
+_RETRYABLE_SQLSTATES = frozenset({"55P03", "25P03"})
+_RETRYABLE_SQLSTATE_CLASSES = frozenset({"08", "40", "53", "57"})
+
+
+def is_retryable_db_error(exc: Optional[BaseException]) -> bool:
+    """Таймаут/недоступность БД (повторить позже), а не ошибка запроса.
+
+    Нужна, чтобы API отвечал Alertmanager-у 503 (тот повторит батч), а не
+    202 с потерянным алертом. Только Postgres (psycopg2): sqlite-ошибки в
+    тестах («no such table») сюда не попадают.
+    """
+    if isinstance(exc, PoolTimeoutError):
+        # Пул исчерпан: `QueuePool limit … reached, connection timed out`.
+        return True
+    if not isinstance(exc, DBAPIError):
+        return False
+    if exc.connection_invalidated:
+        return True
+    orig = exc.orig
+    try:
+        import psycopg2
+    except ImportError:  # окружение без драйвера Postgres
+        return False
+    if not isinstance(orig, psycopg2.Error):
+        return False
+    code = getattr(orig, "pgcode", None)
+    if not code:
+        # Без SQLSTATE psycopg2 отдаёт ошибки уровня соединения:
+        # «could not connect», «server closed the connection unexpectedly».
+        return isinstance(exc, (OperationalError, InterfaceError))
+    return code in _RETRYABLE_SQLSTATES or code[:2] in _RETRYABLE_SQLSTATE_CLASSES
+
+
+class RetryableDbErrorWatch:
+    """Первая retryable-ошибка БД, случившаяся в потоке под наблюдением."""
+
+    __slots__ = ("error",)
+
+    def __init__(self) -> None:
+        self.error: Optional[BaseException] = None
+
+
+_db_error_watch = threading.local()
+
+
+@contextmanager
+def watch_retryable_db_errors() -> Iterator[RetryableDbErrorWatch]:
+    """Заметить таймаут БД, даже если вызываемый код его проглотил.
+
+    Запись в граф (`populate_from_incident`) устроена best-effort: каждая
+    часть в своём SAVEPOINT, любое исключение — warning и дальше. Для битых
+    данных это верно, для `lock_timeout` — нет: алерт молча не записан, а
+    Alertmanager получил 202 и повторять не станет. Наблюдатель ловит ошибку
+    на уровне engine (событие `handle_error`), не меняя сам код записи.
+
+    Работает в пределах одного потока: вызывать вокруг синхронного участка
+    целиком, внутри той же функции, что ушла в threadpool.
+    """
+    watch = RetryableDbErrorWatch()
+    previous = getattr(_db_error_watch, "current", None)
+    _db_error_watch.current = watch
+    try:
+        yield watch
+    finally:
+        _db_error_watch.current = previous
+
+
+def _note_retryable_db_error(context: Any) -> None:
+    watch = getattr(_db_error_watch, "current", None)
+    if watch is None or watch.error is not None:
+        return
+    exc = context.sqlalchemy_exception or context.original_exception
+    if is_retryable_db_error(exc):
+        watch.error = exc
+
+
+if not _is_sqlite:
+    event.listen(engine, "connect", _apply_session_timeouts)
+    event.listen(engine, "handle_error", _note_retryable_db_error)
+
+
 # Celery prefork: ребёнок наследует engine родителя вместе с уже открытыми
 # сокетами Postgres. Два процесса, пишущие в один сокет, дают «weird errors»
 # класса lost synchronization with server / SSL decryption failed.
@@ -178,6 +351,19 @@ try:
     @worker_process_init.connect
     def _dispose_engine_after_fork(**_kwargs) -> None:
         engine.dispose(close=False)
+
+    # Роль воркера: `worker_init` приходит в родителе до fork-а детей (те
+    # наследуют её вместе с модулем), `beat_init` — в процессе beat. Клиент,
+    # который только ставит задачи (API, скрипты), этих сигналов не получает.
+    from celery.signals import beat_init, worker_init
+
+    @worker_init.connect
+    def _declare_worker_role(**_kwargs) -> None:
+        set_process_role(ROLE_WORKER)
+
+    @beat_init.connect
+    def _declare_beat_role(**_kwargs) -> None:
+        set_process_role(ROLE_WORKER)
 except ImportError:  # окружение без celery (например, часть скриптов)
     pass
 
