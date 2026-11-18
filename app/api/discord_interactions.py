@@ -23,7 +23,7 @@ import logging
 import threading
 import time
 from collections import deque
-from typing import Any, Coroutine, Deque, Dict, Set, Tuple
+from typing import Any, Coroutine, Deque, Dict, Optional, Set, Tuple
 
 from datetime import datetime, timezone
 
@@ -32,6 +32,7 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 from fastapi import APIRouter, Header, HTTPException, Request
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
+from starlette.concurrency import run_in_threadpool
 
 from app.config import settings
 from app.database import IncidentRecord, SessionLocal
@@ -324,8 +325,8 @@ def _format_apply_outcome(incident_id: str, outcome: Dict[str, Any]) -> str:
     executor (`app.workers.executor_tasks`): оператор видит одно и то же, где
     бы ни исполнилась команда.
     """
-    if not outcome["ok"]:
-        return _format_apply_refusal(incident_id, outcome.get("reason", "unknown"))
+    if not outcome.get("ok"):
+        return _format_apply_refusal(incident_id, str(outcome.get("reason") or "unknown"))
     result = outcome.get("result") or {}
     success = bool(result.get("success"))
     emoji = "✅" if success else "❌"
@@ -395,6 +396,15 @@ _APPLY_REFUSAL_MESSAGES = {
     "approval_stale":     "❌ Одобрение протухло (старше допустимого окна) — нужен свежий approve.",
     "namespace_unbound":  "❌ У инцидента нет namespace — сверка intent ↔ инцидент невозможна, apply заблокирован.",
     "namespace_mismatch": "❌ Namespace действия не совпадает с namespace инцидента — apply заблокирован.",
+    "intent_stale":       "❌ План устарел (старше допустимого возраста) — kubectl не запущен, нужен новый разбор.",
+    "intent_age_unknown": "❌ Возраст плана неизвестен — kubectl не запущен.",
+    "proposal_expired":   "⌛ Предложение просрочено — kubectl не запущен. Если алерт ещё горит, со следующим его повтором придёт новая карточка.",
+    "alert_resolved":     "ℹ️ Алерт уже погас (resolved) — чинить нечего, kubectl не запущен.",
+    "target_reincarnated": "❌ Цель пересоздана после алерта (uid другой) — kubectl не запущен.",
+    "target_snapshot_unknown": "❌ Не удалось снять состояние цели перед записью — kubectl не запущен.",
+    "cluster_state_unknown": "⚠️ Прошлая попытка оборвалась, состояние кластера неизвестно — проверь вручную; исполнитель в этот инцидент больше не пишет.",
+    "execute_error":      "❌ Сбой исполнителя — подробности в audit-логе (EXECUTOR_APPLY_EXCEPTION).",
+    "task_expired":       "⌛ Executor не взял задачу за отведённое время — kubectl не запущен. Если алерт ещё горит, со следующим его повтором придёт новая карточка.",
 }
 
 
@@ -414,6 +424,13 @@ def _format_apply_refusal(incident_id: str, reason: str) -> str:
         )
     if key == "intent_invalid":
         return "❌ ExecutionIntent невалиден после round-trip — manual triage."
+    if key == "dry_run_recheck_failed":
+        detail = reason.split(":", 1)[1].replace("`", "'").strip() if ":" in reason else ""
+        text = (
+            "❌ Повторный dry-run перед записью не прошёл (цель изменилась "
+            "или apiserver недоступен) — kubectl не запущен."
+        )
+        return f"{text}\n`{detail}`" if detail else text
     return f"❌ Не могу применить: {reason}"
 
 
@@ -484,6 +501,88 @@ def _record_decision(
         db.close()
 
 
+def _revoke_decision(incident_id: str, intent_signature: str) -> bool:
+    """Удалить только что записанное APPROVED: задача apply не встала в очередь.
+
+    Одобрение уникально по (incident_id, signature): оставь его — повторный
+    клик «Применить» упрётся в already_decided, а другой кнопки у карточки
+    моста нет (тупик до правки). Удаляем только `approved`: `declined`
+    сюда попасть не может, но чужое решение не трогаем в любом случае.
+    True — строка удалена, повторный клик сработает.
+    """
+    from app.knowledge_graph.schema import ActionApproval
+
+    db: Session = SessionLocal()
+    try:
+        deleted = (
+            db.query(ActionApproval)
+            .filter(
+                ActionApproval.incident_id == incident_id,
+                ActionApproval.intent_signature == intent_signature,
+                ActionApproval.status == "approved",
+            )
+            .delete(synchronize_session=False)
+        )
+        db.commit()
+        return bool(deleted)
+    except Exception as e:
+        logger.error("discord_revoke_decision_failed error=%s", type(e).__name__)
+        try:
+            db.rollback()
+        except Exception:
+            pass
+        return False
+    finally:
+        db.close()
+
+
+def _stale_bridge_proposal(incident_id: str) -> Optional[str]:
+    """Причина, по которой карточку моста уже нельзя одобрять, или None.
+
+    `proposal_expired:<возраст>s` / `alert_resolved` (bridge.proposal_refusal).
+    Быстрая проверка ради понятного ответа на клик: одобрение не
+    записывается, кнопки снимаются, claim дедупа отпускается. Рубеж перед
+    записью в кластер — та же проверка в `apply_intent`, поэтому здесь
+    fail-open: сбой БД не должен ломать клик. Sync (SQL, Redis) — звать
+    через `run_in_threadpool`. Не карточка моста — None.
+    """
+    from app.remediation.bridge import (is_bridge_analysis, proposal_refusal,
+                                        release_dead_proposal)
+
+    db: Session = SessionLocal()
+    try:
+        record = (
+            db.query(IncidentRecord)
+            .filter(IncidentRecord.incident_id == incident_id)
+            .first()
+        )
+        analysis = getattr(record, "analysis", None)
+        if not is_bridge_analysis(analysis):
+            return None
+        reason = proposal_refusal(db, analysis, getattr(record, "created_at", None))
+        if reason:
+            release_dead_proposal(analysis, reason.split(":", 1)[0])
+        return reason
+    except Exception as e:
+        logger.warning("discord_stale_proposal_check_failed error=%s", type(e).__name__)
+        return None
+    finally:
+        db.close()
+
+
+_STALE_PROPOSAL_MARKS = {
+    "proposal_expired": "⌛ Просрочено — не исполнено",
+    "alert_resolved": "ℹ️ Алерт погас — не исполнено",
+}
+
+
+def _actor_mention(actor: str) -> str:
+    """Кто решил — для текста ответа. В БД лежит Discord user id (стабилен,
+    по нему же whitelist); `<@id>` Discord сам покажет именем. Старые
+    записи с username показываем как были."""
+    return f"<@{actor}>" if actor.isdigit() else f"@{actor}"
+
+
 async def _edit_message_after_decision(
     channel_id: str,
     message_id: str,
@@ -491,11 +590,13 @@ async def _edit_message_after_decision(
     user_name: str,
     decided_at: str,
     original_message: dict,
+    mark: Optional[str] = None,
 ) -> None:
     """PATCH сообщения: убрать buttons + дописать пометку в embed footer.
 
     Используется bot API (PATCH /channels/{cid}/messages/{mid}). Не падаем
-    наружу — приоритет на ack пользователю; edit best-effort.
+    наружу — приоритет на ack пользователю; edit best-effort. `mark` —
+    готовая пометка вместо «Approved/Declined by …» (просроченная карточка).
     """
     token = settings.DISCORD_BOT_TOKEN
     if not token:
@@ -505,8 +606,9 @@ async def _edit_message_after_decision(
     # Сохраняем embeds, добавляем пометку в footer.text. Buttons убираем
     # передачей пустого components-массива (Discord допускает []).
     embeds = list(original_message.get("embeds") or [])
-    icon = "✅" if verdict == "approved" else "❌"
-    mark = f"{icon} {verdict.capitalize()} by @{user_name} at {decided_at}"
+    if mark is None:
+        icon = "✅" if verdict == "approved" else "❌"
+        mark = f"{icon} {verdict.capitalize()} by @{user_name} at {decided_at}"
     if embeds:
         first = embeds[0]
         existing_footer = (first.get("footer") or {}).get("text") or ""
@@ -577,7 +679,8 @@ async def discord_interactions(
         denied = _deny_feedback_if_unauthorized(payload, user_id, incident_id)
         if denied is not None:
             return denied
-        found = _store_feedback(incident_id, "positive", user_id)
+        # Sync-сессия БД — в threadpool, не в event loop (как /copilot в main.py).
+        found = await run_in_threadpool(_store_feedback, incident_id, "positive", user_id)
         if not found:
             return _ephemeral(f"Инцидент `{incident_id}` не найден в БД.")
         return _ephemeral("✅ Отмечено как **верное решение**. Спасибо!")
@@ -600,7 +703,7 @@ async def discord_interactions(
         denied = _deny_feedback_if_unauthorized(payload, user_id, incident_id)
         if denied is not None:
             return denied
-        found = _store_feedback(incident_id, "negative", user_id)
+        found = await run_in_threadpool(_store_feedback, incident_id, "negative", user_id)
         if not found:
             return _ephemeral(f"Инцидент `{incident_id}` не найден в БД.")
         return _ephemeral(
@@ -658,7 +761,11 @@ async def discord_interactions(
         member = payload.get("member") or {}
         user_obj = member.get("user") or payload.get("user") or {}
         user_name = user_obj.get("username") or user_obj.get("global_name") or user_id or "unknown"
-        decision = _record_decision(incident_id, intent_sig, "approved", user_name)
+        # Кто одобрил/применил — везде Discord user id (см. approve-ветку).
+        actor = user_id or user_name
+        decision = await run_in_threadpool(
+            _record_decision, incident_id, intent_sig, "approved", actor,
+        )
         if decision["already_decided"] and decision["status"] != "approved":
             return _ephemeral(f"ℹ️ Уже {decision['status']} — apply отменён.")
 
@@ -674,7 +781,11 @@ async def discord_interactions(
                                                 queue_dispatch_enabled)
         if queue_dispatch_enabled():
             try:
-                dispatch_apply(incident_id, user_id, intent_sig, interaction_token)
+                # Sync publish в Redis-брокер — в threadpool: деградация
+                # брокера не должна морозить event loop api.
+                await run_in_threadpool(
+                    dispatch_apply, incident_id, actor, intent_sig, interaction_token,
+                )
             except Exception as e:
                 # Брокер недоступен — задачи нет, kubectl не запущен. Ответ
                 # сразу, а не deferred: иначе оператор смотрит на вечный loader.
@@ -686,7 +797,7 @@ async def discord_interactions(
                 )
             return _deferred_ephemeral()
         _spawn_background_task(
-            _apply_in_background(incident_id, user_id, intent_sig, interaction_token),
+            _apply_in_background(incident_id, actor, intent_sig, interaction_token),
             context={"kind": "apply_confirm", "incident_id": incident_id,
                      "discord_user_id": user_id},
         )
@@ -711,6 +822,12 @@ async def discord_interactions(
         member = payload.get("member") or {}
         user_obj = member.get("user") or payload.get("user") or {}
         user_name = user_obj.get("username") or user_obj.get("global_name") or user_id or "unknown"
+        # В kg_action_approvals и в applied_by — Discord user id: он стабилен
+        # (username меняется и не уникален), и whitelist одобряющих — тоже по
+        # id. Раньше approve писал username, а apply_confirm ставил задачу с
+        # user id — в аудите один человек выглядел двумя. username остаётся
+        # только в тексте ответа и пометке карточки.
+        actor = user_id or user_name
 
         # ── Authorization gate ───────────────────────────────────────────────
         # Fail-closed: if neither DISCORD_APPROVERS_USER_IDS nor _ROLE_IDS is
@@ -762,24 +879,9 @@ async def discord_interactions(
         message_id = message.get("id")
         channel_id = payload.get("channel_id") or message.get("channel_id")
 
-        decision = _record_decision(
-            incident_id=incident_id,
-            intent_signature=intent_sig,
-            status=verdict,
-            approved_by=user_name,
-        )
-
-        if decision["already_decided"]:
-            prev_status = decision["status"]
-            prev_user = decision["approved_by"] or "?"
-            prev_time = decision["decided_at"] or "?"
-            return _ephemeral(
-                f"ℹ️ Already {prev_status} by @{prev_user} at {prev_time}."
-            )
-
         # Edit оригинального сообщения: убрать buttons + дописать footer.
         # Не блокируем основной response — Discord ждёт ≤3s.
-        def _schedule_edit() -> None:
+        def _schedule_edit(decided_at: str, mark: Optional[str] = None) -> None:
             if message_id and channel_id:
                 _spawn_background_task(
                     _edit_message_after_decision(
@@ -787,20 +889,57 @@ async def discord_interactions(
                         message_id=message_id,
                         verdict=verdict,
                         user_name=user_name,
-                        decided_at=decision["decided_at"],
+                        decided_at=decided_at,
                         original_message=message,
+                        mark=mark,
                     ),
                     context={"kind": "edit_after_decision", "incident_id": incident_id},
                 )
 
+        # ── Карточка моста: просрочена или алерт погас ──────────────────────
+        # Одобрение не записываем (оно уникально и заняло бы пару навсегда),
+        # кнопки снимаем, отвечаем по-человечески. Только для approve:
+        # отклонить можно и просроченное. Не мост — None, поток прежний.
+        if verdict == "approved":
+            stale = await run_in_threadpool(_stale_bridge_proposal, incident_id)
+            if stale:
+                stale_key = stale.split(":", 1)[0]
+                audit_service.log_event(
+                    "DISCORD_APPROVAL_DENIED_STALE_PROPOSAL",
+                    {
+                        "incident_id": incident_id,
+                        "intent_signature": intent_sig,
+                        "discord_user_id": user_id,
+                        "discord_user_name": user_name,
+                        "reason": stale,
+                    },
+                )
+                _schedule_edit("", mark=_STALE_PROPOSAL_MARKS.get(stale_key, "⌛ Не исполнено"))
+                return _ephemeral(_format_apply_refusal(incident_id, stale))
+
+        # Sync-сессия БД — в threadpool, не в event loop.
+        decision = await run_in_threadpool(
+            _record_decision,
+            incident_id=incident_id,
+            intent_signature=intent_sig,
+            status=verdict,
+            approved_by=actor,
+        )
+
+        if decision["already_decided"]:
+            prev_status = decision["status"]
+            prev_user = _actor_mention(str(decision["approved_by"] or "?"))
+            prev_time = decision["decided_at"] or "?"
+            return _ephemeral(
+                f"ℹ️ Already {prev_status} by {prev_user} at {prev_time}."
+            )
+
         from app.workers.executor_tasks import (dispatch_apply,
                                                 queue_dispatch_enabled)
         # При queue постановка в очередь может упасть синхронно (брокер
-        # недоступен). Кнопки тогда снимать нельзя: повторный Approve упрётся
-        # в already_decided, а Apply → «Да, запустить kubectl» для уже
-        # одобренного действия ставит задачу заново — это и есть путь
-        # повтора. Поэтому в этом случае edit — только после успешной
-        # постановки.
+        # недоступен). Кнопки тогда снимать нельзя, а записанное одобрение
+        # отзывается (см. ниже): путь повтора — тот же клик «Применить».
+        # Поэтому в этом случае edit — только после успешной постановки.
         dispatch_via_queue = (
             verdict == "approved"
             and settings.EXECUTOR_ENABLED
@@ -808,7 +947,7 @@ async def discord_interactions(
             and queue_dispatch_enabled()
         )
         if not dispatch_via_queue:
-            _schedule_edit()
+            _schedule_edit(decision["decided_at"])
 
         audit_service.log_event(
             "INCIDENT_ACTION_APPROVED" if verdict == "approved" else "INCIDENT_ACTION_DECLINED",
@@ -831,41 +970,73 @@ async def discord_interactions(
         if settings.EXECUTOR_ENABLED and settings.EXECUTOR_APPROVAL_ENABLED:
             if dispatch_via_queue:
                 # kubectl — в copilot-executor под своим SA (см.
-                # EXECUTOR_DISPATCH). followup-а у этого пути нет и не было:
-                # итог — в audit-trail, как и написано в ответе.
+                # EXECUTOR_DISPATCH). Interaction token этому пути не нужен:
+                # итог задача дописывает в карточку моста ботом
+                # (bridge.report_apply_outcome) и пишет в audit-trail.
                 try:
-                    dispatch_apply(incident_id, user_name, intent_sig)
+                    # Sync publish в Redis-брокер — в threadpool.
+                    await run_in_threadpool(dispatch_apply, incident_id, actor, intent_sig)
                 except Exception as e:
                     logger.error(
                         "approved_executor_dispatch_failed error=%s", str(e),
                         exc_info=True,
                     )
-                    return _ephemeral(
-                        f"✅ Approved by @{user_name}, но поставить apply в очередь "
-                        f"executor не удалось ({type(e).__name__}) — kubectl не "
-                        "запущен. Кнопки оставлены: повтори через Apply → "
-                        "«Да, запустить kubectl»."
+                    # Задачи нет — kubectl не запустится. Одобрение отзываем:
+                    # оно уникально по (incident, signature), и оставленное
+                    # превращало повторный клик в «Already approved», а
+                    # кнопки Apply → «Да, запустить kubectl», на которую
+                    # раньше ссылался этот ответ, у карточки моста нет.
+                    revoked = await run_in_threadpool(
+                        _revoke_decision, incident_id, intent_sig,
                     )
-                _schedule_edit()
+                    audit_service.log_event(
+                        "INCIDENT_ACTION_APPROVAL_REVOKED",
+                        {
+                            "incident_id": incident_id,
+                            "intent_signature": intent_sig,
+                            "discord_user_id": user_id,
+                            "reason": "executor_dispatch_failed",
+                            "error": type(e).__name__,
+                            "revoked": revoked,
+                        },
+                    )
+                    if revoked:
+                        return _ephemeral(
+                            f"❌ Не удалось поставить apply в очередь executor "
+                            f"({type(e).__name__}) — kubectl не запущен, одобрение "
+                            "не засчитано. Кнопки оставлены: нажми «Применить» "
+                            "ещё раз."
+                        )
+                    return _ephemeral(
+                        f"❌ Не удалось поставить apply в очередь executor "
+                        f"({type(e).__name__}) — kubectl не запущен. Отозвать "
+                        "записанное одобрение тоже не удалось: повторный клик "
+                        "ответит «Already approved». Подробности — в логе "
+                        f"сервиса по incident_id={incident_id}."
+                    )
+                _schedule_edit(decision["decided_at"])
                 return _ephemeral(
                     f"✅ Approved by @{user_name}. Executor launched в фоне — "
-                    "итог (включая отказ) смотри в audit-trail "
+                    "итог (успех, отказ или ошибка) появится в карточке "
+                    "предложения; полный след — в audit-trail "
                     "(EXECUTOR_APPLIED / EXECUTOR_APPLY_REFUSED)."
                 )
             try:
-                from app.services.executor_apply import apply_intent
+                from app.workers.executor_tasks import apply_and_report
                 # intent_sig из custom_id → integrity-сверка в apply_intent (TOCTOU).
                 # Strong-ref + done-callback: упавший apply_intent логируется и
-                # аудируется, а не исчезает молча.
+                # аудируется, а не исчезает молча. apply_and_report — тот же
+                # apply_intent плюс итог в карточку моста.
                 _spawn_background_task(
-                    asyncio.to_thread(apply_intent, incident_id, user_name, intent_sig),
+                    asyncio.to_thread(apply_and_report, incident_id, actor, intent_sig),
                     context={"kind": "approve_apply", "incident_id": incident_id,
                              "intent_signature": intent_sig,
-                             "approved_by": user_name},
+                             "approved_by": actor},
                 )
                 return _ephemeral(
                     f"✅ Approved by @{user_name}. Executor launched в фоне — "
-                    "итог (включая отказ) смотри в audit-trail "
+                    "итог (успех, отказ или ошибка) появится в карточке "
+                    "предложения; полный след — в audit-trail "
                     "(EXECUTOR_APPLIED / EXECUTOR_APPLY_REFUSED)."
                 )
             except Exception as e:

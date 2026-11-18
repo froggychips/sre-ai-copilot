@@ -34,11 +34,93 @@ logger = logging.getLogger(__name__)
 
 TASK_EXECUTOR_APPLY = "executor_apply"
 TASK_EXECUTOR_DRY_RUN = "executor_dry_run"
+TASK_APPLY_WATCHDOG = "remediation_apply_watchdog"
 
 
 def queue_dispatch_enabled() -> bool:
     """True — dry-run и apply уходят в очередь copilot-executor."""
     return settings.EXECUTOR_DISPATCH == "queue"
+
+
+# ── отметка «executor взял задачу apply» ─────────────────────────────────
+# Нужна сторожу `remediation_apply_watchdog`: задача с истёкшим `expires`
+# отбрасывается Celery без единой строки нашего кода, а потерянная
+# (acks_late=False, смерть executor-а до старта) не оставляет следа вовсе.
+_PICKED_PREFIX = "copilot:executor_apply:picked:"
+_PICKED_TTL_SECONDS = 86400
+#: Запас сторожа поверх `expires`: задача, взятая на последней секунде,
+#: успевает поставить отметку.
+_WATCHDOG_GRACE_SECONDS = 30
+
+
+def _redis() -> Any:
+    try:
+        import redis
+        return redis.from_url(settings.REDIS_URL, socket_timeout=2,
+                              socket_connect_timeout=2)
+    except Exception:
+        return None
+
+
+def _mark_picked(incident_id: str, intent_sig: str) -> None:
+    r = _redis()
+    if r is None:
+        return
+    try:
+        r.set(f"{_PICKED_PREFIX}{incident_id}:{intent_sig}", "1", ex=_PICKED_TTL_SECONDS)
+    except Exception as e:
+        logger.warning("executor_apply_task.mark_picked_failed error=%s", type(e).__name__)
+
+
+def _was_picked(incident_id: str, intent_sig: str) -> Optional[bool]:
+    """True/False — отметка есть/нет; None — Redis недоступен, не знаем."""
+    r = _redis()
+    if r is None:
+        return None
+    try:
+        return bool(r.exists(f"{_PICKED_PREFIX}{incident_id}:{intent_sig}"))
+    except Exception:
+        return None
+
+
+def apply_expires_seconds() -> int:
+    """Срок годности задачи apply в очереди, сек. 0 — без срока."""
+    try:
+        return max(0, int(getattr(settings, "EXECUTOR_APPLY_TASK_EXPIRES_SECONDS", 600)))
+    except (TypeError, ValueError):
+        return 600
+
+
+def _report_to_card(
+    incident_id: str, outcome: Dict[str, Any], *, only_if_absent: bool = False,
+) -> None:
+    """Итог apply → в карточку моста (bridge.report_apply_outcome).
+
+    Для инцидентов не из моста — no-op. Наружу не бросает: сбой правки
+    карточки не должен менять результат задачи, kubectl уже отработал.
+    """
+    try:
+        from app.remediation.bridge import report_apply_outcome
+        report_apply_outcome(incident_id, outcome, only_if_absent=only_if_absent)
+    except Exception as e:
+        logger.warning(
+            "executor_apply_task.card_report_failed incident=%s error=%s",
+            incident_id, type(e).__name__,
+        )
+
+
+def apply_and_report(incident_id: str, applied_by: str, intent_sig: str) -> Dict[str, Any]:
+    """`apply_intent` + итог в карточку моста — для inline-пути api.
+
+    При EXECUTOR_DISPATCH=inline apply исполняет фоновая нить api
+    (`asyncio.to_thread`), задачи executor-а нет — итог в карточку дописывает
+    она же. Sync и с сетью: звать только из нити, не из event loop.
+    """
+    from app.services.executor_apply import apply_intent
+
+    outcome = apply_intent(incident_id, applied_by, intent_sig)
+    _report_to_card(incident_id, outcome)
+    return outcome
 
 
 # acks_late=False — намеренно, вопреки глобальному task_acks_late=True
@@ -47,8 +129,9 @@ def queue_dispatch_enabled() -> bool:
 # повторила бы запись в кластер. claim в apply_intent такой повтор тоже
 # отобьёт (свежий — apply_in_flight, протухший — unknown без второй записи),
 # но полагаться на второй рубеж там, где первый ставится одной строкой,
-# незачем. Потерянная задача видна оператору: followup не придёт, а в
-# audit-логе не будет EXECUTOR_APPLIED.
+# незачем. Потерянная задача видна оператору: сторож
+# `remediation_apply_watchdog` допишет в карточку моста, что executor задачу
+# не взял, а в audit-логе не будет EXECUTOR_APPLIED.
 @celery_app.task(
     name=TASK_EXECUTOR_APPLY,
     acks_late=False,
@@ -60,10 +143,16 @@ def executor_apply_task(
     intent_sig: str,
     interaction_token: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """Выполнить утверждённый intent и, если есть token, ответить в Discord."""
+    """Выполнить утверждённый intent и сообщить итог оператору.
+
+    Итог уходит двумя путями: followup по interaction token (если он есть —
+    путь Apply → «Да, запустить kubectl») и правкой карточки моста ботом
+    (если инцидент создан мостом; токен клика для этого не нужен).
+    """
     from app.services.audit_logger import audit_service
     from app.services.executor_apply import apply_intent
 
+    _mark_picked(incident_id, intent_sig)
     try:
         outcome = apply_intent(incident_id, applied_by, intent_sig)
     except Exception as e:
@@ -86,7 +175,35 @@ def executor_apply_task(
         asyncio.run(_send_followup(
             interaction_token, _format_apply_outcome(incident_id, outcome),
         ))
+    _report_to_card(incident_id, outcome)
     return _json_safe_outcome(outcome)
+
+
+@celery_app.task(name=TASK_APPLY_WATCHDOG, ignore_result=True)
+def apply_watchdog_task(incident_id: str, intent_sig: str) -> Dict[str, Any]:
+    """Сторож: взял ли executor задачу apply до истечения её `expires`.
+
+    Ставится `dispatch_apply` в обычную очередь (`celery`, copilot-worker) с
+    задержкой `expires + запас`. Отметки «взял» нет — задача протухла в
+    очереди или потеряна: kubectl не запускался, и оператор должен узнать
+    об этом из карточки, а не из тишины. Только чтение Redis и правка
+    карточки; в кластер не пишет. Redis недоступен — не знаем, молчим.
+    """
+    picked = _was_picked(incident_id, intent_sig)
+    if picked is None:
+        return {"picked": None}
+    if picked:
+        return {"picked": True}
+    from app.services.audit_logger import audit_service
+    audit_service.log_event(
+        "EXECUTOR_APPLY_NOT_PICKED_UP",
+        {"incident_id": incident_id, "intent_signature": intent_sig},
+    )
+    logger.warning("executor_apply.not_picked_up incident=%s", incident_id)
+    # only_if_absent: отметка могла потеряться (Redis моргнул у executor-а),
+    # а задача — отработать и записать настоящий итог; его не перетираем.
+    _report_to_card(incident_id, {"ok": False, "reason": "task_expired"}, only_if_absent=True)
+    return {"picked": False}
 
 
 @celery_app.task(name=TASK_EXECUTOR_DRY_RUN)
@@ -137,11 +254,35 @@ def dispatch_apply(
     intent_sig: str,
     interaction_token: Optional[str] = None,
 ) -> str:
-    """Поставить apply в очередь executor. Возвращает id задачи."""
+    """Поставить apply в очередь executor. Возвращает id задачи.
+
+    Sync publish в Redis-брокер: из async-обработчика звать через
+    `run_in_threadpool`. Задача несёт `expires`
+    (EXECUTOR_APPLY_TASK_EXPIRES_SECONDS): простоявшую дольше Celery
+    отбросит, а сторож (`apply_watchdog_task`) сообщит об этом в карточку.
+    Сторож ставится best-effort: его сбой не отменяет уже поставленный apply.
+    """
+    options: Dict[str, Any] = {"queue": settings.EXECUTOR_QUEUE_NAME}
+    expires = apply_expires_seconds()
+    if expires > 0:
+        options["expires"] = expires
     res = executor_apply_task.apply_async(
-        args=[incident_id, applied_by, intent_sig, interaction_token],
-        queue=settings.EXECUTOR_QUEUE_NAME,
+        args=[incident_id, applied_by, intent_sig, interaction_token], **options,
     )
+    if expires > 0:
+        try:
+            # retry=False: apply уже в очереди, а зовут нас из обработчика
+            # клика (threadpool) — не висим на повторах publish ради сторожа.
+            apply_watchdog_task.apply_async(
+                args=[incident_id, intent_sig],
+                countdown=expires + _WATCHDOG_GRACE_SECONDS,
+                retry=False,
+            )
+        except Exception as e:
+            logger.warning(
+                "executor_apply.watchdog_schedule_failed incident=%s error=%s",
+                incident_id, type(e).__name__,
+            )
     return str(res.id)
 
 

@@ -23,8 +23,18 @@ FixAgent), а он на проде выключен. Прод-путь алер�
 Дальше путь общий с LLM-веткой: клик → `_is_authorized_approver`
 (DISCORD_APPROVERS_USER_IDS, fail-closed) → kg_action_approvals →
 `apply_intent` (подпись, свежесть, gate со снимком, пере-dry-run, uid цели)
-→ verify; итог verify дописывается в ту же карточку
-(`annotate_verify_outcome`).
+→ verify. Обратная связь — в ту же карточку, правкой сообщения ботом:
+
+  * итог исполнения — поле «Исполнение» (`report_apply_outcome`): успех,
+    отказ с причиной, упавший kubectl; «executor задачу не взял» — от
+    сторожа `remediation_apply_watchdog`;
+  * итог verify — поле «Verify» (`annotate_verify_outcome`).
+
+Предложение живёт REMEDIATION_BRIDGE_PROPOSAL_TTL_SECONDS и пока его алерт
+не resolved (`proposal_refusal`): позже клик получает отказ, кнопки
+снимаются. Claim дедупа до конечного исхода — короткий (`claim_proposal`),
+а у предложения, умершего без записи в кластер, снимается
+(`release_dead_proposal`) — горящий алерт получает новую карточку.
 
 Сквады. Их алерты идут в `/store` и в канал по решению владельца не
 попадают. Мост — узкое исключение: сквадовый алерт даёт карточку ТОЛЬКО
@@ -68,6 +78,8 @@ __all__ = [
     "Proposal",
     "annotate_verify_outcome",
     "bridge_enabled",
+    "proposal_refusal",
+    "report_apply_outcome",
     "is_bridge_analysis",
     "plan_proposals",
     "run_bridge",
@@ -91,6 +103,9 @@ OUTCOME_EXECUTOR_DISABLED = "executor_disabled"
 OUTCOME_TARGET_UNAVAILABLE = "target_unavailable"
 OUTCOME_TARGET_REINCARNATED = "target_reincarnated"
 OUTCOME_DRY_RUN_FAILED = "dry_run_failed"
+#: dry-run не дал ответа (таймаут очереди executor, исключение) — сбой
+#: транзиентный, claim дедупа остаётся коротким (см. claim_proposal).
+OUTCOME_DRY_RUN_ERROR = "dry_run_error"
 OUTCOME_POST_FAILED = "post_failed"
 
 
@@ -437,19 +452,37 @@ def _recent_decision_exists(db: Any, key: str) -> bool:
     return row is not None
 
 
+def _pending_claim_seconds() -> int:
+    """TTL claim-а, пока предложение не дошло до конечного исхода."""
+    try:
+        pending = int(getattr(settings, "REMEDIATION_BRIDGE_PENDING_CLAIM_SECONDS", 300))
+    except (TypeError, ValueError):
+        pending = 300
+    return max(1, min(pending, _window_seconds()))
+
+
 def claim_proposal(db: Any, key: str) -> bool:
-    """Атомарно занять ключ на окно. False — предложение уже было.
+    """Атомарно занять ключ. False — предложение уже было.
 
     Redis `SET NX EX`: два батча одного алерта, пришедшие одновременно, не
-    выпустят две карточки. Без Redis — по kg_remediation_decisions (окно то
-    же; гонка двух одновременных батчей тогда возможна, лишняя карточка —
-    не лишний kubectl: исполнение всё равно одно на клик и на подпись).
+    выпустят две карточки. Claim берётся КОРОТКИМ
+    (REMEDIATION_BRIDGE_PENDING_CLAIM_SECONDS) и продлевается на всё окно
+    только `confirm_proposal` — когда карточка ушла или dry-run отказал
+    детерминированно. До этой правки claim сразу брался на 6 ч и при
+    транзиентном сбое после него (таймаут очереди executor, исключение,
+    soft/hard time limit задачи, смерть воркера) не снимался: алерт молчал
+    всё окно. Короткий TTL не требует обработчика на каждый из этих
+    случаев — в том числе на SIGKILL, который обработать нельзя.
+
+    Без Redis — по kg_remediation_decisions (окно то же; гонка двух
+    одновременных батчей тогда возможна, лишняя карточка — не лишний
+    kubectl: исполнение всё равно одно на клик и на подпись).
     БД тоже недоступна — False: не уверены, что не слали, — не шлём.
     """
     r = _redis()
     if r is not None:
         try:
-            return bool(r.set(_DEDUP_PREFIX + key, "1", nx=True, ex=_window_seconds()))
+            return bool(r.set(_DEDUP_PREFIX + key, "1", nx=True, ex=_pending_claim_seconds()))
         except Exception as e:
             log.debug("remediation_bridge.redis_claim_failed", error=type(e).__name__)
     try:
@@ -459,8 +492,26 @@ def claim_proposal(db: Any, key: str) -> bool:
         return False
 
 
+def confirm_proposal(key: str) -> None:
+    """Продлить claim на всё окно дедупа: исход предложения конечный.
+
+    Не удалось (Redis моргнул) — claim истечёт коротким, и повтор алерта
+    может дать вторую карточку; фолбэк по kg_remediation_decisions в
+    `claim_proposal` работает только когда Redis недоступен целиком.
+    Лишняя карточка — не лишний kubectl.
+    """
+    r = _redis()
+    if r is None:
+        return
+    try:
+        r.set(_DEDUP_PREFIX + key, "1", ex=_window_seconds())
+    except Exception as e:
+        log.warning("remediation_bridge.redis_confirm_failed", error=type(e).__name__)
+
+
 def release_proposal(key: str) -> None:
-    """Снять claim, если карточка не ушла: следующий батч попробует снова."""
+    """Снять claim: карточка не ушла или предложение умерло без записи в
+    кластер — следующий батч алерта попробует снова."""
     r = _redis()
     if r is None:
         return
@@ -471,6 +522,49 @@ def release_proposal(key: str) -> None:
 
 
 # ── dry-run, запись, карточка ─────────────────────────────────────────────
+
+#: Статусы dry-run, которые повторятся на следующем батче: команда дошла до
+#: apiserver/guard-а и получила отказ. Остальное (`error` — таймаут очереди
+#: executor, рестарт executor-а, исключение) — транзиентный сбой.
+_DETERMINISTIC_DRY_RUN_STATUSES = frozenset({"dry_run_failed", "guardrail_blocked"})
+
+
+def proposal_ttl_seconds() -> int:
+    """Срок жизни предложения моста, сек. 0 — отдельного срока нет."""
+    try:
+        return max(0, int(getattr(settings, "REMEDIATION_BRIDGE_PROPOSAL_TTL_SECONDS", 3600)))
+    except (TypeError, ValueError):
+        return 3600
+
+
+def proposal_refusal(db: Any, analysis: Any, created_at: Any = None) -> Optional[str]:
+    """Почему предложение моста больше нельзя исполнять. None — можно.
+
+    * `proposal_expired:<возраст>s` — карточка старше
+      REMEDIATION_BRIDGE_PROPOSAL_TTL_SECONDS: план посчитан по фактам
+      момента алерта, preconditions с тех пор никто не перепроверял;
+    * `alert_resolved` — алерт предложения resolved в kg_alerts (под
+      REMEDIATION_BRIDGE_REFUSE_RESOLVED). Статус неизвестен — не отказ.
+
+    Зовут и обработчик кнопки (быстрый ответ, одобрение не записывается),
+    и `apply_intent` (рубеж перед записью в кластер). Не мост — None.
+    """
+    if not is_bridge_analysis(analysis):
+        return None
+    ttl = proposal_ttl_seconds()
+    if ttl > 0:
+        from app.services.intent_signature import parse_utc_ts
+        born = parse_utc_ts(analysis.get("execution_intent_at")) or parse_utc_ts(created_at)
+        if born is not None:
+            age = int((datetime.now(timezone.utc) - born).total_seconds())
+            if age > ttl:
+                return f"proposal_expired:{age}s"
+    if getattr(settings, "REMEDIATION_BRIDGE_REFUSE_RESOLVED", True):
+        from app.remediation.verification import _alert_resolved
+        if _alert_resolved(db, "", analysis) is True:
+            return "alert_resolved"
+    return None
+
 
 def _dry_run(intent: "ExecutionIntent") -> Dict[str, Any]:
     """Server-side dry-run тем же путём, что stage_executor пайплайна."""
@@ -536,12 +630,16 @@ def build_card(
 ) -> Dict[str, Any]:
     """Карточка предложения: что сделаем, почему, и две кнопки."""
     why = "\n".join(_check_mark(c) for c in proposal.preconditions) or "—"
+    ttl = proposal_ttl_seconds()
+    # <t:…:t> Discord показывает в часовом поясе читателя.
+    valid = f" Действует до <t:{int(time.time()) + ttl}:t>." if ttl > 0 else ""
     embed: Dict[str, Any] = {
         "title": f"🛠 {proposal.playbook}: {proposal.namespace}/{proposal.resource_name}"[:256],
         "description": (
             f"`{alertname}` сматчил playbook по фактам правил, без LLM. "
             "Server dry-run прошёл. Исполнится только после нажатия, "
-            "и только у владельца."
+            "и только у владельца. Итог исполнения и проверки появится "
+            f"в этой карточке.{valid}"
         ),
         "color": 0x5865F2,
         "fields": [
@@ -593,15 +691,23 @@ async def _propose(db: Any, incident: "Incident", proposal: Proposal) -> str:
     if not claim_proposal(db, key):
         return OUTCOME_DEDUPLICATED
 
+    # Claim пока короткий (см. claim_proposal). Дальше любой выход без
+    # confirm_proposal — транзиентный: claim истечёт сам, и следующий батч
+    # алерта попробует снова.
     executor_result = await asyncio.to_thread(_dry_run, proposal.intent)
-    if executor_result.get("status") != "dry_run_ok":
-        # Claim не снимаем: детерминированный отказ dry-run-а повторится и на
-        # следующем батче — не долбим apiserver каждые repeat_interval.
+    dry_status = executor_result.get("status")
+    if dry_status != "dry_run_ok":
+        transient = dry_status not in _DETERMINISTIC_DRY_RUN_STATUSES
+        if not transient:
+            # Детерминированный отказ dry-run-а повторится и на следующем
+            # батче — не долбим apiserver каждые repeat_interval.
+            confirm_proposal(key)
         audit_service.log_event("REMEDIATION_BRIDGE_DRY_RUN_FAILED", {
             "playbook": proposal.playbook, "namespace": proposal.namespace,
-            "resource": proposal.resource_name, "status": executor_result.get("status"),
+            "resource": proposal.resource_name, "status": dry_status,
+            "transient": transient,
         })
-        return OUTCOME_DRY_RUN_FAILED
+        return OUTCOME_DRY_RUN_ERROR if transient else OUTCOME_DRY_RUN_FAILED
 
     # Своя строка инцидента на каждое предложение: apply/attempts/approvals
     # ключуются incident_id, и одобрение одной карточки не должно покрывать
@@ -613,6 +719,9 @@ async def _propose(db: Any, incident: "Incident", proposal: Proposal) -> str:
     analysis: Dict[str, Any] = {
         "source": BRIDGE_SOURCE,
         "alert_fingerprint": incident.incident_id,
+        # Ключ claim-а дедупа: по нему report_apply_outcome снимает claim,
+        # когда предложение умерло без записи в кластер.
+        "dedup_key": key,
         "execution_intent": proposal.intent.model_dump(mode="json"),
         "execution_intent_at": now_iso,
         "executor_result": executor_result,
@@ -626,34 +735,48 @@ async def _propose(db: Any, incident: "Incident", proposal: Proposal) -> str:
         data=incident.model_dump(mode="json"),
         analysis=analysis,
     )
-    db.add(record)
-    _record_decision(
-        db, incident_id=incident_id, fingerprint=incident.incident_id,
-        proposal=proposal, idempotency_key=_IDEM_PREFIX + key,
-        reasons=proposal.reasons,
-    )
-    db.commit()
-
-    payload = build_card(
-        proposal, incident_id=incident_id, signature=signature,
-        alertname=(incident.labels or {}).get("alertname", "?"),
-    )
-    msg = await DiscordService().send_remediation_proposal(payload)
-    if msg is None:
-        # Карточки нет — нечего одобрять: убираем и запись предложения, иначе
-        # фолбэк-дедуп по БД заглушил бы следующую попытку на всё окно.
-        from app.remediation.models import RemediationDecision
-        db.query(RemediationDecision).filter(
-            RemediationDecision.incident_id == incident_id,
-        ).delete(synchronize_session=False)
-        db.delete(record)
+    posted = False
+    try:
+        db.add(record)
+        _record_decision(
+            db, incident_id=incident_id, fingerprint=incident.incident_id,
+            proposal=proposal, idempotency_key=_IDEM_PREFIX + key,
+            reasons=proposal.reasons,
+        )
         db.commit()
-        release_proposal(key)
-        return OUTCOME_POST_FAILED
-    analysis["bridge_card"] = msg
-    record.analysis = analysis
-    flag_modified(record, "analysis")
-    db.commit()
+
+        payload = build_card(
+            proposal, incident_id=incident_id, signature=signature,
+            alertname=(incident.labels or {}).get("alertname", "?"),
+        )
+        msg = await DiscordService().send_remediation_proposal(payload)
+        if msg is None:
+            # Карточки нет — нечего одобрять: убираем и запись предложения,
+            # иначе фолбэк-дедуп по БД заглушил бы следующую попытку на всё
+            # окно.
+            _discard_proposal(db, incident_id)
+            release_proposal(key)
+            return OUTCOME_POST_FAILED
+        posted = True
+        # Карточка в канале — исход конечный, claim на всё окно. До записи
+        # bridge_card: её сбой не должен привести ко второй карточке.
+        confirm_proposal(key)
+        analysis["bridge_card"] = msg
+        record.analysis = analysis
+        flag_modified(record, "analysis")
+        db.commit()
+    except BaseException:
+        # Exception — сбой БД/Discord; BaseException — отмена корутины по
+        # soft_time_limit задачи. Карточка не ушла — запись предложения
+        # убираем по той же причине, что при msg is None; claim истечёт сам.
+        if not posted:
+            try:
+                db.rollback()
+                _discard_proposal(db, incident_id)
+            except Exception as cleanup_error:
+                log.warning("remediation_bridge.discard_failed",
+                            error=type(cleanup_error).__name__)
+        raise
     audit_service.log_event("REMEDIATION_BRIDGE_PROPOSED", {
         "incident_id": incident_id,
         "alert_fingerprint": incident.incident_id,
@@ -663,6 +786,19 @@ async def _propose(db: Any, incident: "Incident", proposal: Proposal) -> str:
         "intent_signature": signature,
     })
     return OUTCOME_PROPOSED
+
+
+def _discard_proposal(db: Any, incident_id: str) -> None:
+    """Убрать строки предложения, карточка которого не ушла в канал."""
+    from app.database import IncidentRecord
+    from app.remediation.models import RemediationDecision
+    db.query(RemediationDecision).filter(
+        RemediationDecision.incident_id == incident_id,
+    ).delete(synchronize_session=False)
+    db.query(IncidentRecord).filter(
+        IncidentRecord.incident_id == incident_id,
+    ).delete(synchronize_session=False)
+    db.commit()
 
 
 async def run_bridge(db: Any, ctx: "EnrichedContext") -> List[Dict[str, Any]]:
@@ -832,20 +968,28 @@ def annotate_enriched_card(
     return True
 
 
-# ── итог verify → в ту же карточку ────────────────────────────────────────
+# ── итог исполнения и verify → в ту же карточку ───────────────────────────
 
 _VERIFY_ICON = {"verified": "✅", "failed": "❌", "unknown": "❔"}
+#: `unknown` в карточке — словами: оператору важно, что это «не смогли
+#: проверить», а не третий вид успеха.
+_VERIFY_LABEL = {"unknown": "не подтверждено"}
+VERIFY_FIELD = "Verify"
+APPLY_FIELD = "Исполнение"
 
 
-def annotate_verify_outcome(
-    analysis: Any, outcome: str, reasons: Any = None,
-    *, client_factory: Any = None,
+def _annotate_card_field(
+    analysis: Any, name: str, text: str, *, client_factory: Any = None,
+    only_if_absent: bool = False,
 ) -> bool:
-    """Дописать итог verify полем в карточку моста. Best-effort, не бросает.
+    """Записать поле `name` в карточку моста. Best-effort, не бросает.
 
-    GET → PATCH, а не PATCH сохранённым embed-ом: после клика карточку уже
-    отредактировал обработчик кнопки (кто одобрил, кнопки сняты), и старая
-    копия эту пометку стёрла бы.
+    Правка сообщения ботом по `analysis.bridge_card` — interaction token
+    (живёт 15 минут и есть только у клика) не нужен. GET → PATCH, а не PATCH
+    сохранённым embed-ом: после клика карточку уже отредактировал обработчик
+    кнопки (кто одобрил, кнопки сняты), и старая копия эту пометку стёрла бы.
+    Поле с тем же именем заменяется — повтор не плодит дубли.
+    `only_if_absent` — не трогать карточку, если поле уже есть (False).
     """
     if not is_bridge_analysis(analysis):
         return False
@@ -857,22 +1001,133 @@ def annotate_verify_outcome(
     import httpx
     url = f"https://discord.com/api/v10/channels/{channel_id}/messages/{message_id}"
     headers = {"Authorization": f"Bot {token}", "Content-Type": "application/json"}
-    text = f"{_VERIFY_ICON.get(outcome, '•')} {outcome}"
-    if reasons:
-        text += " — " + "; ".join(str(r) for r in list(reasons)[:3])
     try:
         with (client_factory or httpx.Client)(timeout=10.0) as client:
             r = client.get(url, headers=headers)
             if r.status_code >= 400:
+                log.warning("remediation_bridge.annotate_get_failed",
+                            field=name, status=int(r.status_code))
                 return False
             embeds = list((r.json() or {}).get("embeds") or [])
             if not embeds:
                 return False
-            fields = [f for f in embeds[0].get("fields") or [] if f.get("name") != "Verify"]
-            fields.append({"name": "Verify", "value": text[:1024], "inline": False})
+            existing = list(embeds[0].get("fields") or [])
+            if only_if_absent and any(f.get("name") == name for f in existing):
+                return False
+            fields = [f for f in existing if f.get("name") != name]
+            fields.append({"name": name, "value": text[:1024], "inline": False})
             embeds[0]["fields"] = fields
             p = client.patch(url, headers=headers, json={"embeds": embeds})
-            return p.status_code < 400
+            if p.status_code >= 400:
+                log.warning("remediation_bridge.annotate_patch_failed",
+                            field=name, status=int(p.status_code))
+            return bool(p.status_code < 400)
     except Exception as e:
-        log.warning("remediation_bridge.annotate_failed", error=type(e).__name__)
+        log.warning("remediation_bridge.annotate_failed", field=name, error=type(e).__name__)
         return False
+
+
+def annotate_verify_outcome(
+    analysis: Any, outcome: str, reasons: Any = None,
+    *, client_factory: Any = None,
+) -> bool:
+    """Дописать итог verify полем в карточку моста. Best-effort, не бросает."""
+    text = f"{_VERIFY_ICON.get(outcome, '•')} {_VERIFY_LABEL.get(outcome, outcome)}"
+    if reasons:
+        text += " — " + "; ".join(str(r) for r in list(reasons)[:3])
+    return _annotate_card_field(analysis, VERIFY_FIELD, text, client_factory=client_factory)
+
+
+#: Повторный клик или повторная доставка задачи: итог первого исполнения уже
+#: в карточке (или вот-вот будет) — не перетираем его служебным отказом.
+_SILENT_REFUSALS = frozenset({"already_applied", "apply_in_flight"})
+
+#: Отказы, после которых предложение мертво, а в кластер ничего не записано.
+#: Claim дедупа снимаем: если алерт ещё горит, следующий его батч даст
+#: свежую карточку со свежим планом, а не тишину до конца окна.
+_RELEASE_ON_REFUSAL = frozenset({
+    "proposal_expired", "intent_stale", "approval_stale", "alert_resolved",
+    "dry_run_recheck_failed", "target_snapshot_unknown", "task_expired",
+})
+
+
+def _refusal_key(outcome: Dict[str, Any]) -> str:
+    if outcome.get("ok"):
+        return ""
+    return str(outcome.get("reason") or "unknown").split(":", 1)[0]
+
+
+def release_dead_proposal(analysis: Any, reason_key: str) -> bool:
+    """Снять claim дедупа предложения, умершего без записи в кластер."""
+    if not is_bridge_analysis(analysis) or reason_key not in _RELEASE_ON_REFUSAL:
+        return False
+    key = analysis.get("dedup_key")
+    if not key:
+        return False
+    release_proposal(str(key))
+    return True
+
+
+def _load_bridge_analysis(incident_id: str, db_factory: Any = None) -> Optional[Dict[str, Any]]:
+    from app.database import IncidentRecord, SessionLocal
+    db = (db_factory or SessionLocal)()
+    try:
+        record = db.query(IncidentRecord).filter(
+            IncidentRecord.incident_id == incident_id,
+        ).first()
+        analysis = getattr(record, "analysis", None)
+        if not isinstance(analysis, dict) or not is_bridge_analysis(analysis):
+            return None
+        return dict(analysis)
+    finally:
+        db.close()
+
+
+def report_apply_outcome(
+    incident_id: str, outcome: Dict[str, Any],
+    *, db_factory: Any = None, client_factory: Any = None,
+    only_if_absent: bool = False,
+) -> bool:
+    """Дописать итог исполнения в карточку моста. Best-effort, не бросает.
+
+    До этой правки итог apply по кнопке моста (успех, отказ
+    `dry_run_recheck_failed` / `target_reincarnated` / `approval_stale` /
+    `intent_stale`, упавший kubectl) видел только stdout executor-а:
+    followup шлётся по interaction token, а у клика «Применить» его не
+    передают. Здесь тот же механизм, что у verify: правка сообщения ботом.
+
+    Зовётся там, где исполнился `apply_intent` (задача executor-а либо
+    фоновая нить api при EXECUTOR_DISPATCH=inline), — не в event loop.
+    Не карточка моста — False, ничего не делает. `only_if_absent` — для
+    сторожа задачи apply: его «executor задачу не взял» не должно перетереть
+    настоящий итог, если отметка о старте потерялась, а задача отработала.
+    """
+    try:
+        analysis = _load_bridge_analysis(incident_id, db_factory)
+    except Exception as e:
+        log.warning("remediation_bridge.report_load_failed", error=type(e).__name__)
+        return False
+    if analysis is None:
+        return False
+    key = _refusal_key(outcome)
+    if key in _SILENT_REFUSALS:
+        return False
+    try:
+        from app.api.discord_interactions import _format_apply_outcome
+        text = _format_apply_outcome(incident_id, outcome)
+    except Exception as e:
+        log.warning("remediation_bridge.report_format_failed", error=type(e).__name__)
+        text = "✅ выполнено" if outcome.get("ok") else f"❌ отказ: {key}"
+    if outcome.get("ok") and (outcome.get("result") or {}).get("success") \
+            and getattr(settings, "REMEDIATION_VERIFY_ENABLED", True):
+        from app.remediation.verification import verify_delays
+        text += f"\nПроверка результата — через ~{max(1, verify_delays()[0] // 60)} мин."
+    done = _annotate_card_field(analysis, APPLY_FIELD, text, client_factory=client_factory,
+                                only_if_absent=only_if_absent)
+    if done or not only_if_absent:
+        # Сторож (only_if_absent) снимает claim, только если сам записал
+        # итог: иначе задача всё-таки отработала и предложение не мертво.
+        release_dead_proposal(analysis, key)
+    log.info("remediation_bridge.apply_reported", incident_id=incident_id,
+             ok=bool(outcome.get("ok")), reason=key or None, annotated=done)
+    return done
