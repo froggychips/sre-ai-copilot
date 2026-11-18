@@ -53,10 +53,11 @@ skip-ает synthetic-узлы), `QUALITY_THRESHOLDS` (общие пороги).
 from __future__ import annotations
 
 import logging
+from dataclasses import dataclass
 from datetime import datetime, timedelta
-from typing import Any, Dict, List, Optional, Tuple, cast
+from typing import Any, Dict, List, Optional, Sequence, Tuple, cast
 
-from sqlalchemy import and_, or_
+from sqlalchemy import and_, case, func, or_
 from sqlalchemy.orm import Session
 
 from app.knowledge_graph.namespace_lifecycle import missing_namespace_names
@@ -356,12 +357,81 @@ def compute_health_for_service(
     p95_recent, err_recent, n_points = _recent_p95_and_5xx(
         db, cast(int, service.id), now
     )
+    # baseline нужен только для p95 drift — без свежего p95 его не читаем.
+    baseline: Optional[float] = None
+    if p95_recent is not None:
+        baseline = _baseline_p95(db, cast(int, service.id), now)
+
+    # ingress-derived 5xx (живой источник nginx-ingress; per-service http_5xx
+    # выше всегда 0 — app /metrics за JWT, WO-12483).
+    ingress_5xx_rate, ingress_p95_ms = _recent_ingress_5xx_p95(
+        db, cast(int, service.id), now
+    )
+
+    # deploy_failure_pct / slo_burn_pct — из свежей записи kg_signal_aggregates
+    agg = _latest_signal_aggregate(db, cast(int, service.id), now)
+
+    return _score_from_inputs(
+        _HealthInputs(
+            open_critical=open_critical,
+            open_warning=open_warning,
+            chronic_pod_events=chronic_pod_events,
+            recurrence_24h=recurrence_24h,
+            p95_recent=p95_recent,
+            err_recent=err_recent,
+            n_points=n_points,
+            baseline_p95=baseline,
+            ingress_5xx_rate=ingress_5xx_rate,
+            ingress_p95_ms=ingress_p95_ms,
+            has_agg=agg is not None,
+            deploy_failure_pct=agg.deploy_failure_pct if agg is not None else None,
+            slo_burn_pct=agg.slo_burn_pct if agg is not None else None,
+        ),
+        namespace=service.namespace, name=service.name,
+    )
+
+
+@dataclass
+class _HealthInputs:
+    """Всё, что формула health_score читает из базы по одному сервису.
+
+    Общая точка двух путей сбора: построчного (`compute_health_for_service`,
+    запросы на сервис) и пакетного (`compute_health_for_services`, запросы на
+    пачку). Формула (`_score_from_inputs`) у них одна, поэтому результат
+    совпадает бит-в-бит.
+    """
+    open_critical: int = 0
+    open_warning: int = 0
+    chronic_pod_events: int = 0
+    recurrence_24h: int = 0
+    p95_recent: Optional[float] = None
+    err_recent: Optional[float] = None
+    n_points: int = 0
+    baseline_p95: Optional[float] = None
+    ingress_5xx_rate: Optional[float] = None
+    ingress_p95_ms: Optional[float] = None
+    has_agg: bool = False
+    deploy_failure_pct: Optional[float] = None
+    slo_burn_pct: Optional[float] = None
+
+
+def _score_from_inputs(
+    inp: _HealthInputs,
+    namespace: Any = None,
+    name: Any = None,
+) -> Tuple[float, Dict[str, Optional[float]]]:
+    """Формула health_score по собранным сигналам — без обращений к базе."""
+    open_critical = inp.open_critical
+    open_warning = inp.open_warning
+    chronic_pod_events = inp.chronic_pod_events
+    recurrence_24h = inp.recurrence_24h
+    p95_recent, err_recent = inp.p95_recent, inp.err_recent
 
     # p95 drift: текущий vs baseline, penalty при > +50%
     p95_drift_pct: Optional[float] = None
     p95_drift_penalty = 0.0
     if p95_recent is not None:
-        baseline = _baseline_p95(db, cast(int, service.id), now)
+        baseline = inp.baseline_p95
         if baseline and baseline > 0:
             drift = (p95_recent - baseline) / baseline * 100.0
             p95_drift_pct = drift
@@ -377,27 +447,22 @@ def compute_health_for_service(
         over = err_recent - _HTTP_5XX_TRIGGER_RPS
         http_5xx_penalty = _capped(over * _HTTP_5XX_WEIGHT_PER_RPS)
 
-    # ingress-derived 5xx (живой источник nginx-ingress; per-service http_5xx
-    # выше всегда 0 — app /metrics за JWT, WO-12483). Отдельный компонент:
-    # меряет 5xx-rps НА ГРАНИЦЕ сервиса. p95 — информационный (нет baseline'а
-    # для drift'а на ingress-разрезе), штрафуем только 5xx.
-    ingress_5xx_rate, ingress_p95_ms = _recent_ingress_5xx_p95(
-        db, cast(int, service.id), now
-    )
+    # ingress-derived 5xx. Отдельный компонент: меряет 5xx-rps НА ГРАНИЦЕ
+    # сервиса. p95 — информационный (нет baseline'а для drift'а на
+    # ingress-разрезе), штрафуем только 5xx.
+    ingress_5xx_rate, ingress_p95_ms = inp.ingress_5xx_rate, inp.ingress_p95_ms
     ingress_5xx_penalty = 0.0
     if ingress_5xx_rate is not None and ingress_5xx_rate > _INGRESS_5XX_TRIGGER_RPS:
         over = ingress_5xx_rate - _INGRESS_5XX_TRIGGER_RPS
         ingress_5xx_penalty = _capped(over * _INGRESS_5XX_WEIGHT)
 
-    # deploy_failure_pct / slo_burn_pct — из свежей записи kg_signal_aggregates
-    agg = _latest_signal_aggregate(db, cast(int, service.id), now)
     deploy_failure_pct: Optional[float] = None
     slo_burn_pct: Optional[float] = None
     deploy_failure_penalty = 0.0
     slo_burn_penalty = 0.0
-    if agg is not None:
-        deploy_failure_pct = agg.deploy_failure_pct
-        slo_burn_pct = agg.slo_burn_pct
+    if inp.has_agg:
+        deploy_failure_pct = inp.deploy_failure_pct
+        slo_burn_pct = inp.slo_burn_pct
         if deploy_failure_pct is not None and deploy_failure_pct > _DEPLOY_FAILURE_TRIGGER_PCT:
             over = deploy_failure_pct - _DEPLOY_FAILURE_TRIGGER_PCT
             deploy_failure_penalty = _capped(over * _DEPLOY_FAILURE_WEIGHT_PER_PCT)
@@ -417,7 +482,7 @@ def compute_health_for_service(
     score -= slo_burn_penalty
     score = max(0.0, min(1.0, score))
 
-    signals = {
+    signals: Dict[str, Optional[float]] = {
         "open_critical": open_critical,
         "open_warning": open_warning,
         "chronic_pod_events": chronic_pod_events,
@@ -437,17 +502,191 @@ def compute_health_for_service(
             "crit=%.2f warn=%.2f chronic=%.2f recur=%.2f "
             "p95=%.3f 5xx=%.3f deploy_fail=%.3f slo_burn=%.3f "
             "metric_points=%d agg=%s",
-            service.namespace, service.name, score,
+            namespace, name, score,
             open_critical * _PENALTY_PER_OPEN_CRITICAL,
             open_warning * _PENALTY_PER_OPEN_WARNING,
             chronic_pod_events * _PENALTY_CHRONIC_POD_EVENT,
             (recurrence_24h // 5) * _PENALTY_RECURRENCE_PER_5,
             p95_drift_penalty, http_5xx_penalty,
             deploy_failure_penalty, slo_burn_penalty,
-            n_points, "yes" if agg is not None else "no",
+            inp.n_points, "yes" if inp.has_agg else "no",
         )
 
     return score, signals
+
+
+def _mean(values: List[float]) -> Optional[float]:
+    return sum(values) / len(values) if values else None
+
+
+def compute_health_for_services(
+    db: Session,
+    services: Sequence[Tuple[int, Any, Any]],
+    now: Optional[datetime] = None,
+) -> Dict[int, Tuple[float, Dict[str, Optional[float]]]]:
+    """Health сразу для пачки сервисов: {service_id: (score, signals)}.
+
+    `services` — тройки (id, namespace, name); namespace и name нужны только
+    DEBUG-логу. Сигналы собираются шестью запросами на пачку вместо шести-семи
+    на сервис; формула — та же `_score_from_inputs`, что у
+    `compute_health_for_service`, и результат совпадает бит-в-бит (тест
+    `tests/kg/test_health_batch_equivalence.py`).
+
+    Порядок строк внутри сервиса зафиксирован (ORDER BY ts): среднее по float
+    от порядка суммирования зависит, а построчный путь получает строки в
+    порядке индекса (service_id, ts).
+    """
+    now = now or datetime.utcnow()
+    ids = [int(sid) for sid, _, _ in services]
+    result: Dict[int, Tuple[float, Dict[str, Optional[float]]]] = {}
+    if not ids:
+        return result
+    inputs: Dict[int, _HealthInputs] = {sid: _HealthInputs() for sid in ids}
+
+    cutoff_alerts = now - timedelta(days=_OPEN_ALERT_MAX_AGE_DAYS)
+    cutoff_events = now - timedelta(days=_POD_EVENT_LOOKBACK_DAYS)
+    cutoff_recur = now - timedelta(hours=_RECURRENCE_WINDOW_HOURS)
+
+    for sid, severity in (
+        db.query(AlertEvent.service_id, AlertEvent.severity)
+        .filter(
+            AlertEvent.service_id.in_(ids),
+            AlertEvent.resolved_at.is_(None),
+            AlertEvent.fired_at >= cutoff_alerts,
+        )
+        .all()
+    ):
+        sev = (severity or "").lower()
+        if sev == "critical":
+            inputs[cast(int, sid)].open_critical += 1
+        elif sev == "warning":
+            inputs[cast(int, sid)].open_warning += 1
+
+    for sid, n in (
+        db.query(PodEvent.service_id, func.count(PodEvent.id))
+        .filter(
+            PodEvent.service_id.in_(ids),
+            PodEvent.count > 1000,
+            or_(
+                PodEvent.last_seen >= cutoff_events,
+                and_(
+                    PodEvent.last_seen.is_(None),
+                    PodEvent.first_seen >= cutoff_events,
+                ),
+            ),
+        )
+        .group_by(PodEvent.service_id)
+        .all()
+    ):
+        inputs[cast(int, sid)].chronic_pod_events = int(n)
+
+    for sid, n in (
+        db.query(AlertEvent.service_id, func.count(AlertEvent.id))
+        .filter(
+            AlertEvent.service_id.in_(ids),
+            AlertEvent.fired_at >= cutoff_recur,
+        )
+        .group_by(AlertEvent.service_id)
+        .all()
+    ):
+        inputs[cast(int, sid)].recurrence_24h = int(n)
+
+    # Последний час метрик: средний p95 и 5xx, если точек достаточно.
+    recent: Dict[int, List[Tuple[Any, Any]]] = {}
+    for sid, p95, err in (
+        db.query(
+            ServiceHealth.service_id,
+            ServiceHealth.p95_latency_ms,
+            ServiceHealth.http_5xx_rate,
+        )
+        .filter(
+            ServiceHealth.service_id.in_(ids),
+            ServiceHealth.ts >= now - timedelta(hours=_METRIC_RECENT_WINDOW_HOURS),
+        )
+        .order_by(ServiceHealth.service_id, ServiceHealth.ts)
+        .all()
+    ):
+        recent.setdefault(cast(int, sid), []).append((p95, err))
+    for sid, points in recent.items():
+        inp = inputs[sid]
+        inp.n_points = len(points)
+        if len(points) < _MIN_POINTS_FOR_METRICS:
+            continue
+        inp.p95_recent = _mean([float(p) for p, _ in points if p is not None])
+        inp.err_recent = _mean([float(e) for _, e in points if e is not None])
+
+    # Baseline p95 за 7 дней — только тем, у кого есть свежий p95. Пока app
+    # /metrics закрыт (WO-12483), таких нет и запрос не выполняется вовсе.
+    need_baseline = [sid for sid in ids if inputs[sid].p95_recent is not None]
+    if need_baseline:
+        baseline_vals: Dict[int, List[float]] = {}
+        for sid, p95 in (
+            db.query(ServiceHealth.service_id, ServiceHealth.p95_latency_ms)
+            .filter(
+                ServiceHealth.service_id.in_(need_baseline),
+                ServiceHealth.ts >= now - timedelta(days=_METRIC_BASELINE_WINDOW_DAYS),
+                ServiceHealth.ts < now - timedelta(hours=_METRIC_RECENT_WINDOW_HOURS),
+                ServiceHealth.p95_latency_ms.isnot(None),
+            )
+            .order_by(ServiceHealth.service_id, ServiceHealth.ts)
+            .all()
+        ):
+            baseline_vals.setdefault(cast(int, sid), []).append(float(cast(float, p95)))
+        for sid, vals in baseline_vals.items():
+            inputs[sid].baseline_p95 = _mean(vals)
+
+    # Ingress: последняя запись на endpoint (host, path) в окне, потом максимум.
+    latest_obs: Dict[int, Dict[Tuple[Any, Any], Tuple[Any, Any]]] = {}
+    for sid, host, path, err, p95 in (
+        db.query(
+            IngressObservation.service_id,
+            IngressObservation.host,
+            IngressObservation.path,
+            IngressObservation.error_5xx_rate,
+            IngressObservation.p95_latency_ms,
+        )
+        .filter(
+            IngressObservation.service_id.in_(ids),
+            IngressObservation.ts
+            >= now - timedelta(minutes=_INGRESS_RECENT_WINDOW_MINUTES),
+        )
+        .order_by(IngressObservation.ts.desc())
+        .all()
+    ):
+        latest_obs.setdefault(cast(int, sid), {}).setdefault((host, path), (err, p95))
+    for sid, by_endpoint in latest_obs.items():
+        err_vals = [float(e) for e, _ in by_endpoint.values() if e is not None]
+        p95_vals = [float(p) for _, p in by_endpoint.values() if p is not None]
+        inputs[sid].ingress_5xx_rate = max(err_vals) if err_vals else None
+        inputs[sid].ingress_p95_ms = max(p95_vals) if p95_vals else None
+
+    # Свежая запись kg_signal_aggregates: первая по убыванию window_end.
+    for sid, deploy_failure_pct, slo_burn_pct in (
+        db.query(
+            SignalAggregate.service_id,
+            SignalAggregate.deploy_failure_pct,
+            SignalAggregate.slo_burn_pct,
+        )
+        .filter(
+            SignalAggregate.service_id.in_(ids),
+            SignalAggregate.window_end
+            >= now - timedelta(hours=_SIGNAL_AGG_FRESHNESS_HOURS),
+        )
+        .order_by(SignalAggregate.window_end.desc())
+        .all()
+    ):
+        inp = inputs[cast(int, sid)]
+        if inp.has_agg:
+            continue
+        inp.has_agg = True
+        inp.deploy_failure_pct = deploy_failure_pct
+        inp.slo_burn_pct = slo_burn_pct
+
+    for sid, namespace, name in services:
+        result[int(sid)] = _score_from_inputs(
+            inputs[int(sid)], namespace=namespace, name=name,
+        )
+    return result
 
 
 def recompute_all_health(db: Session) -> Dict[str, int]:
@@ -457,29 +696,34 @@ def recompute_all_health(db: Session) -> Dict[str, int]:
     Returns stats: {real_services, recomputed, low_health, perfect_health}.
     """
     now = datetime.utcnow()
-    # ORDER BY id — детерминированный порядок UPDATE-ов при flush: блокировки
-    # берутся по возрастанию id, встречные проходы не могут схлопнуться в
-    # deadlock между собой.
+    # ORDER BY id — детерминированный состав пачек: два встречных прохода
+    # режут сервисы на одни и те же сотни, и пакетный UPDATE каждой берёт
+    # блокировки одним планом в одном порядке — схлопнуться в deadlock между
+    # собой проходы не могут.
     # node_kind='service': с contract 2.4 у пары «Service foo + Deployment foo»
     # два non-synthetic узла. Без фильтра пересчёт делал двойную работу
     # (~9k UPDATE вместо ~4.5k — ровно те row-локи, что кормили deadlock'и
     # 09-10.08) и давал два неразличимых ряда в top_unhealthy.
-    services = (
-        db.query(Service)
-        .filter(
-            Service.synthetic.is_(False),
-            Service.node_kind == NODE_KIND_SERVICE,
+    # Лёгкие строки (id, namespace, name), а не ORM-объекты: пересчёт пишет
+    # пакетным UPDATE, и тянуть ради него metadata_json 6,6 тыс. узлов незачем.
+    services: List[Tuple[int, str, str]] = [
+        (int(sid), str(ns), str(name)) for sid, ns, name in (
+            db.query(Service.id, Service.namespace, Service.name)
+            .filter(
+                Service.synthetic.is_(False),
+                Service.node_kind == NODE_KIND_SERVICE,
+            )
+            .order_by(Service.id)
+            .all()
         )
-        .order_by(Service.id)
-        .all()
-    )
+    ]
     # Узлы namespace, которого нет в кластере, не пересчитываем: свежий
     # health_score у снесённого стенда читался как признак жизни (squad-42,
     # 08.09.2026 — health_computed_at «сегодня» при namespace, удалённом вчера).
     gone_ns = missing_namespace_names(db)
     skipped_missing_ns = 0
     if gone_ns:
-        kept = [s for s in services if cast(str, s.namespace) not in gone_ns]
+        kept = [s for s in services if s[1] not in gone_ns]
         skipped_missing_ns = len(services) - len(kept)
         services = kept
     low_health = 0
@@ -491,19 +735,37 @@ def recompute_all_health(db: Session) -> Dict[str, int]:
     # deadlock (594/сутки на проде 09-10.08). Короткие транзакции отпускают
     # локи каждые ~100 строк; пересчёт идемпотентен, частичный прогон
     # безопасен.
+    #
+    # С 18.11.2026 пачка — это ещё и единица чтения и записи: сигналы
+    # собираются шестью запросами на пачку (`compute_health_for_services`), а
+    # не шестью на сервис, и пишутся одним UPDATE на пачку вместо UPDATE на
+    # строку. Было ~8 запросов на сервис (8,5 млн UPDATE за 18 дней), стало
+    # 7 на сотню.
+    # Локи на kg_services берутся на время одного UPDATE и отпускаются
+    # коммитом сразу за ним — не дольше, чем раньше.
     _COMMIT_BATCH = 100
-    for i, svc in enumerate(services, 1):
-        score, _ = compute_health_for_service(db, svc, now=now)
-        svc.health_score = score
-        svc.health_computed_at = now
-        recomputed += 1
-        if score < 0.4:
-            low_health += 1
-        if score >= 0.99:
-            perfect_health += 1
-        if i % _COMMIT_BATCH == 0:
-            db.commit()
-    db.commit()
+    for start in range(0, len(services), _COMMIT_BATCH):
+        batch = services[start:start + _COMMIT_BATCH]
+        computed = compute_health_for_services(db, batch, now=now)
+        score_by_id: Dict[int, float] = {}
+        for sid, _, _ in batch:
+            score = computed[sid][0]
+            score_by_id[sid] = score
+            recomputed += 1
+            if score < 0.4:
+                low_health += 1
+            if score >= 0.99:
+                perfect_health += 1
+        # Один UPDATE на пачку: score — CASE по id. updated_at двигает
+        # onupdate колонки, как и при ORM-записи.
+        db.query(Service).filter(Service.id.in_(list(score_by_id))).update(
+            {
+                Service.health_score: case(score_by_id, value=Service.id),
+                Service.health_computed_at: now,
+            },
+            synchronize_session=False,
+        )
+        db.commit()
     log.info(
         "kg_health.recompute_done real=%d low_health=%d perfect=%d",
         len(services), low_health, perfect_health,
