@@ -374,6 +374,65 @@ class ServiceHealth(Base):
     )
 
 
+#: Метрики `kg_service_health`, которые сворачиваются в часовые агрегаты.
+#: На каждую — пара колонок `<метрика>_avg` / `<метрика>_max` в
+#: `kg_service_health_hourly`. Один список на модель, миграцию и свёртку
+#: (`health_downsample`): новая колонка сырья без записи здесь в агрегаты
+#: не попадёт — это сторожит tests/kg/test_health_downsample.py.
+HEALTH_HOURLY_METRICS: tuple[str, ...] = (
+    "cpu_pct", "mem_pct", "restarts_rate", "http_5xx_rate", "p95_latency_ms",
+    "orleans_latency_avg_ms", "orleans_timedout_rate",
+    "orleans_messaging_fault_rate", "orleans_pings_missed_rate",
+    "orleans_rerouted_rate", "orleans_activation_churn",
+)
+
+
+class ServiceHealthHourly(Base):
+    """Часовой агрегат `kg_service_health`: среднее и максимум за час.
+
+    Сырые десятиминутные точки читают на глубину семи дней (baseline
+    детектора аномалий и health_score), а хранились тридцать: замер
+    18.11.2026 — 6,6 млн строк и 2,2 ГБ, 56% базы, причём это копия того,
+    что и так лежит в VictoriaMetrics. Свёртка (`health_downsample`,
+    beat `kg_health_downsample`) переносит точки старше
+    `KG_HEALTH_RAW_RETENTION_DAYS` сюда — шесть строк в одну — и удаляет
+    сырьё той же транзакцией.
+
+    Ключ — (service_id, hour) без суррогатного id: строка адресуется ровно
+    этой парой, а второй b-tree на таблице в миллионы строк — та самая
+    копия, которую снимали миграцией 20260905_0100.
+
+    `samples` — сколько сырых точек вошло в час (обычно 6). Среднее по
+    метрике считается по её не-NULL точкам; NULL в агрегате — «за час не
+    было ни одного замера», а не ноль (та же семантика, что у сырья).
+
+    FK на kg_services нет намеренно: в проде его нет и у сырья (таблицы
+    созданы до появления FK в миграциях), а CREATE TABLE с FK взял бы
+    SHARE ROW EXCLUSIVE на kg_services, которую пишут непрерывно. Строки
+    удалённых узлов убирает `gone_retention`.
+    """
+    __tablename__ = "kg_service_health_hourly"
+
+    service_id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=False)
+    #: Начало часа, naive UTC — как `kg_service_health.ts`.
+    hour: Mapped[datetime] = mapped_column(DateTime, primary_key=True)
+    samples: Mapped[int] = mapped_column(Integer, nullable=False)
+
+    __table_args__ = (
+        # Ретеншен агрегатов режет по времени, а ключ начинается с service_id.
+        # BRIN, а не b-tree: строки приходят в порядке времени, и индекс на
+        # миллионы строк занимает килобайты вместо десятков мегабайт. SQLite
+        # (тесты) `postgresql_using` игнорирует и строит обычный индекс.
+        Index("ix_kg_service_health_hourly_hour", "hour", postgresql_using="brin"),
+    )
+
+
+for _metric in HEALTH_HOURLY_METRICS:
+    setattr(ServiceHealthHourly, f"{_metric}_avg", mapped_column(Float, nullable=True))
+    setattr(ServiceHealthHourly, f"{_metric}_max", mapped_column(Float, nullable=True))
+del _metric
+
+
 class ClusterObservation(Base):
     """Global cluster snapshot — те же поля что ClusterHealth.to_dict().
 
@@ -438,6 +497,10 @@ class IngressObservation(Base):
             name="uq_kg_ingress_obs_ingress_host_path_ts",
         ),
         Index("ix_kg_ingress_obs_ingress_ts", "ingress_name", "ts"),
+        # Ретеншен режет по `ts` без ingress_name: ни один из индексов выше
+        # с `ts` не начинается, и каждый батч чистки шёл seq scan-ом
+        # (замер 18.11.2026 — см. миграцию 20261118_0200).
+        Index("ix_kg_ingress_observations_ts", "ts"),
     )
 
 
@@ -474,6 +537,10 @@ class SignalAggregate(Base):
             name="uq_kg_signal_aggregates_service_window",
         ),
         # (service_id, window_end) держит UniqueConstraint выше.
+        # Отдельно по времени — под ретеншен (`window_end < cutoff`): уникальный
+        # начинается с service_id и такой запрос не обслуживает; каждый батч
+        # читал все 850 тысяч строк (миграция 20261118_0200).
+        Index("ix_kg_signal_aggregates_window_end", "window_end"),
     )
 
 
@@ -521,6 +588,10 @@ class AnomalyObservation(Base):
         # (service_id, ts) — префикс уникального (service_id, ts, metric),
         # b-tree обслуживает такие запросы им же.
         Index("ix_kg_anomaly_obs_severity_ts", "severity", "ts"),
+        # Под ретеншен (`ts < cutoff`): у (severity, ts) время — вторая
+        # колонка, и планировщик обходил индекс целиком (миграция
+        # 20261118_0200).
+        Index("ix_kg_anomaly_observations_ts", "ts"),
     )
 
 
