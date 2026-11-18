@@ -13,6 +13,9 @@ spec:
     metadata:
       labels:
         app: copilot-worker
+      annotations:
+        # Хэш k8s/base/settings.yaml, подставляет deploy.sh (см. sre-ai-api).
+        checksum/settings: "SETTINGS_CHECKSUM_PLACEHOLDER"
     spec:
       affinity:
         nodeAffinity:
@@ -69,7 +72,12 @@ spec:
           allowPrivilegeEscalation: false
           capabilities:
             drop: ["ALL"]
+        # Порядок источников — контракт (k8s/base/settings.yaml): ConfigMap с
+        # флагами первым, Secret роли последним (при совпадении ключей
+        # побеждает он), литеральный `env` ниже — сильнее обоих.
         envFrom:
+        - configMapRef:
+            name: sre-ai-copilot-settings
         - secretRef:
             name: sre-ai-secrets
         env:
@@ -84,8 +92,8 @@ spec:
         # на неё в момент создания метрик, то есть при импорте модулей.
         - name: PROMETHEUS_MULTIPROC_DIR
           value: /tmp/prometheus-multiproc
-        # ENV=production включает fail-closed-валидаторы в app/config.py
-        # (обязательные секреты + запрет SAFE_MODE=false). Заполни secrets.yaml.
+        # Предохранители — литералом, а не в ConfigMap: литеральный env нельзя
+        # перекрыть ключом Secret (см. k8s/base/settings.yaml и sre-ai-api).
         - name: ENV
           value: "production"
         - name: SAFE_MODE
@@ -94,21 +102,12 @@ spec:
         # write-право; исполняет его copilot-executor (k8s/executor.yaml).
         - name: EXECUTOR_DISPATCH
           value: "queue"
-        # Error/Fatal из Seq стендов → kg_log_observations (список Seq — из
-        # графа). Egress copilot → seq:80 — в k8s/networkpolicy.yaml; без него
-        # флаг бесполезен (таймауты), поэтому едут одним деплоем.
-        - name: SEQ_SQUAD_DISCOVERY_ENABLED
-          value: "true"
-        # ── дальше: то, что жило ТОЛЬКО в кластере ────────────────────────
-        #
-        # 21.08.2026: манифест и работающий Deployment разошлись полностью. В
-        # git было две переменные и ни одного тома у воркера, в кластере —
-        # пять других переменных, ConfigMap с ownership и emptyDir под /tmp.
-        # Применение манифеста роняло поды на старте (config.py требовал
-        # HMAC-секрет) и попутно отключило бы дайджест и ownership-backfill:
-        # их дефолты в app/config.py — False.
-        - name: ALERTMANAGER_ALLOW_UNAUTHENTICATED
-          value: "true"
+        # Общие флаги (ALERTMANAGER_ALLOW_UNAUTHENTICATED, дайджесты,
+        # ownership-backfill, Seq стендов, DISCORD_DRY_RUN, мост/executor) до
+        # 18.11.2026 стояли здесь литералами или лежали ключами Secret. Теперь
+        # они в ConfigMap sre-ai-copilot-settings (k8s/base/settings.yaml) —
+        # одни и те же для всех ролей. Ниже — только то, что привязано к томам
+        # и секретам именно воркера.
         - name: OWNERSHIP_MANIFEST_PATH
           value: /config/ownership.yaml
         # Манифест людей (TC-логин → Discord id / Jira, сервисные аккаунты,
@@ -127,25 +126,10 @@ spec:
               name: squad-dashboard-secrets
               key: tc_token
               optional: true
-        # Подставляется deploy.sh из IMAGE_TAG; в кластере значение застыло
-        # на 1.0.0-rc.29, потому что ставилось руками.
+        # Подставляется deploy.sh из IMAGE_TAG; TeamCity ставит то же самое
+        # через `kubectl set env` — поэтому литерал, а не ConfigMap.
         - name: BUILD_VERSION
           value: "BUILD_VERSION_PLACEHOLDER"
-        # Дефолт False — без явного true ежедневный дайджест выключится.
-        - name: STATS_DIGEST_ENABLED
-          value: "true"
-        # Сводка хронических алертов (#stats, раз в 6 ч), секция «горят непрерывно».
-        - name: CHRONIC_DIGEST_ENABLED
-          value: "true"
-        # Тоже дефолт False: periodic backfill team_owner через
-        # multi-signal inference.
-        - name: OWNERSHIP_BACKFILL_ENABLED
-          value: "true"
-        # Значение совпадает с дефолтом, но фиксируется явно: «боту можно
-        # писать в Discord» — не та настройка, которую стоит оставлять на
-        # усмотрение дефолта в конфиге.
-        - name: DISCORD_DRY_RUN
-          value: "false"
         # ── Liveness ─────────────────────────────────────────────────────────
         # До этого у воркера НЕ БЫЛО ни одной пробы (у api — все три). OOM ловит
         # kubelet сам, но всё, что НЕ OOM — CPU-троттлинг, залипший
@@ -350,6 +334,9 @@ spec:
     metadata:
       labels:
         app: copilot-worker-sync
+      annotations:
+        # Хэш k8s/base/settings.yaml, подставляет deploy.sh (см. sre-ai-api).
+        checksum/settings: "SETTINGS_CHECKSUM_PLACEHOLDER"
     spec:
       affinity:
         nodeAffinity:
@@ -400,7 +387,12 @@ spec:
           allowPrivilegeEscalation: false
           capabilities:
             drop: ["ALL"]
+        # Порядок источников — контракт (k8s/base/settings.yaml): ConfigMap с
+        # флагами первым, Secret роли последним (при совпадении ключей
+        # побеждает он), литеральный `env` ниже — сильнее обоих.
         envFrom:
+        - configMapRef:
+            name: sre-ai-copilot-settings
         - secretRef:
             name: sre-ai-secrets
         # env — КОПИЯ copilot-worker, обоснование каждой переменной там.
@@ -414,10 +406,6 @@ spec:
           value: "true"
         - name: EXECUTOR_DISPATCH
           value: "queue"
-        - name: SEQ_SQUAD_DISCOVERY_ENABLED
-          value: "true"
-        - name: ALERTMANAGER_ALLOW_UNAUTHENTICATED
-          value: "true"
         - name: OWNERSHIP_MANIFEST_PATH
           value: /config/ownership.yaml
         - name: PEOPLE_MANIFEST_PATH
@@ -430,15 +418,6 @@ spec:
               optional: true
         - name: BUILD_VERSION
           value: "BUILD_VERSION_PLACEHOLDER"
-        - name: STATS_DIGEST_ENABLED
-          value: "true"
-        # Сводка хронических алертов (#stats, раз в 6 ч), секция «горят непрерывно».
-        - name: CHRONIC_DIGEST_ENABLED
-          value: "true"
-        - name: OWNERSHIP_BACKFILL_ENABLED
-          value: "true"
-        - name: DISCORD_DRY_RUN
-          value: "false"
         # Проба та же, что у copilot-worker, и по тем же причинам (`-b`
         # вместо `-A`, `-d` на свой нод, 5 минут grace); отличается только
         # destination — имя нода задано выше через `-n sync@%h`.
@@ -509,6 +488,9 @@ spec:
     metadata:
       labels:
         app: copilot-beat
+      annotations:
+        # Хэш k8s/base/settings.yaml, подставляет deploy.sh (см. sre-ai-api).
+        checksum/settings: "SETTINGS_CHECKSUM_PLACEHOLDER"
     spec:
       affinity:
         nodeAffinity:
@@ -563,46 +545,32 @@ spec:
           readOnly: true
         - name: tmp
           mountPath: /tmp
+        # Порядок источников — контракт (k8s/base/settings.yaml): ConfigMap с
+        # флагами первым, Secret роли последним (при совпадении ключей
+        # побеждает он), литеральный `env` ниже — сильнее обоих.
+        # Свой Secret: beat только публикует задачи по расписанию, ему нужен
+        # брокер (k8s/base/secrets.beat.yaml.example). Флаги задач читает
+        # воркер, который задачу исполняет.
         envFrom:
+        - configMapRef:
+            name: sre-ai-copilot-settings
         - secretRef:
-            name: sre-ai-secrets
+            name: sre-ai-beat-secrets
         env:
-        # ENV=production включает fail-closed-валидаторы в app/config.py
-        # (обязательные секреты + запрет SAFE_MODE=false). Заполни secrets.yaml.
+        # Предохранители — литералом (см. copilot-worker). Общие флаги — в
+        # ConfigMap sre-ai-copilot-settings; beat их не читает (флаг задачи
+        # проверяет воркер), но получает тем же envFrom, что и все.
         - name: ENV
           value: "production"
         - name: SAFE_MODE
           value: "true"
-        # ── дальше: то, что жило ТОЛЬКО в кластере ────────────────────────
-        #
-        # 21.08.2026: манифест и работающий Deployment разошлись полностью. В
-        # git было две переменные и ни одного тома у воркера, в кластере —
-        # пять других переменных, ConfigMap с ownership и emptyDir под /tmp.
-        # Применение манифеста роняло поды на старте (config.py требовал
-        # HMAC-секрет) и попутно отключило бы дайджест и ownership-backfill:
-        # их дефолты в app/config.py — False.
-        - name: ALERTMANAGER_ALLOW_UNAUTHENTICATED
-          value: "true"
         - name: OWNERSHIP_MANIFEST_PATH
           value: /config/ownership.yaml
-        # Манифест людей (TC-логин → Discord id / Jira, сервисные аккаунты,
-        # ручные владельцы namespace) — для kg_namespace_owner_sync. Живёт
-        # только в кластере: связка логин↔человек в репозиторий не попадает.
         - name: PEOPLE_MANIFEST_PATH
           value: /config/people.json
-        # Токен для чтения профилей TeamCity (/app/rest/users) — им резолвится
-        # «assignee Jira → TC-логин». Основной TC_TOKEN (учётка ai-agent) на
-        # этот эндпоинт получает 403. Берём тот же токен, что уже читает
-        # профили в CronJob squad-dashboard; optional — без него путь
-        # jira_assignee просто не сработает.
-        - name: TC_USERS_TOKEN
-          valueFrom:
-            secretKeyRef:
-              name: squad-dashboard-secrets
-              key: tc_token
-              optional: true
-        # Подставляется deploy.sh из IMAGE_TAG; в кластере значение застыло
-        # на 1.0.0-rc.29, потому что ставилось руками.
+        # TC_USERS_TOKEN (secretKeyRef на squad-dashboard-secrets) у beat снят
+        # 18.11.2026: его читает только kg_namespace_owner_sync, а задачу
+        # исполняет воркер. Токен, который процессу не нужен, — лишний токен.
         - name: BUILD_VERSION
           value: "BUILD_VERSION_PLACEHOLDER"
         # KG_SCAN_NAMESPACES здесь БОЛЬШЕ НЕ ЗАДАЁТСЯ, и это осознанно.
@@ -628,9 +596,6 @@ spec:
         # Если ограничение когда-нибудь понадобится, задавать его нужно
         # WORKER'у, а не beat — за этим следит
         # tests/test_scan_scope_config.py.
-        # Дефолт False: periodic backfill team_owner.
-        - name: OWNERSHIP_BACKFILL_ENABLED
-          value: "true"
         # ── Liveness ─────────────────────────────────────────────────────────
         # У beat пробы тоже не было. Смерть процесса контейнер переживёт сам
         # (beat = PID 1, падение → рестарт), а вот ЗАВИСШИЙ планировщик —

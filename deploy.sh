@@ -5,6 +5,18 @@
 #   IMAGE_TAG=1.0.0-rc.11 ./deploy.sh [namespace]                  # WO-кластер (Nexus)
 #   IMAGE_REPO=ghcr.io/froggychips/sre-ai-copilot \
 #     IMAGE_TAG=<git-sha> ./deploy.sh [namespace]                  # образ из CI
+#   IMAGE_TAG=X.Y.Z ./deploy.sh --render [namespace]               # только отрендерить
+#
+# `--render` печатает в stdout ровно те манифесты, которые применил бы деплой,
+# с подставленными образом, версией и значениями площадки, и ничего не меняет:
+#   IMAGE_TAG=X.Y.Z ./deploy.sh --render | kubectl -n sre-ai diff -f -
+# Так сверяется «git против кластера» (scripts/manifest_drift.py --diff делает
+# то же самое), и так же CI проверяет, что в рендере не осталось плейсхолдеров.
+#
+# Значения площадки (не хранятся в публичном git):
+#   STATICS_DB_CIDR — CIDR внешнего Statics-Postgres для NetworkPolicy; если не
+#     задан, берётся из ConfigMap sre-ai-copilot-site (k8s/site.yaml.example);
+#     `none` — правило не создаётся.
 #
 # Про registry. Раньше скрипт хардкодил ghcr и git-sha, потому что туда
 # публикует CI. В WO-кластере это не работало ВООБЩЕ: поды тянут из Nexus
@@ -14,6 +26,11 @@
 # описывал процесс, которого не существует. Теперь registry — параметр.
 set -euo pipefail
 
+RENDER_ONLY=0
+if [[ "${1:-}" == "--render" ]]; then
+    RENDER_ONLY=1
+    shift
+fi
 NAMESPACE="${1:-sre-ai}"
 IMAGE_REPO="${IMAGE_REPO:-docker.lastoasisgame.com/wo/sre-ai-copilot}"
 IMAGE_TAG="${IMAGE_TAG:-}"
@@ -28,32 +45,150 @@ if [[ -z "${IMAGE_TAG}" ]]; then
 fi
 
 IMAGE="${IMAGE_REPO}:${IMAGE_TAG}"
-echo "Образ: ${IMAGE}"
-echo "Namespace: ${NAMESPACE}"
+# В режиме --render stdout — это манифесты, поэтому сообщения идут в stderr.
+log() { echo "$@" >&2; }
+log "Образ: ${IMAGE}"
+log "Namespace: ${NAMESPACE}"
 
-apply_with_image() {
+SETTINGS_MANIFEST="k8s/base/settings.yaml"
+# Secret-ы, на которые ссылаются Deployment-ы через envFrom
+# (k8s/base/secrets.*.yaml.example). Сами Secret-ы скрипт не создаёт и не правит.
+ROLE_SECRETS="sre-ai-secrets sre-ai-executor-secrets sre-ai-beat-secrets"
+
+# Хэш ConfigMap с настройками → аннотация checksum/settings в шаблонах подов.
+# Под читает envFrom только на старте: без аннотации правка ConfigMap не давала
+# бы rollout, и «применено» расходилось бы с «действует».
+if command -v sha256sum >/dev/null 2>&1; then
+    SETTINGS_CHECKSUM="$(sha256sum "${SETTINGS_MANIFEST}" | cut -c1-16)"
+else
+    SETTINGS_CHECKSUM="$(shasum -a 256 "${SETTINGS_MANIFEST}" | cut -c1-16)"
+fi
+
+# CIDR внешнего Statics-Postgres. Определяется ДО любых изменений в кластере:
+# отсутствие значения — отказ, а не молча потерянное egress-правило.
+resolve_statics_cidr() {
+    if [[ -n "${STATICS_DB_CIDR:-}" ]]; then
+        return 0
+    fi
+    STATICS_DB_CIDR="$(kubectl -n "${NAMESPACE}" get configmap sre-ai-copilot-site \
+        -o jsonpath='{.data.STATICS_DB_CIDR}' 2>/dev/null || true)"
+    if [[ -z "${STATICS_DB_CIDR}" ]]; then
+        log "ERROR: не задан STATICS_DB_CIDR (CIDR внешнего Statics-Postgres для NetworkPolicy)."
+        log "  Разово:    STATICS_DB_CIDR=<адрес>/32 IMAGE_TAG=${IMAGE_TAG} ./deploy.sh ${NAMESPACE}"
+        log "  Постоянно: kubectl -n ${NAMESPACE} create configmap sre-ai-copilot-site \\"
+        log "               --from-literal=STATICS_DB_CIDR=<адрес>/32   (k8s/site.yaml.example)"
+        log "  Внешней базы нет: STATICS_DB_CIDR=none — правило не создаётся."
+        log "  Действующее значение: kubectl -n ${NAMESPACE} get networkpolicy copilot-network-policy -o yaml | grep -B1 -A4 ipBlock"
+        exit 1
+    fi
+}
+
+# Рендер манифеста в stdout: образ, версия, хэш настроек, значения площадки.
+render_manifest() {
     local manifest="$1"
     # BUILD_VERSION вместе с образом: это тег РЕАЛЬНО задеплоенного образа,
     # он уходит в Discord-сообщения. Раньше переменную ставили руками, и в
     # кластере она застыла на 1.0.0-rc.29 — то есть сообщения ссылались на
     # версию, которой в поде уже не было. Подставляем из того же IMAGE_TAG,
     # чтобы разъехаться стало нечем.
-    sed -e "s|IMAGE_PLACEHOLDER|${IMAGE}|g" \
-        -e "s|BUILD_VERSION_PLACEHOLDER|${IMAGE_TAG}|g" "${manifest}" \
-        | kubectl -n "${NAMESPACE}" apply -f -
+    #
+    # Первое выражение — CronJob-ы: у них в манифесте `image: ""` с маркером
+    # (сырой apply отклоняется API-сервером, см. k8s/ci-deadman.yaml).
+    # Последние два — блок NetworkPolicy между маркерами site:STATICS_DB_CIDR:
+    # `none` вырезает его целиком.
+    local cidr_expr=(-e "s|STATICS_DB_CIDR_PLACEHOLDER|${STATICS_DB_CIDR:-}|g")
+    if [[ "${STATICS_DB_CIDR:-}" == "none" ]]; then
+        cidr_expr=(-e '/# >>> site:STATICS_DB_CIDR/,/# <<< site:STATICS_DB_CIDR/d')
+    fi
+    sed -e "s|image: \"\" *# IMAGE_PLACEHOLDER.*|image: ${IMAGE}|" \
+        -e "s|IMAGE_PLACEHOLDER|${IMAGE}|g" \
+        -e "s|BUILD_VERSION_PLACEHOLDER|${IMAGE_TAG}|g" \
+        -e "s|SETTINGS_CHECKSUM_PLACEHOLDER|${SETTINGS_CHECKSUM}|g" \
+        "${cidr_expr[@]}" "${manifest}"
 }
+
+apply_with_image() {
+    render_manifest "$1" | kubectl -n "${NAMESPACE}" apply -f -
+}
+
+# Всё, что применяет деплой, в порядке применения. Используется --render;
+# сам деплой ниже применяет те же файлы по шагам.
+DEPLOY_MANIFESTS="k8s/base/rbac.yaml k8s/priorityclass.yaml ${SETTINGS_MANIFEST}
+k8s/migrate-job.yaml k8s/executor.yaml k8s/base/deployment.yaml k8s/worker.yaml
+k8s/networkpolicy.yaml k8s/squad-dashboard.yaml k8s/ci-deadman.yaml"
+
+if [[ "${RENDER_ONLY}" == "1" ]]; then
+    resolve_statics_cidr
+    for m in ${DEPLOY_MANIFESTS}; do
+        echo "---"
+        echo "# Source: ${m}"
+        render_manifest "${m}"
+    done
+    exit 0
+fi
+
+resolve_statics_cidr
 
 # ── 1. Секреты ────────────────────────────────────────────────────────────
 # НИКОГДА не применяем k8s/base/secrets.yaml: это шаблон с REPLACE_ME.
 # Раньше скрипт делал `kubectl apply -f k8s/base/secrets.yaml` и ЗАТИРАЛ
 # боевой Secret плейсхолдерами — мина, взрывающаяся при следующем рестарте
-# pod-ов. Теперь только проверяем, что Secret уже существует
+# pod-ов. Теперь только проверяем, что Secret-ы уже существуют
 # (SealedSecrets / ExternalSecrets / secrets.local.yaml — см. k8s/base/).
-if ! kubectl -n "${NAMESPACE}" get secret sre-ai-secrets >/dev/null 2>&1; then
-    echo "ERROR: Secret sre-ai-secrets не найден в ns ${NAMESPACE}." >&2
-    echo "Создай его до деплоя (см. k8s/base/secrets.yaml — только как шаблон:" >&2
-    echo "  cp k8s/base/secrets.yaml k8s/base/secrets.local.yaml   # заполнить и применить" >&2
-    echo "  либо SealedSecrets/ExternalSecrets — k8s/base/secrets.*.yaml.example)." >&2
+#
+# С 18.11.2026 их три — по ролям (минимальные привилегии): executor и beat
+# больше не получают общий Secret целиком. Под, ссылающийся на отсутствующий
+# Secret, висит в CreateContainerConfigError, поэтому проверяем до apply.
+missing_secrets=""
+for s in ${ROLE_SECRETS}; do
+    if ! kubectl -n "${NAMESPACE}" get secret "${s}" >/dev/null 2>&1; then
+        missing_secrets="${missing_secrets} ${s}"
+    fi
+done
+if [[ -n "${missing_secrets}" ]]; then
+    echo "ERROR: в ns ${NAMESPACE} нет Secret-ов:${missing_secrets}" >&2
+    echo "  sre-ai-secrets — создать до деплоя (шаблон с именами ключей:" >&2
+    echo "    k8s/base/secrets.app.yaml.example; SealedSecrets/ExternalSecrets — соседние *.example)." >&2
+    echo "  sre-ai-executor-secrets / sre-ai-beat-secrets — собрать из него, не выводя значений:" >&2
+    echo "    python3 scripts/split_role_secrets.py plan     # что будет скопировано" >&2
+    echo "    python3 scripts/split_role_secrets.py apply" >&2
+    exit 1
+fi
+
+# Настройка не должна жить в двух местах с разными значениями. Порядок envFrom
+# — ConfigMap, затем Secret, то есть при дубле действует значение из Secret, а
+# git показывает другое. Совпадающий дубль — предупреждение (убрать из Secret,
+# RUNBOOK «Настройки: ConfigMap и секреты по ролям»); расходящийся — отказ до
+# любых изменений в кластере. Печатаются только ИМЕНА ключей.
+settings_pairs="$(kubectl create --dry-run=client -f "${SETTINGS_MANIFEST}" \
+    -o go-template='{{range $k, $v := .data}}{{$k}}={{$v}}{{"\n"}}{{end}}')"
+settings_conflicts=""
+for s in ${ROLE_SECRETS}; do
+    secret_keys="$(kubectl -n "${NAMESPACE}" get secret "${s}" \
+        -o go-template='{{range $k, $v := .data}}{{$k}}{{"\n"}}{{end}}')"
+    while IFS='=' read -r key want; do
+        [[ -z "${key}" ]] && continue
+        if ! grep -qx "${key}" <<<"${secret_keys}"; then
+            continue
+        fi
+        # Значение читается только для ключа, который есть в ConfigMap, то
+        # есть для несекретного флага; на экран не выводится.
+        have="$(kubectl -n "${NAMESPACE}" get secret "${s}" \
+            -o go-template="{{index .data \"${key}\" | base64decode}}")"
+        have_norm="$(printf '%s' "${have}" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')"
+        want_norm="$(printf '%s' "${want}" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')"
+        if [[ "${have_norm}" == "${want_norm}" ]]; then
+            echo "WARNING: ${key} дублируется в Secret ${s} (значение совпадает с ConfigMap) — убрать из Secret" >&2
+        else
+            settings_conflicts="${settings_conflicts} ${s}/${key}"
+        fi
+    done <<<"${settings_pairs}"
+done
+if [[ -n "${settings_conflicts}" ]]; then
+    echo "ERROR: значения в Secret расходятся с ${SETTINGS_MANIFEST}:${settings_conflicts}" >&2
+    echo "  Пока ключ лежит в Secret, действует значение из Secret, а не из git." >&2
+    echo "  Сверить: python3 scripts/split_role_secrets.py verify" >&2
+    echo "  затем привести ${SETTINGS_MANIFEST} к живому значению (или поменять его осознанно)." >&2
     exit 1
 fi
 
@@ -124,6 +259,28 @@ if [[ -n "${write_leaks}" ]]; then
     exit 1
 fi
 
+# Прямой инвариант — только предупреждение: executor включается флагами
+# (k8s/base/settings.yaml), но писать может лишь туда, где есть RoleBinding на
+# sre-ai-remediate. Сверка 18.11.2026 не нашла ни одного: мост и кнопки
+# «включены», а dry-run получает Forbidden. Выдавать запись — решение
+# владельца кластера (пример binding-а — в k8s/base/rbac.yaml), деплой его
+# не принимает и не блокируется.
+executor_ns="$(kubectl get rolebindings -A --no-headers \
+        -o custom-columns='NS:.metadata.namespace,ROLE:.roleRef.name,SUBJ:.subjects[*].name' 2>/dev/null \
+    | awk '$2=="sre-ai-remediate" {n=split($3, s, ","); for (i=1; i<=n; i++) if (s[i]=="sre-ai-executor") {print $1; break}}' \
+    | sort -u | tr '\n' ' ' || true)"
+if [[ -z "${executor_ns// /}" ]]; then
+    echo "WARNING: у SA sre-ai-executor нет ни одного RoleBinding на sre-ai-remediate —" >&2
+    echo "  executor не может менять кластер ни в одном namespace (dry-run → Forbidden, кнопки Apply нет)." >&2
+else
+    echo "Executor может писать в namespace: ${executor_ns}"
+fi
+
+# ── 2б. Настройки: ConfigMap ДО миграций и приложения ────────────────────
+# Job миграций и все пять Deployment-ов читают его через envFrom. Rollout при
+# изменении даёт аннотация checksum/settings (см. render_manifest).
+kubectl -n "${NAMESPACE}" apply -f "${SETTINGS_MANIFEST}"
+
 # ── 3. Миграции: отдельный Job ДО выката приложения ──────────────────────
 # Job immutable по spec → пересоздаём.
 #
@@ -166,7 +323,34 @@ fi
 apply_with_image k8s/executor.yaml
 apply_with_image k8s/base/deployment.yaml
 apply_with_image k8s/worker.yaml
-kubectl -n "${NAMESPACE}" apply -f k8s/networkpolicy.yaml
+# Через рендер, а не сырым apply: в файле плейсхолдер CIDR площадки.
+apply_with_image k8s/networkpolicy.yaml
+
+# ── 5. CronJob-ы на том же образе ────────────────────────────────────────
+# До 18.11.2026 деплой их не трогал, а выкатка TeamCity (`kubectl set image`
+# на пять Deployment-ов) о них не знает: squad-dashboard работал на 1.0.27,
+# ci-deadman стоял на 1.0.0-rc.19 при приложении 1.0.35. Скрипт CronJob-а
+# лежит в ConfigMap — обновляем его вместе с образом, иначе «образ свежий»
+# ничего не значит.
+#
+# CronJob применяется, только если его окружение уже заведено (ConfigMap с env
+# и Secret с токенами описаны в шапке манифеста и в git не хранятся): в
+# кластере, где его нет, деплой приложения не должен ни падать, ни плодить
+# Job-ы в CreateContainerConfigError.
+apply_cronjob() {
+    local name="$1" manifest="$2" script="$3"
+    if ! kubectl -n "${NAMESPACE}" get configmap "${name}-env" >/dev/null 2>&1 \
+        || ! kubectl -n "${NAMESPACE}" get secret "${name}-secrets" >/dev/null 2>&1; then
+        echo "WARNING: CronJob ${name} пропущен — нет ConfigMap ${name}-env или Secret ${name}-secrets (см. шапку ${manifest})." >&2
+        return 0
+    fi
+    kubectl -n "${NAMESPACE}" create configmap "${name}-script" \
+        --from-file="$(basename "${script}")=${script}" \
+        --dry-run=client -o yaml | kubectl -n "${NAMESPACE}" apply -f -
+    apply_with_image "${manifest}"
+}
+apply_cronjob squad-dashboard k8s/squad-dashboard.yaml scripts/squad_dashboard.py
+apply_cronjob ci-deadman k8s/ci-deadman.yaml scripts/ci_deadman.py
 
 # Раньше здесь стояло `rollout status ... || true`, и финальное «Deploy OK»
 # печаталось при ЛЮБОМ исходе: ImagePullBackOff, CrashLoopBackOff, зависший на
@@ -219,6 +403,16 @@ if [[ -n "${rollout_failed}" ]]; then
     exit 1
 fi
 
+# CronJob-ы rollout-а не имеют; проверяем, что образ действительно сменился.
+for cj in squad-dashboard ci-deadman; do
+    cj_image="$(kubectl -n "${NAMESPACE}" get cronjob "${cj}" \
+        -o jsonpath='{.spec.jobTemplate.spec.template.spec.containers[0].image}' 2>/dev/null || true)"
+    if [[ -n "${cj_image}" && "${cj_image}" != "${IMAGE}" ]]; then
+        echo "WARNING: CronJob ${cj} остался на образе ${cj_image}" >&2
+    fi
+done
+
 echo "Deploy OK: ${IMAGE} → ns ${NAMESPACE}"
-echo "(Опционально: k8s/vmalertmanagerconfig.yaml, k8s/monitoring.yaml,"
-echo " k8s/postgres-backup.yaml, k8s/squad-dashboard.yaml — применяются отдельно.)"
+echo "(Отдельно применяются: k8s/vmalertmanagerconfig.yaml, k8s/monitoring.yaml,"
+echo " k8s/postgres-backup.yaml; k8s/postgres.yaml и k8s/redis.yaml — только в окно:"
+echo " правка шаблона StatefulSet перезапускает базу.)"
