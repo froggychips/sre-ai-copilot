@@ -272,3 +272,66 @@ def test_health_purge_dry_run_writes_nothing(db):
     assert stats["applied"] is False
     assert stats["points_deleted"] == 1
     assert db.query(ServiceHealth).count() == 2
+
+
+def test_health_purge_steady_state_runs_no_count(db):
+    """Нечего чистить — ни одного COUNT по kg_service_health.
+
+    До 18.11.2026 на каждый пересозданный namespace уходило два полных COUNT
+    (всего и устаревших) при каждом проходе, хотя устаревших точек в
+    установившемся режиме нет: ~190 запросов по ~100 мс каждые десять минут.
+    Теперь первым идёт EXISTS, и счёт выполняется только перед чисткой.
+    """
+    from sqlalchemy import event
+
+    from app.knowledge_graph.namespace_lifecycle import \
+        purge_stale_health_after_reincarnation
+
+    for n in range(3):
+        _ns(db, f"squad-{n}-shared", born_hours_ago=5)
+        svc = _svc(db, "town", f"squad-{n}-shared")
+        _health(db, svc, hours_ago=1)       # только точки нового стенда
+        _health(db, svc, hours_ago=2)
+    db.commit()
+
+    statements = []
+
+    def _before(conn, cursor, statement, *a):
+        statements.append(statement)
+
+    engine = db.get_bind()
+    event.listen(engine, "before_cursor_execute", _before)
+    try:
+        stats = purge_stale_health_after_reincarnation(db, now=NOW, apply=True)
+    finally:
+        event.remove(engine, "before_cursor_execute", _before)
+
+    assert stats["namespaces_checked"] == 3
+    assert stats["namespaces_purged"] == 0 and stats["points_deleted"] == 0
+    health_sql = [s for s in statements if "kg_service_health" in s]
+    assert len(health_sql) == 3, health_sql          # по одному EXISTS на namespace
+    assert not any("count(" in s.lower() for s in health_sql), health_sql
+
+
+def test_health_purge_counts_match_full_count(db):
+    """Когда чистка нужна, счётчики те же, что давал полный COUNT."""
+    from app.knowledge_graph.namespace_lifecycle import \
+        purge_stale_health_after_reincarnation
+    from app.knowledge_graph.schema import ServiceHealth
+
+    _ns(db, "squad-1-shared", born_hours_ago=5)
+    a = _svc(db, "town", "squad-1-shared")
+    b = _svc(db, "map", "squad-1-shared")
+    for h in (30, 20, 10, 6):
+        _health(db, a, hours_ago=h)
+    _health(db, b, hours_ago=8)
+    _health(db, b, hours_ago=1)
+    db.commit()
+
+    dry = purge_stale_health_after_reincarnation(db, now=NOW, apply=False)
+    assert dry["points_deleted"] == 5 and dry["namespaces_purged"] == 1
+    assert db.query(ServiceHealth).count() == 6
+
+    stats = purge_stale_health_after_reincarnation(db, now=NOW, apply=True)
+    assert stats["points_deleted"] == 5 and stats["namespaces_purged"] == 1
+    assert db.query(ServiceHealth).count() == 1

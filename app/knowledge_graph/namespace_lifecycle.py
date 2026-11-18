@@ -230,6 +230,44 @@ def purge_stale_edges_after_reincarnation(
     return stats
 
 
+def _has_health_points(
+    db: Session,
+    node_ids: List[int],
+    before: Optional[datetime] = None,
+    since: Optional[datetime] = None,
+) -> bool:
+    """Есть ли у узлов хоть одна health-точка (до `before` / начиная с `since`).
+
+    Запрос идёт от kg_services с EXISTS по kg_service_health — это проба
+    индекса (service_id, ts) на узел, ~2 мс на namespace. Прямой
+    `… WHERE service_id IN (…) AND ts < … LIMIT 1` выглядит проще, но
+    планировщик под LIMIT выбирает последовательный проход всей таблицы
+    (замер 18.11.2026: 4,4 с на 6,6 млн строк, когда подходящих точек нет).
+    """
+    conds = [ServiceHealth.service_id == Service.id]
+    if before is not None:
+        conds.append(ServiceHealth.ts < before)
+    if since is not None:
+        conds.append(ServiceHealth.ts >= since)
+    has_points = db.query(ServiceHealth.id).filter(*conds).exists()
+    return (
+        db.query(Service.id)
+        .filter(Service.id.in_(node_ids), has_points)
+        .limit(1)
+        .first()
+    ) is not None
+
+
+def _count_health_points(db: Session, node_ids: List[int]) -> int:
+    """Все health-точки узлов. Дорогой COUNT — только для лога и аудита."""
+    return int(
+        db.query(func.count(ServiceHealth.id))
+        .filter(ServiceHealth.service_id.in_(node_ids))
+        .scalar()
+        or 0
+    )
+
+
 def purge_stale_health_after_reincarnation(
     db: Session, now: Optional[datetime] = None, apply: bool = False,
 ) -> Dict[str, Any]:
@@ -285,11 +323,15 @@ def purge_stale_health_after_reincarnation(
         if not node_ids:
             continue
 
-        total = (
-            db.query(func.count(ServiceHealth.id))
-            .filter(ServiceHealth.service_id.in_(node_ids))
-            .scalar()
-        ) or 0
+        # Сначала дешёвая проверка «есть ли вообще что чистить». В
+        # установившемся режиме ответ «нет» у всех ~90 namespace, а до
+        # 18.11.2026 на каждый уходило два полных COUNT по его точкам
+        # (всего и устаревших) — ~190 запросов по ~100 мс каждые десять
+        # минут, второе место в pg_stat_statements по суммарному времени
+        # (21 тыс. с за 18 дней). Точный счёт нужен только когда чистка
+        # действительно состоится.
+        if not _has_health_points(db, node_ids, before=born):
+            continue
         stale = (
             db.query(func.count(ServiceHealth.id))
             .filter(ServiceHealth.service_id.in_(node_ids),
@@ -312,17 +354,12 @@ def purge_stale_health_after_reincarnation(
         # стенд действительно пишет метрики: хотя бы одна точка новее
         # рождения. Нет таких — значит либо метрики не идут, либо
         # `first_seen_at` врёт, и в обоих случаях удалять нечего.
-        fresh = (
-            db.query(func.count(ServiceHealth.id))
-            .filter(ServiceHealth.service_id.in_(node_ids),
-                    ServiceHealth.ts >= born)
-            .scalar()
-        ) or 0
-        if fresh == 0:
+        if not _has_health_points(db, node_ids, since=born):
             stats["skipped_guard"] += 1
             log.warning(
                 "kg_namespace.health_purge_skipped_no_fresh_points",
-                namespace=ns_row.namespace, stale=stale, total=total,
+                namespace=ns_row.namespace, stale=stale,
+                total=_count_health_points(db, node_ids),
             )
             continue
 
@@ -354,7 +391,8 @@ def purge_stale_health_after_reincarnation(
             "namespace": ns_row.namespace,
             "incarnation": ns_row.incarnation,
             "points_deleted": deleted,
-            "points_total": total,
+            # Сколько было до чистки: остаток плюс удалённое.
+            "points_total": _count_health_points(db, node_ids) + deleted,
         })
 
     if apply:
