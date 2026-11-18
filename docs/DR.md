@@ -8,7 +8,7 @@ Current as of v1.0.33 (2026-11-01). Namespace `sre-ai`.
 |---|---|---|
 | PostgreSQL, database from `postgres-secret` key `POSTGRES_DB` (~3.8 GB; largest table `kg_service_health` ~2.3 GB) | StatefulSet `postgres`, local-path PVC `postgres-data-postgres-0` (50Gi) on node `dev-4` | KG history: alerts, incidents, health series, deploys, remediation decisions / approvals / events |
 | Redis | StatefulSet `redis`, local-path PVC `redis-data-redis-0` (10Gi) on node `dev-4`, AOF + hourly RDB | queues and short-lived windows only, see §5 |
-| Secrets `sre-ai-secrets`, `postgres-secret`, `postgres-backup-s3` | cluster only, not in git | must be recreated by hand; `k8s/base/secrets.yaml` is a template |
+| Secrets `sre-ai-secrets`, `sre-ai-executor-secrets`, `sre-ai-beat-secrets`, `postgres-secret`, `postgres-backup-s3` | cluster only, not in git | must be recreated by hand; key names are in `k8s/base/secrets.*.yaml.example` (the role Secrets are subsets of `sre-ai-secrets`: `scripts/split_role_secrets.py`) |
 | Manifests | git (`k8s/`), except the live hostname pin of `postgres` / `redis` to `dev-4` | — |
 
 The audit log goes to stdout (`AUDIT_LOG_PATH` empty) and is not backed up by this project.
