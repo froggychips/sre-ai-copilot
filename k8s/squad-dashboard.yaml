@@ -39,8 +39,16 @@
 #   # ch_password = CH_PASSWORD из secret mcp-shared-secret (ns mcp), юзер analytics
 #   # gitlab_token = project access token wo-k8s (Reporter, read_repository) — читать squad-mapping.yaml
 #
-# DATABASE_URL берётся из существующего секрета sre-ai-secrets (envFrom).
-# Образ: в проде патчится на внутренний реестр (kubectl set image), как у copilot-worker.
+# DATABASE_URL берётся из существующего секрета sre-ai-secrets (secretKeyRef, один ключ).
+# Образ и ConfigMap со скриптом обновляет deploy.sh вместе с Deployment-ами
+# (шаг «CronJob-ы»). Выкатка TeamCity (`kubectl set image`) этот CronJob пока
+# не знает: 18.11.2026 он работал на образе 1.0.27 при приложении 1.0.35.
+# Скрипту от образа нужны только python3 + requests + psycopg2 + pyyaml, поэтому
+# отставание не ломало его, но и не было видно.
+#
+# `image: ""` ниже — намеренно. Сырой `kubectl apply -f` этого файла API-сервер
+# отклонит («image: Required value») вместо того, чтобы молча записать в
+# CronJob невалидный образ. Применять через deploy.sh.
 apiVersion: batch/v1
 kind: CronJob
 metadata:
@@ -72,13 +80,10 @@ spec:
               type: RuntimeDefault
           containers:
           - name: squad-dashboard
-            # IMAGE_PLACEHOLDER подставляет deploy.sh целиком (registry+repo+tag).
-        # Registry задаётся через IMAGE_REPO — он разный по кластерам:
-        # CI публикует в ghcr по git-sha, а WO-кластер тянет из Nexus
-        # по тегу 1.0.0-rc.N. Хардкод ghcr здесь означал, что deploy.sh
-        # в WO-кластере молча упирался в ImagePullBackOff.
-            # CI публикует ТОЛЬКО :<git-sha> — тега :latest не существует.
-            image: IMAGE_PLACEHOLDER
+            # Пустое значение deploy.sh заменяет на образ целиком
+            # (registry+repo+tag) по маркеру в этой же строке; registry задаётся
+            # через IMAGE_REPO — он разный по кластерам.
+            image: ""  # IMAGE_PLACEHOLDER
             imagePullPolicy: IfNotPresent
             command: ["python3", "/scripts/squad_dashboard.py"]
             securityContext:
@@ -87,11 +92,18 @@ spec:
               capabilities:
                 drop: ["ALL"]
             envFrom:
-            - secretRef:
-                name: sre-ai-secrets           # даёт DATABASE_URL
             - configMapRef:
                 name: squad-dashboard-env       # TC_URL / CONFLUENCE_* / WINDOW
             env:                                # remap lowercase secret-ключей в env-имена скрипта
+            # Из sre-ai-secrets — ОДИН ключ. До 18.11.2026 Secret подключался
+            # целиком (envFrom): Job, который каждые 5 минут ходит в Confluence,
+            # получал токены Discord, GitLab, Jira и пароль ClickHouse прода,
+            # хотя скрипт читает из него только DATABASE_URL.
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: sre-ai-secrets
+                  key: DATABASE_URL
             - name: PEOPLE_MANIFEST_PATH        # тот же манифест людей, что у воркера
               value: /config/people.json
             # Какие сквады показывать. squad-50/51 выведены из оборота 24.09.2026: их нода

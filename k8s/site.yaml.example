@@ -1,0 +1,25 @@
+# Значения площадки для deploy.sh — то, что нельзя хранить в публичном git
+# (адреса внутренних систем), но нужно для воспроизводимого применения
+# манифестов. Тот же приём, что у k8s/people.example.json: в репозитории —
+# пример с именами ключей, настоящие значения — ConfigMap в кластере.
+#
+# Создать (один раз на кластер; значения не секретные, но и не публичные):
+#   kubectl -n sre-ai create configmap sre-ai-copilot-site \
+#     --from-literal=STATICS_DB_CIDR=<адрес>/32
+#
+# deploy.sh читает значение в таком порядке: переменная окружения
+# STATICS_DB_CIDR → этот ConfigMap → отказ до любых изменений в кластере.
+# Молча пропускать правило нельзя: без него kg_statics_versions_sync уходит в
+# таймауты и считается успешным (k8s/networkpolicy.yaml, прецедент 21.08.2026).
+#
+# Адрес ниже — из диапазона для документации (RFC 5737), он никуда не ведёт.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: sre-ai-copilot-site
+  labels:
+    app.kubernetes.io/part-of: sre-ai-copilot
+data:
+  # CIDR внешнего Statics-Postgres (NodePort 31700): egress-правило в
+  # k8s/networkpolicy.yaml. `none` — внешней базы нет, правило не создаётся.
+  STATICS_DB_CIDR: "203.0.113.10/32"
