@@ -47,6 +47,15 @@ spec:
                   - key: env
                     operator: In
                     values: ["dev"]
+                  # Пин на ноду тома. В кластере он стоит патчем (сверка
+                  # 18.11.2026), в git его не было — apply манифеста пин бы
+                  # снял. local-path PV и так привязан к ноде своим
+                  # nodeAffinity, поэтому пин ничего не меняет в размещении,
+                  # но делает его читаемым из манифеста. Другой кластер —
+                  # поменять имя ноды или убрать выражение.
+                  - key: kubernetes.io/hostname
+                    operator: In
+                    values: ["dev-4"]
       # Не переезжает (local-path на dev-4) — выселять последним, см. k8s/priorityclass.yaml.
       priorityClassName: sre-ai-copilot-stateful
       securityContext:
@@ -55,7 +64,13 @@ spec:
         fsGroup: 999
       containers:
         - name: postgres
-          image: postgres:15-alpine
+          # Пин по digest: тег 15-alpine плавающий, и рестарт пода на ноде без
+          # кэша молча приносил бы новый минорный релиз. Digest снят с живого
+          # пода 18.11.2026 (status.containerStatuses[].imageID), это
+          # PostgreSQL 15.18. Тег оставлен для читаемости — при наличии digest
+          # рантайм его игнорирует. Обновление = новый digest здесь + окно:
+          # правка шаблона StatefulSet перезапускает postgres-0.
+          image: postgres:15-alpine@sha256:df7bca0066e6f60cc3dd32faa70caddec20e2c22b58932f79498e5704b23854a
           # 31.10.2026: образ стартовал на дефолтах — shared_buffers 128 МБ при
           # БД 5,3 ГБ и лимите 2Gi, work_mem 4 МБ, без pg_stat_statements
           # (медленный синк диагностировали вслепую, см. 16.10 ниже).

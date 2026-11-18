@@ -49,6 +49,10 @@ spec:
       activeDeadlineSeconds: 3600
       backoffLimit: 2
       template:
+        metadata:
+          # Метка стоит в живом CronJob (сверка 18.11.2026), в git её не было.
+          labels:
+            app: postgres-backup
         spec:
           containers:
           - command:
