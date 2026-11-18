@@ -14,7 +14,6 @@ from app.config import settings
 from app.core.state_machine import IncidentState, StateMachine
 from app.security.replay import alertmanager_signature_cache, is_timestamp_fresh
 from app.database import IncidentRecord, get_db
-from app.ingestion.raw_collector import raw_collector
 from app.knowledge_graph.remediation_events import (SignatureError,
                                                     check_remediation_signature,
                                                     record_external_remediation)
@@ -444,16 +443,9 @@ async def alertmanager_webhook(
     payload: AlertManagerWebhook, db: Session = Depends(get_db)
 ):
     """Receive a Prometheus AlertManager webhook batch and dispatch one Celery task per alert."""
-    # raw_collector requires `id` or `incident_id` at top level. AlertManager
-    # batch не имеет глобального id, поэтому используем `groupKey` как идентификатор
-    # этого batch-а (один webhook = один batch с одним groupKey).
-    raw_payload = payload.model_dump()
-    raw_payload.setdefault("id", payload.groupKey)
-    raw_collector.ingest(raw_payload)
     truncated = _note_truncation(payload, "alertmanager")
 
-    # A3: allowlist filter. Применяем сразу после raw-store, чтобы суrnu trace
-    # сохранил исходный batch, но дальше идут только не-noise alerts.
+    # A3: allowlist filter — дальше идут только не-noise alerts.
     payload_alerts, _suppressed = _filter_suppressed(payload.alerts)
 
     # States where the pipeline is already in-flight — skip re-dispatch.
@@ -669,9 +661,6 @@ async def alertmanager_webhook_store_only(
     """
     from app.knowledge_graph.auto_populator import populate_from_incident
 
-    raw_payload = payload.model_dump()
-    raw_payload.setdefault("id", payload.groupKey)
-    raw_collector.ingest(raw_payload)
     truncated = _note_truncation(payload, "store")
 
     # A3: allowlist filter — pure-noise alerts даже в KG-store не пишем,
@@ -793,9 +782,6 @@ async def alertmanager_webhook_enrich_and_forward(
     from app.services.discord_service import DiscordService
     from app.services.node_resolver import annotate_node_label
 
-    raw_payload = payload.model_dump()
-    raw_payload.setdefault("id", payload.groupKey)
-    raw_collector.ingest(raw_payload)
     truncated = _note_truncation(payload, "enrich_and_forward")
 
     # A3: allowlist filter — Watchdog/InfoInhibitor и self-noise отсеиваем

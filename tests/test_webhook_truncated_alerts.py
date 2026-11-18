@@ -92,7 +92,7 @@ def test_store_endpoint_marks_every_incident_and_reports():
         seen.append(incident)
         return {}
 
-    with patch.object(webhooks.raw_collector, "ingest"), patch(
+    with patch(
         "app.knowledge_graph.auto_populator.populate_from_incident",
         side_effect=_populate,
     ):
@@ -108,7 +108,7 @@ def test_store_endpoint_marks_every_incident_and_reports():
 
 
 def test_store_endpoint_untruncated_batch_reports_zero():
-    with patch.object(webhooks.raw_collector, "ingest"), patch(
+    with patch(
         "app.knowledge_graph.auto_populator.populate_from_incident",
         return_value={},
     ):
