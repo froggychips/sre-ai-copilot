@@ -1,7 +1,9 @@
 # KG Schema / Quality Contract
 
-> **Версия контракта:** `kg_schema: 2.9`
-> **Дата:** 2026-09-08 (2.9 — владелец namespace `kg_namespaces.owner_*`, §1.5;
+> **Версия контракта:** `kg_schema: 2.10`
+> **Дата:** 2026-11-18 (2.10 — срок жизни данных: `kg_service_health_hourly`,
+> TTL узлов `gone`, `kg_namespaces.state = retired`, §1.6;
+> 2.9 — владелец namespace `kg_namespaces.owner_*`, §1.5;
 > 2.8 — `stale_class=gone` у узлов снесённого namespace, §1.4;
 > 2.7 — db-узлы привязаны к realm, §1.3;
 > 2.6 — `owner_source`)
@@ -26,7 +28,7 @@
 ## 1. Версия
 
 ```
-KG_SCHEMA_VERSION = "2.9"
+KG_SCHEMA_VERSION = "2.10"
 ```
 
 `major.minor`:
@@ -36,6 +38,46 @@ KG_SCHEMA_VERSION = "2.9"
   semantic существующего kind перевёрнут. Требует миграции consumer'ов.
 * **minor** — additive: новый edge kind, новый synthetic prefix, новые
   поля QUALITY_THRESHOLDS, перевод planned → active.
+
+### 1.6. Что изменилось в 2.10 — срок жизни данных
+
+Три изменения, все additive и все **по умолчанию выключены** (режимы
+`off` → `dry_run` → `apply`, порядок включения — RUNBOOK «Уборка базы»).
+
+**`kg_service_health_hourly`** (миграция `20261118_0100`). Часовой агрегат
+`kg_service_health`: ключ `(service_id, hour)`, `samples` — число сырых
+точек часа, и пара `<метрика>_avg` / `<метрика>_max` на каждую метрику сырья
+(`schema.HEALTH_HOURLY_METRICS`). NULL в агрегате — «за час не было ни
+одного замера», а не ноль (те же caveats, что у сырья, §7.5). FK на
+`kg_services` нет. Пишет beat `kg_health_downsample`
+(`KG_HEALTH_DOWNSAMPLE_MODE`): точки старше `KG_HEALTH_RAW_RETENTION_DAYS`
+(7) сворачиваются и удаляются из сырья той же транзакцией; агрегаты живут
+`KG_HEALTH_HOURLY_RETENTION_DAYS` (90).
+
+Потребителям: при включённой свёртке `kg_service_health` содержит только
+последние 7 суток (было 30). Кому нужна глубина больше — читать
+`kg_service_health_hourly` (или VictoriaMetrics, первоисточник). Читатели
+внутри копилота смотрят не глубже 7 дней (baseline аномалий и health_score);
+MCP-тул `kg_service_health` с `hours > 168` вернёт только неделю.
+
+**TTL узлов `gone`** (`gone_retention.py`, beat `kg_gone_nodes_purge`,
+`KG_GONE_NODES_TTL_MODE`). Узел с `stale_class = 'gone'` удаляется, когда его
+namespace отсутствует в кластере дольше `KG_GONE_NODES_TTL_DAYS` (30) —
+отсчёт от `kg_namespaces.missing_since`, возврат namespace его обнуляет.
+`expected_stale` / `suspicious_stale` под срок не попадают никогда: это
+существующие сервисы. Вместе с узлом удаляются его health (сырьё и
+агрегаты), аномалии, агрегаты сигналов, деплои и рёбра (`kg_service_edges` с
+обоих концов, `kg_volume_edges`). Остаются и теряют только ссылку
+(`service_id = NULL`): `kg_incidents` (хранит `namespace` + `service_name`),
+`kg_alerts`, `kg_pod_events`, `kg_ingress_observations`,
+`kg_log_observations`. Узел с открытым инцидентом или не закрытым алертом
+пропускается.
+
+**`kg_namespaces.state = 'retired'`**. Значение есть в `NS_STATES` с появления таблицы (14.08.2026), но
+не выставлялось. Теперь его получает namespace, у которого после удаления не
+осталось узлов. Строка сохраняется (счётчик `incarnation` продолжится при
+возврате стенда). Потребителям: «снесённые» — `state <> 'active'`, а не
+`state = 'missing'`.
 
 ### 1.5. Что изменилось в 2.9 — владелец namespace (`kg_namespaces.owner_*`)
 
@@ -182,6 +224,7 @@ owner-coverage, «сервисов всего») считаются только
 | **2.3** | 2026-06-06 | orphan-метрика → **app-scope**: знаменатель = real-сервисы с `stale_class != 'expected_stale'`, orphan = из них без ЛЮБОГО edge (any-kind). Единый источник `compute_orphan_stats(db)`; все consumer'ы (`STARTUP_CONTRACT_CHECK`/`quality_report`/`stats_digest`) считают через него. EDGE_KINDS без изменений |
 | **2.8** | 2026-09-08 | + `stale_class = gone` (namespace снесён; ставит `namespace_lifecycle`, не классификатор); app-scope orphan = `stale_class NOT IN ('expected_stale','gone')`; metrics_sync/health_score/аномалии/агрегаты пропускают узлы не-active namespace. §1.4 |
 | **2.9** | 2026-09-08 | + `kg_namespaces.deployed_by/deployed_branch/owner_login/owner_source/owner_jira_key/owner_discord_id/owner_resolved_at/last_activity_at` (миграция `20260908_0100`), beat `kg_namespace_owner_sync`, `NAMESPACE_OWNER_SOURCES`. §1.5 |
+| **2.10** | 2026-11-18 | + таблица `kg_service_health_hourly` (миграция `20261118_0100`, beat `kg_health_downsample`): сырьё `kg_service_health` — 7 дней, дальше часовые avg/max; TTL узлов `stale_class = gone` (beat `kg_gone_nodes_purge`), `kg_namespaces.state = retired`; индексы по времени под ретеншен (миграция `20261118_0200`). Всё по умолчанию выключено. §1.6 |
 
 ---
 
@@ -427,7 +470,7 @@ PR #86 — first-class column на `kg_services` со значением кла�
 | `active` | `last_deploy_at` < 30 дней назад | `kg_sync.sync_namespace` → `kg_services.stale_class` |
 | `expected_stale` | backup/cron/system ns или infra-owner + deploy за 60d | `stats_digest.stale_deployments_section` (скрывает или compact-pill) |
 | `suspicious_stale` | нет deploy за 30d, не expected | dashboards / SQL `WHERE stale_class = 'suspicious_stale'` |
-| `gone` | namespace узла отсутствует в кластере (`kg_namespaces.state != active`), 2.8 | `namespace_lifecycle.sync_namespace_lifecycle` (sweep), вырезан из app-scope orphan-метрики; при возврате namespace пересчитывается |
+| `gone` | namespace узла отсутствует в кластере (`kg_namespaces.state != active`), 2.8 | `namespace_lifecycle.sync_namespace_lifecycle` (sweep), вырезан из app-scope orphan-метрики; при возврате namespace пересчитывается. С 2.10 — единственный класс со сроком жизни: узел удаляется через `KG_GONE_NODES_TTL_DAYS` отсутствия namespace (§1.6, по умолчанию выключено) |
 
 Реализация классификатора — `app/knowledge_graph/stale_classifier.py`
 (re-export из contract для backward-compat).

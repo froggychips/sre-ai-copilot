@@ -64,7 +64,7 @@ Deploy: the image is built by CI and rolled out with `kubectl set image` on the 
 | Queue | Consumer | What goes there |
 |---|---|---|
 | `celery` (default, `task_default_queue`) | `copilot-worker` | `process_incident`, `generate_reply`, `remediation_bridge`, `remediation_verify`, light beat tasks |
-| `sync` (`SYNC_QUEUE_NAME`) | `copilot-worker-sync` | `SYNC_QUEUE_TASKS` routed by `task_routes`: `kg_topology_sync`, `tc_deploys_to_kg`, `kg_storage_sync`, `kg_metrics_sync`, `kg_endpoints_sync`, `kg_signal_aggregates_compute`, `kg_health_retention`, `kg_topology_resources_sync`, `kg_anomaly_detection_task`, `kg_runtime_correlation_sync`, `kg_nats_subjects_sync` |
+| `sync` (`SYNC_QUEUE_NAME`) | `copilot-worker-sync` | `SYNC_QUEUE_TASKS` routed by `task_routes`: `kg_topology_sync`, `tc_deploys_to_kg`, `kg_storage_sync`, `kg_metrics_sync`, `kg_endpoints_sync`, `kg_signal_aggregates_compute`, `kg_health_retention`, `kg_health_downsample`, `kg_gone_nodes_purge`, `kg_topology_resources_sync`, `kg_anomaly_detection_task`, `kg_runtime_correlation_sync`, `kg_nats_subjects_sync` |
 | `executor` (`EXECUTOR_QUEUE_NAME`) | `copilot-executor` | `executor_apply`, `executor_dry_run` (when `EXECUTOR_DISPATCH=queue`, as in the manifests) |
 
 Every beat task holds a `single_instance` lease, so a slow run is not overlapped by the next tick. Queue lengths are exported as `celery_queue_length{queue}` (see `docs/METRICS.md` §7).
@@ -77,7 +77,7 @@ Beat schedule (`app/workers/tasks.py`, `beat_schedule`, 36 entries), grouped:
 | Events and deploys | `tc_deploys_to_kg` (15 min), `kg_deploy_watch` (5 min), `k8s_pod_events_sync` (10 min), `kg_alerts_resolve_sync` (15 min), `kg_incidents_lifecycle` (5 min), `kg_statics_versions_sync` (5 min) |
 | Metrics and signals | `kg_metrics_sync` (10 min), `kg_cluster_health_sync` (5 min), `kg_ingress_observations_sync` (10 min), `kg_seq_logs_sync` (10 min), `kg_anomaly_detection_task` (10 min), `kg_signal_aggregates_compute` (hourly :23), `kg_runtime_correlation_sync` (30 min), `kg_health_recompute` (20 min), `kg_external_probe` (every minute) |
 | Digests and reports | `daily_stats_digest` (daily, `STATS_DIGEST_HOUR_UTC`), `team_daily_digest` (daily, `TEAM_DIGEST_HOUR_UTC`), `chronic_alerts_digest` (6 h), `weekly_reconciliation` (Mon 06:00 UTC) |
-| Supervision and housekeeping | `kg_self_health_check` (30 min), `kg_stuck_alerts_check` (hourly :11), `kg_health_retention` (daily 03:40 UTC), `discord_dedup_purge` (30 min) |
+| Supervision and housekeeping | `kg_self_health_check` (30 min), `kg_stuck_alerts_check` (hourly :11), `kg_health_downsample` (daily 03:05 UTC, off by default), `kg_health_retention` (daily 03:40 UTC), `kg_gone_nodes_purge` (daily 04:25 UTC, off by default), `discord_dedup_purge` (30 min) |
 
 Not on beat: `remediation_verify` (`apply_async(countdown)` at +5 and +15 min after an apply, §3f), `remediation_bridge` (enqueued by the API), `process_incident` / `generate_reply`, executor tasks.
 
@@ -141,7 +141,9 @@ The relay returns the copilot's response body to Discord unchanged.
 
 ### 2.6 Data lifecycle
 
-- **Retention** (`app/knowledge_graph/health_retention.py`, task `kg_health_retention`, daily 03:40 UTC, batched deletes). Samples (`RETENTION_TARGETS`, floor `MIN_RETENTION_DAYS`=7): `kg_service_health` (`KG_HEALTH_RETENTION_DAYS`, 30), `kg_anomaly_observations`, `kg_signal_aggregates`, `kg_ingress_observations`, `kg_log_observations` — 30 days; `kg_cluster_observations` — 90. Events (`EVENT_RETENTION_TARGETS`, floor `MIN_EVENT_RETENTION_DAYS`=90): `kg_deployments` 180 days by `started_at`, `kg_alerts` 180 and `kg_incidents` 365 by `resolved_at` (open rows are never deleted), `kg_pod_events` 90 by `last_seen`, `kg_remediation_events` 365.
+- **Retention** (`app/knowledge_graph/health_retention.py`, task `kg_health_retention`, daily 03:40 UTC, batched deletes). Samples (`RETENTION_TARGETS`, floor `MIN_RETENTION_DAYS`=7): `kg_service_health` (`KG_HEALTH_RETENTION_DAYS`, 30), `kg_anomaly_observations`, `kg_signal_aggregates`, `kg_ingress_observations`, `kg_log_observations` — 30 days; `kg_cluster_observations` — 90. Events (`EVENT_RETENTION_TARGETS`, floor `MIN_EVENT_RETENTION_DAYS`=90): `kg_deployments` 180 days by `started_at`, `kg_alerts` 180 and `kg_incidents` 365 by `resolved_at` (open rows are never deleted), `kg_pod_events` 90 by `last_seen`, `kg_remediation_events` 365; an incident still referenced by a remediation event is skipped until the event is gone (FK). Remediation workflow (`WORKFLOW_RETENTION_TARGETS`, `KG_WORKFLOW_RETENTION_MODE`, off by default): `kg_remediation_decisions`, `kg_action_approvals`, `kg_remediation_attempts` and bridge rows of `incidents` (`rb-…`) — 180 days.
+- **Health downsampling** (`health_downsample.py`, task `kg_health_downsample`, `KG_HEALTH_DOWNSAMPLE_MODE` off → dry_run → apply): raw `kg_service_health` points older than `KG_HEALTH_RAW_RETENTION_DAYS` (7 — the anomaly/health-score baseline) are folded into `kg_service_health_hourly` (avg/max per metric, sample count) and deleted in the same transaction; aggregates live `KG_HEALTH_HOURLY_RETENTION_DAYS` (90).
+- **Gone-node TTL** (`gone_retention.py`, task `kg_gone_nodes_purge`, `KG_GONE_NODES_TTL_MODE`): nodes with `stale_class='gone'` whose namespace has been absent (`kg_namespaces.missing_since`) longer than `KG_GONE_NODES_TTL_DAYS` (30) are deleted with edges and observations; incidents, alerts and pod events stay and lose only `service_id`; the emptied namespace becomes `retired`. Enabling steps — RUNBOOK, "Database housekeeping".
 - **Write volume**: KG upserts skip unchanged rows (`SERVICE_TOUCH_INTERVAL` 30 min, `EDGE_TOUCH_INTERVAL` 3 h in `populator.py`); `k8s_endpoints_sync` writes metadata only when `endpoints_ready` changes.
 - **Backup** (`k8s/postgres-backup.yaml`, CronJob 02:00 UTC): `pg_dump` (custom format, gzip) onto PVC `postgres-backup-data` on a different node than the database, keeping the last `BACKUP_KEEP` (7) dumps, then `aws s3 cp` to the bucket from Secret `postgres-backup-s3` (upload is skipped if the secret is absent). Alerts: `CopilotPostgresBackupFailed` / `CopilotPostgresBackupMissing`.
 
@@ -573,10 +575,11 @@ primary с fallback на legacy `_classify_stale` (старая инсталля
 
 `app/knowledge_graph/contract.py` — единственный источник истины:
 
-- `KG_SCHEMA_VERSION = "2.9"` (Wave 7 → 2.1; PR #82/#84/#86 → 2.2; orphan на
+- `KG_SCHEMA_VERSION = "2.10"` (Wave 7 → 2.1; PR #82/#84/#86 → 2.2; orphan на
   app-scope → 2.3; `node_kind` → 2.4; orphan перестал считать `serves_traffic`
   связностью → 2.5; `owner_source` → 2.6; `stale_class = gone` → 2.8;
-  владелец namespace `kg_namespaces.owner_*` → 2.9). История и мотивация
+  владелец namespace `kg_namespaces.owner_*` → 2.9;
+  срок жизни данных — `kg_service_health_hourly`, TTL узлов `gone` → 2.10). История и мотивация
   каждого шага — `docs/KG_SCHEMA_CONTRACT.md` §1.
 - `EDGE_KINDS` — реестр всех edge kinds + spec (semantic / src_kinds /
   dst_kinds / source / status / table). Поле `table` различает где
