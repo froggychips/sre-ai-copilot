@@ -23,9 +23,25 @@
 #     не покрываются НИЧЕМ — guard в коде дополнительно блокирует, но и API
 #     уровень тоже отрезан.
 #
-# Write-роль применяется отдельно для каждого target-namespace (squad-*):
-#   kubectl -n squad-foo apply -f rbac.yaml
-# и RoleBinding на sre-ai-executor — осознанно, по одному (пример ниже).
+# Write-роль применяется отдельно для каждого target-namespace (squad-*) —
+# ТОЛЬКО Role sre-ai-remediate и RoleBinding на sre-ai-executor, осознанно, по
+# одному (пример ниже). Весь файл в чужой namespace не применять: 18.11.2026 в
+# `default` нашлись Role sre-ai-read / sre-ai-remediate и RoleBinding
+# sre-ai-read — след `kubectl apply -f rbac.yaml` без `-n`.
+#
+# СВЕРКА С КЛАСТЕРОМ 18.11.2026 (WO-кластер, v1.0.35):
+#   * RoleBinding на sre-ai-remediate нет НИ В ОДНОМ namespace. То есть
+#     executor включён флагами (EXECUTOR_ENABLED, мост), но записать в кластер
+#     не может: `kubectl auth can-i patch deployments
+#     --as=system:serviceaccount:sre-ai:sre-ai-executor -n <любой>` → no, и
+#     server-side dry-run стадии пайплайна получает Forbidden (кнопки Apply
+#     нет — fail-closed). Привязки в git поэтому НЕ добавлены: выдать запись —
+#     решение владельца кластера, а не побочный эффект сверки манифестов.
+#     deploy.sh печатает WARNING, пока привязок нет.
+#   * ClusterRole sre-ai-events-reader жила только в кластере — добавлена ниже.
+#   * ClusterRole/Binding sre-ai-services-reader (services + ingresses) в
+#     кластере есть, сюда НЕ перенесена: её правила целиком входят в
+#     sre-ai-deployments-reader. Кандидат на удаление из кластера.
 
 # imagePullSecrets на ОБОИХ SA: образ лежит во внутреннем реестре
 # docker.lastoasisgame.com, анонимный pull там — 401. До 26.09.2026 секрет стоял
@@ -82,7 +98,13 @@ metadata:
 subjects:
 - kind: ServiceAccount
   name: sre-ai
-  namespace: default  # перенесать в свой namespace при kustomize-overlay
+  # До 18.11.2026 здесь стояло `default`, и так же было в кластере: binding
+  # указывал на несуществующий SA default/sre-ai и не давал ничего. Всё, что
+  # есть в Role sre-ai-read сверх кластерных ролей — pods/log, configmaps,
+  # metrics.k8s.io, — у SA sre-ai в собственном namespace не работало
+  # (`can-i get pods --subresource=log -n sre-ai` → no). При деплое в другой
+  # namespace — поменять здесь и в ClusterRoleBinding-ах ниже.
+  namespace: sre-ai
 roleRef:
   kind: Role
   name: sre-ai-read
@@ -247,4 +269,36 @@ subjects:
 roleRef:
   kind: ClusterRole
   name: sre-ai-deployments-reader
+  apiGroup: rbac.authorization.k8s.io
+
+---
+# События cluster-wide: k8s_events_sync (`kubectl get events -n NS`) читает
+# Warning-события во всех namespace графа, а Role sre-ai-read действует
+# только в namespace копилота. Роль жила в кластере с 16.05.2026 без манифеста;
+# 18.11.2026 перенесена сюда как есть. Только чтение.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: sre-ai-events-reader
+  labels:
+    app.kubernetes.io/part-of: sre-ai-copilot
+rules:
+- apiGroups: [""]
+  resources: ["events"]
+  verbs: ["get", "list", "watch"]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: sre-ai-events-reader
+  labels:
+    app.kubernetes.io/part-of: sre-ai-copilot
+subjects:
+- kind: ServiceAccount
+  name: sre-ai
+  namespace: sre-ai
+roleRef:
+  kind: ClusterRole
+  name: sre-ai-events-reader
   apiGroup: rbac.authorization.k8s.io
