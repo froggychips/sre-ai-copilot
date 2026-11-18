@@ -34,7 +34,7 @@ from __future__ import annotations
 import json
 import logging
 from datetime import datetime
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, NamedTuple, Optional, Tuple, cast
 
 from sqlalchemy.orm import Session
 from sqlalchemy.orm.attributes import flag_modified
@@ -42,7 +42,7 @@ from sqlalchemy.orm.attributes import flag_modified
 from app.knowledge_graph.kubectl_breaker import (record_failure,
                                                  record_success,
                                                  run_kubectl)
-from app.knowledge_graph.populator import upsert_edge
+from app.knowledge_graph.populator import make_upsert_snapshot, upsert_edge
 from app.knowledge_graph.schema import NODE_KIND_SERVICE, Service, ServiceEdge
 
 log = logging.getLogger(__name__)
@@ -201,6 +201,11 @@ def sync_endpoints(db: Session, now: Optional[datetime] = None) -> Dict[str, Any
     return stats
 
 
+class _NodeRef(NamedTuple):
+    """Конец ребра, от которого нужен только id (см. kg_sync._DbServiceRef)."""
+    id: int
+
+
 def _process_batch(
     db: Session,
     nodes: List[Service],
@@ -209,6 +214,15 @@ def _process_batch(
     stats: Dict[str, Any],
 ) -> None:
     """Обработать один батч узлов. Коммит — на вызывающей стороне."""
+    # Рёбра всех узлов батча — одним запросом (populator.UpsertSnapshot), а не
+    # SELECT на узел; ребро, которое не пора освежать, upsert_edge берёт из
+    # снимка без INSERT и обратного SELECT. Снимок живёт один батч.
+    snapshot = make_upsert_snapshot(db)
+    if snapshot is not None:
+        snapshot.preload_edges(
+            int(n.id) for n in nodes
+            if idx.get((str(n.namespace), str(n.name)))
+        )
     for node in nodes:
         key = (str(node.namespace), str(node.name))
         if key not in idx:
@@ -242,17 +256,24 @@ def _process_batch(
         # Новых рёбер не создаём: кого именно обслуживает Service, знает
         # топологический синк по селекторам, а endpoints говорят лишь «да,
         # за ним есть готовые поды».
-        for edge in (
-            db.query(ServiceEdge)
-            .filter(ServiceEdge.src_id == node.id,
-                    ServiceEdge.kind == "serves_traffic")
-            .all()
-        ):
-            if edge.dst is None:
-                continue
+        if snapshot is not None:
+            edges = snapshot.edges_from(node, "serves_traffic")
+        else:
+            edges = (
+                db.query(ServiceEdge)
+                .filter(ServiceEdge.src_id == node.id,
+                        ServiceEdge.kind == "serves_traffic")
+                .all()
+            )
+        for edge in edges:
+            # От dst upsert_edge читает только id — сам узел не подгружаем
+            # (раньше `edge.dst` был ленивой загрузкой: SELECT kg_services по
+            # id на каждое ребро, ~480 тыс. в сутки). dst_id — NOT NULL с FK.
             upsert_edge(
-                db, src=node, dst=edge.dst, kind="serves_traffic",
+                db, src=node, dst=cast(Service, _NodeRef(int(edge.dst_id))),
+                kind="serves_traffic",
                 discovered_by=DISCOVERED_BY_ENDPOINTS,
                 extras={"endpoints_ready": ready},
+                snapshot=snapshot,
             )
             stats["edges_corroborated"] += 1

@@ -35,7 +35,8 @@ from app.knowledge_graph.edge_decay_guard import (
     REASON_UNMAPPED_KIND, SOURCE_KG_SYNC, edge_block_reason, record_source_run,
     unhealthy_sources,
 )
-from app.knowledge_graph.populator import upsert_edge, upsert_service
+from app.knowledge_graph.populator import (UpsertSnapshot, make_upsert_snapshot,
+                                           upsert_edge, upsert_service)
 from app.knowledge_graph.schema import NODE_KIND_SERVICE, Deployment, Service, ServiceEdge
 from app.knowledge_graph.stale_classifier import (
     NS_BROADCAST_EXTRAS_KEY,
@@ -743,6 +744,7 @@ def _upsert_service_pg(
     synthetic: Optional[bool] = None,
     stale_class: Optional[str] = None,
     owner_source: Optional[str] = None,
+    snapshot: Optional[UpsertSnapshot] = None,
 ) -> Service:
     """Upsert логического сервиса — тонкая обёртка над единственным writer-ом.
 
@@ -758,6 +760,9 @@ def _upsert_service_pg(
     этот путь заводит ТОЛЬКО логические сервисы, node_kind=service. Workload-узлы
     создаёт k8s_topology_resources_sync своим вызовом того же writer-а.
     """
+    # snapshot передаём только когда он есть: без него вызов writer-а остаётся
+    # буква в букву прежним.
+    extra: Dict[str, Any] = {"snapshot": snapshot} if snapshot is not None else {}
     return upsert_service(
         db,
         namespace=namespace,
@@ -768,6 +773,7 @@ def _upsert_service_pg(
         node_kind=NODE_KIND_SERVICE,
         stale_class=stale_class,
         owner_source=owner_source,
+        **extra,
     )
 
 
@@ -977,7 +983,10 @@ def _resolve_db_service(
     return None
 
 
-def _drop_superseded_db_edge(db: Session, src: Service, db_node: str, db_ns: str) -> int:
+def _drop_superseded_db_edge(
+    db: Session, src: Service, db_node: str, db_ns: str,
+    snapshot: Optional[UpsertSnapshot] = None,
+) -> int:
     """Удалить ребро `src → db:`-узел, которое заменило ребро в k8s Service.
 
     Оставить его доживать до edge_decay нельзя: при первом проходе так
@@ -1004,6 +1013,9 @@ def _drop_superseded_db_edge(db: Session, src: Service, db_node: str, db_ns: str
     if pair not in _SYNTH_DB_EDGES.pairs:
         return 0
     _SYNTH_DB_EDGES.pairs.discard(pair)
+    if snapshot is not None:
+        # Удаление идёт мимо ORM — снимок сам о нём не узнает.
+        snapshot.forget_edges(int(src.id), old_dst, "uses_db")
     return (
         db.query(ServiceEdge)
         .filter_by(src_id=src.id, dst_id=old_dst, kind="uses_db")
@@ -1165,6 +1177,13 @@ def sync_namespace(
         deploys = _kubectl_get_deployments(namespace)
     # Кэш рёбер в `db:`-узлы — только на этот вызов (см. _SynthDbEdges).
     _reset_synth_db_edges()
+    # Снимок узлов и рёбер namespace — тоже на один вызов, по той же причине:
+    # вызывающий откатывает savepoint namespace при сбое, и снимок, переживший
+    # откат, разошёлся бы с базой. До 18.11.2026 на каждый upsert уходило два
+    # запроса (INSERT … ON CONFLICT и SELECT строки обратно): ~380–410 на
+    # namespace королевства по kg_sync.ns_timing. Со снимком — по SELECT на
+    # затронутый namespace и на рёбра плюс запись того, что реально изменилось.
+    snapshot = make_upsert_snapshot(db)
 
     src_team = _derive_team_owner(namespace)
 
@@ -1182,6 +1201,7 @@ def sync_namespace(
             # заполнялась вовсе: 6441 узел с NULL, то есть угаданный
             # владелец и владелец из k8s-лейбла выглядели одинаково.
             owner_source=OWNER_SOURCE_NAMESPACE_PREFIX,
+            snapshot=snapshot,
         )
         stats["services"] += 1
 
@@ -1194,11 +1214,13 @@ def sync_namespace(
                 name=up_svc,
                 team_owner=_derive_team_owner(up_ns),
                 owner_source=OWNER_SOURCE_NAMESPACE_PREFIX,
+                snapshot=snapshot,
             )
             upsert_edge(
                 db, src=src, dst=dst, kind="calls",
                 discovered_by="kg_sync/env_vars",
                 extras=_inferred_extras("calls"),
+                snapshot=snapshot,
             )
             stats["edges"] += 1
 
@@ -1213,12 +1235,14 @@ def sync_namespace(
                 name=nats_name,
                 team_owner="platform",
                 owner_source=OWNER_SOURCE_PLATFORM_STATIC,
+                snapshot=snapshot,
             )
             upsert_edge(
                 db, src=src, dst=dst,
                 kind="uses_nats",
                 discovered_by="kg_sync/nats_env",
                 extras=_inferred_extras("uses_nats"),
+                snapshot=snapshot,
             )
             stats["edges"] += 1
 
@@ -1282,7 +1306,7 @@ def sync_namespace(
             else:
                 real_db = _resolve_db_service(db, driver, host, namespace)
             if real_db is not None:
-                _drop_superseded_db_edge(db, src, db_node, db_ns)
+                _drop_superseded_db_edge(db, src, db_node, db_ns, snapshot)
                 edge_extras["db_node"] = db_node
                 edge_extras["db_target"] = "k8s_service"
                 if source != "dsn_env":
@@ -1302,12 +1326,14 @@ def sync_namespace(
                     team_owner="data",
                     owner_source=OWNER_SOURCE_PLATFORM_STATIC,
                     synthetic=True,
+                    snapshot=snapshot,
                 )
             upsert_edge(
                 db, src=src, dst=dst,
                 kind="uses_db",
                 discovered_by=f"kg_sync/{source}",
                 extras=edge_extras,
+                snapshot=snapshot,
             )
             stats["edges"] += 1
 
@@ -1515,30 +1541,46 @@ def _enrich_calls_edges_for_ns(
 
     Возвращает count новых edges (попыток upsert — дубликаты идемпотентны).
     """
-    from app.knowledge_graph.schema import Service
     edges_count = 0
+    # Снимок на один namespace, как в sync_namespace: раньше здесь шёл SELECT
+    # узла на каждый деплоймент и на каждый его upstream.
+    snapshot = make_upsert_snapshot(db)
     for deploy in deploys:
         name = deploy.get("metadata", {}).get("name", "")
         if not name:
             continue
-        src = db.query(Service).filter_by(
-            namespace=namespace, name=name, node_kind=NODE_KIND_SERVICE,
-        ).one_or_none()
+        src = _find_service(db, namespace, name, snapshot)
         if src is None:
             continue
         for up_svc, up_ns in _extract_upstreams_extended(deploy, namespace, known_index):
-            dst = db.query(Service).filter_by(
-                namespace=up_ns, name=up_svc, node_kind=NODE_KIND_SERVICE,
-            ).one_or_none()
+            dst = _find_service(db, up_ns, up_svc, snapshot)
             if dst is None:
                 continue
             upsert_edge(
                 db, src=src, dst=dst, kind="calls",
                 discovered_by="kg_sync/env_url_v2",
                 extras=_inferred_extras("calls"),
+                snapshot=snapshot,
             )
             edges_count += 1
     return edges_count
+
+
+def _find_service(
+    db: Session, namespace: str, name: str,
+    snapshot: Optional[UpsertSnapshot],
+) -> Optional[Service]:
+    """Логический сервис по (namespace, name) — из снимка, иначе из базы.
+
+    Отсутствию в снимке здесь верим: Pass 2 только достраивает рёбра между
+    уже существующими узлами, а узлы Pass 1 к этому моменту закоммичены и в
+    снимок попадают при загрузке namespace.
+    """
+    if snapshot is not None:
+        return snapshot.service(namespace, name, NODE_KIND_SERVICE)
+    return db.query(Service).filter_by(
+        namespace=namespace, name=name, node_kind=NODE_KIND_SERVICE,
+    ).one_or_none()
 
 
 def _edge_decay_should_skip(
