@@ -108,7 +108,8 @@ LLM_BACKEND=claude_cli python scripts/eval_golden.py --mode record
 живую модель с replay-эталоном нельзя: тот меряет обвес на записанных
 ответах, и любая перефразировка модели читалась бы как регресс. В live-сводке
 есть ещё `latency_s` (всего, максимум, по кейсам) — только для информации, в
-сверку не входит. Расписание — `.github/workflows/eval-live.yml` на ARC-раннере,
+сверку не входит. Запуск — вручную (`workflow_dispatch`, расписание снято, пока
+LLM-пайплайн в проде выключен): `.github/workflows/eval-live.yml` на ARC-раннере,
 бэкенд `claude_cli` с секретом `CLAUDE_CODE_OAUTH_TOKEN` (`claude setup-token`).
 Пока `baseline_live.json` не зафиксирован, прогон меряет, но не сверяет.
 

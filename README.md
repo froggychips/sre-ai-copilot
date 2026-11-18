@@ -179,7 +179,7 @@ Routing lives in [`k8s/vmalertmanagerconfig.yaml`](k8s/vmalertmanagerconfig.yaml
 | 5 | Live preprod pod crash | ✅ **resolved** | TC context missing (`no_deploys_or_no_timestamp`) — flagged as gap, not false root cause | Correct cautious behaviour; TC MCP URL not configured locally |
 | 6 | Live preprod pod crash | ✅ **resolved** | Pipeline self-diagnosed a false refutation in synthesis | Correct — synthesis explicitly noted the contradiction and recommended manual check |
 
-Being hand-checked is exactly the problem these runs illustrate. The **[golden set](tests/golden/README.md)** closes it: 20 frozen incidents with expectations, run on every PR in `replay` mode (recorded LLM answers — no network, no key, deterministic) and against the real model on a schedule (`.github/workflows/eval-live.yml`). Runs 1–3 are now cases `001` and `013`.
+Being hand-checked is exactly the problem these runs illustrate. The **[golden set](tests/golden/README.md)** closes it: 20 frozen incidents with expectations, run on every PR in `replay` mode (recorded LLM answers — no network, no key, deterministic) and against the real model on demand (`.github/workflows/eval-live.yml`, manual run). Runs 1–3 are now cases `001` and `013`.
 
 ```bash
 python scripts/eval_golden.py --mode replay --check-baseline
@@ -416,7 +416,7 @@ PIPELINE_DIRECT_INVOKE=true
 | 5 | Live preprod pod crash | ✅ **resolved** | TC-контекст missing (`no_deploys_or_no_timestamp`) — отмечен как gap, не ложный root cause | Корректная осторожность; `TEAMCITY_MCP_URL` не настроен локально |
 | 6 | Live preprod pod crash | ✅ **resolved** | Пайплайн самодиагностировал ложное опровержение в синтезе | Корректно — синтез явно отметил противоречие и рекомендовал ручную проверку |
 
-Проверка руками — ровно та проблема, которую эти прогоны иллюстрируют. Её закрывает **[golden-набор](tests/golden/README.md)**: 20 зафиксированных инцидентов с ожиданиями, прогон на каждом PR в режиме `replay` (записанные ответы LLM — без сети, без ключа, детерминированно) и против живой модели по расписанию (`.github/workflows/eval-live.yml`). Прогоны 1–3 стали кейсами `001` и `013`.
+Проверка руками — ровно та проблема, которую эти прогоны иллюстрируют. Её закрывает **[golden-набор](tests/golden/README.md)**: 20 зафиксированных инцидентов с ожиданиями, прогон на каждом PR в режиме `replay` (записанные ответы LLM — без сети, без ключа, детерминированно) и против живой модели по запросу (`.github/workflows/eval-live.yml`, ручной запуск). Прогоны 1–3 стали кейсами `001` и `013`.
 
 ```bash
 python scripts/eval_golden.py --mode replay --check-baseline
