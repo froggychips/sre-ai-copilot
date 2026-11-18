@@ -591,8 +591,12 @@ def sync_all_services(
             # осознанно: синк идемпотентен, повторный прогон восстановит
             # недописанное, а вот блокировка на 12 минут не восстанавливает
             # ничего.
+            if snapshot is not None:
+                snapshot.flush()        # отложенные касания меток — до commit
             db.commit()
 
+    if snapshot is not None:
+        snapshot.flush()
     db.commit()
     logger.info(
         "k8s_topology_resources.services_done fetched=%d nodes=%d workloads=%d "

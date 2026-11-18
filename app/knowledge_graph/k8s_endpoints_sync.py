@@ -277,3 +277,5 @@ def _process_batch(
                 snapshot=snapshot,
             )
             stats["edges_corroborated"] += 1
+    if snapshot is not None:
+        snapshot.flush()                # отложенные касания last_seen_at

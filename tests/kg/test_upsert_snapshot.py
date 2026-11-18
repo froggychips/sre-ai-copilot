@@ -292,6 +292,7 @@ def test_service_noop_decision_mirrors_sql_where(pg_session: Any) -> None:
         snap_ctid = _ctid(db, "kg_services", snap_id)
         populator.upsert_service(db, NS, f"n-{si}-{ai}-snap", snapshot=snapshot,
                                  **kwargs)
+        snapshot.flush()                  # отложенное касание метки
         snap_wrote = _ctid(db, "kg_services", snap_id) != snap_ctid
 
         label = f"строка {_ROW_STATES[si]} аргументы {kwargs}"
@@ -332,24 +333,85 @@ def test_edge_noop_decision_mirrors_sql_where(pg_session: Any) -> None:
 
         dst, edge_id = rows["plain"]
         before = _ctid(db, "kg_service_edges", edge_id)
-        plain = populator.upsert_edge(db, src=src, dst=dst, kind="calls",
-                                      weight=new_weight, discovered_by="s0")
+        populator.upsert_edge(db, src=src, dst=dst, kind="calls",
+                              weight=new_weight, discovered_by="s1")
         sql_wrote = _ctid(db, "kg_service_edges", edge_id) != before
+        plain = _edge_row(db, edge_id)
 
         dst, edge_id = rows["snap"]
         snapshot = populator.UpsertSnapshot(db)
         before = _ctid(db, "kg_service_edges", edge_id)
-        snap = populator.upsert_edge(db, src=src, dst=dst, kind="calls",
-                                     weight=new_weight, discovered_by="s0",
-                                     snapshot=snapshot)
+        returned = populator.upsert_edge(db, src=src, dst=dst, kind="calls",
+                                         weight=new_weight, discovered_by="s1",
+                                         snapshot=snapshot)
+        snapshot.flush()                  # отложенное касание метки
         snap_wrote = _ctid(db, "kg_service_edges", edge_id) != before
+        snap = _edge_row(db, edge_id)
 
         label = f"age_h={age_h} weight={weight} new={new_weight}"
         assert snap_wrote == sql_wrote, label
-        assert (snap.weight, snap.extras, snap.discovered_by) == (
-            plain.weight, plain.extras, plain.discovered_by), label
+        # weight, discovered_by (на касании его переписывает тот, кто видел),
+        # extras и свежесть метки — как после обычного upsert'а.
+        assert snap == plain, label
+        # Объект, который вернул upsert, не расходится с базой.
+        assert (returned.weight, returned.discovered_by) == snap[:2], label
         checked += 1
     assert checked == len(states) * len(incoming)
+
+
+def _edge_row(db: Any, edge_id: int) -> Tuple[Any, ...]:
+    return tuple(db.execute(text(
+        "SELECT weight, discovered_by, extras::text, "
+        "last_seen_at >= (now() at time zone 'utc') - interval '1 minute' "
+        "FROM kg_service_edges WHERE id = :i"), {"i": edge_id}).one())
+
+
+@requires_postgres
+def test_stale_marks_are_touched_in_one_update_per_batch(pg_session: Any) -> None:
+    """Проход, где всем строкам пора освежить метку: UPDATE на пачку, не на строку."""
+    db = pg_session
+    for ns in (NS, SHARED):
+        db.query(ServiceEdge).filter(ServiceEdge.src_id.in_(
+            db.query(Service.id).filter(Service.namespace == ns))).delete(
+                synchronize_session=False)
+        db.query(Service).filter(Service.namespace == ns).delete(
+            synchronize_session=False)
+    _topology_pass_no_commit(db, None)
+    db.flush()
+    ids = [i for (i,) in db.query(Service.id).filter(Service.namespace.in_([NS, SHARED]))]
+    db.execute(text("UPDATE kg_services SET updated_at = updated_at - interval '2 hours' "
+                    "WHERE id = ANY(:ids)"), {"ids": ids})
+    db.execute(text("UPDATE kg_service_edges SET last_seen_at = last_seen_at - interval '5 hours' "
+                    "WHERE src_id = ANY(:ids)"), {"ids": ids})
+    db.expire_all()
+
+    statements: List[str] = []
+
+    def _before(conn: Any, cursor: Any, statement: str, *a: Any) -> None:
+        statements.append(" ".join(statement.split())[:40])
+
+    snapshot = populator.UpsertSnapshot(db)
+    engine = db.get_bind()
+    event.listen(engine, "before_cursor_execute", _before)
+    try:
+        _topology_pass_no_commit(db, snapshot)
+        snapshot.flush()
+    finally:
+        event.remove(engine, "before_cursor_execute", _before)
+
+    assert not any(s.startswith("INSERT") for s in statements), statements
+    updates = [s for s in statements if s.startswith("UPDATE")]
+    # Один UPDATE узлов и по одному на источник рёбер (topology, env).
+    assert len(updates) == 3, updates
+    stale_nodes = db.execute(text(
+        "SELECT count(*) FROM kg_services WHERE id = ANY(:ids) "
+        "AND updated_at < (now() at time zone 'utc') - interval '30 minutes'"),
+        {"ids": ids}).scalar()
+    stale_edges = db.execute(text(
+        "SELECT count(*) FROM kg_service_edges WHERE src_id = ANY(:ids) "
+        "AND last_seen_at < (now() at time zone 'utc') - interval '3 hours'"),
+        {"ids": ids}).scalar()
+    assert stale_nodes == 0 and stale_edges == 0
 
 
 @requires_postgres

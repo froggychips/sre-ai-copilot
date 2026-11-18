@@ -1337,6 +1337,10 @@ def sync_namespace(
             )
             stats["edges"] += 1
 
+    # Отложенные касания меток свежести — одним UPDATE на пачку.
+    if snapshot is not None:
+        snapshot.flush()
+
     # KG Coverage #4: пересчитать stale_class для всех сервисов в этом ns.
     # Делаем здесь (а не в _upsert_service_pg), чтобы один SQL-проход по
     # kg_deployments вместо N×запросов.
@@ -1563,6 +1567,8 @@ def _enrich_calls_edges_for_ns(
                 snapshot=snapshot,
             )
             edges_count += 1
+    if snapshot is not None:
+        snapshot.flush()
     return edges_count
 
 

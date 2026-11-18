@@ -16,7 +16,7 @@ from __future__ import annotations
 from typing import Any, Dict, List, Tuple
 
 import pytest
-from sqlalchemy import create_engine, event
+from sqlalchemy import create_engine, event, text
 from sqlalchemy.orm import sessionmaker
 
 from app.database import Base
@@ -210,6 +210,31 @@ def _wipe(db: Any) -> None:
     db.expunge_all()
 
 
+def _aged_cycle(db: Any, monkeypatch: pytest.MonkeyPatch, snapshot_on: bool) -> _Counter:
+    """Цикл, в котором всем меткам свежести пора обновиться (PostgreSQL)."""
+    monkeypatch.setenv("KG_UPSERT_SNAPSHOT", "1" if snapshot_on else "0")
+    ids = [i for (i,) in db.query(Service.id).filter(Service.namespace.in_(NAMESPACES))]
+    db.execute(text("UPDATE kg_services SET updated_at = updated_at - interval '2 hours' "
+                    "WHERE id = ANY(:ids)"), {"ids": ids})
+    db.execute(text("UPDATE kg_service_edges SET last_seen_at = last_seen_at - interval "
+                    "'5 hours' WHERE src_id = ANY(:ids)"), {"ids": ids})
+    db.commit()
+    db.expire_all()
+    with _Counter(db) as counter:
+        _cycle(db, _cluster(variant=1), monkeypatch)
+    stale_nodes = db.execute(text(
+        "SELECT count(*) FROM kg_services WHERE id = ANY(:ids) "
+        "AND updated_at < (now() at time zone 'utc') - interval '30 minutes'"),
+        {"ids": ids}).scalar()
+    stale_edges = db.execute(text(
+        "SELECT count(*) FROM kg_service_edges WHERE src_id = ANY(:ids) "
+        "AND last_seen_at < (now() at time zone 'utc') - interval '3 hours'"),
+        {"ids": ids}).scalar()
+    counter.by_kind["_stale_nodes"] = int(stale_nodes or 0)
+    counter.by_kind["_stale_edges"] = int(stale_edges or 0)
+    return counter
+
+
 @requires_postgres
 def test_three_sync_cycles_match_on_postgres_and_cut_queries(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
@@ -222,11 +247,24 @@ def test_three_sync_cycles_match_on_postgres_and_cut_queries(
     try:
         _wipe(db)
         plain, plain_steady = _run_three_cycles(db, monkeypatch, snapshot_on=False)
+        plain_aged = _aged_cycle(db, monkeypatch, snapshot_on=False)
+        plain.append(_graph(db))
         _wipe(db)
         snap, snap_steady = _run_three_cycles(db, monkeypatch, snapshot_on=True)
+        snap_aged = _aged_cycle(db, monkeypatch, snapshot_on=True)
+        snap.append(_graph(db))
         for i, (a, b) in enumerate(zip(plain, snap)):
             assert b[0] == a[0], f"узлы разошлись в цикле {i}"
             assert b[1] == a[1], f"рёбра разошлись в цикле {i}"
+
+        # Цикл, где всем меткам пора освежиться: метки освежены в обоих
+        # режимах одинаково (несвежими остаются одни и те же строки — те,
+        # которых синки в этом цикле не видели), но касания идут пачками.
+        assert snap_aged.by_kind.pop("_stale_nodes") == plain_aged.by_kind.pop("_stale_nodes")
+        assert snap_aged.by_kind.pop("_stale_edges") == plain_aged.by_kind.pop("_stale_edges")
+        assert snap_aged.by_kind.get("insert into kg_services", 0) == 0
+        assert snap_aged.by_kind.get("insert into kg_service_edges", 0) == 0
+        assert plain_aged.total / snap_aged.total > 8
 
         with capsys.disabled():
             print(f"\nповторный цикл, запросов: без снимка {plain_steady.total}, "
@@ -234,6 +272,11 @@ def test_three_sync_cycles_match_on_postgres_and_cut_queries(
             for key in sorted(set(plain_steady.by_kind) | set(snap_steady.by_kind)):
                 print(f"  {key:34s} {plain_steady.by_kind.get(key, 0):6d} → "
                       f"{snap_steady.by_kind.get(key, 0):6d}")
+            print(f"цикл с устаревшими метками, запросов: без снимка {plain_aged.total}, "
+                  f"со снимком {snap_aged.total}")
+            for key in sorted(set(plain_aged.by_kind) | set(snap_aged.by_kind)):
+                print(f"  {key:34s} {plain_aged.by_kind.get(key, 0):6d} → "
+                      f"{snap_aged.by_kind.get(key, 0):6d}")
 
         # Повторный цикл со снимком ничего не пишет в узлы и рёбра …
         assert snap_steady.by_kind.get("insert into kg_services", 0) == 0
