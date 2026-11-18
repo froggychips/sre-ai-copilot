@@ -908,6 +908,43 @@ class Settings(BaseSettings):
     # события подов, — разбор инцидента смотрит на оба источника вместе.
     KG_K8S_JOB_RUNS_RETENTION_DAYS: int = Field(30, description="Сколько суток хранить kg_k8s_job_runs")
 
+    # ── Уборка, которая удаляет данные (18.11.2026) ──────────────────────
+    # У каждой — свой режим: off (ничего не делать) → dry_run (посчитать,
+    # что было бы удалено: лог + метрика kg_retention_rows_total с
+    # action="would_*") → apply. Дефолт off: включать по одной, сначала
+    # dry_run, см. docs/RUNBOOK. Неизвестное значение читается как off.
+    #
+    # Свёртка kg_service_health: сырые 10-минутные точки старше RAW-срока
+    # сворачиваются в часовые агрегаты (kg_service_health_hourly) и удаляются.
+    # 7 дней — ровно baseline детектора аномалий и health_score; ниже модуль
+    # откажется работать (health_retention.MIN_RETENTION_DAYS).
+    KG_HEALTH_DOWNSAMPLE_MODE: str = Field("off", description="off | dry_run | apply")
+    KG_HEALTH_RAW_RETENTION_DAYS: int = Field(
+        7, description="Сколько суток хранить сырые точки kg_service_health до свёртки в часовые"
+    )
+    KG_HEALTH_HOURLY_RETENTION_DAYS: int = Field(
+        90, description="Сколько суток хранить часовые агрегаты kg_service_health_hourly"
+    )
+    # Срок жизни узлов stale_class='gone': namespace отсутствует в кластере
+    # (kg_namespaces.missing_since) дольше TTL — узлы удаляются вместе с
+    # рёбрами и наблюдениями. Вернувшийся namespace отсчёт обнуляет.
+    KG_GONE_NODES_TTL_MODE: str = Field("off", description="off | dry_run | apply")
+    KG_GONE_NODES_TTL_DAYS: int = Field(
+        30, description="Через сколько суток отсутствия namespace удалять его gone-узлы"
+    )
+    # Первое включение apply — на одном-двух namespace: CSV имён. Пусто — все
+    # подходящие. Список только сужает, срок и класс проверяются всё равно.
+    KG_GONE_NODES_TTL_NAMESPACES: str = Field(
+        "", description="CSV namespace, которыми ограничить удаление gone-узлов (пусто — все)"
+    )
+    # Таблицы процесса remediation без срока хранения: kg_remediation_decisions,
+    # kg_action_approvals, kg_remediation_attempts и мостовые строки incidents
+    # (rb-…). Пол — health_retention.MIN_EVENT_RETENTION_DAYS (90).
+    KG_WORKFLOW_RETENTION_MODE: str = Field("off", description="off | dry_run | apply")
+    KG_WORKFLOW_RETENTION_DAYS: int = Field(
+        180, description="Сколько суток хранить решения/одобрения/попытки remediation и мостовые incidents"
+    )
+
     # Daily stats digest — Celery beat task который собирает cluster-health
     # + KG-quality + stale-deployments и шлёт в DISCORD_WEBHOOK_STATS_URL.
     # БЕЗ LLM-вызовов (см. tests/test_stats_digest_no_llm.py).
