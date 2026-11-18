@@ -21,8 +21,9 @@
      CrashLoop/OOM-событий у подов нет.
 
 Исход — `verified` / `failed` / `pending` / `unknown`, и `unknown` — честный
-ответ, а не сбой: kubectl недоступен, uid сменился после действия, алерта
-в графе нет. Все проверки лежат в `analysis["executor_verification"]` с
+ответ, а не сбой: kubectl недоступен, uid сменился после действия, а у
+предложения моста — статус его алерта неизвестен (см. `assess`,
+`require_alert_status`). Все проверки лежат в `analysis["executor_verification"]` с
 причинами, состояние исполнителя переходит в `verified` или
 `verification_failed` (`incident_state`).
 
@@ -269,12 +270,39 @@ def _parse_iso(raw: Any) -> Optional[datetime]:
     return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
 
 
-def _alert_resolved(db: Any, incident_id: str) -> Optional[bool]:
-    """Алерт инцидента resolved? None — строки в kg_alerts нет (LLM-путь пишет
-    fingerprint == incident_id)."""
+def alert_fingerprint_for(incident_id: str, analysis: Any = None) -> str:
+    """Fingerprint алерта (ключ kg_alerts), по которому открыт инцидент.
+
+    LLM-путь: `incident_id` и есть fingerprint Alertmanager-а. Мост заводит
+    на каждое предложение свою строку инцидента (`rb-…`), а fingerprint
+    кладёт в `analysis.alert_fingerprint` — искать по `rb-…` в kg_alerts
+    бессмысленно: до этой правки `_alert_resolved` для моста всегда
+    возвращал None, и исход `verified` выставлялся без проверки алерта.
+    """
+    if isinstance(analysis, dict) and analysis.get("source") == "remediation_bridge":
+        fingerprint = analysis.get("alert_fingerprint")
+        if fingerprint:
+            return str(fingerprint)
+    return incident_id
+
+
+def alert_status_required(analysis: Any) -> bool:
+    """Обязан ли исход `verified` опираться на известный статус алерта.
+
+    Для моста — да: алерт — единственный сигнал, по которому действие
+    предложено, и его fingerprint записан в инцидент. Для остальных путей
+    прежнее правило: неизвестный статус — пометка в reasons, не блокер.
+    """
+    return isinstance(analysis, dict) and analysis.get("source") == "remediation_bridge"
+
+
+def _alert_resolved(db: Any, incident_id: str, analysis: Any = None) -> Optional[bool]:
+    """Алерт инцидента resolved? None — строки в kg_alerts нет или запрос
+    не удался: статус неизвестен. Ключ — `alert_fingerprint_for`."""
+    fingerprint = alert_fingerprint_for(incident_id, analysis)
     try:
         from app.knowledge_graph.schema import AlertEvent
-        row = db.query(AlertEvent).filter(AlertEvent.fingerprint == incident_id).first()
+        row = db.query(AlertEvent).filter(AlertEvent.fingerprint == fingerprint).first()
     except Exception:
         return None
     if row is None:
@@ -314,9 +342,15 @@ def assess(
     new_crash_events: int,
     attempt: int,
     max_attempts: int,
+    require_alert_status: bool = False,
 ) -> Dict[str, Any]:
     """Чистая оценка исхода по собранным фактам. Возвращает
-    {outcome, checks, reasons}; каждая проверка — True/False/None(unknown)."""
+    {outcome, checks, reasons}; каждая проверка — True/False/None(unknown).
+
+    `require_alert_status` (мост): неизвестный статус алерта не даёт
+    `verified` — ждём следующей попытки, на последней исход `unknown`
+    («не подтверждено»). По умолчанию — прежнее правило: None не блокер.
+    """
     checks: Dict[str, Any] = {}
     reasons: List[str] = []
     before = before or {}
@@ -381,6 +415,12 @@ def assess(
     if alert_resolved is False:
         reasons.append("алерт всё ещё firing")
         return {"outcome": OUTCOME_PENDING if attempt < max_attempts else OUTCOME_FAILED,
+                "checks": checks, "reasons": reasons}
+    if alert_resolved is None and require_alert_status:
+        # Цель здорова, но погас ли алерт — не знаем. Строка в kg_alerts
+        # появляется при записи алерта, resolved_at — при синке с
+        # Alertmanager-ом: к следующей попытке статус может стать известен.
+        return {"outcome": OUTCOME_PENDING if attempt < max_attempts else OUTCOME_UNKNOWN,
                 "checks": checks, "reasons": reasons}
     return {"outcome": OUTCOME_VERIFIED, "checks": checks, "reasons": reasons}
 
@@ -565,10 +605,11 @@ def verify_remediation(
             intent=intent,
             before=applied.get("target_before"),
             now_snap=now_snap,
-            alert_resolved=_alert_resolved(db, incident_id),
+            alert_resolved=_alert_resolved(db, incident_id, analysis),
             new_crash_events=_new_crash_events(db, intent, applied_at),
             attempt=attempt,
             max_attempts=max_attempts,
+            require_alert_status=alert_status_required(analysis),
         )
         from app.remediation.attempts import BOUND_ENTRY_KEY
         bound_entry = (
