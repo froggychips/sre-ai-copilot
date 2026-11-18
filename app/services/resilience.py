@@ -1,17 +1,30 @@
 import asyncio
 import inspect
 import random
+import sys
 import time
 import weakref
 from functools import wraps
 from typing import Any, Callable, Optional, Tuple, Type
 
-import anthropic
 import httpx
 import structlog
 from redis.asyncio import Redis, from_url
 
 logger = structlog.get_logger()
+
+
+def _anthropic_sdk():
+    """SDK anthropic, если он уже загружен в процесс; иначе None.
+
+    Модуль импортируют api и все процессы Celery ради LoopLocalRedis и
+    rate-limit-а, а SDK нужен лишь затем, чтобы распознать ЕГО исключения.
+    Исключение класса anthropic.* не может прилететь, пока сам SDK не
+    импортирован (это делает app.services.llm_service), поэтому вместо
+    `import anthropic` на уровне модуля смотрим в sys.modules: не загружен —
+    значит, и распознавать нечего.
+    """
+    return sys.modules.get("anthropic")
 
 
 class LoopLocalRedis:
@@ -95,12 +108,16 @@ def is_retryable_llm_error(exc: BaseException) -> bool:
     """
     if isinstance(exc, LLMCircuitOpen):
         return False
-    if isinstance(exc, (anthropic.APIConnectionError, anthropic.RateLimitError)):
-        # APITimeoutError — подкласс APIConnectionError, покрыт здесь же.
-        return True
-    if isinstance(exc, anthropic.APIStatusError):
-        # 5xx (500 api_error / 529 overloaded) — транзиент; 4xx — нет.
-        return exc.status_code >= 500
+    anthropic = _anthropic_sdk()
+    if anthropic is not None:
+        if isinstance(
+            exc, (anthropic.APIConnectionError, anthropic.RateLimitError)
+        ):
+            # APITimeoutError — подкласс APIConnectionError, покрыт здесь же.
+            return True
+        if isinstance(exc, anthropic.APIStatusError):
+            # 5xx (500 api_error / 529 overloaded) — транзиент; 4xx — нет.
+            return exc.status_code >= 500
     if isinstance(exc, asyncio.TimeoutError):
         # Верхняя граница wait_for сработала — повтор оправдан.
         return True
@@ -178,7 +195,10 @@ def llm_retry_strategy(func):
                 logger.warning("llm_call_retry", attempt=attempt, error=str(exc))
                 if attempt < retries:
                     retry_after = None
-                    if isinstance(exc, anthropic.RateLimitError):
+                    anthropic = _anthropic_sdk()
+                    if anthropic is not None and isinstance(
+                        exc, anthropic.RateLimitError
+                    ):
                         retry_after = _retry_after_seconds(exc)
                     if retry_after is not None:
                         # Провайдер сказал сколько ждать — ждём его срок,
