@@ -359,7 +359,7 @@ jobs:
       # Подпись — не часть контракта деплоя: кластер тянет образ из Nexus,
       # собранный локально, а ghcr-образ с подписью никто не проверяет.
       # На self-hosted Mac 05.09.2026 keyless-подпись падала на TLS:
-      # fulcio.sigstore.dev резолвится в 103.105.215.34, сертификат
+      # fulcio.sigstore.dev резолвится в чужой адрес (sinkhole), сертификат
       # «Sinkhole Intermediate CA» — DNS-фильтр на машине раннера подменяет
       # домен. Это среда, не код, и краснить master она не должна.
       - name: Cosign sign image (keyless, OIDC)
