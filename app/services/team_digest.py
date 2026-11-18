@@ -34,6 +34,8 @@ from app.config import settings
 from app.database import ReadOnlyAutocommitSession
 from app.knowledge_graph.schema import (NODE_KIND_SERVICE, AlertEvent,
                                         Deployment, Service, SignalAggregate)
+from app.services.alert_noise_rule import (is_rule_noise_raw,
+                                           reports_exclude_rule_noise)
 from app.knowledge_graph.stuck_alerts import (find_stuck_alerts,
                                               severity_emoji)
 
@@ -124,7 +126,7 @@ def _alerts_breakdown(
 ) -> Dict[str, Any]:
     """Open alerts (resolved_at IS NULL) + severity counters + top alertname."""
     rows = (
-        db.query(AlertEvent.severity, AlertEvent.alertname)
+        db.query(AlertEvent.severity, AlertEvent.alertname, AlertEvent.raw)
         .join(Service, Service.id == AlertEvent.service_id)
         .filter(
             Service.team_owner == team_owner,
@@ -133,9 +135,13 @@ def _alerts_breakdown(
         )
         .all()
     )
+    # Шум по статическому правилу в счётчик открытых не идёт — см.
+    # services/alert_noise_rule.
+    if reports_exclude_rule_noise():
+        rows = [r for r in rows if not is_rule_noise_raw(r[2])]
     severity_counter: Counter = Counter()
     alertname_counter: Counter = Counter()
-    for sev, name in rows:
+    for sev, name, _raw in rows:
         severity_counter[(sev or "unknown").lower()] += 1
         if name:
             alertname_counter[name] += 1

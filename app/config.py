@@ -417,6 +417,45 @@ class Settings(BaseSettings):
     # Сколько минут без прогресса наката считать «наката нет».
     GEN_MISMATCH_QUIET_MINUTES: float = 30.0
 
+    # Статическое правило шума (app/services/alert_noise_rule.py). Замер
+    # 18.11.2026: 3525 из ~3900 инцидентов за неделю — одиночный
+    # CPUThrottlingHigh (+4759 переоткрытий), из них 3081 в squad-* и почти
+    # всегда контейнер `metrics` (сайдкар-экспортер Postgres). Правило чистое
+    # (лейблы + настройки, без SQL/kubectl), поэтому включено по умолчанию.
+    # Совпавший алерт: `kg_alerts.raw.noise_rule`, инцидент — noise=true, один
+    # «хронический» на сервис вместо нового на каждый флап, reopened_count не
+    # растёт. Сигнальный алерт того же сервиса заводит СВОЙ инцидент.
+    # kill-switch: false → прежнее поведение для новых алертов.
+    ALERT_NOISE_RULE_ENABLED: bool = True
+    ALERT_NOISE_RULE_ALERTNAMES: List[str] = Field(
+        default_factory=lambda: ["CPUThrottlingHigh"],
+        description="Точные alertname, к которым применяется правило шума",
+    )
+    ALERT_NOISE_RULE_NAMESPACES: List[str] = Field(
+        default_factory=lambda: ["squad-*", "dev-*"],
+        description="fnmatch-шаблоны namespace (стенды), где алерт — шум",
+    )
+    ALERT_NOISE_RULE_CONTAINERS: List[str] = Field(
+        default_factory=list,
+        description=(
+            "fnmatch-шаблоны контейнера (лейбл container; нет лейбла — имя "
+            "сервиса) внутри совпавших namespace. Пусто = любой контейнер"
+        ),
+    )
+    ALERT_NOISE_RULE_CONTAINERS_ANY_NAMESPACE: List[str] = Field(
+        default_factory=list,
+        description=(
+            "fnmatch-шаблоны контейнера, шумного в ЛЮБОМ namespace, включая "
+            "прод (кандидат: metrics). По умолчанию пусто — прод не глушим"
+        ),
+    )
+    # Сколько часов после закрытия шумовой инцидент сервиса принимает новый
+    # флап обратно (без роста reopened_count). 168 = AGE_OUT_HOURS инцидента.
+    ALERT_NOISE_RULE_REOPEN_HOURS: int = 168
+    # Помеченные правилом алерты не попадают в STUCK_ALERTS_FOUND, в
+    # team-digest (open/stuck) и chronic-digest.
+    ALERT_NOISE_RULE_EXCLUDE_FROM_REPORTS: bool = True
+
     # A3: Explicit alertname allowlist — pure-noise alerts которые AM шлёт
     # либо для self-monitoring (Watchdog ping), либо как technical helper
     # (InfoInhibitor — workaround для AM inhibition rules без matchers).

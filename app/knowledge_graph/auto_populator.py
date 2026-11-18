@@ -175,6 +175,16 @@ def populate_from_incident(db: Session, incident: Incident) -> Dict[str, int]:
     if target.scope != STORE_SCOPE_LEGACY:
         alert_raw["target_kind"] = target.scope
         alert_raw.setdefault("attribution", target.how)
+    # Статическое правило шума (CPUThrottlingHigh на стендах и т.п.): чистая
+    # функция от лейблов и настроек, без I/O. Пометка живёт в самой строке
+    # алерта — читатели kg_alerts (stuck-alerts, дайджесты) фильтруют по ней,
+    # не завися от того, к какому инциденту алерт сейчас привязан. raw
+    # перезаписывается каждым уведомлением, поэтому смена настроек снимает её.
+    from app.services.alert_noise_rule import RAW_NOISE_KEY, noise_rule_kind
+    noise_kind = noise_rule_kind(labels, namespace, service=service_name)
+    if noise_kind:
+        alert_raw[RAW_NOISE_KEY] = noise_kind
+        stats["noise_rule"] = 1
     if fired_at is not None:
         try:
             with db.begin_nested():
@@ -222,6 +232,7 @@ def populate_from_incident(db: Session, incident: Incident) -> Dict[str, int]:
                             alertname=labels.get("alertname") or "unknown",
                             severity=labels.get("severity") or incident.severity,
                             fingerprint=incident.incident_id,
+                            noise_kind=noise_kind,
                         )
                     stats["kg_incident_id"] = cast(int, inc.id)
                 except Exception as e:
@@ -230,7 +241,8 @@ def populate_from_incident(db: Session, incident: Incident) -> Dict[str, int]:
                         error=type(e).__name__, message=str(e),
                     )
 
-    logger.info(
+    # Шум по правилу — сотни повторных уведомлений в час; в info его не пишем.
+    (logger.debug if noise_kind else logger.info)(
         "kg.populate.done",
         incident_id=incident.incident_id,
         service=service_name,
