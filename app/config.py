@@ -1029,6 +1029,23 @@ class Settings(BaseSettings):
         "", description="Comma-separated namespace prefixes where the bridge runs (empty = all)"
     )
 
+    # Вид цели до пробы kubectl (app/remediation/workload.py): мост определяет
+    # Deployment/StatefulSet/DaemonSet/Job по лейблам алерта, графу и форме
+    # имени пода и отсекает playbook, чей `match.target_kinds` цель не
+    # покрывает, — без обогащения, снимка K8sFacts и `describe`. Имя цели
+    # берётся оттуда же (Deployment пода), а не из имени сервиса. False —
+    # поведение 1.0.35: имя `labels.deployment or service`, вид не проверяется.
+    REMEDIATION_BRIDGE_TARGET_KIND_ENABLED: bool = Field(
+        True, description="Bridge resolves the target workload kind and filters playbooks by match.target_kinds before kubectl"
+    )
+    # Блок policy по осям, не зависящим от живого состояния (tier namespace,
+    # data-plane, обратимость, вид ресурса), мост выносит ДО пробы живых
+    # реплик: решение `block` пишется как раньше, kubectl не вызывается.
+    # False — проба идёт всегда (1.0.35).
+    REMEDIATION_BRIDGE_EARLY_POLICY_BLOCK_ENABLED: bool = Field(
+        True, description="Bridge decides static policy blocks (tier/data-plane) before the live replicas probe"
+    )
+
     # Запись об одобрении в kg_action_approvals не имела привязки ко времени:
     # approval четырёхчасовой давности продолжал авторизовывать реальный write
     # (особенно после re-fire алерта). Ограничиваем срок годности одобрения.
