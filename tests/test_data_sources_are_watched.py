@@ -60,6 +60,10 @@ _MAINTENANCE = frozenset({
     "kg_drift_cleanup",
     "kg_health_recompute",
     "kg_health_retention",
+    # Свёртка сырья health в часовые и удаление узлов снесённых стендов —
+    # уборка под своими настройками (по умолчанию выключена).
+    "kg_health_downsample",
+    "kg_gone_nodes_purge",
     "kg_namespace_lifecycle",
     # Владелец namespace — производное от лейблов, Jira и TC; молчание задачи
     # оставляет owner_* устаревшими, но данных графа не искажает.
