@@ -4,6 +4,95 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+Серия по итогам сверки живой инсталляции 1.0.35 с кодом (18.11.2026).
+
+### Исправлено
+
+- **Мост remediation определяет вид цели до kubectl (#562).** Вид нагрузки
+  (Deployment / StatefulSet / DaemonSet / Job) берётся из лейблов алерта,
+  графа и формы имени пода; playbook объявляет `match.target_kinds`,
+  несовместимая цель отсекается до обогащения и проб. Раньше
+  `scale_out_cpu_throttled_deployment` матчился на поды StatefulSet-ов баз:
+  ~5,5 тыс. проб kubectl и строк `plan_render_failed` в сутки при нуле
+  предложений. Блок policy по tier / data-plane — до пробы реплик. Метрики
+  `remediation_bridge_skipped_total`, `remediation_bridge_early_blocks_total`;
+  флаги `REMEDIATION_BRIDGE_TARGET_KIND_ENABLED`,
+  `REMEDIATION_BRIDGE_EARLY_POLICY_BLOCK_ENABLED`.
+- **`CPUThrottlingHigh` на стендах — шум по правилу (#563).** Алерты из
+  `ALERT_NOISE_RULE_ALERTNAMES` в `squad-*` / `dev-*` получают
+  `raw.noise_rule`, инцидент — `noise=true`; флапы сворачиваются в один
+  хронический инцидент на сервис без роста `reopened_count`. Помеченные
+  алерты исключены из `STUCK_ALERTS_FOUND`, team- и chronic-дайджестов;
+  горящий шум не держит погасший сигнальный инцидент открытым.
+  `kg.incident.attached` — в debug. Было: 3525 из ~3900 инцидентов за
+  неделю — одиночный `CPUThrottlingHigh`. Выключатель
+  `ALERT_NOISE_RULE_ENABLED=false`.
+- **Обратная связь по карточке моста (#564).** Verify ищет алерт по
+  настоящему fingerprint (раньше — по `rb-…`, исход `verified` ставился без
+  проверки алерта); неизвестный статус даёт «не подтверждено». Итог apply
+  (успех, отказ с причиной, ошибка) дописывается в карточку ботом. Claim
+  дедупа короткий до конечного исхода — временный сбой dry-run не глушит
+  цель на 6 часов. У предложения срок жизни (60 мин) и отказ по погасшему
+  алерту; у `executor_apply` — `expires` и сторож
+  `remediation_apply_watchdog`. Сбой постановки apply не тупик: одобрение
+  отзывается. Синхронные вызовы обработчика кнопок уведены из event loop;
+  `approved_by` — Discord user id. **Раскатка: api, worker и executor
+  вместе; executor-у нужен `DISCORD_BOT_TOKEN`.**
+- **API не встаёт из-за БД (#565).** `lock_timeout` / `statement_timeout`
+  на соединении по роли процесса (API 3 с / 15 с, worker / executor / beat
+  3 мин / 10 мин, скрипты и alembic без ограничений). Запись вебхуков
+  `/store`, `/enrich-and-forward`, `/remediation` — в потоке
+  (`WEBHOOK_DB_THREADS`); таймаут или недоступность БД отдаётся
+  Alertmanager-у как 503 + `Retry-After` вместо 202 с потерей. Предел тела
+  2 МиБ и 1000 алертов в батче (413). Удалён `raw_collector` — буфер сырых
+  батчей без читателей. **Включается с образом; откат без пересборки —
+  `DB_API_LOCK_TIMEOUT_MS=0`, `DB_API_STATEMENT_TIMEOUT_MS=0`.**
+- **Чистка `kg_incidents` не падает на внешнем ключе событий remediation
+  (#567):** инцидент, на который ещё ссылается событие, пропускается до
+  следующего прогона.
+
+### Производительность
+
+- **Пакетные запросы вместо N+1 в синках и расчёте здоровья (#566).**
+  Детектор аномалий и `recompute_all_health` грузят точки и сигналы
+  пачками и пишут одним UPDATE (~100× меньше запросов на прогон); чистка
+  health-точек после пересоздания стенда — EXISTS вместо двух COUNT;
+  `populator.UpsertSnapshot` — узлы и рёбра namespace из снимка, upsert без
+  изменений в базу не идёт, касания меток свежести одним UPDATE. Схема не
+  менялась. Выключатель `KG_UPSERT_SNAPSHOT=0`.
+- **Выключенный LLM-пайплайн не грузится в процессы (#568).** Пайплайн,
+  агенты и SDK anthropic импортируются лениво (30 модулей, ~6,5 тыс.
+  строк): локально beat 184 → 99 МиБ, api 195 → 116 МиБ, родитель воркера
+  183 → 148 МиБ. `/copilot` и `/replay/{id}` при
+  `LLM_PIPELINE_ENABLED=false` отвечают 503 и ничего не ставят в очередь;
+  `generate_reply` завершается без ретраев и теперь зарегистрирована в
+  воркере. Live golden-eval — только по ручному запуску.
+
+### Добавлено
+
+- **Уборка базы (#567) — всё по умолчанию выключено, режимы
+  `off → dry_run → apply`.** Сырьё `kg_service_health` старше 7 дней
+  сворачивается в часовые агрегаты `kg_service_health_hourly` (beat
+  `kg_health_downsample`); узлы `stale_class='gone'` удаляются через 30 дней
+  отсутствия namespace вместе с рёбрами и наблюдениями, история инцидентов
+  и алертов остаётся (beat `kg_gone_nodes_purge`); у
+  `kg_remediation_decisions` / `kg_action_approvals` /
+  `kg_remediation_attempts` и мостовых `incidents` — срок 180 дней. Индексы
+  по времени под чистку. Миграции `20261118_0100`, `20261118_0200`;
+  контракт KG 2.10. Порядок включения — RUNBOOK, «Уборка базы».
+
+### Инфраструктура
+
+- **Манифесты как источник правды (#569).** Несекретные флаги поведения —
+  в ConfigMap `sre-ai-copilot-settings`; executor и beat получают
+  собственные узкие Secret-ы (`scripts/split_role_secrets.py`); `deploy.sh`
+  отказывает при расхождении флагов между Secret и ConfigMap, обновляет
+  CronJob-ы `squad-dashboard` и `ci-deadman` и умеет `--render`. RBAC,
+  hostname-пин и digest postgres / redis приведены к кластеру; адрес
+  внешней базы убран из публичных манифестов, PII-страж ловит публичные
+  IPv4. **В кластере ничего не меняется до ручного применения по RUNBOOK,
+  «Настройки: ConfigMap и секреты по ролям».**
+
 ## [1.0.35] — 2026-11-17 — брейкер kubectl не открывается от NotFound
 
 ### Исправлено
