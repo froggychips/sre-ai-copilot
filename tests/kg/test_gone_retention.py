@@ -161,6 +161,65 @@ def test_node_with_open_incident_or_firing_alert_is_skipped(graph):
     assert db.query(Namespace).get("squad-old").state == "missing", "узлы остались — не retired"
 
 
+# --- гонка с записью истории (ревью PR #567) --------------------------------
+
+
+def test_incident_committed_between_check_and_lock_keeps_the_node(graph, monkeypatch):
+    """Вебхук открыл инцидент после первой проверки занятости, но до блокировки
+    узлов: проверка под блокировкой обязана его увидеть."""
+    from app.knowledge_graph import gone_retention as mod
+
+    db = graph
+    real_lock = mod._lock_gone
+    fired = []
+
+    def lock_after_webhook(db_, ids):
+        if not fired:
+            fired.append(True)
+            old = NOW - timedelta(minutes=1)
+            db_.add(KGIncident(incident_key="squad-old/town@race", namespace="squad-old",
+                               service_name="town", service_id=10, status="open",
+                               opened_at=old, last_alert_at=old))
+            db_.add(AlertEvent(fingerprint="fp-race", alertname="X", service_id=10, fired_at=old))
+            db_.commit()
+        return real_lock(db_, ids)
+
+    monkeypatch.setattr(mod, "_lock_gone", lock_after_webhook)
+    stats = _run(db)
+
+    assert stats["nodes_skipped_busy"] == 1 and stats["nodes_deleted"] == 1
+    assert _ids(db) == [1, 2, 3, 10, 20], "узел с только что открытым инцидентом цел"
+    assert db.query(KGIncident).one().service_id == 10, "живая история не отвязана"
+    assert db.query(AlertEvent).one().service_id == 10
+    assert db.query(Namespace).get("squad-old").state == "missing"
+
+
+def test_row_written_during_delete_does_not_stay_dangling(graph, monkeypatch):
+    """Таблица без FK (в проде — kg_alerts): строка, записанная после проверки
+    под блокировкой, не должна остаться со ссылкой на удалённый узел."""
+    from app.knowledge_graph import gone_retention as mod
+
+    db = graph
+    real_delete = mod._delete_batch
+
+    def delete_then_late_alert(db_, ids):
+        counts = real_delete(db_, ids)
+        db_.add(AlertEvent(fingerprint="fp-late", alertname="X", service_id=10,
+                           fired_at=NOW))
+        return counts
+
+    monkeypatch.setattr(mod, "_delete_batch", delete_then_late_alert)
+    stats = _run(db)
+
+    assert stats["nodes_deleted"] == 2 and stats["late_refs"] == 1
+    assert db.query(AlertEvent).one().service_id is None
+    assert _ids(db) == [1, 2, 3, 20]
+
+
+def test_no_late_refs_in_the_ordinary_run(graph):
+    assert _run(graph)["late_refs"] == 0
+
+
 # --- что может вернуться ----------------------------------------------------
 
 
@@ -389,3 +448,46 @@ def test_purge_on_postgres_with_real_foreign_keys(pg_session):
     inc = db.query(KGIncident).filter_by(incident_key="gone-ttl-test-old/town@1").one()
     assert inc.service_id is None and inc.service_name == "town"
     assert db.query(AlertEvent).filter_by(fingerprint="gone-ttl-test-fp").one().service_id is None
+
+
+@requires_postgres
+def test_inflight_incident_insert_blocks_node_delete_on_postgres(pg_session):
+    """Настоящая гонка на FK: вебхук вставил открытый инцидент и ещё не
+    закоммитил. Вставка держит FOR KEY SHARE на строке узла — SKIP LOCKED узел
+    не берёт; после коммита узел занят и пропускается проверкой."""
+    from app.database import SessionLocal
+
+    db = pg_session
+    now = datetime.utcnow()
+    db.add(Namespace(namespace="gone-ttl-test-live", state="active", last_seen_at=now))
+    db.add(Namespace(namespace="gone-ttl-test-old", state="missing",
+                     missing_since=now - timedelta(days=40),
+                     last_seen_at=now - timedelta(days=40)))
+    gone = Service(namespace="gone-ttl-test-old", name="town", node_kind="service", stale_class="gone")
+    db.add(gone)
+    db.commit()
+    gone_id = gone.id
+    only = ["gone-ttl-test-old"]
+
+    webhook = SessionLocal()
+    try:
+        webhook.add(KGIncident(incident_key="gone-ttl-test-old/town@race",
+                               namespace="gone-ttl-test-old", service_name="town",
+                               service_id=gone_id, status="open",
+                               opened_at=now, last_alert_at=now))
+        webhook.flush()                       # INSERT выполнен, транзакция открыта
+
+        first = purge_gone_nodes(db, dry_run=False, only_namespaces=only, now=now)
+        assert first["nodes_deleted"] == 0, "узел под KEY SHARE вставки не взят"
+
+        webhook.commit()
+    finally:
+        webhook.close()
+
+    second = purge_gone_nodes(db, dry_run=False, only_namespaces=only, now=now)
+
+    assert second["nodes_deleted"] == 0 and second["nodes_skipped_busy"] == 1
+    db.expire_all()
+    assert db.query(Service).filter_by(id=gone_id).count() == 1
+    inc = db.query(KGIncident).filter_by(incident_key="gone-ttl-test-old/town@race").one()
+    assert inc.service_id == gone_id

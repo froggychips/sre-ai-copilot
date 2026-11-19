@@ -46,6 +46,25 @@ namespace с `last_seen_at` за последние `LIFECYCLE_FRESHNESS`; не�
 
 Узел, на который ссылается открытый инцидент или не закрытый алерт,
 пропускается: история ещё пишется.
+
+**Гонка с записью истории.** Вебхук пишет `kg_alerts` / `kg_incidents` с
+`service_id` параллельно, поэтому занятость проверяется дважды: дёшево до
+блокировки (отсеять батч без транзакции) и ещё раз ПОСЛЕ взятия блокировок
+строк узлов, в той же транзакции, что и удаление. Что это даёт:
+
+  * строка истории закоммичена до блокировки — вторая проверка её видит,
+    узел пропускается;
+  * таблица с настоящим FK на kg_services (в проде — `kg_incidents`, в
+    свежей базе — все): INSERT потомка держит на строке узла FOR KEY SHARE.
+    Незакоммиченная вставка → `SKIP LOCKED` узел не берёт; вставка после
+    нашей блокировки ждёт коммита и получает нарушение FK — ссылку на
+    удалённый узел база не примет;
+  * таблица без FK (в проде — `kg_alerts`, `kg_pod_events`, наблюдения):
+    блокировка узла писателя не останавливает, и строка, закоммиченная
+    между второй проверкой и коммитом удаления, осталась бы с висячим
+    `service_id`. Её подбирает проход после коммита (`_sweep_late_refs`):
+    ссылка снимается, как у остальной истории. Узла уже нет — сохранить
+    связь нельзя, можно только не оставить её висячей.
 """
 from __future__ import annotations
 
@@ -204,6 +223,33 @@ def _delete_batch(db: Session, ids: Sequence[int]) -> Dict[str, int]:
     return counts
 
 
+def _sweep_late_refs(db: Session, ids: Sequence[int]) -> Dict[str, int]:
+    """Снять ссылки на уже удалённые узлы, появившиеся во время удаления.
+
+    Нужен только там, где FK на kg_services нет (см. «Гонка с записью
+    истории» в докстринге модуля): писатель мог закоммитить строку с
+    `service_id` узла между проверкой занятости и коммитом удаления.
+    Возвращает только ненулевые счётчики; коммитит сам.
+    """
+    counts: Dict[str, int] = {}
+    for table in _DETACH_FROM_NODE:
+        res = cast(CursorResult, db.execute(
+            _ids_stmt(f"UPDATE {table} SET service_id = NULL WHERE service_id IN :ids"),  # nosec B608
+            _params(ids, ""),
+        ))
+        if res.rowcount:
+            counts[f"{table}.detached"] = int(res.rowcount)
+    for table, cond in _DELETE_WITH_NODE:
+        res = cast(CursorResult, db.execute(
+            _ids_stmt(f"DELETE FROM {table} WHERE {cond}"),  # nosec B608
+            _params(ids, cond),
+        ))
+        if res.rowcount:
+            counts[table] = counts.get(table, 0) + int(res.rowcount)
+    db.commit()
+    return counts
+
+
 def _merge(total: Dict[str, int], part: Dict[str, int]) -> None:
     for key, value in part.items():
         total[key] = total.get(key, 0) + value
@@ -233,7 +279,10 @@ def purge_gone_nodes(
       * `namespaces_eligible` / `nodes_eligible` — что попало под срок;
       * `nodes_deleted`, `rows` — удалено узлов и строк по таблицам
         (`<таблица>.detached` — строк, у которых снята ссылка);
-      * `nodes_skipped_busy` — узлы с открытым инцидентом или алертом;
+      * `nodes_skipped_busy` — узлы с открытым инцидентом или алертом
+        (проверка до блокировки и повторная под ней);
+      * `late_refs` — строк, записанных на узел уже во время его удаления
+        (таблицы без FK); ссылки с них сняты проходом после коммита;
       * `namespaces_retired` — namespace без единого узла переведены в
         `retired`;
       * `truncated` — упёрлись в `max_nodes` или бюджет времени;
@@ -244,7 +293,8 @@ def purge_gone_nodes(
         "dry_run": dry_run, "ttl_days": ttl_days, "cutoff": None,
         "namespaces_eligible": 0, "nodes_eligible": 0,
         "nodes_deleted": 0, "would_delete_nodes": 0, "nodes_skipped_busy": 0,
-        "namespaces_retired": 0, "rows": {}, "truncated": False, "skipped": None,
+        "namespaces_retired": 0, "late_refs": 0, "rows": {},
+        "truncated": False, "skipped": None,
     }
     if ttl_days < MIN_GONE_TTL_DAYS:
         logger.error("gone_retention.refused ttl_days=%s < min=%s", ttl_days, MIN_GONE_TTL_DAYS)
@@ -331,11 +381,28 @@ def purge_gone_nodes(
                     logger.info("gone_retention.namespace_returned namespace=%s", ns_name)
                     break
                 locked = _lock_gone(db, chunk)
+                # Занятость перепроверяется ПОД блокировкой: инцидент или
+                # алерт, закоммиченный между первой проверкой и этим местом,
+                # иначе ушёл бы вместе с узлом как «закрытая история».
+                late_busy = _busy_node_ids(db, locked) if locked else set()
+                if late_busy:
+                    stats["nodes_skipped_busy"] += len(late_busy)
+                    locked = [i for i in locked if i not in late_busy]
                 if locked:
                     counts = _delete_batch(db, locked)
                     _merge(ns_rows, counts)
                     ns_deleted += counts.get("kg_services", 0)
                 db.commit()
+                if locked:
+                    late = _sweep_late_refs(db, locked)
+                    if late:
+                        logger.warning(
+                            "gone_retention.late_refs namespace=%s %s — строки "
+                            "записаны во время удаления узлов, ссылки сняты",
+                            ns_name, late,
+                        )
+                        stats["late_refs"] += sum(late.values())
+                        _merge(ns_rows, late)
             except Exception:
                 db.rollback()
                 raise
