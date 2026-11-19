@@ -88,6 +88,19 @@ def test_daemonset_with_hashlike_word_is_not_a_deployment(db):
     assert got == WorkloadTarget("DaemonSet", "node-exporter-prometheus", "kg_workload")
 
 
+def test_same_named_deployment_does_not_capture_statefulset_pod(db):
+    """В графе под именем `foo` записан Deployment, а алерт — с пода StatefulSet `foo-0`."""
+    _workload(db, "foo", "Deployment")
+    t = resolve_workload_target({"pod": "foo-0"}, namespace=NS, db=db)
+    assert (t.kind, t.name, t.source) == (None, None, "ambiguous")
+
+
+def test_same_named_statefulset_does_not_capture_deployment_pod(db):
+    _workload(db, "foo", "StatefulSet")
+    t = resolve_workload_target({"pod": "foo-7d9f8c6b5-x2k4q"}, namespace=NS, db=db)
+    assert (t.kind, t.name, t.source) == (None, None, "ambiguous")
+
+
 def test_other_namespace_is_not_consulted(db):
     _workload(db, "town-db-postgresql", "Deployment", namespace="squad-9-k1")
     got = resolve_workload_target(_cpu("town-db-postgresql-0"), db=db)

@@ -76,7 +76,7 @@ class WorkloadTarget:
 
     kind: Optional[str]
     name: Optional[str]
-    source: str  # alert_label | kg_workload | kg_job | pod_name | none
+    source: str  # alert_label | kg_workload | kg_job | pod_name | ambiguous | none
 
     @property
     def kind_label(self) -> str:
@@ -154,6 +154,24 @@ def _from_pod(db: Any, namespace: Optional[str], pod: str) -> WorkloadTarget:
             # Самое длинное имя — самое точное: `<ds>-<слово>` важнее, чем
             # `<ds>` с двумя «хэшами» в хвосте.
             name, kind = max(found, key=lambda item: len(item[0]))
+            # В графе на (namespace, имя) одна workload-строка, а в кластере
+            # Deployment и StatefulSet могут носить одно имя: строка тогда
+            # несёт вид того, кого синк записал последним. Форма имени пода
+            # однозначна (`<имя>-<ordinal>` — StatefulSet, `<имя>-<rs>-<pod>` —
+            # Deployment); если она спорит с графом — вид неизвестен, и
+            # playbook с target_kinds такую цель не возьмёт (fail-closed):
+            # иначе алерт пода StatefulSet увёл бы действие на чужой Deployment.
+            sts_shape = STS_POD_RE.match(pod)
+            shape = None
+            if safe and safe.group("deploy") == name:
+                shape = "Deployment"
+            elif sts_shape and sts_shape.group("sts") == name:
+                shape = "StatefulSet"
+            kinds = {k for n, k in found if n == name}
+            if len(kinds) > 1 or (
+                shape and kind in ("Deployment", "StatefulSet") and kind != shape
+            ):
+                return WorkloadTarget(kind=None, name=None, source="ambiguous")
             return WorkloadTarget(kind=kind, name=name, source="kg_workload")
 
     if cron:
