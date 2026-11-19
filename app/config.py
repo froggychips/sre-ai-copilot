@@ -918,6 +918,10 @@ class Settings(BaseSettings):
     # сворачиваются в часовые агрегаты (kg_service_health_hourly) и удаляются.
     # 7 дней — ровно baseline детектора аномалий и health_score; ниже модуль
     # откажется работать (health_retention.MIN_RETENTION_DAYS).
+    # В режиме apply сырьё удаляет ТОЛЬКО свёртка: KG_HEALTH_RETENTION_DAYS на
+    # kg_service_health перестаёт действовать (иначе при RAW > RETENTION или
+    # отставшей свёртке точки удалялись бы несвёрнутыми). off / dry_run —
+    # срочная чистка работает как раньше.
     KG_HEALTH_DOWNSAMPLE_MODE: str = Field("off", description="off | dry_run | apply")
     KG_HEALTH_RAW_RETENTION_DAYS: int = Field(
         7, description="Сколько суток хранить сырые точки kg_service_health до свёртки в часовые"

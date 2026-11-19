@@ -63,9 +63,10 @@ ACCESS EXCLUSIVE-подобную нагрузку на автовакуум и 
 **Сырьё health — неделя, дальше агрегаты** (18.11.2026). 30 дней сырья
 `kg_service_health` — это 2,2 ГБ из 3,8 ГБ базы при читателях глубиной в
 неделю. Свёртку старше семи суток в часовые агрегаты делает соседний модуль
-`health_downsample` (свой beat, своя настройка, по умолчанию выключен);
-30-дневный срок здесь остаётся страховкой на случай, когда свёртка
-выключена или отстала. Срок жизни узлов снесённых стендов — `gone_retention`.
+`health_downsample` (свой beat, своя настройка, по умолчанию выключен).
+Пока свёртка выключена или в dry_run, 30-дневный срок здесь действует как
+раньше; в режиме apply сырьё удаляет только она (`raw_health_owner`) —
+иначе точка могла бы уйти несвёрнутой. Срок жизни узлов снесённых стендов — `gone_retention`.
 
 **Процесс remediation — третий реестр** (18.11.2026).
 `kg_remediation_decisions`, `kg_action_approvals`, `kg_remediation_attempts`
@@ -100,6 +101,7 @@ logger = logging.getLogger(__name__)
 
 __all__ = [
     "purge_old_health", "purge_observations", "purge_events", "purge_workflow",
+    "raw_health_owner",
     "RETENTION_TARGETS", "EVENT_RETENTION_TARGETS", "WORKFLOW_RETENTION_TARGETS",
     "DEFAULT_RETENTION_DAYS", "MIN_RETENTION_DAYS", "MIN_EVENT_RETENTION_DAYS",
     "DEFAULT_WORKFLOW_RETENTION_DAYS",
@@ -242,11 +244,17 @@ def purge_observations(
     batch_size: int = DEFAULT_BATCH_SIZE,
     max_batches: int = DEFAULT_MAX_BATCHES,
     now: datetime | None = None,
+    owned_elsewhere: Dict[str, str] | None = None,
 ) -> Dict[str, Any]:
     """Прогнать ретеншен по всем таблицам из `RETENTION_TARGETS`.
 
     `overrides` — сроки из настроек по имени таблицы (сейчас так приходит
     `KG_HEALTH_RETENTION_DAYS`). Пол `MIN_RETENTION_DAYS` действует и на них.
+
+    `owned_elsewhere` — таблицы, которые этот прогон НЕ трогает, с причиной
+    (`{таблица: причина}`): у их строк есть другой владелец удаления. Так
+    сырьё `kg_service_health` уступает свёртке, когда она в режиме apply —
+    см. `raw_health_owner`.
 
     Таблицы обрабатываются по очереди и независимо: отказ или ошибка на
     одной не отменяет уборку остальных — иначе одна кривая настройка
@@ -255,6 +263,14 @@ def purge_observations(
     per_table: Dict[str, Any] = {}
     deleted = 0
     for table, ts_column, days in RETENTION_TARGETS:
+        reason = (owned_elsewhere or {}).get(table)
+        if reason:
+            logger.info("retention.table_yielded table=%s reason=%s", table, reason)
+            per_table[table] = {
+                "table": table, "deleted": 0, "batches": 0, "truncated": False,
+                "cutoff": None, "skipped": reason,
+            }
+            continue
         try:
             stats = purge_table(
                 db, table=table, ts_column=ts_column,
@@ -270,6 +286,35 @@ def purge_observations(
         deleted += stats["deleted"]
     logger.info("retention.done deleted=%s tables=%s", deleted, len(per_table))
     return {"deleted": deleted, "per_table": per_table}
+
+
+def raw_health_owner(downsample_mode: Any) -> Dict[str, str]:
+    """Кто удаляет сырьё `kg_service_health` при данном режиме свёртки.
+
+    Возвращает `owned_elsewhere` для `purge_observations`.
+
+    Свёртка в режиме `apply` — ЕДИНСТВЕННЫЙ, кто удаляет сырьё: она удаляет
+    точку той же транзакцией, которой записала её в агрегат. Срочный
+    ретеншен рядом удалял бы точку, не глядя, свёрнута ли она, и терял бы
+    данные в двух случаях:
+
+      * `KG_HEALTH_RAW_RETENTION_DAYS` > `KG_HEALTH_RETENTION_DAYS` (сырьё
+        просили хранить дольше старого порога) — ретеншен срезал бы его
+        раньше, чем до него дойдёт свёртка;
+      * свёртка отстала (прогон ограничен числом окон и временем, первое
+        включение разбирает накопленное несколько ночей; сбой задачи).
+
+    Проверка настроек при старте закрыла бы только первый случай, а второй
+    от настроек не зависит — поэтому чистка уступает, а не валидируется.
+    Цена: если свёртка сломана, сырьё растёт, пока её не починят; это видно
+    (`truncated` / `error` в логе задачи) и обратимо, в отличие от удаления.
+
+    `off` и `dry_run` поведение ретеншена не меняют: dry_run ничего не
+    удаляет, и без срочной чистки таблица росла бы без ограничения.
+    """
+    if retention_mode(downsample_mode) == MODE_APPLY:
+        return {"kg_service_health": "owned_by_downsample"}
+    return {}
 
 
 def purge_events(

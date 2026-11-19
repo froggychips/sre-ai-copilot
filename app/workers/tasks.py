@@ -305,8 +305,9 @@ celery_app.conf.beat_schedule = {
         "schedule": crontab(minute="7,22,37,52"),
         "options": {"expires": 600},
     },
-    # Свёртка сырья health в часовые агрегаты — ДО ретеншена (03:40): точки,
-    # до которых свёртка не дошла, ретеншен на 30-м дне удалит несвёрнутыми.
+    # Свёртка сырья health в часовые агрегаты — до ретеншена (03:40), чтобы
+    # не делить с ним ночное окно. В режиме apply сырьё удаляет только она:
+    # ретеншен kg_service_health не трогает (health_retention.raw_health_owner).
     # Выключена по умолчанию (KG_HEALTH_DOWNSAMPLE_MODE=off → мгновенный выход).
     "kg-health-downsample": {
         "task": "kg_health_downsample",
@@ -1258,6 +1259,7 @@ def kg_health_retention_task():
                                                       purge_events,
                                                       purge_observations,
                                                       purge_workflow,
+                                                      raw_health_owner,
                                                       retention_mode)
 
     db = SessionLocal()
@@ -1265,6 +1267,11 @@ def kg_health_retention_task():
         result = purge_observations(
             db,
             overrides={"kg_service_health": settings.KG_HEALTH_RETENTION_DAYS},
+            # Свёртка в режиме apply сама удаляет сырьё — вместе с записью в
+            # агрегат. Срочная чистка рядом срезала бы несвёрнутое (сырьё
+            # просили хранить дольше KG_HEALTH_RETENTION_DAYS, либо свёртка
+            # отстала). off / dry_run — поведение прежнее.
+            owned_elsewhere=raw_health_owner(settings.KG_HEALTH_DOWNSAMPLE_MODE),
         )
         # События — свой реестр и свой пол (90 дней), см. EVENT_RETENTION_TARGETS:
         # до 31.10.2026 kg_deployments росла без срока до 1,24 млн строк.
