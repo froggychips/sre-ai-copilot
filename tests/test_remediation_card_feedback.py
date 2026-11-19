@@ -448,7 +448,8 @@ def _click(custom_id: str, user_id: str = "111") -> MagicMock:
 class _Press:
     """Нажатие кнопки карточки моста с перехватом побочных эффектов."""
 
-    def __init__(self, dispatch=None):
+    def __init__(self, dispatch=None, dispatch_mode: str = "queue"):
+        self.dispatch_mode = dispatch_mode
         self.audit: list = []
         self.edits: list = []
         self.dispatch = dispatch or MagicMock(return_value="task-1")
@@ -471,7 +472,7 @@ class _Press:
              patch.object(di.settings, "DISCORD_PUBLIC_KEY", "deadbeef"), \
              patch.object(di.settings, "EXECUTOR_ENABLED", True), \
              patch.object(di.settings, "EXECUTOR_APPROVAL_ENABLED", True), \
-             patch.object(di.settings, "EXECUTOR_DISPATCH", "queue"), \
+             patch.object(di.settings, "EXECUTOR_DISPATCH", self.dispatch_mode), \
              patch.object(di.settings, "DISCORD_APPROVERS_USER_IDS", "111"), \
              patch.object(di.settings, "DISCORD_APPROVAL_RATE_LIMIT_PER_HOUR", 0), \
              patch.object(di.audit_service, "log_event",
@@ -549,6 +550,37 @@ async def test_stale_check_failure_does_not_break_click(sessions, fake_redis):
     press.dispatch.assert_called_once()
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("dispatch_mode", ["queue", "inline"])
+async def test_card_feedback_is_promised_only_for_bridge_cards(
+    sessions, fake_redis, dispatch_mode,
+):
+    """`report_apply_outcome` правит только карточку моста: обычному (LLM)
+    инциденту и мосту без записанной карточки ответ итог в карточке не
+    обещает — на обоих путях исполнения (очередь executor и inline)."""
+    _seed_proposal(sessions)                                   # мост с карточкой
+    _seed_proposal(sessions, incident_id="rb-nocard", alert="missing")
+    with sessions() as db:
+        db.add(IncidentRecord(incident_id="fp-llm", status="COMPLETED",
+                              data={"namespace": NS}, analysis={"root_cause": "x"}))
+        nocard = db.query(IncidentRecord).filter_by(incident_id="rb-nocard").one()
+        nocard.analysis = {k: val for k, val in nocard.analysis.items() if k != "bridge_card"}
+        db.commit()
+
+    press = _Press(dispatch_mode=dispatch_mode)
+    replies = {}
+    for incident_id in (INCIDENT_ID, "rb-nocard", "fp-llm", "fp-unknown"):
+        resp = await press(f"approve:{incident_id}:{SIG}")
+        replies[incident_id] = resp["data"]["content"]
+
+    assert "появится в карточке" in replies[INCIDENT_ID]
+    for incident_id in ("rb-nocard", "fp-llm", "fp-unknown"):
+        assert "Executor launched" in replies[incident_id]
+        assert "карточке" not in replies[incident_id]
+        assert "audit-trail" in replies[incident_id]
+    assert press.dispatch.call_count == (4 if dispatch_mode == "queue" else 0)
+
+
 def _approve_in_db(factory) -> None:
     with factory() as db:
         db.add(ActionApproval(
@@ -586,7 +618,7 @@ async def test_blocking_calls_run_outside_event_loop(sessions, fake_redis):
     loop_thread = threading.get_ident()
     seen: dict = {}
 
-    real_record, real_stale = di._record_decision, di._stale_bridge_proposal
+    real_record, real_stale = di._record_decision, di._bridge_proposal_state
 
     def _record(*a, **kw):
         seen["record"] = threading.get_ident()
@@ -602,7 +634,7 @@ async def test_blocking_calls_run_outside_event_loop(sessions, fake_redis):
 
     press = _Press(dispatch=MagicMock(side_effect=_dispatch))
     with patch.object(di, "_record_decision", _record), \
-         patch.object(di, "_stale_bridge_proposal", _stale):
+         patch.object(di, "_bridge_proposal_state", _stale):
         await press(f"approve:{INCIDENT_ID}:{SIG}")
     assert set(seen) == {"record", "stale", "dispatch"}
     assert loop_thread not in seen.values()

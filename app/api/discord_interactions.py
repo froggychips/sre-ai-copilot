@@ -536,15 +536,23 @@ def _revoke_decision(incident_id: str, intent_signature: str) -> bool:
         db.close()
 
 
-def _stale_bridge_proposal(incident_id: str) -> Optional[str]:
-    """Причина, по которой карточку моста уже нельзя одобрять, или None.
+def _bridge_proposal_state(incident_id: str) -> Tuple[bool, Optional[str]]:
+    """Состояние карточки моста для клика «Применить»: (card_feedback, stale).
 
-    `proposal_expired:<возраст>s` / `alert_resolved` (bridge.proposal_refusal).
-    Быстрая проверка ради понятного ответа на клик: одобрение не
-    записывается, кнопки снимаются, claim дедупа отпускается. Рубеж перед
-    записью в кластер — та же проверка в `apply_intent`, поэтому здесь
-    fail-open: сбой БД не должен ломать клик. Sync (SQL, Redis) — звать
-    через `run_in_threadpool`. Не карточка моста — None.
+    `card_feedback` — True, только если инцидент создан мостом И у него
+    записана карточка (`analysis.bridge_card` с id сообщения): лишь тогда
+    `bridge.report_apply_outcome` допишет итог apply в карточку, и ответ на
+    клик вправе это обещать. Для обычных (LLM) инцидентов правки карточки
+    нет — им отвечаем прежним текстом про audit-trail.
+
+    `stale` — причина, по которой карточку моста уже нельзя одобрять
+    (`proposal_expired:<возраст>s` / `alert_resolved`,
+    bridge.proposal_refusal), или None. Быстрая проверка ради понятного
+    ответа на клик: одобрение не записывается, кнопки снимаются, claim
+    дедупа отпускается. Рубеж перед записью в кластер — та же проверка в
+    `apply_intent`, поэтому здесь fail-open: сбой БД не должен ломать клик
+    (и тогда правку карточки не обещаем — (False, None)). Sync (SQL,
+    Redis) — звать через `run_in_threadpool`.
     """
     from app.remediation.bridge import (is_bridge_analysis, proposal_refusal,
                                         release_dead_proposal)
@@ -557,17 +565,42 @@ def _stale_bridge_proposal(incident_id: str) -> Optional[str]:
             .first()
         )
         analysis = getattr(record, "analysis", None)
-        if not is_bridge_analysis(analysis):
-            return None
+        if not isinstance(analysis, dict) or not is_bridge_analysis(analysis):
+            return False, None
+        card = analysis.get("bridge_card")
+        card_feedback = bool(
+            isinstance(card, dict) and card.get("id") and card.get("channel_id")
+        )
         reason = proposal_refusal(db, analysis, getattr(record, "created_at", None))
         if reason:
             release_dead_proposal(analysis, reason.split(":", 1)[0])
-        return reason
+        return card_feedback, reason
     except Exception as e:
         logger.warning("discord_stale_proposal_check_failed error=%s", type(e).__name__)
-        return None
+        return False, None
     finally:
         db.close()
+
+
+def _approved_launched_text(user_name: str, card_feedback: bool) -> str:
+    """Ответ на одобрение, после которого apply запущен.
+
+    Итог в карточку дописывается только у предложений моста
+    (`bridge.report_apply_outcome`; для прочих инцидентов это no-op) —
+    обещаем это только им. Остальным — прежний текст: итог в audit-trail.
+    """
+    if card_feedback:
+        return (
+            f"✅ Approved by @{user_name}. Executor launched в фоне — "
+            "итог (успех, отказ или ошибка) появится в карточке "
+            "предложения; полный след — в audit-trail "
+            "(EXECUTOR_APPLIED / EXECUTOR_APPLY_REFUSED)."
+        )
+    return (
+        f"✅ Approved by @{user_name}. Executor launched в фоне — "
+        "итог (включая отказ) смотри в audit-trail "
+        "(EXECUTOR_APPLIED / EXECUTOR_APPLY_REFUSED)."
+    )
 
 
 _STALE_PROPOSAL_MARKS = {
@@ -899,9 +932,13 @@ async def discord_interactions(
         # ── Карточка моста: просрочена или алерт погас ──────────────────────
         # Одобрение не записываем (оно уникально и заняло бы пару навсегда),
         # кнопки снимаем, отвечаем по-человечески. Только для approve:
-        # отклонить можно и просроченное. Не мост — None, поток прежний.
+        # отклонить можно и просроченное. Не мост — (False, None), поток
+        # прежний. card_feedback — можно ли обещать итог в карточке.
+        card_feedback = False
         if verdict == "approved":
-            stale = await run_in_threadpool(_stale_bridge_proposal, incident_id)
+            card_feedback, stale = await run_in_threadpool(
+                _bridge_proposal_state, incident_id,
+            )
             if stale:
                 stale_key = stale.split(":", 1)[0]
                 audit_service.log_event(
@@ -1015,12 +1052,7 @@ async def discord_interactions(
                         f"сервиса по incident_id={incident_id}."
                     )
                 _schedule_edit(decision["decided_at"])
-                return _ephemeral(
-                    f"✅ Approved by @{user_name}. Executor launched в фоне — "
-                    "итог (успех, отказ или ошибка) появится в карточке "
-                    "предложения; полный след — в audit-trail "
-                    "(EXECUTOR_APPLIED / EXECUTOR_APPLY_REFUSED)."
-                )
+                return _ephemeral(_approved_launched_text(user_name, card_feedback))
             try:
                 from app.workers.executor_tasks import apply_and_report
                 # intent_sig из custom_id → integrity-сверка в apply_intent (TOCTOU).
@@ -1033,12 +1065,7 @@ async def discord_interactions(
                              "intent_signature": intent_sig,
                              "approved_by": actor},
                 )
-                return _ephemeral(
-                    f"✅ Approved by @{user_name}. Executor launched в фоне — "
-                    "итог (успех, отказ или ошибка) появится в карточке "
-                    "предложения; полный след — в audit-trail "
-                    "(EXECUTOR_APPLIED / EXECUTOR_APPLY_REFUSED)."
-                )
+                return _ephemeral(_approved_launched_text(user_name, card_feedback))
             except Exception as e:
                 # Наружу — только тип исключения. Текст может нести DSN,
                 # путь или кусок конфига, а ephemeral-ответ всё равно
