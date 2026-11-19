@@ -1117,6 +1117,30 @@ class Settings(BaseSettings):
     REMEDIATION_BRIDGE_NAMESPACES: str = Field(
         "", description="Comma-separated namespace prefixes where the bridge runs (empty = all)"
     )
+    # Claim дедупа берётся ДО dry-run и карточки. Пока предложение не дошло
+    # до конечного исхода (карточка в канале или детерминированный отказ
+    # dry-run), claim живёт только это время: таймаут очереди executor,
+    # исключение, soft/hard time limit или смерть воркера не глушат алерт
+    # на всё окно REMEDIATION_BRIDGE_DEDUP_SECONDS. Должен быть больше
+    # time_limit задачи remediation_bridge (180 с), иначе параллельный батч
+    # выпустит вторую карточку, пока первая ещё в работе.
+    REMEDIATION_BRIDGE_PENDING_CLAIM_SECONDS: int = Field(
+        300, description="TTL (sec) of a bridge dedup claim until the proposal reaches a terminal outcome"
+    )
+    # Срок жизни предложения моста: карточка старше — клик получает отказ,
+    # кнопки снимаются, apply_intent отказывает `proposal_expired`. Общий
+    # EXECUTOR_INTENT_MAX_AGE_SECONDS (сутки) рассчитан на LLM-разбор; план
+    # моста посчитан по фактам момента алерта и через час описывает другой
+    # кластер. 0 — отдельного срока нет (действует только общий).
+    REMEDIATION_BRIDGE_PROPOSAL_TTL_SECONDS: int = Field(
+        3600, description="Max age (sec) of a bridge proposal card; 0 disables the bridge-specific limit"
+    )
+    # Алерт предложения уже resolved в kg_alerts — чинить нечего: клик
+    # получает отказ, кнопки снимаются. Статус неизвестен (строки нет) —
+    # не отказываем. False — прежнее поведение: погасший алерт не мешает apply.
+    REMEDIATION_BRIDGE_REFUSE_RESOLVED: bool = Field(
+        True, description="Refuse a bridge approve click when the alert is already resolved"
+    )
 
     # Вид цели до пробы kubectl (app/remediation/workload.py): мост определяет
     # Deployment/StatefulSet/DaemonSet/Job по лейблам алерта, графу и форме
@@ -1197,6 +1221,15 @@ class Settings(BaseSettings):
     # подвешивать пайплайн дольше этого.
     EXECUTOR_DRY_RUN_TIMEOUT_SECONDS: int = Field(
         60, description="Таймаут ожидания dry-run из очереди executor (сек)"
+    )
+    # Срок годности задачи apply в очереди executor. Без него задача,
+    # поставленная при лежащем copilot-executor, исполнялась бы после его
+    # возврата — через минуты или часы после клика (в пределах окна
+    # одобрения). Истекла — Celery её отбрасывает, а сторож
+    # `remediation_apply_watchdog` дописывает в карточку моста, что kubectl
+    # не запускался. 0 — без срока (прежнее поведение).
+    EXECUTOR_APPLY_TASK_EXPIRES_SECONDS: int = Field(
+        600, description="Celery expires (sec) for executor_apply; 0 = no expiry"
     )
     # Верификация исхода после apply (remediation/verification.py): снимок
     # цели до/после и отложенные проверки «та же цель, сошёлся rollout,

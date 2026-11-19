@@ -230,12 +230,16 @@ async def test_apply_confirm_queue_broker_down_answers_immediately() -> None:
 async def test_approve_queue_dispatches_to_executor(monkeypatch) -> None:
     from sqlalchemy import create_engine
     from sqlalchemy.orm import sessionmaker
+    from sqlalchemy.pool import StaticPool
 
     from app.database import Base
     from app.knowledge_graph import schema  # noqa: F401
     from app.services.intent_signature import compute_signature
 
-    engine = create_engine("sqlite:///:memory:")
+    # Обработчик кнопок уводит sync-сессии в threadpool: in-memory SQLite
+    # должен быть один на все нити (StaticPool), иначе у нити своя пустая БД.
+    engine = create_engine("sqlite:///:memory:", poolclass=StaticPool,
+                           connect_args={"check_same_thread": False})
     Base.metadata.create_all(engine)
     monkeypatch.setattr(discord_interactions, "SessionLocal",
                         sessionmaker(bind=engine, autocommit=False, autoflush=False))
@@ -270,7 +274,8 @@ async def test_approve_queue_dispatches_to_executor(monkeypatch) -> None:
             _request(payload), x_signature_ed25519="00" * 64, x_signature_timestamp="0",
         )
 
-    dispatch.assert_called_once_with("inc-A", "operator", sig)
+    # applied_by — Discord user id (как у apply_confirm), не username.
+    dispatch.assert_called_once_with("inc-A", "u-1", sig)
     assert "Executor launched" in resp["data"]["content"]
 
 
@@ -400,28 +405,60 @@ def test_run_dry_run_via_queue_uses_executor_queue_timeout_and_forgets() -> None
 
 def test_dispatch_apply_targets_executor_queue() -> None:
     fake = MagicMock(id="t-9")
-    with patch.object(executor_tasks.executor_apply_task, "apply_async", return_value=fake) as aa:
+    with patch.object(executor_tasks.settings, "EXECUTOR_APPLY_TASK_EXPIRES_SECONDS", 600), \
+         patch.object(executor_tasks.executor_apply_task, "apply_async", return_value=fake) as aa, \
+         patch.object(executor_tasks.apply_watchdog_task, "apply_async") as watchdog:
         assert executor_tasks.dispatch_apply("inc-1", "u", _SIG, "tok") == "t-9"
+    # expires: задача, простоявшая в очереди дольше, не исполняется.
     assert aa.call_args.kwargs == {"args": ["inc-1", "u", _SIG, "tok"],
-                                   "queue": executor_tasks.settings.EXECUTOR_QUEUE_NAME}
+                                   "queue": executor_tasks.settings.EXECUTOR_QUEUE_NAME,
+                                   "expires": 600}
+    # Сторож — в обычную очередь (без queue=), после expires + запас.
+    assert watchdog.call_args.kwargs == {"args": ["inc-1", _SIG], "countdown": 630,
+                                         "retry": False}
+
+
+def test_dispatch_apply_without_expiry_schedules_no_watchdog() -> None:
+    """EXECUTOR_APPLY_TASK_EXPIRES_SECONDS=0 — прежнее поведение."""
+    fake = MagicMock(id="t-9")
+    with patch.object(executor_tasks.settings, "EXECUTOR_APPLY_TASK_EXPIRES_SECONDS", 0), \
+         patch.object(executor_tasks.executor_apply_task, "apply_async", return_value=fake) as aa, \
+         patch.object(executor_tasks.apply_watchdog_task, "apply_async") as watchdog:
+        executor_tasks.dispatch_apply("inc-1", "u", _SIG)
+    assert "expires" not in aa.call_args.kwargs
+    watchdog.assert_not_called()
+
+
+def test_dispatch_apply_survives_watchdog_publish_failure() -> None:
+    fake = MagicMock(id="t-9")
+    with patch.object(executor_tasks.executor_apply_task, "apply_async", return_value=fake), \
+         patch.object(executor_tasks.apply_watchdog_task, "apply_async",
+                      side_effect=ConnectionError("redis")):
+        assert executor_tasks.dispatch_apply("inc-1", "u", _SIG) == "t-9"
 
 
 @pytest.mark.asyncio
 async def test_approve_queue_dispatch_failure_keeps_buttons_for_retry(monkeypatch) -> None:
-    """Брокер лёг на Approve: одобрение уже записано, повторный Approve упрётся
-    в already_decided — значит кнопки снимать нельзя, иначе действие
-    пропущено навсегда. Повтор — через Apply → apply_confirm."""
+    """Брокер лёг на Approve: задачи нет, kubectl не запустится. Кнопки не
+    снимаются, а записанное одобрение отзывается — иначе повторный клик
+    упирался в already_decided (у карточки моста другой кнопки нет).
+    Повтор — тем же кликом; он ставит задачу ровно один раз."""
     from sqlalchemy import create_engine
     from sqlalchemy.orm import sessionmaker
+    from sqlalchemy.pool import StaticPool
 
     from app.database import Base
     from app.knowledge_graph import schema  # noqa: F401
+    from app.knowledge_graph.schema import ActionApproval
     from app.services.intent_signature import compute_signature
 
-    engine = create_engine("sqlite:///:memory:")
+    # Обработчик кнопок уводит sync-сессии в threadpool: in-memory SQLite
+    # должен быть один на все нити (StaticPool), иначе у нити своя пустая БД.
+    engine = create_engine("sqlite:///:memory:", poolclass=StaticPool,
+                           connect_args={"check_same_thread": False})
     Base.metadata.create_all(engine)
-    monkeypatch.setattr(discord_interactions, "SessionLocal",
-                        sessionmaker(bind=engine, autocommit=False, autoflush=False))
+    session_factory = sessionmaker(bind=engine, autocommit=False, autoflush=False)
+    monkeypatch.setattr(discord_interactions, "SessionLocal", session_factory)
     sig = compute_signature(_intent())
     payload = {
         "type": 3,
@@ -431,23 +468,44 @@ async def test_approve_queue_dispatch_failure_keeps_buttons_for_retry(monkeypatc
         "message": {"id": "m-1", "channel_id": "c-1",
                     "embeds": [{"title": "t", "footer": {"text": "incident/inc-F"}}]},
     }
+    audit: list = []
+    dispatch = MagicMock(side_effect=[ConnectionError("redis"), "task-1"])
 
     with patch.object(discord_interactions, "_verify_signature", return_value=True), \
          patch.object(discord_interactions.settings, "DISCORD_PUBLIC_KEY", "deadbeef"), \
          patch.object(discord_interactions.settings, "EXECUTOR_ENABLED", True), \
          patch.object(discord_interactions.settings, "EXECUTOR_APPROVAL_ENABLED", True), \
          patch.object(discord_interactions.settings, "DISCORD_APPROVERS_USER_IDS", "u-1"), \
-         patch.object(discord_interactions.audit_service, "log_event"), \
+         patch.object(discord_interactions.audit_service, "log_event",
+                      side_effect=lambda et, d: audit.append(et)), \
          patch.object(executor_tasks.settings, "EXECUTOR_DISPATCH", "queue"), \
-         patch.object(executor_tasks, "dispatch_apply", side_effect=ConnectionError("redis")), \
-         patch.object(discord_interactions, "_edit_message_after_decision") as edit:
+         patch.object(executor_tasks, "dispatch_apply", dispatch), \
+         patch.object(discord_interactions, "_spawn_background_task",
+                      side_effect=lambda coro, **_: coro.close()) as spawn:
         resp = await discord_interactions.discord_interactions(
             _request(payload), x_signature_ed25519="00" * 64, x_signature_timestamp="0",
         )
+        spawn.assert_not_called()          # кнопки на месте
+        assert "kubectl не запущен" in resp["data"]["content"]
+        assert "нажми «Применить» ещё раз" in resp["data"]["content"]
+        with session_factory() as s:
+            assert s.query(ActionApproval).count() == 0
+        assert audit[-1] == "INCIDENT_ACTION_APPROVAL_REVOKED"
 
-    edit.assert_not_called()
-    assert "kubectl не запущен" in resp["data"]["content"]
-    assert "Apply" in resp["data"]["content"]
+        retry = await discord_interactions.discord_interactions(
+            _request(payload), x_signature_ed25519="00" * 64, x_signature_timestamp="0",
+        )
+        assert "Executor launched" in retry["data"]["content"]
+        spawn.assert_called_once()         # теперь кнопки снимаются
+        with session_factory() as s:
+            assert [r.status for r in s.query(ActionApproval).all()] == ["approved"]
+
+        # Третий клик (двойной клик после успеха) — задача второй раз не ставится.
+        again = await discord_interactions.discord_interactions(
+            _request(payload), x_signature_ed25519="00" * 64, x_signature_timestamp="0",
+        )
+        assert "Already approved" in again["data"]["content"]
+    assert dispatch.call_count == 2
 
 
 def test_apply_confirm_retries_for_already_approved_action() -> None:

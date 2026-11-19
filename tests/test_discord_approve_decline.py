@@ -21,6 +21,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
+from sqlalchemy.pool import StaticPool
 
 from app.api import discord_interactions
 from app.core.execution_dsl import ActionType, ExecutionIntent
@@ -52,7 +53,10 @@ def isolated_db(monkeypatch):
     # Импорт здесь чтобы Base зарегистрировала ActionApproval до create_all
     from app.knowledge_graph import schema  # noqa: F401
 
-    engine = create_engine("sqlite:///:memory:")
+    # Обработчик кнопок уводит sync-сессии в threadpool: in-memory SQLite
+    # должен быть один на все нити (StaticPool), иначе у нити своя пустая БД.
+    engine = create_engine("sqlite:///:memory:", poolclass=StaticPool,
+                           connect_args={"check_same_thread": False})
     Base.metadata.create_all(engine)
     TestSession = sessionmaker(bind=engine, autocommit=False, autoflush=False)
 
@@ -161,7 +165,8 @@ async def test_approve_records_decision_and_acks(isolated_db):
         rows = session.query(ActionApproval).all()
         assert len(rows) == 1
         assert rows[0].status == "approved"
-        assert rows[0].approved_by == "yar"
+        # В БД — Discord user id (стабилен, по нему whitelist), не username.
+        assert rows[0].approved_by == "u-1"
 
 
 @pytest.mark.asyncio
@@ -224,7 +229,8 @@ async def test_double_click_returns_already_decided(isolated_db):
 
     assert "Approved" in resp1["data"]["content"]
     assert "Already approved" in resp2["data"]["content"]
-    assert "first" in resp2["data"]["content"]
+    # Кто решил первым — по user id из kg_action_approvals.
+    assert "@u-1" in resp2["data"]["content"]
     # Audit получил только ОДИН event — повторный клик не дублирует
     assert len(audit_calls) == 1
 

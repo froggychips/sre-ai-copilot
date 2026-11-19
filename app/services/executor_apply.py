@@ -29,6 +29,8 @@
          после re-fire, который стёр executor_applied)
        - сам INTENT свежий: возраст плана не старше
          EXECUTOR_INTENT_MAX_AGE_SECONDS (см. ниже, M1)
+       - предложение моста не просрочено и его алерт не resolved
+         (bridge.proposal_refusal: proposal_expired / alert_resolved)
        - инцидент не помечен «состояние кластера неизвестно» (M2)
        - intent.namespace == namespace инцидента из record.data (server-side
          binding: галлюцинированный/инжектированный intent не может действовать
@@ -405,6 +407,17 @@ def apply_intent(
         if _approval_is_stale(approval, approval_max_age):
             return _refuse(incident_id, "approval_stale", applied_by)
 
+        # ── Предложение моста: срок жизни и статус алерта ──────────────
+        # Обработчик кнопки проверяет то же самое до записи одобрения, но
+        # рубеж перед записью в кластер — здесь: задача могла простоять в
+        # очереди executor, а клик — прийти мимо быстрой проверки (она
+        # fail-open при сбое БД). Не мост — None, ветка ничего не меняет.
+        from app.remediation.bridge import proposal_refusal
+        stale_proposal = proposal_refusal(
+            db, analysis, getattr(record, "created_at", None),
+        )
+        if stale_proposal:
+            return _refuse(incident_id, stale_proposal, applied_by)
 
         # ── Binding intent ↔ инцидент ──────────────────────────────────
         # Intent генерирует LLM из обогащённого промпта (логи/алерты =

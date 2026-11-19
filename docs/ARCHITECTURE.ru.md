@@ -124,8 +124,16 @@ Discord → Interactions Endpoint приложения бота (ai-reviewer, о
   → проверка подписи Ed25519 по DISCORD_PUBLIC_KEY (в копилоте)
   → allowlist DISCORD_APPROVERS_USER_IDS (fail-closed; allowlist ролей в коде
     есть, в проде не настроен)
-  → executor_apply (очередь executor, copilot-executor, SA sre-ai-executor)
+  → предложение моста просрочено (REMEDIATION_BRIDGE_PROPOSAL_TTL_SECONDS)
+    или его алерт уже resolved → отказ, кнопки снимаются, одобрение не пишется
+  → executor_apply (очередь executor, copilot-executor, SA sre-ai-executor;
+    задача живёт EXECUTOR_APPLY_TASK_EXPIRES_SECONDS)
+  → итог исполнения (успех / отказ с причиной / ошибка) дописывается в ту же
+    карточку ботом; если executor задачу так и не взял — это допишет сторож
+    remediation_apply_watchdog (очередь celery)
   → remediation_verify через +5 / +15 мин → итог дописывается в ту же карточку
+    (алерт ищется по fingerprint из analysis.alert_fingerprint; статус
+    неизвестен — «не подтверждено», а не verified)
 ```
 
 Relay возвращает Discord тело ответа копилота без изменений.

@@ -41,15 +41,23 @@ _PLAYBOOK = "restart_crashloop_deployment"
 class _FakeRedis:
     def __init__(self) -> None:
         self.store: dict = {}
+        self.ttl: dict = {}
 
     def set(self, key, value, nx=False, ex=None):
         if nx and key in self.store:
             return None
         self.store[key] = value
+        self.ttl[key] = ex
         return True
 
     def delete(self, key):
         self.store.pop(key, None)
+        self.ttl.pop(key, None)
+
+    def expire_short_claims(self, window: int) -> None:
+        """«Прошло время»: claim-ы с TTL короче окна дедупа истекли."""
+        for key in [k for k, ex in self.ttl.items() if ex is not None and ex < window]:
+            self.delete(key)
 
 
 @pytest.fixture
@@ -396,6 +404,108 @@ def test_failed_dry_run_posts_nothing(db, bridge_on, fake_redis):
     outcomes, send = _run(db, _ctx(), dry_status="dry_run_failed")
     assert outcomes[0]["outcome"] == bridge.OUTCOME_DRY_RUN_FAILED
     send.assert_not_awaited()
+
+
+# ── claim дедупа: короткий до конечного исхода ────────────────────────────
+
+_WINDOW = 6 * 3600
+
+
+def _claim_ttls(fake_redis) -> list:
+    return list(fake_redis.ttl.values())
+
+
+def test_posted_card_holds_claim_for_full_window(db, bridge_on, fake_redis):
+    _run(db, _ctx())
+    assert _claim_ttls(fake_redis) == [_WINDOW]
+
+
+def test_deterministic_dry_run_refusal_holds_claim_for_full_window(db, bridge_on, fake_redis):
+    """apiserver отказал — откажет и на следующем батче: не долбим его."""
+    for status in ("dry_run_failed", "guardrail_blocked"):
+        fake_redis.store.clear()
+        fake_redis.ttl.clear()
+        outcomes, send = _run(db, _ctx(), dry_status=status)
+        assert outcomes[0]["outcome"] == bridge.OUTCOME_DRY_RUN_FAILED
+        assert _claim_ttls(fake_redis) == [_WINDOW]
+        send.assert_not_awaited()
+
+
+def test_transient_dry_run_error_keeps_only_short_claim(db, bridge_on, fake_redis):
+    """Таймаут очереди executor / рестарт executor-а (`status: error`): до
+    правки claim оставался на 6 ч, и алерт молчал всё окно."""
+    first, send1 = _run(db, _ctx(fp="fp-a"), dry_status="error")
+    assert first[0]["outcome"] == bridge.OUTCOME_DRY_RUN_ERROR
+    send1.assert_not_awaited()
+    assert _claim_ttls(fake_redis) == [settings.REMEDIATION_BRIDGE_PENDING_CLAIM_SECONDS]
+    # Пока короткий claim жив — параллельный батч второй dry-run не запускает.
+    second, _ = _run(db, _ctx(fp="fp-b"))
+    assert second[0]["outcome"] == bridge.OUTCOME_DEDUPLICATED
+    # Истёк — следующий батч предлагает снова.
+    fake_redis.expire_short_claims(_WINDOW)
+    third, send3 = _run(db, _ctx(fp="fp-c"))
+    assert third[0]["outcome"] == bridge.OUTCOME_PROPOSED
+    send3.assert_awaited_once()
+
+
+def test_exception_after_claim_leaves_short_claim_and_no_orphan_rows(db, bridge_on, fake_redis):
+    """Исключение после claim (Discord/БД): строки предложения убраны —
+    иначе фолбэк-дедуп по БД глушил бы алерт, — claim истечёт коротким."""
+    from app.database import IncidentRecord
+    from app.remediation.models import RemediationDecision
+
+    first, _ = _run(db, _ctx(fp="fp-a"), send=AsyncMock(side_effect=RuntimeError("discord")))
+    assert first[0]["outcome"] == "error:RuntimeError"
+    assert db.query(IncidentRecord).count() == 0
+    assert db.query(RemediationDecision).count() == 0
+    assert _claim_ttls(fake_redis) == [settings.REMEDIATION_BRIDGE_PENDING_CLAIM_SECONDS]
+    fake_redis.expire_short_claims(_WINDOW)
+    second, send2 = _run(db, _ctx(fp="fp-b"))
+    assert second[0]["outcome"] == bridge.OUTCOME_PROPOSED
+    send2.assert_awaited_once()
+
+
+def test_cancelled_task_leaves_short_claim_and_no_orphan_rows(db, bridge_on, fake_redis):
+    """soft_time_limit задачи отменяет корутину (BaseException, не Exception)."""
+    import asyncio
+
+    from app.database import IncidentRecord
+
+    with pytest.raises(asyncio.CancelledError):
+        _run(db, _ctx(), send=AsyncMock(side_effect=asyncio.CancelledError()))
+    assert db.query(IncidentRecord).count() == 0
+    assert _claim_ttls(fake_redis) == [settings.REMEDIATION_BRIDGE_PENDING_CLAIM_SECONDS]
+
+
+def test_card_is_not_duplicated_when_bridge_card_commit_fails(db, bridge_on, fake_redis):
+    """Карточка ушла, а запись bridge_card упала: claim уже на всё окно,
+    строки предложения на месте — кнопки карточки рабочие."""
+    from app.database import IncidentRecord
+
+    real_commit = db.commit
+    calls = {"n": 0}
+
+    def _commit():
+        calls["n"] += 1
+        if calls["n"] == 2:        # 1 — запись предложения, 2 — bridge_card
+            raise RuntimeError("db")
+        return real_commit()
+
+    with patch.object(db, "commit", _commit):
+        outcomes, send = _run(db, _ctx())
+    send.assert_awaited_once()
+    assert outcomes[0]["outcome"] == "error:RuntimeError"
+    assert _claim_ttls(fake_redis) == [_WINDOW]
+    assert db.query(IncidentRecord).count() == 1
+
+
+def test_proposal_stores_dedup_key_and_card_shows_expiry(db, bridge_on, fake_redis):
+    from app.database import IncidentRecord
+
+    _, send = _run(db, _ctx())
+    record = db.query(IncidentRecord).one()
+    assert bridge._DEDUP_PREFIX + record.analysis["dedup_key"] in fake_redis.store
+    assert "Действует до <t:" in send.await_args.args[0]["embeds"][0]["description"]
 
 
 def test_no_card_without_executor_flags(db, bridge_on, fake_redis, monkeypatch):
@@ -777,7 +887,10 @@ async def _press(custom_id: str, user_id: str, approvals_db):
 def approvals_db():
     from app.database import Base
     from app.knowledge_graph import schema  # noqa: F401
-    engine = create_engine("sqlite:///:memory:")
+    # Обработчик кнопок уводит sync-сессии в threadpool: in-memory SQLite
+    # должен быть один на все нити (StaticPool), иначе у нити своя пустая БД.
+    engine = create_engine("sqlite:///:memory:", poolclass=StaticPool,
+                           connect_args={"check_same_thread": False})
     Base.metadata.create_all(engine)
     yield sessionmaker(bind=engine, autocommit=False, autoflush=False)
     engine.dispose()
@@ -814,7 +927,8 @@ async def test_owner_click_dispatches_executor(db, approvals_db):
     _, incident_id, sig = approve_id.split(":", 2)
     resp, audit, dispatched, _ = await _press(approve_id, "owner-1", approvals_db)
     assert "Executor launched" in resp["data"]["content"]
-    assert dispatched == [(incident_id, "user-owner-1", sig)]
+    # applied_by — Discord user id, не username (унификация с apply_confirm).
+    assert dispatched == [(incident_id, "owner-1", sig)]
     assert "INCIDENT_ACTION_APPROVED" in [e for e, _ in audit]
 
 

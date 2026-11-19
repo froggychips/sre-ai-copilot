@@ -123,8 +123,16 @@ Discord → the bot application's Interactions Endpoint (ai-reviewer, a separate
   → Ed25519 signature check with DISCORD_PUBLIC_KEY (in the copilot)
   → allowlist DISCORD_APPROVERS_USER_IDS (fail-closed; role allowlist exists
     in code but is not configured in production)
-  → executor_apply (queue executor, copilot-executor, SA sre-ai-executor)
+  → bridge proposal expired (REMEDIATION_BRIDGE_PROPOSAL_TTL_SECONDS) or its
+    alert already resolved → refusal, buttons removed, no approval recorded
+  → executor_apply (queue executor, copilot-executor, SA sre-ai-executor;
+    the task lives for EXECUTOR_APPLY_TASK_EXPIRES_SECONDS)
+  → the apply outcome (success / refusal with a reason / error) is appended
+    to the same card by the bot; if the executor never picked the task up,
+    the remediation_apply_watchdog task (queue celery) says so
   → remediation_verify at +5 / +15 min → result appended to the same card
+    (the alert is looked up by the fingerprint in analysis.alert_fingerprint;
+    unknown alert status yields "not confirmed", never verified)
 ```
 
 The relay returns the copilot's response body to Discord unchanged.
