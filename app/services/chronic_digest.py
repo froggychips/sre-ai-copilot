@@ -28,6 +28,8 @@ from sqlalchemy.orm import Session
 
 from app.config import settings
 from app.knowledge_graph.schema import AlertEvent, Service
+from app.services.alert_noise_rule import (RAW_NOISE_KEY, is_rule_noise_raw,
+                                           reports_exclude_rule_noise)
 # Порог, с которым daily-дайджест считает своё «chronic» в секции Changes.
 # Импортируем, а не дублируем числом: два сообщения летят в один #stats и
 # обязаны сходиться (см. stats_digest.CHRONIC_TRACKED_MIN_FIRES).
@@ -39,7 +41,7 @@ log = structlog.get_logger()
 def _aggregate(db: Session, window_hours: int, min_fires: int) -> List[Dict[str, Any]]:
     """SQL: group kg_alerts по (service_id, alertname), count, last_fired."""
     since_naive = (datetime.now(timezone.utc) - timedelta(hours=window_hours)).replace(tzinfo=None)
-    rows = (
+    q = (
         db.query(
             Service.namespace.label("ns"),
             Service.name.label("svc"),
@@ -50,7 +52,13 @@ def _aggregate(db: Session, window_hours: int, min_fires: int) -> List[Dict[str,
         )
         .join(Service, Service.id == AlertEvent.service_id)
         .filter(AlertEvent.fired_at >= since_naive)
-        .group_by(Service.namespace, Service.name, AlertEvent.alertname)
+    )
+    if reports_exclude_rule_noise():
+        # Шум по статическому правилу: `raw.noise_rule` отсутствует у обычного
+        # алерта (и у строки без raw) — JSON-путь даёт NULL на Postgres и SQLite.
+        q = q.filter(AlertEvent.raw[RAW_NOISE_KEY].as_string().is_(None))
+    rows = (
+        q.group_by(Service.namespace, Service.name, AlertEvent.alertname)
         .having(func.count(AlertEvent.id) >= min_fires)
         .order_by(func.count(AlertEvent.id).desc())
         .limit(20)
@@ -103,9 +111,12 @@ def _continuous(db: Session, min_hours: int) -> List[Dict[str, Any]]:
         .order_by(AlertEvent.fired_at.asc())
         .all()
     )
+    skip_noise = reports_exclude_rule_noise()
     out: List[Dict[str, Any]] = []
     for r in rows:
         raw = r.raw if isinstance(r.raw, dict) else {}
+        if skip_noise and is_rule_noise_raw(raw):
+            continue
         if r.ns and r.svc:
             where = f"{r.ns}/{r.svc}"
         else:

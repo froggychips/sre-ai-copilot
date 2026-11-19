@@ -34,6 +34,8 @@ from sqlalchemy import case, func
 from sqlalchemy.orm import Session
 
 from app.knowledge_graph.schema import AlertEvent, Service
+from app.services.alert_noise_rule import (is_rule_noise_raw,
+                                           reports_exclude_rule_noise)
 
 log = structlog.get_logger()
 
@@ -209,6 +211,7 @@ def find_stuck_alerts(
             Service.name,
             Service.namespace,
             Service.team_owner,
+            AlertEvent.raw,
         )
         .outerjoin(Service, Service.id == AlertEvent.service_id)
         .filter(AlertEvent.fired_at <= cutoff)
@@ -216,6 +219,12 @@ def find_stuck_alerts(
         .order_by(AlertEvent.fired_at.asc())
         .all()
     )
+    # Шум по статическому правилу (CPUThrottlingHigh на стендах) залипшим не
+    # считаем: он хронический по построению, действия по нему нет, а на
+    # 18.11.2026 он давал 196 из 248 открытых алертов. Фильтр в Python: raw —
+    # JSON, а выборка и так ограничена открытыми алертами.
+    if reports_exclude_rule_noise():
+        rows = [r for r in rows if not is_rule_noise_raw(r.raw)]
 
     if not rows:
         return []
