@@ -23,21 +23,28 @@
 #     не покрываются НИЧЕМ — guard в коде дополнительно блокирует, но и API
 #     уровень тоже отрезан.
 #
-# Write-роль применяется отдельно для каждого target-namespace (squad-*) —
-# ТОЛЬКО Role sre-ai-remediate и RoleBinding на sre-ai-executor, осознанно, по
-# одному (пример ниже). Весь файл в чужой namespace не применять: 18.11.2026 в
-# `default` нашлись Role sre-ai-read / sre-ai-remediate и RoleBinding
-# sre-ai-read — след `kubectl apply -f rbac.yaml` без `-n`.
+# Запись выдаётся по одному namespace: правила лежат в ClusterRole
+# sre-ai-remediate (сама по себе она ничего не даёт), а право появляется только
+# там, где есть RoleBinding на неё для SA sre-ai-executor. ClusterRoleBinding
+# на эту роль не делать никогда. Привязки раздаёт
+# scripts/grant_executor_squads.sh (план / --apply / --revoke) — в git их нет:
+# стенды создаются и сносятся каждый день. Весь файл в чужой namespace не
+# применять: 18.11.2026 в `default` нашлись Role sre-ai-read /
+# sre-ai-remediate и RoleBinding sre-ai-read — след `kubectl apply -f
+# rbac.yaml` без `-n`.
 #
-# СВЕРКА С КЛАСТЕРОМ 18.11.2026 (WO-кластер, v1.0.35):
-#   * RoleBinding на sre-ai-remediate нет НИ В ОДНОМ namespace. То есть
-#     executor включён флагами (EXECUTOR_ENABLED, мост), но записать в кластер
-#     не может: `kubectl auth can-i patch deployments
-#     --as=system:serviceaccount:sre-ai:sre-ai-executor -n <любой>` → no, и
-#     server-side dry-run стадии пайплайна получает Forbidden (кнопки Apply
-#     нет — fail-closed). Привязки в git поэтому НЕ добавлены: выдать запись —
-#     решение владельца кластера, а не побочный эффект сверки манифестов.
-#     deploy.sh печатает WARNING, пока привязок нет.
+# СВЕРКА С КЛАСТЕРОМ 18–19.11.2026 (WO-кластер):
+#   * 18.11 RoleBinding на sre-ai-remediate не было НИ В ОДНОМ namespace:
+#     executor был включён флагами (EXECUTOR_ENABLED, мост), но записать в
+#     кластер не мог — `kubectl auth can-i patch deployments
+#     --as=system:serviceaccount:sre-ai:sre-ai-executor -n <любой>` → no.
+#   * 19.11 владелец кластера выдал запись в стенды: RoleBinding в каждом
+#     namespace `squad-<N>-shared` / `squad-<N>-kingdom<M>` (98 штук). В
+#     остальных namespace — по-прежнему no. Стенд, созданный позже, привязки
+#     не получает, пока скрипт не перезапущен: deploy.sh печатает список
+#     namespace, куда executor может писать.
+#   * Namespace-ная Role sre-ai-remediate (до 19.11 лежала здесь) в кластере
+#     осталась в `sre-ai` и `default`, ни к чему не привязана — удалить.
 #   * ClusterRole sre-ai-events-reader жила только в кластере — добавлена ниже.
 #   * ClusterRole/Binding sre-ai-services-reader (services + ingresses) в
 #     кластере есть, сюда НЕ перенесена: её правила целиком входят в
@@ -111,9 +118,15 @@ roleRef:
   apiGroup: rbac.authorization.k8s.io
 
 ---
-# Write-Role применяется ТОЛЬКО в squad-* (через отдельный RoleBinding) и
-# ТОЛЬКО на SA sre-ai-executor. Не делать ClusterRoleBinding — иначе обходим
+# Правила записи. ClusterRole — чтобы не плодить копию Role в каждом стенде;
+# право появляется только через RoleBinding в конкретном namespace и ТОЛЬКО
+# для SA sre-ai-executor. Не делать ClusterRoleBinding — иначе обходим
 # principle of least privilege.
+#
+# `patch deployments` RBAC-ом не сузить до «рестарт и число реплик»: он же
+# позволяет менять образ и env. Сдерживает это код (playbook, policy,
+# одобрение человеком); сузить на уровне кластера может только
+# ValidatingAdmissionPolicy на этот SA.
 #
 # Состав — ровно то, что умеет execution_dsl: `rollout restart` (patch
 # deployment) и `scale` (patch/update deployments/scale); get/list — для
@@ -121,17 +134,19 @@ roleRef:
 # `create pods/exec` сняты 24.09.2026: ни один путь кода их не вызывал, а
 # exec под write-SA — это произвольная команда в любом контейнере ns.
 apiVersion: rbac.authorization.k8s.io/v1
-kind: Role
+kind: ClusterRole
 metadata:
   name: sre-ai-remediate
+  labels:
+    app.kubernetes.io/part-of: sre-ai-copilot
 rules:
 - apiGroups: ["apps"]
   resources: ["deployments", "deployments/scale"]
   verbs: ["get", "list", "patch", "update"]
 
 ---
-# Пример write-binding в squad-* namespace. Размножать через kustomize.
-# Не применять автоматически — каждый bind должен быть осознанным merge'ем.
+# Пример write-binding в squad-* namespace — ровно то, что создаёт
+# scripts/grant_executor_squads.sh. Через deploy.sh не применяется.
 # Subject — ТОЛЬКО sre-ai-executor: bind на sre-ai вернул бы write-права
 # api-поду.
 # apiVersion: rbac.authorization.k8s.io/v1
@@ -144,7 +159,7 @@ rules:
 #   name: sre-ai-executor
 #   namespace: sre-ai
 # roleRef:
-#   kind: Role
+#   kind: ClusterRole
 #   name: sre-ai-remediate
 #   apiGroup: rbac.authorization.k8s.io
 

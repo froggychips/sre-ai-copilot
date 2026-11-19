@@ -1356,7 +1356,7 @@ Values are compared before removal, so behaviour does not change; rollback is th
 
 - traces of `kubectl apply -f rbac.yaml` without `-n` in `default`: `kubectl -n default delete rolebinding sre-ai-read` and `kubectl -n default delete role sre-ai-read sre-ai-remediate`;
 - `sre-ai-services-reader` duplicates `sre-ai-deployments-reader`: `kubectl delete clusterrolebinding,clusterrole sre-ai-services-reader`; before that `kubectl auth can-i list ingresses.networking.k8s.io -A --as=system:serviceaccount:sre-ai:sre-ai` must stay `yes`;
-- **the executor cannot write to the cluster:** there is no RoleBinding to `sre-ai-remediate` in any namespace (checked 2026-11-18); `deploy.sh` warns about it. Grant it one namespace at a time; example in `k8s/base/rbac.yaml`.
+- **the executor can write to squad stands only:** since 2026-11-19 every `squad-<N>-shared` / `squad-<N>-kingdom<M>` namespace has a RoleBinding to the `sre-ai-remediate` ClusterRole; no other namespace does. A stand created later gets no binding — re-run `scripts/grant_executor_squads.sh --apply` (no arguments prints the plan, `--revoke` removes everything). The namespaced `sre-ai-remediate` Role in `sre-ai` is no longer needed: `kubectl -n sre-ai delete role sre-ai-remediate`.
 
 **TeamCity.** `deploy.sh` updates the CronJobs; the regular rollout does not yet. Add to the `kubectl set image` step of `SreAiCopilotBuildAndDeploy`:
 

@@ -1353,7 +1353,7 @@ python3 scripts/split_role_secrets.py verify    # «пересечений с Co
 
 - след `kubectl apply -f rbac.yaml` без `-n` в `default`: `kubectl -n default delete rolebinding sre-ai-read` и `kubectl -n default delete role sre-ai-read sre-ai-remediate`;
 - `sre-ai-services-reader` дублирует `sre-ai-deployments-reader`: `kubectl delete clusterrolebinding,clusterrole sre-ai-services-reader`, перед этим `kubectl auth can-i list ingresses.networking.k8s.io -A --as=system:serviceaccount:sre-ai:sre-ai` должно оставаться `yes`;
-- **executor не может писать в кластер:** RoleBinding на `sre-ai-remediate` нет ни в одном namespace (сверка 18.11.2026), `deploy.sh` об этом предупреждает. Выдавать — по одному namespace, пример в `k8s/base/rbac.yaml`.
+- **запись executor-а — только в стендах:** с 19.11.2026 RoleBinding на ClusterRole `sre-ai-remediate` есть в каждом `squad-<N>-shared` / `squad-<N>-kingdom<M>`; в остальных namespace записи нет. Стенд, созданный позже, привязки не получает — перезапустить `scripts/grant_executor_squads.sh --apply` (без аргументов показывает план, `--revoke` снимает всё). Namespace-ная Role `sre-ai-remediate` в `sre-ai` больше не нужна: `kubectl -n sre-ai delete role sre-ai-remediate`.
 
 **TeamCity.** `deploy.sh` обновляет CronJob-ы, штатная выкатка — пока нет. В шаг `kubectl set image` конфигурации `SreAiCopilotBuildAndDeploy` добавить:
 
