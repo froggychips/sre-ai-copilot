@@ -49,6 +49,17 @@ async def replay_incident(
     """
     Запускает повторный анализ инцидента на основе исторических данных.
     """
+    # Replay исполняет та же LLM-задача generate_reply. При выключенном
+    # контуре ставить её в очередь бессмысленно: задача завершится как
+    # «skipped», а клиент получит «replay_started» и будет ждать результата.
+    # Проверка стоит после авторизации (Depends) — неавторизованный вызов
+    # по-прежнему получает 401/403, а не подсказку о конфигурации.
+    if not settings.LLM_PIPELINE_ENABLED:
+        raise HTTPException(
+            status_code=503,
+            detail="LLM pipeline is disabled (LLM_PIPELINE_ENABLED=false): "
+            "replay is unavailable",
+        )
     db = SessionLocal()
     try:
         # Ищем инцидент по ID

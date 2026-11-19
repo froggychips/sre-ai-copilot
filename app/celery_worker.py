@@ -1,4 +1,5 @@
 import asyncio
+import importlib
 import json
 from typing import TYPE_CHECKING, cast
 
@@ -7,15 +8,14 @@ import structlog
 if TYPE_CHECKING:
     from redis.asyncio import Redis
 
-from app.agents.analyzer import AnalyzerAgent
+    from app.services.session_manager import SessionManager
+
 from app.config import settings
-from app.context.context_builder import ContextBuilder
 from app.core.state_machine import IncidentState, StateMachine
 from app.database import SessionLocal
 from app.models import Conversation
 from app.replay.contract import assert_replay_isolated_runtime
 from app.services.resilience import LLMResilienceManager, LoopLocalRedis
-from app.services.session_manager import SessionManager
 
 # Единое Celery-приложение. Раньше здесь жил отдельный Celery("worker") без
 # backpressure-конфигурации — на общем Redis-broker/backend это давало ДВА
@@ -45,7 +45,49 @@ redis_client = LoopLocalRedis(settings.REDIS_URL)
 # неотличимо от Redis, но статически это разные типы — сужаем на границе.
 _redis: "Redis" = cast("Redis", redis_client)
 resilience = LLMResilienceManager(_redis)
-session_manager = SessionManager(_redis)
+
+# ── LLM-слой грузится лениво ────────────────────────────────────────────────
+#
+# Этот модуль импортируют api (app.main, app.api.approvals, app.api.replay) и
+# — с 18.11.2026 — каждый процесс Celery (конец app.workers.tasks), причём
+# живому коду отсюда нужны только `redis_client` и `resilience`. Раньше
+# вместе с ними на уровне модуля грузились AnalyzerAgent (а за ним агенты,
+# llm_service и SDK anthropic), ContextBuilder и SessionManager — всё ради
+# пути /copilot, который в проде выключен (`LLM_PIPELINE_ENABLED=False`).
+#
+# Имена остаются атрибутами модуля (PEP 562): `patch("app.celery_worker.
+# AnalyzerAgent")` в тестах и `from app.celery_worker import session_manager`
+# работают как раньше. Тело задачи берёт классы через `_lazy`: подменённое
+# значение лежит в globals() и имеет приоритет.
+_LAZY_ATTRS = {
+    "AnalyzerAgent": "app.agents.analyzer",
+    "ContextBuilder": "app.context.context_builder",
+}
+
+_DISABLED_REASON = "LLM_PIPELINE_ENABLED=false"
+
+
+def _lazy(name: str):
+    try:
+        return globals()[name]
+    except KeyError:
+        return getattr(importlib.import_module(_LAZY_ATTRS[name]), name)
+
+
+def _session_manager() -> "SessionManager":
+    from app.services.session_manager import SessionManager
+
+    manager = SessionManager(_redis)
+    globals()["session_manager"] = manager
+    return manager
+
+
+def __getattr__(name: str):
+    if name in _LAZY_ATTRS:
+        return _lazy(name)
+    if name == "session_manager":
+        return _session_manager()
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 # Терминальные состояния — те, у которых в TRANSITIONS нет исходящих
@@ -101,7 +143,7 @@ async def _generate_reply_logic(
                 raise Exception("Replay mode requires immutable snapshot input")
             enriched_ctx = snapshot.get("payload", {})
         else:
-            builder = ContextBuilder()
+            builder = _lazy("ContextBuilder")()
             # legacy /copilot-путь: Conversation-модель не имеет поля data
             # (см. app/models/__init__.py); защищаемся через getattr,
             # эта ветка не используется основным incident-pipeline-ом.
@@ -109,7 +151,7 @@ async def _generate_reply_logic(
 
         # Reasoning Loop
         for iteration in range(3):
-            analyzer = AnalyzerAgent()
+            analyzer = _lazy("AnalyzerAgent")()
             analysis_data = await analyzer.analyze(enriched_ctx)
 
             try:
@@ -175,6 +217,20 @@ def generate_reply(
     snapshot: dict | None = None,
     environment_fingerprint: str | None = None,
 ):
+    # Тот же предохранитель, что у process_incident: при выключенном
+    # LLM-контуре задача не трогает ни БД, ни LLM и НЕ ретраится. Без него
+    # при `LLM_BACKEND=claude_cli` и отсутствии бинарника в образе задача
+    # падала и трижды уходила в retry. Постановку закрывают сами ручки
+    # (/copilot, /replay отвечают 503); эта проверка — для сообщений, уже
+    # лежащих в очереди, и для окна выкатки, когда api и worker расходятся
+    # в настройках.
+    if not settings.LLM_PIPELINE_ENABLED:
+        logger.warning(
+            "generate_reply.skipped_disabled",
+            conversation_id=conversation_id,
+            replay_mode=replay_mode,
+        )
+        return {"status": "skipped", "reason": _DISABLED_REASON}
     try:
         return asyncio.run(
             _generate_reply_logic(

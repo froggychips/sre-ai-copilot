@@ -233,6 +233,12 @@ app.include_router(
 app.include_router(discord_interactions.router, prefix="/discord", tags=["discord"])
 
 
+_LLM_DISABLED_DETAIL = (
+    "LLM pipeline is disabled (LLM_PIPELINE_ENABLED=false): "
+    "/copilot is unavailable"
+)
+
+
 @app.post("/copilot", status_code=202)
 async def post_copilot(
     response: Response,
@@ -240,6 +246,14 @@ async def post_copilot(
     prompt: str = Body(...),
     user: User = Depends(get_current_user),
 ):
+    # LLM-контур выключен → честный 503 ДО любых побочных эффектов: ни
+    # диалога, ни сообщения в БД, ни задачи в очереди. Раньше ручка флаг не
+    # смотрела: задача уезжала в Celery, там падала (в проде
+    # `LLM_BACKEND=claude_cli` без бинарника в образе) и трижды ретраилась, а
+    # клиент получал 202 и task_id, по которому ответа не будет никогда.
+    if not settings.LLM_PIPELINE_ENABLED:
+        raise HTTPException(status_code=503, detail=_LLM_DISABLED_DETAIL)
+
     # Per-user rate limit (resilience.py token-bucket). /copilot — user-facing
     # точка входа, ровно под что check_rate_limit(user_id) и спроектирован
     # (НЕ автономный alert-пайплайн, который этот бакет задушил бы на fan-out).

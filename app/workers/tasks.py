@@ -5,7 +5,7 @@ import time
 import httpx
 from celery import Celery
 from celery.schedules import crontab
-from celery.signals import task_postrun
+from celery.signals import task_postrun, worker_init
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm.attributes import flag_modified
 
@@ -21,7 +21,6 @@ from app.services.audit_logger import audit_service
 from app.services.cost_guard import peek as peek_budget
 from app.services.telemetry_utils import incident_span
 from app.telemetry import setup_telemetry
-from app.workers.pipeline import IncidentPipeline, transition_to
 from app.workers.pipeline_scope import (SCOPE_APPROVED_KEY, ScopeVerdict,
                                         check_scope)
 from app.workers.task_lock import single_instance
@@ -29,6 +28,65 @@ from app.workers.task_lock import single_instance
 setup_telemetry(service_name="copilot-worker")
 
 logger = logging.getLogger(__name__)
+
+
+# ── LLM-пайплайн грузится лениво ────────────────────────────────────────────
+#
+# До 18.11.2026 здесь стоял `from app.workers.pipeline import ...` на уровне
+# модуля. Этот модуль импортирует КАЖДЫЙ процесс Celery (worker, worker-sync,
+# executor, beat — все стартуют с `-A app.workers.tasks.celery_app`) и api
+# (через app.api.webhooks), поэтому каждый из них тащил в память пайплайн,
+# агентов, llm_service и SDK anthropic — ~6,7 тыс. строк своего кода плюс
+# сторонние пакеты. При этом в проде `LLM_PIPELINE_ENABLED=False`: за всё
+# время ни один инцидент через пайплайн не прошёл. Память, загруженная до
+# форка, — база каждого prefork-процесса; лишние мегабайты здесь умножаются
+# на concurrency и уже приводили к OOM (см. блок про лимиты ниже).
+#
+# Теперь пайплайн импортируется только в теле `async_process_incident`,
+# ПОСЛЕ всех трёх предохранителей (флаг, область действия, бюджет). Имена
+# задач Celery и их регистрация не меняются.
+#
+# `IncidentPipeline` и `transition_to` остаются атрибутами модуля (PEP 562),
+# чтобы работали `patch("app.workers.tasks.IncidentPipeline")` и старые
+# `from app.workers.tasks import transition_to`. Тело задачи берёт их через
+# `_pipeline_attr`: подменённое в тесте значение лежит в globals() и имеет
+# приоритет над настоящим.
+_LAZY_PIPELINE_ATTRS = frozenset({"IncidentPipeline", "transition_to"})
+
+
+def _pipeline_attr(name: str):
+    """Атрибут `app.workers.pipeline`, с учётом подмены на этом модуле."""
+    try:
+        return globals()[name]
+    except KeyError:
+        from app.workers import pipeline as _pipeline
+
+        return getattr(_pipeline, name)
+
+
+def __getattr__(name: str):
+    if name in _LAZY_PIPELINE_ATTRS:
+        return _pipeline_attr(name)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
+@worker_init.connect(weak=False)
+def _preload_shared_libs_before_fork(**_kwargs) -> None:
+    """Загрузить клиент Kubernetes в РОДИТЕЛЕ воркера, до форка пула.
+
+    Клиент kubernetes (~50 МиБ, 1,3 тыс. модулей) нужен живым задачам:
+    kg_storage_sync, мосту remediation (K8sFacts), обогащению алертов. Раньше
+    он попадал в родителя случайно — транзитом через импорт пайплайна — и
+    делился между форками через copy-on-write. С ленивым пайплайном его
+    грузил бы каждый форк сам: приватная копия на процесс и повторный импорт
+    при каждой замене форка (worker_max_tasks_per_child). Поэтому грузим
+    явно и только здесь: `worker_init` шлёт главный процесс worker-а перед
+    созданием пула; beat и api этот сигнал не получают и клиент не держат.
+    """
+    try:
+        from kubernetes import client, config  # noqa: F401
+    except Exception as exc:  # предзагрузка — оптимизация, не условие старта
+        logger.warning("worker.preload_kubernetes_failed: %s", exc)
 
 celery_app = Celery("sre_tasks", broker=settings.REDIS_URL, backend=settings.REDIS_URL)
 
@@ -722,7 +780,9 @@ async def async_process_incident(
                 .filter(IncidentRecord.incident_id == incident_id)
                 .first()
             )
-            pipeline = IncidentPipeline(incident_data, db, record, _root_span)
+            pipeline = _pipeline_attr("IncidentPipeline")(
+                incident_data, db, record, _root_span
+            )
             await pipeline.run()
         except Exception as e:
             # FAILED — терминальное состояние. Если писать его ПЕРЕД Celery-
@@ -762,7 +822,9 @@ async def async_process_incident(
                     )
                     db.rollback()
                 try:
-                    transition_to(record, IncidentState.FAILED, db)
+                    _pipeline_attr("transition_to")(
+                        record, IncidentState.FAILED, db
+                    )
                 except ValueError:
                     db.rollback()
             else:
@@ -2347,3 +2409,11 @@ def _record_beat_heartbeat(sender=None, task_id=None, task=None, state=None, **k
 # отсюда, ему неизвестны. Импорт в конце — модулю нужен уже созданный
 # celery_app.
 from app.workers import executor_tasks  # noqa: E402,F401
+
+# `generate_reply` (legacy /copilot и /replay) объявлена в app.celery_worker.
+# Раньше её сюда никто не импортировал: worker, поднятый с
+# `-A app.workers.tasks.celery_app`, задачи не знал, и сообщение от api
+# отбрасывалось как «unregistered task». Регистрируем явно — модуль теперь
+# лёгкий (агенты и ContextBuilder грузятся в теле задачи), а при
+# `LLM_PIPELINE_ENABLED=False` задача завершается сразу и без ретраев.
+from app import celery_worker  # noqa: E402,F401
