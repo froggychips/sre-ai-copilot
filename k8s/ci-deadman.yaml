@@ -50,16 +50,27 @@
 #   #     --type merge -p "{\"stringData\":{\"github_token\":\"$(cat /path/pat)\"}}"
 #   # Проверка включится сама на следующем тике, менять манифест не нужно.
 #
-# Образ: тот же sre-ai-copilot (нужен только python3 + requests), в проде
-# патчится на внутренний реестр через deploy.sh, как остальные CronJob-ы.
+# Образ: тот же sre-ai-copilot (нужен только python3 + requests). Образ и
+# ConfigMap со скриптом обновляет deploy.sh вместе с Deployment-ами (шаг
+# «CronJob-ы»).
 #
-# ⚠️ `kubectl apply -f` этим файлом ВОЗВРАЩАЕТ image в IMAGE_PLACEHOLDER, и
-# следующий тик падает в InvalidImageName — молча, потому что CronJob не
-# алертит на несозданный под (проверено 15.08.2026). Применять только через
-# deploy.sh, либо сразу после apply вернуть образ:
-#   kubectl -n sre-ai set image cronjob/ci-deadman ci-deadman=$(
-#     kubectl -n sre-ai get deploy sre-ai-api \
-#       -o jsonpath='{.spec.template.spec.containers[0].image}')
+# До 18.11.2026 здесь было написано, что образ «патчится через deploy.sh, как
+# остальные CronJob-ы». Это было неправдой: deploy.sh CronJob-ы не трогал, а
+# выкатка TeamCity делает `kubectl set image` только на пять Deployment-ов.
+# Живой CronJob к этому дню стоял на 1.0.0-rc.19 при приложении 1.0.35, а
+# ConfigMap ci-deadman-script отставал от scripts/ci_deadman.py.
+#
+# `image: ""` ниже — намеренно. Раньше в манифесте стоял IMAGE_PLACEHOLDER, и
+# сырой `kubectl apply -f` записывал его в CronJob как есть: следующий тик
+# падал в InvalidImageName молча, потому что CronJob не алертит на несозданный
+# под (проверено 15.08.2026). Пустой образ API-сервер отклоняет сразу
+# («image: Required value») — ошибка вместо ловушки. Применять через deploy.sh.
+#
+# ПРИОСТАНОВЛЕН. В кластере CronJob стоит с `suspend: true` (последний успешный
+# прогон — 07.09.2026), и манифест повторяет это состояние: применение не
+# должно само включать канарейку, которая пишет в Discord. Включать ли её —
+# отдельное решение; для включения убрать `suspend` здесь и прогнать deploy.sh
+# (скрипт к этому моменту уже будет свежим).
 apiVersion: batch/v1
 kind: CronJob
 metadata:
@@ -71,6 +82,7 @@ spec:
   # которое терпит час, но не терпит недели. Чаще смысла нет, GitHub API
   # на fine-grained PAT даёт 5000 req/h, но канарейка не должна их жечь.
   schedule: "17 * * * *"
+  suspend: true
   concurrencyPolicy: Forbid
   successfulJobsHistoryLimit: 3
   failedJobsHistoryLimit: 5
@@ -100,8 +112,9 @@ spec:
               type: RuntimeDefault
           containers:
           - name: ci-deadman
-            # IMAGE_PLACEHOLDER подставляет deploy.sh целиком (registry+repo+tag).
-            image: IMAGE_PLACEHOLDER
+            # Пустое значение deploy.sh заменяет на образ целиком по маркеру
+            # в этой же строке (см. шапку файла).
+            image: ""  # IMAGE_PLACEHOLDER
             imagePullPolicy: IfNotPresent
             command: ["python3", "/scripts/ci_deadman.py"]
             securityContext:

@@ -52,7 +52,22 @@ spec:
         # писателей (см. deploy.sh).
         - name: PGOPTIONS
           value: "-c lock_timeout=15s"
+        # ConfigMap первым, Secret последним — как у Deployment-ов
+        # (k8s/base/settings.yaml). alembic/env.py импортирует app.config, а
+        # Settings не стартует без LLM_BACKEND=claude_cli или ключа Anthropic:
+        # пока флаг лежал в Secret, Job брал его оттуда; после переноса флагов
+        # в ConfigMap без этой строки миграции упали бы на валидаторе.
+        # ENV здесь намеренно не задан — Job не должен требовать прод-инвариантов.
+        #
+        # optional: этот файл берёт и сборка TeamCity (шаг миграций), причём
+        # из master сразу после мержа — возможно, раньше, чем ConfigMap
+        # появится в кластере. Без optional Job повис бы в
+        # CreateContainerConfigError и остановил релиз; с ним он до переноса
+        # флагов живёт на значениях из Secret, как раньше.
         envFrom:
+        - configMapRef:
+            name: sre-ai-copilot-settings
+            optional: true
         - secretRef:
             name: sre-ai-secrets
         resources:

@@ -52,15 +52,21 @@ def test_task_settings_are_not_set_on_beat_alone(var, task):
     )
 
 
-def test_beat_and_worker_share_the_same_secret_source():
-    """Оба компонента читают один Secret: расхождение здесь тоже невидимо."""
+def test_beat_and_worker_share_the_same_settings_source():
+    """Оба компонента читают флаги из одного ConfigMap: расхождение здесь невидимо.
+
+    До 18.11.2026 инвариант звучал «один Secret на двоих» — флаги лежали в
+    нём. Теперь флаги в ConfigMap sre-ai-copilot-settings, а Secret у beat
+    свой и узкий (k8s/base/secrets.beat.yaml.example): общим обязан быть
+    источник ПОВЕДЕНИЯ, а не токенов.
+    """
     root = pathlib.Path(__file__).parent.parent
     refs = {}
     for doc in yaml.safe_load_all((root / "k8s/worker.yaml").read_text()):
         if doc and doc.get("kind") == "Deployment":
             c = doc["spec"]["template"]["spec"]["containers"][0]
             refs[doc["metadata"]["name"]] = {
-                (f.get("secretRef") or {}).get("name")
+                (f.get("configMapRef") or {}).get("name")
                 for f in c.get("envFrom", [])
-            }
-    assert refs["copilot-worker"] == refs["copilot-beat"], refs
+            } - {None}
+    assert refs["copilot-worker"] == refs["copilot-beat"] == {"sre-ai-copilot-settings"}, refs

@@ -37,6 +37,11 @@ spec:
     metadata:
       labels:
         app: sre-ai-api
+      annotations:
+        # Подставляет deploy.sh: хэш k8s/base/settings.yaml. Под читает envFrom
+        # только на старте — без этой строки правка ConfigMap не давала бы
+        # rollout. `kubectl set image` (TeamCity) аннотацию не трогает.
+        checksum/settings: "SETTINGS_CHECKSUM_PLACEHOLDER"
     spec:
       affinity:
         nodeAffinity:
@@ -81,12 +86,19 @@ spec:
           allowPrivilegeEscalation: false
           capabilities:
             drop: ["ALL"]
+        # Порядок источников — контракт (k8s/base/settings.yaml): ConfigMap с
+        # флагами первым, Secret роли последним (при совпадении ключей
+        # побеждает он), литеральный `env` ниже — сильнее обоих.
         envFrom:
+        - configMapRef:
+            name: sre-ai-copilot-settings
         - secretRef:
             name: sre-ai-secrets
         env:
         # ENV=production включает fail-closed-валидаторы в app/config.py
-        # (обязательные секреты + запрет SAFE_MODE=false). Заполни secrets.yaml.
+        # (обязательные секреты + запрет SAFE_MODE=false). Оба предохранителя —
+        # литералом, а не в ConfigMap: литеральный env нельзя перекрыть ключом
+        # Secret, а в sre-ai-secrets свой ENV есть (см. k8s/base/settings.yaml).
         - name: ENV
           value: "production"
         - name: SAFE_MODE
@@ -96,23 +108,17 @@ spec:
         # write-прав нет. inline тут упёрся бы в Forbidden.
         - name: EXECUTOR_DISPATCH
           value: "queue"
-        # ── дальше: то, что жило ТОЛЬКО в кластере ────────────────────────
+        # ALERTMANAGER_ALLOW_UNAUTHENTICATED, флаги моста/executor-а, LLM_BACKEND
+        # и остальное общее поведение — в ConfigMap sre-ai-copilot-settings
+        # (k8s/base/settings.yaml). Ниже — только своё для api.
         #
-        # 21.08.2026 выяснилось, что этот манифест и работающий Deployment
-        # разошлись полностью: в git было две переменные и ни одного тома, в
-        # кластере — три других переменные, ConfigMap с ownership и emptyDir
-        # под /tmp. Ни одна не совпадала. Применение манифеста роняло поды на
-        # старте и попутно снесло бы рабочую конфигурацию, которой нет больше
-        # нигде. Прод жил на ревизии, воспроизвести которую из репозитория
-        # было нельзя.
+        # ИСТОРИЯ. 21.08.2026 выяснилось, что этот манифест и работающий
+        # Deployment разошлись полностью: в git было две переменные и ни одного
+        # тома, в кластере — три других переменные, ConfigMap с ownership и
+        # emptyDir под /tmp. Применение манифеста роняло поды на старте. Сверка
+        # 18.11.2026 расхождений в Deployment-ах уже не нашла, но флаги
+        # поведения всё ещё жили ключами Secret — отсюда ConfigMap.
         #
-        # Подписывать вебхук AlertManager нечем: стоковый
-        # AlertManager/VMAlertmanager не умеет считать HMAC от body (подробно
-        # в k8s/vmalertmanagerconfig.yaml). Выбран второй вариант из двух
-        # описанных там — изоляция трафика NetworkPolicy без секрета, — и
-        # опт-аут обязан быть явным, иначе config.py откажется стартовать.
-        - name: ALERTMANAGER_ALLOW_UNAUTHENTICATED
-          value: "true"
         # Пустой список, а не ["*"]: браузерных клиентов у этого API нет
         # (Ingress выставлен на плейсхолдер, обращений к защищённым
         # эндпоинтам ноль), а wildcard в проде запрещён гвардом в

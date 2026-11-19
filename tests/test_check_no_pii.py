@@ -102,3 +102,51 @@ def test_repository_itself_is_clean():
         cwd=ROOT, capture_output=True, text=True,
     )
     assert res.returncode == 0, f"PII-страж нашёл персональные данные:\n{res.stdout}"
+
+
+# ── публичные IPv4 (18.11.2026) ───────────────────────────────────────────────
+#
+# В манифестах лежали адрес внешней базы с NodePort и адреса ingress-нод.
+# Адреса в фикстурах ниже — не наши: это давний адрес example.com.
+
+def test_public_ipv4_detected(tmp_path: Path):
+    found = _scan(tmp_path, "cidr: 93.184.216.34/32", name="np.yaml")  # pii-allow: фикстура
+    assert [(rule, frag) for _, rule, frag in found] == [("публичный IPv4", "93.184.216.34")]  # pii-allow: фикстура
+
+
+def test_public_ipv4_in_comment_detected(tmp_path: Path):
+    """Адрес в комментарии — та же утечка: именно так лежали адреса нод."""
+    found = _scan(tmp_path, "# проверено из пода: 93.184.216.34 — TimeoutError")  # pii-allow: фикстура
+    assert [rule for _, rule, _ in found] == ["публичный IPv4"]
+
+
+@pytest.mark.parametrize("text", [
+    "cidr: 10.0.0.0/8",                 # RFC1918 — except у NetworkPolicy
+    "cidr: 172.16.0.0/12",
+    "cidr: 192.168.0.0/16",
+    "host = '10.43.0.1'",               # service CIDR кластера
+    "cidr: 0.0.0.0/0",
+    "bind 127.0.0.1",
+    "METRICS_BIND_ADDR = '0.0.0.0'",
+    "169.254.169.254",                  # link-local (metadata)
+    "STATICS_DB_CIDR: 203.0.113.10/32",  # RFC 5737, диапазон для документации
+    "dns: 8.8.8.8",                     # общеизвестный резолвер
+    "click-plugins==1.1.1.2",           # версия пакета
+    "Chrome/999.0.0.1",                 # не адрес: октет > 255
+    "version 1.0.35 and 1.0.0-rc.19",   # три компонента — не адрес
+])
+def test_non_public_ipv4_allowed(tmp_path: Path, text: str):
+    assert _scan(tmp_path, text) == []
+
+
+def test_ip_legacy_files_are_exact_and_few():
+    """Список исключений не должен расти: для единичного случая есть pii-allow."""
+    assert checker.IP_LEGACY_FILES == {"CHANGELOG.md", "app/services/node_resolver.py"}
+
+
+def test_k8s_manifests_carry_no_public_ipv4():
+    """Манифесты — главное место, где адреса уже лежали; исключений тут нет."""
+    for path in sorted((ROOT / "k8s").rglob("*")):
+        if path.is_file():
+            for lineno, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+                assert checker.find_public_ipv4(line) == [], f"{path}:{lineno}"

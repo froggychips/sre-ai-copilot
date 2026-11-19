@@ -78,6 +78,10 @@ spec:
                   - key: env
                     operator: In
                     values: ["dev"]
+                  # Пин на ноду тома — как в кластере, см. k8s/postgres.yaml.
+                  - key: kubernetes.io/hostname
+                    operator: In
+                    values: ["dev-4"]
       securityContext:
         runAsNonRoot: true
         runAsUser: 999
@@ -86,7 +90,9 @@ spec:
           type: RuntimeDefault
       containers:
       - name: redis
-        image: redis:7-alpine
+        # Пин по digest (снят с живого пода 18.11.2026, Redis 7.4.9) — причины
+        # и порядок обновления те же, что у postgres (k8s/postgres.yaml).
+        image: redis:7-alpine@sha256:6ab0b6e7381779332f97b8ca76193e45b0756f38d4c0dcda72dbb3c32061ab99
         command:
         - redis-server
         - /usr/local/etc/redis/redis.conf

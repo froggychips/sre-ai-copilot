@@ -7,9 +7,15 @@
 таргетированная атака: известны логины, адреса внутренних систем и чьи учётки могли
 остаться неотозванными.
 
+С 18.11.2026 страж ловит и публичные IPv4-адреса: в манифестах лежали адрес внешней
+базы с её NodePort и адреса ingress-нод — готовая карта «куда стучаться», собранная
+самим владельцем. Адреса площадки подаются снаружи (`k8s/site.yaml.example`,
+`STATICS_DB_CIDR` в deploy.sh).
+
 ВАЖНО про устройство проверки. Здесь НЕТ списка настоящих логинов и ФИО — иначе сам
 страж стал бы той самой утечкой. Проверяются только СТРУКТУРНЫЕ признаки:
-связка «логин · нода», корпоративные адреса, непустые карты владения. Всё, что выглядит
+связка «логин · нода», корпоративные адреса, непустые карты владения, глобально
+маршрутизируемые IPv4. Всё, что выглядит
 как реальный человек, обязано жить вне репозитория — в ConfigMap/ENV
 (`NAME_OVERRIDES`, `RESERVED_MAP`, `OWNER_ALIASES_PATH`, `OWNERSHIP_MANIFEST_PATH`).
 
@@ -22,6 +28,7 @@
 """
 from __future__ import annotations
 
+import ipaddress
 import re
 import subprocess
 import sys
@@ -82,6 +89,53 @@ RE_HR_WORDING = re.compile(
 )
 
 
+#: IPv4-литерал. Слева не буква/цифра/точка (иначе это хвост версии или имени),
+#: справа не продолжение (`1.2.3.4.5`, `1.2.3.4a`). Маска `/32` в совпадение не
+#: входит — адрес в CIDR ловится так же, как голый.
+RE_IPV4 = re.compile(r"(?<![\w.])(?:\d{1,3}\.){3}\d{1,3}(?![\w]|\.\d)")
+
+#: Общеизвестные публичные адреса, которые ничего не говорят о нашей площадке:
+#: открытые DNS-резолверы и хрестоматийный «адрес из примера».
+ALLOWED_PUBLIC_IPS = {"8.8.8.8", "8.8.4.4", "1.1.1.1", "1.0.0.1", "1.2.3.4"}
+
+#: Файлы, где правило адресов не применяется. Историю git не переписываем, а
+#: эти файлы правятся отдельно от манифестов:
+#:   CHANGELOG.md — журнал прошлых релизов (в нём остались адреса, уже
+#:     опубликованные вместе с манифестами);
+#:   app/services/node_resolver.py — адрес ноды в docstring; убрать при
+#:     ближайшей правке модуля и вычеркнуть отсюда.
+#: Новые записи сюда не добавлять — для единичного случая есть `pii-allow`.
+IP_LEGACY_FILES = {"CHANGELOG.md", "app/services/node_resolver.py"}
+
+#: Перед «адресом» стоит оператор сравнения версий — это версия пакета
+#: (`click-plugins==1.1.1.2`), а не адрес.
+_VERSION_PREFIXES = ("==", ">=", "<=", "~=", "!=")
+
+
+def find_public_ipv4(line: str) -> list[str]:
+    """Глобально маршрутизируемые IPv4 в строке.
+
+    Разрешено всё, что не ведёт к конкретному хосту в интернете: RFC1918
+    (10/8, 172.16/12, 192.168/16 — в т.ч. pod/service CIDR кластера, они нужны
+    в `except` у NetworkPolicy и вне кластера ничего не значат), loopback,
+    link-local, CGNAT, диапазоны для документации (RFC 5737), 0.0.0.0 и
+    маски. Критерий — `ipaddress.is_global`, а не свой список сетей: его
+    ведёт stdlib по реестру IANA.
+    """
+    found = []
+    for m in RE_IPV4.finditer(line):
+        text = m.group(0)
+        if line[max(0, m.start() - 2):m.start()] in _VERSION_PREFIXES:
+            continue
+        try:
+            addr = ipaddress.IPv4Address(text)
+        except ValueError:  # 999.1.1.1, ведущие нули — не адрес
+            continue
+        if addr.is_global and text not in ALLOWED_PUBLIC_IPS:
+            found.append(text)
+    return found
+
+
 def _iter_files(paths: list[str]) -> list[Path]:
     """Файлы под проверку: аргументы либо всё дерево git.
 
@@ -126,6 +180,7 @@ def scan_file(path: Path) -> list[tuple[int, str, str]]:
 
     findings: list[tuple[int, str, str]] = []
     self_check = path.name == "check_no_pii.py"
+    check_ips = path.as_posix() not in IP_LEGACY_FILES
 
     for lineno, line in enumerate(text.splitlines(), 1):
         if "pii-allow" in line:  # осознанное исключение прямо в строке
@@ -138,6 +193,10 @@ def scan_file(path: Path) -> list[tuple[int, str, str]]:
 
         for m in RE_CORP_EMAIL.finditer(line):
             findings.append((lineno, "корпоративный e-mail", m.group(0)))
+
+        if check_ips:
+            for ip in find_public_ipv4(line):
+                findings.append((lineno, "публичный IPv4", ip))
 
         if not self_check:
             for m in RE_CYRILLIC_NAME.finditer(line):
@@ -164,6 +223,7 @@ def main(argv: list[str]) -> int:
             "\nлогин↔нода, ФИО и кадровые формулировки хранить в нём нельзя."
             "\nРеальные карты подаются снаружи: NAME_OVERRIDES, RESERVED_MAP,"
             "\nOWNER_ALIASES_PATH, OWNERSHIP_MANIFEST_PATH (ConfigMap/ENV)."
+            "\nПубличные адреса площадки — тоже снаружи: k8s/site.yaml.example, STATICS_DB_CIDR."
             "\nЕсли совпадение ложное — добавьте комментарий `pii-allow` в ту же строку.",
             file=sys.stderr,
         )

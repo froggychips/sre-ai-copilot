@@ -39,6 +39,9 @@ spec:
     metadata:
       labels:
         app: copilot-executor
+      annotations:
+        # Хэш k8s/base/settings.yaml, подставляет deploy.sh (см. sre-ai-api).
+        checksum/settings: "SETTINGS_CHECKSUM_PLACEHOLDER"
     spec:
       affinity:
         nodeAffinity:
@@ -88,27 +91,32 @@ spec:
           allowPrivilegeEscalation: false
           capabilities:
             drop: ["ALL"]
+        # Порядок источников — контракт (k8s/base/settings.yaml): ConfigMap с
+        # флагами первым, Secret роли последним (при совпадении ключей
+        # побеждает он), литеральный `env` ниже — сильнее обоих.
+        # Свой Secret, а не общий sre-ai-secrets: у этого пода write-токен
+        # кластера, и пароль ClickHouse, токены GitLab/Jira/TeamCity и вебхуки
+        # Discord ему не нужны — код executor-а читает только DATABASE_URL и
+        # REDIS_URL (k8s/base/secrets.executor.yaml.example).
         envFrom:
+        - configMapRef:
+            name: sre-ai-copilot-settings
         - secretRef:
-            name: sre-ai-secrets
+            name: sre-ai-executor-secrets
         env:
-        # Тот же набор, что у copilot-worker (см. комментарии там), без
-        # ownership/people/дайджестов: executor их не читает.
+        # Только своё; общие флаги — в ConfigMap sre-ai-copilot-settings.
         - name: PROMETHEUS_MULTIPROC_DIR
           value: /tmp/prometheus-multiproc
+        # Предохранители — литералом, см. комментарий у sre-ai-api.
         - name: ENV
           value: "production"
         - name: SAFE_MODE
           value: "true"
-        - name: ALERTMANAGER_ALLOW_UNAUTHENTICATED
-          value: "true"
         - name: BUILD_VERSION
           value: "BUILD_VERSION_PLACEHOLDER"
-        - name: DISCORD_DRY_RUN
-          value: "false"
-        # Сам executor исполняет inline — он и есть исполнитель. Явно, чтобы
-        # случайное queue из секрета не заставило его ставить задачи самому
-        # себе.
+        # Сам executor исполняет inline — он и есть исполнитель. Литералом,
+        # чтобы случайное queue из ConfigMap или Secret не заставило его
+        # ставить задачи самому себе.
         - name: EXECUTOR_DISPATCH
           value: "inline"
         # Проба та же, что у worker-а, и по тем же причинам: `-b` вместо

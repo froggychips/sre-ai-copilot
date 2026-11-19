@@ -86,3 +86,69 @@ def test_no_drift_gives_zero(module, monkeypatch):
                         lambda ns: {"namespace": ns, "checked": 5, "missing": []})
     monkeypatch.setattr(sys, "argv", ["manifest_drift.py"])
     assert module.main() == 0
+
+
+# ── обратные проверки (18.11.2026): «живёт, но не описано» и «описано иначе» ──
+
+
+def test_live_only_objects_are_reported(module):
+    """ClusterRole sre-ai-events-reader полгода жила только в кластере."""
+    described = [("Deployment", "sre-ai-api", "deployment.yaml")]
+    live = [("Deployment", "sre-ai-api"), ("ClusterRole", "sre-ai-something-new"),
+            ("ConfigMap", "kube-root-ca.crt")]
+    assert module.find_extra(live, described) == [
+        {"kind": "ClusterRole", "name": "sre-ai-something-new"}]
+
+
+def test_known_live_only_entries_carry_a_reason(module):
+    """Исключение без причины через полгода — «так исторически сложилось»."""
+    assert module.KNOWN_LIVE_ONLY
+    for key, reason in module.KNOWN_LIVE_ONLY.items():
+        assert len(reason) > 10, key
+    assert not any(kind == "Secret" for kind, _ in module.KNOWN_LIVE_ONLY)
+
+
+def test_kubectl_diff_is_parsed_per_object_and_ignores_generation(module):
+    text = "\n".join([
+        "diff -u -N /tmp/LIVE-1/apps.v1.Deployment.sre-ai.copilot-beat /tmp/MERGED-2/apps.v1.Deployment.sre-ai.copilot-beat",
+        "--- /tmp/LIVE-1/apps.v1.Deployment.sre-ai.copilot-beat\t2026-11-18",
+        "+++ /tmp/MERGED-2/apps.v1.Deployment.sre-ai.copilot-beat\t2026-11-18",
+        "@@ -5,7 +5,7 @@",
+        "-  generation: 188",
+        "+  generation: 189",
+        "-            name: sre-ai-secrets",
+        "+            name: sre-ai-beat-secrets",
+        "diff -u -N /tmp/LIVE-1/v1.ConfigMap.sre-ai.redis-config /tmp/MERGED-2/v1.ConfigMap.sre-ai.redis-config",
+        "-  generation: 1",
+        "+  generation: 2",
+        "diff -u -N /tmp/LIVE-1/batch.v1.Job.sre-ai.sre-ai-migrate /tmp/MERGED-2/batch.v1.Job.sre-ai.sre-ai-migrate",
+        "+kind: Job",
+    ])
+    assert module.parse_kubectl_diff(text) == {
+        "Deployment/copilot-beat": ["-            name: sre-ai-secrets",
+                                    "+            name: sre-ai-beat-secrets"],
+    }
+
+
+def test_declared_namespace_is_respected(module, monkeypatch):
+    """jaeger описан в ns monitoring; поиск в ns копилота давал вечное «отсутствует»."""
+    module._manifests()
+    assert module._DECLARED_NAMESPACE.get(("NetworkPolicy", "github-runner-egress")) == "sre-ai-ci"
+    calls = []
+
+    class _Res:
+        returncode = 0
+
+    monkeypatch.setattr(module.subprocess, "run", lambda cmd, **kw: calls.append(cmd) or _Res())
+    module._exists("NetworkPolicy", "github-runner-egress", "sre-ai")
+    assert calls[0][-2:] == ["-n", "sre-ai-ci"]
+
+
+def test_diff_failure_is_reported_not_treated_as_clean(module, monkeypatch, capsys):
+    """Не удалось сверить ≠ расхождений нет: об этом надо сказать."""
+    monkeypatch.setattr(module, "_manifests", lambda: [])
+    monkeypatch.setattr(module, "_live_objects", lambda ns: None)
+    monkeypatch.setattr(module, "spec_diff", lambda ns: None)
+    monkeypatch.setattr(sys, "argv", ["manifest_drift.py", "--diff"])
+    module.main()
+    assert "не сверены" in capsys.readouterr().out

@@ -30,7 +30,7 @@ Watchdog and `severity=none` go to a blackhole. The only exception to "squads ar
 | `postgres-backup` | CronJob | 02:00 UTC, see [DR.md](DR.md) |
 | `squad-dashboard`, `ci-deadman` | CronJob | |
 
-Runtime flags live in Secret `sre-ai-secrets` (`envFrom` on all five Deployments); the manifests in git carry only `BUILD_VERSION` and `EXECUTOR_DISPATCH`. `postgres` and `redis` have PriorityClass `sre-ai-copilot-stateful` (100000, `preemptionPolicy: Never`): local-path volumes cannot move, so these pods are evicted last.
+Runtime flags live in ConfigMap `sre-ai-copilot-settings` (`k8s/base/settings.yaml`, `envFrom` on all five Deployments), secrets in per-role Secrets; see [Settings: ConfigMap and per-role secrets](#settings-configmap-and-per-role-secrets). `postgres` and `redis` have PriorityClass `sre-ai-copilot-stateful` (100000, `preemptionPolicy: Never`): local-path volumes cannot move, so these pods are evicted last.
 
 ---
 
@@ -279,14 +279,15 @@ Click 👎 on the embed to store user feedback structurally.
 #### Stop new applies (normal control)
 
 ```bash
-# fast: env on the Deployment overrides the value from Secret sre-ai-secrets;
-# set env triggers a rollout. The flag is read by the API (button click) and
-# by the worker (bridge cards).
+# fast: a literal env on the Deployment overrides both the ConfigMap and the
+# Secret; set env triggers a rollout. The flag is read by the API (button
+# click) and by the worker (bridge cards).
 kubectl -n sre-ai set env deploy/sre-ai-api deploy/copilot-worker \
   EXECUTOR_APPROVAL_ENABLED=false
-# durable: the same key in Secret sre-ai-secrets, then drop the override
-# (pods read envFrom at start — the set env rollout picks up the Secret):
-kubectl -n sre-ai patch secret sre-ai-secrets -p '{"stringData":{"EXECUTOR_APPROVAL_ENABLED":"false"}}'
+# durable: the value in k8s/base/settings.yaml (PR), deploy.sh, then drop the
+# override. While the key is still in Secret sre-ai-secrets (before migration
+# step 7) deploy.sh refuses on the mismatch — remove the key from the Secret first.
+IMAGE_TAG=<current tag> ./deploy.sh sre-ai
 kubectl -n sre-ai set env deploy/sre-ai-api deploy/copilot-worker EXECUTOR_APPROVAL_ENABLED-
 ```
 
@@ -302,7 +303,7 @@ kubectl -n sre-ai scale deploy/copilot-executor --replicas=0
 
 #### Permanent
 
-Set both `EXECUTOR_ENABLED=false` and `EXECUTOR_APPROVAL_ENABLED=false` in `sre-ai-secrets`. No cards with buttons; nothing is executed.
+Set both `EXECUTOR_ENABLED=false` and `EXECUTOR_APPROVAL_ENABLED=false` in `k8s/base/settings.yaml` and roll out with `deploy.sh`. No cards with buttons; nothing is executed.
 
 ### Audit trail
 
@@ -462,7 +463,7 @@ Deterministic path without an LLM (since 1.0.31, executed in Celery since 1.0.32
 
 ### Flags
 
-All of them are keys of Secret `sre-ai-secrets`, not of the manifests in `k8s/`.
+The flags are keys of ConfigMap `sre-ai-copilot-settings` (`k8s/base/settings.yaml`); `DISCORD_APPROVERS_USER_IDS` is a key of Secret `sre-ai-secrets`. `REMEDIATION_BRIDGE_NAMESPACES` is not set anywhere (code default).
 
 | Variable | Production | Meaning |
 |---|---|---|
@@ -489,12 +490,11 @@ kubectl -n sre-ai set env deploy/sre-ai-api deploy/copilot-worker \
   REMEDIATION_BRIDGE_ENABLED=false
 ```
 
-Durable — in the Secret (pods read `envFrom` at start, hence the restart), then drop the `set env` override:
+Durable — in `k8s/base/settings.yaml` (PR) and `deploy.sh` (the `checksum/settings` annotation triggers the rollout), then drop the `set env` override:
 
 ```bash
-kubectl -n sre-ai patch secret sre-ai-secrets -p '{"stringData":{"REMEDIATION_BRIDGE_ENABLED":"false"}}'
+IMAGE_TAG=<current tag> ./deploy.sh sre-ai
 kubectl -n sre-ai set env deploy/sre-ai-api deploy/copilot-worker REMEDIATION_BRIDGE_ENABLED-
-kubectl -n sre-ai rollout restart deploy/sre-ai-api deploy/copilot-worker
 ```
 
  To stop executing but keep the bridge computing, see [Killing the executor](#killing-the-executor).
@@ -1255,6 +1255,122 @@ should have at least one case to detect regression.
 
 ---
 
+## Settings: ConfigMap and per-role secrets
+
+Since 2026-11-18 configuration has three layers, each with one home:
+
+| Layer | Where | What |
+|---|---|---|
+| Behaviour | ConfigMap `sre-ai-copilot-settings` — `k8s/base/settings.yaml`, in git | non-secret flags shared by all roles: bridge, executor, digests, `LLM_BACKEND`, `DISCORD_DRY_RUN` … |
+| Secrets | the role's Secret — git has only a key-name template (`k8s/base/secrets.*.yaml.example`) | tokens, passwords, URLs with credentials, addresses of internal systems |
+| Role | literal `env` in the Deployment | `ENV`, `SAFE_MODE` (safety invariants), `EXECUTOR_DISPATCH`, `BUILD_VERSION`, paths of mounted files |
+
+**Precedence** (weakest to strongest): ConfigMap → role Secret → literal `env`. In `envFrom` the ConfigMap comes first and the Secret last — on a key collision the last source wins. Hence:
+
+- while a key is still in the Secret, the Secret value is in effect; `deploy.sh` warns about an identical duplicate and refuses, before changing anything, on a differing one;
+- an emergency `kubectl set env deploy/... FLAG=value` still beats everything and still triggers a rollout by itself.
+
+**Changing a flag durably:** edit `k8s/base/settings.yaml`, PR, then `IMAGE_TAG=<current tag> ./deploy.sh sre-ai`. The rollout comes from the `checksum/settings` annotation: a pod reads `envFrom` only at start. After a manual `kubectl edit configmap` you need `kubectl -n sre-ai rollout restart deploy/...` — and the edit drifts from git.
+
+**Per-role secrets:**
+
+| Secret | Used by | Keys |
+|---|---|---|
+| `sre-ai-secrets` | `sre-ai-api`, `copilot-worker`, `copilot-worker-sync`, Job `sre-ai-migrate`; CronJob `squad-dashboard` takes the single key `DATABASE_URL` | `secrets.app.yaml.example` (36 keys) |
+| `sre-ai-executor-secrets` | `copilot-executor` (the only one allowed to write to the cluster) | `DATABASE_URL`, `REDIS_URL`; optional `OTLP_EXPORTER_ENDPOINT`, `DISCORD_APPLICATION_ID`, `DISCORD_BOT_TOKEN` |
+| `sre-ai-beat-secrets` | `copilot-beat` | `REDIS_URL`, `DATABASE_URL`; optional `OTLP_EXPORTER_ENDPOINT` |
+
+`Settings` has no required fields — every field has a default; starting with `ENV=production` only needs: `LLM_BACKEND=claude_cli` (or `ANTHROPIC_API_KEY`), `SAFE_MODE=true`, `ALERTMANAGER_ALLOW_UNAUTHENTICATED=true` (or `ALERTMANAGER_WEBHOOK_SECRET`), and a non-placeholder `DATABASE_URL`; Celery needs `REDIS_URL`. The first three come from the ConfigMap and literals, so a role only needs `DATABASE_URL` + `REDIS_URL` — enforced by `tests/test_settings_configmap.py`. beat never connects to the database; it needs `DATABASE_URL` only because of the validator.
+
+Further split (not done): by the import graph of its handlers `sre-ai-api` does not need `CH_PROD_*`, `GITLAB_*`, `SEQ_INSTANCES`; a separate Secret for the api is the next step.
+
+**Site values.** The address of the external Statics Postgres used by the NetworkPolicy is not kept in git: `deploy.sh` takes it from `STATICS_DB_CIDR` or from ConfigMap `sre-ai-copilot-site` (`k8s/site.yaml.example`) and refuses to start without a value.
+
+### Migrating from the single Secret (one-off)
+
+Run by a human. Steps 1–4 change nothing in running pods; step 5 is the only one that restarts them. Do not combine with a game production release or an active incident. Every step is reversible.
+
+```bash
+cd <sre-ai-copilot clone on the branch with these manifests>
+TAG=$(kubectl -n sre-ai get deploy sre-ai-api \
+  -o jsonpath='{.spec.template.spec.containers[0].image}' | sed 's/.*://')
+
+# 1. Site values — from the NetworkPolicy currently in effect.
+kubectl -n sre-ai create configmap sre-ai-copilot-site --from-literal=STATICS_DB_CIDR="$(
+  kubectl -n sre-ai get networkpolicy copilot-network-policy \
+    -o jsonpath='{.spec.egress[?(@.ports[0].port==31700)].to[0].ipBlock.cidr}')"
+#    rollback: kubectl -n sre-ai delete configmap sre-ai-copilot-site
+
+# 2. Role Secrets — a copy of the needed keys; values are never printed.
+python3 scripts/split_role_secrets.py plan     # key names only
+python3 scripts/split_role_secrets.py apply
+#    rollback: kubectl -n sre-ai delete secret sre-ai-executor-secrets sre-ai-beat-secrets
+
+# 3. Flags: the ConfigMap in git versus the values currently effective from the Secret.
+python3 scripts/split_role_secrets.py verify
+#    On a mismatch: read the value with the command from the output, fix
+#    k8s/base/settings.yaml (first of all the keys marked «СВЕРИТЬ»), commit,
+#    rerun verify. Continue only on exit code 0.
+
+# 4. Exactly what the deploy will change.
+IMAGE_TAG=$TAG ./deploy.sh --render | kubectl -n sre-ai diff -f -
+#    Expected: ConfigMap sre-ai-copilot-settings (new); on the five Deployments —
+#    envFrom, the checksum/settings annotation and the removed literals;
+#    RoleBinding sre-ai-read (namespace default → sre-ai); CronJob images.
+#    Anything else: investigate before applying.
+
+# 5. Apply: migrations (no-op), RBAC, ConfigMap, five rollouts, CronJobs.
+IMAGE_TAG=$TAG ./deploy.sh sre-ai
+kubectl -n sre-ai get deploy,cronjob -o wide
+python3 scripts/manifest_drift.py --diff      # postgres/redis remain (step 8)
+```
+
+**Rolling back step 5** (leave the Secrets and the ConfigMap — they hurt nobody):
+
+```bash
+for d in sre-ai-api copilot-worker copilot-worker-sync copilot-beat copilot-executor; do
+  kubectl -n sre-ai rollout undo deploy/$d
+done
+# CronJobs: restore the image; squad-dashboard gets the whole Secret again
+kubectl -n sre-ai set image cronjob/squad-dashboard squad-dashboard=<previous image>
+kubectl -n sre-ai set image cronjob/ci-deadman ci-deadman=<previous image>
+kubectl -n sre-ai set env cronjob/squad-dashboard --from=secret/sre-ai-secrets
+```
+
+**6. Watch for a day:** alert cards and bridge buttons, the 09:00 UTC digest, `kubectl -n sre-ai get pods` without restarts, the squad dashboard keeps updating (`kubectl -n sre-ai get cronjob squad-dashboard`).
+
+**7. Remove the flags from the Secret** — from then on the ConfigMap is their source of truth:
+
+```bash
+python3 scripts/split_role_secrets.py cleanup   # prints the patch command and the rollback command
+# run the printed `kubectl patch secret ... --type=json`
+kubectl -n sre-ai rollout restart deploy/sre-ai-api deploy/copilot-worker deploy/copilot-worker-sync
+python3 scripts/split_role_secrets.py verify    # no overlap with the ConfigMap
+```
+
+Values are compared before removal, so behaviour does not change; rollback is the command `cleanup` prints, which puts the flags back (no copy of the Secret on disk is needed).
+
+**8. postgres / redis** (in a window, optional): `kubectl -n sre-ai apply -f k8s/redis.yaml`, then `k8s/postgres.yaml`. The manifests carry the same image, now pinned by digest — changing the StatefulSet template restarts the pod (tens of seconds without the database or the broker). Rollback: `kubectl -n sre-ai rollout undo sts/<name>`.
+
+**9. Leftovers in the cluster** (the owner's decision):
+
+- traces of `kubectl apply -f rbac.yaml` without `-n` in `default`: `kubectl -n default delete rolebinding sre-ai-read` and `kubectl -n default delete role sre-ai-read sre-ai-remediate`;
+- `sre-ai-services-reader` duplicates `sre-ai-deployments-reader`: `kubectl delete clusterrolebinding,clusterrole sre-ai-services-reader`; before that `kubectl auth can-i list ingresses.networking.k8s.io -A --as=system:serviceaccount:sre-ai:sre-ai` must stay `yes`;
+- **the executor cannot write to the cluster:** there is no RoleBinding to `sre-ai-remediate` in any namespace (checked 2026-11-18); `deploy.sh` warns about it. Grant it one namespace at a time; example in `k8s/base/rbac.yaml`.
+
+**TeamCity.** `deploy.sh` updates the CronJobs; the regular rollout does not yet. Add to the `kubectl set image` step of `SreAiCopilotBuildAndDeploy`:
+
+```bash
+kubectl -n sre-ai set image cronjob/squad-dashboard squad-dashboard="$IMAGE"
+kubectl -n sre-ai set image cronjob/ci-deadman ci-deadman="$IMAGE"
+for s in squad-dashboard:squad_dashboard.py ci-deadman:ci_deadman.py; do
+  kubectl -n sre-ai create configmap "${s%%:*}-script" \
+    --from-file="${s##*:}=scripts/${s##*:}" --dry-run=client -o yaml | kubectl -n sre-ai apply -f -
+done
+```
+
+---
+
 ## Release, rollout and rollback
 
 The Helm chart is gone (#524). Production is rolled out by TeamCity; `deploy.sh` is for manifest changes.
@@ -1287,16 +1403,22 @@ kubectl -n sre-ai set env \
 
 ### 4. deploy.sh — only for manifest changes
 
-`IMAGE_TAG=X.Y.Z ./deploy.sh sre-ai` when a release changes Deployment, NetworkPolicy, RBAC or PriorityClass manifests. It checks Secret `sre-ai-secrets`, applies `k8s/base/rbac.yaml` and `k8s/priorityclass.yaml`, checks RBAC (the `sre-ai` SA must **not** be able to patch deployments), warns about long transactions, runs `sre-ai-migrate`, applies `k8s/executor.yaml`, `k8s/base/deployment.yaml`, `k8s/worker.yaml`, `k8s/networkpolicy.yaml` with `BUILD_VERSION` substituted, and waits for all five rollouts.
+`IMAGE_TAG=X.Y.Z ./deploy.sh sre-ai` when a release changes Deployment, CronJob, NetworkPolicy, RBAC, PriorityClass manifests or `k8s/base/settings.yaml`. Before changing anything it checks the site value `STATICS_DB_CIDR`, that the three role Secrets exist, and that flags in the Secrets do not differ from the ConfigMap; then it applies `k8s/base/rbac.yaml` and `k8s/priorityclass.yaml`, checks RBAC (the `sre-ai` SA must **not** be able to patch deployments; an executor with no write bindings is a warning), applies the settings ConfigMap, warns about long transactions, runs `sre-ai-migrate`, applies `k8s/executor.yaml`, `k8s/base/deployment.yaml`, `k8s/worker.yaml`, `k8s/networkpolicy.yaml`, updates the `squad-dashboard` and `ci-deadman` CronJobs (image and script ConfigMap), and waits for all five rollouts.
 
-It does **not** touch `postgres` / `redis`, `k8s/vmalertmanagerconfig.yaml`, `k8s/monitoring.yaml`, `k8s/postgres-backup.yaml`, `k8s/squad-dashboard.yaml` — those are applied separately.
+`IMAGE_TAG=X.Y.Z ./deploy.sh --render` prints the same manifests with substitutions and changes nothing: `... --render | kubectl -n sre-ai diff -f -` shows what a deploy would change. `python3 scripts/manifest_drift.py --diff` runs the same comparison for the whole namespace, including objects that exist only in the cluster.
 
-**StatefulSets: `kubectl patch`, never `kubectl apply`.** The live `postgres` and `redis` StatefulSets are pinned to `dev-4` (hostname affinity) where their local-path volumes are; git has only `env In [dev]`. An `apply` of `k8s/postgres.yaml` / `k8s/redis.yaml` would drop the pin. Example:
+It does **not** touch `postgres` / `redis`, `k8s/vmalertmanagerconfig.yaml`, `k8s/monitoring.yaml`, `k8s/postgres-backup.yaml` — those are applied separately.
+
+**CronJobs and the NetworkPolicy: only through `deploy.sh`.** `k8s/squad-dashboard.yaml` and `k8s/ci-deadman.yaml` carry an empty image and `k8s/networkpolicy.yaml` a placeholder instead of the site address: the API server rejects a raw `kubectl apply -f`. That is deliberate — such an apply used to write an invalid image into the CronJob silently. `ci-deadman` is suspended in the manifest (`suspend: true`), as it is in the cluster.
+
+**StatefulSets: only in a window.** `k8s/postgres.yaml` and `k8s/redis.yaml` match the live objects (the hostname pin to `dev-4` and the digest-pinned image are in git since 2026-11-18), so `kubectl apply` no longer drops anything. But any template change restarts the database pod. A targeted change without a full apply:
 
 ```bash
 kubectl -n sre-ai patch sts postgres --type=json -p \
   '[{"op":"replace","path":"/spec/template/spec/containers/0/resources/limits/cpu","value":"<cpu>"}]'
 ```
+
+and put the same change into the manifest, or the next apply reverts it.
 
 ### 5. Manual build (TeamCity unavailable)
 
