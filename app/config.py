@@ -49,6 +49,43 @@ class Settings(BaseSettings):
     # убивал под. 5с хватает in-cluster с запасом.
     DB_CONNECT_TIMEOUT: int = Field(5, description="libpq connect_timeout (сек)")
 
+    # Потолки на ожидание блокировки и на длительность одного запроса —
+    # отдельно по роли процесса (см. app/database.py: set_process_role).
+    # До них в сессии был только idle_in_transaction_session_timeout, и запрос,
+    # вставший за чужим row-lock, ждал без срока: в API — пока kubelet не
+    # убьёт под по /healthz (08.08 и 31.10.2026), в воркере — до глобального
+    # лимита задачи 25/30 минут, занимая слот.
+    #
+    # API — секунды: самый тяжёлый штатный запрос ~0,7 с, потолок 15 с даёт
+    # запас ×20, а Alertmanager на 503 повторит батч. Воркер — минуты: худший
+    # замеренный запрос за всё время (pg_stat_statements, 18.11.2026) — 22 с,
+    # батч retention — 8,5 с; 10 минут на запрос не задевают ни один штатный
+    # синк, но не дают зависшему держать слот полчаса. lock_timeout воркера
+    # (3 мин) выше idle_in_transaction_session_timeout (2 мин): держателя,
+    # ушедшего во внешний вызов, PG снимет раньше, чем сдастся ожидающий.
+    # 0 — без ограничения. Разовые скрипты и alembic роль не объявляют и
+    # ограничений не получают (у миграций свой SET LOCAL lock_timeout).
+    DB_API_LOCK_TIMEOUT_MS: int = Field(
+        3_000, ge=0, description="lock_timeout (мс) соединений процесса API; 0 — без ограничения"
+    )
+    DB_API_STATEMENT_TIMEOUT_MS: int = Field(
+        15_000, ge=0, description="statement_timeout (мс) соединений процесса API; 0 — без ограничения"
+    )
+    DB_WORKER_LOCK_TIMEOUT_MS: int = Field(
+        180_000, ge=0, description="lock_timeout (мс) соединений Celery worker/beat; 0 — без ограничения"
+    )
+    DB_WORKER_STATEMENT_TIMEOUT_MS: int = Field(
+        600_000, ge=0, description="statement_timeout (мс) соединений Celery worker/beat; 0 — без ограничения"
+    )
+    # Сколько потоков одновременно занимает синхронная работа вебхуков с БД
+    # (/webhooks/*). Отдельный лимит, а не общий threadpool Starlette (40):
+    # шторм вебхуков не должен съесть потоки, в которых отвечает /readyz, и
+    # не должен поднять число активных соединений API выше пула
+    # (DB_POOL_SIZE + DB_MAX_OVERFLOW = 30 на процесс при max_connections=100).
+    WEBHOOK_DB_THREADS: int = Field(
+        8, ge=1, description="Макс. одновременных потоков с БД-работой вебхуков на процесс API"
+    )
+
     REDIS_URL: str = Field(
         "redis://localhost:6379/0",
         description="Redis connection URL for Celery broker and backend",
@@ -764,6 +801,19 @@ class Settings(BaseSettings):
     ALERTMANAGER_REQUIRE_SIGNED_TIMESTAMP: bool = Field(
         False,
         description="Требовать X-Alertmanager-Timestamp (отклонять body-only подпись)",
+    )
+    # Потолок тела вебхука. Без него тело читалось в память целиком ещё до
+    # проверки подписи (на store-ресиверах `max_alerts: 0`, батч не ограничен)
+    # при лимите пода 512Mi. Алерт в батче — 1–2 КБ, 2 МиБ — это тысяча с
+    # лишним алертов в одной группе. Сверх — 413: Alertmanager 4xx не
+    # повторяет, поэтому отказ логируется (`webhook.body_too_large`); лечится
+    # `max_alerts` на ресивере — тогда батч придёт усечённым и это будет
+    # видно по `truncated_alerts`. 0 — без ограничения.
+    WEBHOOK_MAX_BODY_BYTES: int = Field(
+        2 * 1024 * 1024, ge=0, description="Макс. размер тела вебхука (байт); сверх — 413; 0 — без ограничения"
+    )
+    WEBHOOK_MAX_ALERTS: int = Field(
+        1000, ge=0, description="Макс. число алертов в одном батче вебхука; сверх — 413; 0 — без ограничения"
     )
     # Fail-open раньше был неявным: при незаданном секрете проверка подписи
     # молча пропускалась, а обязательность секрета висела на точном литерале

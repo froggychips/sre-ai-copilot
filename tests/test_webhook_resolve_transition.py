@@ -74,10 +74,9 @@ def _run_resolve(webhooks, db, fingerprint: str, **kw):
 
 @pytest.fixture
 def webhooks(monkeypatch):
-    """Модуль вебхуков с заглушённым raw_collector и перехваченным логом."""
+    """Модуль вебхуков с перехваченным логом."""
     import app.api.webhooks as webhooks_mod
 
-    monkeypatch.setattr(webhooks_mod.raw_collector, "ingest", MagicMock())
     monkeypatch.setattr(webhooks_mod, "log", MagicMock())
     return webhooks_mod
 

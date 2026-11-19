@@ -1,11 +1,17 @@
+import asyncio
+import functools
 import hashlib
 import hmac
 import re
+import weakref
 from datetime import datetime, timedelta
-from typing import Iterable, List, Optional
+from typing import Any, Callable, Iterable, List, Optional, TypeVar
 
+import anyio
+import anyio.to_thread
 import structlog
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Request, Response
+from fastapi.routing import APIRoute
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -13,8 +19,8 @@ from app.auth import User, get_current_user
 from app.config import settings
 from app.core.state_machine import IncidentState, StateMachine
 from app.security.replay import alertmanager_signature_cache, is_timestamp_fresh
-from app.database import IncidentRecord, get_db
-from app.ingestion.raw_collector import raw_collector
+from app.database import (IncidentRecord, RetryableDbErrorWatch, get_db,
+                          is_retryable_db_error, watch_retryable_db_errors)
 from app.knowledge_graph.remediation_events import (SignatureError,
                                                     check_remediation_signature,
                                                     record_external_remediation)
@@ -27,8 +33,175 @@ from app.services.teamcity_service import incident_teamcity_context
 from app.workers.tasks import (async_process_incident, celery_app,
                                process_incident_task)
 
-router = APIRouter()
 log = structlog.get_logger()
+
+_T = TypeVar("_T")
+
+
+def _too_large(reason: str, **fields: Any) -> HTTPException:
+    """413 с понятной причиной. Alertmanager 4xx не повторяет — батч потерян,
+    поэтому отказ обязан остаться в логе: по нему видно, какому ресиверу
+    нужен `max_alerts`."""
+    log.warning("webhook.body_too_large", reason=reason, **fields)
+    return HTTPException(status_code=413, detail=f"webhook payload too large: {reason}")
+
+
+class BodyLimitRoute(APIRoute):
+    """Маршрут с потолком на размер тела (WEBHOOK_MAX_BODY_BYTES).
+
+    Проверка стоит ДО обработчика FastAPI: тот читает тело в память целиком
+    раньше любых зависимостей (включая проверку подписи), так что `Depends`
+    для этого опоздал бы. Сначала — по `Content-Length`, не читая ни байта;
+    затем счётчик на `receive`, потому что заголовка может не быть (chunked)
+    или он может врать.
+    """
+
+    def get_route_handler(self) -> Callable[[Request], Any]:
+        original = super().get_route_handler()
+
+        async def handler(request: Request) -> Response:
+            limit = int(getattr(settings, "WEBHOOK_MAX_BODY_BYTES", 0) or 0)
+            if limit <= 0:
+                return await original(request)
+            declared = request.headers.get("content-length", "")
+            if declared.isdigit() and int(declared) > limit:
+                raise _too_large(
+                    "content-length", path=request.url.path,
+                    content_length=int(declared), limit=limit,
+                )
+            inner = request.receive
+            seen = 0
+
+            async def capped_receive() -> Any:
+                nonlocal seen
+                message = await inner()
+                if message.get("type") == "http.request":
+                    seen += len(message.get("body") or b"")
+                    if seen > limit:
+                        raise _too_large(
+                            "body", path=request.url.path, received=seen, limit=limit,
+                        )
+                return message
+
+            return await original(Request(request.scope, capped_receive))
+
+        return handler
+
+
+router = APIRouter(route_class=BodyLimitRoute)
+
+
+def _check_batch_size(payload: AlertManagerWebhook, endpoint: str) -> None:
+    """413, если алертов в батче больше WEBHOOK_MAX_ALERTS (0 — без лимита)."""
+    limit = int(getattr(settings, "WEBHOOK_MAX_ALERTS", 0) or 0)
+    if limit > 0 and len(payload.alerts) > limit:
+        raise _too_large(
+            "alerts", endpoint=endpoint, receiver=payload.receiver,
+            alerts=len(payload.alerts), limit=limit,
+        )
+
+
+# ── синхронная работа с БД — вне event loop ──────────────────────────────
+#
+# Обработчики вебхуков — `async def`, а SQLAlchemy-сессия синхронная. Любой
+# её вызов прямо в обработчике останавливает event loop на время запроса:
+# uvicorn работает в один worker, и пока `upsert_service` ждёт row-lock на
+# `kg_services`, не отвечает НИЧЕГО, включая `/healthz` — kubelet убивает
+# под, Alertmanager теряет вебхуки (08.08 и 31.10.2026).
+#
+# Синхронные участки уходят в поток под отдельным лимитом (WEBHOOK_DB_THREADS):
+# общий threadpool Starlette (40) делят `/readyz` и остальные ручки, и шторм
+# вебхуков не должен его съесть. Лимит же держит число одновременно занятых
+# соединений ниже размера пула.
+#
+# Потокобезопасность: сессия запроса в каждый момент принадлежит одному
+# потоку — обработчик ждёт (`await`) завершения участка и только потом
+# запускает следующий. Конкурентно (gather) с одной `db` вызывать нельзя.
+_db_limiters: "weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, anyio.CapacityLimiter]" = (
+    weakref.WeakKeyDictionary()
+)
+
+
+def _db_limiter() -> anyio.CapacityLimiter:
+    # Лимитер привязан к event loop — держим по одному на loop (в проде он
+    # один; в тестах каждый TestClient/asyncio.run создаёт свой).
+    loop = asyncio.get_running_loop()
+    limiter = _db_limiters.get(loop)
+    if limiter is None:
+        limiter = anyio.CapacityLimiter(
+            max(1, int(getattr(settings, "WEBHOOK_DB_THREADS", 8) or 8))
+        )
+        _db_limiters[loop] = limiter
+    return limiter
+
+
+async def _in_db_thread(func: Callable[..., _T], *args: Any, **kwargs: Any) -> _T:
+    """Выполнить синхронный участок работы с БД в потоке, не в event loop."""
+    return await anyio.to_thread.run_sync(
+        functools.partial(func, *args, **kwargs), limiter=_db_limiter(),
+    )
+
+
+#: Через сколько секунд клиенту стоит повторить запрос после 503.
+_DB_BUSY_RETRY_AFTER_SEC = 5
+
+
+def _db_busy(endpoint: str, exc: Optional[BaseException]) -> HTTPException:
+    """503 на таймаут/недоступность БД — ретраибельный отказ.
+
+    Alertmanager повторяет уведомление на любой 5xx (с backoff, в пределах
+    group_interval, затем на следующем flush группы), на 2xx — нет. Поэтому
+    батч, который не удалось записать из-за `lock_timeout`, обязан уйти
+    отказом целиком: запись идемпотентна по fingerprint, повтор безопасен,
+    а 202 с `result: failed` означал бы тихую потерю.
+    """
+    log.warning(
+        "webhook.db_busy",
+        endpoint=endpoint,
+        error=type(exc).__name__ if exc is not None else None,
+        pgcode=getattr(getattr(exc, "orig", None), "pgcode", None),
+    )
+    return HTTPException(
+        status_code=503,
+        detail="database is busy, retry later",
+        headers={"Retry-After": str(_DB_BUSY_RETRY_AFTER_SEC)},
+    )
+
+
+def _safe_rollback(db: Session) -> None:
+    try:
+        db.rollback()
+    except Exception as e:  # соединение могло умереть вместе с запросом
+        log.warning("webhook.rollback_failed", error=type(e).__name__)
+
+
+def _fail_if_db_busy(db: Session, watch: RetryableDbErrorWatch, endpoint: str) -> None:
+    """Таймаут БД в только что выполненном участке → откат и 503."""
+    if watch.error is not None:
+        _safe_rollback(db)
+        raise _db_busy(endpoint, watch.error)
+
+
+def _open_db_or_busy(db: Session, endpoint: str) -> None:
+    """Взять соединение заранее: исчерпанный пул и мёртвая БД — это 503 сразу,
+    а не «алерт не записан» где-то внутри best-effort записи в граф."""
+    try:
+        db.connection()
+    except Exception as e:
+        _safe_rollback(db)
+        if is_retryable_db_error(e):
+            raise _db_busy(endpoint, e) from e
+        raise
+
+
+def _commit_or_busy(db: Session, endpoint: str) -> None:
+    try:
+        db.commit()
+    except Exception as e:
+        _safe_rollback(db)
+        if is_retryable_db_error(e):
+            raise _db_busy(endpoint, e) from e
+        raise
 
 
 def _suppress_names() -> List[str]:
@@ -444,16 +617,10 @@ async def alertmanager_webhook(
     payload: AlertManagerWebhook, db: Session = Depends(get_db)
 ):
     """Receive a Prometheus AlertManager webhook batch and dispatch one Celery task per alert."""
-    # raw_collector requires `id` or `incident_id` at top level. AlertManager
-    # batch не имеет глобального id, поэтому используем `groupKey` как идентификатор
-    # этого batch-а (один webhook = один batch с одним groupKey).
-    raw_payload = payload.model_dump()
-    raw_payload.setdefault("id", payload.groupKey)
-    raw_collector.ingest(raw_payload)
+    _check_batch_size(payload, "alertmanager")
     truncated = _note_truncation(payload, "alertmanager")
 
-    # A3: allowlist filter. Применяем сразу после raw-store, чтобы суrnu trace
-    # сохранил исходный batch, но дальше идут только не-noise alerts.
+    # A3: allowlist filter — дальше идут только не-noise alerts.
     payload_alerts, _suppressed = _filter_suppressed(payload.alerts)
 
     # States where the pipeline is already in-flight — skip re-dispatch.
@@ -646,6 +813,89 @@ async def alertmanager_webhook(
     return {"status": "accepted", "alerts": accepted, "truncated_alerts": truncated}
 
 
+def _store_batch_sync(
+    db: Session,
+    payload_alerts: List[AlertManagerAlert],
+    truncated: int,
+    churn: set,
+) -> List[dict]:
+    """Запись батча `/store` в граф. Синхронная: вызывать через `_in_db_thread`.
+
+    Порядок и семантика — те же, что были в теле обработчика: алерты по
+    порядку батча, пометка шума сразу за своим алертом, общий commit в конце.
+    Добавлено одно: таймаут/недоступность БД (в т.ч. проглоченные внутри
+    best-effort записи) прерывают батч отказом 503 — см. `_db_busy`.
+    """
+    from app.knowledge_graph.auto_populator import populate_from_incident
+
+    stored: List[dict] = []
+    with watch_retryable_db_errors() as watch:
+        if any(a.status != "resolved" for a in payload_alerts):
+            _open_db_or_busy(db, "store")
+        for alert in payload_alerts:
+            try:
+                validate_alert_labels(alert)
+                incident = Incident.from_alertmanager(
+                    alert, batch_truncated_alerts=truncated,
+                )
+            except HTTPException:
+                # Малформированные alerts skip-аем, не падаем на batch.
+                log.warning("kg_store.skipped_invalid_alert", labels=alert.labels)
+                continue
+
+            # Resolved-events тоже регистрируем — даёт recurrence/flapping
+            # сигнал, не только firing.
+            if alert.status == "resolved":
+                stored.append({"incident_id": incident.incident_id, "result": "resolved-skipped"})
+                continue
+
+            try:
+                stats = populate_from_incident(db, incident)
+                stored.append({"incident_id": incident.incident_id, "result": "stored", **stats})
+                # Только сам GenerationMismatch: ReplicasMismatch того же Deployment-а
+                # в том же batch-е — реальный сигнал, churn его не касается.
+                if alert.labels.get("alertname") == "KubeDeploymentGenerationMismatch":
+                    from app.knowledge_graph.incidents import unmark_incident_noise
+                    from app.services.alert_enrichment import GENERATION_CHURN_NOISE_KIND
+                    key = (alert.labels.get("namespace"), alert.labels.get("deployment"))
+                    if key in churn:
+                        ALERTS_SUPPRESSED.labels(
+                            reason=GENERATION_CHURN_NOISE_KIND,
+                            alertname=alert.labels.get("alertname", ""),
+                        ).inc()
+                        _mark_incidents_noise(db, [incident], [GENERATION_CHURN_NOISE_KIND])
+                    else:
+                        # Тот же fingerprint раньше был churn-ом, теперь — нет (пошёл
+                        # накат, spec написал человек, снимка нет): снимаем старую
+                        # пометку, иначе инцидент так и останется спрятанным.
+                        try:
+                            unmark_incident_noise(
+                                db, fingerprint=incident.incident_id, kind=GENERATION_CHURN_NOISE_KIND,
+                            )
+                            db.commit()
+                        except Exception as e:
+                            db.rollback()
+                            log.warning("kg_store.noise_unmark_failed",
+                                        incident_id=incident.incident_id, error=type(e).__name__)
+            except Exception as e:
+                # Откатываем failed-транзакцию, иначе session остаётся в
+                # сорванном состоянии и финальный db.commit() уронит весь batch.
+                _safe_rollback(db)
+                if is_retryable_db_error(e):
+                    raise _db_busy("store", e) from e
+                log.warning(
+                    "kg_store.populate_failed",
+                    incident_id=incident.incident_id,
+                    error=type(e).__name__,
+                    message=str(e),
+                )
+                stored.append({"incident_id": incident.incident_id, "result": "failed"})
+            _fail_if_db_busy(db, watch, "store")
+
+        _commit_or_busy(db, "store")
+    return stored
+
+
 @router.post(
     "/alertmanager/store",
     status_code=202,
@@ -667,11 +917,7 @@ async def alertmanager_webhook_store_only(
 
     HMAC-подпись и signature-check те же что и у full pipeline endpoint.
     """
-    from app.knowledge_graph.auto_populator import populate_from_incident
-
-    raw_payload = payload.model_dump()
-    raw_payload.setdefault("id", payload.groupKey)
-    raw_collector.ingest(raw_payload)
+    _check_batch_size(payload, "store")
     truncated = _note_truncation(payload, "store")
 
     # A3: allowlist filter — pure-noise alerts даже в KG-store не пишем,
@@ -679,65 +925,12 @@ async def alertmanager_webhook_store_only(
     payload_alerts, suppressed_count = _filter_suppressed(payload.alerts)
     churn = await _generation_churn_targets(payload_alerts)
 
-    stored = []
-    for alert in payload_alerts:
-        try:
-            validate_alert_labels(alert)
-            incident = Incident.from_alertmanager(
-                alert, batch_truncated_alerts=truncated,
-            )
-        except HTTPException:
-            # Малформированные alerts skip-аем, не падаем на batch.
-            log.warning("kg_store.skipped_invalid_alert", labels=alert.labels)
-            continue
-
-        # Resolved-events тоже регистрируем — даёт recurrence/flapping
-        # сигнал, не только firing.
-        if alert.status == "resolved":
-            stored.append({"incident_id": incident.incident_id, "result": "resolved-skipped"})
-            continue
-
-        try:
-            stats = populate_from_incident(db, incident)
-            stored.append({"incident_id": incident.incident_id, "result": "stored", **stats})
-            # Только сам GenerationMismatch: ReplicasMismatch того же Deployment-а
-            # в том же batch-е — реальный сигнал, churn его не касается.
-            if alert.labels.get("alertname") == "KubeDeploymentGenerationMismatch":
-                from app.knowledge_graph.incidents import unmark_incident_noise
-                from app.services.alert_enrichment import GENERATION_CHURN_NOISE_KIND
-                key = (alert.labels.get("namespace"), alert.labels.get("deployment"))
-                if key in churn:
-                    ALERTS_SUPPRESSED.labels(
-                        reason=GENERATION_CHURN_NOISE_KIND,
-                        alertname=alert.labels.get("alertname", ""),
-                    ).inc()
-                    _mark_incidents_noise(db, [incident], [GENERATION_CHURN_NOISE_KIND])
-                else:
-                    # Тот же fingerprint раньше был churn-ом, теперь — нет (пошёл
-                    # накат, spec написал человек, снимка нет): снимаем старую
-                    # пометку, иначе инцидент так и останется спрятанным.
-                    try:
-                        unmark_incident_noise(
-                            db, fingerprint=incident.incident_id, kind=GENERATION_CHURN_NOISE_KIND,
-                        )
-                        db.commit()
-                    except Exception as e:
-                        db.rollback()
-                        log.warning("kg_store.noise_unmark_failed",
-                                    incident_id=incident.incident_id, error=type(e).__name__)
-        except Exception as e:
-            # Откатываем failed-транзакцию, иначе session остаётся в
-            # сорванном состоянии и финальный db.commit() уронит весь batch.
-            db.rollback()
-            log.warning(
-                "kg_store.populate_failed",
-                incident_id=incident.incident_id,
-                error=type(e).__name__,
-                message=str(e),
-            )
-            stored.append({"incident_id": incident.incident_id, "result": "failed"})
-
-    db.commit()
+    # Вся запись батча — одним синхронным участком в потоке: event loop
+    # свободен, сессией владеет один поток, соединение занято только на
+    # время участка (commit в его конце возвращает его в пул).
+    stored = await _in_db_thread(
+        _store_batch_sync, db, payload_alerts, truncated, churn,
+    )
 
     # Детерминированный мост (REMEDIATION_BRIDGE_ENABLED). Сквадовые алерты
     # в канал не идут — исключение одно: playbook с policy approve даёт
@@ -767,6 +960,46 @@ async def alertmanager_webhook_store_only(
     }
 
 
+def _enrich_store_batch_sync(db: Session, prepared: List[tuple]) -> List[dict]:
+    """Store-фаза `/enrich-and-forward`. Синхронная: вызывать через `_in_db_thread`.
+
+    `prepared` — `(incident, is_resolved)` в порядке батча. Запись — как
+    раньше в теле обработчика: firing-алерты по порядку, общий commit в конце;
+    таймаут/недоступность БД → 503 (до отправки чего-либо в Discord, повтор
+    батча безопасен).
+    """
+    from app.knowledge_graph.auto_populator import populate_from_incident
+
+    stored: List[dict] = []
+    with watch_retryable_db_errors() as watch:
+        if any(not is_resolved for _inc, is_resolved in prepared):
+            _open_db_or_busy(db, "enrich_and_forward")
+        for incident, is_resolved in prepared:
+            if is_resolved:
+                stored.append({"incident_id": incident.incident_id, "result": "resolved-skipped"})
+                continue
+            try:
+                stats = populate_from_incident(db, incident)
+                stored.append({"incident_id": incident.incident_id, "result": "stored", **stats})
+            except Exception as e:
+                # Откатываем failed-транзакцию, иначе session остаётся в
+                # сорванном состоянии и финальный db.commit() уронит весь batch.
+                _safe_rollback(db)
+                if is_retryable_db_error(e):
+                    raise _db_busy("enrich_and_forward", e) from e
+                log.warning(
+                    "enrich_forward.populate_failed",
+                    incident_id=incident.incident_id,
+                    error=type(e).__name__,
+                    message=str(e),
+                )
+                stored.append({"incident_id": incident.incident_id, "result": "failed"})
+            _fail_if_db_busy(db, watch, "enrich_and_forward")
+
+        _commit_or_busy(db, "enrich_and_forward")
+    return stored
+
+
 @router.post(
     "/alertmanager/enrich-and-forward",
     status_code=202,
@@ -788,24 +1021,24 @@ async def alertmanager_webhook_enrich_and_forward(
 
     Если DISCORD_ENRICH_ENABLED=false — поведение идентично /store.
     """
-    from app.knowledge_graph.auto_populator import populate_from_incident
     from app.services.alert_enrichment import enrich_alert_async, prefetch_node_namespaces
     from app.services.discord_service import DiscordService
     from app.services.node_resolver import annotate_node_label
 
-    raw_payload = payload.model_dump()
-    raw_payload.setdefault("id", payload.groupKey)
-    raw_collector.ingest(raw_payload)
+    _check_batch_size(payload, "enrich_and_forward")
     truncated = _note_truncation(payload, "enrich_and_forward")
 
     # A3: allowlist filter — Watchdog/InfoInhibitor и self-noise отсеиваем
     # ДО enrichment-стадии. Это снимает ~30-40% бесполезного шума.
     payload_alerts, suppressed_allowlist = _filter_suppressed(payload.alerts)
 
-    stored = []
-    firing_incidents = []  # (incident, env-hint) — для post-store enrich.
+    stored: List[dict] = []
+    firing_incidents: List[Incident] = []  # для post-store enrich.
     resolved_criticals = []  # critical-резолвы → зелёный notice в Discord.
 
+    # Фаза 1 (event loop, без БД): валидация и резолв ноды. Порядок алертов
+    # сохраняется — `stored` дополняется в фазе 2 в том же порядке батча.
+    prepared: List[tuple] = []  # (incident, is_resolved)
     for alert in payload_alerts:
         try:
             validate_alert_labels(alert)
@@ -828,28 +1061,16 @@ async def alertmanager_webhook_enrich_and_forward(
         if alert.status == "resolved":
             # Warning-резолвы в Discord не идут (шум); critical — короткий
             # зелёный notice, чтобы был виден конец инцидента.
-            stored.append({"incident_id": incident.incident_id, "result": "resolved-skipped"})
             if (incident.severity or "").lower() == "critical":
                 resolved_criticals.append(incident)
+            prepared.append((incident, True))
             continue
-
-        try:
-            stats = populate_from_incident(db, incident)
-            stored.append({"incident_id": incident.incident_id, "result": "stored", **stats})
-        except Exception as e:
-            # Откатываем failed-транзакцию, иначе session остаётся в
-            # сорванном состоянии и финальный db.commit() уронит весь batch.
-            db.rollback()
-            log.warning(
-                "enrich_forward.populate_failed",
-                incident_id=incident.incident_id,
-                error=type(e).__name__,
-                message=str(e),
-            )
-            stored.append({"incident_id": incident.incident_id, "result": "failed"})
         firing_incidents.append(incident)
+        prepared.append((incident, False))
 
-    db.commit()
+    # Фаза 2 (поток): запись в граф одним синхронным участком с commit в
+    # конце — event loop свободен, соединение занято только на время участка.
+    stored = await _in_db_thread(_enrich_store_batch_sync, db, prepared)
 
     # Discord-enrich tier. Под фичефлагом — чтобы /store-style behaviour
     # сохранялся, пока канарейка не подтвердит безвредность.
@@ -897,7 +1118,8 @@ async def alertmanager_webhook_enrich_and_forward(
                 # = метрика-источник (vm-kube-state-metrics), не target. Держим
                 # dedup/suppress-ключ на target-workload'е (как в kg_alerts),
                 # иначе gen/replicas-mismatch схлопываются на один KSM-ключ.
-                head_service = resolve_store_service(
+                head_service = await _in_db_thread(
+                    resolve_store_service,
                     head_inc.labels,
                     legacy_default=(
                         head_inc.labels.get("service")
@@ -950,7 +1172,7 @@ async def alertmanager_webhook_enrich_and_forward(
                         "enrich_forward.suppress_rollout",
                         alertname=alertname, service=head_service,
                     )
-                    _mark_incidents_noise(db, incs, ["rollout"])
+                    await _in_db_thread(_mark_incidents_noise, db, incs, ["rollout"])
                     continue
 
                 # enrich_alert целиком синхронный и тяжёлый (10+ sync SQL,
@@ -979,7 +1201,7 @@ async def alertmanager_webhook_enrich_and_forward(
                         ) if flag
                     ]
                     if kinds:
-                        _mark_incidents_noise(db, [inc], kinds)
+                        await _in_db_thread(_mark_incidents_noise, db, [inc], kinds)
                 env_hint = _env_hint(incs[0].namespace)
                 resurfaced = (decision == Decision.SEND_RESURFACED)
                 delivered = await discord_service.send_enriched_alert(
@@ -1050,7 +1272,8 @@ async def alertmanager_webhook_enrich_and_forward(
                     namespace=inc.namespace,
                     # Тот же target-резолв, что в firing-notice/kg_alerts —
                     # иначе зелёный resolve уходит на vm-kube-state-metrics.
-                    service=resolve_store_service(
+                    service=await _in_db_thread(
+                        resolve_store_service,
                         inc.labels,
                         legacy_default=(
                             inc.labels.get("service") or inc.labels.get("deployment")
@@ -1130,5 +1353,12 @@ async def remediation_event_webhook(
     Никакого LLM и никаких действий в кластере: это запись факта. Повтор
     того же `(actor, run_id, namespace)` идемпотентен (retry исполнителя).
     """
-    result = record_external_remediation(db, payload)
+    try:
+        result = await _in_db_thread(record_external_remediation, db, payload)
+    except HTTPException:
+        raise
+    except Exception as e:
+        if is_retryable_db_error(e):
+            raise _db_busy("remediation", e) from e
+        raise
     return {"status": "recorded" if result["created"] else "duplicate", **result}

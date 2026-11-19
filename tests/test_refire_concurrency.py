@@ -152,7 +152,6 @@ def test_refire_endpoint_dispatches_once_and_persists_flap_count(db, monkeypatch
 
     monkeypatch.setattr(webhooks, "incident_teamcity_context",
                         AsyncMock(return_value={"deploy": "build-42"}))
-    monkeypatch.setattr(webhooks.raw_collector, "ingest", MagicMock())
     monkeypatch.setattr(webhooks.settings, "PIPELINE_DIRECT_INVOKE", False)
     fake_task = MagicMock()
     fake_task.id = "task-xyz"
@@ -185,7 +184,6 @@ def test_refire_endpoint_second_immediate_fire_is_deduplicated(db, monkeypatch):
 
     monkeypatch.setattr(webhooks, "incident_teamcity_context",
                         AsyncMock(return_value=None))
-    monkeypatch.setattr(webhooks.raw_collector, "ingest", MagicMock())
     delay = MagicMock()
     monkeypatch.setattr(webhooks.process_incident_task, "delay", delay)
 

@@ -86,6 +86,10 @@ def _run_startup_contract_check() -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # Роль процесса для таймаутов БД (lock_timeout/statement_timeout уровня
+    # API) — до первого обращения к базе. См. app/database.py.
+    from app.database import ROLE_API, set_process_role
+    set_process_role(ROLE_API)
     # Startup: поднимаем prometheus-сервер.
     # addr берётся из settings.METRICS_BIND_ADDR (default "0.0.0.0", чтобы
     # in-cluster scraping продолжал работать). В PROD порт :8001 ОБЯЗАТЕЛЬНО
