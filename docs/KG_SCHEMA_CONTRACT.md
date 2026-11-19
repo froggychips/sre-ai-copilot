@@ -46,8 +46,11 @@ KG_SCHEMA_VERSION = "2.10"
 
 **`kg_service_health_hourly`** (миграция `20261118_0100`). Часовой агрегат
 `kg_service_health`: ключ `(service_id, hour)`, `samples` — число сырых
-точек часа, и пара `<метрика>_avg` / `<метрика>_max` на каждую метрику сырья
-(`schema.HEALTH_HOURLY_METRICS`). NULL в агрегате — «за час не было ни
+точек часа, и тройка `<метрика>_avg` / `<метрика>_max` / `<метрика>_n` на
+каждую метрику сырья (`schema.HEALTH_HOURLY_METRICS`). `_n` — число не-NULL
+замеров метрики за час: среднее за более длинный период считать как
+`sum(avg * n) / sum(n)`, а не по `samples` (точка, где метрика NULL, в
+`samples` входит, в среднее — нет). NULL в агрегате — «за час не было ни
 одного замера», а не ноль (те же caveats, что у сырья, §7.5). FK на
 `kg_services` нет. Пишет beat `kg_health_downsample`
 (`KG_HEALTH_DOWNSAMPLE_MODE`): точки старше `KG_HEALTH_RAW_RETENTION_DAYS`

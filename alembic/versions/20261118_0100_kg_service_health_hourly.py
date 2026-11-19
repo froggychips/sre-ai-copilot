@@ -7,8 +7,9 @@ Create Date: 2026-11-18 01:00:00.000000
 `kg_service_health` — 2,2 ГБ из 3,8 ГБ базы (замер 18.11.2026: 6,6 млн строк,
 хранение 30 дней), при том что сырые десятиминутные точки читают на глубину
 семи дней. Новая таблица принимает свёртку точек старше
-`KG_HEALTH_RAW_RETENTION_DAYS`: строка на (service_id, час) со средним и
-максимумом по каждой метрике и числом вошедших точек. Пишет beat-задача
+`KG_HEALTH_RAW_RETENTION_DAYS`: строка на (service_id, час) со средним,
+максимумом и числом не-NULL замеров по каждой метрике (`_avg`, `_max`, `_n`)
+и общим числом вошедших точек (`samples`). Пишет beat-задача
 `kg_health_downsample` (app/knowledge_graph/health_downsample.py), по
 умолчанию выключена.
 
@@ -53,6 +54,8 @@ def upgrade() -> None:
     for metric in _METRICS:
         columns.append(sa.Column(f"{metric}_avg", sa.Float(), nullable=True))
         columns.append(sa.Column(f"{metric}_max", sa.Float(), nullable=True))
+        # Число не-NULL замеров метрики за час — вес среднего при слиянии.
+        columns.append(sa.Column(f"{metric}_n", sa.SmallInteger(), nullable=True))
     op.create_table(
         _TABLE,
         *columns,

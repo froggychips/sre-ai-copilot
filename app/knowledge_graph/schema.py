@@ -9,8 +9,8 @@ from datetime import datetime
 
 from typing import Any, Optional
 from sqlalchemy import (JSON, BigInteger, Boolean, DateTime, Float,
-                        ForeignKey, Index, Integer, String, Text,
-                        UniqueConstraint, text)
+                        ForeignKey, Index, Integer, SmallInteger, String,
+                        Text, UniqueConstraint, text)
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.database import Base
@@ -375,8 +375,8 @@ class ServiceHealth(Base):
 
 
 #: Метрики `kg_service_health`, которые сворачиваются в часовые агрегаты.
-#: На каждую — пара колонок `<метрика>_avg` / `<метрика>_max` в
-#: `kg_service_health_hourly`. Один список на модель, миграцию и свёртку
+#: На каждую — тройка колонок `<метрика>_avg` / `<метрика>_max` /
+#: `<метрика>_n` в `kg_service_health_hourly`. Один список на модель, миграцию и свёртку
 #: (`health_downsample`): новая колонка сырья без записи здесь в агрегаты
 #: не попадёт — это сторожит tests/kg/test_health_downsample.py.
 HEALTH_HOURLY_METRICS: tuple[str, ...] = (
@@ -403,8 +403,12 @@ class ServiceHealthHourly(Base):
     копия, которую снимали миграцией 20260905_0100.
 
     `samples` — сколько сырых точек вошло в час (обычно 6). Среднее по
-    метрике считается по её не-NULL точкам; NULL в агрегате — «за час не
-    было ни одного замера», а не ноль (та же семантика, что у сырья).
+    метрике считается по её не-NULL точкам, и их число хранится рядом —
+    `<метрика>_n`: вес среднего при слиянии с поздней точкой и при
+    укрупнении (сутки из часов). Взвешивать по `samples` нельзя: точка, где
+    метрика NULL, в `samples` входит, а в среднее — нет. NULL в агрегате
+    (`_avg`, `_max` и `_n` разом) — «за час не было ни одного замера», а не
+    ноль (та же семантика, что у сырья).
 
     FK на kg_services нет намеренно: в проде его нет и у сырья (таблицы
     созданы до появления FK в миграциях), а CREATE TABLE с FK взял бы
@@ -430,6 +434,7 @@ class ServiceHealthHourly(Base):
 for _metric in HEALTH_HOURLY_METRICS:
     setattr(ServiceHealthHourly, f"{_metric}_avg", mapped_column(Float, nullable=True))
     setattr(ServiceHealthHourly, f"{_metric}_max", mapped_column(Float, nullable=True))
+    setattr(ServiceHealthHourly, f"{_metric}_n", mapped_column(SmallInteger, nullable=True))
 del _metric
 
 

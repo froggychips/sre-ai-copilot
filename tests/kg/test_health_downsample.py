@@ -93,7 +93,9 @@ def test_null_metric_stays_null_not_zero(db):
     row = db.query(ServiceHealthHourly).one()
     assert row.samples == 2
     assert row.cpu_pct_avg == 5.0, "среднее — по не-NULL точкам"
+    assert row.cpu_pct_n == 1, "вес среднего — число не-NULL замеров, не samples"
     assert row.http_5xx_rate_avg is None and row.http_5xx_rate_max is None
+    assert row.http_5xx_rate_n is None, "замеров не было — NULL, а не 0"
     assert row.orleans_latency_avg_ms_avg is None
 
 
@@ -242,6 +244,46 @@ def test_late_point_merges_into_existing_hour(db):
     assert row.mem_pct_avg is None
 
 
+def test_late_point_merge_weights_by_non_null_count_not_samples(db):
+    """Ревью PR #567: одно значение 100 среди двух строк часа + поздняя 200.
+
+    avg() считал только не-NULL точку, а слияние взвешивало по samples=2 и
+    давало (100*2 + 200*1) / 3 = 133,3. Верно — 150: замеров метрики два.
+    """
+    base = _hour(10)
+    _point(db, base, cpu_pct=100.0, mem_pct=10.0)
+    _point(db, base + timedelta(minutes=10), cpu_pct=None, mem_pct=30.0)
+    db.commit()
+    _run(db)
+
+    _point(db, base + timedelta(minutes=20), cpu_pct=200.0, mem_pct=None)
+    db.commit()
+    _run(db)
+
+    row = db.query(ServiceHealthHourly).one()
+    assert row.samples == 3
+    assert row.cpu_pct_avg == pytest.approx(150.0) and row.cpu_pct_n == 2
+    assert row.cpu_pct_max == 200.0
+    assert row.mem_pct_avg == pytest.approx(20.0) and row.mem_pct_n == 2, (
+        "поздняя точка без метрики не меняет ни среднее, ни вес"
+    )
+
+
+def test_late_point_fills_metric_that_had_no_measurements(db):
+    base = _hour(10)
+    _point(db, base, cpu_pct=None)
+    db.commit()
+    _run(db)
+    assert db.query(ServiceHealthHourly).one().cpu_pct_n is None
+
+    _point(db, base + timedelta(minutes=10), cpu_pct=40.0)
+    db.commit()
+    _run(db)
+
+    row = db.query(ServiceHealthHourly).one()
+    assert (row.samples, row.cpu_pct_avg, row.cpu_pct_max, row.cpu_pct_n) == (2, 40.0, 40.0, 1)
+
+
 def test_failed_chunk_leaves_raw_and_aggregates_consistent(db, monkeypatch):
     """Обрыв между INSERT и DELETE откатывает оба: точка не теряется и не двоится."""
     from app.knowledge_graph import health_downsample as mod
@@ -275,7 +317,7 @@ def test_every_raw_metric_is_aggregated():
     assert raw == set(HEALTH_HOURLY_METRICS)
     hourly = {c.name for c in ServiceHealthHourly.__table__.columns}
     for m in HEALTH_HOURLY_METRICS:
-        assert {f"{m}_avg", f"{m}_max"} <= hourly
+        assert {f"{m}_avg", f"{m}_max", f"{m}_n"} <= hourly
 
 
 def test_migration_and_model_agree_on_columns():
@@ -289,6 +331,9 @@ def test_migration_and_model_agree_on_columns():
     mig = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mig)
     assert tuple(mig._METRICS) == tuple(HEALTH_HOURLY_METRICS)
+    source = path.read_text(encoding="utf-8")
+    for suffix in ("_avg", "_max", "_n"):
+        assert f'f"{{metric}}{suffix}"' in source, f"в миграции нет колонок {suffix}"
 
 
 # --- ретеншен агрегатов -----------------------------------------------------
@@ -391,6 +436,22 @@ def test_fold_on_postgres_is_exact_and_idempotent(pg_session):
     row = db.query(ServiceHealthHourly).filter_by(service_id=sid).one()
     assert row.samples == 4 and row.cpu_pct_avg == pytest.approx(50.0) and row.cpu_pct_max == 110.0
 
+    assert row.cpu_pct_n == 4 and row.mem_pct_n is None
+
+    # Вес — число не-NULL замеров метрики: 100 среди двух строк + поздняя 200 = 150.
+    other = base + timedelta(hours=1)
+    db.add(ServiceHealth(service_id=sid, ts=other, cpu_pct=100.0, source="vm"))
+    db.add(ServiceHealth(service_id=sid, ts=other + timedelta(minutes=10), cpu_pct=None, source="vm"))
+    db.commit()
+    downsample_service_health(db, dry_run=False, now=PG_NOW)
+    db.add(ServiceHealth(service_id=sid, ts=other + timedelta(minutes=20), cpu_pct=200.0, source="vm"))
+    db.commit()
+    downsample_service_health(db, dry_run=False, now=PG_NOW)
+    db.expire_all()
+    row2 = db.query(ServiceHealthHourly).filter_by(service_id=sid, hour=other).one()
+    assert (row2.samples, row2.cpu_pct_n) == (3, 2)
+    assert row2.cpu_pct_avg == pytest.approx(150.0) and row2.cpu_pct_max == 200.0
+
     purged = purge_hourly(db, retention_days=7, raw_days=7, dry_run=False,
                           now=PG_NOW + timedelta(days=30))
-    assert purged["deleted"] == 1
+    assert purged["deleted"] == 2

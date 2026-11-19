@@ -25,7 +25,8 @@
 «свёрнуто, но не удалено» (следующий прогон посчитал бы точки дважды), ни
 «удалено, но не свёрнуто». ON CONFLICT нужен только на случай точки,
 записанной в уже свёрнутый час задним числом: она вливается в агрегат
-(число точек складывается, среднее взвешивается по нему, максимум — больший).
+точно — у каждой метрики хранится число её не-NULL замеров (`<метрика>_n`),
+среднее взвешивается по нему, максимум — больший, счётчики складываются.
 
 **Граница — по целым часам.** `cutoff` округляется вниз до часа: час либо
 целиком сырьё, либо целиком агрегат, и строка агрегата не дописывается
@@ -34,9 +35,11 @@
 **Пол.** `raw_days < MIN_RETENTION_DAYS` — отказ: внутри семи дней лежит
 baseline детектора аномалий, а свёрнутое сырьё не восстановить.
 
-Рядом продолжает работать 30-дневный ретеншен сырья
-(`health_retention.RETENTION_TARGETS`): при включённой свёртке ему нечего
-удалять, при выключенной или отставшей — он остаётся страховкой от роста.
+Рядом есть 30-дневный ретеншен сырья (`health_retention.RETENTION_TARGETS`).
+Он действует, пока свёртка выключена или в dry_run. В режиме apply сырьё
+удаляет только свёртка (`health_retention.raw_health_owner`): срочная чистка
+не знает, свёрнута ли точка, и при `raw_days` больше её срока или при
+отставшей свёртке удаляла бы несвёрнутое.
 """
 from __future__ import annotations
 
@@ -111,19 +114,28 @@ def _fold_sql(hour_expr: str) -> str:
     select_cols = ["service_id", f"{hour_expr} AS hour", "count(*) AS samples"]
     updates = [f"samples = {_HOURLY}.samples + excluded.samples"]
     for m in HEALTH_HOURLY_METRICS:
-        avg, mx = f"{m}_avg", f"{m}_max"
-        insert_cols += [avg, mx]
-        select_cols += [f"avg({m}) AS {avg}", f"max({m}) AS {mx}"]
-        # Слияние с уже существующей строкой часа (поздняя точка). CASE, а не
-        # GREATEST/COALESCE-арифметика: одинаково работает в PostgreSQL и
-        # SQLite, и NULL («замеров не было») не превращается в ноль.
+        avg, mx, n = f"{m}_avg", f"{m}_max", f"{m}_n"
+        insert_cols += [avg, mx, n]
+        # count(m) считает только не-NULL — ровно те точки, по которым
+        # берётся avg(m). NULLIF: «замеров не было» хранится как NULL во всех
+        # трёх колонках, а не как 0 рядом с NULL-средним.
+        select_cols += [
+            f"avg({m}) AS {avg}", f"max({m}) AS {mx}", f"NULLIF(count({m}), 0) AS {n}",
+        ]
+        # Слияние с уже существующей строкой часа (поздняя точка). Среднее
+        # взвешивается по числу не-NULL замеров САМОЙ метрики, не по samples:
+        # точка, где метрика NULL, в samples входит, а в avg — нет (одно
+        # значение 100 среди двух строк + поздняя 200 — это 150, не 133,3).
+        # CASE, а не GREATEST/COALESCE-арифметика: одинаково работает в
+        # PostgreSQL и SQLite, и NULL не превращается в ноль. Правые части SET
+        # в обеих СУБД видят значения строки ДО обновления.
         updates.append(
             f"{avg} = CASE"
-            f" WHEN excluded.{avg} IS NULL THEN {_HOURLY}.{avg}"
-            f" WHEN {_HOURLY}.{avg} IS NULL THEN excluded.{avg}"
-            f" ELSE ({_HOURLY}.{avg} * {_HOURLY}.samples"
-            f" + excluded.{avg} * excluded.samples)"
-            f" / ({_HOURLY}.samples + excluded.samples) END"
+            f" WHEN excluded.{n} IS NULL THEN {_HOURLY}.{avg}"
+            f" WHEN {_HOURLY}.{n} IS NULL THEN excluded.{avg}"
+            f" ELSE ({_HOURLY}.{avg} * {_HOURLY}.{n}"
+            f" + excluded.{avg} * excluded.{n})"
+            f" / ({_HOURLY}.{n} + excluded.{n}) END"
         )
         updates.append(
             f"{mx} = CASE"
@@ -131,6 +143,12 @@ def _fold_sql(hour_expr: str) -> str:
             f" WHEN {_HOURLY}.{mx} IS NULL THEN excluded.{mx}"
             f" WHEN excluded.{mx} > {_HOURLY}.{mx} THEN excluded.{mx}"
             f" ELSE {_HOURLY}.{mx} END"
+        )
+        updates.append(
+            f"{n} = CASE"
+            f" WHEN excluded.{n} IS NULL THEN {_HOURLY}.{n}"
+            f" WHEN {_HOURLY}.{n} IS NULL THEN excluded.{n}"
+            f" ELSE {_HOURLY}.{n} + excluded.{n} END"
         )
     return (
         f"INSERT INTO {_HOURLY} ({', '.join(insert_cols)}) "  # nosec B608
