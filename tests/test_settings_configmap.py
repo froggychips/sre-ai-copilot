@@ -179,8 +179,10 @@ def test_only_executor_and_beat_have_narrow_secrets() -> None:
     assert ROLE_SECRET["copilot-beat"] != "sre-ai-secrets"
     assert _example_keys("executor") >= {"DATABASE_URL", "REDIS_URL"}
     forbidden = re.compile(r"^(CH_PROD_|GITLAB_|JIRA_|TC_|STATICS_|ANTHROPIC_|DISCORD_WEBHOOK|DISCORD_BOT)")
+    # Токен бота executor-у нужен: он сам дописывает итог apply в карточку моста.
+    allowed = {"executor": {"DISCORD_BOT_TOKEN"}, "beat": set()}
     for role in ("executor", "beat"):
-        leaked = [k for k in _example_keys(role) if forbidden.match(k)]
+        leaked = [k for k in _example_keys(role) if forbidden.match(k) and k not in allowed[role]]
         assert not leaked, f"secrets.{role}.yaml.example: лишние для роли ключи {leaked}"
 
 
