@@ -12,13 +12,16 @@ backfill (читать k8s API, TeamCity history, alertmanager dump) — отд�
 """
 from __future__ import annotations
 
+import os
+from collections import OrderedDict
 from datetime import datetime, timedelta
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 
 import sqlalchemy as sa
 import structlog
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
+from sqlalchemy.orm.attributes import set_committed_value
 
 from app.database import Base
 from app.knowledge_graph.contract import (UQ_KG_SERVICE_NS_NAME_KIND,
@@ -60,6 +63,326 @@ def insert_idempotent(db: Session, row: Any) -> bool:
     except IntegrityError:
         return False
 
+# ── Снимок узлов и рёбер на время прохода синка ──────────────────────────────
+#
+# До 18.11.2026 каждый upsert был парой запросов: INSERT … ON CONFLICT и
+# SELECT той же строки обратно. На ~3 тыс. деплойментов, ~6,2 тыс. Service и
+# ~11 тыс. рёбер за проход это давало (pg_stat_statements за 18 дней):
+#   * 34,4 млн SELECT kg_services по (namespace, name, node_kind);
+#   * 25,1 млн INSERT kg_service_edges и 26,5 млн SELECT ребра обратно;
+#   * 22 млн INSERT kg_services, из которых строку меняли единицы процентов.
+# При этом `ON CONFLICT DO UPDATE` берёт блокировку строки даже когда его
+# WHERE ложен и строка не пишется — и держит её до коммита. Синк проходил по
+# всем узлам namespace и всё это время не давал записать их пути вебхука.
+#
+# Снимок грузит узлы namespace одним SELECT и рёбра из них — ещё одним, а
+# upsert сверяется со снимком: строка на месте и менять в ней нечего — в базу
+# не идём вовсе; пора только освежить метку — касание откладывается и уходит
+# одним UPDATE на пачку (`UpsertSnapshot.flush`). Любое сомнение (узла нет в
+# снимке, отличается хоть одно поле, растёт вес ребра) — прежний полный путь
+# через INSERT … ON CONFLICT, который остаётся единственным местом записи
+# значений и единственным арбитром при гонке.
+#
+# Снимок живёт недолго (один namespace или одна пачка) и может отстать от
+# базы на секунды. Отставание безопасно в одну сторону: устаревшая метка
+# времени или вес приводят к лишнему полному upsert'у. В другую — когда
+# соседний писатель успел изменить строку после загрузки снимка — узел
+# дождётся следующего прохода синка, как дождался бы при любой другой гонке.
+
+#: Выключатель без выкатки: KG_UPSERT_SNAPSHOT=0 на воркере возвращает
+#: прежний путь (INSERT + SELECT на каждый upsert).
+_SNAPSHOT_ENV = "KG_UPSERT_SNAPSHOT"
+
+EdgeKey = Tuple[int, str, str]          # (dst_id, kind, direction)
+
+#: Сколько отложенных касаний копит снимок до принудительной записи.
+_TOUCH_FLUSH_SIZE = 200
+
+
+class UpsertSnapshot:
+    """Узлы и рёбра нескольких namespace, загруженные пачкой.
+
+    Не потокобезопасен и привязан к одной Session: объекты в нём — её
+    ORM-объекты. После отката savepoint'а или транзакции снимок надо
+    сбросить (`clear`): в нём могут остаться узлы, которых в базе уже нет.
+    """
+
+    def __init__(self, db: Session, max_namespaces: int = 8) -> None:
+        self._db = db
+        self._max_namespaces = max(1, max_namespaces)
+        # namespace → {(name, node_kind): Service}; порядок — давность загрузки.
+        self._services: "OrderedDict[str, Dict[Tuple[str, str], Service]]" = OrderedDict()
+        # src_id → {(dst_id, kind, direction): ServiceEdge}. Ключ есть —
+        # рёбра этого узла загружены (пустой словарь = рёбер нет).
+        self._edges: Dict[int, Dict[EdgeKey, ServiceEdge]] = {}
+        # namespace, для узлов которого рёбра загружены целиком.
+        self._edge_namespaces: Set[str] = set()
+        # Отложенные касания меток свежести — см. `flush`.
+        self._service_touches: Dict[int, Service] = {}
+        self._edge_touches: Dict[Optional[str], Dict[int, ServiceEdge]] = {}
+
+    # ── узлы ────────────────────────────────────────────────────────────
+    def _load_namespace(self, namespace: str) -> Dict[Tuple[str, str], Service]:
+        loaded = self._services.get(namespace)
+        if loaded is not None:
+            return loaded
+        # populate_existing перечитывает объекты поверх identity-map и стёр
+        # бы несохранённые правки — сначала отдаём их базе.
+        if self._db.dirty:
+            self._db.flush()
+        loaded = {
+            (str(svc.name), str(svc.node_kind)): svc
+            for svc in (
+                self._db.query(Service)
+                .filter(Service.namespace == namespace)
+                .populate_existing()
+                .all()
+            )
+        }
+        self._services[namespace] = loaded
+        while len(self._services) > self._max_namespaces:
+            old_ns, old = self._services.popitem(last=False)
+            self._edge_namespaces.discard(old_ns)
+            for svc in old.values():
+                self._edges.pop(int(svc.id), None)
+        return loaded
+
+    def service(self, namespace: str, name: str, node_kind: str) -> Optional[Service]:
+        """Узел из снимка или None. None не значит «в базе нет»."""
+        svc = self._load_namespace(namespace).get((name, node_kind))
+        if svc is None or not self._alive(svc):
+            return None
+        return svc
+
+    def remember_service(self, svc: Service) -> None:
+        """Положить узел, только что прочитанный полным путём upsert'а."""
+        loaded = self._services.get(str(svc.namespace))
+        if loaded is None:
+            return
+        loaded[(str(svc.name), str(svc.node_kind))] = svc
+        # Узел мог появиться после загрузки рёбер namespace: рёбер у нового
+        # узла нет, а у существовавшего они уже в снимке.
+        if str(svc.namespace) in self._edge_namespaces:
+            self._edges.setdefault(int(svc.id), {})
+
+    # ── рёбра ───────────────────────────────────────────────────────────
+    def preload_edges(self, src_ids: Iterable[int]) -> None:
+        """Загрузить рёбра, исходящие из перечисленных узлов, одним запросом."""
+        ids = sorted({int(i) for i in src_ids} - set(self._edges))
+        if not ids:
+            return
+        for sid in ids:
+            self._edges[sid] = {}
+        for edge in (
+            self._db.query(ServiceEdge)
+            .filter(ServiceEdge.src_id.in_(ids))
+            .populate_existing()
+            .all()
+        ):
+            self._edges[int(edge.src_id)][_edge_key(edge)] = edge
+
+    def _edges_of(self, src: Any) -> Dict[EdgeKey, ServiceEdge]:
+        src_id = int(src.id)
+        loaded = self._edges.get(src_id)
+        if loaded is not None:
+            return loaded
+        namespace = str(src.namespace)
+        if namespace not in self._edge_namespaces:
+            nodes = self._load_namespace(namespace)
+            self._edge_namespaces.add(namespace)
+            self.preload_edges(int(svc.id) for svc in nodes.values())
+        # Узел не из снимка namespace (заведён мимо него) — грузим отдельно.
+        if src_id not in self._edges:
+            self.preload_edges([src_id])
+        return self._edges[src_id]
+
+    def edge(self, src: Any, dst_id: int, kind: str, direction: str) -> Optional[ServiceEdge]:
+        """Ребро из снимка или None. None не значит «в базе нет»."""
+        edge = self._edges_of(src).get((int(dst_id), kind, direction or ""))
+        if edge is None or not self._alive(edge):
+            return None
+        return edge
+
+    def edges_from(self, src: Any, kind: str) -> List[ServiceEdge]:
+        """Все рёбра `kind` из узла — замена SELECT по (src_id, kind)."""
+        return [
+            edge for key, edge in self._edges_of(src).items()
+            if key[1] == kind and self._alive(edge)
+        ]
+
+    def remember_edge(self, edge: ServiceEdge) -> None:
+        loaded = self._edges.get(int(edge.src_id))
+        if loaded is not None:
+            loaded[_edge_key(edge)] = edge
+
+    def forget_edges(self, src_id: int, dst_id: int, kind: str) -> None:
+        """Убрать ребро, удалённое мимо ORM (bulk DELETE), — все direction."""
+        loaded = self._edges.get(int(src_id))
+        if not loaded:
+            return
+        for key in [k for k in loaded if k[0] == int(dst_id) and k[1] == kind]:
+            del loaded[key]
+
+    # ── касания меток свежести ──────────────────────────────────────────
+    #
+    # Строка, в которой не изменилось ничего, кроме срока метки
+    # (SERVICE_TOUCH_INTERVAL / EDGE_TOUCH_INTERVAL), — не повод для
+    # поштучного INSERT … ON CONFLICT и SELECT обратно: таких строк за проход
+    # тысячи (workload-узлы — раз в 30 минут, рёбра — раз в 3 часа). Касания
+    # копятся и уходят одним UPDATE на пачку. Условие по давности метки в
+    # UPDATE то же, что в `where=` у ON CONFLICT: строку, которую только что
+    # освежил сосед, второй раз не переписываем.
+
+    def touch_service(self, svc: Service, now: datetime) -> None:
+        """Отложить обновление updated_at узла, в котором больше нечего менять."""
+        self._service_touches[int(svc.id)] = svc
+        # Снимок сразу считает метку свежей — повторный upsert в этом же
+        # проходе второе касание не заводит. Объект при этом не «грязный».
+        set_committed_value(svc, "updated_at", now)
+        if len(self._service_touches) >= _TOUCH_FLUSH_SIZE:
+            self.flush()
+
+    def touch_edge(self, edge: ServiceEdge, now: datetime, discovered_by: Optional[str]) -> None:
+        """Отложить обновление last_seen_at (и discovered_by) ребра."""
+        self._edge_touches.setdefault(discovered_by or None, {})[int(edge.id)] = edge
+        set_committed_value(edge, "last_seen_at", now)
+        if discovered_by:
+            set_committed_value(edge, "discovered_by", discovered_by)
+        if sum(len(v) for v in self._edge_touches.values()) >= _TOUCH_FLUSH_SIZE:
+            self.flush()
+
+    def flush(self) -> None:
+        """Записать отложенные касания. Зовётся в конце прохода и перед commit.
+
+        Не вызвать его — значит оставить метки свежести несвежими: по ним
+        работают edge-decay и проверки свежести узлов. Поэтому каждый проход,
+        получивший снимок, обязан закончиться `flush()`.
+        """
+        now = datetime.utcnow()
+        if self._service_touches:
+            ids = sorted(self._service_touches)
+            self._service_touches = {}
+            tbl = Service.__table__
+            self._db.execute(
+                sa.update(tbl)
+                .where(
+                    tbl.c.id.in_(ids),
+                    sa.or_(
+                        tbl.c.updated_at.is_(None),
+                        tbl.c.updated_at < now - SERVICE_TOUCH_INTERVAL,
+                    ),
+                )
+                .values(updated_at=now)
+            )
+        touches, self._edge_touches = self._edge_touches, {}
+        for discovered_by, edges in touches.items():
+            edge_tbl = ServiceEdge.__table__
+            values: Dict[str, Any] = {"last_seen_at": now}
+            if discovered_by:
+                values["discovered_by"] = discovered_by
+            self._db.execute(
+                sa.update(edge_tbl)
+                .where(
+                    edge_tbl.c.id.in_(sorted(edges)),
+                    sa.or_(
+                        edge_tbl.c.last_seen_at.is_(None),
+                        edge_tbl.c.last_seen_at < now - EDGE_TOUCH_INTERVAL,
+                    ),
+                )
+                .values(**values)
+            )
+
+    def clear(self) -> None:
+        """Сбросить снимок после отката: и строки, и неотправленные касания.
+
+        Касания теряются до следующего прохода — он заведёт их заново.
+        """
+        self._services.clear()
+        self._edges.clear()
+        self._edge_namespaces.clear()
+        self._service_touches = {}
+        self._edge_touches = {}
+
+    def _alive(self, obj: Any) -> bool:
+        """Объект всё ещё строка базы: не удалён и не ждёт удаления."""
+        state = sa.inspect(obj)
+        return bool(state.persistent) and obj not in self._db.deleted
+
+
+def _edge_key(edge: ServiceEdge) -> EdgeKey:
+    return (int(edge.dst_id), str(edge.kind), str(edge.direction or ""))
+
+
+def make_upsert_snapshot(db: Session, max_namespaces: int = 8) -> Optional[UpsertSnapshot]:
+    """Снимок для прохода синка или None, если он выключен (KG_UPSERT_SNAPSHOT=0)."""
+    if os.environ.get(_SNAPSHOT_ENV, "1").strip().lower() in ("0", "false", "no", "off"):
+        return None
+    return UpsertSnapshot(db, max_namespaces=max_namespaces)
+
+
+def _service_fields_unchanged(
+    svc: Service,
+    team_owner: Optional[str],
+    synthetic: Optional[bool],
+    stale_class: Optional[str],
+    owner_source: Optional[str],
+    k8s_uid: Optional[str],
+    owner_fallback: Optional[str],
+    owner_respect_trust: bool,
+) -> bool:
+    """Верно ли, что `_upsert_service_pg` не изменил бы поля этой строки.
+
+    Зеркало условия `where=` в ON CONFLICT без его временной части: строка
+    пишется, если хотя бы одно поле из set_clause отличается от того, что в
+    него было бы записано (срок метки updated_at вызывающий проверяет сам).
+    Ветки те же и в том же порядке, что при сборке set_clause; соответствие
+    двух записей одного правила держит тест `tests/kg/test_upsert_snapshot.py`
+    на живом PostgreSQL.
+    """
+    owner_empty = not svc.team_owner            # NULL и '' — одно состояние
+    if team_owner and owner_respect_trust:
+        incoming = OWNER_SOURCE_TRUST.get(owner_source or "", 0.0)
+        current = OWNER_SOURCE_TRUST.get(svc.owner_source or "", 0.0)
+        if (owner_empty or current <= incoming) and (
+            svc.team_owner != team_owner or svc.owner_source != owner_source
+        ):
+            return False
+    elif team_owner:
+        if svc.team_owner != team_owner or svc.owner_source != owner_source:
+            return False
+    elif owner_fallback:
+        # Пустое поле получило бы догадку — это запись.
+        if owner_empty:
+            return False
+    elif owner_empty and svc.owner_source is not None:
+        # Провенанс без владельца был бы вычищен.
+        return False
+    if stale_class is not None and svc.stale_class != stale_class:
+        return False
+    if synthetic is not None and bool(svc.synthetic) != bool(synthetic):
+        return False
+    if k8s_uid is not None and svc.k8s_uid != k8s_uid:
+        return False
+    return True
+
+
+def _merge_service_metadata(
+    db: Session, svc: Service, metadata: Optional[Dict[str, Any]],
+) -> None:
+    """Дописать ключи источника в metadata_json, не трогая чужие."""
+    if metadata is None:
+        return
+    existing_meta: Dict[str, Any] = (
+        svc.metadata_json if isinstance(svc.metadata_json, dict) else {}
+    )
+    merged = dict(existing_meta)
+    merged.update(metadata)
+    if merged != existing_meta:
+        svc.metadata_json = merged
+        db.flush()
+
+
+
 def upsert_service(
     db: Session,
     namespace: str,
@@ -74,6 +397,7 @@ def upsert_service(
     owner_fallback: Optional[str] = None,
     owner_fallback_source: Optional[str] = None,
     owner_respect_trust: bool = False,
+    snapshot: Optional[UpsertSnapshot] = None,
 ) -> Service:
     """Idempotent upsert узла графа — ЕДИНСТВЕННЫЙ путь записи kg_services.
 
@@ -121,6 +445,12 @@ def upsert_service(
     На PostgreSQL использует INSERT ON CONFLICT DO UPDATE — атомарно, без
     race condition при параллельных worker'ах.
     На других диалектах (SQLite в тестах) — старый SELECT+INSERT.
+
+    `snapshot` — снимок узлов прохода синка (`UpsertSnapshot`). С ним узел,
+    в котором нечего менять, возвращается из снимка без единого запроса и без
+    блокировки строки; всё остальное идёт прежним путём. Кто передал снимок,
+    обязан в конце прохода вызвать `snapshot.flush()` — иначе отложенные
+    касания updated_at не запишутся.
     """
     if owner_source is not None and not owner_source_valid(owner_source):
         logger.warning(
@@ -157,11 +487,13 @@ def upsert_service(
             db, namespace, name, team_owner, metadata, synthetic, node_kind,
             stale_class, owner_source, k8s_uid,
             owner_fallback, owner_fallback_source, owner_respect_trust,
+            snapshot,
         )
     return _upsert_service_fallback(
         db, namespace, name, team_owner, metadata, synthetic, node_kind,
         stale_class, owner_source, k8s_uid,
         owner_fallback, owner_fallback_source, owner_respect_trust,
+        snapshot,
     )
 
 
@@ -215,10 +547,24 @@ def _upsert_service_pg(
     owner_fallback: Optional[str] = None,
     owner_fallback_source: Optional[str] = None,
     owner_respect_trust: bool = False,
+    snapshot: Optional[UpsertSnapshot] = None,
 ) -> Service:
     from sqlalchemy.dialects.postgresql import insert as pg_insert
 
     now = datetime.utcnow()
+    if snapshot is not None:
+        known = snapshot.service(namespace, name, node_kind)
+        if known is not None and _service_fields_unchanged(
+            known, team_owner, synthetic, stale_class, owner_source,
+            k8s_uid, owner_fallback, owner_respect_trust,
+        ):
+            # Строка на месте и менять в ней нечего: ни INSERT (он взял бы
+            # блокировку строки до коммита), ни SELECT обратно. Если пора
+            # освежить метку — касание уйдёт пачкой (snapshot.flush).
+            if known.updated_at is None or known.updated_at < now - SERVICE_TOUCH_INTERVAL:
+                snapshot.touch_service(known, now)
+            _merge_service_metadata(db, known, metadata)
+            return known
     values: Dict[str, Any] = {
         "namespace": namespace,
         "name": name,
@@ -362,15 +708,9 @@ def _upsert_service_pg(
         .populate_existing()
         .one()
     )
-    if metadata is not None:
-        existing_meta: Dict[str, Any] = (
-            svc.metadata_json if isinstance(svc.metadata_json, dict) else {}
-        )
-        merged = dict(existing_meta)
-        merged.update(metadata)
-        if merged != existing_meta:
-            svc.metadata_json = merged
-            db.flush()
+    if snapshot is not None:
+        snapshot.remember_service(svc)
+    _merge_service_metadata(db, svc, metadata)
     return svc
 
 
@@ -388,16 +728,22 @@ def _upsert_service_fallback(
     owner_fallback: Optional[str] = None,
     owner_fallback_source: Optional[str] = None,
     owner_respect_trust: bool = False,
+    snapshot: Optional[UpsertSnapshot] = None,
 ) -> Service:
-    svc = (
-        db.query(Service)
-        .filter(
-            Service.namespace == namespace,
-            Service.name == name,
-            Service.node_kind == node_kind,
+    # Промах снимка не значит «узла нет» — тогда спрашиваем базу, как раньше.
+    svc = snapshot.service(namespace, name, node_kind) if snapshot is not None else None
+    if svc is None:
+        svc = (
+            db.query(Service)
+            .filter(
+                Service.namespace == namespace,
+                Service.name == name,
+                Service.node_kind == node_kind,
+            )
+            .one_or_none()
         )
-        .one_or_none()
-    )
+        if svc is not None and snapshot is not None:
+            snapshot.remember_service(svc)
     if svc is None:
         svc = Service(
             namespace=namespace,
@@ -416,6 +762,8 @@ def _upsert_service_fallback(
         )
         db.add(svc)
         db.flush()
+        if snapshot is not None:
+            snapshot.remember_service(svc)
         logger.info("kg.service_created", namespace=namespace, name=name)
     else:
         changed = False
@@ -617,8 +965,14 @@ def upsert_edge(
     discovered_by: Optional[str] = None,
     extras: Optional[Dict[str, Any]] = None,
     direction: str = "",
+    snapshot: Optional[UpsertSnapshot] = None,
 ) -> ServiceEdge:
     """Idempotent upsert по (src_id, dst_id, kind, direction).
+
+    `snapshot` — снимок рёбер прохода синка (`UpsertSnapshot`): ребро, у
+    которого не растёт weight, берётся из снимка без запросов, а касание
+    last_seen_at откладывается до `snapshot.flush()` (вызвать его в конце
+    прохода — обязанность вызывающего). От `dst` читается только `.id`.
 
     На PostgreSQL — INSERT ON CONFLICT, исключает race condition.
     `extras` (JSON): discovery_sources и confidence — merge, не overwrite.
@@ -630,9 +984,11 @@ def upsert_edge(
     if _is_postgresql(db):
         return _upsert_edge_pg(
             db, src, dst, kind, weight, discovered_by, extras, direction,
+            snapshot,
         )
     return _upsert_edge_fallback(
         db, src, dst, kind, weight, discovered_by, extras, direction,
+        snapshot,
     )
 
 
@@ -645,11 +1001,30 @@ def _upsert_edge_pg(
     discovered_by: Optional[str],
     extras: Optional[Dict[str, Any]],
     direction: str = "",
+    snapshot: Optional[UpsertSnapshot] = None,
 ) -> ServiceEdge:
     from sqlalchemy import func
     from sqlalchemy.dialects.postgresql import insert as pg_insert
 
     now = datetime.utcnow()
+    if snapshot is not None:
+        known = snapshot.edge(src, dst.id, kind, direction or "")
+        # Зеркало `where=` ниже: поштучно писать нужно, только если растёт
+        # вес (или его нет вовсе — GREATEST тогда проставит входящий). Иначе
+        # INSERT изменил бы разве что метку — пропускаем и его, и SELECT
+        # ребра обратно, а касание метки уходит пачкой (snapshot.flush).
+        if known is not None:
+            fresh = (
+                known.last_seen_at is not None
+                and known.last_seen_at >= now - EDGE_TOUCH_INTERVAL
+            )
+            if fresh and not (known.weight is not None and known.weight < weight):
+                _merge_edge_extras(db, known, discovered_by, extras)
+                return known
+            if not fresh and known.weight is not None and known.weight >= weight:
+                snapshot.touch_edge(known, now, discovered_by)
+                _merge_edge_extras(db, known, discovered_by, extras)
+                return known
     initial_extras = dict(extras or {})
     if discovered_by:
         initial_extras.setdefault("discovery_sources", [discovered_by])
@@ -700,7 +1075,19 @@ def _upsert_edge_pg(
         .populate_existing()
         .one()
     )
-    # C3: merge extras + discovery_sources в Python (JSONB merge в SQL сложнее).
+    if snapshot is not None:
+        snapshot.remember_edge(edge)
+    _merge_edge_extras(db, edge, discovered_by, extras)
+    return edge
+
+
+def _merge_edge_extras(
+    db: Session,
+    edge: ServiceEdge,
+    discovered_by: Optional[str],
+    extras: Optional[Dict[str, Any]],
+) -> None:
+    """C3: merge extras + discovery_sources в Python (JSONB merge в SQL сложнее)."""
     merged = dict(edge.extras or {})
     changed = False
     if extras:
@@ -715,7 +1102,6 @@ def _upsert_edge_pg(
     if changed and merged != (edge.extras or {}):
         edge.extras = merged
         db.flush()
-    return edge
 
 
 def _upsert_edge_fallback(
@@ -727,14 +1113,23 @@ def _upsert_edge_fallback(
     discovered_by: Optional[str],
     extras: Optional[Dict[str, Any]],
     direction: str = "",
+    snapshot: Optional[UpsertSnapshot] = None,
 ) -> ServiceEdge:
+    # Промах снимка не значит «ребра нет» — тогда спрашиваем базу, как раньше.
     edge = (
-        db.query(ServiceEdge)
-        .filter(ServiceEdge.src_id == src.id, ServiceEdge.dst_id == dst.id,
-                ServiceEdge.kind == kind,
-                ServiceEdge.direction == (direction or ""))
-        .one_or_none()
+        snapshot.edge(src, dst.id, kind, direction or "")
+        if snapshot is not None else None
     )
+    if edge is None:
+        edge = (
+            db.query(ServiceEdge)
+            .filter(ServiceEdge.src_id == src.id, ServiceEdge.dst_id == dst.id,
+                    ServiceEdge.kind == kind,
+                    ServiceEdge.direction == (direction or ""))
+            .one_or_none()
+        )
+        if edge is not None and snapshot is not None:
+            snapshot.remember_edge(edge)
     now = datetime.utcnow()
     initial_extras = dict(extras or {})
     if discovered_by:
@@ -749,6 +1144,8 @@ def _upsert_edge_fallback(
         )
         db.add(edge)
         db.flush()
+        if snapshot is not None:
+            snapshot.remember_edge(edge)
     else:
         edge.last_seen_at = now
         # KG H5: weight монотонно растёт — env-sync (weight=1) не понижает

@@ -51,7 +51,8 @@ from app.knowledge_graph.edge_decay_guard import (
     SOURCE_TOPOLOGY_INGRESSES, SOURCE_TOPOLOGY_SERVICES, record_source_run)
 from app.knowledge_graph.k8s_endpoints_sync import DISCOVERED_BY_ENDPOINTS
 from app.knowledge_graph.contract import OWNER_SOURCE_NAMESPACE_PREFIX
-from app.knowledge_graph.populator import upsert_edge, upsert_service
+from app.knowledge_graph.populator import (UpsertSnapshot, make_upsert_snapshot,
+                                           upsert_edge, upsert_service)
 from app.knowledge_graph.schema import (NODE_KIND_SERVICE, NODE_KIND_WORKLOAD,
                                         Service, ServiceEdge)
 
@@ -91,6 +92,11 @@ EDGE_ROUTES_TO = "routes_to"             # Ingress → Service
 # транзакция активно работает, поэтому idle_in_transaction_session_timeout
 # её не обрывает, и спасает только дробление на короткие.
 _COMMIT_BATCH = 200
+
+#: Сколько namespace держит снимок узлов и рёбер (populator.UpsertSnapshot).
+#: Service и его workload лежат в одном namespace, а Service-ы приходят
+#: сгруппированными по namespace — хватает текущего и пары соседних.
+_SNAPSHOT_NAMESPACES = 4
 
 DISCOVERED_BY_SVC = "k8s_topology_resources/service"
 DISCOVERED_BY_INGRESS = "k8s_topology_resources/ingress"
@@ -553,14 +559,26 @@ def sync_all_services(
         # См. ingresses: сбой выборки ≠ «Service-ов ноль».
         stats["error"] = _LAST_FETCH_ERROR["services"]
 
+    # Снимок узлов и рёбер (populator.UpsertSnapshot): Service-ы приходят
+    # сгруппированными по namespace, и узлы namespace грузятся одним SELECT,
+    # а рёбра из них — ещё одним. До 18.11.2026 на каждый Service уходило семь
+    # запросов (два upsert узла по INSERT + SELECT, SELECT рёбер по selector'у,
+    # upsert ребра по INSERT + SELECT) — ~44 тыс. за проход, 96 проходов в
+    # сутки. В снимке держим несколько последних namespace, не весь кластер.
+    snapshot = make_upsert_snapshot(db, max_namespaces=_SNAPSHOT_NAMESPACES)
+
     for i, svc in enumerate(services, 1):
         try:
             # SAVEPOINT на item: один DataError не переводит Session в
             # aborted-состояние (PendingRollbackError на соседях и финальном
             # commit) и не роняет весь tick. Зеркалит k8s_events_sync.
             with db.begin_nested():
-                _sync_one_service(db, svc, deployments_index, stats)
+                _sync_one_service(db, svc, deployments_index, stats, snapshot)
         except Exception as e:
+            # Откат savepoint'а мог унести строки, которые снимок уже считает
+            # существующими, — после сбоя ему верить нельзя.
+            if snapshot is not None:
+                snapshot.clear()
             stats["errors"] += 1
             logger.warning(
                 "k8s_topology_resources.service_failed ns=%s name=%s err=%s",
@@ -573,8 +591,12 @@ def sync_all_services(
             # осознанно: синк идемпотентен, повторный прогон восстановит
             # недописанное, а вот блокировка на 12 минут не восстанавливает
             # ничего.
+            if snapshot is not None:
+                snapshot.flush()        # отложенные касания меток — до commit
             db.commit()
 
+    if snapshot is not None:
+        snapshot.flush()
     db.commit()
     logger.info(
         "k8s_topology_resources.services_done fetched=%d nodes=%d workloads=%d "
@@ -599,6 +621,7 @@ def _drop_stale_selector_edges(
     svc_node: Service,
     selector: Dict[str, str],
     stats: Dict[str, Any],
+    snapshot: Optional[UpsertSnapshot] = None,
 ) -> None:
     """Снять serves_traffic-рёбра, построенные по УСТАРЕВШЕМУ selector'у.
 
@@ -618,12 +641,15 @@ def _drop_stale_selector_edges(
     ребро не трогаем, даже если срез пуст. Ребро без `extras.selector`
     (до contract 2.4 наследие) тоже не трогаем: судить не по чему.
     """
-    edges = (
-        db.query(ServiceEdge)
-        .filter(ServiceEdge.src_id == svc_node.id,
-                ServiceEdge.kind == EDGE_SERVES_TRAFFIC)
-        .all()
-    )
+    if snapshot is not None:
+        edges = snapshot.edges_from(svc_node, EDGE_SERVES_TRAFFIC)
+    else:
+        edges = (
+            db.query(ServiceEdge)
+            .filter(ServiceEdge.src_id == svc_node.id,
+                    ServiceEdge.kind == EDGE_SERVES_TRAFFIC)
+            .all()
+        )
     for edge in edges:
         # Тот же паттерн, что в blast_radius._edge_sources: `edge.extras or
         # {}` mypy выводит как пустой dict, и .get по нему не типизируется.
@@ -664,6 +690,7 @@ def _sync_one_service(
     svc: Dict[str, Any],
     deployments_index: Dict[str, Any],
     stats: Dict[str, Any],
+    snapshot: Optional[UpsertSnapshot] = None,
 ) -> None:
     """Тело обработки одного Service — вынесено ради per-item SAVEPOINT."""
     meta = svc.get("metadata") or {}
@@ -705,6 +732,7 @@ def _sync_one_service(
         # uid объекта был в руках всё это время — синк держит полный JSON.
         # Без него пересозданный Service неотличим от прежнего по имени.
         k8s_uid=meta.get("uid"),
+        snapshot=snapshot,
     )
     stats["nodes_upserted"] += 1
 
@@ -712,7 +740,7 @@ def _sync_one_service(
     # Прежде чем искать новые матчи — снять те рёбра, что построены по
     # прежнему selector'у. Иначе переключённый Service продолжает указывать
     # на старый workload, и делает это молча.
-    _drop_stale_selector_edges(db, svc_node, selector, stats)
+    _drop_stale_selector_edges(db, svc_node, selector, stats, snapshot)
     if not selector:
         stats["skipped_no_selector"] += 1
         return
@@ -768,6 +796,7 @@ def _sync_one_service(
             node_kind=NODE_KIND_WORKLOAD,
             metadata={"k8s_workload": _extract_workload_meta(dep)},
             k8s_uid=(dep.get("metadata") or {}).get("uid"),
+            snapshot=snapshot,
         )
         stats["workload_nodes_upserted"] += 1
         if dep_node.id == svc_node.id:
@@ -787,6 +816,7 @@ def _sync_one_service(
                 "selector": selector,
                 "service_type": meta_json.get("service_type"),
             },
+            snapshot=snapshot,
         )
         stats["edges_serves_traffic"] += 1
 

@@ -41,7 +41,7 @@ import logging
 import os
 import statistics
 from datetime import datetime, timedelta
-from typing import Any, Dict, List, Optional, Tuple, cast
+from typing import Any, Dict, List, Optional, Sequence, Set, Tuple, cast
 
 from sqlalchemy.orm import Session
 
@@ -162,7 +162,7 @@ def _threshold_crit() -> float:
 
 
 def _extract_values(
-    rows: List[ServiceHealth], metric: str,
+    rows: Sequence[Any], metric: str,
 ) -> List[float]:
     """Из списка health-rows достаёт non-NULL значения по метрике."""
     out: List[float] = []
@@ -222,7 +222,7 @@ def _compute_robust_z(
 
 
 def _seasonal_baseline(
-    rows: List[ServiceHealth], metric: str, target_hour: int,
+    rows: Sequence[Any], metric: str, target_hour: int,
 ) -> List[float]:
     """Отфильтровать baseline-точки по hour-of-day ±SEASONAL_HOUR_BAND.
 
@@ -309,7 +309,140 @@ def _detect_for_service(
     crit_thresh: float,
     rel_floor: float = 0.0,
 ) -> Dict[str, int]:
-    """Считает аномалии для одного сервиса.
+    """Считает аномалии для одного сервиса — построчный путь (SELECT на сервис).
+
+    Проход по всем сервисам (`detect_anomalies`) им больше не пользуется: он
+    грузит точки пачками (`_load_health_rows`). Функция оставлена для разового
+    вызова по одному сервису и как эталон в тесте эквивалентности пакетного
+    пути.
+    """
+    baseline_start = now - timedelta(days=BASELINE_DAYS)
+    rows: List[ServiceHealth] = (
+        db.query(ServiceHealth)
+        .filter(
+            ServiceHealth.service_id == service.id,
+            ServiceHealth.ts >= baseline_start,
+            ServiceHealth.ts <= now,
+        )
+        .order_by(ServiceHealth.ts.asc())
+        .all()
+    )
+    return _detect_from_rows(
+        db, service, rows, now,
+        warn_thresh=warn_thresh, crit_thresh=crit_thresh, rel_floor=rel_floor,
+    )
+
+
+# ── Пакетная загрузка точек ──────────────────────────────────────────────────
+#
+# До 18.11.2026 проход делал SELECT семи дней kg_service_health на КАЖДЫЙ
+# сервис: ~6,6 тыс. запросов за проход, 17,2 млн за 18 дней и первое место в
+# pg_stat_statements по суммарному времени (44,6 тыс. с). При этом из 6,6 тыс.
+# сервисов свежие точки (последний час) есть у ~2,9 тыс.: остальным считать
+# нечего, но baseline у ~1,3 тыс. из них всё равно выгружался целиком.
+#
+# Теперь: один запрос «у кого есть точки за последний час», проверка наличия
+# истории у остальных (только ради счётчика skipped_no_current) и выгрузка
+# точек пачками по `_HEALTH_FETCH_CHUNK` сервисов. Таблица физически
+# упорядочена по времени вставки, поэтому точки одного сервиса лежат по одной
+# на блок (1008 строк = 1007 блоков), а точки пачки сервисов за один тик — в
+# одном блоке: пачка из 40 читает 4,4 тыс. блоков вместо 40 тыс.
+
+#: Сколько сервисов выгружать одним запросом. 50 × до 1008 точек × 13 колонок —
+#: десятки МБ в Python на время пачки; больше — уже заметно в памяти воркера.
+_HEALTH_FETCH_CHUNK = 50
+#: Размер IN-списка в запросах без выгрузки точек.
+_ID_CHUNK = 500
+
+
+def _chunks(items: List[int], size: int) -> List[List[int]]:
+    return [items[i:i + size] for i in range(0, len(items), size)]
+
+
+def _services_with_current_points(db: Session, now: datetime) -> Set[int]:
+    """id сервисов, у которых есть хотя бы одна точка за «текущее» окно."""
+    current_start = now - timedelta(hours=BASELINE_EXCLUDE_HOURS)
+    return {
+        int(sid) for (sid,) in (
+            db.query(ServiceHealth.service_id)
+            .filter(ServiceHealth.ts >= current_start, ServiceHealth.ts <= now)
+            .distinct()
+            .all()
+        )
+    }
+
+
+def _services_with_any_points(
+    db: Session, service_ids: List[int], now: datetime,
+) -> Set[int]:
+    """Какие из `service_ids` имеют хоть одну точку в baseline-окне.
+
+    Нужен только чтобы счётчик skipped_no_current остался тем же, что у
+    построчного пути: «точки есть, свежих нет» считается, «точек нет вовсе» —
+    нет. EXISTS по (service_id, ts) — одна проба индекса на сервис.
+    """
+    baseline_start = now - timedelta(days=BASELINE_DAYS)
+    found: Set[int] = set()
+    for chunk in _chunks(service_ids, _ID_CHUNK):
+        has_points = (
+            db.query(ServiceHealth.id)
+            .filter(
+                ServiceHealth.service_id == Service.id,
+                ServiceHealth.ts >= baseline_start,
+                ServiceHealth.ts <= now,
+            )
+            .exists()
+        )
+        found.update(
+            int(sid) for (sid,) in
+            db.query(Service.id).filter(Service.id.in_(chunk), has_points).all()
+        )
+    return found
+
+
+def _load_health_rows(
+    db: Session, service_ids: List[int], now: datetime,
+) -> Dict[int, List[Any]]:
+    """Точки baseline-окна сразу для пачки сервисов: service_id → строки по ts.
+
+    Те же строки и в том же порядке, что отдаёт построчный запрос
+    `_detect_for_service` (ts уникален в пределах сервиса), только колонки —
+    одни метрики, без ORM-объектов.
+    """
+    baseline_start = now - timedelta(days=BASELINE_DAYS)
+    by_service: Dict[int, List[Any]] = {}
+    if not service_ids:
+        return by_service
+    rows = (
+        db.query(
+            ServiceHealth.service_id,
+            ServiceHealth.ts,
+            *[getattr(ServiceHealth, m) for m in METRICS],
+        )
+        .filter(
+            ServiceHealth.service_id.in_(service_ids),
+            ServiceHealth.ts >= baseline_start,
+            ServiceHealth.ts <= now,
+        )
+        .order_by(ServiceHealth.service_id.asc(), ServiceHealth.ts.asc())
+        .all()
+    )
+    for r in rows:
+        by_service.setdefault(int(r.service_id), []).append(r)
+    return by_service
+
+
+def _detect_from_rows(
+    db: Session,
+    service: Service,
+    rows: Sequence[Any],
+    now: datetime,
+    *,
+    warn_thresh: float,
+    crit_thresh: float,
+    rel_floor: float = 0.0,
+) -> Dict[str, int]:
+    """Считает аномалии сервиса по уже загруженным точкам (по возрастанию ts).
 
     Возвращает счётчики: inserted / skipped_dup / skipped_no_baseline /
     skipped_no_current / skipped_volume_guard.
@@ -323,18 +456,7 @@ def _detect_for_service(
     }
 
     current_start = now - timedelta(hours=BASELINE_EXCLUDE_HOURS)
-    baseline_start = now - timedelta(days=BASELINE_DAYS)
 
-    rows: List[ServiceHealth] = (
-        db.query(ServiceHealth)
-        .filter(
-            ServiceHealth.service_id == service.id,
-            ServiceHealth.ts >= baseline_start,
-            ServiceHealth.ts <= now,
-        )
-        .order_by(ServiceHealth.ts.asc())
-        .all()
-    )
     if not rows:
         return counters
 
@@ -576,25 +698,49 @@ def detect_anomalies(
         "by_severity": {"warning": 0, "critical": 0},
     }
 
-    for svc in services:
+    # Точки грузим пачками, а не запросом на сервис (см. блок «Пакетная
+    # загрузка точек»). Сервисы без свежих точек не выгружаются вовсе: им
+    # нужен только счётчик, и он считается по EXISTS.
+    all_ids = [cast(int, s.id) for s in services]
+    current_ids = _services_with_current_points(db, now)
+    with_current = [s for s in services if cast(int, s.id) in current_ids]
+    history_only = _services_with_any_points(
+        db, [sid for sid in all_ids if sid not in current_ids], now,
+    )
+    stats["skipped_no_current"] += len(history_only) * len(METRICS)
+    stats["services_with_current"] = len(with_current)
+
+    for start in range(0, len(with_current), _HEALTH_FETCH_CHUNK):
+        batch = with_current[start:start + _HEALTH_FETCH_CHUNK]
         try:
-            counters = _detect_for_service(
-                db, svc, now,
-                warn_thresh=warn_thresh, crit_thresh=crit_thresh,
-                rel_floor=rel_floor,
+            rows_by_service = _load_health_rows(
+                db, [cast(int, s.id) for s in batch], now,
             )
         except Exception as e:
-            stats["errors"] += 1
+            stats["errors"] += len(batch)
             log.warning(
-                "anomaly_detection.compute_failed ns=%s name=%s err=%s",
-                svc.namespace, svc.name, e,
+                "anomaly_detection.load_failed services=%d err=%s", len(batch), e,
             )
             continue
-        stats["inserted"] += counters["inserted"]
-        stats["skipped_dup"] += counters["skipped_dup"]
-        stats["skipped_no_baseline"] += counters["skipped_no_baseline"]
-        stats["skipped_no_current"] += counters["skipped_no_current"]
-        stats["skipped_volume_guard"] += counters["skipped_volume_guard"]
+        for svc in batch:
+            try:
+                counters = _detect_from_rows(
+                    db, svc, rows_by_service.get(cast(int, svc.id), ()), now,
+                    warn_thresh=warn_thresh, crit_thresh=crit_thresh,
+                    rel_floor=rel_floor,
+                )
+            except Exception as e:
+                stats["errors"] += 1
+                log.warning(
+                    "anomaly_detection.compute_failed ns=%s name=%s err=%s",
+                    svc.namespace, svc.name, e,
+                )
+                continue
+            stats["inserted"] += counters["inserted"]
+            stats["skipped_dup"] += counters["skipped_dup"]
+            stats["skipped_no_baseline"] += counters["skipped_no_baseline"]
+            stats["skipped_no_current"] += counters["skipped_no_current"]
+            stats["skipped_volume_guard"] += counters["skipped_volume_guard"]
 
     # Лог-error аномалии: только сервисы с записями в kg_log_observations за
     # baseline-окно (обычно ~36, не все 2.4k real svc → дёшево).
