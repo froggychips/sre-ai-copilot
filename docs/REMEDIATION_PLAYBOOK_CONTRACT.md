@@ -23,6 +23,20 @@ preconditions → policy → привязка к снимку → gate → пе�
 | `absent` | только ABSENT-факты | FOUND, UNKNOWN, факта нет, конфликт FOUND+ABSENT, конфликт ABSENT+UNKNOWN |
 | `evidence_not_in` | у каждого FOUND-факта есть ключ, и значение не из списка | ключа нет, значение из списка |
 
+До preconditions matcher сверяет вид цели с `match.target_kinds` (необязательное поле
+v2; допустимые значения — `Deployment`, `StatefulSet`, `DaemonSet`, `Job`, `CronJob`,
+`Cluster`):
+
+| `match.target_kinds` | Вид цели | Итог |
+|---|---|---|
+| не задан | любой, неизвестный | вид не проверяется |
+| задан | входит в список | дальше — preconditions |
+| задан | не входит в список | не совпал (`target_kind_mismatch`) |
+| задан | не определён | не совпал (`target_kind_unknown`, fail-closed) |
+
+Вызов `match_playbooks` без `target_kind` (pipeline до выбора цели, golden-реплей) вид
+не проверяет. Оба playbook-а реестра объявляют `target_kinds: ["Deployment"]`.
+
 - **restart:** `crashloop` found; `oom_killed`, `recent_deploy` absent; `process_crash`
   found без падения по сигналу (exit-коды 132, 134, 135, 136, 138, 139).
 - **scale:** `resource_pressure` found; `crashloop`, `oom_killed`, `recent_deploy` absent.
@@ -112,6 +126,25 @@ FixAgent, вход в этот контракт — прямо с прод-пу�
   `apply_async` задачи `remediation_bridge` в очередь `celery` (с 1.0.32). Redis
   недоступен — задача не ставится. Вся работа ниже идёт в воркере;
 
+- вид и имя цели определяются до любого kubectl (`app/remediation/workload.py`,
+  флаг `REMEDIATION_BRIDGE_TARGET_KIND_ENABLED`): явный лейбл алерта (`deployment`,
+  `statefulset`, `daemonset`, `job_name`, `cronjob`) → workload-узел графа с именем,
+  выведенным из пода (`metadata_json.k8s_workload.workload_kind`), или Job из
+  `kg_k8s_jobs` → форма имени пода (`<имя>-<rs-hash>-<pod-hash>` — Deployment,
+  `<имя>-<цифры>-<pod-hash>` — Job от CronJob, `<имя>-<ordinal>` — StatefulSet) → вид
+  неизвестен. Имя Deployment-а берётся оттуда же, а не из имени сервиса обогащения;
+- цель, вид которой определён и не подходит ни одному playbook-у с этим `alertname`,
+  отсекается в начале задачи — до обогащения и снимка K8sFacts; остальные несовпадения
+  по виду отсекает `match_playbooks`. В обоих случаях — debug-строка
+  `remediation_bridge.playbook_skipped` и счётчик
+  `remediation_bridge_skipped_total{reason,playbook,target_kind}` (причины
+  `target_kind_mismatch`, `target_kind_unknown`, `plan_render_failed`);
+- блок policy по осям, не зависящим от живого состояния (`namespace_tier`,
+  `resource_kind`, `data_plane`, `reversibility`), выносится до пробы живых реплик
+  (флаг `REMEDIATION_BRIDGE_EARLY_POLICY_BLOCK_ENABLED`): gate считается на заглушках
+  реплик, и решение принимается, только если это `block` с причиной по одной из этих
+  осей. Решение пишется в `kg_remediation_decisions` как раньше; `command_preview` у
+  такой строки без чисел реплик, счётчик — `remediation_bridge_early_blocks_total`;
 - preconditions считаются по фактам правил `enrich_alert` и по фактам
   состояния пода (K8sFacts → `OOMKilledRule`, `ProcessCrashRule`,
   `PodEventsRule`); снимок не снят — `absent` понижается до `unknown`;

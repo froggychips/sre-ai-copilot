@@ -73,6 +73,7 @@ __all__ = [
     "run_bridge",
     "annotate_enriched_card",
     "run_bridge_for_incident",
+    "target_kind_incompatible",
     "wants_bridge",
 ]
 
@@ -262,6 +263,9 @@ class Proposal:
     classification: Optional[str]
     command_preview: str
     preconditions: List[Dict[str, Any]] = field(default_factory=list)
+    #: Блок вынесен до пробы kubectl: в intent-е заглушки реплик, исполнять
+    #: его нельзя (и некому — block-предложение до `_propose` не доходит).
+    early_block: bool = False
 
     @property
     def blocked(self) -> bool:
@@ -312,91 +316,278 @@ def _plan_context(pb: Any, namespace: str, name: str) -> Dict[str, Any]:
     return {"current_replicas": current, "replicas": current + 1}
 
 
-def _target_name(ctx: "EnrichedContext") -> Optional[str]:
+def _legacy_target_name(ctx: "EnrichedContext") -> Optional[str]:
     labels = ctx.incident.labels or {}
     return labels.get("deployment") or ctx.service or None
+
+
+def _target_kind_enabled() -> bool:
+    return bool(getattr(settings, "REMEDIATION_BRIDGE_TARGET_KIND_ENABLED", True))
+
+
+def _early_block_enabled() -> bool:
+    return bool(getattr(settings, "REMEDIATION_BRIDGE_EARLY_POLICY_BLOCK_ENABLED", True))
+
+
+def _count_skip(playbook: str, reason: str, target_kind: Optional[str]) -> None:
+    """Счётчик пропуска + debug. Info на каждый алерт здесь не пишем: при
+    цели не того вида это тысячи одинаковых строк в сутки."""
+    from app.remediation.workload import KIND_UNKNOWN
+    kind = target_kind or KIND_UNKNOWN
+    try:
+        from app.metrics import REMEDIATION_BRIDGE_SKIPPED
+        REMEDIATION_BRIDGE_SKIPPED.labels(
+            reason=reason, playbook=playbook, target_kind=kind,
+        ).inc()
+    except Exception:  # noqa: BLE001 — метрика не должна ронять мост
+        pass
+    log.debug("remediation_bridge.playbook_skipped", playbook=playbook,
+              reason=reason, target_kind=kind)
+
+
+def target_kind_incompatible(
+    labels: Optional[Dict[str, Any]], namespace: Optional[str], db: Any = None,
+) -> bool:
+    """Дешёвый отсев ДО обогащения и K8sFacts: цель точно не того вида.
+
+    True — вид цели определён (лейблы, граф, форма имени пода), и ни один
+    исполнимый playbook с этим alertname его не принимает: мосту здесь делать
+    нечего, обогащать алерт и снимать под незачем. Вид не определён — False:
+    после обогащения появится имя сервиса, и `plan_proposals` решит сам.
+    Без сети; с `db` — до двух SELECT-ов. Ошибка — False (идём старым путём).
+    """
+    if not _target_kind_enabled():
+        return False
+    try:
+        from app.remediation.matcher import (default_registry,
+                                             target_kind_rejection)
+        from app.remediation.workload import resolve_workload_target
+
+        lb = dict(labels or {})
+        alertname = lb.get("alertname")
+        target = resolve_workload_target(lb, namespace=namespace, db=db)
+        if target.kind is None:
+            return False
+        rejected: List[tuple] = []
+        for pb in default_registry().values():
+            if not pb.executable or alertname not in (pb.match.alertnames or ()):
+                continue
+            reason = target_kind_rejection(pb, target.kind)
+            if reason is None:
+                return False
+            rejected.append((pb.name, reason))
+        if not rejected:
+            return False
+        for playbook, reason in rejected:
+            _count_skip(playbook, reason, target.kind)
+        return True
+    except Exception as e:
+        log.warning("remediation_bridge.target_kind_check_failed", error=type(e).__name__)
+        return False
+
+
+#: Оси policy, значение которых не зависит от живого состояния цели: их
+#: block-решение известно до пробы реплик. `confidence` сюда не входит — у
+#: gate-а она зависит от того, целое ли `replicas`.
+_STATIC_BLOCK_AXES = frozenset({
+    "namespace_tier", "resource_kind", "data_plane", "reversibility",
+})
+#: Заглушки серверных шаблонов для предварительной оценки policy. В кластер
+#: не уходят: предложение с ними бывает только `block`.
+_PLACEHOLDER_CONTEXT = {"current_replicas": 1, "replicas": 2}
+
+
+def _needs_live_params(pb: Any) -> bool:
+    """Ждёт ли план значений, за которыми мост идёт в kubectl."""
+    from app.remediation.playbook import template_name
+    return any(
+        template_name(v) is not None
+        for step in (pb.plan.steps or ()) for v in (step.params or {}).values()
+    )
+
+
+def _assemble(
+    pb: Any, plan_ctx: Dict[str, Any], probe: Any, *,
+    ctx: "EnrichedContext", facts: "FactStore", db: Any,
+    namespace: str, name: str, kind: str, classification: Optional[str],
+) -> Optional[Proposal]:
+    """План → intent → снимок → gate → Proposal. PlanRenderError — наружу."""
+    from app.core.execution_dsl import DSLTranslator, action_spec
+    from app.remediation.binding import (bind_server_params,
+                                         build_match_snapshot, find_entry)
+    from app.remediation.executor_gate import evaluate_intent_gate
+    from app.remediation.matcher import PlanRenderError, render_plan
+    from app.remediation.risk_axes import _classify_namespace
+    from app.remediation.target_resolver import resolve_target
+
+    labels = dict(ctx.incident.labels or {})
+    alertname = labels.get("alertname")
+    try:
+        rendered = render_plan(pb, namespace=namespace, resource_name=name,
+                               context=plan_ctx)
+    except ValueError as e:
+        raise PlanRenderError(str(e)) from e
+    mutating = [intent for intent, _ in rendered if action_spec(intent.action).mutating]
+    if not mutating:
+        return None
+    snapshot = build_match_snapshot(
+        [pb], facts=facts, namespace=namespace,
+        alertname=alertname, classification=classification,
+    )
+    entry = find_entry(snapshot, pb.name)
+    if entry is None:
+        return None
+    intent = mutating[0].model_copy(update={"playbook_match": entry.get("binding")})
+    intent = bind_server_params(intent, snapshot, probe)
+    decision = evaluate_intent_gate(intent, match_snapshot=snapshot, require_binding=True)
+    target = resolve_target(
+        {"labels": labels},
+        facts={"target": {"kind": kind, "namespace": namespace, "name": name}},
+        kg_session=db,
+    )
+    return Proposal(
+        playbook=pb.name,
+        namespace=namespace,
+        resource_name=name,
+        tier=_classify_namespace(namespace).value,
+        mode=decision.mode.value,
+        reasons=list(decision.reasons),
+        intent=intent,
+        snapshot=snapshot,
+        target_ref=target.to_dict(),
+        classification=classification,
+        command_preview=" ".join(DSLTranslator.to_argv(intent)),
+        preconditions=list(entry.get("preconditions") or []),
+    )
+
+
+def _early_policy_block(pb: Any, **kw: Any) -> Optional[Proposal]:
+    """Блок policy, известный без kubectl, — или None (идём за живыми данными).
+
+    Плану scale-out нужны живые реплики, и раньше мост шёл за ними
+    (`describe deployment`) даже для prod/system, где исход предрешён: tier
+    namespace и data-plane от числа реплик не зависят. Здесь тот же gate
+    считается на заглушках реплик; решение принимается, только если это
+    `block` и среди причин есть ось из `_STATIC_BLOCK_AXES`. `block.any` —
+    «любое из условий», так что с настоящими репликами исход тот же, а
+    причины по этим осям — те же самые; только они и записываются.
+
+    Что меняется для записи в kg_remediation_decisions: `command_preview`
+    без чисел реплик (их не снимали), и блок пишется, даже если Deployment-а
+    с таким именем уже нет (раньше проба возвращала «нет реплик», и строки
+    не было).
+    """
+    from app.remediation.matcher import PlanRenderError
+    try:
+        proposal = _assemble(
+            pb, dict(_PLACEHOLDER_CONTEXT),
+            lambda _intent: _PLACEHOLDER_CONTEXT["current_replicas"], **kw,
+        )
+    except PlanRenderError:
+        return None
+    if proposal is None or not proposal.blocked:
+        return None
+    static = [
+        r for r in proposal.reasons
+        if isinstance(r, dict) and r.get("axis") in _STATIC_BLOCK_AXES
+    ]
+    if not static:
+        return None
+    proposal.reasons = static
+    proposal.early_block = True
+    proposal.command_preview = (
+        f"{proposal.intent.action.value} {proposal.intent.resource_type}/"
+        f"{proposal.resource_name} -n {proposal.namespace} "
+        "(блок policy до пробы: живые параметры не снимались)"
+    )
+    try:
+        from app.metrics import REMEDIATION_BRIDGE_EARLY_BLOCKS
+        REMEDIATION_BRIDGE_EARLY_BLOCKS.labels(
+            playbook=proposal.playbook, tier=proposal.tier,
+        ).inc()
+    except Exception:  # noqa: BLE001
+        pass
+    return proposal
 
 
 def plan_proposals(
     ctx: "EnrichedContext", facts: "FactStore", db: Any = None,
 ) -> List[Proposal]:
     """Совпавшие v2-playbook-и → intent-ы и решения policy. Без сети, кроме
-    `bind_server_params` (kubectl get, только если план ждёт current_replicas).
+    `_plan_context` (kubectl get, только если план ждёт current_replicas).
+
+    Порядок — от дешёвого к дорогому:
+      1. вид и имя цели (`workload.resolve_workload_target`: лейблы, граф,
+         форма имени пода) — без kubectl;
+      2. `match_playbooks` с `target_kind`: playbook, чей `match.target_kinds`
+         цель не покрывает, отсекается здесь (debug + счётчик
+         `remediation_bridge_skipped_total`);
+      3. блок policy по статическим осям (`_early_policy_block`) — решение
+         `block` без пробы живых реплик;
+      4. только теперь `_plan_context` (kubectl) и полный gate.
 
     Intent собирает сервер из plan.steps: первый мутирующий шаг (немутирующие
     describe/get_logs исполнять по кнопке незачем). Снимок и привязка — те же
     функции, что у pipeline для FixAgent (`build_match_snapshot`,
     `bind_server_params`); gate вызывается с require_binding=True.
     """
-    from app.core.execution_dsl import DSLTranslator, action_spec
-    from app.remediation.binding import (bind_server_params,
-                                         build_match_snapshot, find_entry)
-    from app.remediation.executor_gate import evaluate_intent_gate
-    from app.remediation.matcher import (PlanRenderError, classify_alert,
-                                         match_playbooks, render_plan)
-    from app.remediation.risk_axes import _classify_namespace
-    from app.remediation.target_resolver import resolve_target
+    from app.remediation.matcher import (ANY_TARGET_KIND, classify_alert,
+                                         match_playbooks)
 
     labels = dict(ctx.incident.labels or {})
     alertname = labels.get("alertname")
     namespace = ctx.incident.namespace or labels.get("namespace")
-    name = _target_name(ctx)
+    name = _legacy_target_name(ctx)
+    kind_filter: Optional[str] = ANY_TARGET_KIND
+    kind: Optional[str] = None
+    if _target_kind_enabled():
+        from app.remediation.workload import resolve_workload_target
+        workload = resolve_workload_target(
+            labels, namespace=namespace, service=ctx.service, db=db,
+        )
+        kind = kind_filter = workload.kind
+        # Имя Deployment-а — из пода алерта (pod → ReplicaSet → Deployment по
+        # графу/форме имени), а не имя сервиса: они не обязаны совпадать.
+        name = workload.name or name
     if not namespace or not name:
         return []
     classification = classify_alert(labels)
+    rejected: List[tuple] = []
     try:
         candidates = match_playbooks(
             alertname=alertname, classification=classification, facts=facts,
+            target_kind=kind_filter, rejected=rejected,
         )
     except Exception as e:
         log.warning("remediation_bridge.match_failed", error=type(e).__name__)
         return []
+    for playbook, reason in rejected:
+        _count_skip(playbook, reason, kind)
 
+    common: Dict[str, Any] = dict(
+        ctx=ctx, facts=facts, db=db, namespace=namespace, name=name,
+        kind=kind or "Deployment", classification=classification,
+    )
     proposals: List[Proposal] = []
     for pb in candidates:
+        if _early_block_enabled() and _needs_live_params(pb):
+            early = _early_policy_block(pb, **common)
+            if early is not None:
+                proposals.append(early)
+                continue
         try:
             plan_ctx = _plan_context(pb, namespace, name)
-        except PlanRenderError as e:
-            log.info("remediation_bridge.plan_render_failed", playbook=pb.name, error=str(e)[:160])
+            proposal = _assemble(pb, plan_ctx, _probe_current_replicas, **common)
+        except ValueError as e:
+            # PlanRenderError и отказ валидатора ExecutionIntent (запретный
+            # namespace, недопустимое имя): раньше второй ронял весь отбор
+            # (`plan_failed error=ValidationError`), теперь — только этот план.
+            _count_skip(pb.name, "plan_render_failed", kind)
+            log.info("remediation_bridge.plan_render_failed", playbook=pb.name,
+                     namespace=namespace, resource=name, error=str(e)[:160])
             continue
-        try:
-            rendered = render_plan(pb, namespace=namespace, resource_name=name,
-                                   context=plan_ctx)
-        except (PlanRenderError, ValueError) as e:
-            log.info("remediation_bridge.plan_render_failed", playbook=pb.name, error=str(e)[:160])
-            continue
-        mutating = [intent for intent, _ in rendered if action_spec(intent.action).mutating]
-        if not mutating:
-            continue
-        snapshot = build_match_snapshot(
-            [pb], facts=facts, namespace=namespace,
-            alertname=alertname, classification=classification,
-        )
-        entry = find_entry(snapshot, pb.name)
-        if entry is None:
-            continue
-        intent = mutating[0].model_copy(update={"playbook_match": entry.get("binding")})
-        intent = bind_server_params(intent, snapshot, _probe_current_replicas)
-        decision = evaluate_intent_gate(intent, match_snapshot=snapshot, require_binding=True)
-        target = resolve_target(
-            {"labels": labels},
-            facts={"target": {"kind": "Deployment", "namespace": namespace, "name": name}},
-            kg_session=db,
-        )
-        proposals.append(Proposal(
-            playbook=pb.name,
-            namespace=namespace,
-            resource_name=name,
-            tier=_classify_namespace(namespace).value,
-            mode=decision.mode.value,
-            reasons=list(decision.reasons),
-            intent=intent,
-            snapshot=snapshot,
-            target_ref=target.to_dict(),
-            classification=classification,
-            command_preview=" ".join(DSLTranslator.to_argv(intent)),
-            preconditions=list(entry.get("preconditions") or []),
-        ))
+        if proposal is not None:
+            proposals.append(proposal)
     return proposals
 
 
@@ -738,6 +929,13 @@ async def run_bridge_for_incident(
         return []
     db = SessionLocal()
     try:
+        # До обогащения и K8sFacts: цель не того вида (StatefulSet базы под
+        # playbook для Deployment-а) — дальше идти незачем.
+        if await asyncio.to_thread(
+            target_kind_incompatible, incident.labels,
+            incident.namespace or (incident.labels or {}).get("namespace"), db,
+        ):
+            return []
         ctx = await enrich_alert_async(db, incident)
         outcomes = await run_bridge(db, ctx)
     except Exception as e:

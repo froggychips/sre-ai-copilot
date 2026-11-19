@@ -24,13 +24,25 @@ from app.diagnostics.facts import FactStore, Verdict
 from app.remediation.playbook import Playbook, load_registry, template_name
 
 __all__ = [
+    "ANY_TARGET_KIND",
+    "REASON_TARGET_KIND_MISMATCH",
+    "REASON_TARGET_KIND_UNKNOWN",
     "PlanRenderError",
     "check_preconditions",
     "classify_alert",
     "default_registry",
     "match_playbooks",
     "render_plan",
+    "target_kind_rejection",
 ]
+
+#: Значение `target_kind` по умолчанию: вид цели не проверять. Так зовут
+#: matcher те, у кого цели ещё нет (pipeline отбирает кандидатов для FixAgent
+#: до выбора цели, golden-реплей) — их поведение не меняется.
+ANY_TARGET_KIND = "*"
+
+REASON_TARGET_KIND_MISMATCH = "target_kind_mismatch"
+REASON_TARGET_KIND_UNKNOWN = "target_kind_unknown"
 
 
 class PlanRenderError(ValueError):
@@ -126,17 +138,44 @@ def _match_section_ok(
     return True
 
 
+def target_kind_rejection(playbook: Playbook, target_kind: str | None) -> str | None:
+    """Почему цель этого вида playbook-у не подходит; None — подходит.
+
+    `match.target_kinds` не задан — вид не проверяется. Задан: вид вне
+    списка — `target_kind_mismatch`; вид неизвестен (None) —
+    `target_kind_unknown`. Неизвестное не считается подходящим: playbook,
+    умеющий только Deployment, на «не знаем что» потратил бы пробу kubectl и
+    в лучшем случае получил бы NotFound (fail-closed).
+    """
+    kinds = playbook.match.target_kinds
+    if not kinds or target_kind == ANY_TARGET_KIND:
+        return None
+    if not target_kind:
+        return REASON_TARGET_KIND_UNKNOWN
+    if target_kind not in kinds:
+        return REASON_TARGET_KIND_MISMATCH
+    return None
+
+
 def match_playbooks(
     registry: Mapping[str, Playbook] | None = None,
     *,
     alertname: str | None = None,
     classification: str | None = None,
     facts: FactStore | None = None,
+    target_kind: str | None = ANY_TARGET_KIND,
+    rejected: list[tuple[str, str]] | None = None,
 ) -> list[Playbook]:
     """Исполнимые (v2) playbook-и, чей match и preconditions выполнены.
 
     Порядок — по имени (как в реестре), чтобы кандидаты в промпте и в
     аудите не зависели от порядка обхода файлов.
+
+    `target_kind` — вид рабочей нагрузки цели (`Deployment`, ...), None —
+    «не удалось определить»; по умолчанию не проверяется. Сверка с
+    `match.target_kinds` идёт ДО preconditions: она дешевле и не зависит от
+    фактов. В `rejected` (если передан) дописываются `(playbook, причина)`
+    отсечённых по виду — для счётчика и лога вызывающего.
     """
     if registry is None:
         registry = default_registry()
@@ -146,6 +185,11 @@ def match_playbooks(
         if not pb.executable:
             continue
         if not _match_section_ok(pb, alertname, classification):
+            continue
+        reason = target_kind_rejection(pb, target_kind)
+        if reason is not None:
+            if rejected is not None:
+                rejected.append((pb.name, reason))
             continue
         ok, _ = check_preconditions(pb, facts)
         if ok:

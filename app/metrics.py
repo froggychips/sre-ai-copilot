@@ -39,6 +39,31 @@ ALERTS_TRUNCATED = Counter(
 )
 
 
+# Мост remediation: алерт дошёл до отбора playbook-ов, но предложения не
+# будет. Раньше это были тысячи info-строк `plan_render_failed` в сутки
+# (playbook для Deployment-а матчился на StatefulSet базы); теперь — debug и
+# этот счётчик. `reason`:
+#   "target_kind_mismatch" — вид цели не входит в `match.target_kinds`;
+#   "target_kind_unknown"  — вид цели определить не удалось (fail-closed);
+#   "plan_render_failed"   — план не собрался (нет живых реплик, шаблон).
+# `target_kind` — Deployment/StatefulSet/DaemonSet/Job/CronJob/Cluster/unknown.
+# Кардинальность: playbook-ов единицы × 3 причины × 7 видов. Считает воркер
+# (multiprocess-реестр, см. app/observability/worker_metrics.py).
+REMEDIATION_BRIDGE_SKIPPED = Counter(
+    "remediation_bridge_skipped_total",
+    "Remediation bridge: playbook skipped for an alert before any proposal",
+    ["reason", "playbook", "target_kind"],
+)
+
+# Блок policy, вынесенный мостом до пробы kubectl (tier namespace,
+# data-plane): решение `block` записано, живые параметры плана не снимались.
+REMEDIATION_BRIDGE_EARLY_BLOCKS = Counter(
+    "remediation_bridge_early_blocks_total",
+    "Remediation bridge: policy block decided before the live kubectl probe",
+    ["playbook", "tier"],
+)
+
+
 def observe_request_latency(duration):
     REQUEST_LATENCY.observe(duration)
 

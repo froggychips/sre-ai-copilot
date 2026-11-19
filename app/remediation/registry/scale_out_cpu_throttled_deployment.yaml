@@ -28,6 +28,9 @@ description: |
   одобрение человека; prod/preprod/system/data-plane — block.
 match:
   alertnames: ["CPUThrottlingHigh"]
+  # Действие плана — над Deployment-ом: StatefulSet/DaemonSet/Job и цель
+  # неизвестного вида отсекаются на матчинге, без пробы kubectl.
+  target_kinds: ["Deployment"]
 preconditions:
   - {fact: resource_pressure, verdict: found}
   - {fact: crashloop, verdict: absent}

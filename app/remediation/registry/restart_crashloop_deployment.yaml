@@ -23,6 +23,9 @@ description: |
   одобрение человека; prod/preprod/system/data-plane — block.
 match:
   alertnames: ["KubePodCrashLooping", "PodCrashLooping"]
+  # Действие плана — над Deployment-ом: StatefulSet/DaemonSet/Job и цель
+  # неизвестного вида отсекаются на матчинге, без пробы kubectl.
+  target_kinds: ["Deployment"]
 preconditions:
   - {fact: crashloop, verdict: found}
   - {fact: oom_killed, verdict: absent}

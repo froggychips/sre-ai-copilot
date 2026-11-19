@@ -42,6 +42,10 @@ SCHEMA_V1 = "remediation.playbook/v1"
 SCHEMA_V2 = "remediation.playbook/v2"
 _SCHEMA_VERSIONS = (SCHEMA_V1, SCHEMA_V2)
 
+#: Допустимые значения `match.target_kinds` — то, что умеет назвать
+#: `remediation.workload.resolve_workload_target` (регистр как в k8s).
+TARGET_KINDS = ("Deployment", "StatefulSet", "DaemonSet", "Job", "CronJob", "Cluster")
+
 
 class PlaybookValidationError(ValueError):
     """Raised when a playbook YAML fails schema validation.
@@ -100,12 +104,32 @@ class _MatchSection(_StrictModel):
     # v2: точные имена алертов AlertManager. Без glob-ов: `*CrashLoop*`
     # незаметно подхватил бы новый алерт, про который автор playbook-а не думал.
     alertnames: list[str] | None = None
+    # v2, необязательное: виды рабочей нагрузки, к которым playbook применим
+    # (`Deployment`, `StatefulSet`, ...). Задано — цель другого или
+    # неизвестного вида отсекается на матчинге, до сбора параметров плана и
+    # без kubectl. Не задано — вид цели не проверяется (как раньше).
+    target_kinds: list[str] | None = None
     job_age_hours: _NumericConstraint | None = None
     active_jobs: _NumericConstraint | None = None
     failed_jobs: _NumericConstraint | None = None
     alert_age: _NumericConstraint | None = None
     recent_deploy_age: _NumericConstraint | None = None
     affected_replicas_pct: _NumericConstraint | None = None
+
+
+    @field_validator("target_kinds")
+    @classmethod
+    def _check_target_kinds(cls, v: list[str] | None) -> list[str] | None:
+        if v is None:
+            return v
+        if not v:
+            raise ValueError("target_kinds must not be empty (omit the field instead)")
+        unknown = [k for k in v if k not in TARGET_KINDS]
+        if unknown:
+            raise ValueError(
+                f"unknown target kind(s) {unknown} (известные: {list(TARGET_KINDS)})"
+            )
+        return v
 
 
 class _AutoSection(_StrictModel):
@@ -343,6 +367,7 @@ class Playbook(_StrictModel):
             v2_only = [
                 name for name, present in (
                     ("match.alertnames", self.match.alertnames is not None),
+                    ("match.target_kinds", self.match.target_kinds is not None),
                     ("plan.steps", self.plan.steps is not None),
                     ("preconditions", self.preconditions is not None),
                     ("verify", self.verify is not None),
