@@ -1242,7 +1242,7 @@ Since 2026-11-18 configuration has three layers, each with one home:
 | Secret | Used by | Keys |
 |---|---|---|
 | `sre-ai-secrets` | `sre-ai-api`, `copilot-worker`, `copilot-worker-sync`, Job `sre-ai-migrate`; CronJob `squad-dashboard` takes the single key `DATABASE_URL` | `secrets.app.yaml.example` (36 keys) |
-| `sre-ai-executor-secrets` | `copilot-executor` (the only one allowed to write to the cluster) | `DATABASE_URL`, `REDIS_URL`; optional `OTLP_EXPORTER_ENDPOINT`, `DISCORD_APPLICATION_ID` |
+| `sre-ai-executor-secrets` | `copilot-executor` (the only one allowed to write to the cluster) | `DATABASE_URL`, `REDIS_URL`; optional `OTLP_EXPORTER_ENDPOINT`, `DISCORD_APPLICATION_ID`, `DISCORD_BOT_TOKEN` |
 | `sre-ai-beat-secrets` | `copilot-beat` | `REDIS_URL`, `DATABASE_URL`; optional `OTLP_EXPORTER_ENDPOINT` |
 
 `Settings` has no required fields — every field has a default; starting with `ENV=production` only needs: `LLM_BACKEND=claude_cli` (or `ANTHROPIC_API_KEY`), `SAFE_MODE=true`, `ALERTMANAGER_ALLOW_UNAUTHENTICATED=true` (or `ALERTMANAGER_WEBHOOK_SECRET`), and a non-placeholder `DATABASE_URL`; Celery needs `REDIS_URL`. The first three come from the ConfigMap and literals, so a role only needs `DATABASE_URL` + `REDIS_URL` — enforced by `tests/test_settings_configmap.py`. beat never connects to the database; it needs `DATABASE_URL` only because of the validator.

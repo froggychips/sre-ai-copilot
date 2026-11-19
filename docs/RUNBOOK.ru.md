@@ -1239,7 +1239,7 @@ side-by-side, или открыть `input.json` и перерисовать в 
 | Secret | Кто подключает | Ключи |
 |---|---|---|
 | `sre-ai-secrets` | `sre-ai-api`, `copilot-worker`, `copilot-worker-sync`, Job `sre-ai-migrate`; CronJob `squad-dashboard` — один ключ `DATABASE_URL` | `secrets.app.yaml.example` (36 ключей) |
-| `sre-ai-executor-secrets` | `copilot-executor` (единственный с правом записи в кластер) | `DATABASE_URL`, `REDIS_URL`; необязательные `OTLP_EXPORTER_ENDPOINT`, `DISCORD_APPLICATION_ID` |
+| `sre-ai-executor-secrets` | `copilot-executor` (единственный с правом записи в кластер) | `DATABASE_URL`, `REDIS_URL`; необязательные `OTLP_EXPORTER_ENDPOINT`, `DISCORD_APPLICATION_ID`, `DISCORD_BOT_TOKEN` |
 | `sre-ai-beat-secrets` | `copilot-beat` | `REDIS_URL`, `DATABASE_URL`; необязательный `OTLP_EXPORTER_ENDPOINT` |
 
 Обязательных полей у `Settings` нет — у всех есть дефолты; старт с `ENV=production` требует только: `LLM_BACKEND=claude_cli` (или `ANTHROPIC_API_KEY`), `SAFE_MODE=true`, `ALERTMANAGER_ALLOW_UNAUTHENTICATED=true` (или `ALERTMANAGER_WEBHOOK_SECRET`), непустой неплейсхолдерный `DATABASE_URL`; `REDIS_URL` нужен Celery. Первые три приходят из ConfigMap и литералов, то есть роли достаточно `DATABASE_URL` + `REDIS_URL` — это держит `tests/test_settings_configmap.py`. beat к базе не подключается, `DATABASE_URL` ему нужен только из-за валидатора.
