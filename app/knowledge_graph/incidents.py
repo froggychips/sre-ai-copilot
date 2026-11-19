@@ -329,7 +329,7 @@ def reconcile_incidents(db: Session, *, now: Optional[datetime] = None) -> Dict[
     for inc in open_incidents:
         row: Any = inc
         stats["checked"] += 1
-        fps = list(inc.fingerprints or [])
+        fps = _reconcile_fingerprints(inc)
         if fps:
             rows = (
                 db.query(AlertEvent.fingerprint, AlertEvent.resolved_at)
@@ -357,6 +357,25 @@ def reconcile_incidents(db: Session, *, now: Optional[datetime] = None) -> Dict[
     if stats["resolved"] or stats["aged_out"]:
         log.info("kg.incidents.reconciled", **stats)
     return stats
+
+
+def _reconcile_fingerprints(inc: KGIncident) -> List[str]:
+    """Алерты, по которым решается, закрывать ли инцидент.
+
+    Шум по статическому правилу, присоединённый к СИГНАЛЬНОМУ инциденту, в
+    расчёт не идёт: хронический троттлинг горит неделями и держал бы уже
+    погасший инцидент открытым — тот занимал бы единственный открытый слот
+    сервиса, и следующая реальная проблема сворачивалась бы в него. После
+    закрытия шумовой алерт на ближайшем уведомлении уходит в свой
+    хронический инцидент (сигнальный он не переоткрывает).
+    У чисто шумового инцидента учитываются все алерты, как раньше.
+    """
+    fps = list(inc.fingerprints or [])
+    marked = inc.extras.get("noise_fingerprints") if isinstance(inc.extras, dict) else None
+    if not isinstance(marked, dict):
+        return fps
+    signal = [fp for fp in fps if NOISE_KIND_RULE not in list(marked.get(fp) or [])]
+    return signal or fps
 
 
 def _all_noise(extras: Any, fps: List[str]) -> bool:

@@ -207,6 +207,34 @@ def test_noise_alert_joins_open_signal_incident_without_hiding_it(db):
     assert same.extras["noise_fingerprints"] == {"fp-t": [NOISE_KIND_RULE]}
 
 
+def test_firing_noise_does_not_keep_resolved_signal_incident_open(db):
+    """Хронический троттлинг не держит погасший сигнальный инцидент открытым."""
+    svc = _svc(db)
+    signal = _attach(db, svc, "fp-c", T0, alertname="KubePodCrashLooping", noise=False)
+    _attach(db, svc, "fp-t", T0 + timedelta(minutes=1))      # шум горит и не гаснет
+    _resolve(db, "fp-c", T0 + timedelta(minutes=30))
+
+    closed = db.get(KGIncident, signal.id)
+    assert closed.status == STATUS_RESOLVED
+    assert closed.resolved_at == T0 + timedelta(minutes=30)
+
+    # Следующее уведомление о том же шуме уходит в свой хронический инцидент,
+    # сигнальный не переоткрывается, слот сервиса свободен для новой проблемы.
+    chronic = _attach(db, svc, "fp-t", T0 + timedelta(hours=4))
+    assert chronic.id != signal.id
+    assert chronic.noise is True
+    assert chronic.incident_key.endswith(NOISE_KEY_SUFFIX)
+    assert db.get(KGIncident, signal.id).status == STATUS_RESOLVED
+
+
+def test_signal_incident_stays_open_while_signal_alert_fires(db):
+    svc = _svc(db)
+    signal = _attach(db, svc, "fp-c", T0, alertname="KubePodCrashLooping", noise=False)
+    _attach(db, svc, "fp-t", T0 + timedelta(minutes=1))
+    _resolve(db, "fp-t", T0 + timedelta(minutes=30))          # погас только шум
+    assert db.get(KGIncident, signal.id).status == STATUS_OPEN
+
+
 def test_rule_mark_is_removed_when_rule_stops_matching(db):
     svc = _svc(db)
     inc = _attach(db, svc, "fp-t", T0)
