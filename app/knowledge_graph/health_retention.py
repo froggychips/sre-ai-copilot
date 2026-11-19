@@ -59,6 +59,33 @@ ACCESS EXCLUSIVE-подобную нагрузку на автовакуум и 
 наблюдательные таблицы вместе. У алертов и инцидентов время — `resolved_at`:
 открытые (NULL) не трогаются никогда. `kg_k8s_jobs`, `kg_services`,
 `kg_service_edges` — не история, а текущее состояние, их чистят синки.
+
+**Сырьё health — неделя, дальше агрегаты** (18.11.2026). 30 дней сырья
+`kg_service_health` — это 2,2 ГБ из 3,8 ГБ базы при читателях глубиной в
+неделю. Свёртку старше семи суток в часовые агрегаты делает соседний модуль
+`health_downsample` (свой beat, своя настройка, по умолчанию выключен).
+Пока свёртка выключена или в dry_run, 30-дневный срок здесь действует как
+раньше; в режиме apply сырьё удаляет только она (`raw_health_owner`) —
+иначе точка могла бы уйти несвёрнутой. Срок жизни узлов снесённых стендов — `gone_retention`.
+
+**Процесс remediation — третий реестр** (18.11.2026).
+`kg_remediation_decisions`, `kg_action_approvals`, `kg_remediation_attempts`
+и мостовые строки `incidents` (`rb-…`, статус навсегда APPROVAL_PENDING)
+срока не имели вовсе. Сегодня там десятки строк, но это ровно то состояние,
+в котором `kg_deployments` была до своих 1,96 ГБ. Список —
+`WORKFLOW_RETENTION_TARGETS`, включается настройкой
+`KG_WORKFLOW_RETENTION_MODE` (off → dry_run → apply).
+
+**Ссылки между таблицами — условием, а не порядком.** Порядок списка
+(«сначала события, потом инциденты») закрывал FK
+kg_remediation_events → kg_incidents только пока событие создано раньше,
+чем закрыт его инцидент. Замер 18.11.2026: у 26 из 487 привязанных событий
+`created_at` позже `resolved_at` инцидента (до шести минут — медик
+дописывает прогон после закрытия). В такой паре инцидент пересекает границу
+первым, DELETE батча падает на FK и откатывается целиком — вместе со всеми
+остальными инцидентами батча. Поэтому строка, на которую ещё ссылаются, в
+выборку не попадает (`_EXTRA_WHERE`): она уйдёт следующим прогоном, когда
+уйдёт ссылка.
 """
 from __future__ import annotations
 
@@ -66,16 +93,50 @@ import logging
 from datetime import datetime, timedelta
 from typing import Any, Dict, cast
 
+from prometheus_client import Counter
 from sqlalchemy import CursorResult, text
 from sqlalchemy.orm import Session
 
 logger = logging.getLogger(__name__)
 
 __all__ = [
-    "purge_old_health", "purge_observations", "purge_events",
-    "RETENTION_TARGETS", "EVENT_RETENTION_TARGETS",
+    "purge_old_health", "purge_observations", "purge_events", "purge_workflow",
+    "raw_health_owner",
+    "RETENTION_TARGETS", "EVENT_RETENTION_TARGETS", "WORKFLOW_RETENTION_TARGETS",
     "DEFAULT_RETENTION_DAYS", "MIN_RETENTION_DAYS", "MIN_EVENT_RETENTION_DAYS",
+    "DEFAULT_WORKFLOW_RETENTION_DAYS",
+    "MODE_OFF", "MODE_DRY_RUN", "MODE_APPLY", "retention_mode", "RETENTION_ROWS",
 ]
+
+# ── Режимы уборки, удаляющей данные ───────────────────────────────────────
+MODE_OFF = "off"
+MODE_DRY_RUN = "dry_run"
+MODE_APPLY = "apply"
+
+
+def retention_mode(raw: Any) -> str:
+    """Привести значение настройки `*_MODE` к одному из трёх режимов.
+
+    Всё, что не `dry_run` и не `apply` (опечатка, пустая строка, None), —
+    `off`: непонятная настройка не должна ничего удалять.
+    """
+    value = str(raw or "").strip().lower().replace("-", "_")
+    if value in (MODE_DRY_RUN, MODE_APPLY):
+        return value
+    if value not in ("", MODE_OFF):
+        logger.warning("retention.unknown_mode value=%r — читаю как off", raw)
+    return MODE_OFF
+
+
+#: Строки, которые уборка удалила (`deleted`), свернула (`folded`,
+#: `hourly_upserted`) или удалила бы в режиме dry_run (`would_*`). Счётчик, а
+#: не gauge: воркер prefork, значения складывает multiprocess-режим
+#: prometheus_client. Суточный объём — `increase(...[1d])`.
+RETENTION_ROWS = Counter(
+    "kg_retention_rows_total",
+    "Rows deleted / folded by KG retention jobs, or that would be in dry-run",
+    ["target", "action"],
+)
 
 #: Сколько истории храним. 30 дней = 4× самое глубокое окно потребителя (7д).
 DEFAULT_RETENTION_DAYS = 30
@@ -129,10 +190,51 @@ EVENT_RETENTION_TARGETS: tuple[tuple[str, str, int], ...] = (
     ("kg_pod_events", "last_seen", 90),
     # Починки медика — год: это датасет live-RCA и история стендов.
     ("kg_remediation_events", "created_at", 365),
-    # После kg_remediation_events: у тех FK на kg_incidents.id. По resolved_at —
-    # открытые остаются.
+    # По resolved_at — открытые остаются. Инцидент, на который ещё ссылается
+    # событие медика (FK), пропускается — см. `_EXTRA_WHERE`.
     ("kg_incidents", "resolved_at", 365),
 )
+
+#: Срок хранения таблиц процесса remediation. Полгода: одобрение и попытка —
+#: аудит «кто и что разрешил», и разбор полётов по ним идёт месяцы спустя.
+DEFAULT_WORKFLOW_RETENTION_DAYS = 180
+
+#: Таблицы процесса remediation: (таблица, колонка времени, срок хранения).
+#: Срок приходит из `KG_WORKFLOW_RETENTION_DAYS`, здесь — дефолт. Потомки
+#: раньше родителя: FK между ними нет (связь — строковый incident_id), но
+#: строка `incidents` уходит только когда на неё никто не ссылается.
+WORKFLOW_RETENTION_TARGETS: tuple[tuple[str, str, int], ...] = (
+    ("kg_remediation_decisions", "created_at", DEFAULT_WORKFLOW_RETENTION_DAYS),
+    ("kg_action_approvals", "created_at", DEFAULT_WORKFLOW_RETENTION_DAYS),
+    # По updated_at: попытку трогает отложенная верификация (+5/+15 минут).
+    ("kg_remediation_attempts", "updated_at", DEFAULT_WORKFLOW_RETENTION_DAYS),
+    ("incidents", "created_at", DEFAULT_WORKFLOW_RETENTION_DAYS),
+)
+
+#: Дополнительное условие отбора на таблицу — литералы, не ввод. Оно всегда
+#: СУЖАЕТ выборку: строка, которая под него не попала, остаётся.
+_EXTRA_WHERE: Dict[str, str] = {
+    # FK kg_remediation_events.incident_id → kg_incidents.id (NO ACTION):
+    # инцидент со ссылкой ждёт, пока уйдёт событие.
+    "kg_incidents": (
+        "NOT EXISTS (SELECT 1 FROM kg_remediation_events e"
+        " WHERE e.incident_id = kg_incidents.id)"
+    ),
+    # Только мостовые строки (`rb-…` заводит remediation.bridge): остальное в
+    # `incidents` — разборы LLM-пайплайна, у них срока нет, и назначать его
+    # заодно незачем. Строка с живым claim-ом исполнителя и строка, на которую
+    # ссылаются решение / одобрение / попытка, остаются.
+    "incidents": (
+        "incident_id LIKE 'rb-%'"
+        " AND (executor_state IS NULL OR executor_state <> 'in_flight')"
+        " AND NOT EXISTS (SELECT 1 FROM kg_remediation_decisions d"
+        " WHERE d.incident_id = incidents.incident_id)"
+        " AND NOT EXISTS (SELECT 1 FROM kg_action_approvals a"
+        " WHERE a.incident_id = incidents.incident_id)"
+        " AND NOT EXISTS (SELECT 1 FROM kg_remediation_attempts t"
+        " WHERE t.incident_id = incidents.incident_id)"
+    ),
+}
 
 
 def purge_observations(
@@ -142,11 +244,17 @@ def purge_observations(
     batch_size: int = DEFAULT_BATCH_SIZE,
     max_batches: int = DEFAULT_MAX_BATCHES,
     now: datetime | None = None,
+    owned_elsewhere: Dict[str, str] | None = None,
 ) -> Dict[str, Any]:
     """Прогнать ретеншен по всем таблицам из `RETENTION_TARGETS`.
 
     `overrides` — сроки из настроек по имени таблицы (сейчас так приходит
     `KG_HEALTH_RETENTION_DAYS`). Пол `MIN_RETENTION_DAYS` действует и на них.
+
+    `owned_elsewhere` — таблицы, которые этот прогон НЕ трогает, с причиной
+    (`{таблица: причина}`): у их строк есть другой владелец удаления. Так
+    сырьё `kg_service_health` уступает свёртке, когда она в режиме apply —
+    см. `raw_health_owner`.
 
     Таблицы обрабатываются по очереди и независимо: отказ или ошибка на
     одной не отменяет уборку остальных — иначе одна кривая настройка
@@ -155,6 +263,14 @@ def purge_observations(
     per_table: Dict[str, Any] = {}
     deleted = 0
     for table, ts_column, days in RETENTION_TARGETS:
+        reason = (owned_elsewhere or {}).get(table)
+        if reason:
+            logger.info("retention.table_yielded table=%s reason=%s", table, reason)
+            per_table[table] = {
+                "table": table, "deleted": 0, "batches": 0, "truncated": False,
+                "cutoff": None, "skipped": reason,
+            }
+            continue
         try:
             stats = purge_table(
                 db, table=table, ts_column=ts_column,
@@ -172,6 +288,35 @@ def purge_observations(
     return {"deleted": deleted, "per_table": per_table}
 
 
+def raw_health_owner(downsample_mode: Any) -> Dict[str, str]:
+    """Кто удаляет сырьё `kg_service_health` при данном режиме свёртки.
+
+    Возвращает `owned_elsewhere` для `purge_observations`.
+
+    Свёртка в режиме `apply` — ЕДИНСТВЕННЫЙ, кто удаляет сырьё: она удаляет
+    точку той же транзакцией, которой записала её в агрегат. Срочный
+    ретеншен рядом удалял бы точку, не глядя, свёрнута ли она, и терял бы
+    данные в двух случаях:
+
+      * `KG_HEALTH_RAW_RETENTION_DAYS` > `KG_HEALTH_RETENTION_DAYS` (сырьё
+        просили хранить дольше старого порога) — ретеншен срезал бы его
+        раньше, чем до него дойдёт свёртка;
+      * свёртка отстала (прогон ограничен числом окон и временем, первое
+        включение разбирает накопленное несколько ночей; сбой задачи).
+
+    Проверка настроек при старте закрыла бы только первый случай, а второй
+    от настроек не зависит — поэтому чистка уступает, а не валидируется.
+    Цена: если свёртка сломана, сырьё растёт, пока её не починят; это видно
+    (`truncated` / `error` в логе задачи) и обратимо, в отличие от удаления.
+
+    `off` и `dry_run` поведение ретеншена не меняют: dry_run ничего не
+    удаляет, и без срочной чистки таблица росла бы без ограничения.
+    """
+    if retention_mode(downsample_mode) == MODE_APPLY:
+        return {"kg_service_health": "owned_by_downsample"}
+    return {}
+
+
 def purge_events(
     db: Session,
     *,
@@ -183,8 +328,8 @@ def purge_events(
     """Прогнать ретеншен по таблицам событий из `EVENT_RETENTION_TARGETS`.
 
     Тот же контракт, что у `purge_observations`: таблицы независимы, пол —
-    `MIN_EVENT_RETENTION_DAYS`, порядок списка значим (FK
-    kg_remediation_events → kg_incidents).
+    `MIN_EVENT_RETENTION_DAYS`. FK kg_remediation_events → kg_incidents
+    закрыт условием отбора (`_EXTRA_WHERE`), а не порядком списка.
     """
     per_table: Dict[str, Any] = {}
     deleted = 0
@@ -205,6 +350,51 @@ def purge_events(
         deleted += stats["deleted"]
     logger.info("retention.events.done deleted=%s tables=%s", deleted, len(per_table))
     return {"deleted": deleted, "per_table": per_table}
+
+
+def purge_workflow(
+    db: Session,
+    *,
+    retention_days: int = DEFAULT_WORKFLOW_RETENTION_DAYS,
+    dry_run: bool = True,
+    batch_size: int = DEFAULT_BATCH_SIZE,
+    max_batches: int = DEFAULT_MAX_BATCHES,
+    now: datetime | None = None,
+) -> Dict[str, Any]:
+    """Прогнать ретеншен по таблицам процесса remediation.
+
+    `dry_run=True` (дефолт) ничего не удаляет: считает строки за границей и
+    возвращает их в `would_delete`. Один срок на все четыре таблицы — иначе
+    одобрение могло бы пережить попытку, которую оно разрешило. Пол —
+    `MIN_EVENT_RETENTION_DAYS`.
+    """
+    per_table: Dict[str, Any] = {}
+    deleted = 0
+    would_delete = 0
+    for table, ts_column, _days in WORKFLOW_RETENTION_TARGETS:
+        try:
+            stats = purge_table(
+                db, table=table, ts_column=ts_column,
+                retention_days=retention_days,
+                batch_size=batch_size, max_batches=max_batches, now=now,
+                min_days=MIN_EVENT_RETENTION_DAYS, dry_run=dry_run,
+            )
+        except Exception as e:  # noqa: BLE001 — соседние таблицы не виноваты
+            logger.error("retention.workflow.table_failed table=%s: %s", table, e)
+            db.rollback()
+            per_table[table] = {"error": str(e)}
+            continue
+        per_table[table] = stats
+        deleted += stats["deleted"]
+        would_delete += stats.get("would_delete", 0)
+    logger.info(
+        "retention.workflow.done dry_run=%s deleted=%s would_delete=%s",
+        dry_run, deleted, would_delete,
+    )
+    return {
+        "dry_run": dry_run, "deleted": deleted, "would_delete": would_delete,
+        "per_table": per_table,
+    }
 
 
 def purge_old_health(
@@ -230,7 +420,11 @@ def purge_old_health(
 #: Имена таблиц и колонок подставляются в SQL текстом (параметризовать
 #: идентификаторы нельзя), поэтому берутся только из `RETENTION_TARGETS` и
 #: сверяются с ним же: снаружи произвольное имя таблицы сюда не попадёт.
-_ALLOWED_TABLES = {t: c for t, c, _ in (*RETENTION_TARGETS, *EVENT_RETENTION_TARGETS)}
+_ALLOWED_TABLES = {
+    t: c for t, c, _ in (
+        *RETENTION_TARGETS, *EVENT_RETENTION_TARGETS, *WORKFLOW_RETENTION_TARGETS,
+    )
+}
 
 
 def purge_table(
@@ -243,11 +437,15 @@ def purge_table(
     max_batches: int = DEFAULT_MAX_BATCHES,
     now: datetime | None = None,
     min_days: int = MIN_RETENTION_DAYS,
+    dry_run: bool = False,
 ) -> Dict[str, Any]:
     """Удалить строки `table` старше `retention_days` по колонке `ts_column`.
 
     `min_days` — пол: `MIN_RETENTION_DAYS` для сэмплов,
     `MIN_EVENT_RETENTION_DAYS` для событий (`purge_events`).
+
+    `dry_run=True` — только посчитать (`would_delete` в ответе и метрика
+    `kg_retention_rows_total{action="would_delete"}`), ничего не удаляя.
 
     Возвращает статистику прогона:
       * `deleted` — сколько строк удалено;
@@ -280,8 +478,27 @@ def purge_table(
         }
 
     cutoff = (now or datetime.utcnow()) - timedelta(days=retention_days)
+    extra = _EXTRA_WHERE.get(table)
+    # Имя таблицы и колонки сверены с реестрами выше, `extra` — литерал из
+    # `_EXTRA_WHERE` этого модуля; значения идут bind-параметрами.
+    where = f"{ts_column} < :cutoff" + (f" AND {extra}" if extra else "")
     deleted = 0
     batches = 0
+
+    if dry_run:
+        would = int(db.execute(
+            text(f"SELECT count(*) FROM {table} WHERE {where}"),  # nosec B608
+            {"cutoff": cutoff},
+        ).scalar() or 0)
+        db.rollback()   # чтение не должно оставлять открытую транзакцию
+        RETENTION_ROWS.labels(target=table, action="would_delete").inc(would)
+        dry_stats: Dict[str, Any] = {
+            "table": table, "deleted": 0, "would_delete": would, "batches": 0,
+            "truncated": False, "cutoff": cutoff.isoformat(), "skipped": None,
+            "dry_run": True,
+        }
+        logger.info("retention.table_dry_run %s", dry_stats)
+        return dry_stats
 
     for _ in range(max_batches):
         # DELETE ... WHERE id IN (SELECT ... LIMIT n) — портируемый способ
@@ -299,7 +516,7 @@ def purge_table(
                 text(
                     f"DELETE FROM {table} WHERE id IN ("  # nosec B608
                     f"  SELECT id FROM {table}"
-                    f"  WHERE {ts_column} < :cutoff"
+                    f"  WHERE {where}"
                     f"  ORDER BY {ts_column} LIMIT :lim"
                     ")"
                 ),
@@ -316,6 +533,7 @@ def purge_table(
         if rows < batch_size:
             break   # старых строк больше не осталось
 
+    RETENTION_ROWS.labels(target=table, action="deleted").inc(deleted)
     truncated = batches >= max_batches and deleted >= max_batches * batch_size
     stats: Dict[str, Any] = {
         "table": table,

@@ -264,6 +264,8 @@ if settings.CELERY_TASK_ALWAYS_EAGER:
 #   * kg_signal_aggregates_compute — SQL-агрегаты по всему графу за 24 ч;
 #   * kg_runtime_correlation_sync — «дорогой запрос», скользящее окно 7 дней;
 #   * kg_health_retention — ночное удаление батчами из шести таблиц;
+#   * kg_health_downsample, kg_gone_nodes_purge — того же рода ночная уборка
+#     (свёртка сырья health в часовые, удаление узлов снесённых стендов);
 #   * kg_nats_subjects_sync — git clone + grep по монорепе (выключен по
 #     умолчанию, но если включат — ему место здесь).
 # Остальные остаются в `celery`: они либо короткие (один kubectl get,
@@ -281,6 +283,8 @@ SYNC_QUEUE_TASKS: frozenset = frozenset({
     "kg_endpoints_sync",
     "kg_signal_aggregates_compute",
     "kg_health_retention",
+    "kg_health_downsample",
+    "kg_gone_nodes_purge",
     "kg_topology_resources_sync",
     "kg_anomaly_detection_task",
     "kg_runtime_correlation_sync",
@@ -359,9 +363,26 @@ celery_app.conf.beat_schedule = {
         "schedule": crontab(minute="7,22,37,52"),
         "options": {"expires": 600},
     },
+    # Свёртка сырья health в часовые агрегаты — до ретеншена (03:40), чтобы
+    # не делить с ним ночное окно. В режиме apply сырьё удаляет только она:
+    # ретеншен kg_service_health не трогает (health_retention.raw_health_owner).
+    # Выключена по умолчанию (KG_HEALTH_DOWNSAMPLE_MODE=off → мгновенный выход).
+    "kg-health-downsample": {
+        "task": "kg_health_downsample",
+        "schedule": crontab(hour=3, minute=5),
+        "options": {"expires": 1800},
+    },
     "kg-health-retention": {
         "task": "kg_health_retention",
         "schedule": crontab(hour=3, minute=40),
+        "options": {"expires": 3600},
+    },
+    # Узлы снесённых стендов (stale_class='gone') старше TTL — после
+    # ретеншена, чтобы не делить с ним ночное окно. Выключена по умолчанию
+    # (KG_GONE_NODES_TTL_MODE=off).
+    "kg-gone-nodes-purge": {
+        "task": "kg_gone_nodes_purge",
+        "schedule": crontab(hour=4, minute=25),
         "options": {"expires": 3600},
     },
     "kg-namespace-lifecycle": {
@@ -1296,21 +1317,121 @@ def kg_health_retention_task():
     Раз в сутки и ночью: удаление батчами всё равно нагружает автовакуум, а
     срочности в нём никакой.
     """
-    from app.knowledge_graph.health_retention import (purge_events,
-                                                      purge_observations)
+    from app.knowledge_graph.health_retention import (MODE_APPLY, MODE_OFF,
+                                                      purge_events,
+                                                      purge_observations,
+                                                      purge_workflow,
+                                                      raw_health_owner,
+                                                      retention_mode)
 
     db = SessionLocal()
     try:
         result = purge_observations(
             db,
             overrides={"kg_service_health": settings.KG_HEALTH_RETENTION_DAYS},
+            # Свёртка в режиме apply сама удаляет сырьё — вместе с записью в
+            # агрегат. Срочная чистка рядом срезала бы несвёрнутое (сырьё
+            # просили хранить дольше KG_HEALTH_RETENTION_DAYS, либо свёртка
+            # отстала). off / dry_run — поведение прежнее.
+            owned_elsewhere=raw_health_owner(settings.KG_HEALTH_DOWNSAMPLE_MODE),
         )
         # События — свой реестр и свой пол (90 дней), см. EVENT_RETENTION_TARGETS:
         # до 31.10.2026 kg_deployments росла без срока до 1,24 млн строк.
         result["events"] = purge_events(db)
+        # Таблицы процесса remediation (решения, одобрения, попытки, мостовые
+        # incidents) — третий реестр, под своей настройкой: off → dry_run → apply.
+        workflow_mode = retention_mode(settings.KG_WORKFLOW_RETENTION_MODE)
+        if workflow_mode != MODE_OFF:
+            result["workflow"] = purge_workflow(
+                db,
+                retention_days=settings.KG_WORKFLOW_RETENTION_DAYS,
+                dry_run=workflow_mode != MODE_APPLY,
+            )
         return result
     except Exception as e:
         logger.warning("kg_health_retention.failed: %s", e)
+        db.rollback()
+        return {"error": str(e)}
+    finally:
+        db.close()
+
+
+# Очередь `sync`, как у kg_health_retention: ночная уборка батчами.
+@celery_app.task(name="kg_health_downsample")
+@single_instance(ttl_seconds=1800)
+def kg_health_downsample_task():
+    """Свернуть сырые точки kg_service_health в часовые агрегаты.
+
+    Замер 18.11.2026: таблица — 2,2 ГБ из 3,8 ГБ базы, 6,6 млн строк за 30
+    дней, а читают сырьё на неделю (baseline детектора аномалий и
+    health_score). Точки старше `KG_HEALTH_RAW_RETENTION_DAYS` сворачиваются
+    в `kg_service_health_hourly` (шесть строк в одну) и удаляются той же
+    транзакцией; агрегаты старше `KG_HEALTH_HOURLY_RETENTION_DAYS` удаляются.
+
+    Режим — `KG_HEALTH_DOWNSAMPLE_MODE`: off (дефолт) → dry_run (только
+    посчитать) → apply. Прогон ограничен числом окон и временем: первое
+    включение разбирает накопленное за несколько ночей, самое старое — первым.
+    """
+    from app.knowledge_graph.health_downsample import (
+        downsample_service_health, purge_hourly)
+    from app.knowledge_graph.health_retention import (MODE_APPLY, MODE_OFF,
+                                                      retention_mode)
+
+    mode = retention_mode(settings.KG_HEALTH_DOWNSAMPLE_MODE)
+    if mode == MODE_OFF:
+        return {"skipped": "disabled"}
+    dry_run = mode != MODE_APPLY
+    db = SessionLocal()
+    try:
+        result = downsample_service_health(
+            db, raw_days=settings.KG_HEALTH_RAW_RETENTION_DAYS, dry_run=dry_run,
+        )
+        result["hourly"] = purge_hourly(
+            db,
+            retention_days=settings.KG_HEALTH_HOURLY_RETENTION_DAYS,
+            raw_days=settings.KG_HEALTH_RAW_RETENTION_DAYS,
+            dry_run=dry_run,
+        )
+        return result
+    except Exception as e:
+        logger.warning("kg_health_downsample.failed: %s", e)
+        db.rollback()
+        return {"error": str(e)}
+    finally:
+        db.close()
+
+
+@celery_app.task(name="kg_gone_nodes_purge")
+@single_instance(ttl_seconds=1800)
+def kg_gone_nodes_purge_task():
+    """Удалить узлы stale_class='gone', чей namespace отсутствует дольше TTL.
+
+    Замер 18.11.2026: 12 342 узла из 24 811 — `gone`, срока жизни у них не
+    было; 79 namespace (4853 узла) отсутствуют дольше 30 дней. Отсчёт — от
+    `kg_namespaces.missing_since`: вернувшийся стенд lifecycle переводит в
+    active и срок обнуляется. Узлы уходят вместе с рёбрами и наблюдениями;
+    инциденты, алерты и события подов остаются и теряют только ссылку.
+
+    Режим — `KG_GONE_NODES_TTL_MODE`: off (дефолт) → dry_run → apply;
+    `KG_GONE_NODES_TTL_NAMESPACES` сужает прогон до перечисленных namespace.
+    """
+    from app.knowledge_graph.gone_retention import purge_gone_nodes
+    from app.knowledge_graph.health_retention import (MODE_APPLY, MODE_OFF,
+                                                      retention_mode)
+
+    mode = retention_mode(settings.KG_GONE_NODES_TTL_MODE)
+    if mode == MODE_OFF:
+        return {"skipped": "disabled"}
+    db = SessionLocal()
+    try:
+        return purge_gone_nodes(
+            db, ttl_days=settings.KG_GONE_NODES_TTL_DAYS, dry_run=mode != MODE_APPLY,
+            only_namespaces=[
+                n for n in settings.KG_GONE_NODES_TTL_NAMESPACES.split(",") if n.strip()
+            ],
+        )
+    except Exception as e:
+        logger.warning("kg_gone_nodes_purge.failed: %s", e)
         db.rollback()
         return {"error": str(e)}
     finally:

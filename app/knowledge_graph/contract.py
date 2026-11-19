@@ -37,6 +37,11 @@ log = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 #: KG schema contract version. Bump rules — см. docs/KG_SCHEMA_CONTRACT.md.
+#: 2.10 = срок жизни данных: таблица `kg_service_health_hourly` (часовые
+#: агрегаты, миграция 20261118_0100) — сырьё `kg_service_health` при
+#: включённой свёртке живёт 7 дней; узлы `stale_class = gone` удаляются по
+#: TTL от `kg_namespaces.missing_since`, namespace получает `state = retired`.
+#: Обе уборки по умолчанию выключены. Additive.
 #: 2.9 = владелец namespace: `kg_namespaces.deployed_by/deployed_branch/owner_*/
 #: last_activity_at` (миграция 20260908_0100), beat kg_namespace_owner_sync,
 #: NAMESPACE_OWNER_SOURCES. Один резолв для медика, дашборда и MCP-тула.
@@ -66,7 +71,7 @@ log = logging.getLogger(__name__)
 #: без expected_stale-инфры) + единый источник `compute_orphan_stats`; все
 #: consumer'ы (STARTUP_CONTRACT_CHECK, quality_report, stats_digest) считают
 #: orphan через него. EDGE_KINDS не менялись.
-KG_SCHEMA_VERSION: str = "2.9"
+KG_SCHEMA_VERSION: str = "2.10"
 
 
 # ---------------------------------------------------------------------------

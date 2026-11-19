@@ -333,7 +333,7 @@ Read-side API used by enrichment + MCP tools:
 ### KG schema/quality contract (`app/knowledge_graph/contract.py`)
 - **The single source of truth** for what the KG counts as service / orphan /
   synthetic / owner-known, and which edge kinds are allowed.
-- `KG_SCHEMA_VERSION: str = "2.9"` — current contract version. Bump rules in
+- `KG_SCHEMA_VERSION: str = "2.10"` — current contract version. Bump rules in
   `docs/KG_SCHEMA_CONTRACT.md` §8 (major = breaking, minor = additive).
 - `EDGE_KINDS: Dict[str, EdgeKindSpec]` — registry of all edge kinds. Each spec has
   `semantic`, `src_kinds`, `dst_kinds`, `source`, `status`
@@ -436,7 +436,7 @@ Read-side API used by enrichment + MCP tools:
 `resolve_job_target(db, ns, job_name)` → `(target, how)` with `how` ∈ `job_owner / cronjob_owner / cronjob_name / job_name`; `cronjob_base_name` strips the `-<unix-minutes>` suffix (≥ 8 digits). Used by `resolve_store_service` (store path, dedup key, resolved notice) and `enrich_alert`.
 
 ### Health retention (`app/knowledge_graph/health_retention.py`)
-`RETENTION_TARGETS` (six observation tables) purged in batches by `kg_health_retention`.
+`RETENTION_TARGETS` (six observation tables) purged in batches by `kg_health_retention`. Next to it: `health_downsample.py` (folds raw `kg_service_health` points older than 7 days into hourly aggregates in `kg_service_health_hourly`) and `gone_retention.py` (TTL for nodes with `stale_class='gone'`); both are off by default, modes off → dry_run → apply, see RUNBOOK "Database housekeeping".
 
 ### Self-health metrics (`app/knowledge_graph/self_health_metrics.py`)
 `publish_snapshot` / `read_snapshot` (Redis `stats:self_health:last`), `SelfHealthCollector` (prometheus_client Collector) registered at API startup; `k8s/monitoring.yaml` holds `VMPodScrape` + `VMRule sre-ai-copilot`.

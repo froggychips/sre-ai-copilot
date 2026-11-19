@@ -527,6 +527,41 @@ kubectl -n sre-ai set env deploy/sre-ai-api deploy/copilot-worker \
 
 ---
 
+## Уборка базы: свёртка health, срок жизни gone-узлов, ретеншен remediation
+
+Три уборки, которые **удаляют данные**. Каждая под своей настройкой с тремя режимами — `off` (по умолчанию), `dry_run` (только считает), `apply`. Неизвестное значение читается как `off`. Исполняются в `copilot-worker-sync`, поэтому настройки ставятся на него. Включать по одной: сначала `dry_run`, посмотреть цифры за одну ночь, потом `apply`.
+
+| Что | Настройки | Задача (UTC) |
+|---|---|---|
+| Свёртка `kg_service_health`: сырьё старше N дней → часовые агрегаты `kg_service_health_hourly`, агрегаты старше M дней удаляются | `KG_HEALTH_DOWNSAMPLE_MODE`, `KG_HEALTH_RAW_RETENTION_DAYS` (7, пол 7), `KG_HEALTH_HOURLY_RETENTION_DAYS` (90) | `kg_health_downsample`, 03:05 |
+| Узлы `stale_class='gone'`, чей namespace отсутствует дольше D дней, — вместе с рёбрами и наблюдениями | `KG_GONE_NODES_TTL_MODE`, `KG_GONE_NODES_TTL_DAYS` (30, пол 7), `KG_GONE_NODES_TTL_NAMESPACES` (CSV, пусто — все) | `kg_gone_nodes_purge`, 04:25 |
+| `kg_remediation_decisions`, `kg_action_approvals`, `kg_remediation_attempts`, мостовые строки `incidents` (`rb-…`) | `KG_WORKFLOW_RETENTION_MODE`, `KG_WORKFLOW_RETENTION_DAYS` (180, пол 90) | шаг `kg_health_retention`, 03:40 |
+
+```bash
+# 1. dry-run — ничего не пишет
+kubectl -n sre-ai set env deploy/copilot-worker-sync KG_HEALTH_DOWNSAMPLE_MODE=dry_run
+# 2. наутро: что было бы сделано
+kubectl -n sre-ai logs deploy/copilot-worker-sync --since=12h | grep -E 'health_downsample\.|gone_retention\.|retention\.(workflow|table_dry_run)'
+# 3. apply
+kubectl -n sre-ai set env deploy/copilot-worker-sync KG_HEALTH_DOWNSAMPLE_MODE=apply
+```
+
+Что смотреть в dry-run (лог задачи и метрика `kg_retention_rows_total{target,action}`, `action` = `would_fold` / `would_upsert` / `would_delete` / `would_detach`):
+
+- **свёртка**: `would_fold` — сырых строк уйдёт (18.11.2026 — около 3,97 млн из 6,6 млн), `would_create_hourly` — часовых строк появится (около 666 тысяч). Отношение около 6:1; заметно меньше — точки пишутся реже десяти минут, это повод посмотреть на `kg_metrics_sync`, а не на свёртку;
+- **gone-узлы**: `would_delete_nodes` и `rows` по таблицам (18.11.2026 — 4853 узла в 79 namespace, 5101 деплой, 1141 инцидент и 407 алертов теряют только ссылку). `nodes_skipped_busy` > 0 — у узлов снесённого стенда остались открытые инциденты или алерты: сначала разобраться с ними. `late_refs` > 0 после `apply` — на узел писали прямо во время удаления (ссылки сняты, но это повод посмотреть, кто пишет по снесённому стенду). `skipped: lifecycle_stale` — `kg_namespace_lifecycle` не отмечал живых namespace больше двух часов, удаление отказалось работать: чинить lifecycle. Первое `apply` — на одном-двух namespace через `KG_GONE_NODES_TTL_NAMESPACES`;
+- **remediation**: `would_delete` по четырём таблицам.
+
+В режиме `apply` свёртки сырьё `kg_service_health` удаляет только она: `kg_health_retention` эту таблицу пропускает (`skipped: owned_by_downsample`), и `KG_HEALTH_RETENTION_DAYS` на неё не действует — иначе при отставшей свёртке или `KG_HEALTH_RAW_RETENTION_DAYS` больше 30 точки удалялись бы несвёрнутыми. Если свёртка сломалась, сырьё растёт, пока её не починят: следить за `truncated` / `error` в её логе. В `off` и `dry_run` чистка по 30 дням работает как раньше.
+
+После `apply`: `action="folded"` / `"deleted"` в той же метрике, `truncated: true` в логе значит «упёрлись в лимит прогона, остаток уйдёт следующей ночью» (первая свёртка разбирает накопленное за три ночи). В `kubectl logs` ищите `KG_GONE_NODES_PURGED` — аудит-событие на каждый namespace.
+
+**Место на диске.** Удаление строк не уменьшает файлы: PostgreSQL переиспользует освободившееся место, база перестаёт расти, но `pg_database_size` остаётся прежним. Вернуть место ОС — отдельная операция окном: `REINDEX INDEX CONCURRENTLY` для трёх индексов `kg_service_health` (1,4 ГБ из 2,2 ГБ таблицы — индексы) и `VACUUM FULL kg_service_health` при остановленных писателях (см. «Миграции и блокировки»).
+
+**Откат.** `KG_*_MODE=off` останавливает уборку со следующего тика. Удалённое не возвращается: свёрнутое сырьё есть в VictoriaMetrics, узлы вернувшегося стенда заведёт синк топологии (без истории прежнего воплощения).
+
+---
+
 ## Логирование
 
 `configure_logging()` из `app/observability/logging_setup.py` вызывается в `app/main.py` (API) и `app/workers/tasks.py` (все процессы Celery).

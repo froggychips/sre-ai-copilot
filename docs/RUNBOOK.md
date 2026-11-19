@@ -528,6 +528,41 @@ Watch API readiness/liveness, `AlertmanagerClusterFailedToSendAlerts`, Celery qu
 
 ---
 
+## Database housekeeping: health downsampling, gone-node TTL, remediation retention
+
+Three jobs that **delete data**. Each has its own setting with three modes — `off` (default), `dry_run` (count only), `apply`. An unknown value is read as `off`. They run in `copilot-worker-sync`, so that is where the settings go. Enable one at a time: `dry_run` first, read one night of numbers, then `apply`.
+
+| What | Settings | Task (UTC) |
+|---|---|---|
+| `kg_service_health` downsampling: raw points older than N days → hourly aggregates in `kg_service_health_hourly`; aggregates older than M days are deleted | `KG_HEALTH_DOWNSAMPLE_MODE`, `KG_HEALTH_RAW_RETENTION_DAYS` (7, floor 7), `KG_HEALTH_HOURLY_RETENTION_DAYS` (90) | `kg_health_downsample`, 03:05 |
+| Nodes with `stale_class='gone'` whose namespace has been absent for more than D days, with their edges and observations | `KG_GONE_NODES_TTL_MODE`, `KG_GONE_NODES_TTL_DAYS` (30, floor 7), `KG_GONE_NODES_TTL_NAMESPACES` (CSV, empty = all) | `kg_gone_nodes_purge`, 04:25 |
+| `kg_remediation_decisions`, `kg_action_approvals`, `kg_remediation_attempts`, bridge rows of `incidents` (`rb-…`) | `KG_WORKFLOW_RETENTION_MODE`, `KG_WORKFLOW_RETENTION_DAYS` (180, floor 90) | step of `kg_health_retention`, 03:40 |
+
+```bash
+# 1. dry-run — writes nothing
+kubectl -n sre-ai set env deploy/copilot-worker-sync KG_HEALTH_DOWNSAMPLE_MODE=dry_run
+# 2. next morning: what would have been done
+kubectl -n sre-ai logs deploy/copilot-worker-sync --since=12h | grep -E 'health_downsample\.|gone_retention\.|retention\.(workflow|table_dry_run)'
+# 3. apply
+kubectl -n sre-ai set env deploy/copilot-worker-sync KG_HEALTH_DOWNSAMPLE_MODE=apply
+```
+
+What to read in dry-run (task log and the `kg_retention_rows_total{target,action}` metric, `action` = `would_fold` / `would_upsert` / `would_delete` / `would_detach`):
+
+- **downsampling**: `would_fold` — raw rows that would go (2026-11-18: about 3.97M of 6.6M), `would_create_hourly` — hourly rows that would appear (about 666K). The ratio is about 6:1; a much lower one means points are written less often than every ten minutes — look at `kg_metrics_sync`, not at the downsampling;
+- **gone nodes**: `would_delete_nodes` and `rows` per table (2026-11-18: 4853 nodes in 79 namespaces, 5101 deployments; 1141 incidents and 407 alerts only lose the link). `nodes_skipped_busy` > 0 — nodes of a removed stand still have open incidents or alerts: deal with those first. `late_refs` > 0 after `apply` — something wrote to a node while it was being deleted (the links were cleared, but check who writes for a removed stand). `skipped: lifecycle_stale` — `kg_namespace_lifecycle` has not marked any namespace alive for over two hours and the purge refused to run: fix the lifecycle. Do the first `apply` on one or two namespaces via `KG_GONE_NODES_TTL_NAMESPACES`;
+- **remediation**: `would_delete` for the four tables.
+
+While downsampling is in `apply`, it is the only job that deletes raw `kg_service_health` rows: `kg_health_retention` skips that table (`skipped: owned_by_downsample`) and `KG_HEALTH_RETENTION_DAYS` no longer applies to it — otherwise a lagging downsampling job, or `KG_HEALTH_RAW_RETENTION_DAYS` above 30, would have points deleted unfolded. If downsampling breaks, raw rows grow until it is fixed: watch for `truncated` / `error` in its log. In `off` and `dry_run` the 30-day purge works as before.
+
+After `apply`: `action="folded"` / `"deleted"` in the same metric; `truncated: true` in the log means the run hit its cap and the rest goes the next night (the first downsampling works through the backlog in three nights). Look for `KG_GONE_NODES_PURGED` in `kubectl logs` — one audit event per namespace.
+
+**Disk space.** Deleting rows does not shrink files: PostgreSQL reuses the freed space, the database stops growing, but `pg_database_size` stays where it was. Returning space to the OS is a separate maintenance-window operation: `REINDEX INDEX CONCURRENTLY` for the three `kg_service_health` indexes (1.4 GB of the table's 2.2 GB is indexes) and `VACUUM FULL kg_service_health` with writers stopped (see "Migrations and locks").
+
+**Rollback.** `KG_*_MODE=off` stops a job from the next tick. Deleted data does not come back: the folded raw points exist in VictoriaMetrics, and nodes of a returned stand are re-created by the topology sync (without the history of the previous incarnation).
+
+---
+
 ## Logging
 
 `app/observability/logging_setup.py` `configure_logging()` is called in `app/main.py` (API) and `app/workers/tasks.py` (all Celery processes).

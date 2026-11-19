@@ -64,7 +64,7 @@ VMAlertmanager (k8s/vmalertmanagerconfig.yaml)
 | Очередь | Кто слушает | Что туда идёт |
 |---|---|---|
 | `celery` (по умолчанию, `task_default_queue`) | `copilot-worker` | `process_incident`, `generate_reply`, `remediation_bridge`, `remediation_verify`, лёгкие beat-задачи |
-| `sync` (`SYNC_QUEUE_NAME`) | `copilot-worker-sync` | `SYNC_QUEUE_TASKS` через `task_routes`: `kg_topology_sync`, `tc_deploys_to_kg`, `kg_storage_sync`, `kg_metrics_sync`, `kg_endpoints_sync`, `kg_signal_aggregates_compute`, `kg_health_retention`, `kg_topology_resources_sync`, `kg_anomaly_detection_task`, `kg_runtime_correlation_sync`, `kg_nats_subjects_sync` |
+| `sync` (`SYNC_QUEUE_NAME`) | `copilot-worker-sync` | `SYNC_QUEUE_TASKS` через `task_routes`: `kg_topology_sync`, `tc_deploys_to_kg`, `kg_storage_sync`, `kg_metrics_sync`, `kg_endpoints_sync`, `kg_signal_aggregates_compute`, `kg_health_retention`, `kg_health_downsample`, `kg_gone_nodes_purge`, `kg_topology_resources_sync`, `kg_anomaly_detection_task`, `kg_runtime_correlation_sync`, `kg_nats_subjects_sync` |
 | `executor` (`EXECUTOR_QUEUE_NAME`) | `copilot-executor` | `executor_apply`, `executor_dry_run` (при `EXECUTOR_DISPATCH=queue`, как в манифестах) |
 
 Каждая beat-задача держит аренду `single_instance`, медленный прогон не накладывается на следующий тик. Длина очередей экспортируется как `celery_queue_length{queue}` (см. `docs/METRICS.ru.md` §7).
@@ -77,7 +77,7 @@ VMAlertmanager (k8s/vmalertmanagerconfig.yaml)
 | События и деплои | `tc_deploys_to_kg` (15 мин), `kg_deploy_watch` (5 мин), `k8s_pod_events_sync` (10 мин), `kg_alerts_resolve_sync` (15 мин), `kg_incidents_lifecycle` (5 мин), `kg_statics_versions_sync` (5 мин) |
 | Метрики и сигналы | `kg_metrics_sync` (10 мин), `kg_cluster_health_sync` (5 мин), `kg_ingress_observations_sync` (10 мин), `kg_seq_logs_sync` (10 мин), `kg_anomaly_detection_task` (10 мин), `kg_signal_aggregates_compute` (каждый час :23), `kg_runtime_correlation_sync` (30 мин), `kg_health_recompute` (20 мин), `kg_external_probe` (каждую минуту) |
 | Дайджесты и отчёты | `daily_stats_digest` (раз в сутки, `STATS_DIGEST_HOUR_UTC`), `team_daily_digest` (раз в сутки, `TEAM_DIGEST_HOUR_UTC`), `chronic_alerts_digest` (6 ч), `weekly_reconciliation` (пн 06:00 UTC) |
-| Надзор и уборка | `kg_self_health_check` (30 мин), `kg_stuck_alerts_check` (каждый час :11), `kg_health_retention` (раз в сутки 03:40 UTC), `discord_dedup_purge` (30 мин) |
+| Надзор и уборка | `kg_self_health_check` (30 мин), `kg_stuck_alerts_check` (каждый час :11), `kg_health_downsample` (раз в сутки 03:05 UTC, по умолчанию выключена), `kg_health_retention` (раз в сутки 03:40 UTC), `kg_gone_nodes_purge` (раз в сутки 04:25 UTC, по умолчанию выключена), `discord_dedup_purge` (30 мин) |
 
 Не на beat: `remediation_verify` (`apply_async(countdown)` через +5 и +15 мин после apply, §3f), `remediation_bridge` (ставит API), `process_incident` / `generate_reply`, задачи executor-а.
 
@@ -150,7 +150,9 @@ Relay возвращает Discord тело ответа копилота без
 
 ### 2.6 Жизненный цикл данных
 
-- **Ретеншен** (`app/knowledge_graph/health_retention.py`, задача `kg_health_retention`, раз в сутки 03:40 UTC, удаление батчами). Сэмплы (`RETENTION_TARGETS`, пол `MIN_RETENTION_DAYS`=7): `kg_service_health` (`KG_HEALTH_RETENTION_DAYS`, 30), `kg_anomaly_observations`, `kg_signal_aggregates`, `kg_ingress_observations`, `kg_log_observations` — 30 дней; `kg_cluster_observations` — 90. События (`EVENT_RETENTION_TARGETS`, пол `MIN_EVENT_RETENTION_DAYS`=90): `kg_deployments` 180 дней по `started_at`, `kg_alerts` 180 и `kg_incidents` 365 по `resolved_at` (открытые не удаляются никогда), `kg_pod_events` 90 по `last_seen`, `kg_remediation_events` 365.
+- **Ретеншен** (`app/knowledge_graph/health_retention.py`, задача `kg_health_retention`, раз в сутки 03:40 UTC, удаление батчами). Сэмплы (`RETENTION_TARGETS`, пол `MIN_RETENTION_DAYS`=7): `kg_service_health` (`KG_HEALTH_RETENTION_DAYS`, 30), `kg_anomaly_observations`, `kg_signal_aggregates`, `kg_ingress_observations`, `kg_log_observations` — 30 дней; `kg_cluster_observations` — 90. События (`EVENT_RETENTION_TARGETS`, пол `MIN_EVENT_RETENTION_DAYS`=90): `kg_deployments` 180 дней по `started_at`, `kg_alerts` 180 и `kg_incidents` 365 по `resolved_at` (открытые не удаляются никогда), `kg_pod_events` 90 по `last_seen`, `kg_remediation_events` 365; инцидент, на который ещё ссылается событие remediation, пропускается, пока не уйдёт событие (FK). Процесс remediation (`WORKFLOW_RETENTION_TARGETS`, `KG_WORKFLOW_RETENTION_MODE`, по умолчанию выключен): `kg_remediation_decisions`, `kg_action_approvals`, `kg_remediation_attempts` и мостовые строки `incidents` (`rb-…`) — 180 дней.
+- **Свёртка health** (`health_downsample.py`, задача `kg_health_downsample`, `KG_HEALTH_DOWNSAMPLE_MODE` off → dry_run → apply): сырые точки `kg_service_health` старше `KG_HEALTH_RAW_RETENTION_DAYS` (7 — baseline аномалий и health_score) сворачиваются в `kg_service_health_hourly` (avg/max и число не-NULL замеров по метрике, число точек) и удаляются той же транзакцией; агрегаты живут `KG_HEALTH_HOURLY_RETENTION_DAYS` (90).
+- **Срок жизни gone-узлов** (`gone_retention.py`, задача `kg_gone_nodes_purge`, `KG_GONE_NODES_TTL_MODE`): узлы `stale_class='gone'`, чей namespace отсутствует (`kg_namespaces.missing_since`) дольше `KG_GONE_NODES_TTL_DAYS` (30), удаляются с рёбрами и наблюдениями; инциденты, алерты и события подов остаются и теряют только `service_id`; опустевший namespace становится `retired`. Порядок включения — RUNBOOK, «Уборка базы».
 - **Объём записи**: upsert-ы KG не переписывают неизменившиеся строки (`SERVICE_TOUCH_INTERVAL` 30 мин, `EDGE_TOUCH_INTERVAL` 3 ч в `populator.py`); `k8s_endpoints_sync` пишет metadata только при смене `endpoints_ready`.
 - **Бэкап** (`k8s/postgres-backup.yaml`, CronJob 02:00 UTC): `pg_dump` (custom, gzip) на PVC `postgres-backup-data` на другой ноде, чем база, хранятся последние `BACKUP_KEEP` (7) дампов; затем `aws s3 cp` в бакет из Secret `postgres-backup-s3` (без секрета выгрузка пропускается). Алерты: `CopilotPostgresBackupFailed` / `CopilotPostgresBackupMissing`.
 
@@ -535,10 +537,11 @@ baseline-снимков перед remediation-волной.
 
 `app/knowledge_graph/contract.py` — единственный источник истины:
 
-- `KG_SCHEMA_VERSION = "2.9"` (Wave 7 → 2.1; PR #82/#84/#86 → 2.2; orphan на
+- `KG_SCHEMA_VERSION = "2.10"` (Wave 7 → 2.1; PR #82/#84/#86 → 2.2; orphan на
   app-scope → 2.3; `node_kind` → 2.4; orphan перестал считать `serves_traffic`
   связностью → 2.5; `owner_source` → 2.6; `stale_class = gone` → 2.8;
-  владелец namespace `kg_namespaces.owner_*` → 2.9). История и мотивация —
+  владелец namespace `kg_namespaces.owner_*` → 2.9;
+  срок жизни данных — `kg_service_health_hourly`, TTL узлов `gone` → 2.10). История и мотивация —
   `docs/KG_SCHEMA_CONTRACT.md` §1.
 - `EDGE_KINDS` — реестр всех edge kinds (semantic / src_kinds / dst_kinds /
   source / status / table); поле `table` различает где edge живёт
