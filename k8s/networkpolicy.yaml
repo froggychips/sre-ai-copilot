@@ -137,6 +137,23 @@ spec:
     - protocol: TCP
       port: 31700
   # <<< site:STATICS_DB_CIDR
+  # Прод-ClickHouse (CHI `wo` в ns prod-analytics), HTTP 8123 —
+  # `clickhouse_service` (CH_PROD_HOST). До 20.11.2026 правила не было вовсе:
+  # CH_PROD_HOST указывал на внешний адрес с портом 8725, который не покрывает
+  # ни одно правило ниже (443 — только HTTPS), и каждый запрос копилота к
+  # аналитике уходил в таймаут — тот же класс, что statics выше. Теперь
+  # CH_PROD_HOST — clickhouse-wo.prod-analytics.svc:8123, и правило — по
+  # namespace и лейблам подов CHI, без IP.
+  - to:
+    - namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: prod-analytics
+      podSelector:
+        matchLabels:
+          clickhouse.altinity.com/chi: wo
+    ports:
+    - protocol: TCP
+      port: 8123
   # Kubernetes API server (diagnostics/remediation, kg_*_sync).
   - to:
     - ipBlock:
