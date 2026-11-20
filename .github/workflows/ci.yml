@@ -278,7 +278,14 @@ jobs:
         # Покрытие от этого не сужается, а уточняется: .venv собран ровно из
         # requirements.txt, и проверяются фактически установленные версии со
         # всеми транзитивными зависимостями, а не то, что записано в файле.
-        run: .venv/bin/pip-audit --strict
+        #
+        # --cache-dir явно (20.11.2026): без него pip-audit берёт кеш через
+        # platformdirs.user_cache_path(ensure_exists=True), а platformdirs 4.14.8
+        # (транзитивная, не закреплена) проверяет права и падает с
+        # «PermissionError: /home/runner, writable by another user» — домашний
+        # каталог self-hosted раннера group-writable. С явным каталогом
+        # platformdirs не вызывается вовсе.
+        run: .venv/bin/pip-audit --strict --cache-dir "${RUNNER_TEMP}/pip-audit-cache"
 
   build-and-push:
     name: Build and Push Docker Image
