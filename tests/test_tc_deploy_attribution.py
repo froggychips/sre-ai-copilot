@@ -289,3 +289,20 @@ def test_targeted_deploy_makes_service_active(db):
     by_name = {s.name: s.stale_class for s in db.query(Service)}
     assert by_name["chat-message-service"] == "active"
     assert by_name["town-service"] != "active"
+
+
+def test_unresolved_target_is_skipped_not_attributed_by_branch(db):
+    """NAMESPACE=%TARGET_SQUAD% без итогового значения (WO-18783, 24.11.2026).
+
+    По ветке `<default>` установка сквада осела бы на preprod-* — чужое
+    окружение. Цель неизвестна → записи нет.
+    """
+    _svc(db, "town-service", "preprod-shared")
+    db.commit()
+
+    b = _build(branch="<default>", target_realm=None)
+    b["target_unresolved"] = True
+    stats = _run(db, [b])
+
+    assert db.query(Deployment).count() == 0
+    assert stats["skipped_no_realm"] == 1

@@ -1566,6 +1566,12 @@ async def _tc_deploys_to_kg_logic() -> dict:
             # 596. Граф указывал не на те окружения, и в нужных деплоев не
             # было видно вообще.
             target_realm = b.get("target_realm")
+            if b.get("target_unresolved"):
+                # NAMESPACE задан ссылкой, которую TC так и не разрешил
+                # (билд упал до подстановки). Цель неизвестна; по ветке
+                # `<default>` установка сквада осела бы на preprod.
+                stats_skipped_no_realm += 1
+                continue
             if target_realm:
                 # NAMESPACE в TC — это РЕАЛЬМ: «squad-27», «preprod», «prod».
                 # Разворачиваем в конкретные namespace графа по префиксу:

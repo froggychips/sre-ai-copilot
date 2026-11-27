@@ -269,3 +269,55 @@ def test_embed_keeps_negative_verdict_when_stream_healthy():
                          "stale": False}
     value = _dep_field(_build_fields([ctx]))
     assert "вряд ли связано" in value
+
+
+# ── цель из параметров билда: те же правила, что у задачи ────────────────
+
+def _patch_builds(monkeypatch, builds):
+    import app.services.teamcity_service as tc
+
+    async def _fake_recent(**_kw):
+        return builds
+
+    monkeypatch.setattr(tc, "recent_deploys", _fake_recent)
+    monkeypatch.setattr(
+        tc, "tc_sync_config_status", lambda: {"configured": True, "reason": ""},
+    )
+
+
+def test_unresolved_squad_install_not_counted_as_preprod(db, monkeypatch):
+    """24.11.2026: установки сквадов с NAMESPACE=%TARGET_SQUAD% шли по ветке
+    `<default>`→preprod в should_ingest и держали warn ~25% «потерь»."""
+    _mk_service(db, "auth", "preprod-shared")
+    _patch_builds(monkeypatch, [{
+        "buildtype_id": "Wo_Backend_K8sNewCluster_InstallSquadEnvDeploy",
+        "number": "35", "branch": "<default>",
+        "target_realm": None, "target_unresolved": True,
+    }])
+    r = check_deploy_stream_ingestion(db)
+    assert r.status == "ok", r.detail
+    assert r.detail.get("should_ingest", 0) == 0
+
+
+def test_realm_missing_from_graph_not_counted(db, monkeypatch):
+    """Сквад снесён до проверки — задача такой билд пропускает, чек тоже."""
+    _mk_service(db, "auth", "preprod-shared")
+    _patch_builds(monkeypatch, [{
+        "buildtype_id": "Wo_Backend_K8sNewCluster_InstallSquadEnv",
+        "number": "320", "branch": "<default>",
+        "target_realm": "squad-24", "target_unresolved": False,
+    }])
+    r = check_deploy_stream_ingestion(db)
+    assert r.status == "ok", r.detail
+
+
+def test_realm_present_but_not_ingested_is_a_miss(db, monkeypatch):
+    _mk_service(db, "town-service", "squad-10-kingdom2")
+    _patch_builds(monkeypatch, [{
+        "buildtype_id": "Wo_Backend_K8sNewCluster_InstallSquadEnv",
+        "number": "327", "branch": "<default>",
+        "target_realm": "squad-10", "target_unresolved": False,
+    }])
+    r = check_deploy_stream_ingestion(db)
+    assert r.status == "fail"
+    assert r.detail["should_ingest"] == 1

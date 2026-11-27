@@ -478,6 +478,34 @@ _DEPLOY_ID_EXCLUDE = ("releasepool", "updateterrain", "updatesecret",
 # явно в локаторе = ручной whitelist, который протухнет с первым новым
 # пайплайном. Кап при этом больше не съедается: страницы идут до
 # исчерпания окна, а не до 200 сырых билдов.
+#: Параметры билда, из которых берётся цель деплоя (см. `recent_deploys`).
+_TARGET_PARAMS_LOCATOR = "name:(value:(NAMESPACE|SERVICE_NAME),matchType:matches)"
+
+
+def _resolved_param(
+    props: dict[str, Any], resolved: dict[str, Any], name: str,
+) -> tuple[Optional[str], bool]:
+    """Значение параметра билда после подстановки ссылок TC.
+
+    `properties` — то, что задано в конфигурации, как есть. С 24.11.2026
+    установка сквада стала цепочкой (WO-18783): `InstallSquadEnv` берёт
+    NAMESPACE ссылкой `%dep.…InstallSquadEnvDeploy.TARGET_SQUAD%`, а сам
+    `InstallSquadEnvDeploy` — `%TARGET_SQUAD%`. В `properties` лежит именно
+    эта строка, реальм «%TARGET_SQUAD%» в графе не находится, и задача
+    молча выкидывала билд (`skipped_no_realm`), а self-health считал его
+    пропущенным: `deploy_stream_ingestion` в warn с 24.11, ~25% «потерь».
+    Итог подстановки лежит в `resultingProperties`.
+
+    Возвращает (значение или None, «значение задано, но не разрешилось»).
+    """
+    raw = props.get(name)
+    value = resolved.get(name) or raw
+    if value and "%" in value:
+        value = None
+    unresolved = bool(raw) and value is None
+    return (value or None), unresolved
+
+
 _TC_PAGE_SIZE = 200
 _TC_MAX_PAGES = 10  # ≤2000 сырых билдов на проект за окно
 
@@ -548,6 +576,10 @@ def _fetch_recent_deploys_direct(
             "build(id,number,status,state,branchName,buildTypeId,"
             "buildType(name),startDate,finishDate,"
             "properties(property(name,value)),"
+            # Итоговые значения тех же параметров после подстановки ссылок.
+            # Только два имени — у билда их ~1650, тащить все незачем.
+            f"resultingProperties($locator({_TARGET_PARAMS_LOCATOR}),"
+            "property(name,value)),"
             "triggered(type,date,user(username,name)),"
             "revisions(revision(version,vcs-root-instance(name,vcs-root-id))))"
         )
@@ -585,6 +617,14 @@ def _fetch_recent_deploys_direct(
                     for pr in ((b.get("properties") or {}).get("property") or [])
                     if pr.get("name")
                 }
+                resolved = {
+                    pr.get("name"): pr.get("value")
+                    for pr in ((b.get("resultingProperties") or {}).get("property") or [])
+                    if pr.get("name")
+                }
+                target_realm, realm_unresolved = _resolved_param(
+                    props, resolved, "NAMESPACE")
+                target_service, _ = _resolved_param(props, resolved, "SERVICE_NAME")
                 if not _is_deploy_buildtype(btype_name, b.get("buildTypeId")):
                     continue
                 triggered = b.get("triggered") or {}
@@ -621,8 +661,14 @@ def _fetch_recent_deploys_direct(
                     # РЕАЛЬМ («squad-27», «preprod»), а не полное имя
                     # namespace: разворачивать его в конкретные namespace —
                     # дело вызывающего.
-                    "target_realm": props.get("NAMESPACE") or None,
-                    "target_service": props.get("SERVICE_NAME") or None,
+                    "target_realm": target_realm,
+                    "target_service": target_service,
+                    # NAMESPACE задан ссылкой, а итогового значения нет
+                    # (билд упал раньше, чем TC её разрешил): цель
+                    # неизвестна, и приписывать билд окружению по ветке
+                    # нельзя — `<default>` превратил бы установку сквада в
+                    # деплой preprod.
+                    "target_unresolved": realm_unresolved,
                     "url": (
                         f"{settings.TEAMCITY_WEB_URL.rstrip('/')}/viewLog.html?buildId={b.get('id')}"
                         if settings.TEAMCITY_WEB_URL and b.get("id") else None
