@@ -79,6 +79,8 @@ case "$MODE" in
     done
     echo "RoleBinding применён в $ok namespace, ошибок: $fail"
     echo "Проверка:"; check
+    # Частичная выдача — не успех: часть стендов осталась без права записи.
+    [ "$fail" -eq 0 ] || exit 1
     ;;
   --revoke)
     n=0
