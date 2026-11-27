@@ -650,6 +650,7 @@ def _drop_stale_selector_edges(
                     ServiceEdge.kind == EDGE_SERVES_TRAFFIC)
             .all()
         )
+    dropped = False
     for edge in edges:
         # Тот же паттерн, что в blast_radius._edge_sources: `edge.extras or
         # {}` mypy выводит как пустой dict, и .get по нему не типизируется.
@@ -683,6 +684,24 @@ def _drop_stale_selector_edges(
         )
         db.delete(edge)
         stats["edges_dropped_stale_selector"] += 1
+        dropped = True
+
+    # DELETE должен уйти в базу ДО того, как вызывающий начнёт заводить
+    # рёбра заново. `upsert_edge` пишет Core-ским `INSERT … ON CONFLICT`, а
+    # Core-оператор autoflush не вызывает: удалённая через ORM строка ещё
+    # лежит в таблице, конфликт срабатывает, `where=` по свежести ничего не
+    # обновляет — и только следующий `flush()` наконец исполняет DELETE.
+    # Обратный `SELECT … .one()` после этого строку не находит:
+    # `NoResultFound`, откат SAVEPOINT'а, `errors=1` в отчёте источника.
+    #
+    # Живой случай 18–27.11.2026: `prod-analytics/clickhouse-gcore-intercept`
+    # — рёбра на CHI-поды, найденные только по Endpoints и без
+    # `extras.selector`, каждый проход снимались здесь и тут же падали при
+    # пересоздании. Один такой Service держал `source_coverage` в warn
+    # (`k8s_topology_resources_sync/services: fetch_errors`) неделю, а
+    # CopilotSelfHealthWarnStuck — в канале.
+    if dropped:
+        db.flush()
 
 
 def _sync_one_service(

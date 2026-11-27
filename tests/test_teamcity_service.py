@@ -392,3 +392,71 @@ def test_id_exclusion_wins_over_renamed_display_name():
         "Update release pool agents", "Wo_Admin_Preupdate_ReleasePoolToggle")
     assert not _is_deploy_buildtype(
         "Backup terrain settings", "Wo_Backend_K8sNewCluster_UpdateTerrain")
+
+
+# ── цель деплоя: ссылки в параметрах (WO-18783, 24.11.2026) ────────────────
+#
+# Установка сквада стала цепочкой: NAMESPACE у `InstallSquadEnv` задан
+# ссылкой `%dep.…InstallSquadEnvDeploy.TARGET_SQUAD%`, у `InstallSquadEnvDeploy`
+# — `%TARGET_SQUAD%`. В `properties` TC отдаёт строку как есть; итог подстановки
+# — только в `resultingProperties`.
+
+
+def _with_params(build: dict, props: dict, resolved: dict) -> dict:
+    build["properties"] = {
+        "property": [{"name": k, "value": v} for k, v in props.items()]}
+    build["resultingProperties"] = {
+        "property": [{"name": k, "value": v} for k, v in resolved.items()]}
+    return build
+
+
+def test_target_realm_taken_from_resolved_reference():
+    b = _with_params(
+        _tc_build(0, "Squad deploy"),
+        {"NAMESPACE": "%dep.Wo_Backend_K8sNewCluster_InstallSquadEnvDeploy.TARGET_SQUAD%"},
+        {"NAMESPACE": "squad-10"},
+    )
+    out = _fetch(_FakeTCClient([b]))
+    assert out[0]["target_realm"] == "squad-10"
+    assert out[0]["target_unresolved"] is False
+
+
+def test_unresolved_reference_is_not_a_realm():
+    """Билд упал до подстановки: в resultingProperties пусто, ссылка не цель."""
+    b = _with_params(
+        _tc_build(0, "Squad deploy"), {"NAMESPACE": "%TARGET_SQUAD%"}, {},
+    )
+    out = _fetch(_FakeTCClient([b]))
+    assert out[0]["target_realm"] is None
+    assert out[0]["target_unresolved"] is True
+
+
+def test_plain_namespace_without_reference_unchanged():
+    b = _with_params(
+        _tc_build(0, "Squad deploy"),
+        {"NAMESPACE": "squad-gd", "SERVICE_NAME": "push-service"},
+        {"NAMESPACE": "squad-gd", "SERVICE_NAME": "push-service"},
+    )
+    out = _fetch(_FakeTCClient([b]))
+    assert out[0]["target_realm"] == "squad-gd"
+    assert out[0]["target_service"] == "push-service"
+    assert out[0]["target_unresolved"] is False
+
+
+def test_build_without_namespace_param_is_not_unresolved():
+    out = _fetch(_FakeTCClient([_tc_build(0, "Kingdom deploy")]))
+    assert out[0]["target_realm"] is None
+    assert out[0]["target_unresolved"] is False
+
+
+def test_fields_request_only_target_params_resolved():
+    """~1650 resultingProperties у билда — запрашиваем только два имени."""
+    captured = {}
+
+    class _Spy(_FakeTCClient):
+        def get_json(self, path, params=None):
+            captured.update(params or {})
+            return super().get_json(path, params)
+
+    _fetch(_Spy([_tc_build(0, "Kingdom deploy")]))
+    assert "resultingProperties($locator(name:(value:(NAMESPACE|SERVICE_NAME)" in captured["fields"]

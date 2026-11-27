@@ -1077,7 +1077,9 @@ def check_deploy_stream_ingestion(db: Session) -> CheckResult:
 
     # branch → list[ns] (обратное к branch_for_namespace по distinct ns в KG)
     ns_by_branch: Dict[str, bool] = {}
+    all_ns: List[str] = []
     for (ns,) in db.query(Service.namespace).distinct().all():
+        all_ns.append(ns)
         br = branch_for_namespace(ns)
         if br:
             ns_by_branch[br] = True
@@ -1095,6 +1097,21 @@ def check_deploy_stream_ingestion(db: Session) -> CheckResult:
             branch = "prod"
         elif branch == "<default>":
             branch = "preprod"
+        # Цель из параметров билда — по тем же правилам, что в задаче:
+        # неразрешённая ссылка и реальм без namespace в графе задача
+        # пропускает (`skipped_no_realm`), и чек не должен считать их
+        # потерей. Без этого установки сквадов с 24.11.2026 (NAMESPACE
+        # ссылкой `%TARGET_SQUAD%`, см. teamcity_service._resolved_param)
+        # шли в should_ingest по ветке `<default>`→preprod и держали
+        # warn ~25% «потерь», хотя писать их было некуда.
+        if b.get("target_unresolved"):
+            continue
+        realm = b.get("target_realm")
+        if realm:
+            prefix = f"{realm}-"
+            if any(ns == realm or ns.startswith(prefix) for ns in all_ns):
+                should_ingest.append(b)
+            continue
         if ns_by_branch.get(branch):
             should_ingest.append(b)
 

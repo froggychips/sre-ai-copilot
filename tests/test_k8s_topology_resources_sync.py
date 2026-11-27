@@ -1002,3 +1002,105 @@ def test_ingresses_successful_fetch_clears_previous_error(db, monkeypatch):
     stats = mod.sync_all_ingresses_declarative(db)
 
     assert "error" not in stats
+
+
+# ── снятое ребро уходит в базу до пересоздания (27.11.2026) ────────────────
+
+
+def _endpoints_only_edge(db, svc_ns="prod-analytics", svc_name="ch-intercept",
+                         workload="chi-wo-wo-0-dc2"):
+    from datetime import datetime
+
+    from app.knowledge_graph.k8s_endpoints_sync import DISCOVERED_BY_ENDPOINTS
+    svc = upsert_service(db, namespace=svc_ns, name=svc_name,
+                         node_kind=NODE_KIND_SERVICE)
+    wl = upsert_service(db, namespace=svc_ns, name=workload,
+                        node_kind=NODE_KIND_WORKLOAD)
+    edge = ServiceEdge(
+        src_id=svc.id, dst_id=wl.id, kind=EDGE_SERVES_TRAFFIC, direction="",
+        discovered_by=DISCOVERED_BY_ENDPOINTS,
+        extras={"discovery_sources": [DISCOVERED_BY_ENDPOINTS]},
+        last_seen_at=datetime.utcnow(),
+    )
+    db.add(edge)
+    db.commit()
+    return svc, wl
+
+
+def test_dropped_stale_edge_flushed_before_recreate(db):
+    """DELETE снятого ребра должен уйти в базу до пересоздания.
+
+    `upsert_edge` на postgres пишет Core-ским INSERT … ON CONFLICT, который
+    autoflush не вызывает: без явного flush удаление исполнялось ПОСЛЕ
+    вставки, и обратный SELECT … .one() падал NoResultFound. Живой случай —
+    prod-analytics/clickhouse-gcore-intercept, `errors=1` каждый проход и
+    `source_coverage` в warn неделю.
+    """
+    from app.knowledge_graph import k8s_topology_resources_sync as m
+
+    svc, _ = _endpoints_only_edge(db)
+    stats = {"edges_dropped_stale_selector": 0}
+    flushed_with_pending_delete = []
+    real_flush = db.flush
+
+    def _spy_flush(*a, **kw):
+        flushed_with_pending_delete.append(bool(db.deleted))
+        return real_flush(*a, **kw)
+
+    with patch.object(db, "flush", side_effect=_spy_flush):
+        m._drop_stale_selector_edges(
+            db, svc, {"clickhouse.altinity.com/chi": "wo"}, stats, None)
+
+    assert stats["edges_dropped_stale_selector"] == 1
+    assert flushed_with_pending_delete == [True]
+    assert db.query(ServiceEdge).filter_by(kind=EDGE_SERVES_TRAFFIC).count() == 0
+
+
+def test_no_flush_when_nothing_dropped(db):
+    from app.knowledge_graph import k8s_topology_resources_sync as m
+
+    svc = upsert_service(db, namespace="ns", name="lonely",
+                         node_kind=NODE_KIND_SERVICE)
+    db.commit()
+    with patch.object(db, "flush") as fl:
+        m._drop_stale_selector_edges(
+            db, svc, {"app": "x"}, {"edges_dropped_stale_selector": 0}, None)
+    fl.assert_not_called()
+
+
+@pytest.mark.skipif(
+    not __import__("tests.conftest", fromlist=["_has_live_postgres"])._has_live_postgres(),
+    reason="нужен живой postgres: путь _upsert_edge_pg + UpsertSnapshot",
+)
+def test_endpoints_only_edge_recreated_with_snapshot_on_postgres():
+    """Сценарий прода целиком: снимок + Core-upsert на postgres."""
+    import uuid
+
+    import app.knowledge_graph.schema  # noqa: F401
+    from app.database import Base as PgBase
+    from app.database import SessionLocal, engine
+
+    PgBase.metadata.create_all(engine)
+    s = SessionLocal()
+    ns = f"t-intercept-{uuid.uuid4().hex[:8]}"
+    try:
+        _endpoints_only_edge(s, svc_ns=ns, svc_name="ch-intercept",
+                             workload="chi-wo-wo-0-dc2")
+        dep = _mk_deployment("chi-wo-wo-0-dc2", ns,
+                             pod_labels={"clickhouse.altinity.com/chi": "wo"})
+        svc = _mk_service("ch-intercept", ns,
+                          selector={"clickhouse.altinity.com/chi": "wo"})
+        with patch(
+            "app.knowledge_graph.k8s_topology_resources_sync._kubectl_get_all",
+            return_value=[svc],
+        ):
+            stats = sync_all_services(
+                s, deployments_index=_index_deployments_by_ns([dep]))
+        assert stats["errors"] == 0, stats
+        assert stats["edges_dropped_stale_selector"] == 1
+        assert stats["edges_serves_traffic"] == 1
+    finally:
+        s.rollback()
+        s.query(Service).filter(Service.namespace == ns).delete()
+        s.commit()
+        s.close()
