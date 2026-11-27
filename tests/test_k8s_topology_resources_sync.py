@@ -1100,7 +1100,14 @@ def test_endpoints_only_edge_recreated_with_snapshot_on_postgres():
         assert stats["edges_dropped_stale_selector"] == 1
         assert stats["edges_serves_traffic"] == 1
     finally:
+        # Рёбра ссылаются на kg_services по FK (src_id/dst_id) — сначала они.
         s.rollback()
-        s.query(Service).filter(Service.namespace == ns).delete()
+        ids = [i for (i,) in s.query(Service.id).filter(Service.namespace == ns)]
+        if ids:
+            s.query(ServiceEdge).filter(
+                ServiceEdge.src_id.in_(ids) | ServiceEdge.dst_id.in_(ids)
+            ).delete(synchronize_session=False)
+            s.query(Service).filter(Service.id.in_(ids)).delete(
+                synchronize_session=False)
         s.commit()
         s.close()
