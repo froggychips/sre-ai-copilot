@@ -103,9 +103,19 @@ def test_remediate_role_matches_what_execution_dsl_can_do() -> None:
     их не вызывает ни один путь кода, а exec под write-SA = произвольная
     команда в любом контейнере namespace-а."""
     role = next(d for d in _docs(_K8S / "base" / "rbac.yaml")
-                if d["kind"] == "Role" and d["metadata"]["name"] == "sre-ai-remediate")
+                if d["kind"] == "ClusterRole" and d["metadata"]["name"] == "sre-ai-remediate")
     resources = {r for rule in role["rules"] for r in rule["resources"]}
     assert resources == {"deployments", "deployments/scale"}
+
+
+def test_write_role_is_never_bound_cluster_wide() -> None:
+    """Правила записи — ClusterRole, но право выдаётся только RoleBinding-ом в
+    конкретном namespace: ClusterRoleBinding на неё дал бы executor-у запись
+    во весь кластер, включая прод."""
+    for path in sorted(_K8S.rglob("*.yaml")):
+        for d in _docs(path):
+            if d.get("kind") == "ClusterRoleBinding":
+                assert d["roleRef"]["name"] != "sre-ai-remediate", path.name
 
 
 def test_executor_sa_is_used_only_by_copilot_executor() -> None:
