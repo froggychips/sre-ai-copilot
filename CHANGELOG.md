@@ -4,6 +4,40 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+## [1.0.37] — 2026-11-27 — self-health без залипших warn, деплои стендов снова в графе
+
+### Исправлено
+
+- **`source_coverage` больше не держит warn (#581).** Синк сервисов снимал
+  устаревшее selector-ребро без flush, а пересоздание шло Core-ским
+  `INSERT … ON CONFLICT`: DELETE уходил в базу после вставки, и обратный
+  `SELECT … .one()` падал `NoResultFound`. Проявлялось только в боевом режиме
+  со снимком узлов (`UpsertSnapshot`) — на одном Service каждый проход давал
+  `errors=1`, и чек неделю стоял в warn. Теперь удаление сбрасывается до
+  пересоздания.
+- **Деплои стендов снова попадают в граф (#581).** С переходом установки стенда
+  на цепочку сборок `NAMESPACE` в параметрах билда задан ссылкой
+  (`%TARGET_SQUAD%`); бралось сырое значение, namespace в графе не находился, и
+  с 24.11 деплои стендов не записывались, а `deploy_stream_ingestion` считал их
+  потерями preprod. Цель берётся из `resultingProperties`; неразрешённая ссылка
+  помечается `target_unresolved` и пропускается, чек считает по тем же
+  правилам. Пропущенное с 24.11 дозаливается `backfill_tc_deploys`.
+- **Egress к прод-ClickHouse (#572).** В NetworkPolicy не было правила к CH:
+  запросы `clickhouse_service` уходили в таймаут. Правило по namespace
+  `prod-analytics` и лейблу подов CHI, порт 8123; CI: `pip-audit` с отдельным
+  cache-dir (обход `PermissionError` на self-hosted раннере).
+
+### Изменено
+
+- **Запись executor-а в стендах (#571).** Правила записи — `ClusterRole
+  sre-ai-remediate` (сама ничего не даёт); право появляется только через
+  RoleBinding в namespace стенда, которые раздаёт
+  `scripts/grant_executor_squads.sh` (`--apply` / `--revoke`, код 1 при
+  частичной выдаче). Тест запрещает ClusterRoleBinding на роль.
+- **Зависимости (#573–#580):** anthropic 2.11.0, fastapi 0.165.0 (+ starlette
+  1.10.0), sqlalchemy 2.1.9, pydantic-settings 2.16.3, kubernetes 37.0.3;
+  actions: docker/login-action 4.8.0, codeql-action 4.39.3, setup-uv 10.4.0.
+
 ## [1.0.36] — 2026-11-19 — мост не работает вхолостую, API не встаёт из-за БД, N+1 в синках
 
 Серия по итогам сверки живой инсталляции 1.0.35 с кодом (18.11.2026).
